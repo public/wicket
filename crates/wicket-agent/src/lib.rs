@@ -93,7 +93,9 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
         "bypassPermissions".into(),
         // Server-side search would bypass the egress proxy (the LLM proxy strips it too).
         "--disallowedTools".into(),
-        "WebSearch".into(),
+        // In-box subagents can't be told apart by identity; when the manifest says so, the only way
+        // to start a subagent is wicket's spawn_agent (its own sandbox and identity).
+        if m.agent.as_ref().map(|a| a.in_box_subagents).unwrap_or(true) { "WebSearch".into() } else { "WebSearch,Agent,Task".into() },
         "--append-system-prompt".into(),
         NOTICE.into(),
         // The only MCP server is wicket's gateway; repo-supplied MCP config is ignored.

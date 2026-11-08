@@ -217,6 +217,34 @@ assert identity *on the box's behalf*:
 live in the vault, or a KMS/HSM in production, and are rotated. Short-lived certificates and signatures
 carry the policy epoch, so a revocation is visible to verifiers.
 
+**Agent-to-agent messages** go only through wicket (boxes have no network to reach each other). A
+sender calls `send_message(to, body)` on its gateway. wicket sets the sender from the socket (an agent
+can't name itself), checks policy and signs the envelope with the sender's agent key. The recipient's
+gateway verifies the envelope against the issuer before delivering it. The policy:
+- parent and child may always talk;
+- otherwise the recipient's zone must list the sender's zone in `accept_from`;
+- never across tenants (in v1; §15 sharing policy later).
+
+A message is therefore delivered only if:
+1. its sender is an agent this installation launched;
+2. its zone is the zone wicket put it in;
+3. it was addressed to this recipient.
+
+Bodies are the sender's data, shown to the recipient as such. Typed gates (§4.3) narrow them further.
+
+**PoC status (2026-11-08).** Built: the issuer (`wicket identity issuer`), per-run identity documents
+(EdDSA JWS) with keys held by `wicket run`, `whoami`, `send_message`, `await_message`, `spawn_agent`
+(a child `wicket run` with its own sandbox, sockets and identity, reach narrowed only), and signed
+`run_finished` reports. Also:
+- verified identities are shown with every pending request, and the console refuses approval when the
+  identity doesn't verify (enforced on the server, not just in the page);
+- the passkey signs the identity digest together with the decision;
+- `audit --verify` re-checks every identity and envelope offline;
+- `in_box_subagents: false` removes Claude Code's own Agent tool, so every subagent is a wicket child.
+
+Not built: signed result attestations, RFC 9421 egress signatures, node enrolment and pinned host keys,
+the separate system user, and federation with other installations.
+
 **Granularity is the sandbox.** Subagents inside one box share a process and a uid, so per-subagent
 *cryptographic* identity is impossible there. Per-subagent attribution is reported, not proven (§11.1).
 An agent whose identity must be provable on its own runs in its own sandbox, as a wicket child or team
@@ -418,7 +446,8 @@ dereferences it, which taints `fix` with `web` and blocks its pushes."*
 
 - **Static:** wicketd runs the manifest's graph directly. Zones run in dependency order, and outputs flow
   through gates.
-- **Dynamic:** a zone may be granted the `wicket.spawn` tool in its MCP gateway. A parent calls
+- **Dynamic** (PoC: `spawn_agent`, with `max_children` in the agent spec; same zone, reach narrowed by host,
+  no grandchildren yet): a zone may be granted the `wicket.spawn` tool in its MCP gateway. A parent calls
   `spawn(zone_template, task_text, inputs: [handle…])`. wicketd checks child ⊆ parent and admits only
   handles and typed values as inputs. **The child's task text inherits the parent's label.** It is only as
   trusted as the parent, and re-derivation for the child's escalations runs against the chain of task texts

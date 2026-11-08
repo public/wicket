@@ -356,13 +356,24 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
             if req.status != "pending" {
                 return err(StatusCode::CONFLICT, format!("{id} is {}, not pending", req.status));
             }
+            let identity = Ledger::open(&ledger_path()).map(|l| crate::verified_identity(&l, &req.run, None)).unwrap_or(Value::Null);
+            // No approving for an agent whose identity doesn't verify (programs have none; they're fine).
+            let unverified = identity.get("verified").and_then(|v| v.as_bool()) != Some(true)
+                && !identity.get("error").and_then(|e| e.as_str()).unwrap_or("").starts_with("no identity was issued");
+            if approve && unverified {
+                return err(StatusCode::CONFLICT, format!("{id}: the requesting agent's identity does not verify; it can be denied, not approved"));
+            }
             // The exact decision the passkey will sign. Field order is fixed.
             let decision_json = json!({
                 "v": 1, "tenant": state.tenant.0, "request": req.id, "run": req.run, "zone": req.zone,
                 "method": req.method, "host": req.host, "path": req.path, "risk": req.risk,
                 "decision": if approve { "approve" } else { "deny" },
                 "uses": uses, "ttl_secs": if approve { Some(ttl_secs) } else { None },
-                // Who the human was told this is for; the passkey signs it with the decision.
+                // Who the human was told this is for; the passkey signs it with the decision: the
+                // agent's verified identity (bound by its document's digest) and, inside its box,
+                // which subagent reportedly asked.
+                "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
+                "identity_verified": identity.get("verified"),
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
             })
             .to_string();
@@ -415,7 +426,11 @@ fn dashboard(state: &State) -> Result<Value> {
     Ok(json!({
         "now": wicket_store::now(),
         "tenant": t.0,
-        "pending": l.pending(t)?,
+        "pending": l.pending(t)?.into_iter().map(|r| {
+            let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
+            v["identity"] = crate::verified_identity(&l, &r.run, None);
+            v
+        }).collect::<Vec<_>>(),
         "decided": l.decided(t, 15)?,
         "runs": l.runs(t, 15)?,
         "passkeys": l.operator_credentials(t)?,

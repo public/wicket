@@ -28,6 +28,16 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum IdentityCmd {
+    /// Print the installation issuer's public key (JWK): what verifiers need.
+    Issuer,
+    /// Verify and show the identity wicket issued for a run.
+    Show { run: String },
+    /// List every agent identity issued, verified.
+    List,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Run a task manifest: one Claude Code agent in one zone.
     Run {
@@ -44,6 +54,12 @@ enum Cmd {
         /// ssh identity for --node.
         #[arg(long)]
         ssh_key: Option<PathBuf>,
+        /// Internal: the run id to use (set by a parent starting a child agent).
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
+        /// Internal: the run that started this one (`spawn_agent`).
+        #[arg(long, hide = true)]
+        parent_run: Option<String>,
     },
     /// List pending escalation requests.
     Pending,
@@ -107,6 +123,11 @@ enum Cmd {
     Operator {
         #[command(subcommand)]
         cmd: OperatorCmd,
+    },
+    /// Agent identities (design §3.2): the issuer's public key, and verified identity documents.
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
     },
     /// Check the environment: Docker, gVisor, image, secrets, ledger.
     Doctor {
@@ -179,6 +200,64 @@ pub fn ledger_path() -> PathBuf {
     data_dir().join("ledger.db")
 }
 
+/// The verified identity of the agent running as `run`, for showing to humans: the identity document
+/// is checked against the issuer and against the ledger's own row, so an edited row is caught.
+/// `at` is the time to check validity at (now for live runs, issue time for history).
+pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::Value {
+    let row = match l.identity(run) {
+        Ok(Some(r)) => r,
+        Ok(None) => return serde_json::json!({ "verified": false, "run": run, "error": "no identity was issued for this run" }),
+        Err(e) => return serde_json::json!({ "verified": false, "run": run, "error": e.to_string() }),
+    };
+    let check = || -> anyhow::Result<wicket_identity::AgentClaims> {
+        let issuer = issuer()?;
+        let c = wicket_identity::verify_identity(&row.jws, &issuer.verifying_key(), at.unwrap_or(row.issued_at))?;
+        if c.run != row.run || c.tenant != row.tenant || c.zone != row.zone || c.agent != row.agent || c.sub != row.spiffe_id || c.parent_run != row.parent_run {
+            anyhow::bail!("the ledger's record does not match the signed identity");
+        }
+        Ok(c)
+    };
+    match check() {
+        Ok(c) => {
+            let parent_agent = c.parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|p| p.agent);
+            serde_json::json!({
+                "verified": true, "id": c.sub, "agent": c.agent, "zone": c.zone, "tenant": c.tenant, "run": c.run,
+                "parent_run": c.parent_run, "parent_agent": parent_agent, "node": c.node, "image": c.image,
+                "manifest_sha256": c.manifest_sha256, "identity_sha256": wicket_identity::identity_digest(&row.jws),
+            })
+        }
+        Err(e) => serde_json::json!({ "verified": false, "run": run, "agent": row.agent, "zone": row.zone, "error": e.to_string() }),
+    }
+}
+
+/// One line for terminals.
+pub fn identity_line(v: &serde_json::Value) -> String {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
+    if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
+        let parent = v.get("parent_run").and_then(|p| p.as_str()).map(|p| format!(", child of {} ({p})", v.get("parent_agent").and_then(|a| a.as_str()).unwrap_or("?"))).unwrap_or_default();
+        format!("{} [verified]{parent}", g("id"))
+    } else {
+        format!("NOT VERIFIED: {}", g("error"))
+    }
+}
+
+/// The installation's identity issuer key (design §3.2). Under WICKET_HOME when that is set.
+pub fn issuer_key_path() -> PathBuf {
+    if let Some(d) = std::env::var_os("WICKET_HOME") {
+        return PathBuf::from(d).join("identity/issuer.key");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config/wicket/identity/issuer.key")
+}
+
+pub fn trust_domain() -> String {
+    std::env::var("WICKET_TRUST_DOMAIN").unwrap_or_else(|_| "wicket.local".into())
+}
+
+pub fn issuer() -> Result<wicket_identity::Issuer> {
+    Ok(wicket_identity::Issuer::load_or_create(&issuer_key_path(), &trust_domain())?)
+}
+
 fn operator() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
     format!("{user}@cli (host break-glass)")
@@ -193,7 +272,9 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run { manifest, workdir, image, node, ssh_key } => run::run(&manifest, workdir.as_deref(), &image, node.as_deref(), ssh_key.as_deref()).await,
+        Cmd::Run { manifest, workdir, image, node, ssh_key, run_id, parent_run } => {
+            run::run(&manifest, workdir.as_deref(), &image, node.as_deref(), ssh_key.as_deref(), run_id, parent_run).await
+        }
         Cmd::Pending => {
             let l = Ledger::open(&ledger_path())?;
             let p = l.pending(&TenantId::single())?;
@@ -203,6 +284,7 @@ async fn main() -> Result<()> {
             for r in p {
                 let age = wicket_store::now() - r.created_at;
                 println!("{}  {} {}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, r.risk, r.run, age, r.reason);
+                println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
                 for a in &r.attribution {
                     println!("    for: {}  (reported by the agent, unverified)", wicket_agent::clip(&wicket_proxy::attribution_line(a), 240));
                 }
@@ -221,6 +303,7 @@ async fn main() -> Result<()> {
                 "request": id, "decision": "approve", "grant": gid, "by": operator(),
                 "method": req.method, "host": req.host, "path": req.path,
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
+                "agent_identity": verified_identity(&l, &req.run, None),
                 "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
             }))?;
             println!("approved {id} → grant {gid}: {} {}{} ({}, {})", req.method, req.host, prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") }, humantime::format_duration(ttl));
@@ -233,6 +316,20 @@ async fn main() -> Result<()> {
             println!("denied {id}");
             Ok(())
         }
+        Cmd::Identity { cmd } => {
+            let l = Ledger::open(&ledger_path())?;
+            match cmd {
+                IdentityCmd::Issuer => println!("{}", serde_json::to_string_pretty(&issuer()?.public_jwk())?),
+                IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
+                IdentityCmd::List => {
+                    for row in l.identities()? {
+                        let status = l.run_status(&row.run)?.unwrap_or_default();
+                        println!("{}  {:<10} {}", row.run, status, identity_line(&verified_identity(&l, &row.run, None)));
+                    }
+                }
+            }
+            Ok(())
+        }
         Cmd::Audit { tail, verify } => {
             let l = Ledger::open(&ledger_path())?;
             if verify {
@@ -240,8 +337,10 @@ async fn main() -> Result<()> {
                 println!("audit chain OK: {n} records");
                 let (ok, bad) = verify_signed_decisions(&l)?;
                 println!("passkey-signed decisions: {ok} verified offline, {bad} failed");
-                if bad > 0 {
-                    bail!("{bad} signed decision(s) failed verification");
+                let (iok, ibad) = verify_identities_and_messages(&l)?;
+                println!("agent identities and signed messages: {iok} verified offline, {ibad} failed");
+                if bad + ibad > 0 {
+                    bail!("{} record(s) failed verification", bad + ibad);
                 }
                 return Ok(());
             }
@@ -312,6 +411,40 @@ async fn main() -> Result<()> {
 
 /// Re-verifies every passkey-signed decision in the audit log from the stored public keys alone: the
 /// signature must cover exactly the recorded decision.
+/// Verifies every issued identity (at its issue time) and every stored envelope (at its send time).
+fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize)> {
+    let (mut ok, mut bad) = (0, 0);
+    for row in l.identities()? {
+        let v = verified_identity(l, &row.run, None);
+        if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
+            ok += 1;
+        } else {
+            println!("  identity of {}: FAILED: {}", row.run, v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
+            bad += 1;
+        }
+    }
+    let key = issuer()?.verifying_key();
+    for (id, env) in l.envelopes()? {
+        // Check at the time the envelope says it was sent (identities expire after their run).
+        let at = env.split('.').nth(1).and_then(|p| {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok()
+        }).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v.get("iat").and_then(|t| t.as_i64())).unwrap_or(0);
+        match wicket_identity::verify_envelope(&env, &key, at) {
+            Ok((_, p)) if p.get("jti").and_then(|j| j.as_str()) == Some(id.as_str()) => ok += 1,
+            Ok(_) => {
+                println!("  message {id}: FAILED: id does not match its envelope");
+                bad += 1;
+            }
+            Err(e) => {
+                println!("  message {id}: FAILED: {e}");
+                bad += 1;
+            }
+        }
+    }
+    Ok((ok, bad))
+}
+
 fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
     use wicket_auth::{decision_challenge, unb64u, Credential, RelyingParty};
     let keys = l.operator_credentials_all(&TenantId::single())?;

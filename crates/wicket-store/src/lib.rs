@@ -50,6 +50,21 @@ pub struct Request {
     pub attribution: Vec<serde_json::Value>,
 }
 
+/// The identity document wicket issued for one run, with the fields it is looked up by.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentityRow {
+    pub run: String,
+    pub tenant: String,
+    pub spiffe_id: String,
+    pub zone: String,
+    pub agent: String,
+    pub parent_run: Option<String>,
+    /// The zone's `accept_from` at launch: who may message this agent besides parent and children.
+    pub accept_from: Vec<String>,
+    pub jws: String,
+    pub issued_at: i64,
+}
+
 /// An operator's passkey (ES256 public key; base64url credential id).
 #[derive(Debug, Clone, Serialize)]
 pub struct OperatorCredential {
@@ -106,6 +121,15 @@ CREATE TABLE IF NOT EXISTS operator_credentials (
   sign_count INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER,
   revoked INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS identities (
+  run TEXT PRIMARY KEY, tenant TEXT NOT NULL, spiffe_id TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
+  parent_run TEXT, accept_from TEXT NOT NULL DEFAULT '[]', jws TEXT NOT NULL, issued_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
+  created_at INTEGER NOT NULL, delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
@@ -191,6 +215,76 @@ impl Ledger {
             params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr],
         )?;
         Ok((id, true))
+    }
+
+    // ---- identities and messages (design §3.2) ----
+
+    /// Records the identity document wicket issued for a run.
+    pub fn put_identity(&self, id: &IdentityRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO identities (run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id.run, id.tenant, id.spiffe_id, id.zone, id.agent, id.parent_run, serde_json::Value::from(id.accept_from.clone()).to_string(), id.jws, id.issued_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn identity(&self, run: &str) -> Result<Option<IdentityRow>> {
+        Ok(self
+            .conn
+            .query_row("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE run = ?1", params![run], row_to_identity)
+            .optional()?)
+    }
+
+    pub fn identities(&self) -> Result<Vec<IdentityRow>> {
+        let mut st = self.conn.prepare("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities ORDER BY issued_at")?;
+        let rows = st.query_map([], row_to_identity)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// A run's status ("running", "succeeded", …), if it exists.
+    pub fn run_status(&self, run: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?)
+    }
+
+    /// Children started by `run` (from their identity documents).
+    pub fn children(&self, run: &str) -> Result<Vec<IdentityRow>> {
+        let mut st = self.conn.prepare("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE parent_run = ?1 ORDER BY issued_at")?;
+        let rows = st.query_map(params![run], row_to_identity)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn add_message(&self, id: &str, tenant: &TenantId, from_run: &str, to_run: &str, envelope: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, tenant.0, from_run, to_run, envelope, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Takes the oldest undelivered message for `run`: (id, from_run, envelope). Marked delivered
+    /// in the same transaction, so each message is handed out once.
+    pub fn take_message(&mut self, run: &str) -> Result<Option<(String, String, String)>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let m: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT id, from_run, envelope FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, id LIMIT 1",
+                params![run],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((id, _, _)) = &m {
+            tx.execute("UPDATE messages SET delivered_at = ?2 WHERE id = ?1", params![id, now()])?;
+        }
+        tx.commit()?;
+        Ok(m)
+    }
+
+    /// Every stored envelope (id, envelope), for offline verification.
+    pub fn envelopes(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT id, envelope FROM messages ORDER BY created_at")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The request a grant was made for, if any.
@@ -436,6 +530,20 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
     })
 }
 
+fn row_to_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityRow> {
+    Ok(IdentityRow {
+        run: r.get(0)?,
+        tenant: r.get(1)?,
+        spiffe_id: r.get(2)?,
+        zone: r.get(3)?,
+        agent: r.get(4)?,
+        parent_run: r.get(5)?,
+        accept_from: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+        jws: r.get(7)?,
+        issued_at: r.get(8)?,
+    })
+}
+
 /// Whether two attribution objects name the same askers (same agents and calls).
 fn same_askers(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     let key = |v: &serde_json::Value| -> Vec<(String, String)> {
@@ -453,6 +561,33 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn messages_are_delivered_once_in_order() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        l.add_message("m-1", &t, "run_a", "run_b", "env1").unwrap();
+        l.add_message("m-2", &t, "run_a", "run_b", "env2").unwrap();
+        l.add_message("m-3", &t, "run_a", "run_c", "env3").unwrap();
+        assert_eq!(l.take_message("run_b").unwrap().unwrap().0, "m-1");
+        assert_eq!(l.take_message("run_b").unwrap().unwrap().0, "m-2");
+        assert!(l.take_message("run_b").unwrap().is_none());
+        assert_eq!(l.envelopes().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn identities_are_found_by_run_and_parent() {
+        let l = Ledger::open_in_memory().unwrap();
+        let row = |run: &str, parent: Option<&str>| IdentityRow {
+            run: run.into(), tenant: "t0".into(), spiffe_id: format!("spiffe://x/{run}"), zone: "z".into(), agent: "a".into(),
+            parent_run: parent.map(String::from), accept_from: vec!["ops".into()], jws: "j".into(), issued_at: 1,
+        };
+        l.put_identity(&row("run_p", None)).unwrap();
+        l.put_identity(&row("run_c", Some("run_p"))).unwrap();
+        assert_eq!(l.identity("run_c").unwrap().unwrap().parent_run.as_deref(), Some("run_p"));
+        assert_eq!(l.identity("run_p").unwrap().unwrap().accept_from, vec!["ops".to_string()]);
+        assert_eq!(l.children("run_p").unwrap().len(), 1);
     }
 
     #[test]

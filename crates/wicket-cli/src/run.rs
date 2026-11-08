@@ -10,9 +10,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
 use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::{Docker, Mount, SandboxSpec};
+use sha2::Digest;
 use wicket_store::Ledger;
 
-pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node: Option<&str>, ssh_key: Option<&Path>) -> Result<()> {
+pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node: Option<&str>, ssh_key: Option<&Path>, run_id: Option<String>, parent_run: Option<String>) -> Result<()> {
     let text = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
     let m = Manifest::from_yaml(&text)?;
     let vault = Vault::new(Vault::default_dir());
@@ -57,7 +58,11 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
         bail!("image {image} not found{} (run: wicket image)", node.as_ref().map(|n| format!(" on {}", n.target)).unwrap_or_default());
     }
 
-    let run = RunId::new();
+    let run = match run_id {
+        Some(id) if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) => RunId(id),
+        Some(id) => bail!("bad --run-id {id:?}"),
+        None => RunId::new(),
+    };
     let dir = data_dir().join("runs").join(&run.0);
     for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
         std::fs::create_dir_all(dir.join(sub))?;
@@ -87,6 +92,106 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
+    // Identity (design §3.2): launch is registration. wicket issues this instance's identity from
+    // facts it chose, and keeps the instance's key here; the box never sees either.
+    let identity: Option<Arc<wicket_proxy::RunIdentity>> = match &m.agent {
+        None => None,
+        Some(a) => {
+            let issuer = crate::issuer()?;
+            let key = wicket_identity::AgentKey::generate();
+            let now = wicket_store::now();
+            let ttl = m.zone.limits.timeout()?.as_secs() as i64 + 3600;
+            let manifest_sha256 = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+            let node_name = node.as_ref().map(|n| n.target.clone()).unwrap_or_else(|| "local".into());
+            if let Some(p) = &parent_run {
+                let l = ledger.lock().expect("ledger");
+                match l.identity(p)? {
+                    Some(pi) if pi.tenant == m.tenant.0 && l.run_status(p)?.as_deref() == Some("running") => {}
+                    _ => bail!("parent run {p} is not a running agent of this tenant"),
+                }
+            }
+            let jws = issuer.issue(&m.tenant.0, &m.zone.name, &a.name, &run.0, parent_run.as_deref(), &manifest_sha256, image, &node_name, now, ttl, &key.public());
+            let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now)?;
+            {
+                let l = ledger.lock().expect("ledger");
+                l.put_identity(&wicket_store::IdentityRow {
+                    run: run.0.clone(), tenant: m.tenant.0.clone(), spiffe_id: claims.sub.clone(), zone: m.zone.name.clone(), agent: a.name.clone(),
+                    parent_run: parent_run.clone(), accept_from: m.zone.accept_from.clone(), jws: jws.clone(), issued_at: now,
+                })?;
+                l.audit(&m.tenant, Some(&run), "identity.issued", &serde_json::json!({
+                    "id": claims.sub, "parent_run": parent_run, "identity_sha256": wicket_identity::identity_digest(&jws),
+                    "issuer_kid": wicket_identity::key_id(&issuer.verifying_key()), "manifest_sha256": claims.manifest_sha256, "image": image, "node": node_name,
+                }))?;
+            }
+            Some(Arc::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() }))
+        }
+    };
+
+    // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
+    // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
+    let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
+    let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
+        Some(a) if a.max_children > 0 => {
+            let (pm, prun, pdir, kids) = (m.clone(), run.0.clone(), dir.clone(), children.clone());
+            let (img, node_arg, key_arg) = (image.to_string(), node.as_ref().map(|n| n.target.clone()), ssh_key.map(|k| k.to_path_buf()));
+            let max = a.max_children as usize;
+            Some(Arc::new(move |req: wicket_proxy::SpawnRequest| -> Result<String> {
+                let ok_name = !req.agent.is_empty() && req.agent.len() <= 32 && req.agent.starts_with(|c: char| c.is_ascii_lowercase())
+                    && req.agent.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                if !ok_name {
+                    bail!("name must match ^[a-z][a-z0-9-]{{0,31}}$");
+                }
+                let mut kids = kids.lock().expect("children");
+                if kids.len() >= max {
+                    bail!("this agent may start at most {max} children");
+                }
+                let mut cm = pm.clone();
+                cm.task = req.task;
+                if let Some(ca) = cm.agent.as_mut() {
+                    ca.name = req.agent.clone();
+                    ca.max_children = 0; // no grandchildren in the PoC
+                }
+                if let Some(hosts) = &req.reach_hosts {
+                    for h in hosts {
+                        if !pm.zone.reach.iter().any(|r| &r.host == h) {
+                            bail!("{h} is not in this agent's reach; a child's reach can only narrow");
+                        }
+                    }
+                    cm.zone.reach.retain(|r| hosts.contains(&r.host));
+                    cm.zone.inject.retain(|i| hosts.contains(&i.host));
+                }
+                let child = RunId::new();
+                let cdir = pdir.join("children");
+                std::fs::create_dir_all(&cdir)?;
+                let yaml = cdir.join(format!("{}.yaml", child.0));
+                std::fs::write(&yaml, serde_yaml::to_string(&cm)?)?;
+                let log = std::fs::File::create(cdir.join(format!("{}.log", child.0)))?;
+                let mut cmd = std::process::Command::new(std::env::current_exe()?);
+                cmd.args(["run", "--run-id", &child.0, "--parent-run", &prun, "--image", &img]);
+                if let Some(n) = &node_arg {
+                    cmd.args(["--node", n]);
+                }
+                if let Some(k) = &key_arg {
+                    cmd.arg("--ssh-key").arg(k);
+                }
+                cmd.arg(&yaml).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+                let proc = cmd.spawn().context("starting the child agent")?;
+                // The child records its identity before its box starts; wait for it so the parent can
+                // message it straight away.
+                let ledger = crate::ledger_path();
+                for _ in 0..100 {
+                    if Ledger::open(&ledger).ok().and_then(|l| l.identity(&child.0).ok().flatten()).is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                kids.push((child.0.clone(), proc));
+                Ok(child.0)
+            }) as wicket_proxy::Spawner)
+        }
+        _ => None,
+    };
+
     // Who inside the box made a request: read from the agent's event stream (outside the box).
     let tracker = Arc::new(Mutex::new(wicket_agent::attribution::Tracker::default()));
     let attribute: Option<wicket_proxy::Attributor> = if m.program.is_some() {
@@ -98,7 +203,7 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
             Some((serde_json::to_value(&a).ok()?, a.summary()))
         }))
     };
-    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute };
+    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute, identity: identity.clone(), spawner };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let gateway = Gateway::new(ctx.clone());
@@ -177,6 +282,9 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
 
     println!("wicket run {}  tenant {}  zone {}  {} {} ({})", run, m.tenant, m.zone.name, if is_program { "program" } else { "agent" }, workload, workload_kind);
     println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
+    if let Some(i) = &identity {
+        println!("  identity {}{}", i.claims.sub, i.claims.parent_run.as_ref().map(|p| format!("  (child of {p})")).unwrap_or_default());
+    }
     if let Some(n) = &node {
         println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
     }
@@ -268,6 +376,29 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     }
     let outbox = dir.join("workspace/out/result.json");
     let result = std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    // A child reports back to its parent with a signed message, before its run is marked ended.
+    if let (Some(i), Some(p)) = (&identity, &parent_run) {
+        let body = serde_json::json!({ "status": status, "result": result });
+        match ctx.send_message(p, "run_finished", body) {
+            Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
+            Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),
+        }
+    }
+    // A parent's children end with it: interrupt them (each stops its own box), then wait briefly.
+    let kids: Vec<(String, std::process::Child)> = std::mem::take(&mut *children.lock().expect("children"));
+    for (crun, mut proc) in kids {
+        if proc.try_wait().ok().flatten().is_none() {
+            println!("[wicket] stopping child {crun}");
+            let _ = std::process::Command::new("kill").args(["-INT", &proc.id().to_string()]).status();
+            for _ in 0..60 {
+                if proc.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let _ = proc.kill();
+        }
+    }
     let pending: Vec<String> = {
         let l = ledger.lock().expect("ledger");
         l.pending(&m.tenant)?.into_iter().filter(|r| r.run == run.0).map(|r| r.id).collect()

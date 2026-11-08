@@ -106,3 +106,33 @@ The task asked Claude Code (in gVisor, zone `research`, empty reach) to start tw
 
 Not yet covered: the console card was changed but not exercised in a browser in this run, and the
 "used by a different agent" warning is covered only by inspection, not by a test.
+
+## Agent identity and child agents (2026-11-08)
+
+Manifest: agent `lead`, `max_children: 1`, `in_box_subagents: false`, zone `research` with empty reach.
+
+- `lead` started as `spiffe://wicket.local/t/t0/z/research/a/lead`, called `whoami`, then `spawn_agent`
+  ("fetcher"). The child ran as a separate `wicket run` with its own gVisor box, sockets, proxies and identity
+  `spiffe://wicket.local/t/t0/z/research/a/fetcher`, with `parent_run` set.
+- The child's `curl https://example.com/` became pending. `wicket pending` showed
+  `agent: spiffe://wicket.local/t/t0/z/research/a/fetcher [verified], child of lead (run_…)`.
+- Approved with the CLI. The decision record carries the verified identity (agent, zone, parent, image,
+  manifest digest, identity digest). The child retried and got 200.
+- The child sent `{"http_status": 200, "my_identity": …}` to its parent with `send_message`. Its runner then
+  sent a signed `run_finished`. The parent received both through `await_message`, each with
+  `from.id = …/a/fetcher` and `relation: "your child"`, set and verified by wicket, and wrote them to its
+  result.json.
+- Parent 97 s, child 83 s; the parent stopped no children, because the child had already finished.
+- `wicket identity list` verified both identities. `wicket audit --verify` passed: the chain, plus 4 identities
+  and messages verified offline.
+
+Unit tests cover what the live run didn't:
+- tampered and foreign-issuer identity documents;
+- a spoofed envelope (one agent's identity, another agent's key);
+- cross-zone refusal without `accept_from`, and cross-tenant refusal;
+- size limits;
+- a forged envelope planted in the ledger;
+- a genuine envelope replayed to the wrong recipient.
+
+The console's identity display and its approval refusal for unverified identities were not exercised in a
+browser (the page script was syntax-checked only).

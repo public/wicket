@@ -14,6 +14,9 @@
   header span { color:var(--quiet); font-size:13px; }
   main { max-width:760px; margin:0 auto; padding:12px 16px 40px; }
   h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--quiet); margin:22px 0 8px; }
+  .agent { margin:6px 0 2px; font-size:15px; } .agent .ok { color:var(--good); font-weight:700; } .agent .bad { color:var(--bad); font-weight:600; }
+  .agent .idline { color:var(--quiet); font-family:ui-monospace,Menlo,monospace; font-size:11px; word-break:break-all; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
   .who { margin:6px 0; font-size:14px; } .who .cand { margin-left:10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
   .who .note { color:var(--quiet); font-size:12px; margin-top:2px; } .who .warn { color:var(--warn); font-size:13px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:8px 0; }
@@ -100,11 +103,28 @@ async function act(kind, body) {
   try {
     const begin = await post("/api/decide/begin", { ...body, decision: kind });
     const d = begin.decision;
-    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path + ((d.requested_by || []).length ? " for " + d.requested_by.join(", ") : ""));
+    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path + (d.agent ? " for agent " + d.agent : "") + ((d.requested_by || []).length ? " (" + d.requested_by.join(", ") + ")" : ""));
     const j = await post("/api/decide/finish", await assertWith(begin.publicKey));
     toast(j.ok);
   } catch (e) { toast(e.message); }
   refresh();
+}
+
+// The requesting agent's identity, verified by the console against wicket's issuer. Approve is
+// disabled when an agent's identity does not verify: you can't approve without knowing who for.
+function renderAgent(c, id) {
+  const w = el("div", "agent");
+  if (id.verified) {
+    w.append(el("span", "ok", "✓ "), el("b", "", strip(id.agent)), document.createTextNode(" · zone " + strip(id.zone)));
+    if (id.parent_run) w.append(document.createTextNode(" · child of " + strip(id.parent_agent || "?")));
+    w.append(el("div", "idline", strip(id.id)));
+    c.append(w); return true;
+  }
+  if ((id.error || "").startsWith("no identity was issued")) {
+    w.append(el("div", "", "Program run (no agent identity)")); c.append(w); return true;
+  }
+  w.append(el("div", "bad", "Agent identity NOT verified: " + strip(id.error || "unknown") + ". Approval is disabled."));
+  c.append(w); return false;
 }
 
 // Who in the box asked, from the agent's own event stream: helpful, not proof.
@@ -132,12 +152,14 @@ function renderPending(s) {
     const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
     c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path)));
     c.append(el("div", "why", strip(p.reason)));
+    const idOk = renderAgent(c, p.identity || {});
     c.append(renderWho(p.attribution || []));
     c.append(el("div", "meta", p.id + " · zone " + p.zone + " · " + p.run + " · " + ago(s.now, p.created_at)));
     const b = el("div", "buttons");
     const once = el("button", "approve", "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
     const hour = el("button", "", "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
     const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
+    if (!idOk) { once.disabled = true; hour.disabled = true; }
     if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") b.append(once, deny); else b.append(once, hour, deny);
     c.append(b); box.append(c);
   }
