@@ -1,0 +1,16 @@
+# End-to-end test without an API key: a scripted mock model drives Claude Code.
+task: |
+  Read the octocat/Hello-World repository on GitHub and write a summary to /workspace/out/result.json.
+agent:
+  name: summariser
+  max_turns: 4
+zone:
+  name: research
+  isolation: gvisor
+  reach:
+    - { host: api.github.com, paths: ["/repos/octocat/Hello-World", "/repos/octocat/Hello-World/**"] }
+    - { host: github.com, methods: [GET, POST], paths: ["/octocat/Hello-World/info/refs", "/octocat/Hello-World/git-upload-pack"] }
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:9999
+  limits: { memory: 2g, cpus: 1, timeout: 5m }

@@ -1,0 +1,302 @@
+//! `wicket run`: one agent, one zone, one sandbox.
+
+use crate::node::Node;
+use crate::{data_dir, ledger_path};
+use anyhow::{bail, Context, Result};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use wicket_core::{Manifest, RunId};
+use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_sandbox::{Docker, Mount, SandboxSpec};
+use wicket_store::Ledger;
+
+pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node: Option<&str>, ssh_key: Option<&Path>) -> Result<()> {
+    let text = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+    let m = Manifest::from_yaml(&text)?;
+    let vault = Vault::new(Vault::default_dir());
+    if let Some(llm) = &m.zone.llm {
+        vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
+    }
+    // A program runs only the source it was approved as (its digest), copied into the box.
+    let program_src = match &m.program {
+        Some(p) => {
+            let base = manifest_path.parent().unwrap_or(Path::new("."));
+            let src = p.source.as_ref().map(|s| base.join(s));
+            let digest = match &src {
+                Some(s) => Some(crate::program::digest_dir(s)?),
+                None => None,
+            };
+            match (&p.digest, &digest) {
+                (Some(want), Some(got)) if want != got => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
+                (Some(_), None) => bail!("program {} pins a digest but has no source", p.name),
+                (None, Some(got)) => println!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
+                _ => {}
+            }
+            src.map(|s| (s, digest.unwrap_or_default()))
+        }
+        None => None,
+    };
+    let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or_else(|| image.to_string());
+    let image = image.as_str();
+    let (workload, workload_kind) = match (&m.agent, &m.program) {
+        (Some(a), _) => (a.name.clone(), a.kind.clone()),
+        (_, Some(p)) => (p.name.clone(), "program".to_string()),
+        _ => unreachable!("validated"),
+    };
+    for i in &m.zone.inject {
+        vault.get(&i.secret).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host))?;
+    }
+    let node = node.map(|n| Node::new(n, ssh_key));
+    let docker = match &node {
+        Some(n) => Docker::over_ssh(n.ssh_prefix()),
+        None => Docker::from_env(),
+    };
+    if !docker.image_exists(image).await? {
+        bail!("image {image} not found{} (run: wicket image)", node.as_ref().map(|n| format!(" on {}", n.target)).unwrap_or_default());
+    }
+
+    let run = RunId::new();
+    let dir = data_dir().join("runs").join(&run.0);
+    for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    for w in workdir.into_iter().chain(program_src.as_ref().map(|(s, _)| s.as_path())) {
+        let st = std::process::Command::new("cp").arg("-a").arg(format!("{}/.", w.display())).arg(dir.join("workspace")).status()?;
+        if !st.success() {
+            bail!("copying {} failed", w.display());
+        }
+    }
+
+    let ledger = Arc::new(Mutex::new(Ledger::open(&ledger_path())?));
+    {
+        let l = ledger.lock().expect("ledger");
+        l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
+        l.audit(&m.tenant, Some(&run), "run.start", &serde_json::json!({
+            "zone": m.zone.name, "agent": workload, "kind": workload_kind, "isolation": m.zone.isolation, "image": image,
+            "reach": m.zone.reach.len(), "task": m.task,
+            "program_digest": program_src.as_ref().map(|(_, d)| d.clone()),
+            "program_pinned": m.program.as_ref().map(|p| p.digest.is_some()),
+        }))?;
+    }
+
+    // Enforcement points, on unix sockets that only this box gets.
+    let ca = Arc::new(RunCa::generate(&run.0)?);
+    std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
+    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate };
+    let egress = Egress::new(ctx.clone(), ca.clone())?;
+    let llm = Llm::new(ctx.clone())?;
+    let gateway = Gateway::new(ctx.clone());
+    let (es, ls, gs) = (dir.join("sock/egress.sock"), dir.join("sock/llm.sock"), dir.join("sock/gateway.sock"));
+    let g_task = tokio::spawn({
+        let gs = gs.clone();
+        async move { gateway.serve(&gs).await }
+    });
+    let e_task = tokio::spawn({
+        let es = es.clone();
+        async move { egress.serve(&es).await }
+    });
+    let l_task = tokio::spawn({
+        let llm = llm.clone();
+        let ls = ls.clone();
+        async move { llm.serve(&ls).await }
+    });
+    for _ in 0..50 {
+        if es.exists() && ls.exists() && gs.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let is_program = m.program.is_some();
+    let plan = match wicket_agent::program_plan(&m, &run) {
+        Some(p) => p,
+        None => wicket_agent::claude_code_plan(&m, &run),
+    };
+    // Where the box's directories live: here, or on the remote node (which gets no secrets: only
+    // the CA's public certificate, the workspace, and the two forwarded sockets).
+    let (box_root, user, _forward) = match &node {
+        None => {
+            let uid = std::process::Command::new("id").arg("-u").output()?;
+            let gid = std::process::Command::new("id").arg("-g").output()?;
+            (dir.clone(), format!("{}:{}", String::from_utf8_lossy(&uid.stdout).trim(), String::from_utf8_lossy(&gid.stdout).trim()), None)
+        }
+        Some(n) => {
+            let home = n.sh("echo $HOME").await?;
+            let rd = format!("{home}/wicket-runs/{}", run.0);
+            n.sh(&format!("umask 077; mkdir -p {rd}/sock {rd}/ca {rd}/state/home {rd}/state/claude {rd}/workspace/out")).await?;
+            n.put(&format!("{rd}/ca/ca.pem"), ca.cert_pem().as_bytes()).await?;
+            if let Some(w) = workdir {
+                n.put_dir(w, &format!("{rd}/workspace")).await?;
+            }
+            let fwd = n
+                .forward(&[
+                    (format!("{rd}/sock/egress.sock"), es.as_path()),
+                    (format!("{rd}/sock/llm.sock"), ls.as_path()),
+                    (format!("{rd}/sock/gateway.sock"), gs.as_path()),
+                ])
+                .await?;
+            let user = n.sh("echo $(id -u):$(id -g)").await?;
+            (std::path::PathBuf::from(rd), user, Some(fwd))
+        }
+    };
+    let name = format!("wicket-{}", run.0.replace('_', "-"));
+    let spec = SandboxSpec {
+        name: name.clone(),
+        image: image.to_string(),
+        isolation: m.zone.isolation,
+        mounts: vec![
+            Mount { host: box_root.join("sock"), target: wicket_agent::SOCK_DIR.into(), read_only: false },
+            Mount { host: box_root.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
+            Mount { host: box_root.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
+            Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false },
+        ],
+        env: plan.env,
+        argv: plan.argv,
+        memory: m.zone.limits.memory.clone(),
+        cpus: m.zone.limits.cpus,
+        pids: m.zone.limits.pids,
+        user,
+        workdir: wicket_agent::WORKSPACE.into(),
+    };
+
+    println!("wicket run {}  tenant {}  zone {}  {} {} ({})", run, m.tenant, m.zone.name, if is_program { "program" } else { "agent" }, workload, workload_kind);
+    println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
+    if let Some(n) = &node {
+        println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
+    }
+    println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
+    println!("  run dir {}", dir.display());
+    let started = std::time::Instant::now();
+    let mut child = docker.spawn(&spec)?;
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut lines = BufReader::new(stdout).lines();
+    let log_path = dir.join("agent.stderr.log");
+    let err_task = tokio::spawn(async move {
+        let mut out = String::new();
+        let mut l = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = l.next_line().await {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        let _ = std::fs::write(log_path, &out);
+        out
+    });
+    let transcript = dir.join("transcript.jsonl");
+    let mut transcript_f = std::fs::File::create(&transcript)?;
+    let timeout = m.zone.limits.timeout()?;
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut status = "unknown".to_string();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line? {
+                Some(l) => {
+                    use std::io::Write;
+                    let _ = writeln!(transcript_f, "{l}");
+                    if is_program {
+                        println!("[program] {}", wicket_agent::clip(&l, 300));
+                    } else if let Some(r) = wicket_agent::render_event(&l) {
+                        println!("{r}");
+                    }
+                }
+                None => break,
+            },
+            Some(ev) = rx.recv() => print_event(&ev),
+            _ = &mut deadline => {
+                println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
+                docker.kill(&name).await?;
+                status = "timeout".into();
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("[wicket] interrupted; stopping the box");
+                docker.kill(&name).await?;
+                status = "interrupted".into();
+            }
+        }
+    }
+    let exit = child.wait().await?;
+    while let Ok(ev) = rx.try_recv() {
+        print_event(&ev);
+    }
+    let stderr_text = err_task.await.unwrap_or_default();
+    if status == "unknown" {
+        status = if exit.success() { "succeeded".into() } else { format!("failed ({exit})") };
+    }
+    if !exit.success() && !stderr_text.trim().is_empty() {
+        println!("[wicket] agent stderr (last lines):");
+        for l in stderr_text.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+            println!("    {}", wicket_agent::clip(l, 300));
+        }
+    }
+    e_task.abort();
+    l_task.abort();
+    g_task.abort();
+
+    // Typed output: the outbox, parsed and size-limited outside the box.
+    if let Some(n) = &node {
+        let rd = box_root.display().to_string();
+        if let Ok(s) = n.sh(&format!("head -c 65537 {rd}/workspace/out/result.json 2>/dev/null || true")).await {
+            let _ = std::fs::write(dir.join("workspace/out/result.json"), s);
+        }
+        let _ = n.sh(&format!("rm -rf {rd}")).await;
+    }
+    let outbox = dir.join("workspace/out/result.json");
+    let result = std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let pending: Vec<String> = {
+        let l = ledger.lock().expect("ledger");
+        l.pending(&m.tenant)?.into_iter().filter(|r| r.run == run.0).map(|r| r.id).collect()
+    };
+    // Pending requests are withdrawn by run_ended below; report them first.
+    let summary = serde_json::json!({
+        "status": status, "seconds": started.elapsed().as_secs(),
+        "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
+        "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "output_tokens": llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "pending_requests": pending, "result": result,
+    });
+    {
+        let l = ledger.lock().expect("ledger");
+        let _ = l.run_ended(&run, &status, &summary.to_string())?;
+        l.audit(&m.tenant, Some(&run), "run.end", &summary)?;
+    }
+    println!("\n[wicket] run {run}: {status} in {}s; {} model requests, {} in / {} out tokens",
+        summary["seconds"], summary["model_requests"], summary["input_tokens"], summary["output_tokens"]);
+    match &result {
+        Some(r) => println!("[wicket] result.json: {}", wicket_agent::clip(&r.to_string(), 1200)),
+        None => println!("[wicket] no valid result.json in the outbox"),
+    }
+    if !pending.is_empty() {
+        println!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
+    }
+    println!("[wicket] transcript {}", transcript.display());
+    Ok(())
+}
+
+fn print_event(ev: &Event) {
+    match ev {
+        Event::Egress { method, host, path, risk, outcome, detail } => {
+            let tag = match outcome.as_str() {
+                "allow" => "ALLOW  ",
+                "pending" => "PENDING",
+                "denied" => "DENIED ",
+                _ => "BLOCKED",
+            };
+            println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));
+            if outcome == "pending" {
+                if let Some(id) = detail.split(|c: char| c == ' ' || c == ':').next() {
+                    println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
+                }
+            }
+        }
+        Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
+        Event::Llm { model, status, input_tokens, output_tokens, requests, outcome } => {
+            println!("[llm]    #{requests} {} → {status}  in {input_tokens} / out {output_tokens}  ({outcome})", model.as_deref().unwrap_or("?"));
+        }
+    }
+}

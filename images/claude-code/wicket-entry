@@ -1,0 +1,26 @@
+#!/bin/bash
+# wicket in-box entrypoint. The box has no network interface except loopback; this exposes the
+# bind-mounted unix sockets of wicket's proxies on 127.0.0.1 for proxy-aware tools, then runs the
+# agent. Everything here is advisory: enforcement happens outside the box.
+set -eu
+
+SOCK=/wicket/sock
+socat TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/egress.sock &
+socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/llm.sock &
+socat TCP-LISTEN:8081,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/gateway.sock &
+
+# Trust the run's CA (public certificate only) alongside the system roots.
+cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-bundle.pem
+export SSL_CERT_FILE=/tmp/ca-bundle.pem CURL_CA_BUNDLE=/tmp/ca-bundle.pem GIT_SSL_CAINFO=/tmp/ca-bundle.pem \
+       REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem
+
+mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" /workspace/out
+
+# Wait (briefly) for the forwarders to listen.
+i=0
+while [ $i -lt 50 ]; do
+  if (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null; then break; fi
+  i=$((i + 1)); sleep 0.1
+done
+
+exec "$@"

@@ -1,0 +1,16 @@
+[package]
+name = "wicket-store"
+description = "wicket ledger: escalation requests, grants with use counts and expiry, runs, and a hash-chained audit log (SQLite)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,46 @@
+agentgateway|d327d10bc92b|2026-11-06|LICENSE|Apache License                            Version 2.0, Janua
+agent-router|d41f08217b8d|2026-11-06|LICENSE|                                 Apache License             
+agent-scan|99d404778f6f|2026-11-06|LICENSE|                                 Apache License             
+agent-vault|16ec8d5a5db3|2026-11-06|LICENSE|Copyright (c) 2022 Infisical Inc.  Portions of this software
+arcade-mcp|9fb03000e7f8|2026-11-06|LICENSE|MIT License  Copyright (c) 2025, Arcade AI 
+bifrost|6e640279b363|2026-11-07|LICENSE|Apache License                            Version 2.0, Janua
+biscuit-rust|21e650f31a85|2026-10-29||
+cedar|5af7b8cd78e4|2026-11-06|LICENSE|                                  Apache License            
+cedar-spec|a4c5a89cd156|2026-11-06|LICENSE|                                  Apache License            
+chaperone|fb311dd0b8a3|2026-10-13|LICENSE|                                 Apache License             
+codex-network-proxy|748ab55ca7de|2026-11-08|LICENSE|                                 Apache License             
+docker-mcp-gateway|7e0f34277c91|2026-10-26|LICENSE|MIT License  Copyright (c) 2025 Docker 
+fastmcp|936a9659d871|2026-11-06|LICENSE|                                 Apache License             
+gh-aw-firewall|f040e76584da|2026-11-07|LICENSE|MIT License  Copyright (c) 2025 GitHub Next 
+github-mcp-server|99d6d6503a7b|2026-11-04|LICENSE|MIT License  Copyright (c) 2025 GitHub 
+hudsucker|7b7baf3c528f|2026-08-25|LICENSE-APACHE|Apache License                            Version 2.0, Janua
+iam-dataset|edf8511acb5e|2026-11-07|LICENSE|MIT License  Copyright (c) 2021 Ian Mckay 
+invariant|2340fe2d9cd6|2026-01-12|LICENSE|                                 Apache License             
+invariant-gateway|9baeade022cc|2025-11-06|LICENSE|                                 Apache License             
+iron-proxy|3d96ce8dd2ca|2026-11-04|LICENSE|                                 Apache License             
+kong|21032122ab80|2026-10-19|LICENSE|                                  Apache License            
+lasso-mcp-gateway|7e7f1f6e5314|2026-01-22|LICENSE|MIT License  Copyright (c) 2024 Lasso Security, Inc 
+macaroon-rs|ba1c81c8fa61|2022-10-13|LICENSE|MIT License  Copyright (c) 2020 Jack Lund, macaroon-rs Contr
+mcp-context-forge|7d34038ca1f2|2026-11-06|LICENSE|                                 Apache License             
+ms-mcp-gateway|cf9f5e9eff89|2026-11-04|LICENSE|MIT License  Copyright (c) 2025 Microsoft 
+nemo-guardrails|537fd7742982|2026-11-06|LICENCES-3rd-party|Chatbot-UI  MIT License 
+onecli|afb4a19cc378|2026-11-05|LICENSE|                                 Apache License             
+openapi-mcp-generator|835374e1dea8|2026-10-24|LICENSE|MIT License  Copyright (c) 2025 harsha-iiiv 
+pingora|1adcb3815b70|2026-10-30|LICENSE|                                  Apache License            
+policy-sentry|5a4ec2561787|2026-10-08|LICENSE|Copyright 2019 Salesforce.com  Permission is hereby granted,
+pomerium|a04c468238de|2026-11-06|LICENSE|                                 Apache License             
+purplellama|f64eebd53003|2026-10-30|LICENSE|LLAMA 3.2 COMMUNITY LICENSE AGREEMENT  Llama 3.2 Version Rel
+rama|3872267a9afc|2026-11-08|LICENSE-APACHE|                              Apache License                
+regorus|9c2d5db76a87|2026-11-06|LICENSE|    MIT License      Copyright (c) Microsoft Corporation. 
+rmcp|5596a8a0bba2|2026-11-05|LICENSE|The MCP project is undergoing a licensing transition from th
+rs-ucan|59ff9b9c8479|2026-03-29|LICENSE|                                 Apache License             
+smokescreen|5b4b7aabca9b|2026-11-03|LICENSE.txt|Copyright (c) 2016 Stripe  MIT License 
+superfly-macaroon|7413ea9ac684|2026-11-06|LICENSE|                                  Apache License            
+superfly-tokenizer|0f51c9d780d0|2026-10-29|LICENSE|                                  Apache License            
+teleport|1283425b60ec|2026-08-25|LICENSE|                    GNU AFFERO GENERAL PUBLIC LICENSE       
+toolhive|42cd9b7e497b|2026-11-07|LICENSE|                                 Apache License             
+tracekit|d5916e92e387|2026-11-07|LICENSE|MIT License  Copyright (c) 2026 Cygnux Labs 
+tsidp|43c68a646380|2026-11-07|LICENSE|BSD 3-Clause License  Copyright (c) 2025 Tailscale Inc & AUT
+agent-threat-rules|5759a0f00612|2026-11-08|LICENSE|MIT
+cisco-mcp-scanner|9ff8fc84b792|2026-11-05|LICENSE|Apache-2.0
+flywheel-connectors|EXCLUDED (licence rider withholds all rights from Anthropic incl. analysis); clone deleted
