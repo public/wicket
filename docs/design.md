@@ -537,9 +537,9 @@ their own credentials. So:
   inner agents never get the owner's Claude subscription. They use their own vendors' terms, or models the
   owner holds API access to elsewhere (not an Anthropic API key, by the owner's rule).
 - **Single-owner mode** is the owner running their own Claude Code on their own hosts with their own
-  subscription, at individual scale. That is the case the PoC covers. The vault holding the token and the
-  proxy injecting it is a grey area against the "store or intermediate" sentence; keep it to the owner's own
-  use, keep usage ordinary, and revisit if Anthropic's guidance changes.
+  subscription, at individual scale. That is the case the PoC covers, and it is ordinary use of Claude Code
+  (owner, 2026-11-08: "It's just Claude code"): the client is the unmodified binary, and the proxy only keeps
+  the token out of the box. Keep it to the owner's own use.
 - **Platform mode (§15) never brokers subscription credentials.** Each end user signs in to Claude Code
   through Anthropic's own flow, or the tenant brings an API key or cloud-provider credential billed to
   itself. wicket doesn't pay for, resell or intermediate Claude usage. Centaur's token broker [16 §3-2] is
