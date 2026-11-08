@@ -28,8 +28,9 @@ pub struct RunCtx {
     /// Who inside the box is making a request to (host, path), as reported by the agent's event
     /// stream: the attribution as JSON, plus a one-line summary. Untrusted; for humans only.
     pub attribute: Option<Attributor>,
-    /// This agent instance's wicket-issued identity (design §3.2). None for programs.
-    pub identity: Option<Arc<RunIdentity>>,
+    /// This agent instance's wicket-issued identity (design §3.2), rotated while it runs. None for
+    /// programs.
+    pub identity: Option<Arc<IdentityCell>>,
     /// Starts a child agent in its own sandbox; None when the agent may not spawn.
     pub spawner: Option<Spawner>,
 }
@@ -42,6 +43,22 @@ pub struct RunIdentity {
     pub key: wicket_identity::AgentKey,
     /// The installation issuer's public key, for verifying other agents' envelopes.
     pub issuer: wicket_identity::VerifyingKey,
+}
+
+/// The current identity of a run. The runner swaps in a fresh document and key every few minutes;
+/// readers always take the latest.
+pub struct IdentityCell(std::sync::RwLock<Arc<RunIdentity>>);
+
+impl IdentityCell {
+    pub fn new(i: RunIdentity) -> IdentityCell {
+        IdentityCell(std::sync::RwLock::new(Arc::new(i)))
+    }
+    pub fn current(&self) -> Arc<RunIdentity> {
+        self.0.read().expect("identity").clone()
+    }
+    pub fn replace(&self, i: RunIdentity) {
+        *self.0.write().expect("identity") = Arc::new(i);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,12 +112,19 @@ impl RunCtx {
     /// run's identity, set by wicket; the agent can't choose it. Allowed between parent and child,
     /// or when the recipient's zone lists this zone in `accept_from`, within one tenant.
     pub fn send_message(&self, to_run: &str, kind: &str, body: serde_json::Value) -> std::result::Result<String, String> {
-        let me = self.identity.as_ref().ok_or("this run has no wicket identity")?;
+        let me = self.identity.as_ref().ok_or("this run has no wicket identity")?.current();
+        let now = wicket_store::now();
+        if me.claims.exp <= now {
+            return Err("this agent's identity has expired and was not refreshed; it can't send".into());
+        }
         let size = body.to_string().len();
         if size > MAX_MESSAGE_BYTES {
             return Err(format!("message body is {size} bytes; the limit is {MAX_MESSAGE_BYTES}"));
         }
         let l = self.ledger.lock().map_err(|_| "ledger lock")?;
+        if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
+            return Err(format!("this agent's identity was revoked (revoked: {r})"));
+        }
         let rec = match l.identity(to_run).map_err(|e| e.to_string())? {
             Some(r) if r.tenant == self.tenant.0 => r,
             _ => return Err(format!("no agent {to_run}")),
@@ -119,7 +143,7 @@ impl RunCtx {
         };
         let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
         let payload = serde_json::json!({
-            "jti": id, "iat": wicket_store::now(), "kind": kind,
+            "jti": id, "iat": now, "kind": kind,
             "to": rec.spiffe_id, "to_run": to_run, "body": body,
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);

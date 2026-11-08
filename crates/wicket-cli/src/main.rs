@@ -35,6 +35,13 @@ enum IdentityCmd {
     Show { run: String },
     /// List every agent identity issued, verified.
     List,
+    /// Revoke a run's identity at once (e.g. if its environment may be compromised): its box is
+    /// stopped, its messages are no longer delivered, and its requests can't be approved.
+    Revoke {
+        run: String,
+        #[arg(long, default_value = "revoked by the operator")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -219,10 +226,16 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
     };
     match check() {
         Ok(c) => {
+            if let Ok(Some((r, when, by, reason))) = l.revoked_in_chain(run) {
+                let whose = if r == run { "identity".to_string() } else { format!("identity of its ancestor {r}") };
+                return serde_json::json!({ "verified": false, "revoked": true, "run": run, "agent": c.agent, "zone": c.zone,
+                    "error": format!("{whose} revoked by {by} at {when}: {reason}") });
+            }
             let parent_agent = c.parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|p| p.agent);
             serde_json::json!({
                 "verified": true, "id": c.sub, "agent": c.agent, "zone": c.zone, "tenant": c.tenant, "run": c.run,
                 "parent_run": c.parent_run, "parent_agent": parent_agent, "node": c.node, "image": c.image,
+                "principal": c.principal, "acting_for": c.chain(), "expires_at": c.exp,
                 "manifest_sha256": c.manifest_sha256, "identity_sha256": wicket_identity::identity_digest(&row.jws),
             })
         }
@@ -234,8 +247,8 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
 pub fn identity_line(v: &serde_json::Value) -> String {
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
     if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
-        let parent = v.get("parent_run").and_then(|p| p.as_str()).map(|p| format!(", child of {} ({p})", v.get("parent_agent").and_then(|a| a.as_str()).unwrap_or("?"))).unwrap_or_default();
-        format!("{} [verified]{parent}", g("id"))
+        let chain = v.get("acting_for").and_then(|c| c.as_array()).map(|c| c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" → ")).unwrap_or_default();
+        format!("{} [verified]  acting for: {chain}", g("id"))
     } else {
         format!("NOT VERIFIED: {}", g("error"))
     }
@@ -248,6 +261,13 @@ pub fn issuer_key_path() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join(".config/wicket/identity/issuer.key")
+}
+
+/// The principal behind a run started from this CLI: the local unix user. That is all the PoC CLI
+/// knows; runs started from the console would carry the passkey-authenticated operator instead.
+pub fn cli_principal() -> serde_json::Value {
+    let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
+    serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
 }
 
 pub fn trust_domain() -> String {
@@ -321,6 +341,14 @@ async fn main() -> Result<()> {
             match cmd {
                 IdentityCmd::Issuer => println!("{}", serde_json::to_string_pretty(&issuer()?.public_jwk())?),
                 IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
+                IdentityCmd::Revoke { run, reason } => {
+                    if l.identity(&run)?.is_none() {
+                        bail!("no identity was issued for {run}");
+                    }
+                    let fresh = l.revoke(&run, &operator(), &reason)?;
+                    l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "identity.revoked", &serde_json::json!({ "run": run, "by": operator(), "reason": reason }))?;
+                    println!("{} {run}: its runner stops the box within seconds; its messages and approvals are refused", if fresh { "revoked" } else { "already revoked" });
+                }
                 IdentityCmd::List => {
                     for row in l.identities()? {
                         let status = l.run_status(&row.run)?.unwrap_or_default();
@@ -414,22 +442,30 @@ async fn main() -> Result<()> {
 /// Verifies every issued identity (at its issue time) and every stored envelope (at its send time).
 fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize)> {
     let (mut ok, mut bad) = (0, 0);
+    let key = issuer()?.verifying_key();
+    // Every document ever issued, rotations included, each at its own issue time (plus current
+    // documents from ledgers that predate the history table).
+    let mut docs = l.identity_history()?;
     for row in l.identities()? {
-        let v = verified_identity(l, &row.run, None);
-        if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
-            ok += 1;
-        } else {
-            println!("  identity of {}: FAILED: {}", row.run, v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
-            bad += 1;
+        if !docs.iter().any(|(_, j, _)| j == &row.jws) {
+            docs.push((row.run.clone(), row.jws.clone(), row.issued_at));
         }
     }
-    let key = issuer()?.verifying_key();
-    for (id, env) in l.envelopes()? {
-        // Check at the time the envelope says it was sent (identities expire after their run).
-        let at = env.split('.').nth(1).and_then(|p| {
-            use base64::Engine;
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok()
-        }).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v.get("iat").and_then(|t| t.as_i64())).unwrap_or(0);
+    for (run, jws, at) in docs {
+        match wicket_identity::verify_identity(&jws, &key, at) {
+            Ok(c) if c.run == run => ok += 1,
+            Ok(_) => {
+                println!("  identity of {run} issued at {at}: FAILED: names another run");
+                bad += 1;
+            }
+            Err(e) => {
+                println!("  identity of {run} issued at {at}: FAILED: {e}");
+                bad += 1;
+            }
+        }
+    }
+    for (id, env, at) in l.envelopes()? {
+        // Each message at the time wicket recorded it: the sender's identity must have been valid then.
         match wicket_identity::verify_envelope(&env, &key, at) {
             Ok((_, p)) if p.get("jti").and_then(|j| j.as_str()) == Some(id.as_str()) => ok += 1,
             Ok(_) => {

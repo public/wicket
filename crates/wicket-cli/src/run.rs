@@ -13,6 +13,12 @@ use wicket_sandbox::{Docker, Mount, SandboxSpec};
 use sha2::Digest;
 use wicket_store::Ledger;
 
+/// How long an agent identity is valid (seconds). Re-issued at half-life. WICKET_IDENTITY_TTL
+/// overrides the 10-minute default (minimum 20 s, for tests).
+fn identity_ttl() -> i64 {
+    std::env::var("WICKET_IDENTITY_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(600).max(20)
+}
+
 pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node: Option<&str>, ssh_key: Option<&Path>, run_id: Option<String>, parent_run: Option<String>) -> Result<()> {
     let text = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
     let m = Manifest::from_yaml(&text)?;
@@ -94,23 +100,42 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
     // Identity (design §3.2): launch is registration. wicket issues this instance's identity from
     // facts it chose, and keeps the instance's key here; the box never sees either.
-    let identity: Option<Arc<wicket_proxy::RunIdentity>> = match &m.agent {
+    // Identities are short-lived (identity_ttl) and re-issued with a fresh key at half-life while the
+    // run lives, so a leaked key or document is useful for minutes, not for the run.
+    let identity_ttl = identity_ttl();
+    let mut id_spec: Option<wicket_identity::IdentitySpec> = None;
+    let identity: Option<Arc<wicket_proxy::IdentityCell>> = match &m.agent {
         None => None,
         Some(a) => {
             let issuer = crate::issuer()?;
             let key = wicket_identity::AgentKey::generate();
             let now = wicket_store::now();
-            let ttl = m.zone.limits.timeout()?.as_secs() as i64 + 3600;
+            let ttl = identity_ttl;
             let manifest_sha256 = hex::encode(sha2::Sha256::digest(text.as_bytes()));
             let node_name = node.as_ref().map(|n| n.target.clone()).unwrap_or_else(|| "local".into());
-            if let Some(p) = &parent_run {
-                let l = ledger.lock().expect("ledger");
-                match l.identity(p)? {
-                    Some(pi) if pi.tenant == m.tenant.0 && l.run_status(p)?.as_deref() == Some("running") => {}
-                    _ => bail!("parent run {p} is not a running agent of this tenant"),
+            // Who this agent acts for. A root run: the human who started it, and how wicket knows
+            // (the PoC CLI knows only the local unix user). A child: its parent's principal, with the
+            // parent prepended to the delegation chain, read from the parent's verified identity
+            // (not from anything the parent agent said).
+            let (principal, act) = match &parent_run {
+                Some(p) => {
+                    let l = ledger.lock().expect("ledger");
+                    let pc = match l.identity(p)? {
+                        Some(pi) if pi.tenant == m.tenant.0 && l.run_status(p)?.as_deref() == Some("running") && l.revoked_in_chain(p)?.is_none() => {
+                            wicket_identity::verify_identity(&pi.jws, &issuer.verifying_key(), now).with_context(|| format!("parent {p}'s identity"))?
+                        }
+                        _ => bail!("parent run {p} is not a running, unrevoked agent of this tenant"),
+                    };
+                    (pc.principal.clone(), Some(pc.act_for_child()))
                 }
-            }
-            let jws = issuer.issue(&m.tenant.0, &m.zone.name, &a.name, &run.0, parent_run.as_deref(), &manifest_sha256, image, &node_name, now, ttl, &key.public());
+                None => (crate::cli_principal(), None),
+            };
+            let spec = wicket_identity::IdentitySpec {
+                tenant: m.tenant.0.clone(), zone: m.zone.name.clone(), agent: a.name.clone(), run: run.0.clone(), parent_run: parent_run.clone(),
+                manifest_sha256: manifest_sha256.clone(), image: image.to_string(), node: node_name.clone(), principal, act,
+            };
+            let jws = issuer.issue(&spec, now, ttl, &key.public());
+            id_spec = Some(spec);
             let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now)?;
             {
                 let l = ledger.lock().expect("ledger");
@@ -121,9 +146,10 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
                 l.audit(&m.tenant, Some(&run), "identity.issued", &serde_json::json!({
                     "id": claims.sub, "parent_run": parent_run, "identity_sha256": wicket_identity::identity_digest(&jws),
                     "issuer_kid": wicket_identity::key_id(&issuer.verifying_key()), "manifest_sha256": claims.manifest_sha256, "image": image, "node": node_name,
+                    "acting_for": claims.chain(), "expires_at": claims.exp,
                 }))?;
             }
-            Some(Arc::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() }))
+            Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))
         }
     };
 
@@ -283,7 +309,9 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     println!("wicket run {}  tenant {}  zone {}  {} {} ({})", run, m.tenant, m.zone.name, if is_program { "program" } else { "agent" }, workload, workload_kind);
     println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
     if let Some(i) = &identity {
-        println!("  identity {}{}", i.claims.sub, i.claims.parent_run.as_ref().map(|p| format!("  (child of {p})")).unwrap_or_default());
+        let c = i.current().claims.clone();
+        println!("  identity {}  (valid {}s, re-issued every {}s)", c.sub, identity_ttl, identity_ttl / 2);
+        println!("  acting for {}", c.chain().join(" → "));
     }
     if let Some(n) = &node {
         println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
@@ -292,6 +320,49 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
     let mut child = docker.spawn(&spec)?;
+    // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rotate_task = match (&identity, id_spec) {
+        (Some(cell), Some(spec)) => {
+            let (cell, ledger, docker, name, revoked) = (cell.clone(), ledger.clone(), docker.clone(), name.clone(), revoked.clone());
+            let tenant = m.tenant.clone();
+            let run2 = run.clone();
+            Some(tokio::spawn(async move {
+                let issuer = match crate::issuer() {
+                    Ok(i) => i,
+                    Err(e) => return eprintln!("[wicket] identity refresh disabled: {e}"),
+                };
+                let mut next = wicket_store::now() + identity_ttl / 2;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let rv = ledger.lock().ok().and_then(|l| l.revoked_in_chain(&run2.0).ok().flatten());
+                    if let Some((r, _, by, reason)) = rv {
+                        let whose = if r == run2.0 { "this agent's".to_string() } else { format!("ancestor {r}'s") };
+                        println!("[wicket] {whose} identity was revoked by {by} ({reason}); stopping the box");
+                        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = docker.kill(&name).await;
+                        return;
+                    }
+                    let now = wicket_store::now();
+                    if now < next {
+                        continue;
+                    }
+                    let key = wicket_identity::AgentKey::generate();
+                    let jws = issuer.issue(&spec, now, identity_ttl, &key.public());
+                    let Ok(claims) = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now) else { continue };
+                    if let Ok(l) = ledger.lock() {
+                        let _ = l.rotate_identity(&run2.0, &jws, now, claims.exp);
+                        let _ = l.audit(&tenant, Some(&run2), "identity.rotated", &serde_json::json!({
+                            "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp,
+                        }));
+                    }
+                    cell.replace(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() });
+                    next = now + identity_ttl / 2;
+                }
+            }))
+        }
+        _ => None,
+    };
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
     let mut lines = BufReader::new(stdout).lines();
@@ -353,6 +424,12 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
         print_event(&ev);
     }
     let stderr_text = err_task.await.unwrap_or_default();
+    if let Some(t) = &rotate_task {
+        t.abort();
+    }
+    if revoked.load(std::sync::atomic::Ordering::SeqCst) {
+        status = "revoked".into();
+    }
     if status == "unknown" {
         status = if exit.success() { "succeeded".into() } else { format!("failed ({exit})") };
     }
@@ -377,7 +454,7 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     let outbox = dir.join("workspace/out/result.json");
     let result = std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     // A child reports back to its parent with a signed message, before its run is marked ended.
-    if let (Some(i), Some(p)) = (&identity, &parent_run) {
+    if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {
         let body = serde_json::json!({ "status": status, "result": result });
         match ctx.send_message(p, "run_finished", body) {
             Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),

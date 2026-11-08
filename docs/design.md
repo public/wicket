@@ -217,6 +217,42 @@ assert identity *on the box's behalf*:
 live in the vault, or a KMS/HSM in production, and are rotated. Short-lived certificates and signatures
 carry the policy epoch, so a revocation is visible to verifiers.
 
+**Short-lived keys, rotation and revocation** (owner, 2026-11-08: keys must be short-lived and
+refreshed, in case an agent's environment is compromised or a key is exfiltrated).
+- **Agent identities live 10 minutes.** At half-life the runner issues a new document with a brand-new
+  key and discards the old key. A copied key or document is useless within minutes.
+- **Validity is checked at a trusted time.** The verifier checks the identity at a time *it* trusts,
+  never one the sender claims: the ledger's record time for messages, and its own clock for anything
+  presented live. So an expired key can't be used to backdate a message.
+- **Every document issued is kept** (`identity_history`), so the audit verifies each one at its own
+  issue time.
+- **`wicket identity revoke <run>` is the kill switch.** Within seconds:
+  - the run's box is stopped;
+  - its undelivered messages are dropped;
+  - it can't send;
+  - its pending requests can't be approved.
+
+  Revocation cascades to everything the run started, because children act on its authority.
+- **The installation's root key is the remaining long-lived secret.** In the PoC it's a 0600 file
+  readable by the operator's user. Production splits it: the root stays offline or in a TPM/KMS and only
+  certifies short-lived *issuing* keys, rotated daily or faster. `wicket run` never sees the root.
+- **Agent keys never enter the box,** so compromising the box itself doesn't expose a key. Rotation
+  covers the other paths: memory of the runner process, logs, a compromised host.
+
+**Back to the human** (owner, 2026-11-08: identities must be tied to the initiator, all the way back to
+the human user if there is one).
+- **Every identity names its `principal`:** the human or trigger at the root of the chain, and how wicket
+  knew it was them. A run started from the PoC CLI is `{type: human, id: <unix user>, via: cli,
+  assurance: unix-user}`. A run started from the console will carry the passkey-authenticated operator.
+  A schedule or webhook carries itself and the human who created it (§13.2).
+- **Delegation through agents is recorded in `act`** (RFC 8693 actor chain). A child's `act` is its
+  parent, whose `act` is its own parent, and so on down to the principal.
+- **The child's runner builds the chain from the parent's verified identity,** not from anything the
+  parent agent said. Neither the principal nor the chain can be widened along the way.
+- **It's shown wherever a human decides,** e.g. "Acting for: alice (cli, unix-user) → lead → fetcher".
+  The passkey signs it with the decision, and recipients of messages see it too.
+- Mandates (§16) will hang off the same principal.
+
 **Agent-to-agent messages** go only through wicket (boxes have no network to reach each other). A
 sender calls `send_message(to, body)` on its gateway. wicket sets the sender from the socket (an agent
 can't name itself), checks policy and signs the envelope with the sender's agent key. The recipient's
@@ -242,8 +278,15 @@ Bodies are the sender's data, shown to the recipient as such. Typed gates (§4.3
 - `audit --verify` re-checks every identity and envelope offline;
 - `in_box_subagents: false` removes Claude Code's own Agent tool, so every subagent is a wicket child.
 
+Also built since then:
+- 10-minute identities re-issued every 5 minutes with fresh keys, with history and audit;
+- delivery checks at the ledger's record time;
+- revocation that cascades to children and stops boxes;
+- the principal and delegation chain in every identity, shown with every request.
+
 Not built: signed result attestations, RFC 9421 egress signatures, node enrolment and pinned host keys,
-the separate system user, and federation with other installations.
+the separate system user, root and issuing key separation, console-started runs (passkey principal),
+and federation with other installations.
 
 **Granularity is the sandbox.** Subagents inside one box share a process and a uid, so per-subagent
 *cryptographic* identity is impossible there. Per-subagent attribution is reported, not proven (§11.1).
@@ -2182,4 +2225,15 @@ of the rest matters.
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
     own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
-12. **Name.** "wicket" is a working name (the small door set into a larger gate).
+12. **Node transport: SSH for now, explore others** (owner, 2026-11-08: "ssh is fine for now but keep a
+    note about exploring other protocols"). SSH (`ssh -R` per run) is not resumable:
+    - one TCP connection carries the forwarded sockets and the event stream, and a drop kills the run's
+      route out;
+    - it has head-of-line blocking, trust-on-first-use host keys, and needs an inbound sshd.
+
+    To explore: the node dials out over QUIC (`quinn`) with mTLS node certificates from the issuer
+    (§3.2). That gives independent streams, connection migration and fast reconnect. On top of it goes a
+    numbered, acknowledged control and event stream that resumes from the last acknowledged position.
+    Proxied requests fail retryably instead of resuming, and pending approvals live in the ledger, so
+    they survive drops. Alternatives: WireGuard plus HTTP/2 (gRPC), or WebSocket.
+13. **Name.** "wicket" is a working name (the small door set into a larger gate).

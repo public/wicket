@@ -40,6 +40,8 @@ pub enum IdError {
 pub type Result<T> = std::result::Result<T, IdError>;
 
 pub const IDENTITY_TYP: &str = "wicket-id+jwt";
+/// Tolerated clock difference between signer and verifier, in seconds.
+pub const CLOCK_SKEW: i64 = 60;
 pub const MESSAGE_TYP: &str = "wicket-msg+jwt";
 
 /// `spiffe://<trust domain>/t/<tenant>/z/<zone>/a/<agent>`.
@@ -68,8 +70,71 @@ pub struct AgentClaims {
     pub node: String,
     pub iat: i64,
     pub exp: i64,
-    /// The agent instance's public key (RFC 7800 confirmation), held by wicket.
+    /// The agent instance's public key (RFC 7800 confirmation), held by wicket. A fresh key with
+    /// every re-issue: identities are short-lived and rotated while the agent runs.
     pub cnf: Value,
+    /// Who this agent ultimately acts for: the human (or trigger) at the root of the chain, and how
+    /// wicket knew it was them. Children inherit it unchanged. (Null in documents issued before
+    /// principals existed.)
+    #[serde(default)]
+    pub principal: Value,
+    /// The delegation chain, RFC 8693 style: the current actor's parent, whose own `act` is its
+    /// parent, … down to the principal. None for an agent started directly by its principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Value>,
+}
+
+/// The facts an identity document asserts, besides issuer, subject, times and key.
+#[derive(Clone, Debug)]
+pub struct IdentitySpec {
+    pub tenant: String,
+    pub zone: String,
+    pub agent: String,
+    pub run: String,
+    pub parent_run: Option<String>,
+    pub manifest_sha256: String,
+    pub image: String,
+    pub node: String,
+    pub principal: Value,
+    pub act: Option<Value>,
+}
+
+impl AgentClaims {
+    /// The `act` value a child of this agent should carry: this agent, then whatever it acts for.
+    pub fn act_for_child(&self) -> Value {
+        let mut a = json!({ "sub": self.sub, "run": self.run });
+        if let Some(prev) = &self.act {
+            a["act"] = prev.clone();
+        }
+        a
+    }
+
+    /// The chain from the principal to this agent, as readable labels: ["alice (cli)", "lead", "fetcher"].
+    pub fn chain(&self) -> Vec<String> {
+        let mut agents = vec![self.sub.rsplit('/').next().unwrap_or(&self.sub).to_string()];
+        let mut cur = self.act.as_ref();
+        while let Some(a) = cur {
+            if let Some(sub) = a.get("sub").and_then(|s| s.as_str()) {
+                agents.push(sub.rsplit('/').next().unwrap_or(sub).to_string());
+            }
+            cur = a.get("act");
+        }
+        agents.push(principal_label(&self.principal));
+        agents.reverse();
+        agents
+    }
+}
+
+/// "alice (cli, unix user)", "schedule nightly (created by alice)", …
+pub fn principal_label(p: &Value) -> String {
+    let g = |k: &str| p.get(k).and_then(|x| x.as_str()).unwrap_or("?");
+    if p.is_null() {
+        return "unknown principal".into();
+    }
+    match g("type") {
+        "human" => format!("{} ({}, {})", g("id"), g("via"), g("assurance")),
+        other => format!("{other} {}", g("id")),
+    }
 }
 
 /// The installation's issuer key.
@@ -122,23 +187,24 @@ impl Issuer {
                 "kid": key_id(&self.verifying_key()), "iss": self.issuer_id() })
     }
 
-    /// Issues an identity document for an agent instance whose public key is `agent`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn issue(&self, tenant: &str, zone: &str, agent_name: &str, run: &str, parent_run: Option<&str>, manifest_sha256: &str, image: &str, node: &str, iat: i64, ttl_secs: i64, agent: &VerifyingKey) -> String {
+    /// Issues a short-lived identity document for an agent instance whose (fresh) public key is `agent`.
+    pub fn issue(&self, spec: &IdentitySpec, iat: i64, ttl_secs: i64, agent: &VerifyingKey) -> String {
         let claims = AgentClaims {
             iss: self.issuer_id(),
-            sub: spiffe_id(&self.trust_domain, tenant, zone, agent_name),
-            tenant: tenant.into(),
-            zone: zone.into(),
-            agent: agent_name.into(),
-            run: run.into(),
-            parent_run: parent_run.map(String::from),
-            manifest_sha256: manifest_sha256.into(),
-            image: image.into(),
-            node: node.into(),
+            sub: spiffe_id(&self.trust_domain, &spec.tenant, &spec.zone, &spec.agent),
+            tenant: spec.tenant.clone(),
+            zone: spec.zone.clone(),
+            agent: spec.agent.clone(),
+            run: spec.run.clone(),
+            parent_run: spec.parent_run.clone(),
+            manifest_sha256: spec.manifest_sha256.clone(),
+            image: spec.image.clone(),
+            node: spec.node.clone(),
             iat,
             exp: iat + ttl_secs,
             cnf: json!({ "jwk": { "kty": "OKP", "crv": "Ed25519", "x": B64.encode(agent.to_bytes()) } }),
+            principal: spec.principal.clone(),
+            act: spec.act.clone(),
         };
         jws_sign(&self.key, json!({ "alg": "EdDSA", "typ": IDENTITY_TYP, "kid": key_id(&self.verifying_key()) }), &serde_json::to_value(claims).expect("claims"))
     }
@@ -168,7 +234,7 @@ impl AgentKey {
     }
 }
 
-/// Verifies an identity document against the issuer's key and the clock.
+/// Verifies an identity document against the issuer's key, valid at time `now` (iat ≤ now ≤ exp).
 pub fn verify_identity(jws: &str, issuer: &VerifyingKey, now: i64) -> Result<AgentClaims> {
     let (header, payload) = jws_verify(jws, issuer)?;
     if header.get("typ").and_then(|t| t.as_str()) != Some(IDENTITY_TYP) {
@@ -177,6 +243,9 @@ pub fn verify_identity(jws: &str, issuer: &VerifyingKey, now: i64) -> Result<Age
     let claims: AgentClaims = serde_json::from_value(payload).map_err(|_| IdError::Malformed("identity claims"))?;
     if claims.exp < now {
         return Err(IdError::Expired(claims.exp));
+    }
+    if claims.iat > now + CLOCK_SKEW {
+        return Err(IdError::Malformed("issued in the future"));
     }
     Ok(claims)
 }
@@ -192,15 +261,17 @@ pub fn sign_envelope(key: &AgentKey, identity_jws: &str, payload: &Value) -> Str
     jws_sign(&key.0, json!({ "alg": "EdDSA", "typ": MESSAGE_TYP, "wid": identity_jws }), payload)
 }
 
-/// Verifies an envelope: the embedded identity against the issuer, then the message against the
-/// identity's bound key. Returns the sender's verified claims and the payload.
-pub fn verify_envelope(jws: &str, issuer: &VerifyingKey, now: i64) -> Result<(AgentClaims, Value)> {
+/// Verifies an envelope: the embedded identity against the issuer (valid at `at`, the time the
+/// message was sent), then the message against the identity's bound key. Returns the sender's
+/// verified claims and the payload. Callers check that `at` is a time they trust (the ledger's
+/// record time, or their own clock for something presented to them now), not the sender's say-so.
+pub fn verify_envelope(jws: &str, issuer: &VerifyingKey, at: i64) -> Result<(AgentClaims, Value)> {
     let header = jws_header(jws)?;
     if header.get("typ").and_then(|t| t.as_str()) != Some(MESSAGE_TYP) {
         return Err(IdError::WrongType(MESSAGE_TYP));
     }
     let wid = header.get("wid").and_then(|w| w.as_str()).ok_or(IdError::Malformed("envelope without identity"))?;
-    let sender = verify_identity(wid, issuer, now)?;
+    let sender = verify_identity(wid, issuer, at)?;
     let x = sender.cnf.pointer("/jwk/x").and_then(|x| x.as_str()).ok_or(IdError::Malformed("cnf"))?;
     let kb: [u8; 32] = B64.decode(x).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("cnf key"))?;
     let agent_key = VerifyingKey::from_bytes(&kb).map_err(|_| IdError::Malformed("cnf key"))?;
@@ -248,8 +319,40 @@ fn jws_verify(jws: &str, key: &VerifyingKey) -> Result<(Value, Value)> {
 mod tests {
     use super::*;
 
+    fn spec(zone: &str, agent: &str, act: Option<Value>) -> IdentitySpec {
+        IdentitySpec {
+            tenant: "t0".into(), zone: zone.into(), agent: agent.into(), run: "run_a".into(), parent_run: None,
+            manifest_sha256: "m".into(), image: "img".into(), node: "local".into(),
+            principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}), act,
+        }
+    }
+
     fn issue(i: &Issuer, k: &AgentKey, zone: &str, agent: &str) -> String {
-        i.issue("t0", zone, agent, "run_a", None, "m", "img", "local", 1000, 3600, &k.public())
+        i.issue(&spec(zone, agent, None), 1000, 3600, &k.public())
+    }
+
+    #[test]
+    fn the_chain_runs_from_the_human_through_each_parent() {
+        let i = Issuer::generate("test.local");
+        let lead = verify_identity(&issue(&i, &AgentKey::generate(), "research", "lead"), &i.verifying_key(), 1500).unwrap();
+        let child = verify_identity(&i.issue(&spec("research", "fetcher", Some(lead.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
+        let grandchild = verify_identity(&i.issue(&spec("research", "reader", Some(child.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
+        assert_eq!(grandchild.chain(), vec!["alice (cli, unix-user)", "lead", "fetcher", "reader"]);
+        assert_eq!(grandchild.principal["id"], "alice");
+    }
+
+    #[test]
+    fn short_lived_identities_reject_use_outside_their_window() {
+        let i = Issuer::generate("test.local");
+        let k = AgentKey::generate();
+        let doc = i.issue(&spec("research", "lead", None), 1000, 600, &k.public());
+        assert!(verify_identity(&doc, &i.verifying_key(), 1599).is_ok());
+        assert!(matches!(verify_identity(&doc, &i.verifying_key(), 1601), Err(IdError::Expired(1600))));
+        assert!(verify_identity(&doc, &i.verifying_key(), 900).is_err(), "not before issue (beyond skew)");
+        // A message signed with an old key is only valid at a time inside that key's window.
+        let env = sign_envelope(&k, &doc, &json!({"jti": "m"}));
+        assert!(verify_envelope(&env, &i.verifying_key(), 1200).is_ok());
+        assert!(verify_envelope(&env, &i.verifying_key(), 5000).is_err());
     }
 
     #[test]
@@ -264,7 +367,7 @@ mod tests {
         // Another installation's issuer, or a forged document, does not verify.
         let other = Issuer::generate("test.local");
         assert!(verify_identity(&doc, &other.verifying_key(), 1500).is_err());
-        let forged = issue(&other, &k, "research", "explorer");
+        let forged = other.issue(&spec("research", "explorer", None), 1000, 3600, &k.public());
         assert!(verify_identity(&forged, &i.verifying_key(), 1500).is_err());
     }
 

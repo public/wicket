@@ -19,7 +19,6 @@ wicket-agent.workspace = true
 wicket-auth.workspace = true
 wicket-identity.workspace = true
 hex.workspace = true
-base64 = "0.22"
 serde_yaml.workspace = true
 anyhow.workspace = true
 clap.workspace = true

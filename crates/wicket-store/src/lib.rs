@@ -50,6 +50,14 @@ pub struct Request {
     pub attribution: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub id: String,
+    pub from_run: String,
+    pub envelope: String,
+    pub created_at: i64,
+}
+
 /// The identity document wicket issued for one run, with the fields it is looked up by.
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentityRow {
@@ -124,6 +132,13 @@ CREATE TABLE IF NOT EXISTS operator_credentials (
 CREATE TABLE IF NOT EXISTS identities (
   run TEXT PRIMARY KEY, tenant TEXT NOT NULL, spiffe_id TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   parent_run TEXT, accept_from TEXT NOT NULL DEFAULT '[]', jws TEXT NOT NULL, issued_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS identity_history (
+  run TEXT NOT NULL, jws TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS identity_history_run ON identity_history (run, issued_at);
+CREATE TABLE IF NOT EXISTS revocations (
+  run TEXT PRIMARY KEY, revoked_at INTEGER NOT NULL, by TEXT NOT NULL, reason TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
@@ -219,6 +234,45 @@ impl Ledger {
 
     // ---- identities and messages (design §3.2) ----
 
+    /// Replaces a run's current identity document (rotation) and keeps the old one in history.
+    pub fn rotate_identity(&self, run: &str, jws: &str, issued_at: i64, expires_at: i64) -> Result<()> {
+        self.conn.execute("UPDATE identities SET jws = ?2, issued_at = ?3 WHERE run = ?1", params![run, jws, issued_at])?;
+        self.conn.execute("INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4)", params![run, jws, issued_at, expires_at])?;
+        Ok(())
+    }
+
+    /// Every identity document ever issued (run, jws, issued_at), for offline verification.
+    pub fn identity_history(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut st = self.conn.prepare("SELECT run, jws, issued_at FROM identity_history ORDER BY issued_at")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Revokes a run's identity: its messages stop being delivered, its requests can't be
+    /// approved, and its runner stops the box. Idempotent.
+    pub fn revoke(&self, run: &str, by: &str, reason: &str) -> Result<bool> {
+        Ok(self.conn.execute("INSERT OR IGNORE INTO revocations (run, revoked_at, by, reason) VALUES (?1, ?2, ?3, ?4)", params![run, now(), by, reason])? > 0)
+    }
+
+    /// Whether this run or any run it descends from is revoked: a child acts on its parent's
+    /// authority, so revoking the parent revokes the subtree. Returns (revoked run, when, by, reason).
+    pub fn revoked_in_chain(&self, run: &str) -> Result<Option<(String, i64, String, String)>> {
+        let mut cur = Some(run.to_string());
+        for _ in 0..32 {
+            let Some(r) = cur else { break };
+            if let Some((when, by, reason)) = self.revoked(&r)? {
+                return Ok(Some((r, when, by, reason)));
+            }
+            cur = self.identity(&r)?.and_then(|i| i.parent_run);
+        }
+        Ok(None)
+    }
+
+    /// When and why a run's identity was revoked, if it was.
+    pub fn revoked(&self, run: &str) -> Result<Option<(i64, String, String)>> {
+        Ok(self.conn.query_row("SELECT revoked_at, by, reason FROM revocations WHERE run = ?1", params![run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+    }
+
     /// Records the identity document wicket issued for a run.
     pub fn put_identity(&self, id: &IdentityRow) -> Result<()> {
         self.conn.execute(
@@ -226,6 +280,7 @@ impl Ledger {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![id.run, id.tenant, id.spiffe_id, id.zone, id.agent, id.parent_run, serde_json::Value::from(id.accept_from.clone()).to_string(), id.jws, id.issued_at],
         )?;
+        self.conn.execute("INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, 0)", params![id.run, id.jws, id.issued_at])?;
         Ok(())
     }
 
@@ -262,28 +317,29 @@ impl Ledger {
         Ok(())
     }
 
-    /// Takes the oldest undelivered message for `run`: (id, from_run, envelope). Marked delivered
-    /// in the same transaction, so each message is handed out once.
-    pub fn take_message(&mut self, run: &str) -> Result<Option<(String, String, String)>> {
+    /// Takes the oldest undelivered message for `run`. Marked delivered in the same transaction, so
+    /// each message is handed out once. `created_at` is when wicket recorded it: the time its
+    /// sender's identity must have been valid.
+    pub fn take_message(&mut self, run: &str) -> Result<Option<StoredMessage>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let m: Option<(String, String, String)> = tx
+        let m: Option<StoredMessage> = tx
             .query_row(
-                "SELECT id, from_run, envelope FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, id LIMIT 1",
+                "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, id LIMIT 1",
                 params![run],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok(StoredMessage { id: r.get(0)?, from_run: r.get(1)?, envelope: r.get(2)?, created_at: r.get(3)? }),
             )
             .optional()?;
-        if let Some((id, _, _)) = &m {
+        if let Some(StoredMessage { id, .. }) = &m {
             tx.execute("UPDATE messages SET delivered_at = ?2 WHERE id = ?1", params![id, now()])?;
         }
         tx.commit()?;
         Ok(m)
     }
 
-    /// Every stored envelope (id, envelope), for offline verification.
-    pub fn envelopes(&self) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare("SELECT id, envelope FROM messages ORDER BY created_at")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    /// Every stored envelope (id, envelope, created_at), for offline verification.
+    pub fn envelopes(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut st = self.conn.prepare("SELECT id, envelope, created_at FROM messages ORDER BY created_at")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -570,8 +626,8 @@ mod tests {
         l.add_message("m-1", &t, "run_a", "run_b", "env1").unwrap();
         l.add_message("m-2", &t, "run_a", "run_b", "env2").unwrap();
         l.add_message("m-3", &t, "run_a", "run_c", "env3").unwrap();
-        assert_eq!(l.take_message("run_b").unwrap().unwrap().0, "m-1");
-        assert_eq!(l.take_message("run_b").unwrap().unwrap().0, "m-2");
+        assert_eq!(l.take_message("run_b").unwrap().unwrap().id, "m-1");
+        assert_eq!(l.take_message("run_b").unwrap().unwrap().id, "m-2");
         assert!(l.take_message("run_b").unwrap().is_none());
         assert_eq!(l.envelopes().unwrap().len(), 3);
     }
@@ -588,6 +644,21 @@ mod tests {
         assert_eq!(l.identity("run_c").unwrap().unwrap().parent_run.as_deref(), Some("run_p"));
         assert_eq!(l.identity("run_p").unwrap().unwrap().accept_from, vec!["ops".to_string()]);
         assert_eq!(l.children("run_p").unwrap().len(), 1);
+        l.rotate_identity("run_p", "j2", 5, 605).unwrap();
+        assert_eq!(l.identity("run_p").unwrap().unwrap().jws, "j2");
+        assert_eq!(l.identity_history().unwrap().len(), 3, "both originals and the rotation are kept");
+        assert!(l.revoked("run_c").unwrap().is_none());
+        assert!(l.revoke("run_c", "owner", "suspected leak").unwrap());
+        assert!(!l.revoke("run_c", "owner", "again").unwrap(), "idempotent");
+        assert_eq!(l.revoked("run_c").unwrap().unwrap().2, "suspected leak");
+        l.revoke("run_p", "owner", "parent compromised").unwrap();
+        l.put_identity(&row("run_g", Some("run_c"))).unwrap();
+        assert_eq!(l.revoked_in_chain("run_g").unwrap().unwrap().0, "run_c", "nearest revoked ancestor");
+        let l2 = Ledger::open_in_memory().unwrap();
+        l2.put_identity(&row("run_p", None)).unwrap();
+        l2.put_identity(&row("run_c", Some("run_p"))).unwrap();
+        l2.revoke("run_p", "owner", "x").unwrap();
+        assert_eq!(l2.revoked_in_chain("run_c").unwrap().unwrap().0, "run_p", "revoking a parent revokes its children");
     }
 
     #[test]

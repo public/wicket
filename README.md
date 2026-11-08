@@ -43,7 +43,12 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
   `accept_from`.
 - `max_children: N` in the agent spec allows `spawn_agent`: a child agent in its own sandbox with its own identity,
   whose requests are approved separately. Set `in_box_subagents: false` to make that the only kind of subagent.
-- `wicket audit --verify` re-checks every identity and message signature offline.
+- Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
+  `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
+  and approvals.
+- Every identity records who it acts for, back to the human: `acting for: alice (cli, unix-user) → lead → fetcher`.
+- `wicket audit --verify` re-checks every identity ever issued (rotations included) and every message signature,
+  offline.
 
 ## Requirements
 

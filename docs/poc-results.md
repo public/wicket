@@ -136,3 +136,31 @@ Unit tests cover what the live run didn't:
 
 The console's identity display and its approval refusal for unverified identities were not exercised in a
 browser (the page script was syntax-checked only).
+
+## Short-lived identities, revocation and the chain to the human (2026-11-08)
+
+Same parent/child manifest, with `WICKET_IDENTITY_TTL=30`: identities valid 30 s, re-issued every 15 s.
+
+- The run started with `acting for claude (cli, unix-user) → lead`. The child's pending request showed
+  `agent: …/a/fetcher [verified]  acting for: claude (cli, unix-user) → lead → fetcher`. The child's runner
+  built that chain from the parent's verified identity.
+- Within 40 s the audit log held 6 `identity.rotated` records across both runs, each with a new key and
+  identity digest.
+- `wicket identity revoke <lead run>` while the child waited for approval:
+  - The lead's runner logged that the identity was revoked, stopped its box and interrupted its child. The
+    lead ended as `revoked`.
+  - The child's attempt to send `run_finished` was refused (`this agent's identity was revoked (revoked:
+    <lead run>)`), and its pending request was withdrawn.
+  - `wicket identity list` showed both as NOT VERIFIED: the lead revoked, and the child through its
+    ancestor.
+- `wicket audit --verify` passed: 96 audit records, and 12 identity documents and messages verified offline.
+  These include every rotation, plus messages from the earlier run whose identities predate the
+  `principal` claim.
+
+Unit tests add:
+- a genuine envelope signed with an expired key and recorded now, which is dropped;
+- messages from a sender revoked after sending;
+- sending after revocation;
+- revocation cascading to children;
+- validity windows;
+- the delegation chain over three generations.

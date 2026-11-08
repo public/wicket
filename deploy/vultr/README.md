@@ -18,3 +18,6 @@ tar -C images/claude-code -cf - . | ssh -i $K wicket@$IP \
 
 # before destroying the node: confirm it holds no secrets (see docs/poc-results.md), then destroy it
 ```
+
+SSH is the PoC's node transport. It isn't resumable: if the connection drops, the run loses its route out.
+Other transports are an open question (design §21, "Node transport").
