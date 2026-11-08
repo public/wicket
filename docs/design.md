@@ -520,11 +520,33 @@ never use the anthropic API key. This is just Claude Code cli with my subscripti
 - The box gets a same-shaped placeholder in `CLAUDE_CODE_OAUTH_TOKEN`. The LLM proxy strips it and injects
   `Authorization: Bearer <token>` on the way out. Verified in the PoC: Claude Code switches to subscription
   mode, sends every model call through `ANTHROPIC_BASE_URL`, and makes no other outbound calls.
-- wicket never reads or copies an existing Claude login, and never emulates Claude Code's OAuth flow.
+- Alternatively the vault holds a *reference* to the host's existing Claude Code login (`wicket secret link`):
+  wicket reads the current access token at injection time, never the refresh token, never writes the
+  credentials file, and never copies it. wicket never emulates Claude Code's OAuth flow.
 - API-key injection was removed from the code entirely.
 
+**Anthropic's rules on subscription credentials** (owner, 2026-11-08: "whatever Anthropic say is ok"). The
+Claude Code legal and compliance page (read 2026-11-08) says subscription OAuth "is designed to support
+ordinary use of Claude Code and other native Anthropic applications". Developers building products,
+including on the Agent SDK, "should use API key authentication". Third parties may not "route requests
+through Free, Pro, Max, or Ultra plan credentials on behalf of their users". They also may not "collect,
+store, or intermediate Claude.ai credentials or session tokens". A platform hosting Claude Code may not
+"remove, disable, or restrict any authentication method built into it", and each end user signs in with
+their own credentials. So:
+- **Subscription tokens are for the unmodified Claude Code binary only.** Hermes, pi, OpenCode and other
+  inner agents never get the owner's Claude subscription. They use their own vendors' terms, or models the
+  owner holds API access to elsewhere (not an Anthropic API key, by the owner's rule).
+- **Single-owner mode** is the owner running their own Claude Code on their own hosts with their own
+  subscription, at individual scale. That is the case the PoC covers. The vault holding the token and the
+  proxy injecting it is a grey area against the "store or intermediate" sentence; keep it to the owner's own
+  use, keep usage ordinary, and revisit if Anthropic's guidance changes.
+- **Platform mode (§15) never brokers subscription credentials.** Each end user signs in to Claude Code
+  through Anthropic's own flow, or the tenant brings an API key or cloud-provider credential billed to
+  itself. wicket doesn't pay for, resell or intermediate Claude usage. Centaur's token broker [16 §3-2] is
+  therefore a single-owner pattern only.
+
 Other agents' vendor logins (ChatGPT for Codex) would follow the same placeholder-and-inject pattern, if
-the owner chooses them.
+the owner chooses them and the vendor's terms allow it.
 
 **Model agnosticism** lives in the LLM proxy, not the adapters. It speaks the **Anthropic Messages** API,
 then **OpenAI Responses** (Codex is Responses-only), then Google, then Chat (only for open-weights servers).
@@ -2024,6 +2046,7 @@ of the rest matters.
 | Process jail for development; **gVisor as the floor for valuable zones and all third-party servers**; microVMs later | No KVM here; containers and process jails share the host kernel, and models escape misconfigured ones (SandboxEscapeBench); gVisor gives checkpoint/restore without KVM | Bare-metal dev box available |
 | Speak Claude Code's stream-json control protocol directly from Rust | No Rust Agent SDK; the protocol is what the SDKs use | Anthropic publishes a spec or Rust SDK |
 | Claude subscription token (`claude setup-token`) injected by the LLM proxy; never an Anthropic API key | Owner's rule; the credential still never enters the box | — |
+| Subscription tokens only for the unmodified Claude Code binary, in single-owner mode; never for other inner agents, never brokered in platform mode | Anthropic's legal and compliance page; owner: "whatever Anthropic say is ok" | §6 |
 | YAML-subset adapter DSL | Diffable by humans and LLMs; JSON canonical form for signing | — |
 | Hybrid substrate: Kubernetes for capacity, pools and services; `wicket-node` direct launch for sandboxes and per-task MCP instances; CRDs are desired state, the ledger is authority | Don't rebuild scheduling, autoscaling and GC. But the pod path is 1–2 orders of magnitude too slow for the hot path and can't park |  Kubernetes' TCB or footprint proves unacceptable for hostile workloads → own small reconciler behind the same `Sandbox` trait |
 | Enforcement evaluates the whole chain; subset checks only for admission and explanation | A subset-check bug then costs usability, never authority (Fly macaroons) | — |
@@ -2069,7 +2092,4 @@ of the rest matters.
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
     own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
-12. **Subscription token for other inner agents** [13 §12]: may the owner's Claude subscription token be
-    injected for agents other than Claude Code (Hermes, pi, OpenCode talking to Anthropic's API)? Owner
-    decision; the default is no.
-13. **Name.** "wicket" is a working name (the small door set into a larger gate).
+12. **Name.** "wicket" is a working name (the small door set into a larger gate).

@@ -799,12 +799,11 @@ This document covers **Nous Research's Hermes Agent**. The others are listed onl
 
 - wicket-llm fronts Hermes with `transport: anthropic_messages`, or `codex_responses` / `chat_completions` for
   other upstreams, plus a placeholder `key_env`. No key ever enters the box.
-- **Owner decision needed [L].** The owner's rule is "never an Anthropic API key; Claude Code CLI with my
-  subscription" (design §6).
-  - Whether a Claude subscription token may legitimately be injected for a *third-party* harness such as Hermes is a
-    terms question. This research does not settle it.
-  - Until it is settled, the Hermes adapter should target non-Anthropic upstreams the owner chooses (Nous Portal,
-    OpenRouter, open-weights), or stay unused.
+- **Settled (2026-11-08): no Claude subscription for Hermes.** The owner's rule is "never an Anthropic API key;
+  Claude Code CLI with my subscription", and Anthropic's Claude Code legal and compliance page reserves
+  subscription OAuth for "ordinary use of Claude Code and other native Anthropic applications" (design §6).
+  The Hermes adapter targets non-Anthropic upstreams the owner chooses (Nous Portal, OpenRouter, open-weights),
+  or stays unused.
 - Hermes would happily read `CLAUDE_CODE_OAUTH_TOKEN` if it were present. The conformance suite must show it is
   absent.
 
@@ -1084,7 +1083,7 @@ Codex runtime, nested `claude -p`.
   requests` → `execute_code`)?
 - **[L] key shapes** in §12: `auxiliary.<task>.provider`, `curator.enabled`, `platforms: {}`, `nudge_interval: 0`,
   `hermes config validate`. `configuration.md` and `hermes_cli/config_defaults.py` at the pinned tag decide them.
-- **[L] owner decision** in §11.3.
+- Owner decision on subscription tokens: settled, see §11.3.
 
 ---
 
