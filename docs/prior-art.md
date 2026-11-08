@@ -1,8 +1,8 @@
 # Prior art catalogue
 
-*Generated 2026-11-08 from the study tables in `research/05`–`08`; see those files for each item's notes. Local copies are under `refs/` (not committed; read [refs/README.md](../refs/README.md) first). Relevance: 3 = directly shapes a wicket mechanism, 2 = useful evidence or partial reuse, 1 = background.*
+*Generated 2026-11-08 from the study tables in `research/05`–`08`, extended with `research/13`, `16` and `17`; see those files for each item's notes. Local copies are under `refs/` (not committed; read [refs/README.md](../refs/README.md) first). Relevance: 3 = directly shapes a wicket mechanism, 2 = useful evidence or partial reuse, 1 = background.*
 
-101 papers and specs, 76 projects.
+112 papers and specs, 94 projects (including the meta-harness section at the end).
 
 ## Papers, specs and write-ups
 
@@ -190,3 +190,48 @@
 | 1 | rs-ucan | https://github.com/ucan-wg/rs-ucan | Apache-2.0 | Rust | refs/repos/rs-ucan | cross-check for the Constraint vocabulary | [08](research/08-oss-gateways-policy.md) |
 | 1 | SWE-ReX | https://github.com/SWE-agent/SWE-ReX | MIT | Python | refs/repos/SWE-ReX | negative lesson for exec channel (no PS1 sentinels, no host TCP port) | [07](research/07-oss-sandboxes-runtimes.md) |
 | 0 | flywheel_connectors | https://github.com/Dicklesworthstone/flywheel_connectors | MIT + anti-Anthropic rider | Rust | refs/repos/(deleted) | **excluded: licence** | [08](research/08-oss-gateways-policy.md) |
+
+## Meta-harnesses, harness literature and Hermes (research 13, 16, 17)
+
+Licences marked — were not checked at file level; read the research note before reusing code. About 20 more orchestrators and session managers are compared in [16 §1](research/16-metaharnesses.md).
+
+### Papers
+
+| rel | key | title | year | venue | link | local copy | notes |
+|---|---|---|---|---|---|---|---|
+| 3 | meta-harness-2603.28052 | Meta-Harness: End-to-End Optimization of Model Harnesses | 2026 | arXiv preprint | https://arxiv.org/abs/2603.28052 | refs/papers/meta-harness-2603.28052/ | [17](research/17-metaharness-literature.md): the other meaning of the word; wicket is not a harness optimiser |
+| 3 | harness-conditions-2606.10106 | What makes a harness a harness: necessary and sufficient conditions | 2026 | arXiv preprint | https://arxiv.org/abs/2606.10106 | refs/papers/harness-conditions-2606.10106/ | [17](research/17-metaharness-literature.md): four conditions; wicket supplies control from outside the box |
+| 3 | harnessrisk-2608.17597 | HarnessRisk: A Lifecycle-Oriented Benchmark for Agent Harness Safety | 2026 | arXiv preprint | https://arxiv.org/abs/2608.17597 | refs/papers/harnessrisk-2608.17597/ | [17](research/17-metaharness-literature.md): configuration phase most exposed |
+| 3 | harnesssafe-2608.06984 | HarnessSafe: Evaluating Safety Across Persistent Carriers in Agent Harnesses | 2026 | arXiv preprint | https://arxiv.org/abs/2608.06984 | refs/papers/harnesssafe-2608.06984/ | [17](research/17-metaharness-literature.md): injections persist via memory and skills; promotion-gate metric |
+| 2 | dgm-2505.22954 | Darwin Gödel Machine: Open-Ended Evolution of Self-Improving Agents | 2025 | ICLR 2026 | https://arxiv.org/abs/2505.22954 | refs/papers/dgm-2505.22954/ | [17](research/17-metaharness-literature.md): gamed a visible checker; verifier zones |
+| 2 | adas-2408.08435 | Automated Design of Agentic Systems (ADAS) | 2024 | ICLR 2025 | https://arxiv.org/abs/2408.08435 | refs/papers/adas-2408.08435/ | [17](research/17-metaharness-literature.md): harness search as a workload |
+| 2 | last-harness-2604.21003 | The Last Harness You'll Ever Build | 2026 | arXiv preprint | https://arxiv.org/abs/2604.21003 | refs/papers/last-harness-2604.21003/ | [17](research/17-metaharness-literature.md): evaluator outside the proposer |
+| 2 | terminal-bench-2601.11868 | Terminal-Bench: Benchmarking Agents on Hard, Realistic Tasks in CLIs | 2026 | arXiv preprint | https://arxiv.org/abs/2601.11868 | refs/papers/terminal-bench-2601.11868/ | [17](research/17-metaharness-literature.md): utility benchmark for the cost of the boundary |
+| 2 | hal-2510.11977 | Holistic Agent Leaderboard | 2025 | arXiv preprint | https://arxiv.org/abs/2510.11977 | refs/papers/hal-2510.11977/ | [17](research/17-metaharness-literature.md): log review found shortcuts; audit independent of the agent |
+| 2 | swe-agent-2405.15793 | SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering | 2024 | NeurIPS 2024 | https://arxiv.org/abs/2405.15793 | refs/papers/swe-agent-2405.15793/ | [17](research/17-metaharness-literature.md): denial bodies as agent-computer interface |
+| 1 | harness-disclosure-2605.23950 | Stop Comparing LLM Agents Without Disclosing the Harness | 2026 | arXiv preprint | https://arxiv.org/abs/2605.23950 | refs/papers/harness-disclosure-2605.23950/ | [17](research/17-metaharness-literature.md): disclose harness in wicket-bench reports |
+
+Essays and vendor docs (Anthropic's harness and Managed Agents posts, the Claude Agent SDK hosting guide, OpenAI's harness-engineering posts, Böckeler, Hashimoto, Schmid, Willison) are listed with links in [17 §1, §3](research/17-metaharness-literature.md).
+
+### Projects
+
+| rel | project | url | licence | lang | local copy | what wicket takes | notes |
+|---|---|---|---|---|---|---|---|
+| 3 | Agent Substrate + AX | https://github.com/agent-substrate/substrate | — | Go | refs/repos/agent-substrate | placeholder-discard injection, NXDOMAIN DNS gating, fail-closed status matrix, wake-on-request parking | [16](research/16-metaharnesses.md) |
+| 3 | Centaur | https://github.com/paradigmxyz/centaur | — | Rust | refs/repos/centaur | dummy credentials file + brokered bearer with serialised refresh-token rotation | [16](research/16-metaharnesses.md) |
+| 3 | inspect_ai agent bridge | https://github.com/UKGovernmentBEIS/inspect_ai | MIT | Python | (not cloned) | tool-call review at the model proxy; provider tools withheld; proposal-bound single-use host tools | [16](research/16-metaharnesses.md) |
+| 3 | Paperclip | https://github.com/paperclipai/paperclip | — | TS | (not cloned) | HTTP 409 `approval_required` with canonical-args hash and retry contract as §9.5 conformance cases | [16](research/16-metaharnesses.md) |
+| 3 | Hermes Agent | https://github.com/NousResearch/hermes-agent | MIT | Python | refs/repos/hermes-agent | inner-agent target (T1 gateway JSON-RPC); negative: self-modifying memory, skills, config and hooks | [13](research/13-hermes.md) |
+| 2 | Omnigent | https://github.com/omnigent-ai/omnigent | — | Python | refs/repos/omnigent | host-bound placeholder rules as negative tests; env passthrough list; avoid fail-open defaults | [16](research/16-metaharnesses.md) |
+| 2 | Harbor | https://github.com/harbor-framework/harbor | — | Python | (not cloned) | Terminal-Bench runner; per-phase network policy; negative: model key in the box | [16](research/16-metaharnesses.md) |
+| 2 | fullsend | https://github.com/fullsend-ai/fullsend | — | — | refs/repos/fullsend | credential tier decision tree with no-credential default | [16](research/16-metaharnesses.md) |
+| 2 | branchyard | https://github.com/vamsiramakrishnan/branchyard | — | Rust | refs/repos/branchyard | netns whose only exit is a listener handed to the engine; enforce=required | [16](research/16-metaharnesses.md) |
+| 2 | loom | https://github.com/cosmix/loom | — | Rust | refs/repos/loom | at-most-once tickets applied by a daemon outside the box; agent-config changes held for review | [16](research/16-metaharnesses.md) |
+| 2 | leash | https://github.com/strongdm/leash | — | Go | (not cloned) | shadow mode before enforce; lint when the enforcement point is weaker than the policy | [16](research/16-metaharnesses.md) |
+| 1 | metaharness.tools | https://github.com/nrwl/metaharness.tools | — | — | (not cloned) | the term's catalogue; none of its projects centres on the box | [16](research/16-metaharnesses.md) |
+| 1 | Gas City | https://github.com/gastownhall/gascity | — | Go | (not cloned) | grants bound to a request digest, never cached | [16](research/16-metaharnesses.md) |
+| 1 | Agent Orchestrator | https://github.com/OrchestratorInc/agent-orchestrator | — | TS | (not cloned) | input lease so typed input can't approve a dialog by accident | [16](research/16-metaharnesses.md) |
+| 1 | Scion | https://github.com/GoogleCloudPlatform/scion | — | Go | refs/repos/scion | push secrets after restore so snapshots stay clean | [16](research/16-metaharnesses.md) |
+| 1 | sandcastle | https://github.com/mattpocock/sandcastle | — | TS | (not cloned) | explicit "what this boundary does not protect" text | [16](research/16-metaharnesses.md) |
+| 0 | SuperagenticAI metaharness | https://github.com/SuperagenticAI/metaharness | FSL-1.1-ALv2 | Python | (not cloned) | **not open source**; ideas only | [16](research/16-metaharnesses.md) |
+| 0 | Multica | https://github.com/multica-ai/multica | custom | — | (not cloned) | **not open source**; negative: forces Codex to danger-full-access | [16](research/16-metaharnesses.md) |

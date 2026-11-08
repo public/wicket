@@ -1,11 +1,18 @@
 # wicket — design v0.2
 
-*v0.2, 2026-11-08. Draft for discussion: research 01–11 folded in (12 and 13 pending). Nothing is built yet.*
+*v0.2, 2026-11-08. Draft for discussion: research 01–17 folded in. Nothing is built yet.*
 
 A **meta-harness**: it does not run an agent loop. It builds the environment that other agent processes
 run in, gives each the least access its task needs, brokers every crossing of a boundary, and shows humans
 what those boundaries are. Claude Code is the primary inner agent; the harness itself is agent-agnostic and
 model-agnostic.
+
+"Meta-harness" has two meanings in 2026 [17 §2.3, §1.1]. wicket uses it in the sense of Anthropic's
+Managed Agents post: a platform that is unopinionated about the agent loop and virtualises session, harness
+and sandbox. It adds enforcement on top. It is *not* the optimiser sense of Lee et al.'s *Meta-Harness*
+(arXiv 2603.28052), which searches over harness code. In de Macedo's four-condition definition of a harness
+(loop, tools, context, control), wicket supplies the fourth, control and containment, from outside the box
+for agents that already have the other three. That is why §6 can stay agent-agnostic.
 
 Sources:
 - [`00-origin-conversation.md`](00-origin-conversation.md) — the concept brief (zones and gates, the
@@ -36,6 +43,10 @@ Sources:
 - [`research/13-hermes.md`](research/13-hermes.md) — Hermes Agent.
 - [`research/14-multi-tenancy.md`](research/14-multi-tenancy.md) — platform mode and tenant isolation.
 - [`research/15-mandates-user-delegation.md`](research/15-mandates-user-delegation.md) — user mandates, agentic commerce.
+- [`research/16-metaharnesses.md`](research/16-metaharnesses.md) — about 40 meta-harnesses, orchestrators and
+  sandboxed runners compared (Omnigent, Agent Substrate, Centaur, inspect_ai, Paperclip, Harbor, …).
+- [`research/17-metaharness-literature.md`](research/17-metaharness-literature.md) — essays, papers and vendor
+  docs on harnesses, harness search, evaluation harnesses and harness safety.
 - [`prior-art.md`](prior-art.md) — the consolidated catalogue of papers and projects.
 - Components, processes and dependencies: Claude Doc https://claude.ai/artifact/XDhPxV33xb5G7QG4FpkS2L
 
@@ -62,10 +73,20 @@ Things the brief assumed or left open, and what we now know (2026-11-08):
 | The process jail is a reasonable first tier | Frontier models escape misconfigured containers (SandboxEscapeBench). gVisor is the floor for anything valuable, every hardening layer fails closed, and VMMs are jailed too. [05, 07] |
 | Credential injection at the proxy | Substituting placeholders anywhere in a request (srt's mask, iron-proxy, tokenizer) reflects the real secret back. Inject only into the declared header slot, rebuild requests from the `Op`, never forward client headers. [07, 08] |
 | Adapters generated from OpenAPI | Better sources exist: GitHub's docs repo maps permissions to 1,075 endpoints, GitHub OpenAPI flags `triggersNotification`, AWS publishes per-action `IsWrite`/`IsPermissionManagement`, Cloudflare tags token groups. These set **risk floors** the generator cannot go below. [04 §4.1] |
+| Nothing like wicket exists | Still true after surveying ~40 self-described meta-harnesses and orchestrators. The norm is worktrees plus skip-permissions, with the model key or a copied `~/.claude` login in the box. The closest designs (Agent Substrate, Centaur, inspect_ai's agent bridge, Omnigent) keep keys out and default-deny egress, but none ships typed escalation bound to a digest with grants that can't be answered from inside the box. [16 §0, §3] |
+| Evaluation harnesses already "box any agent" | They do, but they write the model key into the box and allowlist the model host (Harbor), and guard against cheating rather than exfiltration. Cheating is real (agents reading future commits, patching scorers), so scorers belong outside the proposer's reach: the verifier-zone pattern (§17). [17 §1.4, §2.5] |
+| The harness matters less than the model | It moves both. Changing only the edit format moved 14 of 16 models by about 15 points; swapping the harness with the model fixed moved a containment score from 39 to 62 (HarnessSafe). wicket's denial bodies are part of the agent's interface, and the boundary's utility cost has to be measured (§9.5, §19 M1/M3). [17 §2.2, §2.6] |
 
 ---
 
 ## 2. Principles
+
+*Scaffolding versus boundaries.* "Every component in a harness encodes an assumption about what the model
+can't do" is right for prompts, loops and adapters, which should be deleted as models improve; that is why
+wicket's adapters, `AgentCaps` and LaunchPlans are data with per-version conformance (§6.1). It is wrong for
+authority: the enforcement plane assumes nothing about model weakness. Anthropic made the same call when it
+chose structural isolation over narrow token scoping [17 §1.1]. Policy enforced at the proxies also never
+enters the context window, so compaction can't erode it.
 
 1. **The box is hostile.** Assume the inner agent is compromised from its first token. Nothing inside the
    box is in the trusted computing base, including the adapter's own config, hooks and the agent's own
@@ -393,7 +414,24 @@ MiniScope, AutoCedar, ceLLMate, Conseca]:
 
 ## 6. Inner agents
 
-Detail: [01 §4] (Claude Code, ACP), [11] (Codex, pi), [12] (OpenClaw).
+Detail: [01 §4] (Claude Code, ACP), [11] (Codex, pi), [12] (OpenClaw), [13] (Hermes), [16] (how ~40
+orchestrators drive these agents).
+
+**Hermes Agent** [13] is a T1 candidate through its `hermes-gateway-v1` JSON-RPC (host-answered approvals,
+steer/interrupt, resume, replay of pending requests on reconnect), with ACP as the T2 fallback. Its own
+security policy says the OS is the only boundary and recommends wrapping the whole process, which is
+`Placement::Whole`. Its risk is self-modification: by default it writes memory and skills (including a
+background fork that replays the transcript into them), schedules its own cron jobs, edits its own
+`config.yaml`, installs and hot-reloads MCP servers, and imports any Python in `hooks/`. Under wicket its
+config is regenerated on every wake, memory and skill writes are staged to `pending/` for the §13.4
+promotion gate, prompts are answered only `once` or `deny`, and library mode is never used (it auto-approves
+dangerous commands when no callback is attached). Hermes has no unix-socket transport, so it uses the
+loopback forwarders like Claude Code.
+
+**Claude Code adapter details from the Agent SDK hosting guide** [17 §3]: auto-memory loads regardless of
+`settingSources`, so the LaunchPlan sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`; each zone gets its own
+`CLAUDE_CONFIG_DIR`; there is no session timeout, so §13.8 budgets must cover it; and
+`CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` is a usable stall signal.
 
 ```rust
 pub trait InnerAgent: Send + Sync {
@@ -993,6 +1031,14 @@ Detail: [04 §7].
   differential prior art.
 - **Rewrites server-side tool definitions** to the zone's reach, and taints sessions on server-side tool
   results.
+- **Subscription logins without the login in the box** [16 §3-2]: the box gets a syntactically valid but
+  fake credentials file (or the placeholder `CLAUDE_CODE_OAUTH_TOKEN`), `wicket-llm` injects the real bearer,
+  and a single token broker serialises refresh-token rotation for every zone (Centaur's recipe). The PoC
+  injects the access token by reference and never touches the refresh token.
+- **Can review tool calls in model responses** before the agent sees them, and turn a forbidden call into a
+  synthetic refusal (inspect_ai's agent bridge) [16 §3-1]. This is a second enforcement point for actions that
+  never cross a proxy, such as local file edits; it is advisory for those, since the box can act without the
+  model's say-so.
 - Is the liveness sensor: no model request for N seconds after a denial means the agent is waiting.
   Cache-warm and model-refresh requests don't count.
 - Does **not** forward client auth headers, ever (the containment-post lesson). It applies the §9.0
@@ -1031,6 +1077,13 @@ negotiated them. Connections are never held open while a human decides.
 grant, spawn a child zone, meet a prerequisite. In APPA, removing remedies dropped utility from 88% to
 35%. Bodies never echo tainted content. E1 also measures retry loops (CapScope's runs took about 2× as long
 because of retries after refusals).
+
+**The wording is interface, and the retry contract is typed** [16 §3-4, 17 §4-2]. Paperclip's tool gateway
+is the closest shipped analogue: HTTP 409 `approval_required` with a canonical-arguments hash and expiry,
+and a retry carrying the approved request id that is rejected if the arguments changed. Its error codes
+become conformance cases for §9.5. Bodies stay short with remedies first, body wording is an arm of E1, and
+the §6.1 suite checks that an agent's next action after a denial is the offered remedy or a wait, not a
+reroute.
 
 ---
 
@@ -1877,6 +1930,13 @@ taint, so it goes through a **promotion gate**, the same idea as memory promotio
 - **Cheaper than an agent:** no model, no agent start-up. Pure functions can run in the Wasm codemode tier
   in milliseconds (§7.1).
 
+**Verifier zones** [17 §4-5]. Harness search (ADAS, Darwin Gödel Machine, Meta-Harness) and agent-written
+programs are natural wicket workloads, and every one of those systems assumes an honest scorer. The evidence
+says otherwise: agents game checkers they can see. So the proposer zone emits a candidate as a handle; a
+runner zone executes it with only the LLM proxy; a verifier zone that the proposer cannot read scores it and
+returns a typed, low-capacity score across the gate. A winning candidate is promoted through the signed
+program promotion above.
+
 ---
 
 ## 18. Crate layout
@@ -2001,7 +2061,15 @@ of the rest matters.
 9. **`vendor_rc` credentials:** can the proxy swap a placeholder for the vendor session credential
    (E-RC2), or does `vendor_rc` always mean "vendor credential in the box"?
 10. **`Placement::Split` before v1?** Codex `exec-server` is experimental; pi's remote tool operations and
-    Claude Managed Agents are alternatives.
+    Claude Managed Agents are alternatives. Split is a durability and latency choice, not a security one: the
+    loop reads every tool result, so it is as tainted as the box, and moving it out helps only if its host
+    also holds no credentials and its egress also goes through the proxies [17 §4-9].
 11. **Agent context files in untrusted refs:** removing them is safe but may break legitimate project
     conventions. Should they be exposed as handles, summarised by a quarantined reader, or simply dropped?
-12. **Name.** "wicket" is a working name (the small door set into a larger gate).
+    Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
+    so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
+    own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
+12. **Subscription token for other inner agents** [13 §12]: may the owner's Claude subscription token be
+    injected for agents other than Claude Code (Hermes, pi, OpenCode talking to Anthropic's API)? Owner
+    decision; the default is no.
+13. **Name.** "wicket" is a working name (the small door set into a larger gate).
