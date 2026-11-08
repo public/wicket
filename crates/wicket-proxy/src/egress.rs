@@ -155,11 +155,28 @@ impl Egress {
                 return problem(403, "forbidden", "Outside this program's reach", &format!("{why}. Programs do not escalate: change the program's approved reach instead."), None);
             }
             Verdict::NeedsGrant(why) => {
+                // Who in the box is asking (reported by the agent's own event stream, not proven).
+                let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
                 let mut ledger = ctx.ledger.lock().expect("ledger lock");
                 match ledger.consume_grant(&op) {
                     Ok(Some(gid)) => {
+                        let approved_for: Vec<String> = ledger
+                            .request_for_grant(&gid)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.attribution.iter().flat_map(crate::attributed_agents).collect())
+                            .unwrap_or_default();
                         drop(ledger);
-                        emit("allow", format!("grant {gid}"));
+                        let mut detail = format!("grant {gid}");
+                        if let Some((v, line)) = &who {
+                            detail.push_str(&format!("; used by {line}"));
+                            let users = crate::attributed_agents(v);
+                            // The grant is usable by anything in the box; flag use by someone else.
+                            if !approved_for.is_empty() && !users.is_empty() && !users.iter().any(|u| approved_for.contains(u)) {
+                                detail.push_str(&format!("; WARNING: approved for {}", approved_for.join(" | ")));
+                            }
+                        }
+                        emit("allow", detail);
                     }
                     Ok(None) => {
                         if let Ok(Some(rid)) = ledger.denied_recently(&op) {
@@ -167,11 +184,12 @@ impl Egress {
                             emit("denied", format!("request {rid} was denied"));
                             return problem(403, "denied", "Denied by a human", &format!("request {rid} was denied: do not retry"), None);
                         }
-                        let res = ledger.pending_for(&op, &why);
+                        let res = ledger.pending_for(&op, &why, who.as_ref().map(|(v, _)| v));
                         drop(ledger);
                         return match res {
                             Ok((rid, fresh)) => {
-                                emit("pending", format!("{rid}{}: {why}", if fresh { " (new)" } else { "" }));
+                                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
+                                emit("pending", format!("{rid}{}: {why}{for_line}", if fresh { " (new)" } else { "" }));
                                 problem(403, "pending-approval", "Pending approval", &why, Some(&rid))
                             }
                             Err(e) => problem(500, "error", "Ledger error", &e.to_string(), None),

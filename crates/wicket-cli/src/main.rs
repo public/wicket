@@ -203,6 +203,9 @@ async fn main() -> Result<()> {
             for r in p {
                 let age = wicket_store::now() - r.created_at;
                 println!("{}  {} {}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, r.risk, r.run, age, r.reason);
+                for a in &r.attribution {
+                    println!("    for: {}  (reported by the agent, unverified)", wicket_agent::clip(&wicket_proxy::attribution_line(a), 240));
+                }
             }
             Ok(())
         }
@@ -217,6 +220,7 @@ async fn main() -> Result<()> {
             l.audit(&TenantId::single(), None, "decision", &serde_json::json!({
                 "request": id, "decision": "approve", "grant": gid, "by": operator(),
                 "method": req.method, "host": req.host, "path": req.path,
+                "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
                 "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
             }))?;
             println!("approved {id} → grant {gid}: {} {}{} ({}, {})", req.method, req.host, prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") }, humantime::format_duration(ttl));

@@ -87,7 +87,18 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
     std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
-    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate };
+    // Who inside the box made a request: read from the agent's event stream (outside the box).
+    let tracker = Arc::new(Mutex::new(wicket_agent::attribution::Tracker::default()));
+    let attribute: Option<wicket_proxy::Attributor> = if m.program.is_some() {
+        None
+    } else {
+        let t = tracker.clone();
+        Some(Arc::new(move |host: &str, path: &str| {
+            let a = t.lock().ok()?.attribute(host, path);
+            Some((serde_json::to_value(&a).ok()?, a.summary()))
+        }))
+    };
+    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let gateway = Gateway::new(ctx.clone());
@@ -201,8 +212,17 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
                     let _ = writeln!(transcript_f, "{l}");
                     if is_program {
                         println!("[program] {}", wicket_agent::clip(&l, 300));
-                    } else if let Some(r) = wicket_agent::render_event(&l) {
-                        println!("{r}");
+                    } else {
+                        let sub = tracker.lock().ok().and_then(|mut t| t.observe(&l));
+                        if let Some(r) = wicket_agent::render_event(&l) {
+                            match sub {
+                                Some(who) => {
+                                    let who = wicket_agent::clip(&who, 60);
+                                    println!("{}", r.lines().map(|x| format!("  ↳ [{who}] {x}")).collect::<Vec<_>>().join("\n"));
+                                }
+                                None => println!("{r}"),
+                            }
+                        }
                     }
                 }
                 None => break,

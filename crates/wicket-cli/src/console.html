@@ -14,6 +14,8 @@
   header span { color:var(--quiet); font-size:13px; }
   main { max-width:760px; margin:0 auto; padding:12px 16px 40px; }
   h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--quiet); margin:22px 0 8px; }
+  .who { margin:6px 0; font-size:14px; } .who .cand { margin-left:10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .who .note { color:var(--quiet); font-size:12px; margin-top:2px; } .who .warn { color:var(--warn); font-size:13px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:8px 0; }
   .req .what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; word-break:break-all; }
   .meta { color:var(--quiet); font-size:13px; margin-top:4px; }
@@ -98,12 +100,29 @@ async function act(kind, body) {
   try {
     const begin = await post("/api/decide/begin", { ...body, decision: kind });
     const d = begin.decision;
-    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path);
+    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path + ((d.requested_by || []).length ? " for " + d.requested_by.join(", ") : ""));
     const j = await post("/api/decide/finish", await assertWith(begin.publicKey));
     toast(j.ok);
   } catch (e) { toast(e.message); }
   refresh();
 }
+
+// Who in the box asked, from the agent's own event stream: helpful, not proof.
+function renderWho(list) {
+  const w = el("div", "who");
+  const line = r => strip(r.agent) + " — " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
+  if (!list.length) { w.append(el("div", "", "For: unknown (no agent event stream)")); }
+  for (const a of list) {
+    const rs = a.requesters || [];
+    if (a.basis === "none" || !rs.length) w.append(el("div", "", "For: unknown — no tool call was in flight"));
+    else if (a.basis === "ambiguous") { w.append(el("div", "", "For: one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "• " + line(r))); }
+    else w.append(el("div", "", "For: " + line(r0(rs))));
+  }
+  if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+  w.append(el("div", "note", "Reported by the agent's event stream, not proven. Anything in this box could use the grant."));
+  return w;
+}
+const r0 = rs => rs[0];
 
 function renderPending(s) {
   const box = document.getElementById("pending"); box.replaceChildren();
@@ -113,6 +132,7 @@ function renderPending(s) {
     const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
     c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path)));
     c.append(el("div", "why", strip(p.reason)));
+    c.append(renderWho(p.attribution || []));
     c.append(el("div", "meta", p.id + " · zone " + p.zone + " · " + p.run + " · " + ago(s.now, p.created_at)));
     const b = el("div", "buttons");
     const once = el("button", "approve", "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });

@@ -25,6 +25,33 @@ pub struct RunCtx {
     pub events: UnboundedSender<Event>,
     /// False for programs with `on_pending: fail`: out-of-reach requests fail without a pending request.
     pub escalate: bool,
+    /// Who inside the box is making a request to (host, path), as reported by the agent's event
+    /// stream: the attribution as JSON, plus a one-line summary. Untrusted; for humans only.
+    pub attribute: Option<Attributor>,
+}
+
+pub type Attributor = Arc<dyn Fn(&str, &str) -> Option<(serde_json::Value, String)> + Send + Sync>;
+
+/// One line describing an attribution object, for terminals and logs.
+pub fn attribution_line(v: &serde_json::Value) -> String {
+    let rs = v.get("requesters").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    let one = |r: &serde_json::Value| {
+        let g = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
+        format!("{} via {}: {}", g("agent"), g("tool"), g("call").chars().take(80).collect::<String>())
+    };
+    match v.get("basis").and_then(|b| b.as_str()).unwrap_or("none") {
+        "none" => "unknown (no tool call in flight)".into(),
+        "ambiguous" => format!("one of: {}", rs.iter().map(one).collect::<Vec<_>>().join(" | ")),
+        _ => rs.first().map(one).unwrap_or_default(),
+    }
+}
+
+/// The agents an attribution object names.
+pub fn attributed_agents(v: &serde_json::Value) -> Vec<String> {
+    v.get("requesters")
+        .and_then(|r| r.as_array())
+        .map(|rs| rs.iter().filter_map(|r| r.get("agent").and_then(|a| a.as_str()).map(String::from)).collect())
+        .unwrap_or_default()
 }
 
 /// Live events for the operator's console and the audit log.

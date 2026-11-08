@@ -2,6 +2,8 @@
 //! output. Everything configured here is advisory: the box boundary and the proxies enforce.
 //! The launch carries placeholders and routes only, never a credential.
 
+pub mod attribution;
+
 use serde_json::Value;
 use wicket_core::{Manifest, RunId};
 
@@ -160,7 +162,7 @@ pub fn render_event(line: &str) -> Option<String> {
     }
 }
 
-fn summarise_input(v: &Value) -> String {
+pub(crate) fn summarise_input(v: &Value) -> String {
     for key in ["command", "file_path", "url", "pattern", "path", "description"] {
         if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
             return s.to_string();

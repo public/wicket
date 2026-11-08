@@ -87,3 +87,22 @@ proxy, but with no model.
 | Unpinned (development) | runs; prints the digest to approve; the allowed GitHub read works; `example.com` is **blocked** without a pending request (`on_pending: fail`); typed output in 2 s |
 | Pinned to the approved digest | same result in 1 s; the digest is recorded in `run.start` |
 | Pinned, after appending one comment line | refused: the source digest differs from the approved one |
+
+## Subagent attribution (2026-11-08)
+
+The task asked Claude Code (in gVisor, zone `research`, empty reach) to start two subagents in parallel.
+"Fetch example page" ran `curl https://example.com/`; "Count files" ran `ls /workspace | wc -l`.
+
+- wicket labelled each subagent's lines in the run output (`↳ [subagent general-purpose: Fetch example page]`)
+  from `parent_tool_use_id` in Claude Code's stream-json.
+- The blocked request was attributed to the right subagent while both were running (`basis: matched`, by host):
+  `wicket pending` showed `for: subagent general-purpose: Fetch example page via Bash: curl -sS … https://example.com/`.
+- The subagent found `mcp__wicket__await_grant` through ToolSearch and waited on it by itself.
+- The approval's audit record carries `requested_by: ["subagent general-purpose: Fetch example page"]`. The
+  passkey-signed console path signs the same field.
+- After approval the retry was allowed, and the audit records `grant g-…; used by subagent general-purpose:
+  Fetch example page via Bash: curl …`. No mismatch warning, since the same subagent used it.
+- The run succeeded in 36 s.
+
+Not yet covered: the console card was changed but not exercised in a browser in this run, and the
+"used by a different agent" warning is covered only by inspection, not by a test.

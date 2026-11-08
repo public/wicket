@@ -45,6 +45,9 @@ pub struct Request {
     pub reason: String,
     pub status: String,
     pub created_at: i64,
+    /// Who inside the box asked, as reported by the agent's event stream (one entry per distinct
+    /// asker; each is an attribution object). Untrusted: shown to humans, never used to decide.
+    pub attribution: Vec<serde_json::Value>,
 }
 
 /// An operator's passkey (ES256 public key; base64url credential id).
@@ -89,7 +92,8 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
   method TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, risk TEXT NOT NULL, reason TEXT NOT NULL,
-  status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT
+  status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
+  attribution TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
 CREATE TABLE IF NOT EXISTS grants (
@@ -117,6 +121,8 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
+        // Ledgers created before requests recorded who asked.
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN attribution TEXT NOT NULL DEFAULT '[]'", []);
         Ok(Ledger { conn })
     }
 
@@ -154,31 +160,51 @@ impl Ledger {
 
     /// Returns the id of the pending request for this op, creating it if needed (deduplicated on the
     /// op digest, so a retrying agent doesn't flood the queue).
-    pub fn pending_for(&self, op: &Op, reason: &str) -> Result<(String, bool)> {
+    /// Records a pending request for `op`, or returns the existing one. `who` is the attribution of
+    /// this ask; when a *different* asker hits an existing request, it is added, so the human sees
+    /// everyone a grant would serve.
+    pub fn pending_for(&self, op: &Op, reason: &str, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
         let digest = op.digest();
-        if let Some(id) = self
+        if let Some((id, attr)) = self
             .conn
             .query_row(
-                "SELECT id FROM requests WHERE tenant = ?1 AND zone = ?2 AND digest = ?3 AND status = 'pending'",
+                "SELECT id, attribution FROM requests WHERE tenant = ?1 AND zone = ?2 AND digest = ?3 AND status = 'pending'",
                 params![op.tenant.0, op.zone, digest],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?
         {
+            if let Some(w) = who {
+                let mut list: Vec<serde_json::Value> = serde_json::from_str(&attr).unwrap_or_default();
+                if !list.iter().any(|x| same_askers(x, w)) && list.len() < 8 {
+                    list.push(w.clone());
+                    self.conn.execute("UPDATE requests SET attribution = ?2 WHERE id = ?1", params![id, serde_json::Value::from(list).to_string()])?;
+                }
+            }
             return Ok((id, false));
         }
         let id = new_request_id();
+        let attr = serde_json::Value::from(who.cloned().into_iter().collect::<Vec<_>>()).to_string();
         self.conn.execute(
-            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
-            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now()],
+            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
+            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr],
         )?;
         Ok((id, true))
     }
 
+    /// The request a grant was made for, if any.
+    pub fn request_for_grant(&self, grant: &str) -> Result<Option<Request>> {
+        let rid: Option<Option<String>> = self.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![grant], |r| r.get(0)).optional()?;
+        match rid.flatten() {
+            Some(rid) => Ok(Some(self.request(&rid)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn request(&self, id: &str) -> Result<Request> {
         self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
     }
@@ -197,7 +223,7 @@ impl Ledger {
     /// Recently decided requests, newest first.
     pub fn decided(&self, tenant: &TenantId, limit: usize) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests
              WHERE tenant = ?1 AND status != 'pending' ORDER BY decided_at DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![tenant.0, limit as i64], row_to_request)?;
@@ -206,7 +232,7 @@ impl Ledger {
 
     pub fn pending(&self, tenant: &TenantId) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests
              WHERE tenant = ?1 AND status = 'pending' ORDER BY created_at",
         )?;
         let rows = st.query_map(params![tenant.0], row_to_request)?;
@@ -218,7 +244,7 @@ impl Ledger {
     pub fn approve(&mut self, id: &str, a: &Approval) -> Result<String> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let req = tx
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))?;
         if req.status != "pending" {
@@ -406,7 +432,19 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
         reason: r.get(8)?,
         status: r.get(9)?,
         created_at: r.get(10)?,
+        attribution: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
     })
+}
+
+/// Whether two attribution objects name the same askers (same agents and calls).
+fn same_askers(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let key = |v: &serde_json::Value| -> Vec<(String, String)> {
+        v.get("requesters").and_then(|r| r.as_array()).map(|rs| rs.iter().map(|r| (
+            r.get("agent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            r.get("call").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        )).collect()).unwrap_or_default()
+    };
+    key(a) == key(b)
 }
 
 #[cfg(test)]
@@ -418,24 +456,39 @@ mod tests {
     }
 
     #[test]
+    fn every_distinct_asker_is_recorded_on_a_shared_request() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let o = op("/o/r.git/git-receive-pack");
+        let who = |agent: &str| serde_json::json!({"basis": "matched", "requesters": [{"agent": agent, "tool": "Bash", "call": "git push", "tool_use_id": "t"}]});
+        let (id, _) = l.pending_for(&o, "push", Some(&who("subagent fixer"))).unwrap();
+        l.pending_for(&o, "push", Some(&who("subagent fixer"))).unwrap();
+        l.pending_for(&o, "push", Some(&who("main agent"))).unwrap();
+        let r = l.request(&id).unwrap();
+        assert_eq!(r.attribution.len(), 2, "same asker twice counts once; a new asker is added");
+        assert_eq!(r.attribution[1]["requesters"][0]["agent"], "main agent");
+        let gid = l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        assert_eq!(l.request_for_grant(&gid).unwrap().unwrap().id, id);
+    }
+
+    #[test]
     fn pending_is_deduplicated_and_single_use_grant_is_consumed_once() {
         let mut l = Ledger::open_in_memory().unwrap();
         let o = op("/o/r.git/git-receive-pack");
-        let (id, fresh) = l.pending_for(&o, "push").unwrap();
+        let (id, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh);
-        assert_eq!(l.pending_for(&o, "push").unwrap(), (id.clone(), false));
+        assert_eq!(l.pending_for(&o, "push", None).unwrap(), (id.clone(), false));
         assert_eq!(l.consume_grant(&o).unwrap(), None);
-        l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "alex".into() }).unwrap();
+        l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         assert!(l.consume_grant(&o).unwrap().is_some());
         assert_eq!(l.consume_grant(&o).unwrap(), None, "single use");
-        assert!(matches!(l.deny(&id, "alex"), Err(StoreError::NotPending(_, _))));
+        assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
     }
 
     #[test]
     fn prefix_grants_never_exceed_the_ask() {
         let mut l = Ledger::open_in_memory().unwrap();
         let o = op("/o/r/contents/docs/a.md");
-        let (id, _) = l.pending_for(&o, "x").unwrap();
+        let (id, _) = l.pending_for(&o, "x", None).unwrap();
         // A prefix that is not a prefix of the asked path is ignored: the grant stays exact.
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(60), path_prefix: Some("/other".into()), decided_by: "a".into() }).unwrap();
         assert!(l.consume_grant(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
@@ -445,7 +498,7 @@ mod tests {
     #[test]
     fn ending_a_run_withdraws_its_pending_requests() {
         let l = Ledger::open_in_memory().unwrap();
-        let (id, _) = l.pending_for(&op("/x"), "x").unwrap();
+        let (id, _) = l.pending_for(&op("/x"), "x", None).unwrap();
         assert_eq!(l.run_ended(&RunId("run_t".into()), "succeeded", "").unwrap(), 1);
         assert_eq!(l.request(&id).unwrap().status, "withdrawn");
         assert!(l.pending(&TenantId::single()).unwrap().is_empty());

@@ -184,6 +184,44 @@ header set/remove and credential, deny, need-body; fail closed; per-request time
 plane swappable and lets us test the decider offline from recorded frames, and run Anthropic's `srt-proxy`
 as a differential reference. [04 §7.1]
 
+### 3.2 Identity: proving an agent is one of ours (owner, 2026-11-08)
+
+The owner's requirement: there must be cryptographic proof that an agent in a given zone is one of wicket's.
+The proof must not depend on agents registering themselves at startup.
+
+**Launch is registration.** An agent never enrols itself. wicket creates the identity record *before* the
+box starts, from facts it chose and can hash:
+- tenant, zone, agent id (§13) and activation;
+- manifest digest, policy epoch, image digest, adapter and agent version;
+- the node it runs on.
+
+It then binds that record to the channels it creates for that box: the unix sockets that only that box
+gets. A self-registration handshake would be weaker in every way. It would put a bearer secret in the box,
+where any code there can read it. It would prove only that *something* in the box knew a bootstrap token,
+and a leaked token could be replayed.
+
+**No identity key ever enters the box.** Anything in the box can read anything else in it, so a key
+there identifies the box at best, and only until something copies it. Instead the enforcement points
+assert identity *on the box's behalf*:
+
+| Who needs the proof | Mechanism |
+|---|---|
+| wicket's own proxies | The socket a request arrives on *is* the box (no token; already the PoC's model). On remote nodes, the forwarded socket rides an SSH or mTLS channel to a node wicket enrolled, with the host key pinned at provisioning. The PoC still trusts the host key on first use. |
+| Other zones, other tenants (§15 sharing), the console | Every gate message, handle and output is wrapped by the gateway in a **signed envelope**: issuer, identity record digest, content digest, labels. A receiver verifies wicket's signature, never the sender's claim. |
+| External services | `wicket-egress` signs outbound requests with **HTTP Message Signatures** (RFC 9421), as Web Bot Auth does. It is opt-in per reach rule, and carries a `Signature-Agent` that resolves to the zone's identity. |
+| Anyone auditing a result later | A **launch attestation** signed at start (the identity record) and a **result attestation** signed at end (output digests, the egress decisions, grants used). This is in-toto/SLSA-style provenance, chained into the audit log. |
+| wicket, about its own nodes | Node enrolment with a one-time join token leads to a node key, held in a TPM where there is one, and short-lived mTLS certificates. Later, a hardware attestation (SEV-SNP/TDX quote, TPM quote) that the node runs the expected runtime. Until then a node is trusted because wicket created it through the provider API and pinned its host key. |
+
+**Naming.** wicket is the issuer for its trust domain, in the way SPIRE is for SPIFFE. Identities look like
+`spiffe://<install>/t/<tenant>/z/<zone>/a/<agent>`, with the activation and run as claims. Signing keys
+live in the vault, or a KMS/HSM in production, and are rotated. Short-lived certificates and signatures
+carry the policy epoch, so a revocation is visible to verifiers.
+
+**Granularity is the sandbox.** Subagents inside one box share a process and a uid, so per-subagent
+*cryptographic* identity is impossible there. Per-subagent attribution is reported, not proven (§11.1).
+An agent whose identity must be provable on its own runs in its own sandbox, as a wicket child or team
+member, and gets its own record, sockets and signatures.
+
 ---
 
 ## 4. Core model
@@ -1210,6 +1248,29 @@ PendingHuman → Granted | Denied | Expired          Granted → Active → Clos
   something else and is inflated by ASB's forced attack-tool injection [06].) If the parent tier is ever
   turned on, it gets a mechanically checked limit on what it may approve (no endorsement, at most R2),
   with each ruling bound single-use to the exact call.
+
+### 11.1 Who a request is for (owner, 2026-11-08: "a user can't approve a grant if it doesn't know who it's for")
+
+Every pending request names who asked, and the human sees it before deciding.
+- **Across sandboxes** this is exact: the identity is the socket (§3.2).
+- **Inside one sandbox** (Claude Code's subagents and agent teams, Codex threads, a crew) it is reported,
+  not proven. wicket reads the agent's own event stream outside the box. For Claude Code, every subagent
+  tool call carries `parent_tool_use_id`, which points at the `Agent` call that started the subagent, with
+  its type and description. wicket matches a blocked request to the calls in flight: exactly one call
+  naming the host or git operation, else the only call in flight, else every candidate. It never picks
+  one silently.
+- The console card shows "For: subagent general-purpose: Fetch example page — Bash: curl …", the
+  candidates when it's ambiguous, and a warning when more than one agent asked for the same thing (one
+  grant would serve them all). It always adds a note that the attribution is reported, and that anything
+  in the box could use the grant.
+- The passkey signs `requested_by` together with the decision, so the record says who the human was told
+  it was for.
+- When a grant is used, the user is attributed too. A grant used by an agent other than the one it was
+  approved for is flagged in the audit log. A later policy could revoke it, or require approval per agent.
+- A request no in-flight call explains is shown as "unknown". That itself is a signal: a background
+  process, or something the agent didn't announce.
+
+Built in the PoC and verified with two concurrent Claude Code subagents ([poc-results](poc-results.md)).
 
 ---
 

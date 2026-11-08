@@ -362,6 +362,8 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
                 "method": req.method, "host": req.host, "path": req.path, "risk": req.risk,
                 "decision": if approve { "approve" } else { "deny" },
                 "uses": uses, "ttl_secs": if approve { Some(ttl_secs) } else { None },
+                // Who the human was told this is for; the passkey signs it with the decision.
+                "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
             })
             .to_string();
             let nonce = random_bytes(16);
