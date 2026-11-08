@@ -13,6 +13,8 @@ outside the sandbox, and shows humans the boundaries as zones and gates.
 The PoC is a vertical slice of milestones M0 and M1: one Claude Code agent, one zone, one sandbox, single tenant
 (`t0`, with tenant ids carried everywhere so platform mode can be added).
 
+![PoC architecture: processes, trust boundaries and what runs where](docs/poc-architecture.svg)
+
 What it does:
 - runs Claude Code in a **gVisor** container with **no network** (`--network none`, read-only root, all
   capabilities dropped);
