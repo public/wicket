@@ -1,0 +1,46 @@
+# A guided tour of the PoC. Watch the console while it runs.
+#
+# - The lead agent reads a public GitHub repo: allowed by the zone's reach, so no prompt.
+# - It starts a child agent ("fetcher") in its own sandbox with its own identity. The child's read of
+#   example.com is outside the reach, so it waits for you. The console card shows which agent it is,
+#   verified, and who it acts for.
+# - The lead then tries to push to the repo. Pushes are risk R4, so that waits for you too: deny it.
+# - The child reports back to the lead in a signed message, and the lead writes a summary.
+#
+#   wicket serve                               # the console (passkey sign-in)
+#   wicket run examples/demo.yaml              # the agents
+task: |
+  You are the lead agent in a demonstration of wicket, the system that sandboxes you. Use the wicket
+  MCP tools (load them with ToolSearch: whoami, spawn_agent, await_message, await_grant).
+  1. Call wicket whoami and note your identity and who you act for.
+  2. Read https://api.github.com/repos/octocat/Hello-World with curl and note its description and
+     default branch.
+  3. Call wicket spawn_agent with name "fetcher" and this task: "Fetch https://example.com/ with curl
+     and note its <title>. If you get a 403 pending-approval response, call the wicket await_grant tool
+     with its request_id (timeout_seconds 600) and then retry once. Then send your parent a message
+     with wicket send_message (to: "parent"), body {"title": ..., "http_status": ...}."
+  4. While the child works, try to push to the repository: run
+     `git ls-remote https://github.com/octocat/Hello-World.git` (allowed), then
+     `curl -sS -X POST https://github.com/octocat/Hello-World.git/git-receive-pack` (a push: it will need
+     a human's approval). If it is pending, call await_grant with its request_id (timeout_seconds 600).
+     If a human denies it, accept that and do not look for another way.
+  5. Call wicket await_message (timeout_seconds 600) until you have the child's message and its
+     run_finished message.
+  6. Write /workspace/out/result.json with: your identity, the repo description, what happened to the
+     push, and the child's message (with the sender identity wicket reported).
+agent:
+  name: lead
+  max_turns: 40
+  max_children: 1
+  in_box_subagents: false
+zone:
+  name: research
+  isolation: gvisor
+  reach:
+    - { host: api.github.com, paths: ["/repos/octocat/Hello-World", "/repos/octocat/Hello-World/**"] }
+    - { host: github.com, methods: [GET], paths: ["/octocat/Hello-World.git/info/refs"] }
+  llm:
+    secret: claude-oauth
+    max_requests: 80
+    max_output_tokens: 80000
+  limits: { memory: 1500m, cpus: 1, timeout: 25m }
