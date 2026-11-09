@@ -41,8 +41,11 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - Agents talk only through wicket: `send_message` and `await_message` in the gateway. wicket sets and signs the
   sender. Parent and child may always talk; other zones only if the recipient's zone lists them in
   `accept_from`.
-- `max_children: N` in the agent spec allows `spawn_agent`: a child agent in its own sandbox with its own identity,
-  whose requests are approved separately. Set `in_box_subagents: false` to make that the only kind of subagent.
+- `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own sandbox and identity, in a
+  zone the agent writes. That zone must be a subset of the agent's own: reach, credentials, model budget (carved
+  out), resources, time, isolation and images. Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
+  exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
+  `in_box_subagents: false` to make wicket children the only kind of subagent.
 - Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
   `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
   and approvals.

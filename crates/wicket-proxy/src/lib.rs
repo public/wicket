@@ -84,15 +84,31 @@ impl IdentityCell {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A box an agent asks to start (design §5.1): an agent or a program, in a zone the agent writes
+/// itself, which must be a subset of its own unless a human approves exactly that zone.
+#[derive(Debug, Clone, Default)]
 pub struct SpawnRequest {
-    pub agent: String,
-    pub task: String,
-    /// Narrow the child's reach to these hosts (each must already be in the parent's reach).
+    pub name: String,
+    /// "agent" or "program" (a program can be a long-running service).
+    pub kind: String,
+    /// An agent's task.
+    pub task: Option<String>,
+    /// A program's command line.
+    pub command: Vec<String>,
+    /// Default: the parent's image.
+    pub image: Option<String>,
+    /// The new zone, in manifest form (JSON). Omitted fields default to the parent's (limits with the
+    /// time it has left, isolation, unlisted_hosts) or to nothing (reach, inject, volumes).
+    pub zone: Option<serde_json::Value>,
+    pub max_children: u32,
+    /// If the zone isn't a subset of the parent's, put exactly this zone to a human instead of refusing.
+    pub ask_human: bool,
+    /// spawn_agent's shorthand: the parent's zone, narrowed to these hosts.
     pub reach_hosts: Option<Vec<String>>,
 }
 
-pub type Spawner = Arc<dyn Fn(SpawnRequest) -> anyhow::Result<String> + Send + Sync>;
+/// Ok: what to tell the agent (started, or waiting for approval). Err: why not.
+pub type Spawner = Arc<dyn Fn(SpawnRequest) -> std::result::Result<String, String> + Send + Sync>;
 
 /// Maximum size of a message body, in bytes of JSON.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;

@@ -175,9 +175,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // run lives, so a leaked key or document is useful for minutes, not for the run.
     let identity_ttl = identity_ttl();
     let mut id_spec: Option<wicket_identity::IdentitySpec> = None;
-    let identity: Option<Arc<wicket_proxy::IdentityCell>> = match &m.agent {
+    // Every box gets one: agents and programs alike (a program signs its run_finished with it).
+    let workload_name = m.agent.as_ref().map(|a| a.name.clone()).or_else(|| m.program.as_ref().map(|p| p.name.clone()));
+    let identity: Option<Arc<wicket_proxy::IdentityCell>> = match &workload_name {
         None => None,
-        Some(a) => {
+        Some(wname) => {
             let issuer = crate::issuer()?;
             let key = wicket_identity::AgentKey::generate();
             let now = wicket_store::now();
@@ -207,7 +209,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None => (crate::cli_principal(), None),
             };
             let spec = wicket_identity::IdentitySpec {
-                tenant: m.tenant.0.clone(), zone: m.zone.name.clone(), agent: a.name.clone(), run: run.0.clone(), parent_run: parent_run.clone(),
+                tenant: m.tenant.0.clone(), zone: m.zone.name.clone(), agent: wname.clone(), run: run.0.clone(), parent_run: parent_run.clone(),
                 manifest_sha256: manifest_sha256.clone(), image: image.to_string(), node: node_name.clone(), principal, act,
             };
             let jws = issuer.issue(&spec, now, ttl, &key.public());
@@ -216,7 +218,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             {
                 let l = ledger.lock().expect("ledger");
                 l.put_identity(&wicket_store::IdentityRow {
-                    run: run.0.clone(), tenant: m.tenant.0.clone(), spiffe_id: claims.sub.clone(), zone: m.zone.name.clone(), agent: a.name.clone(),
+                    run: run.0.clone(), tenant: m.tenant.0.clone(), spiffe_id: claims.sub.clone(), zone: m.zone.name.clone(), agent: wname.clone(),
                     parent_run: parent_run.clone(), accept_from: m.zone.accept_from.clone(), jws: jws.clone(), issued_at: now,
                 })?;
                 l.audit(&m.tenant, Some(&run), "identity.issued", &serde_json::json!({
@@ -232,66 +234,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
-        Some(a) if a.max_children > 0 => {
-            let (pm, prun, pdir, kids) = (m.clone(), run.0.clone(), dir.clone(), children.clone());
-            let (img, node_arg, key_arg) = (image.to_string(), node.as_ref().map(|n| n.target.clone()), ssh_key.map(|k| k.to_path_buf()));
-            let max = a.max_children as usize;
-            Some(Arc::new(move |req: wicket_proxy::SpawnRequest| -> Result<String> {
-                let ok_name = !req.agent.is_empty() && req.agent.len() <= 32 && req.agent.starts_with(|c: char| c.is_ascii_lowercase())
-                    && req.agent.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-                if !ok_name {
-                    bail!("name must match ^[a-z][a-z0-9-]{{0,31}}$");
-                }
-                let mut kids = kids.lock().expect("children");
-                if kids.len() >= max {
-                    bail!("this agent may start at most {max} children");
-                }
-                let mut cm = pm.clone();
-                cm.task = req.task;
-                if let Some(ca) = cm.agent.as_mut() {
-                    ca.name = req.agent.clone();
-                    ca.max_children = 0; // no grandchildren in the PoC
-                    ca.idle_timeout = "0s".into(); // a child reports to its parent, not the operator
-                }
-                if let Some(hosts) = &req.reach_hosts {
-                    for h in hosts {
-                        if !pm.zone.reach.iter().any(|r| &r.host == h) {
-                            bail!("{h} is not in this agent's reach; a child's reach can only narrow");
-                        }
-                    }
-                    cm.zone.reach.retain(|r| hosts.contains(&r.host));
-                    cm.zone.inject.retain(|i| hosts.contains(&i.host));
-                }
-                let child = RunId::new();
-                let cdir = pdir.join("children");
-                std::fs::create_dir_all(&cdir)?;
-                let yaml = cdir.join(format!("{}.yaml", child.0));
-                std::fs::write(&yaml, serde_yaml::to_string(&cm)?)?;
-                let log = std::fs::File::create(cdir.join(format!("{}.log", child.0)))?;
-                let mut cmd = std::process::Command::new(std::env::current_exe()?);
-                cmd.args(["run", "--run-id", &child.0, "--parent-run", &prun, "--image", &img]);
-                if let Some(n) = &node_arg {
-                    cmd.args(["--node", n]);
-                }
-                if let Some(k) = &key_arg {
-                    cmd.arg("--ssh-key").arg(k);
-                }
-                cmd.arg(&yaml).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
-                let proc = cmd.spawn().context("starting the child agent")?;
-                // The child records its identity before its box starts; wait for it so the parent can
-                // message it straight away.
-                let ledger = crate::ledger_path();
-                for _ in 0..100 {
-                    if Ledger::open(&ledger).ok().and_then(|l| l.identity(&child.0).ok().flatten()).is_some() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                kids.push((child.0.clone(), proc));
-                Ok(child.0)
-            }) as wicket_proxy::Spawner)
-        }
+        Some(a) if a.max_children > 0 => Some(crate::spawn::spawner(crate::spawn::SpawnCtx {
+            parent: m.clone(),
+            run: run.clone(),
+            dir: dir.clone(),
+            image: image.to_string(),
+            node: node.as_ref().map(|n| n.target.clone()),
+            ssh_key: ssh_key.map(|k| k.to_path_buf()),
+            ledger: ledger.clone(),
+            children: children.clone(),
+            llm: llm_slot.clone(),
+            deadline: std::time::Instant::now() + m.zone.limits.timeout()?,
+        })),
         _ => None,
     };
 
@@ -345,6 +301,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute, identity: identity.clone(), spawner, swaps };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
+    let _ = llm_slot.set(llm.clone());
     let gateway = Gateway::new(ctx.clone());
     let (es, ls, gs) = (dir.join("sock/egress.sock"), dir.join("sock/llm.sock"), dir.join("sock/gateway.sock"));
     let g_task = tokio::spawn({
@@ -571,6 +528,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     let mut status = "unknown".to_string();
+    // A program's last lines of output: its result, when it reports to a parent.
+    let mut program_tail: Vec<String> = Vec::new();
     loop {
         tokio::select! {
             ex = child.wait(), if lines.is_none() => {
@@ -588,6 +547,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let _ = writeln!(transcript_f, "{l}");
                     if is_program {
                         println!("[program] {}", wicket_agent::clip(&l, 300));
+                        program_tail.push(l.clone());
+                        if program_tail.len() > 40 {
+                            program_tail.remove(0);
+                        }
                     } else {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
@@ -685,7 +648,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let result = std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     // A child reports back to its parent with a signed message, before its run is marked ended.
     if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {
-        let body = serde_json::json!({ "status": status, "result": result });
+        let output: String = program_tail.join("\n").chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
+        let body = if is_program {
+            serde_json::json!({ "status": status, "result": result, "output_tail": output })
+        } else {
+            serde_json::json!({ "status": status, "result": result })
+        };
         match ctx.send_message(p, "run_finished", body) {
             Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
             Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),

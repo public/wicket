@@ -27,10 +27,21 @@ pub struct Llm {
     pub requests: AtomicU64,
     pub input_tokens: AtomicU64,
     pub output_tokens: AtomicU64,
+    /// Budget handed to boxes this run started (spawn): no longer this run's to spend.
+    pub reserved_requests: AtomicU64,
+    pub reserved_output_tokens: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
 }
 
 impl Llm {
+    /// Model requests and output tokens this run has left to spend or hand on.
+    pub fn remaining(&self) -> Option<(u64, u64)> {
+        let spec = self.ctx.zone.llm.as_ref()?;
+        let used_r = self.requests.load(Ordering::SeqCst) + self.reserved_requests.load(Ordering::SeqCst);
+        let used_t = self.output_tokens.load(Ordering::SeqCst) + self.reserved_output_tokens.load(Ordering::SeqCst);
+        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(used_t)))
+    }
+
     pub fn new(ctx: RunCtx) -> Result<Arc<Llm>> {
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(Arc::new(Llm {
@@ -39,6 +50,8 @@ impl Llm {
             requests: AtomicU64::new(0),
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
+            reserved_requests: AtomicU64::new(0),
+            reserved_output_tokens: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
     }
@@ -71,12 +84,12 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
-        let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1 + self.reserved_requests.load(Ordering::SeqCst);
         if n > spec.max_requests {
             self.event(None, 429, 0, 0, "budget: request cap reached");
             return problem(429, "budget", "Model request budget exhausted", &format!("this run may make at most {} model requests", spec.max_requests), None);
         }
-        if self.output_tokens.load(Ordering::SeqCst) >= spec.max_output_tokens {
+        if self.output_tokens.load(Ordering::SeqCst) + self.reserved_output_tokens.load(Ordering::SeqCst) >= spec.max_output_tokens {
             self.event(None, 429, 0, 0, "budget: output token cap reached");
             return problem(429, "budget", "Model token budget exhausted", &format!("this run may generate at most {} output tokens", spec.max_output_tokens), None);
         }

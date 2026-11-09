@@ -505,12 +505,44 @@ dereferences it, which taints `fix` with `web` and blocks its pushes."*
 
 - **Static:** wicketd runs the manifest's graph directly. Zones run in dependency order, and outputs flow
   through gates.
-- **Dynamic** (PoC: `spawn_agent`, with `max_children` in the agent spec; same zone, reach narrowed by host,
-  no grandchildren yet): a zone may be granted the `wicket.spawn` tool in its MCP gateway. A parent calls
+- **Dynamic** (PoC: `spawn`, with `max_children` in the agent spec): a zone may be granted the
+  `wicket.spawn` tool in its MCP gateway. A parent calls
   `spawn(zone_template, task_text, inputs: [handle…])`. wicketd checks child ⊆ parent and admits only
   handles and typed values as inputs. **The child's task text inherits the parent's label.** It is only as
   trusted as the parent, and re-derivation for the child's escalations runs against the chain of task texts
   back to the root, each with its label.
+
+**Agents construct zones** (owner, 2026-11-09: as long as the new zone's permissions are a subset of the
+agent's own; a human with that much access can approve an extension). Built:
+- **`spawn` starts an agent (task) or a program (command, possibly a long-running service)** in a zone the
+  caller writes.
+- **`wicket_core::subset` proves the zone is within the caller's,** conservatively; anything it can't prove
+  is a violation, and every violation is listed. It checks:
+  - reach: host, method and path, each covered by a parent rule;
+  - credential injections: only the parent's own;
+  - model budget: at most what's left, and then carved out of the parent's;
+  - memory, CPU, PIDs and time;
+  - isolation: at least as strong;
+  - images: from the parent's allowlist;
+  - `accept_from` and child slots.
+- **Inherited without asking:** the parent's `forbid` rules, `unlisted_hosts: hide`, and defaults no wider
+  than the parent's.
+- **With `ask_human`, a wider zone becomes a pending request** bound to the request as the agent stated it.
+  A human approves, and the agent's identical retry starts exactly that zone. It's audited as
+  `spawn.beyond_parent`.
+- **Every box gets an identity,** programs included, chained to its creator and the human. Programs report
+  back with a signed `run_finished` carrying their output tail.
+
+**Humans are principals under the same rules** (owner, 2026-11-09): an identity, an authority (by default
+everything) and audited, signed actions. An approval is a principal delegating part of its own authority,
+accepted only within it (#11).
+
+Also recorded as issues:
+- MCP servers per zone, granted by the creator within its own access (#9);
+- agent-built MCP servers as reusable tools (#10);
+- `expose`/`connect` (#6);
+- `request_capacity` (#7);
+- moving a running agent to a bigger box by checkpoint and restore, or a provider resize (#8).
 
 ### 5.2 Policy derivation
 

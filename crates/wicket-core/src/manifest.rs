@@ -167,6 +167,9 @@ pub struct ZoneSpec {
     /// inherits its labels, design §12).
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
+    /// Images boxes in this zone may start other boxes from (besides their own), with `spawn`.
+    #[serde(default)]
+    pub images: Vec<String>,
     /// Zones whose agents may send messages to agents in this zone (besides parent and children).
     /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
     #[serde(default)]
