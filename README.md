@@ -30,7 +30,27 @@ What it does:
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
 
-### Requirements
+#### Agent identity and child agents
+
+Every agent run gets an identity issued by the installation (`spiffe://wicket.local/t/<tenant>/z/<zone>/a/<agent>`),
+an EdDSA-signed document whose key is held by wicket, never by the box.
+
+- Show it: `wicket identity issuer` (public key for verifiers), `wicket identity list`, `wicket identity show <run>`.
+- Pending requests show the requesting agent's verified identity. The console won't approve for an agent
+  whose identity doesn't verify.
+- Agents talk only through wicket: `send_message` and `await_message` in the gateway. wicket sets and signs the
+  sender. Parent and child may always talk; other zones only if the recipient's zone lists them in
+  `accept_from`.
+- `max_children: N` in the agent spec allows `spawn_agent`: a child agent in its own sandbox with its own identity,
+  whose requests are approved separately. Set `in_box_subagents: false` to make that the only kind of subagent.
+- Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
+  `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
+  and approvals.
+- Every identity records who it acts for, back to the human: `acting for: alice (cli, unix-user) → lead → fetcher`.
+- `wicket audit --verify` re-checks every identity ever issued (rotations included) and every message signature,
+  offline.
+
+## Requirements
 
 Linux with Docker and gVisor (`runsc`) registered as a Docker runtime with `--host-uds=open`:
 

@@ -4,6 +4,7 @@ members = [
     "crates/wicket-core",
     "crates/wicket-store",
     "crates/wicket-auth",
+    "crates/wicket-identity",
     "crates/wicket-proxy",
     "crates/wicket-sandbox",
     "crates/wicket-agent",
@@ -46,6 +47,7 @@ humantime = "2"
 wicket-core = { path = "crates/wicket-core" }
 wicket-store = { path = "crates/wicket-store" }
 wicket-auth = { path = "crates/wicket-auth" }
+wicket-identity = { path = "crates/wicket-identity" }
 wicket-proxy = { path = "crates/wicket-proxy" }
 wicket-sandbox = { path = "crates/wicket-sandbox" }
 wicket-agent = { path = "crates/wicket-agent" }

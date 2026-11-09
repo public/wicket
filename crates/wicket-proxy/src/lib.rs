@@ -28,7 +28,51 @@ pub struct RunCtx {
     /// Who inside the box is making a request to (host, path), as reported by the agent's event
     /// stream: the attribution as JSON, plus a one-line summary. Untrusted; for humans only.
     pub attribute: Option<Attributor>,
+    /// This agent instance's wicket-issued identity (design §3.2), rotated while it runs. None for
+    /// programs.
+    pub identity: Option<Arc<IdentityCell>>,
+    /// Starts a child agent in its own sandbox; None when the agent may not spawn.
+    pub spawner: Option<Spawner>,
 }
+
+/// An agent instance's identity: the document wicket issued and the key it signs with on the
+/// agent's behalf. The key lives here, in the `wicket run` process, never in the box.
+pub struct RunIdentity {
+    pub jws: String,
+    pub claims: wicket_identity::AgentClaims,
+    pub key: wicket_identity::AgentKey,
+    /// The installation issuer's public key, for verifying other agents' envelopes.
+    pub issuer: wicket_identity::VerifyingKey,
+}
+
+/// The current identity of a run. The runner swaps in a fresh document and key every few minutes;
+/// readers always take the latest.
+pub struct IdentityCell(std::sync::RwLock<Arc<RunIdentity>>);
+
+impl IdentityCell {
+    pub fn new(i: RunIdentity) -> IdentityCell {
+        IdentityCell(std::sync::RwLock::new(Arc::new(i)))
+    }
+    pub fn current(&self) -> Arc<RunIdentity> {
+        self.0.read().expect("identity").clone()
+    }
+    pub fn replace(&self, i: RunIdentity) {
+        *self.0.write().expect("identity") = Arc::new(i);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnRequest {
+    pub agent: String,
+    pub task: String,
+    /// Narrow the child's reach to these hosts (each must already be in the parent's reach).
+    pub reach_hosts: Option<Vec<String>>,
+}
+
+pub type Spawner = Arc<dyn Fn(SpawnRequest) -> anyhow::Result<String> + Send + Sync>;
+
+/// Maximum size of a message body, in bytes of JSON.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 pub type Attributor = Arc<dyn Fn(&str, &str) -> Option<(serde_json::Value, String)> + Send + Sync>;
 
@@ -64,6 +108,52 @@ pub enum Event {
 }
 
 impl RunCtx {
+    /// Sends a signed message from this agent to the agent running as `to_run`. The sender is this
+    /// run's identity, set by wicket; the agent can't choose it. Allowed between parent and child,
+    /// or when the recipient's zone lists this zone in `accept_from`, within one tenant.
+    pub fn send_message(&self, to_run: &str, kind: &str, body: serde_json::Value) -> std::result::Result<String, String> {
+        let me = self.identity.as_ref().ok_or("this run has no wicket identity")?.current();
+        let now = wicket_store::now();
+        if me.claims.exp <= now {
+            return Err("this agent's identity has expired and was not refreshed; it can't send".into());
+        }
+        let size = body.to_string().len();
+        if size > MAX_MESSAGE_BYTES {
+            return Err(format!("message body is {size} bytes; the limit is {MAX_MESSAGE_BYTES}"));
+        }
+        let l = self.ledger.lock().map_err(|_| "ledger lock")?;
+        if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
+            return Err(format!("this agent's identity was revoked (revoked: {r})"));
+        }
+        let rec = match l.identity(to_run).map_err(|e| e.to_string())? {
+            Some(r) if r.tenant == self.tenant.0 => r,
+            _ => return Err(format!("no agent {to_run}")),
+        };
+        if l.run_status(to_run).map_err(|e| e.to_string())?.as_deref() != Some("running") {
+            return Err(format!("agent {} ({to_run}) is not running", rec.agent));
+        }
+        let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
+            "child"
+        } else if me.claims.parent_run.as_deref() == Some(to_run) {
+            "parent"
+        } else if rec.accept_from.iter().any(|z| z == &self.zone.name) {
+            "peer"
+        } else {
+            return Err(format!("zone {} does not accept messages from zone {} (its accept_from does not list it)", rec.zone, self.zone.name));
+        };
+        let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let payload = serde_json::json!({
+            "jti": id, "iat": now, "kind": kind,
+            "to": rec.spiffe_id, "to_run": to_run, "body": body,
+        });
+        let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
+        l.add_message(&id, &self.tenant, &self.run.0, to_run, &env).map_err(|e| e.to_string())?;
+        let _ = l.audit(&self.tenant, Some(&self.run), "message", &serde_json::json!({
+            "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
+        }));
+        Ok(id)
+    }
+
     pub(crate) fn emit(&self, ev: Event) {
         if let Ok(v) = serde_json::to_value(&ev) {
             if let Ok(l) = self.ledger.lock() {

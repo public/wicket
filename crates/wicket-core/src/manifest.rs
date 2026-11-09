@@ -76,6 +76,19 @@ pub struct AgentSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// How many child agents this agent may start with `spawn_agent`, each in its own sandbox with
+    /// its own identity (design §3.2, §5.1). 0 = none.
+    #[serde(default)]
+    pub max_children: u32,
+    /// Whether the agent may also run its own in-box subagents (Claude Code's Agent tool). Their
+    /// requests are attributed but not provably identified; set false to require that every
+    /// subagent is a wicket child with its own identity.
+    #[serde(default = "yes")]
+    pub in_box_subagents: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_agent_kind() -> String {
@@ -107,6 +120,10 @@ pub struct ZoneSpec {
     /// The model route; required for agents, absent for programs.
     #[serde(default)]
     pub llm: Option<LlmSpec>,
+    /// Zones whose agents may send messages to agents in this zone (besides parent and children).
+    /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
+    #[serde(default)]
+    pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
 }
