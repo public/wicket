@@ -29,6 +29,8 @@ pub struct SandboxSpec {
     /// uid:gid inside the box (the host user, so files in the workspace stay ours).
     pub user: String,
     pub workdir: String,
+    /// Keep the agent's stdin open (the supervisor writes its task and follow-ups there).
+    pub interactive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +130,9 @@ impl Docker {
             "--label".into(),
             "wicket=1".into(),
         ];
+        if spec.interactive {
+            a.push("--interactive".into());
+        }
         for m in &spec.mounts {
             a.push("--mount".into());
             a.push(format!(
@@ -149,7 +154,7 @@ impl Docker {
     /// Starts the box with stdout and stderr piped.
     pub fn spawn(&self, spec: &SandboxSpec) -> Result<Child> {
         let mut c = self.command_with(self.build_args(spec));
-        c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        c.stdin(if spec.interactive { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         Ok(c.spawn().context("starting docker run")?)
     }
 
@@ -188,12 +193,14 @@ mod tests {
             pids: 64,
             user: "1000:1000".into(),
             workdir: "/workspace".into(),
+            interactive: true,
         };
         let a = d.build_args(&spec).join(" ");
         assert!(a.contains("--network none"));
         assert!(a.contains("--runtime runsc"));
         assert!(a.contains("--cap-drop ALL"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
+        assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));
     }
 

@@ -85,6 +85,29 @@ pub struct AgentSpec {
     /// subagent is a wicket child with its own identity.
     #[serde(default = "yes")]
     pub in_box_subagents: bool,
+    /// Keep the session open this long after each turn for follow-up messages from the operator
+    /// (`wicket say <run> …`). "0s" (default) ends the run when the first task is done.
+    #[serde(default = "zero")]
+    pub idle_timeout: String,
+    /// Extra environment for the agent: non-secret configuration only. Variables
+    /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+fn zero() -> String {
+    "0s".into()
+}
+
+/// Environment variables a manifest may not set: wicket's routes, trust and placeholders.
+pub const RESERVED_ENV_PREFIXES: [&str; 12] = [
+    "ANTHROPIC_", "CLAUDE_", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_", "CURL_", "NODE_", "MCP_", "GIT_SSL", "WICKET_",
+];
+
+impl AgentSpec {
+    pub fn idle(&self) -> Result<std::time::Duration, ManifestError> {
+        humantime::parse_duration(&self.idle_timeout).map_err(|e| ManifestError::Invalid(format!("agent.idle_timeout: {e}")))
+    }
 }
 
 fn yes() -> bool {
@@ -120,12 +143,27 @@ pub struct ZoneSpec {
     /// The model route; required for agents, absent for programs.
     #[serde(default)]
     pub llm: Option<LlmSpec>,
+    /// Named directories that persist between runs of this zone, mounted read-write at `path`: any
+    /// state a workload keeps (a cache, a dataset, model weights, a database). Per tenant and zone,
+    /// and shared by the zone's runs, so whatever one run leaves there the next one reads (and
+    /// inherits its labels, design §12).
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
     /// Zones whose agents may send messages to agents in this zone (besides parent and children).
     /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
     #[serde(default)]
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeSpec {
+    /// `[a-z0-9-]+`, unique within the zone.
+    pub name: String,
+    /// Absolute path inside the box, under /volumes.
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,11 +193,15 @@ fn default_paths() -> Vec<String> {
 pub struct InjectRule {
     pub host: String,
     pub header: String,
-    /// e.g. `Bearer {secret}`.
+    /// e.g. `Bearer {secret}`, or `Basic {basic:x-access-token}` for base64("x-access-token:<secret>").
     #[serde(default = "default_format")]
     pub format: String,
     /// Name of the secret in wicket's vault.
     pub secret: String,
+    /// If the secret isn't in the vault, send requests to this host without it instead of refusing
+    /// to start (e.g. anonymous reads of a public repo until a token is set up).
+    #[serde(default)]
+    pub optional: bool,
 }
 
 fn default_format() -> String {
@@ -259,6 +301,13 @@ impl Manifest {
                     Some(_) => return Err(ManifestError::Invalid("only the anthropic LLM provider is supported in the PoC".into())),
                     None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
                 }
+                a.idle()?;
+                for k in a.env.keys() {
+                    let ok = !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                    if !ok || RESERVED_ENV_PREFIXES.iter().any(|p| k.starts_with(p)) || ["HOME", "PATH", "USER"].contains(&k.as_str()) {
+                        return Err(ManifestError::Invalid(format!("agent.env may not set {k:?}: wicket controls it")));
+                    }
+                }
             }
             (None, Some(p)) => {
                 if p.command.is_empty() {
@@ -279,8 +328,16 @@ impl Manifest {
             }
         }
         for i in &self.zone.inject {
-            if !i.format.contains("{secret}") {
-                return Err(ManifestError::Invalid(format!("inject format for {} lacks {{secret}}", i.host)));
+            if !i.format.contains("{secret}") && !i.format.contains("{basic:") {
+                return Err(ManifestError::Invalid(format!("inject format for {} lacks {{secret}} or {{basic:USER}}", i.host)));
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        for v in &self.zone.volumes {
+            let name_ok = !v.name.is_empty() && v.name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+            let path_ok = v.path.starts_with("/volumes/") && !v.path.contains("..") && v.path.len() > "/volumes/".len();
+            if !name_ok || !path_ok || !names.insert(v.name.clone()) {
+                return Err(ManifestError::Invalid(format!("volume {:?} at {:?}: names are [a-z0-9-]+ and unique; paths live under /volumes/", v.name, v.path)));
             }
         }
         self.zone.limits.timeout()?;
@@ -347,6 +404,22 @@ zone:
     fn rejects_unknown_fields() {
         let bad = EXAMPLE.replace("name: research", "name: research\n  surprise: 1");
         assert!(Manifest::from_yaml(&bad).is_err());
+    }
+
+    #[test]
+    fn env_and_volumes_are_validated() {
+        let base = |extra: &str| format!("task: t\nagent: {{ name: a{extra} }}\nzone: {{ name: z, llm: {{}} }}\n");
+        assert!(Manifest::from_yaml(&base(", env: { DATA_DIR: /volumes/data }")).is_ok());
+        for bad in ["HTTPS_PROXY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "SSL_CERT_FILE", "HOME", "lower"] {
+            assert!(Manifest::from_yaml(&base(&format!(", env: {{ {bad}: x }}"))).is_err(), "{bad} must be refused");
+        }
+        assert!(Manifest::from_yaml(&base(", idle_timeout: 30m")).is_ok());
+        assert!(Manifest::from_yaml(&base(", idle_timeout: soon")).is_err());
+        let vol = |v: &str| format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, volumes: [{v}] }}\n");
+        assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data }")).is_ok());
+        assert!(Manifest::from_yaml(&vol("{ name: data, path: /workspace/x }")).is_err());
+        assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/../etc }")).is_err());
+        assert!(Manifest::from_yaml(&vol("{ name: a, path: /volumes/a }, { name: a, path: /volumes/b }")).is_err());
     }
 
     #[test]

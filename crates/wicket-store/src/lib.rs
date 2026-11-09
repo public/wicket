@@ -133,6 +133,10 @@ CREATE TABLE IF NOT EXISTS identities (
   run TEXT PRIMARY KEY, tenant TEXT NOT NULL, spiffe_id TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   parent_run TEXT, accept_from TEXT NOT NULL DEFAULT '[]', jws TEXT NOT NULL, issued_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operator_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
+  created_at INTEGER NOT NULL, consumed_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS identity_history (
   run TEXT NOT NULL, jws TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
 );
@@ -230,6 +234,30 @@ impl Ledger {
             params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr],
         )?;
         Ok((id, true))
+    }
+
+    // ---- operator follow-ups to a running agent ----
+
+    /// Queues a follow-up from the operator for a running agent. Operator text is trusted task text
+    /// (it comes from the principal), unlike anything an agent or a web page says.
+    pub fn add_operator_message(&self, run: &str, text: &str, by: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO operator_messages (run, text, by, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, text, by, now()])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Takes every queued follow-up for `run`, oldest first: (text, by). Each is handed out once.
+    pub fn take_operator_messages(&mut self, run: &str) -> Result<Vec<(String, String)>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(i64, String, String)> = {
+            let mut st = tx.prepare("SELECT id, text, by FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL ORDER BY id")?;
+            let r = st.query_map(params![run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            r.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (id, _, _) in &rows {
+            tx.execute("UPDATE operator_messages SET consumed_at = ?2 WHERE id = ?1", params![id, now()])?;
+        }
+        tx.commit()?;
+        Ok(rows.into_iter().map(|(_, t, b)| (t, b)).collect())
     }
 
     // ---- identities and messages (design §3.2) ----
@@ -617,6 +645,17 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn operator_follow_ups_are_taken_once() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        l.add_operator_message("run_a", "first", "owner").unwrap();
+        l.add_operator_message("run_a", "second", "owner").unwrap();
+        l.add_operator_message("run_b", "other run", "owner").unwrap();
+        let got = l.take_operator_messages("run_a").unwrap();
+        assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
+        assert!(l.take_operator_messages("run_a").unwrap().is_empty());
     }
 
     #[test]

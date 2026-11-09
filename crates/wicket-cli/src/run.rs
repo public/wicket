@@ -19,9 +19,47 @@ fn identity_ttl() -> i64 {
     std::env::var("WICKET_IDENTITY_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(600).max(20)
 }
 
-pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node: Option<&str>, ssh_key: Option<&Path>, run_id: Option<String>, parent_run: Option<String>) -> Result<()> {
-    let text = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
-    let m = Manifest::from_yaml(&text)?;
+/// What `wicket run` was asked to do.
+pub struct RunOpts<'a> {
+    pub manifest: &'a Path,
+    /// Copied into the box's /workspace first.
+    pub workdir: Option<&'a Path>,
+    /// Mounted read-write as the box's /workspace, in place (local runs only).
+    pub workspace_dir: Option<&'a Path>,
+    /// Replaces the manifest's task text.
+    pub task: Option<String>,
+    pub image: &'a str,
+    pub node: Option<&'a str>,
+    pub ssh_key: Option<&'a Path>,
+    pub run_id: Option<String>,
+    pub parent_run: Option<String>,
+}
+
+pub async fn run(o: RunOpts<'_>) -> Result<()> {
+    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } = o;
+    let raw = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+    let mut m = Manifest::from_yaml(&raw)?;
+    if let Some(t) = task {
+        if m.agent.is_none() {
+            bail!("--task applies to agent manifests only");
+        }
+        m.task = t;
+    }
+    // The effective manifest (after any --task) is what the identity's digest covers.
+    let text = serde_yaml::to_string(&m)?;
+    let workspace_dir = match workspace_dir {
+        None => None,
+        Some(_) if node.is_some() => bail!("--workspace-dir mounts a local directory; it can't be used with --node"),
+        Some(_) if workdir.is_some() => bail!("use either --workdir (copy in) or --workspace-dir (mount in place)"),
+        Some(w) => {
+            let w = std::fs::canonicalize(w).with_context(|| format!("--workspace-dir {}", w.display()))?;
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            if !w.is_dir() || w == Path::new("/") || w == home {
+                bail!("--workspace-dir must be a project directory, not {}", w.display());
+            }
+            Some(w)
+        }
+    };
     let vault = Vault::new(Vault::default_dir());
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
@@ -53,7 +91,11 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
         _ => unreachable!("validated"),
     };
     for i in &m.zone.inject {
-        vault.get(&i.secret).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host))?;
+        match vault.get(&i.secret) {
+            Ok(_) => {}
+            Err(_) if i.optional => println!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host),
+            Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
+        }
     }
     let node = node.map(|n| Node::new(n, ssh_key));
     let docker = match &node {
@@ -176,6 +218,7 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
                 if let Some(ca) = cm.agent.as_mut() {
                     ca.name = req.agent.clone();
                     ca.max_children = 0; // no grandchildren in the PoC
+                    ca.idle_timeout = "0s".into(); // a child reports to its parent, not the operator
                 }
                 if let Some(hosts) = &req.reach_hosts {
                     for h in hosts {
@@ -286,6 +329,35 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
             (std::path::PathBuf::from(rd), user, Some(fwd))
         }
     };
+    // Volumes persist per tenant and zone, on whichever host runs the box.
+    let mut volume_mounts = Vec::new();
+    for v in &m.zone.volumes {
+        let host = match &node {
+            None => {
+                let d = data_dir().join("volumes").join(&m.tenant.0).join(&m.zone.name).join(&v.name);
+                std::fs::create_dir_all(&d)?;
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+                d
+            }
+            Some(n) => {
+                let home = n.sh("echo $HOME").await?;
+                let d = format!("{home}/wicket-volumes/{}/{}/{}", m.tenant.0, m.zone.name, v.name);
+                n.sh(&format!("umask 077; mkdir -p {}", wicket_sandbox::shell_quote(&d))).await?;
+                std::path::PathBuf::from(d)
+            }
+        };
+        volume_mounts.push(Mount { host, target: v.path.clone(), read_only: false });
+    }
+    let workspace_mounts = match &workspace_dir {
+        // In place: the project directory itself, with this run's outbox mounted over its out/.
+        Some(w) => vec![
+            Mount { host: w.clone(), target: wicket_agent::WORKSPACE.into(), read_only: false },
+            Mount { host: box_root.join("workspace/out"), target: format!("{}/out", wicket_agent::WORKSPACE), read_only: false },
+        ],
+        None => vec![Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false }],
+    };
+    let interactive = plan.stdin_task.is_some();
+    let stdin_task = plan.stdin_task.clone();
     let name = format!("wicket-{}", run.0.replace('_', "-"));
     let spec = SandboxSpec {
         name: name.clone(),
@@ -295,8 +367,11 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
             Mount { host: box_root.join("sock"), target: wicket_agent::SOCK_DIR.into(), read_only: false },
             Mount { host: box_root.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
             Mount { host: box_root.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
-            Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false },
-        ],
+        ]
+        .into_iter()
+        .chain(workspace_mounts)
+        .chain(volume_mounts)
+        .collect(),
         env: plan.env,
         argv: plan.argv,
         memory: m.zone.limits.memory.clone(),
@@ -304,6 +379,7 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
         pids: m.zone.limits.pids,
         user,
         workdir: wicket_agent::WORKSPACE.into(),
+        interactive,
     };
 
     println!("wicket run {}  tenant {}  zone {}  {} {} ({})", run, m.tenant, m.zone.name, if is_program { "program" } else { "agent" }, workload, workload_kind);
@@ -363,6 +439,17 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
         }
         _ => None,
     };
+    // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
+    // written the same way while the session is open; closing stdin ends it.
+    let mut stdin = child.stdin.take();
+    if let (Some(si), Some(t)) = (stdin.as_mut(), &stdin_task) {
+        use tokio::io::AsyncWriteExt;
+        si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
+    }
+    let idle = m.agent.as_ref().map(|a| a.idle()).transpose()?.unwrap_or_default();
+    let mut turn_running = true;
+    let mut last_result = std::time::Instant::now();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
     let mut lines = BufReader::new(stdout).lines();
@@ -392,6 +479,16 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
                     if is_program {
                         println!("[program] {}", wicket_agent::clip(&l, 300));
                     } else {
+                        // A top-level result ends the agent's turn (subagents' results carry a parent).
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").map_or(true, |p| p.is_null()) {
+                                turn_running = false;
+                                last_result = std::time::Instant::now();
+                                if stdin.is_some() && !idle.is_zero() {
+                                    println!("[wicket] turn done; follow-ups for {}: wicket say {} \"…\"", humantime::format_duration(idle), run);
+                                }
+                            }
+                        }
                         let sub = tracker.lock().ok().and_then(|mut t| t.observe(&l));
                         if let Some(r) = wicket_agent::render_event(&l) {
                             match sub {
@@ -407,6 +504,26 @@ pub async fn run(manifest_path: &Path, workdir: Option<&Path>, image: &str, node
                 None => break,
             },
             Some(ev) = rx.recv() => print_event(&ev),
+            _ = tick.tick(), if stdin.is_some() => {
+                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
+                for (text, by) in msgs {
+                    use tokio::io::AsyncWriteExt;
+                    println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
+                    if let Some(si) = stdin.as_mut() {
+                        if si.write_all(format!("{}\n", wicket_agent::user_message(&text)).as_bytes()).await.is_err() {
+                            stdin = None;
+                            break;
+                        }
+                    }
+                    turn_running = true;
+                }
+                if !turn_running && last_result.elapsed() >= idle {
+                    if !idle.is_zero() {
+                        println!("[wicket] no follow-up for {}; closing the session", humantime::format_duration(idle));
+                    }
+                    stdin = None; // EOF: the agent finishes and exits
+                }
+            }
             _ = &mut deadline => {
                 println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
                 docker.kill(&name).await?;

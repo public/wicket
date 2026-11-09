@@ -17,6 +17,18 @@ pub const OUTBOX: &str = "/workspace/out/result.json";
 pub struct LaunchPlan {
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
+    /// The first message to write to the agent's stdin (stream-json input), if it takes its task
+    /// that way. Follow-ups from the operator are written the same way while the session is open.
+    pub stdin_task: Option<String>,
+}
+
+/// The run's CA bundle (system roots plus the run CA) inside the box, built by wicket-entry. Tools that
+/// don't read SSL_CERT_FILE can be pointed at it through the manifest's env (e.g. CARGO_HTTP_CAINFO).
+pub const CA_BUNDLE: &str = "/tmp/ca-bundle.pem";
+
+/// One user turn in Claude Code's stream-json input format.
+pub fn user_message(text: &str) -> String {
+    serde_json::json!({ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }).to_string()
 }
 
 const NOTICE: &str = "You are running inside a wicket sandbox. Rules of this environment:\n\
@@ -40,6 +52,7 @@ fn common_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
         ("HOME".to_string(), format!("{STATE_DIR}/home")),
         ("WICKET_RUN".to_string(), run.0.clone()),
         ("WICKET_TENANT".to_string(), m.tenant.0.clone()),
+        ("WICKET_CA_BUNDLE".to_string(), CA_BUNDLE.to_string()),
     ])
     .collect()
 }
@@ -49,7 +62,7 @@ pub fn program_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     let p = m.program.as_ref()?;
     let mut argv = vec!["wicket-entry".to_string()];
     argv.extend(p.command.iter().cloned());
-    Some(LaunchPlan { env: common_env(m, run), argv })
+    Some(LaunchPlan { env: common_env(m, run), argv, stdin_task: None })
 }
 
 pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
@@ -75,16 +88,21 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
         // await_grant blocks until a human decides (up to 10 minutes).
         ("MCP_TOOL_TIMEOUT", "660000".into()),
         ("WICKET_TENANT", m.tenant.0.clone()),
+        ("WICKET_CA_BUNDLE", CA_BUNDLE.into()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
+    // The manifest's own non-secret variables (validated: none of wicket's reserved names).
+    .chain(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())))
     .collect();
 
     let mut argv = vec![
         "wicket-entry".to_string(),
         "claude".into(),
         "-p".into(),
-        m.task.clone(),
+        // The task arrives on stdin as the first user turn; follow-ups use the same channel.
+        "--input-format".into(),
+        "stream-json".into(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -111,7 +129,7 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
         argv.push("--max-turns".into());
         argv.push(n.to_string());
     }
-    LaunchPlan { env, argv }
+    LaunchPlan { env, argv, stdin_task: Some(user_message(&m.task)) }
 }
 
 /// A one-line, human-readable rendering of a stream-json event, or None to skip it.

@@ -52,6 +52,12 @@ enum Cmd {
         /// Copy this directory into the box's /workspace first.
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// Mount this directory as the box's /workspace, read-write and in place (local runs only).
+        #[arg(long)]
+        workspace_dir: Option<PathBuf>,
+        /// Use this task text instead of the manifest's.
+        #[arg(long)]
+        task: Option<String>,
         /// Agent image.
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
@@ -67,6 +73,12 @@ enum Cmd {
         /// Internal: the run that started this one (`spawn_agent`).
         #[arg(long, hide = true)]
         parent_run: Option<String>,
+    },
+    /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
+    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
+    Say {
+        run: String,
+        text: Vec<String>,
     },
     /// List pending escalation requests.
     Pending,
@@ -292,8 +304,28 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run { manifest, workdir, image, node, ssh_key, run_id, parent_run } => {
-            run::run(&manifest, workdir.as_deref(), &image, node.as_deref(), ssh_key.as_deref(), run_id, parent_run).await
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
+            run::run(run::RunOpts {
+                manifest: &manifest, workdir: workdir.as_deref(), workspace_dir: workspace_dir.as_deref(), task, image: &image,
+                node: node.as_deref(), ssh_key: ssh_key.as_deref(), run_id, parent_run,
+            })
+            .await
+        }
+        Cmd::Say { run, text } => {
+            let text = text.join(" ");
+            if text.trim().is_empty() {
+                bail!("nothing to say");
+            }
+            let l = Ledger::open(&ledger_path())?;
+            match l.run_status(&run)?.as_deref() {
+                Some("running") => {}
+                Some(s) => bail!("{run} is {s}, not running"),
+                None => bail!("no run {run}"),
+            }
+            l.add_operator_message(&run, &text, &operator())?;
+            l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "operator.message", &serde_json::json!({ "by": operator(), "chars": text.len() }))?;
+            println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
+            Ok(())
         }
         Cmd::Pending => {
             let l = Ledger::open(&ledger_path())?;

@@ -1,0 +1,37 @@
+# wicket working on its own source tree: one example of a project describing its workload.
+# See README.md. Give the task with --task and the checkout with --workspace-dir.
+task: Describe the repository in /workspace briefly.
+agent:
+  name: maintainer
+  max_turns: 150
+  # Keep the session open between turns for follow-ups (wicket say <run> "...").
+  idle_timeout: 30m
+  env:
+    CARGO_HOME: /volumes/cargo
+    CARGO_TARGET_DIR: /volumes/target
+    CARGO_HTTP_CAINFO: /tmp/ca-bundle.pem   # the run's CA bundle (WICKET_CA_BUNDLE)
+    CARGO_BUILD_JOBS: "2"
+    CARGO_TERM_COLOR: never
+zone:
+  name: wicket-src
+  isolation: gvisor
+  reach:
+    # Crates (read-only).
+    - { host: index.crates.io }
+    - { host: static.crates.io }
+    # Fetch this repository. Pushes (git-receive-pack) are not in reach: each one waits for a human.
+    - { host: github.com, methods: [GET, POST], paths: ["/public/wicket.git/info/refs", "/public/wicket.git/git-upload-pack"] }
+    # Read the repository's issues and pull requests. Creating one waits for a human.
+    - { host: api.github.com, paths: ["/repos/public/wicket", "/repos/public/wicket/**"] }
+  inject:
+    # A fine-grained token for this repository only, if the operator has stored one; anonymous otherwise.
+    - { host: github.com, header: Authorization, format: "Basic {basic:x-access-token}", secret: github-wicket, optional: true }
+    - { host: api.github.com, header: Authorization, format: "Bearer {secret}", secret: github-wicket, optional: true }
+  volumes:
+    - { name: cargo, path: /volumes/cargo }
+    - { name: target, path: /volumes/target }
+  llm:
+    secret: claude-oauth
+    max_requests: 400
+    max_output_tokens: 600000
+  limits: { memory: 3g, cpus: 2, timeout: 3h, pids: 4096 }
