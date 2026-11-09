@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wicket</title>
+<style>
+  :root { --bg:#fafaf8; --ink:#1d1d1b; --quiet:#6b6b66; --line:#e2e1dc; --card:#fff; --accent:#2f6fde; --warn:#b4540a; --bad:#b42318; --good:#1e7a46; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --ink:#ecebe6; --quiet:#a3a29c; --line:#33332f; --card:#1f1f1d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:baseline; }
+  header h1 { font-size:17px; margin:0; }
+  header span { color:var(--quiet); font-size:13px; }
+  main { max-width:760px; margin:0 auto; padding:12px 16px 40px; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--quiet); margin:22px 0 8px; }
+  .who { margin:6px 0; font-size:14px; } .who .cand { margin-left:10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .who .note { color:var(--quiet); font-size:12px; margin-top:2px; } .who .warn { color:var(--warn); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:8px 0; }
+  .req .what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; word-break:break-all; }
+  .meta { color:var(--quiet); font-size:13px; margin-top:4px; }
+  .why { font-size:13px; margin-top:6px; }
+  .risk { display:inline-block; font-size:12px; font-weight:600; padding:1px 7px; border-radius:20px; border:1px solid currentColor; margin-right:6px; }
+  .r0, .r1 { color:var(--good); } .r2 { color:var(--accent); } .r3 { color:var(--warn); } .r4 { color:var(--bad); }
+  .buttons { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  button { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button.approve { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  button.deny { border-color:var(--bad); color:var(--bad); }
+  .empty { color:var(--quiet); font-size:14px; }
+  .row { display:flex; justify-content:space-between; gap:10px; font-size:14px; padding:6px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; word-break:break-all; }
+  .log { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
+  #msg { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:14px; display:none; }
+</style>
+</head>
+<body>
+<header><h1>wicket</h1><span id="tenant"></span></header>
+<main>
+  <div id="auth" class="card" style="display:none"></div>
+  <div id="console" style="display:none">
+  <h2>Waiting for you</h2>
+  <div id="pending"></div>
+  <h2>Runs</h2>
+  <div class="card" id="runs"></div>
+  <h2>Recent decisions</h2>
+  <div class="card" id="decided"></div>
+  <h2>Activity</h2>
+  <div class="card log" id="audit"></div>
+  <h2>Operator</h2>
+  <div class="card" id="operator"></div>
+  </div>
+</main>
+<div id="msg"></div>
+<script>
+"use strict";
+// Every string from the ledger is untrusted (agents influence paths and reasons): set as textContent only.
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = String(text); return e; };
+const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f​-‏‪-‮⁦-⁩]/g, " ");
+const ago = (now, t) => { const s = Math.max(0, now - t); return s < 90 ? s + "s ago" : s < 5400 ? Math.round(s / 60) + "m ago" : Math.round(s / 3600) + "h ago"; };
+const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
+const riskLabel = r => ({ R0Read: "R0 read", R1ReadScoped: "R1 read", R2WriteReversible: "R2 write", R3ExternalOrIrreversible: "R3 external", R4ExecOrPrivilege: "R4 exec/privilege" })[r] || r;
+
+function toast(t) { const m = document.getElementById("msg"); m.textContent = t; m.style.display = "block"; setTimeout(() => m.style.display = "none", 2500); }
+
+// ---- passkeys (WebAuthn) ----
+const b2a = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const a2b = s => { s = s.replace(/-/g, "+").replace(/_/g, "/"); s += "===".slice((s.length + 3) % 4); return Uint8Array.from(atob(s), c => c.charCodeAt(0)); };
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-wicket-csrf": "1" }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function getOptions(pk) {
+  return { ...pk, challenge: a2b(pk.challenge), allowCredentials: (pk.allowCredentials || []).map(c => ({ ...c, id: a2b(c.id) })) };
+}
+async function assertWith(pk) {
+  const cred = await navigator.credentials.get({ publicKey: getOptions(pk) });
+  return { challenge: pk.challenge, id: b2a(cred.rawId), clientDataJSON: b2a(cred.response.clientDataJSON),
+           authenticatorData: b2a(cred.response.authenticatorData), signature: b2a(cred.response.signature) };
+}
+async function registerPasskey() {
+  try {
+    const { publicKey: pk } = await post("/api/register/begin");
+    const opts = { ...pk, challenge: a2b(pk.challenge), user: { ...pk.user, id: a2b(pk.user.id) }, excludeCredentials: (pk.excludeCredentials || []).map(c => ({ ...c, id: a2b(c.id) })) };
+    const cred = await navigator.credentials.create({ publicKey: opts });
+    const name = (document.getElementById("pkname") || {}).value || "passkey";
+    const j = await post("/api/register/finish", { challenge: pk.challenge, name, clientDataJSON: b2a(cred.response.clientDataJSON), attestationObject: b2a(cred.response.attestationObject) });
+    toast(j.ok); boot();
+  } catch (e) { toast("passkey: " + e.message); }
+}
+async function signIn() {
+  try { const { publicKey } = await post("/api/login/begin"); const j = await post("/api/login/finish", await assertWith(publicKey)); toast(j.ok); boot(); }
+  catch (e) { toast("sign-in: " + e.message); }
+}
+// Every decision is signed: the passkey challenge is the hash of exactly this decision.
+async function act(kind, body) {
+  try {
+    const begin = await post("/api/decide/begin", { ...body, decision: kind });
+    const d = begin.decision;
+    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path + ((d.requested_by || []).length ? " for " + d.requested_by.join(", ") : ""));
+    const j = await post("/api/decide/finish", await assertWith(begin.publicKey));
+    toast(j.ok);
+  } catch (e) { toast(e.message); }
+  refresh();
+}
+
+// Who in the box asked, from the agent's own event stream: helpful, not proof.
+function renderWho(list) {
+  const w = el("div", "who");
+  const line = r => strip(r.agent) + " — " + strip(r.tool) + ": " + strip(r.call).slice(0, 120);
+  if (!list.length) { w.append(el("div", "", "For: unknown (no agent event stream)")); }
+  for (const a of list) {
+    const rs = a.requesters || [];
+    if (a.basis === "none" || !rs.length) w.append(el("div", "", "For: unknown — no tool call was in flight"));
+    else if (a.basis === "ambiguous") { w.append(el("div", "", "For: one of " + rs.length + " concurrent calls:")); for (const r of rs) w.append(el("div", "cand", "• " + line(r))); }
+    else w.append(el("div", "", "For: " + line(r0(rs))));
+  }
+  if (list.length > 1) w.append(el("div", "warn", "Asked by more than one agent: one grant would serve all of them."));
+  w.append(el("div", "note", "Reported by the agent's event stream, not proven. Anything in this box could use the grant."));
+  return w;
+}
+const r0 = rs => rs[0];
+
+function renderPending(s) {
+  const box = document.getElementById("pending"); box.replaceChildren();
+  if (!s.pending.length) { box.append(el("div", "empty", "Nothing is waiting for a decision.")); return; }
+  for (const p of s.pending) {
+    const c = el("div", "card req");
+    const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
+    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path)));
+    c.append(el("div", "why", strip(p.reason)));
+    c.append(renderWho(p.attribution || []));
+    c.append(el("div", "meta", p.id + " · zone " + p.zone + " · " + p.run + " · " + ago(s.now, p.created_at)));
+    const b = el("div", "buttons");
+    const once = el("button", "approve", "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
+    const hour = el("button", "", "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
+    const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
+    if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") b.append(once, deny); else b.append(once, hour, deny);
+    c.append(b); box.append(c);
+  }
+}
+
+function renderRows(id, rows, f, emptyText) {
+  const box = document.getElementById(id); box.replaceChildren();
+  if (!rows.length) { box.append(el("div", "empty", emptyText)); return; }
+  for (const r of rows) box.append(f(r));
+}
+
+function line(op) {
+  const b = op.body || {};
+  if (op.kind === "op" && b.kind === "egress") {
+    const cls = b.outcome === "allow" ? "ok" : b.outcome === "pending" ? "pend" : "blocked";
+    const d = el("div"); d.append(el("span", cls, b.outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(b.method + " " + b.host + b.path)));
+    return d;
+  }
+  if (op.kind === "op" && b.kind === "llm") return el("div", "", "model  #" + b.requests + " " + strip(b.model || "?") + " → " + b.status + "  in " + b.input_tokens + " / out " + b.output_tokens);
+  if (op.kind === "decision") return el("div", b.decision === "approve" ? "ok" : "blocked", b.decision + " " + b.request + " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : ""));
+  if (op.kind === "operator.passkey_added") return el("div", "", "passkey added: " + strip(b.name) + " via " + strip(b.via));
+  if (op.kind === "run.start") return el("div", "", "start  " + op.run + " zone " + strip(b.zone) + " agent " + strip(b.agent));
+  if (op.kind === "run.end") return el("div", "", "end    " + op.run + " " + strip(b.status) + " · " + b.model_requests + " model calls");
+  return el("div", "", op.kind);
+}
+
+function renderOperator(s) {
+  const box = document.getElementById("operator"); box.replaceChildren();
+  for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
+  const b = el("div", "buttons");
+  const add = el("button", "", "Add another passkey"); add.onclick = registerPasskey;
+  const out = el("button", "", "Sign out"); out.onclick = async () => { await post("/api/logout"); boot(); };
+  b.append(add, out); box.append(b);
+}
+
+async function boot() {
+  const me = await (await fetch("/api/me")).json();
+  const auth = document.getElementById("auth"), con = document.getElementById("console");
+  auth.replaceChildren();
+  if (me.who.state === "operator") { auth.style.display = "none"; con.style.display = ""; refresh(); return; }
+  con.style.display = "none"; auth.style.display = "";
+  if (me.who.state === "bootstrap") {
+    auth.append(el("div", "", "Enrol this device's passkey. It signs you in, and you will sign every approval with it."));
+    const name = el("input"); name.id = "pkname"; name.value = "my phone"; name.style.cssText = "margin-top:10px;padding:8px;font:inherit;width:100%";
+    const b = el("div", "buttons"); const go = el("button", "approve", "Create passkey"); go.onclick = registerPasskey; b.append(go);
+    auth.append(name, b);
+  } else if (me.passkeys > 0) {
+    auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on."));
+    const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
+  } else {
+    auth.append(el("div", "", "No passkey is enrolled yet. Open the one-time enrolment link printed by `wicket serve`."));
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    if (!r.ok) { boot(); return; }
+    const s = await r.json();
+    document.getElementById("tenant").textContent = "tenant " + s.tenant;
+    renderPending(s);
+    renderRows("runs", s.runs, x => { const d = el("div", "row"); d.append(el("span", "mono", x.id), el("span", "", strip(x.zone + " · " + x.status + " · " + ago(s.now, x.started_at)))); return d; }, "No runs yet.");
+    renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");
+    renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
+    renderOperator(s);
+  } catch (e) { /* keep polling */ }
+}
+boot(); setInterval(() => { if (document.getElementById("console").style.display === "") refresh(); }, 2000);
+</script>
+</body>
+</html>

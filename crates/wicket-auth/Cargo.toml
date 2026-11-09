@@ -1,0 +1,19 @@
+[package]
+name = "wicket-auth"
+description = "Minimal, strict WebAuthn (passkey) verification for wicket operator decisions: ES256 only, user verification required, challenges bound to the exact decision."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"
+base64 = "0.22"
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

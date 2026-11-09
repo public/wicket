@@ -1,0 +1,12 @@
+[package]
+name = "wicket-agent"
+description = "wicket inner-agent adapters. PoC: Claude Code in print mode with stream-json output."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

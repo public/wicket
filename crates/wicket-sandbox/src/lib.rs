@@ -1,0 +1,210 @@
+//! Sandbox backends (design §7). The PoC has one: Docker, with gVisor as the default runtime. Every
+//! box runs with `--network none`; its only way out is the unix sockets wicket bind-mounts in, which
+//! an in-box forwarder exposes on 127.0.0.1 for proxy-aware tools.
+
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::process::{Child, Command};
+use wicket_core::Isolation;
+
+#[derive(Clone, Debug)]
+pub struct Mount {
+    pub host: PathBuf,
+    pub target: String,
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SandboxSpec {
+    pub name: String,
+    pub image: String,
+    pub isolation: Isolation,
+    pub mounts: Vec<Mount>,
+    pub env: Vec<(String, String)>,
+    pub argv: Vec<String>,
+    pub memory: String,
+    pub cpus: f32,
+    pub pids: u32,
+    /// uid:gid inside the box (the host user, so files in the workspace stay ours).
+    pub user: String,
+    pub workdir: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Docker {
+    /// Command prefix, e.g. ["docker"] or ["sudo", "docker"] (from WICKET_DOCKER), or an ssh
+    /// command ending in "docker" for a remote node.
+    cmd: Vec<String>,
+    /// Arguments pass through a remote shell (ssh) and must be quoted.
+    quote: bool,
+}
+
+/// Quotes one argument for a POSIX shell.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,@%+".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+impl Docker {
+    pub fn from_env() -> Docker {
+        let cmd = std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into());
+        Docker { cmd: cmd.split_whitespace().map(String::from).collect(), quote: false }
+    }
+
+    /// Docker on a remote node, reached with the given ssh command (ending in the target).
+    pub fn over_ssh(mut ssh: Vec<String>) -> Docker {
+        ssh.push("docker".into());
+        Docker { cmd: ssh, quote: true }
+    }
+
+    fn command(&self) -> Command {
+        let mut c = Command::new(&self.cmd[0]);
+        c.args(&self.cmd[1..]);
+        c
+    }
+
+    fn command_with<I: IntoIterator<Item = String>>(&self, args: I) -> Command {
+        let mut c = self.command();
+        for a in args {
+            c.arg(if self.quote { shell_quote(&a) } else { a });
+        }
+        c
+    }
+
+    /// Which runtimes the daemon offers (e.g. "runc", "runsc").
+    pub async fn runtimes(&self) -> Result<Vec<String>> {
+        let out = self
+            .command_with(["info".to_string(), "--format".into(), "{{range $k, $v := .Runtimes}}{{$k}} {{end}}".into()])
+            .output()
+            .await
+            .context("running docker info")?;
+        if !out.status.success() {
+            bail!("docker info failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().map(String::from).collect())
+    }
+
+    pub async fn image_exists(&self, image: &str) -> Result<bool> {
+        let st = self.command_with(["image".to_string(), "inspect".into(), image.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        Ok(st.success())
+    }
+
+    pub fn build_args(&self, spec: &SandboxSpec) -> Vec<String> {
+        let runtime = match spec.isolation {
+            Isolation::Gvisor => "runsc",
+            Isolation::Runc => "runc",
+        };
+        let mut a: Vec<String> = vec![
+            "run".into(),
+            "--rm".into(),
+            "--init".into(),
+            "--name".into(),
+            spec.name.clone(),
+            "--runtime".into(),
+            runtime.into(),
+            "--network".into(),
+            "none".into(),
+            "--memory".into(),
+            spec.memory.clone(),
+            "--cpus".into(),
+            format!("{}", spec.cpus),
+            "--pids-limit".into(),
+            spec.pids.to_string(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--read-only".into(),
+            "--tmpfs".into(),
+            "/tmp:rw,nosuid,size=512m".into(),
+            "--user".into(),
+            spec.user.clone(),
+            "--workdir".into(),
+            spec.workdir.clone(),
+            "--label".into(),
+            "wicket=1".into(),
+        ];
+        for m in &spec.mounts {
+            a.push("--mount".into());
+            a.push(format!(
+                "type=bind,source={},target={}{}",
+                m.host.display(),
+                m.target,
+                if m.read_only { ",readonly" } else { "" }
+            ));
+        }
+        for (k, v) in &spec.env {
+            a.push("--env".into());
+            a.push(format!("{k}={v}"));
+        }
+        a.push(spec.image.clone());
+        a.extend(spec.argv.iter().cloned());
+        a
+    }
+
+    /// Starts the box with stdout and stderr piped.
+    pub fn spawn(&self, spec: &SandboxSpec) -> Result<Child> {
+        let mut c = self.command_with(self.build_args(spec));
+        c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        Ok(c.spawn().context("starting docker run")?)
+    }
+
+    pub async fn kill(&self, name: &str) -> Result<()> {
+        let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        Ok(())
+    }
+
+    /// Builds an image from a directory, with host networking for the build only (the daemon has no
+    /// bridge network; sandboxes never get one).
+    pub async fn build_image(&self, tag: &str, dir: &std::path::Path) -> Result<()> {
+        let st = self.command_with(["build".to_string(), "--network".into(), "host".into(), "-t".into(), tag.into(), dir.display().to_string()]).status().await?;
+        if !st.success() {
+            bail!("docker build failed");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn args_never_include_a_network() {
+        let d = Docker { cmd: vec!["docker".into()], quote: false };
+        let spec = SandboxSpec {
+            name: "wicket-test".into(),
+            image: "img".into(),
+            isolation: Isolation::Gvisor,
+            mounts: vec![Mount { host: "/x".into(), target: "/y".into(), read_only: true }],
+            env: vec![("A".into(), "b".into())],
+            argv: vec!["claude".into()],
+            memory: "1g".into(),
+            cpus: 1.0,
+            pids: 64,
+            user: "1000:1000".into(),
+            workdir: "/workspace".into(),
+        };
+        let a = d.build_args(&spec).join(" ");
+        assert!(a.contains("--network none"));
+        assert!(a.contains("--runtime runsc"));
+        assert!(a.contains("--cap-drop ALL"));
+        assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
+        assert!(a.ends_with("img claude"));
+    }
+
+    #[test]
+    fn shell_quoting_survives_hostile_text() {
+        assert_eq!(shell_quote("plain-arg"), "plain-arg");
+        assert_eq!(shell_quote(""), "''");
+        // Round-trip through a real shell: what the remote shell sees must equal the input.
+        for s in ["it's $(touch /tmp/pwned) `id` \\n \"q\" ; | & > <", "multi\nline\ttext", "''''", "a'b'c"] {
+            let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", shell_quote(s))).output().unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), s);
+        }
+    }
+}

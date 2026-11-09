@@ -1,0 +1,13 @@
+[package]
+name = "wicket-sandbox"
+description = "wicket sandbox backends. PoC: Docker with gVisor (runsc), --network none, unix-socket-only egress."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true

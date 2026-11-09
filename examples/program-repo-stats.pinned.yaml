@@ -1,0 +1,14 @@
+# A deterministic program: no model, same sandbox, egress control and audit as an agent.
+task: Weekly public stats for octocat/Hello-World.
+program:
+  name: repo-stats
+  source: ../programs/repo-stats
+  command: [bash, /workspace/stats.sh]
+  on_pending: fail          # out-of-reach requests fail; nothing is queued for a human
+  digest: sha256:5323d8327784ed2da0351f0a2dd715550695c285691c67aa6d8a7f2208c2aaae
+zone:
+  name: stats
+  isolation: gvisor
+  reach:
+    - { host: api.github.com, paths: ["/repos/octocat/Hello-World"] }
+  limits: { memory: 512m, cpus: 1, timeout: 2m }
