@@ -184,6 +184,22 @@ header set/remove and credential, deny, need-body; fail closed; per-request time
 plane swappable and lets us test the decider offline from recorded frames, and run Anthropic's `srt-proxy`
 as a differential reference. [04 §7.1]
 
+### 3.1.1 wicket inside the box: its own name, not localhost (owner, 2026-11-09)
+
+wicket's endpoints in the box (egress proxy, LLM route, MCP gateway) live at **`wicket.internal`**, on
+their own address, so the agent keeps all of `127.0.0.0/8` for its own servers.
+- **The address is `198.18.0.1`,** from a block reserved for benchmarking and never routed on a real
+  network, added to the box's loopback. `.internal` is the top-level domain reserved for private use;
+  `.local` would send tools looking for it with multicast DNS.
+- **The name comes from the box's hosts file**, written by the runtime at creation. The box has no resolver
+  (§9.1, DNS).
+- **wicket-entry starts as root** with only `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`, adds the address,
+  then starts the forwarders and the agent through `setpriv` as the agent's user. By then every capability
+  set is empty, including the bounding set, and `no-new-privileges` holds throughout.
+- **Those capabilities act on gVisor's own network stack**, never the host's.
+- **Verified live:** the agent ran its own servers on 127.0.0.1:8080 and :3128 (wicket's old ports), its
+  capability sets were all zero, and `ip addr add` failed.
+
 ### 3.2 Identity: proving an agent is one of ours (owner, 2026-11-08)
 
 The owner's requirement: there must be cryptographic proof that an agent in a given zone is one of wicket's.
@@ -216,6 +232,77 @@ assert identity *on the box's behalf*:
 `spiffe://<install>/t/<tenant>/z/<zone>/a/<agent>`, with the activation and run as claims. Signing keys
 live in the vault, or a KMS/HSM in production, and are rotated. Short-lived certificates and signatures
 carry the policy epoch, so a revocation is visible to verifiers.
+
+**Short-lived keys, rotation and revocation** (owner, 2026-11-08: keys must be short-lived and
+refreshed, in case an agent's environment is compromised or a key is exfiltrated).
+- **Agent identities live 10 minutes.** At half-life the runner issues a new document with a brand-new
+  key and discards the old key. A copied key or document is useless within minutes.
+- **Validity is checked at a trusted time.** The verifier checks the identity at a time *it* trusts,
+  never one the sender claims: the ledger's record time for messages, and its own clock for anything
+  presented live. So an expired key can't be used to backdate a message.
+- **Every document issued is kept** (`identity_history`), so the audit verifies each one at its own
+  issue time.
+- **`wicket identity revoke <run>` is the kill switch.** Within seconds:
+  - the run's box is stopped;
+  - its undelivered messages are dropped;
+  - it can't send;
+  - its pending requests can't be approved.
+
+  Revocation cascades to everything the run started, because children act on its authority.
+- **The installation's root key is the remaining long-lived secret.** In the PoC it's a 0600 file
+  readable by the operator's user. Production splits it: the root stays offline or in a TPM/KMS and only
+  certifies short-lived *issuing* keys, rotated daily or faster. `wicket run` never sees the root.
+- **Agent keys never enter the box,** so compromising the box itself doesn't expose a key. Rotation
+  covers the other paths: memory of the runner process, logs, a compromised host.
+
+**Back to the human** (owner, 2026-11-08: identities must be tied to the initiator, all the way back to
+the human user if there is one).
+- **Every identity names its `principal`:** the human or trigger at the root of the chain, and how wicket
+  knew it was them. A run started from the PoC CLI is `{type: human, id: <unix user>, via: cli,
+  assurance: unix-user}`. A run started from the console will carry the passkey-authenticated operator.
+  A schedule or webhook carries itself and the human who created it (§13.2).
+- **Delegation through agents is recorded in `act`** (RFC 8693 actor chain). A child's `act` is its
+  parent, whose `act` is its own parent, and so on down to the principal.
+- **The child's runner builds the chain from the parent's verified identity,** not from anything the
+  parent agent said. Neither the principal nor the chain can be widened along the way.
+- **It's shown wherever a human decides,** e.g. "Acting for: alice (cli, unix-user) → lead → fetcher".
+  The passkey signs it with the decision, and recipients of messages see it too.
+- Mandates (§16) will hang off the same principal.
+
+**Agent-to-agent messages** go only through wicket (boxes have no network to reach each other). A
+sender calls `send_message(to, body)` on its gateway. wicket sets the sender from the socket (an agent
+can't name itself), checks policy and signs the envelope with the sender's agent key. The recipient's
+gateway verifies the envelope against the issuer before delivering it. The policy:
+- parent and child may always talk;
+- otherwise the recipient's zone must list the sender's zone in `accept_from`;
+- never across tenants (in v1; §15 sharing policy later).
+
+A message is therefore delivered only if:
+1. its sender is an agent this installation launched;
+2. its zone is the zone wicket put it in;
+3. it was addressed to this recipient.
+
+Bodies are the sender's data, shown to the recipient as such. Typed gates (§4.3) narrow them further.
+
+**PoC status (2026-11-08).** Built: the issuer (`wicket identity issuer`), per-run identity documents
+(EdDSA JWS) with keys held by `wicket run`, `whoami`, `send_message`, `await_message`, `spawn_agent`
+(a child `wicket run` with its own sandbox, sockets and identity, reach narrowed only), and signed
+`run_finished` reports. Also:
+- verified identities are shown with every pending request, and the console refuses approval when the
+  identity doesn't verify (enforced on the server, not just in the page);
+- the passkey signs the identity digest together with the decision;
+- `audit --verify` re-checks every identity and envelope offline;
+- `in_box_subagents: false` removes Claude Code's own Agent tool, so every subagent is a wicket child.
+
+Also built since then:
+- 10-minute identities re-issued every 5 minutes with fresh keys, with history and audit;
+- delivery checks at the ledger's record time;
+- revocation that cascades to children and stops boxes;
+- the principal and delegation chain in every identity, shown with every request.
+
+Not built: signed result attestations, RFC 9421 egress signatures, node enrolment and pinned host keys,
+the separate system user, root and issuing key separation, console-started runs (passkey principal),
+and federation with other installations.
 
 **Granularity is the sandbox.** Subagents inside one box share a process and a uid, so per-subagent
 *cryptographic* identity is impossible there. Per-subagent attribution is reported, not proven (§11.1).
@@ -418,11 +505,44 @@ dereferences it, which taints `fix` with `web` and blocks its pushes."*
 
 - **Static:** wicketd runs the manifest's graph directly. Zones run in dependency order, and outputs flow
   through gates.
-- **Dynamic:** a zone may be granted the `wicket.spawn` tool in its MCP gateway. A parent calls
+- **Dynamic** (PoC: `spawn`, with `max_children` in the agent spec): a zone may be granted the
+  `wicket.spawn` tool in its MCP gateway. A parent calls
   `spawn(zone_template, task_text, inputs: [handle…])`. wicketd checks child ⊆ parent and admits only
   handles and typed values as inputs. **The child's task text inherits the parent's label.** It is only as
   trusted as the parent, and re-derivation for the child's escalations runs against the chain of task texts
   back to the root, each with its label.
+
+**Agents construct zones** (owner, 2026-11-09: as long as the new zone's permissions are a subset of the
+agent's own; a human with that much access can approve an extension). Built:
+- **`spawn` starts an agent (task) or a program (command, possibly a long-running service)** in a zone the
+  caller writes.
+- **`wicket_core::subset` proves the zone is within the caller's,** conservatively; anything it can't prove
+  is a violation, and every violation is listed. It checks:
+  - reach: host, method and path, each covered by a parent rule;
+  - credential injections: only the parent's own;
+  - model budget: at most what's left, and then carved out of the parent's;
+  - memory, CPU, PIDs and time;
+  - isolation: at least as strong;
+  - images: from the parent's allowlist;
+  - `accept_from` and child slots.
+- **Inherited without asking:** the parent's `forbid` rules, `unlisted_hosts: hide`, and defaults no wider
+  than the parent's.
+- **With `ask_human`, a wider zone becomes a pending request** bound to the request as the agent stated it.
+  A human approves, and the agent's identical retry starts exactly that zone. It's audited as
+  `spawn.beyond_parent`.
+- **Every box gets an identity,** programs included, chained to its creator and the human. Programs report
+  back with a signed `run_finished` carrying their output tail.
+
+**Humans are principals under the same rules** (owner, 2026-11-09): an identity, an authority (by default
+everything) and audited, signed actions. An approval is a principal delegating part of its own authority,
+accepted only within it (#11).
+
+Also recorded as issues:
+- MCP servers per zone, granted by the creator within its own access (#9);
+- agent-built MCP servers as reusable tools (#10);
+- `expose`/`connect` (#6);
+- `request_capacity` (#7);
+- moving a running agent to a bigger box by checkpoint and restore, or a provider resize (#8).
 
 ### 5.2 Policy derivation
 
@@ -454,6 +574,11 @@ MiniScope, AutoCedar, ceLLMate, Conseca]:
 
 Detail: [01 §4] (Claude Code, ACP), [11] (Codex, pi), [12] (OpenClaw), [13] (Hermes), [16] (how ~40
 orchestrators drive these agents).
+
+**Adapter settings** (`agent.adapter_settings`) pass harmless configuration to the agent's own adapter: for
+Claude Code, its `settings.json`. Only allowlisted keys are accepted: commit attribution, output style and
+similar. Hooks, permissions, MCP servers, environment and credential helpers stay under wicket's control.
+`agent.env` likewise refuses wicket's reserved variables (proxies, CA, model routes, placeholders).
 
 **Hermes Agent** [13] is a T1 candidate through its `hermes-gateway-v1` JSON-RPC (host-answered approvals,
 steer/interrupt, resume, replay of pending requests on reconnect), with ACP as the T2 fallback. Its own
@@ -1133,6 +1258,30 @@ Retry-After: 30
 MCP returns the same body as an `isError` result, or `input_required` / a task handle when the client
 negotiated them. Connections are never held open while a human decides.
 
+**Agents must not spin at the edge** (owner, 2026-11-09: the goal is that agents don't spin endlessly
+when they hit isolation limits, and instead ask for more reach when they need it).
+- **Every refusal says which case it is in the status line**, because many tools show nothing else:
+  `Blocked by wicket sandbox: never allowed`, `… needs human approval (r-…)`, `… denied by a human`, or,
+  in hiding zones, `unknown host`. The body says the sandbox has no other route, and what to do.
+- **Repeats are counted.** From the third block of the same request, the refusal says to stop. After every
+  ten blocks in a run, the operator sees "agent may be stuck".
+- **`request_access`** lets the agent ask ahead, once, for a URL or a path prefix, with a reason shown to the
+  human as the agent's own claim. It then waits with `await_grant`.
+- **Every agent gets the same sandbox notice:** batch runs and wrapped sessions alike.
+
+In a live check, an agent blocked on two hosts waited with `await_grant` and retried each once after
+approval. It didn't probe.
+
+**DNS.** The box has no resolver and no network. Names are resolved only on the host, and only for requests
+a rule allows. So DNS isn't an exfiltration route, and blocked or pending names are never looked up.
+- **Wildcard reach rules are the residual channel:** any name under them is resolved on the host. Prefer
+  exact hosts in sensitive zones.
+- **Showing "no such domain" in `escalate` mode needs an existence check.** A safe one asks only whether the
+  *registered* domain exists (public suffix list), so agent-chosen subdomains are never queried. It's not
+  built; `unlisted_hosts: hide` is the strict alternative.
+- **An in-box resolver, when one is needed,** is wicket's own synthetic one: zone names only, "no such
+  domain" otherwise, and never forwarding an agent-chosen name (§7).
+
 **Denials are recoverable** [05 §10.2-7]. The body lists the remedies policy allows: request this narrower
 grant, spawn a child zone, meet a prerequisite. In APPA, removing remedies dropped utility from 88% to
 35%. Bodies never echo tainted content. E1 also measures retry loops (CapScope's runs took about 2× as long
@@ -1425,6 +1574,19 @@ its label is the join of everything that shaped it.
   staged memory (default RPO 60 s). An agent on a dead node is rebuilt elsewhere from its last durable
   checkpoint. Hibernated agents are unaffected.
 
+**PoC (2026-11-09).** Built so far:
+- **Named volumes per tenant and zone** (`zone.volumes`, under `/volumes/` in the box). They live on whichever
+  host runs the box and persist across runs.
+- **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
+  mounted over its `out/`.
+- **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
+  input. The session stays open for `agent.idle_timeout` after each turn and closes after that. Operator
+  text is trusted task text from the principal, unlike anything an agent or a page says.
+
+Not built: snapshots, hibernate and wake, object storage, encryption of agent state.
+
+Volumes inherit the zone's taint like any store (§12): whatever one run leaves there, the next one reads.
+
 ### 13.6 Garbage collection
 
 - **Policy decides; the agent never does.** `RetentionPolicy` sets each tier's threshold (`idle_to_sleep` …
@@ -1687,6 +1849,25 @@ own channels.
 endpoints [11 §2.9]. So the mode is `vendor_rc{claude | codex}`, with the same rules. Approval answers that
 would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gains
 `answers_are_policy_writes`.
+
+**PoC results (2026-11-09).** Built as `wicket wrap` plus `examples/remote-control`:
+- **The bridge runs on the host.** `CLAUDE_CODE_PROCESS_WRAPPER` puts each session process in a gVisor box,
+  with its stdio connected through.
+- **E-RC1: yes.** A session ran entirely through the egress proxy: the worker registered, the event
+  stream (SSE) worked, model calls worked, and the owner chatted with it live from the Claude desktop app.
+- **E-RC2: yes, with no account credential in the box.**
+  - The box gets a placeholder `.credentials.json` (only the non-secret scope and subscription fields are
+    copied) and a placeholder in place of the bridge's session token.
+  - The egress proxy swaps each placeholder for the real value, in `Authorization` only and only toward
+    `api.anthropic.com`. The login is read by reference, as in §6.
+  - The bridge's messaging socket and its other host paths never enter the box.
+- **E-RC3: a first allowlist from a real session.**
+  - Allowed: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/code/sessions/*/worker/**`, and four profile
+    and bootstrap reads.
+  - Forbidden (zone `forbid` rules): the account's connectors (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`,
+    `/mcp-registry/**`). Wrapped sessions also get wicket's gateway as their only MCP server.
+- **Two layers of approval were visible in the app:** Claude Code's own prompt (advisory, in the box) and
+  wicket's block (decided only in wicket).
 
 **Experiments** [09 §9]:
 - **E-RC1:** does a jailed RC session work through the egress proxy?
@@ -2153,4 +2334,26 @@ of the rest matters.
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
     own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
-12. **Name.** "wicket" is a working name (the small door set into a larger gate).
+12. **Node transport: SSH for now, explore others** (owner, 2026-11-08: "ssh is fine for now but keep a
+    note about exploring other protocols"). SSH (`ssh -R` per run) is not resumable:
+    - one TCP connection carries the forwarded sockets and the event stream, and a drop kills the run's
+      route out;
+    - it has head-of-line blocking, trust-on-first-use host keys, and needs an inbound sshd.
+
+    To explore: the node dials out over QUIC (`quinn`) with mTLS node certificates from the issuer
+    (§3.2). That gives independent streams, connection migration and fast reconnect. On top of it goes a
+    numbered, acknowledged control and event stream that resumes from the last acknowledged position.
+    Proxied requests fail retryably instead of resuming, and pending approvals live in the ledger, so
+    they survive drops. Alternatives: WireGuard plus HTTP/2 (gRPC), or WebSocket.
+13. **wicket working on wicket** (owner, 2026-11-09: "iterate on wicket from inside wicket"; wicket stays
+    general, with nothing development-specific built in). `examples/self-hosting/` is one project describing
+    its own workload: the image, the reach, volumes for its caches, and allowlisted adapter settings.
+    It works for building, unit tests and commits, with pushes and pull requests waiting for a human.
+    Open:
+    - Running wicket's own end-to-end tests from inside needs Docker and gVisor in the box. The host's
+      Docker socket would be an escape, so this needs a throwaway node per test run, started as a program
+      or tool (§17).
+    - A push is two approvals today: the push discovery and the push itself. A grant scoped to one push
+      would make it one.
+    - Steering from a phone needs the console reachable (§14.1).
+14. **Name.** "wicket" is a working name (the small door set into a larger gate).

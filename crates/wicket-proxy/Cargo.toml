@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 wicket-core.workspace = true
 wicket-store.workspace = true
+wicket-identity.workspace = true
+ulid.workspace = true
+base64 = "0.22"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

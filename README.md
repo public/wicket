@@ -30,7 +30,30 @@ What it does:
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
 
-### Requirements
+#### Agent identity and child agents
+
+Every agent run gets an identity issued by the installation (`spiffe://wicket.local/t/<tenant>/z/<zone>/a/<agent>`),
+an EdDSA-signed document whose key is held by wicket, never by the box.
+
+- Show it: `wicket identity issuer` (public key for verifiers), `wicket identity list`, `wicket identity show <run>`.
+- Pending requests show the requesting agent's verified identity. The console won't approve for an agent
+  whose identity doesn't verify.
+- Agents talk only through wicket: `send_message` and `await_message` in the gateway. wicket sets and signs the
+  sender. Parent and child may always talk; other zones only if the recipient's zone lists them in
+  `accept_from`.
+- `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own sandbox and identity, in a
+  zone the agent writes. That zone must be a subset of the agent's own: reach, credentials, model budget (carved
+  out), resources, time, isolation and images. Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
+  exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
+  `in_box_subagents: false` to make wicket children the only kind of subagent.
+- Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
+  `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
+  and approvals.
+- Every identity records who it acts for, back to the human: `acting for: alice (cli, unix-user) → lead → fetcher`.
+- `wicket audit --verify` re-checks every identity ever issued (rotations included) and every message signature,
+  offline.
+
+## Requirements
 
 Linux with Docker and gVisor (`runsc`) registered as a Docker runtime with `--host-uds=open`:
 
@@ -81,8 +104,40 @@ any change is refused until re-approved. Out-of-reach requests fail instead of e
 For testing without a model, `examples/mock-github.yaml` plus `wicket dev mock-llm --command '...'` drives the whole path
 with a scripted model.
 
+### Longer sessions, volumes and in-place workspaces
+
+These are general features for any workload:
+- **`wicket run … --workspace-dir <dir>`** mounts a directory as the box's `/workspace`, in place, instead
+  of copying it. `--task "…"` replaces the manifest's task.
+- **`zone.volumes`** are named directories under `/volumes/` that persist between runs of a zone: caches,
+  datasets, any state.
+- **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
+  a follow-up, which becomes its next turn.
+- **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
+  allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
+- **`inject` rules can be `optional`,** and `{basic:USER}` renders an HTTP Basic credential (e.g. git over
+  HTTPS with a token).
+
+`examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
+
+### Inside the box
+
+wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
+script), so the agent has all of localhost for its own servers. The entry script adds that address as root
+with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+
+### Agents launched by something else, e.g. Remote Control
+
+`wicket wrap --manifest <m> -- <agent command line>` runs an agent that another program launches inside a box,
+with stdio connected through. `examples/remote-control/` uses it as Claude Code's `CLAUDE_CODE_PROCESS_WRAPPER`,
+so a session you drive from the Claude app runs in gVisor. It holds only placeholder credentials, which the
+proxy swaps for the real ones on `api.anthropic.com` alone. See its manifest for the reach a session needs.
+
+Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone doesn't name
+look like it doesn't exist. Agents ask ahead for reach with `request_access`.
+
 ### Not in the PoC yet
 
-Adapter-generated MCP tools and third-party MCP servers, multiple zones and gates, labels and handles, the console and passkey approvals, long-lived agents
-and hibernation, Cedar policy, multi-tenant mode, other agents (Codex, pi). Response bodies are not scrubbed for
+Adapter-generated MCP tools and third-party MCP servers, multiple zones and gates, labels and handles, hibernation
+and wake, Cedar policy, multi-tenant mode, other agents (Codex, pi). Response bodies are not scrubbed for
 reflected credentials (headers are). See the milestones in docs/design.md.

@@ -106,3 +106,143 @@ The task asked Claude Code (in gVisor, zone `research`, empty reach) to start tw
 
 Not yet covered: the console card was changed but not exercised in a browser in this run, and the
 "used by a different agent" warning is covered only by inspection, not by a test.
+
+## Agent identity and child agents (2026-11-08)
+
+Manifest: agent `lead`, `max_children: 1`, `in_box_subagents: false`, zone `research` with empty reach.
+
+- `lead` started as `spiffe://wicket.local/t/t0/z/research/a/lead`, called `whoami`, then `spawn_agent`
+  ("fetcher"). The child ran as a separate `wicket run` with its own gVisor box, sockets, proxies and identity
+  `spiffe://wicket.local/t/t0/z/research/a/fetcher`, with `parent_run` set.
+- The child's `curl https://example.com/` became pending. `wicket pending` showed
+  `agent: spiffe://wicket.local/t/t0/z/research/a/fetcher [verified], child of lead (run_…)`.
+- Approved with the CLI. The decision record carries the verified identity (agent, zone, parent, image,
+  manifest digest, identity digest). The child retried and got 200.
+- The child sent `{"http_status": 200, "my_identity": …}` to its parent with `send_message`. Its runner then
+  sent a signed `run_finished`. The parent received both through `await_message`, each with
+  `from.id = …/a/fetcher` and `relation: "your child"`, set and verified by wicket, and wrote them to its
+  result.json.
+- Parent 97 s, child 83 s; the parent stopped no children, because the child had already finished.
+- `wicket identity list` verified both identities. `wicket audit --verify` passed: the chain, plus 4 identities
+  and messages verified offline.
+
+Unit tests cover what the live run didn't:
+- tampered and foreign-issuer identity documents;
+- a spoofed envelope (one agent's identity, another agent's key);
+- cross-zone refusal without `accept_from`, and cross-tenant refusal;
+- size limits;
+- a forged envelope planted in the ledger;
+- a genuine envelope replayed to the wrong recipient.
+
+The console's identity display and its approval refusal for unverified identities were not exercised in a
+browser (the page script was syntax-checked only).
+
+## Short-lived identities, revocation and the chain to the human (2026-11-08)
+
+Same parent/child manifest, with `WICKET_IDENTITY_TTL=30`: identities valid 30 s, re-issued every 15 s.
+
+- The run started with `acting for claude (cli, unix-user) → lead`. The child's pending request showed
+  `agent: …/a/fetcher [verified]  acting for: claude (cli, unix-user) → lead → fetcher`. The child's runner
+  built that chain from the parent's verified identity.
+- Within 40 s the audit log held 6 `identity.rotated` records across both runs, each with a new key and
+  identity digest.
+- `wicket identity revoke <lead run>` while the child waited for approval:
+  - The lead's runner logged that the identity was revoked, stopped its box and interrupted its child. The
+    lead ended as `revoked`.
+  - The child's attempt to send `run_finished` was refused (`this agent's identity was revoked (revoked:
+    <lead run>)`), and its pending request was withdrawn.
+  - `wicket identity list` showed both as NOT VERIFIED: the lead revoked, and the child through its
+    ancestor.
+- `wicket audit --verify` passed: 96 audit records, and 12 identity documents and messages verified offline.
+  These include every rotation, plus messages from the earlier run whose identities predate the
+  `principal` claim.
+
+Unit tests add:
+- a genuine envelope signed with an expired key and recorded now, which is dropped;
+- messages from a sender revoked after sending;
+- sending after revocation;
+- revocation cascading to children;
+- validity windows;
+- the delegation chain over three generations.
+
+## wicket working on wicket (2026-11-09)
+
+Workload: `examples/self-hosting/`. The image is the agent image plus Rust 1.99.1. The workspace is a separate
+clone of this repository, mounted with `--workspace-dir`. Two volumes (cargo home, target dir). Reach covers
+crates.io, git fetch of this repository, and its GitHub API. A GitHub token would be injected if stored; none
+was.
+
+Session 1 (idle timeout shortened to 3 minutes):
+- Inside gVisor, Claude Code read the GitHub repository (`git ls-remote origin`, anonymous) and fetched ~60
+  crates through the egress proxy. It ran `cargo test -p wicket-core`, then added a unit test (reserved
+  `PATH` and `USER` in `agent.env`), re-ran the tests and committed on a new branch.
+- First turn ≈ 4 minutes, most of it the cold fetch and build.
+- A follow-up sent with `wicket say` arrived as the next turn: clippy, 0 warnings. After 3 idle minutes
+  the session closed and the run ended as succeeded.
+- The volumes then held 58 MB of crates and 349 MB of build output.
+- The agent's commit carried Claude Code's default `Co-Authored-By` trailer. That led to
+  `agent.adapter_settings`, which the example uses to turn attribution off.
+
+Session 2 (one-shot):
+- `cargo test -p wicket-core` took 2.0 s from the warm volumes.
+- An empty commit made by the agent had no trailer, and `result.json` reached the outbox.
+- The run took 12 s.
+
+The agent's test is in this branch as `test: cover reserved PATH and USER in agent.env`, with the trailer removed.
+Not exercised: pushes and pull requests (no token stored, and each would wait for approval), and wicket's own
+end-to-end tests (they need Docker in the box; design §21).
+
+## Remote Control inside wicket, and agents at the edge (2026-11-09)
+
+- **Remote Control in a box.** A Claude Code Remote Control bridge on the host, with
+  `CLAUDE_CODE_PROCESS_WRAPPER=examples/remote-control/wrap.sh`, put each session process in a gVisor box
+  (`wicket wrap`). The owner chatted with it live from the Claude desktop app.
+  - Model calls, the worker registration, and the session's event stream and deliveries all went through the
+    egress proxy.
+  - The box held only a placeholder login file and a placeholder session token; the proxy swapped in the
+    real ones toward `api.anthropic.com` only.
+  - The identity read `acting for: claude.ai account … (remote-control) → rc-agent`.
+- **Connectors.** The first session tried the account's 11 claude.ai connectors (`mcp-proxy.anthropic.com`).
+  Those requests were denied, then forbidden in the zone; a later session's connector listing was refused
+  outright, and no connector requests reached the queue.
+- **The agent didn't know it was sandboxed**, and WebFetch showed only a bare 403, so the agent retried by
+  other means. That led to:
+  - status lines and bodies that say which kind of block it is;
+  - a shared sandbox notice for wrapped sessions;
+  - `request_access`;
+  - spin detection.
+- **The live check after those changes.** A batch agent blocked on `news.ycombinator.com` and a made-up
+  domain said "Both need approval. I'll wait on the grants", waited with `await_grant`, and retried each
+  once after the owner approved from the console with a passkey.
+  - The made-up domain failed at DNS on the host after approval, and the agent reported that it doesn't
+    exist.
+
+## wicket at wicket.internal, localhost for the agent (2026-11-09)
+
+A probe agent in a fresh box (new image):
+- `whoami` worked over MCP at `wicket.internal:8081`.
+- Its own `http.server`s on 127.0.0.1:8080 and 127.0.0.1:3128 both answered 200. Those were wicket's old
+  in-box ports.
+- `https://example.com/` returned 200 through the proxy at `wicket.internal:3128`.
+- `id`: uid 1001. CapInh, CapPrm, CapEff, CapBnd and CapAmb were all 0, and `ip addr add` failed with
+  "Operation not permitted".
+- `getent hosts wicket.internal` → 198.18.0.1, and `lo` carried 127.0.0.1/8 and 198.18.0.1/32.
+
+## Agents construct zones (2026-11-09)
+
+A lead agent (zone `research`: reach `example.com` and part of `api.github.com`; 60 model requests; 15 minutes):
+1. It spawned agent `reader` in zone `{reach: [example.com], llm: 15 requests, 1g, 5m}`. This started
+   within the lead's zone, with 15 requests carved out of the lead's budget. The reader fetched the page
+   in its own box and sent the title back in a signed message, then `run_finished`.
+2. It spawned program `hn` (`curl https://news.ycombinator.com/`) in zone `{reach: [news.ycombinator.com]}`.
+   This was refused with each violation listed: GET and HEAD on `news.ycombinator.com/**` aren't within the
+   lead's reach.
+3. The same request with `ask_human` became pending request `SPAWN wicket.internal/zones/research.hn/<digest>`,
+   showing the lead's verified identity and the violations.
+   - The first live run found a bug: the approval was bound to a digest of the derived manifest, which
+     includes the parent's remaining time, so the identical retry asked again. Fixed by binding to the
+     request as stated; the digest was then identical across runs.
+   - After approval the retry started `hn` (audited as `spawn.beyond_parent`). It reached Hacker News
+     (200), and sent a signed `run_finished` with its output. That needed programs to get identities too.
+
+`wicket identity list` showed `…/z/research.hn/a/hn [verified]  acting for: claude (cli, unix-user) → lead → hn`.

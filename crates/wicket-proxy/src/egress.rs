@@ -23,6 +23,8 @@ pub struct Egress {
     ctx: RunCtx,
     ca: Arc<RunCa>,
     client: reqwest::Client,
+    /// Blocked attempts this run: per request (or host), and in total.
+    strikes: std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
 }
 
 impl Egress {
@@ -32,7 +34,7 @@ impl Egress {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
-        Ok(Arc::new(Egress { ctx, ca, client }))
+        Ok(Arc::new(Egress { ctx, ca, client, strikes: Default::default() }))
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -65,6 +67,9 @@ impl Egress {
             if host.parse::<std::net::IpAddr>().is_ok() {
                 return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
             }
+            if let Some(r) = self.judge_host(&host, "CONNECT") {
+                return Ok(r);
+            }
             let me = self.clone();
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
@@ -82,6 +87,9 @@ impl Egress {
         let host = req.uri().host().map(|h| h.to_ascii_lowercase());
         match host {
             Some(h) if req.uri().scheme_str() == Some("http") => {
+                if let Some(r) = self.judge_host(&h, req.method().as_str()) {
+                    return Ok(r);
+                }
                 let me = self.clone();
                 Ok(me.handle(req, h, "http").await)
             }
@@ -102,6 +110,56 @@ impl Egress {
         Ok(())
     }
 
+    /// Decides about a host before any request to it (and before TLS): never-reachable hosts are
+    /// refused, saying so; in zones that hide unlisted hosts, they behave as if they didn't exist.
+    fn judge_host(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
+        match wicket_core::host_verdict(&self.ctx.zone, host) {
+            wicket_core::HostVerdict::Open => None,
+            wicket_core::HostVerdict::Forbidden(why) => {
+                self.ctx.emit(Event::Egress { method: method.into(), host: host.into(), path: "/".into(), risk: "-".into(), outcome: "forbidden".into(), detail: why.clone() });
+                let note = self.strike(&format!("host {host}"));
+                Some(problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
+                    "{why}. This will never be allowed from this sandbox, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
+                    crate::SANDBOX_FACT
+                ), None))
+            }
+            wicket_core::HostVerdict::Hidden => {
+                self.ctx.emit(Event::Egress { method: method.into(), host: host.into(), path: "/".into(), risk: "-".into(), outcome: "hidden".into(), detail: "not a host this zone can see".into() });
+                let note = self.strike(&format!("host {host}"));
+                Some(problem(502, "unknown-host", "wicket sandbox: unknown host", &format!(
+                    "{host} does not exist as far as this sandbox is concerned: it can only see the hosts its zone names. {} Do not retry it.{note}",
+                    crate::SANDBOX_FACT
+                ), None))
+            }
+        }
+    }
+
+    /// Counts a blocked attempt and returns a note for the agent once it starts repeating itself: the
+    /// point is that an agent at the edge of its sandbox stops and asks, rather than spinning.
+    fn strike(&self, key: &str) -> String {
+        let (same, total) = {
+            let mut s = self.strikes.lock().expect("strikes");
+            let same = {
+                let n = s.0.entry(key.to_string()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            s.1 += 1;
+            (same, s.1)
+        };
+        if total == 10 || (total > 10 && total % 10 == 0) {
+            self.ctx.emit(Event::Tool { name: "wicket".into(), detail: format!("agent may be stuck: {total} blocked requests in this run") });
+        }
+        let mut note = String::new();
+        if same >= 3 {
+            note.push_str(&format!(" This exact request has now been blocked {same} times: stop retrying it."));
+        }
+        if total >= 10 {
+            note.push_str(&format!(" This run has hit the sandbox's limits {total} times. Stop exploring alternatives: tell the user what you need, or call request_access once with a reason."));
+        }
+        note
+    }
+
     fn refuse(&self, host: &str, method: &str, path: &str, why: &str) -> Response<BoxBody> {
         self.ctx.emit(Event::Egress {
             method: method.into(),
@@ -111,7 +169,7 @@ impl Egress {
             outcome: "forbidden".into(),
             detail: why.into(),
         });
-        problem(403, "forbidden", "Forbidden by wicket", why, None)
+        problem(403, "forbidden", "Blocked by wicket sandbox: malformed request", &format!("{why}. {}", crate::SANDBOX_FACT), None)
     }
 
     /// Decide and, if allowed, forward one request. `host` is the CONNECT target (or the absolute
@@ -148,7 +206,11 @@ impl Egress {
             Verdict::AllowByReach(i) => emit("allow", format!("reach rule {i}")),
             Verdict::Forbidden(why) => {
                 emit("forbidden", why.clone());
-                return problem(403, "forbidden", "Forbidden by wicket", &why, None);
+                let note = self.strike(&op.digest());
+                return problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
+                    "{why}. This will never be allowed from this sandbox, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
+                    crate::SANDBOX_FACT
+                ), None);
             }
             Verdict::NeedsGrant(why) if !ctx.escalate => {
                 emit("forbidden", format!("{why}; this run does not escalate (on_pending: fail)"));
@@ -182,7 +244,11 @@ impl Egress {
                         if let Ok(Some(rid)) = ledger.denied_recently(&op) {
                             drop(ledger);
                             emit("denied", format!("request {rid} was denied"));
-                            return problem(403, "denied", "Denied by a human", &format!("request {rid} was denied: do not retry"), None);
+                            let note = self.strike(&op.digest());
+                            return problem(403, "denied", "Blocked by wicket sandbox: denied by a human", &format!(
+                                "A human denied request {rid} for exactly this request. {} Do not retry it; continue without it and tell the user.{note}",
+                                crate::SANDBOX_FACT
+                            ), None);
                         }
                         let res = ledger.pending_for(&op, &why, who.as_ref().map(|(v, _)| v));
                         drop(ledger);
@@ -190,7 +256,11 @@ impl Egress {
                             Ok((rid, fresh)) => {
                                 let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
                                 emit("pending", format!("{rid}{}: {why}{for_line}", if fresh { " (new)" } else { "" }));
-                                problem(403, "pending-approval", "Pending approval", &why, Some(&rid))
+                                let note = self.strike(&op.digest());
+                                problem(403, "pending-approval", "Blocked by wicket sandbox: needs human approval", &format!(
+                                    "{why}. wicket has asked a human to approve request {rid}; until they do, this request fails every time. {} Call await_grant with {rid} to wait, or tell the user that request {rid} is waiting for their approval in wicket (approvals happen in wicket, not in this conversation).{note}",
+                                    crate::SANDBOX_FACT
+                                ), Some(&rid))
                             }
                             Err(e) => problem(500, "error", "Ledger error", &e.to_string(), None),
                         };
@@ -207,6 +277,8 @@ impl Egress {
 
     async fn forward(&self, req: Request<Incoming>, host: &str, scheme: &str, pq: &str) -> Result<Response<BoxBody>> {
         let (parts, body) = req.into_parts();
+        // What the box put in Authorization: only ever a placeholder, to be swapped (below) or dropped.
+        let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let url = format!("{scheme}://{host}{pq}");
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
@@ -216,25 +288,43 @@ impl Egress {
                 rb = rb.header(name.as_str(), value.as_bytes());
             }
         }
-        // Inject the zone's credential for this host into its one declared slot.
+        // Inject the zone's credential for this host into its one declared slot. An optional rule
+        // whose secret isn't set sends the request without it (e.g. anonymous reads).
+        let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
-                let secret = self.ctx.vault.get(&rule.secret)?;
-                rb = rb.header(rule.header.as_str(), rule.format.replace("{secret}", &secret));
+                let secret = match self.ctx.vault.get(&rule.secret) {
+                    Ok(s) => s,
+                    Err(_) if rule.optional => break,
+                    Err(e) => return Err(e),
+                };
+                let value = render_credential(&rule.format, &secret);
+                rb = rb.header(rule.header.as_str(), value.as_str());
+                injected.push(secret);
+                injected.push(value);
                 break;
+            }
+        }
+        if injected.is_empty() {
+            if let Some(auth) = &box_auth {
+                let presented = auth.strip_prefix("Bearer ").unwrap_or("");
+                match self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented) {
+                    Some(sw) => {
+                        let real = match &sw.real {
+                            crate::SwapSource::Vault(name) => self.ctx.vault.get(name)?,
+                            crate::SwapSource::Value(v) => v.clone(),
+                        };
+                        rb = rb.header("authorization", format!("Bearer {real}"));
+                        injected.push(real);
+                        tracing::debug!(host, swap = %sw.name, "credential swapped");
+                    }
+                    None => tracing::debug!(host, "box-supplied authorization dropped (not a known placeholder)"),
+                }
             }
         }
         let resp = rb.body(body).send().await?;
         let status = StatusCode::from_u16(resp.status().as_u16())?;
         let mut out = Response::builder().status(status);
-        let injected: Vec<String> = self
-            .ctx
-            .zone
-            .inject
-            .iter()
-            .filter(|r| host_matches(&r.host, host))
-            .filter_map(|r| self.ctx.vault.get(&r.secret).ok())
-            .collect();
         for (name, value) in resp.headers().iter() {
             if STRIP_RESPONSE.contains(&name.as_str()) {
                 continue;
@@ -247,5 +337,29 @@ impl Egress {
         }
         let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         Ok(out.body(BodyExt::boxed(StreamBody::new(stream)))?)
+    }
+}
+
+/// Renders an injection format: `{secret}` is the secret itself; `{basic:USER}` is
+/// base64("USER:secret"), for HTTP Basic credentials such as git over HTTPS with a token.
+pub fn render_credential(format: &str, secret: &str) -> String {
+    use base64::Engine;
+    let mut out = format.replace("{secret}", secret);
+    while let Some(start) = out.find("{basic:") {
+        let Some(len) = out[start..].find('}') else { break };
+        let user = out[start + 7..start + len].to_string();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        out.replace_range(start..start + len + 1, &enc);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn credential_formats() {
+        assert_eq!(super::render_credential("Bearer {secret}", "tok"), "Bearer tok");
+        // base64("x-access-token:tok")
+        assert_eq!(super::render_credential("Basic {basic:x-access-token}", "tok"), "Basic eC1hY2Nlc3MtdG9rZW46dG9r");
     }
 }

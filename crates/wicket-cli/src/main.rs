@@ -9,6 +9,7 @@ mod mock;
 mod node;
 mod program;
 mod run;
+mod spawn;
 mod serve;
 
 use anyhow::{bail, Context, Result};
@@ -28,6 +29,23 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum IdentityCmd {
+    /// Print the installation issuer's public key (JWK): what verifiers need.
+    Issuer,
+    /// Verify and show the identity wicket issued for a run.
+    Show { run: String },
+    /// List every agent identity issued, verified.
+    List,
+    /// Revoke a run's identity at once (e.g. if its environment may be compromised): its box is
+    /// stopped, its messages are no longer delivered, and its requests can't be approved.
+    Revoke {
+        run: String,
+        #[arg(long, default_value = "revoked by the operator")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Run a task manifest: one Claude Code agent in one zone.
     Run {
@@ -35,6 +53,12 @@ enum Cmd {
         /// Copy this directory into the box's /workspace first.
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// Mount this directory as the box's /workspace, read-write and in place (local runs only).
+        #[arg(long)]
+        workspace_dir: Option<PathBuf>,
+        /// Use this task text instead of the manifest's.
+        #[arg(long)]
+        task: Option<String>,
         /// Agent image.
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
@@ -44,6 +68,30 @@ enum Cmd {
         /// ssh identity for --node.
         #[arg(long)]
         ssh_key: Option<PathBuf>,
+        /// Internal: the run id to use (set by a parent starting a child agent).
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
+        /// Internal: the run that started this one (`spawn_agent`).
+        #[arg(long, hide = true)]
+        parent_run: Option<String>,
+    },
+    /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
+    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
+    Say {
+        run: String,
+        text: Vec<String>,
+    },
+    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
+    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
+    /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
+    Wrap {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = "wicket/claude-code:poc")]
+        image: String,
+        /// The agent command line, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
     },
     /// List pending escalation requests.
     Pending,
@@ -107,6 +155,11 @@ enum Cmd {
     Operator {
         #[command(subcommand)]
         cmd: OperatorCmd,
+    },
+    /// Agent identities (design §3.2): the issuer's public key, and verified identity documents.
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
     },
     /// Check the environment: Docker, gVisor, image, secrets, ledger.
     Doctor {
@@ -179,6 +232,77 @@ pub fn ledger_path() -> PathBuf {
     data_dir().join("ledger.db")
 }
 
+/// The verified identity of the agent running as `run`, for showing to humans: the identity document
+/// is checked against the issuer and against the ledger's own row, so an edited row is caught.
+/// `at` is the time to check validity at (now for live runs, issue time for history).
+pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::Value {
+    let row = match l.identity(run) {
+        Ok(Some(r)) => r,
+        Ok(None) => return serde_json::json!({ "verified": false, "run": run, "error": "no identity was issued for this run" }),
+        Err(e) => return serde_json::json!({ "verified": false, "run": run, "error": e.to_string() }),
+    };
+    let check = || -> anyhow::Result<wicket_identity::AgentClaims> {
+        let issuer = issuer()?;
+        let c = wicket_identity::verify_identity(&row.jws, &issuer.verifying_key(), at.unwrap_or(row.issued_at))?;
+        if c.run != row.run || c.tenant != row.tenant || c.zone != row.zone || c.agent != row.agent || c.sub != row.spiffe_id || c.parent_run != row.parent_run {
+            anyhow::bail!("the ledger's record does not match the signed identity");
+        }
+        Ok(c)
+    };
+    match check() {
+        Ok(c) => {
+            if let Ok(Some((r, when, by, reason))) = l.revoked_in_chain(run) {
+                let whose = if r == run { "identity".to_string() } else { format!("identity of its ancestor {r}") };
+                return serde_json::json!({ "verified": false, "revoked": true, "run": run, "agent": c.agent, "zone": c.zone,
+                    "error": format!("{whose} revoked by {by} at {when}: {reason}") });
+            }
+            let parent_agent = c.parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|p| p.agent);
+            serde_json::json!({
+                "verified": true, "id": c.sub, "agent": c.agent, "zone": c.zone, "tenant": c.tenant, "run": c.run,
+                "parent_run": c.parent_run, "parent_agent": parent_agent, "node": c.node, "image": c.image,
+                "principal": c.principal, "acting_for": c.chain(), "expires_at": c.exp,
+                "manifest_sha256": c.manifest_sha256, "identity_sha256": wicket_identity::identity_digest(&row.jws),
+            })
+        }
+        Err(e) => serde_json::json!({ "verified": false, "run": run, "agent": row.agent, "zone": row.zone, "error": e.to_string() }),
+    }
+}
+
+/// One line for terminals.
+pub fn identity_line(v: &serde_json::Value) -> String {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
+    if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
+        let chain = v.get("acting_for").and_then(|c| c.as_array()).map(|c| c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" → ")).unwrap_or_default();
+        format!("{} [verified]  acting for: {chain}", g("id"))
+    } else {
+        format!("NOT VERIFIED: {}", g("error"))
+    }
+}
+
+/// The installation's identity issuer key (design §3.2). Under WICKET_HOME when that is set.
+pub fn issuer_key_path() -> PathBuf {
+    if let Some(d) = std::env::var_os("WICKET_HOME") {
+        return PathBuf::from(d).join("identity/issuer.key");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config/wicket/identity/issuer.key")
+}
+
+/// The principal behind a run started from this CLI: the local unix user. That is all the PoC CLI
+/// knows; runs started from the console would carry the passkey-authenticated operator instead.
+pub fn cli_principal() -> serde_json::Value {
+    let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
+    serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
+}
+
+pub fn trust_domain() -> String {
+    std::env::var("WICKET_TRUST_DOMAIN").unwrap_or_else(|_| "wicket.local".into())
+}
+
+pub fn issuer() -> Result<wicket_identity::Issuer> {
+    Ok(wicket_identity::Issuer::load_or_create(&issuer_key_path(), &trust_domain())?)
+}
+
 fn operator() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
     format!("{user}@cli (host break-glass)")
@@ -193,7 +317,36 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run { manifest, workdir, image, node, ssh_key } => run::run(&manifest, workdir.as_deref(), &image, node.as_deref(), ssh_key.as_deref()).await,
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
+            run::run(run::RunOpts {
+                manifest: &manifest, workdir: workdir.as_deref(), workspace_dir: workspace_dir.as_deref(), task, image: &image,
+                node: node.as_deref(), ssh_key: ssh_key.as_deref(), run_id, parent_run, wrap: None,
+            })
+            .await
+        }
+        Cmd::Wrap { manifest, image, argv } => {
+            run::run(run::RunOpts {
+                manifest: &manifest, workdir: None, workspace_dir: None, task: None, image: &image,
+                node: None, ssh_key: None, run_id: None, parent_run: None, wrap: Some(argv),
+            })
+            .await
+        }
+        Cmd::Say { run, text } => {
+            let text = text.join(" ");
+            if text.trim().is_empty() {
+                bail!("nothing to say");
+            }
+            let l = Ledger::open(&ledger_path())?;
+            match l.run_status(&run)?.as_deref() {
+                Some("running") => {}
+                Some(s) => bail!("{run} is {s}, not running"),
+                None => bail!("no run {run}"),
+            }
+            l.add_operator_message(&run, &text, &operator())?;
+            l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "operator.message", &serde_json::json!({ "by": operator(), "chars": text.len() }))?;
+            println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
+            Ok(())
+        }
         Cmd::Pending => {
             let l = Ledger::open(&ledger_path())?;
             let p = l.pending(&TenantId::single())?;
@@ -202,7 +355,8 @@ async fn main() -> Result<()> {
             }
             for r in p {
                 let age = wicket_store::now() - r.created_at;
-                println!("{}  {} {}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, r.risk, r.run, age, r.reason);
+                println!("{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, if r.scope_prefix { "*  (every path under it)" } else { "" }, r.risk, r.run, age, r.reason);
+                println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
                 for a in &r.attribution {
                     println!("    for: {}  (reported by the agent, unverified)", wicket_agent::clip(&wicket_proxy::attribution_line(a), 240));
                 }
@@ -221,6 +375,7 @@ async fn main() -> Result<()> {
                 "request": id, "decision": "approve", "grant": gid, "by": operator(),
                 "method": req.method, "host": req.host, "path": req.path,
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
+                "agent_identity": verified_identity(&l, &req.run, None),
                 "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
             }))?;
             println!("approved {id} → grant {gid}: {} {}{} ({}, {})", req.method, req.host, prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") }, humantime::format_duration(ttl));
@@ -233,6 +388,28 @@ async fn main() -> Result<()> {
             println!("denied {id}");
             Ok(())
         }
+        Cmd::Identity { cmd } => {
+            let l = Ledger::open(&ledger_path())?;
+            match cmd {
+                IdentityCmd::Issuer => println!("{}", serde_json::to_string_pretty(&issuer()?.public_jwk())?),
+                IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
+                IdentityCmd::Revoke { run, reason } => {
+                    if l.identity(&run)?.is_none() {
+                        bail!("no identity was issued for {run}");
+                    }
+                    let fresh = l.revoke(&run, &operator(), &reason)?;
+                    l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "identity.revoked", &serde_json::json!({ "run": run, "by": operator(), "reason": reason }))?;
+                    println!("{} {run}: its runner stops the box within seconds; its messages and approvals are refused", if fresh { "revoked" } else { "already revoked" });
+                }
+                IdentityCmd::List => {
+                    for row in l.identities()? {
+                        let status = l.run_status(&row.run)?.unwrap_or_default();
+                        println!("{}  {:<10} {}", row.run, status, identity_line(&verified_identity(&l, &row.run, None)));
+                    }
+                }
+            }
+            Ok(())
+        }
         Cmd::Audit { tail, verify } => {
             let l = Ledger::open(&ledger_path())?;
             if verify {
@@ -240,8 +417,10 @@ async fn main() -> Result<()> {
                 println!("audit chain OK: {n} records");
                 let (ok, bad) = verify_signed_decisions(&l)?;
                 println!("passkey-signed decisions: {ok} verified offline, {bad} failed");
-                if bad > 0 {
-                    bail!("{bad} signed decision(s) failed verification");
+                let (iok, ibad) = verify_identities_and_messages(&l)?;
+                println!("agent identities and signed messages: {iok} verified offline, {ibad} failed");
+                if bad + ibad > 0 {
+                    bail!("{} record(s) failed verification", bad + ibad);
                 }
                 return Ok(());
             }
@@ -312,6 +491,48 @@ async fn main() -> Result<()> {
 
 /// Re-verifies every passkey-signed decision in the audit log from the stored public keys alone: the
 /// signature must cover exactly the recorded decision.
+/// Verifies every issued identity (at its issue time) and every stored envelope (at its send time).
+fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize)> {
+    let (mut ok, mut bad) = (0, 0);
+    let key = issuer()?.verifying_key();
+    // Every document ever issued, rotations included, each at its own issue time (plus current
+    // documents from ledgers that predate the history table).
+    let mut docs = l.identity_history()?;
+    for row in l.identities()? {
+        if !docs.iter().any(|(_, j, _)| j == &row.jws) {
+            docs.push((row.run.clone(), row.jws.clone(), row.issued_at));
+        }
+    }
+    for (run, jws, at) in docs {
+        match wicket_identity::verify_identity(&jws, &key, at) {
+            Ok(c) if c.run == run => ok += 1,
+            Ok(_) => {
+                println!("  identity of {run} issued at {at}: FAILED: names another run");
+                bad += 1;
+            }
+            Err(e) => {
+                println!("  identity of {run} issued at {at}: FAILED: {e}");
+                bad += 1;
+            }
+        }
+    }
+    for (id, env, at) in l.envelopes()? {
+        // Each message at the time wicket recorded it: the sender's identity must have been valid then.
+        match wicket_identity::verify_envelope(&env, &key, at) {
+            Ok((_, p)) if p.get("jti").and_then(|j| j.as_str()) == Some(id.as_str()) => ok += 1,
+            Ok(_) => {
+                println!("  message {id}: FAILED: id does not match its envelope");
+                bad += 1;
+            }
+            Err(e) => {
+                println!("  message {id}: FAILED: {e}");
+                bad += 1;
+            }
+        }
+    }
+    Ok((ok, bad))
+}
+
 fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
     use wicket_auth::{decision_challenge, unb64u, Credential, RelyingParty};
     let keys = l.operator_credentials_all(&TenantId::single())?;
