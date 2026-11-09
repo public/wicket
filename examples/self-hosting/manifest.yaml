@@ -12,6 +12,10 @@ agent:
     CARGO_HTTP_CAINFO: /tmp/ca-bundle.pem   # the run's CA bundle (WICKET_CA_BUNDLE)
     CARGO_BUILD_JOBS: "2"
     CARGO_TERM_COLOR: never
+  # This project's commits carry no AI attribution trailers.
+  adapter_settings:
+    includeCoAuthoredBy: false
+    attribution: { commit: "", pr: "" }
 zone:
   name: wicket-src
   isolation: gvisor

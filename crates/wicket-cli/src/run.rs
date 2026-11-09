@@ -348,6 +348,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         };
         volume_mounts.push(Mount { host, target: v.path.clone(), read_only: false });
     }
+    if let Some(w) = &workspace_dir {
+        // Create the outbox mount point ourselves, so it isn't left behind owned by root.
+        std::fs::create_dir_all(w.join("out"))?;
+    }
     let workspace_mounts = match &workspace_dir {
         // In place: the project directory itself, with this run's outbox mounted over its out/.
         Some(w) => vec![
@@ -356,6 +360,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         ],
         None => vec![Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false }],
     };
+    // The agent's adapter settings (allowlisted keys only), in its own config dir.
+    if let Some(a) = m.agent.as_ref().filter(|a| !a.adapter_settings.is_empty()) {
+        let json = serde_json::to_vec_pretty(&serde_json::Value::Object(a.adapter_settings.clone()))?;
+        match &node {
+            None => std::fs::write(box_root.join("state/claude/settings.json"), json)?,
+            Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
+        }
+    }
     let interactive = plan.stdin_task.is_some();
     let stdin_task = plan.stdin_task.clone();
     let name = format!("wicket-{}", run.0.replace('_', "-"));

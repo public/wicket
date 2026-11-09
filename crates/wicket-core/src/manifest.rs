@@ -93,7 +93,15 @@ pub struct AgentSpec {
     /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Settings for the agent's own adapter (for claude-code: written to its settings.json), limited
+    /// to keys that can't change what the agent can reach or run (ADAPTER_SETTINGS_ALLOWED).
+    #[serde(default)]
+    pub adapter_settings: serde_json::Map<String, serde_json::Value>,
 }
+
+/// Adapter settings a manifest may set: presentation and commit metadata only. Hooks, permissions,
+/// MCP servers, environment, credential helpers and the like stay under wicket's control.
+pub const ADAPTER_SETTINGS_ALLOWED: [&str; 6] = ["includeCoAuthoredBy", "attribution", "outputStyle", "alwaysThinkingEnabled", "cleanupPeriodDays", "language"];
 
 fn zero() -> String {
     "0s".into()
@@ -302,6 +310,9 @@ impl Manifest {
                     None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
                 }
                 a.idle()?;
+                if let Some(k) = a.adapter_settings.keys().find(|k| !ADAPTER_SETTINGS_ALLOWED.contains(&k.as_str())) {
+                    return Err(ManifestError::Invalid(format!("agent.adapter_settings may not set {k:?} (allowed: {})", ADAPTER_SETTINGS_ALLOWED.join(", "))));
+                }
                 for k in a.env.keys() {
                     let ok = !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
                     if !ok || RESERVED_ENV_PREFIXES.iter().any(|p| k.starts_with(p)) || ["HOME", "PATH", "USER"].contains(&k.as_str()) {
@@ -414,6 +425,10 @@ zone:
             assert!(Manifest::from_yaml(&base(&format!(", env: {{ {bad}: x }}"))).is_err(), "{bad} must be refused");
         }
         assert!(Manifest::from_yaml(&base(", idle_timeout: 30m")).is_ok());
+        assert!(Manifest::from_yaml(&base(", adapter_settings: { includeCoAuthoredBy: false }")).is_ok());
+        for bad in ["hooks", "permissions", "apiKeyHelper", "env", "mcpServers"] {
+            assert!(Manifest::from_yaml(&base(&format!(", adapter_settings: {{ {bad}: {{}} }}"))).is_err(), "{bad} must be refused");
+        }
         assert!(Manifest::from_yaml(&base(", idle_timeout: soon")).is_err());
         let vol = |v: &str| format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, volumes: [{v}] }}\n");
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data }")).is_ok());
