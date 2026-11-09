@@ -227,3 +227,22 @@ A probe agent in a fresh box (new image):
 - `id`: uid 1001. CapInh, CapPrm, CapEff, CapBnd and CapAmb were all 0, and `ip addr add` failed with
   "Operation not permitted".
 - `getent hosts wicket.internal` → 198.18.0.1, and `lo` carried 127.0.0.1/8 and 198.18.0.1/32.
+
+## Agents construct zones (2026-11-09)
+
+A lead agent (zone `research`: reach `example.com` and part of `api.github.com`; 60 model requests; 15 minutes):
+1. It spawned agent `reader` in zone `{reach: [example.com], llm: 15 requests, 1g, 5m}`. This started
+   within the lead's zone, with 15 requests carved out of the lead's budget. The reader fetched the page
+   in its own box and sent the title back in a signed message, then `run_finished`.
+2. It spawned program `hn` (`curl https://news.ycombinator.com/`) in zone `{reach: [news.ycombinator.com]}`.
+   This was refused with each violation listed: GET and HEAD on `news.ycombinator.com/**` aren't within the
+   lead's reach.
+3. The same request with `ask_human` became pending request `SPAWN wicket.internal/zones/research.hn/<digest>`,
+   showing the lead's verified identity and the violations.
+   - The first live run found a bug: the approval was bound to a digest of the derived manifest, which
+     includes the parent's remaining time, so the identical retry asked again. Fixed by binding to the
+     request as stated; the digest was then identical across runs.
+   - After approval the retry started `hn` (audited as `spawn.beyond_parent`). It reached Hacker News
+     (200), and sent a signed `run_finished` with its output. That needed programs to get identities too.
+
+`wicket identity list` showed `…/z/research.hn/a/hn [verified]  acting for: claude (cli, unix-user) → lead → hn`.

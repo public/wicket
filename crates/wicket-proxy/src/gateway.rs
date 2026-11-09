@@ -102,6 +102,7 @@ impl Gateway {
             "send_message" => self.send_message(&args),
             "await_message" => self.await_message(&args).await,
             "spawn_agent" => self.spawn_agent(&args),
+            "spawn" => self.spawn(&args),
             "request_access" => self.request_access(&args),
             _ => (format!("unknown tool {name}"), true),
         };
@@ -259,8 +260,29 @@ impl Gateway {
             return ("`task` is required".into(), true);
         }
         let reach_hosts = args.get("reach_hosts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect());
-        match spawn(crate::SpawnRequest { agent: name.into(), task: task.into(), reach_hosts }) {
-            Ok(run) => (format!("started child agent {name} as run {run}, in its own sandbox with its own wicket identity. Its requests are approved separately. Use await_message to receive its messages and its final result."), false),
+        match spawn(crate::SpawnRequest { name: name.into(), kind: "agent".into(), task: Some(task.into()), reach_hosts, ..Default::default() }) {
+            Ok(msg) => (msg, false),
+            Err(e) => (format!("not started: {e}"), true),
+        }
+    }
+
+    /// The general form: an agent or a program, in a zone the caller writes.
+    fn spawn(&self, args: &Value) -> (String, bool) {
+        let Some(spawn) = &self.ctx.spawner else { return ("this agent may not start other boxes (max_children is 0)".into(), true) };
+        let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
+        let req = crate::SpawnRequest {
+            name: s("name").unwrap_or_default(),
+            kind: s("kind").unwrap_or_else(|| "agent".into()),
+            task: s("task"),
+            command: args.get("command").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            image: s("image"),
+            zone: args.get("zone").cloned().filter(|z| z.is_object()),
+            max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
+            ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
+            reach_hosts: None,
+        };
+        match spawn(req) {
+            Ok(msg) => (msg, false),
             Err(e) => (format!("not started: {e}"), true),
         }
     }
@@ -396,6 +418,28 @@ fn tools() -> Value {
                     "reach_hosts": { "type": "array", "items": { "type": "string" }, "description": "optional: only these hosts from your own reach" }
                 },
                 "required": ["name", "task"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "spawn",
+            "description": "Start a new box: an agent (with a task) or a program (a command, e.g. a long-running service), in a zone you describe. The zone must be within yours: reach, credentials, model budget (carved out of yours), memory, cpus, time, isolation and images can only narrow. If it isn't, you get the list of what exceeds yours; set ask_human to put exactly that zone to a human instead, then await_grant and call spawn again with the same arguments. Returns the new run id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+                    "kind": { "type": "string", "enum": ["agent", "program"], "default": "agent" },
+                    "task": { "type": "string", "description": "for agents" },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "for programs" },
+                    "image": { "type": "string", "description": "default: your own image" },
+                    "zone": {
+                        "type": "object",
+                        "description": "manifest-style zone: reach [{host, methods, paths}], forbid, unlisted_hosts, inject, volumes [{name, path}], llm {max_requests, max_output_tokens}, limits {memory, cpus, timeout, pids}, isolation, images, accept_from. Omitted: reach and credentials none; limits, isolation and unlisted_hosts yours; an agent's model budget half of what you have left."
+                    },
+                    "max_children": { "type": "integer", "minimum": 0, "default": 0 },
+                    "ask_human": { "type": "boolean", "default": false }
+                },
+                "required": ["name"],
                 "additionalProperties": false
             }
         },

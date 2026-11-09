@@ -9,6 +9,7 @@ mod mock;
 mod node;
 mod program;
 mod run;
+mod spawn;
 mod serve;
 
 use anyhow::{bail, Context, Result};
