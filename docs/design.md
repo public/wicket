@@ -184,6 +184,22 @@ header set/remove and credential, deny, need-body; fail closed; per-request time
 plane swappable and lets us test the decider offline from recorded frames, and run Anthropic's `srt-proxy`
 as a differential reference. [04 §7.1]
 
+### 3.1.1 wicket inside the box: its own name, not localhost (owner, 2026-11-09)
+
+wicket's endpoints in the box (egress proxy, LLM route, MCP gateway) live at **`wicket.internal`**, on
+their own address, so the agent keeps all of `127.0.0.0/8` for its own servers.
+- **The address is `198.18.0.1`,** from a block reserved for benchmarking and never routed on a real
+  network, added to the box's loopback. `.internal` is the top-level domain reserved for private use;
+  `.local` would send tools looking for it with multicast DNS.
+- **The name comes from the box's hosts file**, written by the runtime at creation. The box has no resolver
+  (§9.1, DNS).
+- **wicket-entry starts as root** with only `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`, adds the address,
+  then starts the forwarders and the agent through `setpriv` as the agent's user. By then every capability
+  set is empty, including the bounding set, and `no-new-privileges` holds throughout.
+- **Those capabilities act on gVisor's own network stack**, never the host's.
+- **Verified live:** the agent ran its own servers on 127.0.0.1:8080 and :3128 (wicket's old ports), its
+  capability sets were all zero, and `ip addr add` failed.
+
 ### 3.2 Identity: proving an agent is one of ours (owner, 2026-11-08)
 
 The owner's requirement: there must be cryptographic proof that an agent in a given zone is one of wicket's.

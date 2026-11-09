@@ -14,6 +14,14 @@ pub const STATE_DIR: &str = "/wicket/state";
 pub const WORKSPACE: &str = "/workspace";
 pub const OUTBOX: &str = "/workspace/out/result.json";
 
+/// wicket's services inside the box: their own name and address (set up by wicket-entry), so the
+/// agent keeps all of localhost. 198.18.0.0/15 is reserved for benchmarking and never routed.
+pub const WICKET_HOST: &str = "wicket.internal";
+pub const WICKET_ADDR: &str = "198.18.0.1";
+const PROXY_URL: &str = "http://wicket.internal:3128";
+const LLM_URL: &str = "http://wicket.internal:8080";
+const NO_PROXY: &str = "localhost,127.0.0.1,::1,wicket.internal";
+
 pub struct LaunchPlan {
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
@@ -42,17 +50,17 @@ pub const SANDBOX_NOTICE: &str = "You are running inside a wicket sandbox: a gVi
 const BATCH_NOTICE: &str = "- Work in /workspace. When you finish, write a short JSON summary to /workspace/out/result.json with fields: status (\"done\" or \"blocked\"), summary (string), and pending_requests (list of request ids you are still waiting on).";
 
 /// wicket's MCP gateway as the agent's only MCP server; repo- or account-supplied servers are ignored.
-const WICKET_MCP: &str = r#"{"mcpServers":{"wicket":{"type":"http","url":"http://127.0.0.1:8081/mcp"}}}"#;
+const WICKET_MCP: &str = r#"{"mcpServers":{"wicket":{"type":"http","url":"http://wicket.internal:8081/mcp"}}}"#;
 
 /// Routes every program and agent shares: the egress proxy, the CA, and run identity.
 fn common_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
     [
-        ("HTTPS_PROXY", "http://127.0.0.1:3128"),
-        ("HTTP_PROXY", "http://127.0.0.1:3128"),
-        ("https_proxy", "http://127.0.0.1:3128"),
-        ("http_proxy", "http://127.0.0.1:3128"),
-        ("NO_PROXY", "127.0.0.1,localhost"),
-        ("no_proxy", "127.0.0.1,localhost"),
+        ("HTTPS_PROXY", PROXY_URL),
+        ("HTTP_PROXY", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("http_proxy", PROXY_URL),
+        ("NO_PROXY", NO_PROXY),
+        ("no_proxy", NO_PROXY),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -158,8 +166,8 @@ pub fn claude_code_wrapped_plan(m: &Manifest, run: &RunId, argv: &[String], laun
         env.push(("CLAUDE_CODE_SESSION_ACCESS_TOKEN".into(), session_placeholder.clone()));
     }
     for (k, v) in [
-        ("HTTPS_PROXY", "http://127.0.0.1:3128"), ("HTTP_PROXY", "http://127.0.0.1:3128"), ("https_proxy", "http://127.0.0.1:3128"),
-        ("http_proxy", "http://127.0.0.1:3128"), ("NO_PROXY", "127.0.0.1,localhost"), ("no_proxy", "127.0.0.1,localhost"),
+        ("HTTPS_PROXY", PROXY_URL), ("HTTP_PROXY", PROXY_URL), ("https_proxy", PROXY_URL),
+        ("http_proxy", PROXY_URL), ("NO_PROXY", NO_PROXY), ("no_proxy", NO_PROXY),
         ("DISABLE_AUTOUPDATER", "1"), ("MCP_TOOL_TIMEOUT", "660000"), ("WICKET_CA_BUNDLE", CA_BUNDLE),
         // Remote Control needs Anthropic's API, but not telemetry or error reporting.
         ("DISABLE_TELEMETRY", "1"), ("DISABLE_ERROR_REPORTING", "1"),
@@ -190,16 +198,16 @@ pub mod anyhow_free {
 pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
     let agent = m.agent.as_ref().expect("an agent manifest");
     let env = vec![
-        ("ANTHROPIC_BASE_URL", "http://127.0.0.1:8080".to_string()),
+        ("ANTHROPIC_BASE_URL", LLM_URL.to_string()),
         // A placeholder shaped like a subscription token: the LLM proxy strips it and injects the real
         // one. The box never holds a usable credential, and no API key is ever involved.
         ("CLAUDE_CODE_OAUTH_TOKEN", format!("sk-ant-oat01-wicket-placeholder-{}", run.0.replace('_', "-"))),
-        ("HTTPS_PROXY", "http://127.0.0.1:3128".into()),
-        ("HTTP_PROXY", "http://127.0.0.1:3128".into()),
-        ("https_proxy", "http://127.0.0.1:3128".into()),
-        ("http_proxy", "http://127.0.0.1:3128".into()),
-        ("NO_PROXY", "127.0.0.1,localhost".into()),
-        ("no_proxy", "127.0.0.1,localhost".into()),
+        ("HTTPS_PROXY", PROXY_URL.into()),
+        ("HTTP_PROXY", PROXY_URL.into()),
+        ("https_proxy", PROXY_URL.into()),
+        ("http_proxy", PROXY_URL.into()),
+        ("NO_PROXY", NO_PROXY.into()),
+        ("no_proxy", NO_PROXY.into()),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
         ("DISABLE_AUTOUPDATER", "1".into()),
         ("DISABLE_TELEMETRY", "1".into()),
@@ -351,7 +359,7 @@ mod tests {
         assert!(all.contains("CLAUDE_CODE_ENVIRONMENT_KIND") && all.contains("user:inference"));
         assert!(w.plan.argv.contains(&format!("{STATE_DIR}/launcher/file0")));
         assert!(String::from_utf8_lossy(&w.files[0].1).starts_with("be nice") && String::from_utf8_lossy(&w.files[0].1).contains("gVisor"));
-        assert!(w.plan.argv.windows(2).any(|p| p[0] == "--mcp-config" && p[1].contains("127.0.0.1:8081")));
+        assert!(w.plan.argv.windows(2).any(|p| p[0] == "--mcp-config" && p[1].contains("wicket.internal:8081")));
         assert!(w.plan.argv.contains(&"--strict-mcp-config".to_string()));
         assert_eq!(&w.plan.argv[..2], &["wicket-entry".to_string(), "claude".to_string()]);
         let _ = std::fs::remove_dir_all(dir);
@@ -364,8 +372,9 @@ mod tests {
         let get = |k: &str| p.env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
         assert!(get("CLAUDE_CODE_OAUTH_TOKEN").unwrap().contains("placeholder"));
         assert!(get("ANTHROPIC_API_KEY").is_none(), "never an API key");
-        assert_eq!(get("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:8080");
-        assert_eq!(get("HTTPS_PROXY").unwrap(), "http://127.0.0.1:3128");
+        assert_eq!(get("ANTHROPIC_BASE_URL").unwrap(), "http://wicket.internal:8080");
+        assert_eq!(get("HTTPS_PROXY").unwrap(), "http://wicket.internal:3128");
+        assert!(get("NO_PROXY").unwrap().contains("localhost"), "the agent's own localhost stays local");
         assert!(p.argv.contains(&"--disallowedTools".to_string()));
     }
 

@@ -216,3 +216,14 @@ end-to-end tests (they need Docker in the box; design §21).
   once after the owner approved from the console with a passkey.
   - The made-up domain failed at DNS on the host after approval, and the agent reported that it doesn't
     exist.
+
+## wicket at wicket.internal, localhost for the agent (2026-11-09)
+
+A probe agent in a fresh box (new image):
+- `whoami` worked over MCP at `wicket.internal:8081`.
+- Its own `http.server`s on 127.0.0.1:8080 and 127.0.0.1:3128 both answered 200. Those were wicket's old
+  in-box ports.
+- `https://example.com/` returned 200 through the proxy at `wicket.internal:3128`.
+- `id`: uid 1001. CapInh, CapPrm, CapEff, CapBnd and CapAmb were all 0, and `ip addr add` failed with
+  "Operation not permitted".
+- `getent hosts wicket.internal` → 198.18.0.1, and `lo` carried 127.0.0.1/8 and 198.18.0.1/32.

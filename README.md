@@ -117,6 +117,12 @@ These are general features for any workload:
 
 `examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
 
+### Inside the box
+
+wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
+script), so the agent has all of localhost for its own servers. The entry script adds that address as root
+with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+
 ### Agents launched by something else, e.g. Remote Control
 
 `wicket wrap --manifest <m> -- <agent command line>` runs an agent that another program launches inside a box,
