@@ -438,6 +438,15 @@ zone:
     }
 
     #[test]
+    fn agent_env_may_not_set_path_or_user() {
+        for name in ["PATH", "USER"] {
+            let y = format!("task: t\nagent: {{ name: a, env: {{ {name}: x }} }}\nzone: {{ name: z, llm: {{}} }}\n");
+            let err = Manifest::from_yaml(&y).unwrap_err().to_string();
+            assert!(err.contains("agent.env may not set"), "{name}: {err}");
+        }
+    }
+
+    #[test]
     fn wildcard_hosts() {
         assert!(host_matches("*.githubusercontent.com", "raw.githubusercontent.com"));
         assert!(!host_matches("*.githubusercontent.com", "githubusercontent.com"));
