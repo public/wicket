@@ -101,8 +101,24 @@ any change is refused until re-approved. Out-of-reach requests fail instead of e
 For testing without a model, `examples/mock-github.yaml` plus `wicket dev mock-llm --command '...'` drives the whole path
 with a scripted model.
 
+### Longer sessions, volumes and in-place workspaces
+
+These are general features for any workload:
+- **`wicket run … --workspace-dir <dir>`** mounts a directory as the box's `/workspace`, in place, instead
+  of copying it. `--task "…"` replaces the manifest's task.
+- **`zone.volumes`** are named directories under `/volumes/` that persist between runs of a zone: caches,
+  datasets, any state.
+- **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
+  a follow-up, which becomes its next turn.
+- **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
+  allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
+- **`inject` rules can be `optional`,** and `{basic:USER}` renders an HTTP Basic credential (e.g. git over
+  HTTPS with a token).
+
+`examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
+
 ### Not in the PoC yet
 
-Adapter-generated MCP tools and third-party MCP servers, multiple zones and gates, labels and handles, the console and passkey approvals, long-lived agents
-and hibernation, Cedar policy, multi-tenant mode, other agents (Codex, pi). Response bodies are not scrubbed for
+Adapter-generated MCP tools and third-party MCP servers, multiple zones and gates, labels and handles, hibernation
+and wake, Cedar policy, multi-tenant mode, other agents (Codex, pi). Response bodies are not scrubbed for
 reflected credentials (headers are). See the milestones in docs/design.md.

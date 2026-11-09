@@ -164,3 +164,30 @@ Unit tests add:
 - revocation cascading to children;
 - validity windows;
 - the delegation chain over three generations.
+
+## wicket working on wicket (2026-11-09)
+
+Workload: `examples/self-hosting/`. The image is the agent image plus Rust 1.99.1. The workspace is a separate
+clone of this repository, mounted with `--workspace-dir`. Two volumes (cargo home, target dir). Reach covers
+crates.io, git fetch of this repository, and its GitHub API. A GitHub token would be injected if stored; none
+was.
+
+Session 1 (idle timeout shortened to 3 minutes):
+- Inside gVisor, Claude Code read the GitHub repository (`git ls-remote origin`, anonymous) and fetched ~60
+  crates through the egress proxy. It ran `cargo test -p wicket-core`, then added a unit test (reserved
+  `PATH` and `USER` in `agent.env`), re-ran the tests and committed on a new branch.
+- First turn ≈ 4 minutes, most of it the cold fetch and build.
+- A follow-up sent with `wicket say` arrived as the next turn: clippy, 0 warnings. After 3 idle minutes
+  the session closed and the run ended as succeeded.
+- The volumes then held 58 MB of crates and 349 MB of build output.
+- The agent's commit carried Claude Code's default `Co-Authored-By` trailer. That led to
+  `agent.adapter_settings`, which the example uses to turn attribution off.
+
+Session 2 (one-shot):
+- `cargo test -p wicket-core` took 2.0 s from the warm volumes.
+- An empty commit made by the agent had no trailer, and `result.json` reached the outbox.
+- The run took 12 s.
+
+The agent's test is in this branch as `test: cover reserved PATH and USER in agent.env`, with the trailer removed.
+Not exercised: pushes and pull requests (no token stored, and each would wait for approval), and wicket's own
+end-to-end tests (they need Docker in the box; design §21).

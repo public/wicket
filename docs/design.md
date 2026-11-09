@@ -527,6 +527,11 @@ MiniScope, AutoCedar, ceLLMate, Conseca]:
 Detail: [01 §4] (Claude Code, ACP), [11] (Codex, pi), [12] (OpenClaw), [13] (Hermes), [16] (how ~40
 orchestrators drive these agents).
 
+**Adapter settings** (`agent.adapter_settings`) pass harmless configuration to the agent's own adapter: for
+Claude Code, its `settings.json`. Only allowlisted keys are accepted: commit attribution, output style and
+similar. Hooks, permissions, MCP servers, environment and credential helpers stay under wicket's control.
+`agent.env` likewise refuses wicket's reserved variables (proxies, CA, model routes, placeholders).
+
 **Hermes Agent** [13] is a T1 candidate through its `hermes-gateway-v1` JSON-RPC (host-answered approvals,
 steer/interrupt, resume, replay of pending requests on reconnect), with ACP as the T2 fallback. Its own
 security policy says the OS is the only boundary and recommends wrapping the whole process, which is
@@ -1497,6 +1502,19 @@ its label is the join of everything that shaped it.
   staged memory (default RPO 60 s). An agent on a dead node is rebuilt elsewhere from its last durable
   checkpoint. Hibernated agents are unaffected.
 
+**PoC (2026-11-09).** Built so far:
+- **Named volumes per tenant and zone** (`zone.volumes`, under `/volumes/` in the box). They live on whichever
+  host runs the box and persist across runs.
+- **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
+  mounted over its `out/`.
+- **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
+  input. The session stays open for `agent.idle_timeout` after each turn and closes after that. Operator
+  text is trusted task text from the principal, unlike anything an agent or a page says.
+
+Not built: snapshots, hibernate and wake, object storage, encryption of agent state.
+
+Volumes inherit the zone's taint like any store (§12): whatever one run leaves there, the next one reads.
+
 ### 13.6 Garbage collection
 
 - **Policy decides; the agent never does.** `RetentionPolicy` sets each tier's threshold (`idle_to_sleep` …
@@ -2236,4 +2254,15 @@ of the rest matters.
     numbered, acknowledged control and event stream that resumes from the last acknowledged position.
     Proxied requests fail retryably instead of resuming, and pending approvals live in the ledger, so
     they survive drops. Alternatives: WireGuard plus HTTP/2 (gRPC), or WebSocket.
-13. **Name.** "wicket" is a working name (the small door set into a larger gate).
+13. **wicket working on wicket** (owner, 2026-11-09: "iterate on wicket from inside wicket"; wicket stays
+    general, with nothing development-specific built in). `examples/self-hosting/` is one project describing
+    its own workload: the image, the reach, volumes for its caches, and allowlisted adapter settings.
+    It works for building, unit tests and commits, with pushes and pull requests waiting for a human.
+    Open:
+    - Running wicket's own end-to-end tests from inside needs Docker and gVisor in the box. The host's
+      Docker socket would be an escape, so this needs a throwaway node per test run, started as a program
+      or tool (§17).
+    - A push is two approvals today: the push discovery and the push itself. A grant scoped to one push
+      would make it one.
+    - Steering from a phone needs the console reachable (§14.1).
+14. **Name.** "wicket" is a working name (the small door set into a larger gate).
