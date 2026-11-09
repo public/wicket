@@ -145,6 +145,16 @@ pub struct ZoneSpec {
     /// What the zone may reach over HTTP(S). Anything else becomes a pending escalation.
     #[serde(default)]
     pub reach: Vec<ReachRule>,
+    /// What a host that no reach rule names looks like from inside: `escalate` (default) treats a
+    /// request to it as a pending request a human can approve; `hide` makes it look like it doesn't
+    /// exist (the proxy refuses the connection before TLS, with a not-found status), for zones that
+    /// should never learn or ask about anything beyond their reach.
+    #[serde(default)]
+    pub unlisted_hosts: UnlistedHosts,
+    /// Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked
+    /// before `reach`.
+    #[serde(default)]
+    pub forbid: Vec<ForbidRule>,
     /// Credentials injected by the egress proxy into exactly one header slot per host.
     #[serde(default)]
     pub inject: Vec<InjectRule>,
@@ -163,6 +173,34 @@ pub struct ZoneSpec {
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UnlistedHosts {
+    #[default]
+    Escalate,
+    Hide,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForbidRule {
+    pub host: String,
+    /// Path globs, as in reach rules. Default: everything on the host.
+    #[serde(default = "default_paths")]
+    pub paths: Vec<String>,
+}
+
+impl ForbidRule {
+    /// Whether this rule covers every path on `host` (so the host itself is off limits).
+    pub fn covers_host(&self, host: &str) -> bool {
+        host_matches(&self.host, host) && self.paths.iter().any(|p| p == "/**")
+    }
+
+    pub fn matches(&self, host: &str, path: &str) -> bool {
+        host_matches(&self.host, host) && self.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(path)).unwrap_or(false))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,6 +373,14 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!("bad reach host {:?}", r.host)));
             }
             for p in &r.paths {
+                compile_glob(p)?;
+            }
+        }
+        for f in &self.zone.forbid {
+            if f.host.is_empty() || f.host.contains('/') {
+                return Err(ManifestError::Invalid(format!("bad forbid host {:?}", f.host)));
+            }
+            for p in &f.paths {
                 compile_glob(p)?;
             }
         }

@@ -117,6 +117,22 @@ These are general features for any workload:
 
 `examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
 
+### Inside the box
+
+wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
+script), so the agent has all of localhost for its own servers. The entry script adds that address as root
+with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+
+### Agents launched by something else, e.g. Remote Control
+
+`wicket wrap --manifest <m> -- <agent command line>` runs an agent that another program launches inside a box,
+with stdio connected through. `examples/remote-control/` uses it as Claude Code's `CLAUDE_CODE_PROCESS_WRAPPER`,
+so a session you drive from the Claude app runs in gVisor. It holds only placeholder credentials, which the
+proxy swaps for the real ones on `api.anthropic.com` alone. See its manifest for the reach a session needs.
+
+Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone doesn't name
+look like it doesn't exist. Agents ask ahead for reach with `request_access`.
+
 ### Not in the PoC yet
 
 Adapter-generated MCP tools and third-party MCP servers, multiple zones and gates, labels and handles, hibernation

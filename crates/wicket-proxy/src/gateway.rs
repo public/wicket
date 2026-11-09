@@ -102,6 +102,7 @@ impl Gateway {
             "send_message" => self.send_message(&args),
             "await_message" => self.await_message(&args).await,
             "spawn_agent" => self.spawn_agent(&args),
+            "request_access" => self.request_access(&args),
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
@@ -198,6 +199,55 @@ impl Gateway {
                 return (format!("no message after {}s. You may call await_message again.", timeout.as_secs()), false);
             }
             tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    /// An agent asking ahead for reach it needs: one URL, or every path under a prefix on a host.
+    fn request_access(&self, args: &Value) -> (String, bool) {
+        let Some(url) = args.get("url").and_then(|v| v.as_str()) else { return ("`url` is required, e.g. https://example.org/docs/".into(), true) };
+        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if reason.is_empty() {
+            return ("`reason` is required: say what you need it for, in a sentence".into(), true);
+        }
+        let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_ascii_uppercase();
+        let prefix = args.get("scope").and_then(|v| v.as_str()) == Some("prefix");
+        let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
+            return ("`url` must start with https:// (or http://)".into(), true);
+        };
+        let (authority, pq) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let host = authority.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        let pq = if pq.is_empty() { "/" } else { pq };
+        let (raw_path, query) = pq.split_once('?').unwrap_or((pq, ""));
+        let path = match wicket_core::canonical_path(raw_path) {
+            Ok(p) => p.to_string(),
+            Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
+        };
+        match wicket_core::host_verdict(&self.ctx.zone, &host) {
+            wicket_core::HostVerdict::Forbidden(why) => return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false),
+            wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host this sandbox can see."), false),
+            wicket_core::HostVerdict::Open => {}
+        }
+        let op = wicket_core::Op::egress_with_query(&self.ctx.tenant, &self.ctx.run, &self.ctx.zone.name, &method, &host, &path, query);
+        match wicket_core::evaluate(&self.ctx.zone, &op) {
+            wicket_core::Verdict::AllowByReach(_) if !prefix => return (format!("{method} {host}{path} is already allowed: just make the request."), false),
+            wicket_core::Verdict::Forbidden(why) => return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false),
+            _ => {}
+        }
+        let who = self.ctx.attribute.as_ref().and_then(|f| f(&host, &path)).map(|(v, _)| v);
+        let res = {
+            let l = self.ctx.ledger.lock().expect("ledger");
+            if let Ok(Some(rid)) = l.denied_recently(&op) {
+                return (format!("not requested: a human denied {rid} for this a few minutes ago. Don't ask again; continue without it."), false);
+            }
+            l.ask(&op, &format!("asked by the agent: {reason}"), prefix, who.as_ref())
+        };
+        match res {
+            Ok((rid, fresh)) => {
+                let scope = if prefix { format!("{method} {host}{path}* (every path under it)") } else { format!("{method} {host}{path}") };
+                (format!("{} {rid} for {scope}. Call await_grant with request_id {rid} to wait for the decision. Don't try other routes meanwhile.",
+                    if fresh { "requested:" } else { "already requested:" }), false)
+            }
+            Err(e) => (e.to_string(), true),
         }
     }
 
@@ -321,6 +371,21 @@ fn tools() -> Value {
             "annotations": { "readOnlyHint": true }
         },
         {
+            "name": "request_access",
+            "description": "Ask a human for reach you need but don't have, before trying or after a 'needs human approval' block: one URL, or (scope prefix) every path under a URL's path. Give a one-sentence reason. Returns a request_id: then call await_grant with it. Ask once per need; never probe for other routes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "e.g. https://news.ycombinator.com/ or https://api.example.org/v2/items" },
+                    "method": { "type": "string", "default": "GET" },
+                    "scope": { "type": "string", "enum": ["exact", "prefix"], "default": "exact" },
+                    "reason": { "type": "string", "description": "what you need it for" }
+                },
+                "required": ["url", "reason"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "spawn_agent",
             "description": "Start a child agent in its own sandbox with its own wicket identity, for work that should be separately identified and approved. It gets the task text and (optionally) a narrower reach. Returns its run id; use await_message for its messages and result.",
             "inputSchema": {
@@ -383,7 +448,7 @@ mod tests {
             RunCtx {
                 tenant: TenantId(tenant.into()), run: RunId(run.into()), zone: Arc::new(m.zone.clone()), ledger: self.ledger.clone(),
                 vault: crate::vault::Vault::new(std::env::temp_dir()), events: tx, escalate: true, attribute: None,
-                identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))), spawner: None,
+                identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))), spawner: None, swaps: vec![],
             }
         }
     }

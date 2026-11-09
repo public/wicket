@@ -1,26 +1,39 @@
 #!/bin/bash
-# wicket in-box entrypoint. The box has no network interface except loopback; this exposes the
-# bind-mounted unix sockets of wicket's proxies on 127.0.0.1 for proxy-aware tools, then runs the
-# agent. Everything here is advisory: enforcement happens outside the box.
+# wicket in-box entrypoint. The box has no network interface except loopback. wicket's services get
+# their own address, wicket.internal = 198.18.0.1 (a block reserved for benchmarking, never routed on
+# a real network), so the agent keeps all of localhost for itself. This script starts as root with
+# only NET_ADMIN, SETUID, SETGID and SETPCAP, just long enough to add that address; everything else,
+# the forwarders included, runs as the agent's user with no capabilities at all. Enforcement happens
+# outside the box: the forwarders only expose the bind-mounted unix sockets of wicket's proxies.
 set -eu
 
+WICKET_ADDR=198.18.0.1
+AS="${WICKET_AS_USER:?wicket-entry needs WICKET_AS_USER=uid:gid}"
+U=${AS%%:*}
+G=${AS##*:}
+# Become the agent's user for good: no capabilities, none inheritable, an empty bounding set.
+drop() { setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --bounding-set=-all -- "$@"; }
+
+ip addr add "$WICKET_ADDR/32" dev lo
+
 SOCK=/wicket/sock
-socat TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/egress.sock &
-socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/llm.sock &
-socat TCP-LISTEN:8081,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$SOCK/gateway.sock &
+drop socat TCP-LISTEN:3128,bind=$WICKET_ADDR,fork,reuseaddr UNIX-CONNECT:$SOCK/egress.sock &
+drop socat TCP-LISTEN:8080,bind=$WICKET_ADDR,fork,reuseaddr UNIX-CONNECT:$SOCK/llm.sock &
+drop socat TCP-LISTEN:8081,bind=$WICKET_ADDR,fork,reuseaddr UNIX-CONNECT:$SOCK/gateway.sock &
 
 # Trust the run's CA (public certificate only) alongside the system roots.
-cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-bundle.pem
+drop sh -c 'cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-bundle.pem'
 export SSL_CERT_FILE=/tmp/ca-bundle.pem CURL_CA_BUNDLE=/tmp/ca-bundle.pem GIT_SSL_CAINFO=/tmp/ca-bundle.pem \
        REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem
 
-mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" /workspace/out
+drop mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+drop mkdir -p /workspace/out 2>/dev/null || true   # absent when the workspace is mounted elsewhere
 
 # Wait (briefly) for the forwarders to listen.
 i=0
 while [ $i -lt 50 ]; do
-  if (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null; then break; fi
+  if (exec 3<>/dev/tcp/$WICKET_ADDR/8080) 2>/dev/null; then break; fi
   i=$((i + 1)); sleep 0.1
 done
 
-exec "$@"
+exec setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --bounding-set=-all -- "$@"

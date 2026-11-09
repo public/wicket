@@ -191,3 +191,39 @@ Session 2 (one-shot):
 The agent's test is in this branch as `test: cover reserved PATH and USER in agent.env`, with the trailer removed.
 Not exercised: pushes and pull requests (no token stored, and each would wait for approval), and wicket's own
 end-to-end tests (they need Docker in the box; design §21).
+
+## Remote Control inside wicket, and agents at the edge (2026-11-09)
+
+- **Remote Control in a box.** A Claude Code Remote Control bridge on the host, with
+  `CLAUDE_CODE_PROCESS_WRAPPER=examples/remote-control/wrap.sh`, put each session process in a gVisor box
+  (`wicket wrap`). The owner chatted with it live from the Claude desktop app.
+  - Model calls, the worker registration, and the session's event stream and deliveries all went through the
+    egress proxy.
+  - The box held only a placeholder login file and a placeholder session token; the proxy swapped in the
+    real ones toward `api.anthropic.com` only.
+  - The identity read `acting for: claude.ai account … (remote-control) → rc-agent`.
+- **Connectors.** The first session tried the account's 11 claude.ai connectors (`mcp-proxy.anthropic.com`).
+  Those requests were denied, then forbidden in the zone; a later session's connector listing was refused
+  outright, and no connector requests reached the queue.
+- **The agent didn't know it was sandboxed**, and WebFetch showed only a bare 403, so the agent retried by
+  other means. That led to:
+  - status lines and bodies that say which kind of block it is;
+  - a shared sandbox notice for wrapped sessions;
+  - `request_access`;
+  - spin detection.
+- **The live check after those changes.** A batch agent blocked on `news.ycombinator.com` and a made-up
+  domain said "Both need approval. I'll wait on the grants", waited with `await_grant`, and retried each
+  once after the owner approved from the console with a passkey.
+  - The made-up domain failed at DNS on the host after approval, and the agent reported that it doesn't
+    exist.
+
+## wicket at wicket.internal, localhost for the agent (2026-11-09)
+
+A probe agent in a fresh box (new image):
+- `whoami` worked over MCP at `wicket.internal:8081`.
+- Its own `http.server`s on 127.0.0.1:8080 and 127.0.0.1:3128 both answered 200. Those were wicket's old
+  in-box ports.
+- `https://example.com/` returned 200 through the proxy at `wicket.internal:3128`.
+- `id`: uid 1001. CapInh, CapPrm, CapEff, CapBnd and CapAmb were all 0, and `ip addr add` failed with
+  "Operation not permitted".
+- `getent hosts wicket.internal` → 198.18.0.1, and `lo` carried 127.0.0.1/8 and 198.18.0.1/32.

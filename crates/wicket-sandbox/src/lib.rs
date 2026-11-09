@@ -1,6 +1,6 @@
 //! Sandbox backends (design §7). The PoC has one: Docker, with gVisor as the default runtime. Every
 //! box runs with `--network none`; its only way out is the unix sockets wicket bind-mounts in, which
-//! an in-box forwarder exposes on 127.0.0.1 for proxy-aware tools.
+//! an in-box forwarder exposes at wicket.internal (its own address, so the agent keeps localhost).
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -123,8 +123,22 @@ impl Docker {
             "--read-only".into(),
             "--tmpfs".into(),
             "/tmp:rw,nosuid,size=512m".into(),
+            // wicket-entry starts as root with only the capabilities it needs to give wicket.internal its
+            // address, then becomes `spec.user` with no capabilities (no-new-privileges throughout).
             "--user".into(),
-            spec.user.clone(),
+            "0:0".into(),
+            "--env".into(),
+            format!("WICKET_AS_USER={}", spec.user),
+            "--cap-add".into(),
+            "NET_ADMIN".into(),
+            "--cap-add".into(),
+            "SETUID".into(),
+            "--cap-add".into(),
+            "SETGID".into(),
+            "--cap-add".into(),
+            "SETPCAP".into(),
+            "--add-host".into(),
+            "wicket.internal:198.18.0.1".into(),
             "--workdir".into(),
             spec.workdir.clone(),
             "--label".into(),
@@ -149,6 +163,14 @@ impl Docker {
         a.push(spec.image.clone());
         a.extend(spec.argv.iter().cloned());
         a
+    }
+
+    /// Starts the box with the given stdin and stdout (e.g. inherited from whoever launched wicket,
+    /// when wicket wraps an agent another program drives) and stderr piped.
+    pub fn spawn_with(&self, spec: &SandboxSpec, stdin: Stdio, stdout: Stdio) -> Result<Child> {
+        let mut c = self.command_with(self.build_args(spec));
+        c.stdin(stdin).stdout(stdout).stderr(Stdio::piped()).kill_on_drop(true);
+        Ok(c.spawn().context("starting docker run")?)
     }
 
     /// Starts the box with stdout and stderr piped.
@@ -199,6 +221,9 @@ mod tests {
         assert!(a.contains("--network none"));
         assert!(a.contains("--runtime runsc"));
         assert!(a.contains("--cap-drop ALL"));
+        assert!(a.contains("--user 0:0") && a.contains("WICKET_AS_USER=1000:1000"), "starts as root only to set up, then drops");
+        assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
+        assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
         assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));

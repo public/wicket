@@ -6,7 +6,7 @@ ARG CLAUDE_CODE_VERSION=2.1.319
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates git socat curl jq ripgrep less procps python3 \
+      ca-certificates git socat curl jq ripgrep less procps python3 iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \

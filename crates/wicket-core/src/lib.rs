@@ -11,7 +11,7 @@ pub mod op;
 
 pub use canon::{canonical_path, CanonError};
 pub use manifest::{AgentSpec, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, ProgramSpec, ReachRule, ZoneSpec};
-pub use op::{evaluate, Op, RiskClass, Surface, Verdict};
+pub use op::{evaluate, host_verdict, HostVerdict, Op, RiskClass, Surface, Verdict};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

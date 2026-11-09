@@ -20,6 +20,7 @@ wicket-auth.workspace = true
 wicket-identity.workspace = true
 hex.workspace = true
 serde_yaml.workspace = true
+libc = "0.2"
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

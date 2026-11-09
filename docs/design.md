@@ -184,6 +184,22 @@ header set/remove and credential, deny, need-body; fail closed; per-request time
 plane swappable and lets us test the decider offline from recorded frames, and run Anthropic's `srt-proxy`
 as a differential reference. [04 §7.1]
 
+### 3.1.1 wicket inside the box: its own name, not localhost (owner, 2026-11-09)
+
+wicket's endpoints in the box (egress proxy, LLM route, MCP gateway) live at **`wicket.internal`**, on
+their own address, so the agent keeps all of `127.0.0.0/8` for its own servers.
+- **The address is `198.18.0.1`,** from a block reserved for benchmarking and never routed on a real
+  network, added to the box's loopback. `.internal` is the top-level domain reserved for private use;
+  `.local` would send tools looking for it with multicast DNS.
+- **The name comes from the box's hosts file**, written by the runtime at creation. The box has no resolver
+  (§9.1, DNS).
+- **wicket-entry starts as root** with only `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`, adds the address,
+  then starts the forwarders and the agent through `setpriv` as the agent's user. By then every capability
+  set is empty, including the bounding set, and `no-new-privileges` holds throughout.
+- **Those capabilities act on gVisor's own network stack**, never the host's.
+- **Verified live:** the agent ran its own servers on 127.0.0.1:8080 and :3128 (wicket's old ports), its
+  capability sets were all zero, and `ip addr add` failed.
+
 ### 3.2 Identity: proving an agent is one of ours (owner, 2026-11-08)
 
 The owner's requirement: there must be cryptographic proof that an agent in a given zone is one of wicket's.
@@ -1210,6 +1226,30 @@ Retry-After: 30
 MCP returns the same body as an `isError` result, or `input_required` / a task handle when the client
 negotiated them. Connections are never held open while a human decides.
 
+**Agents must not spin at the edge** (owner, 2026-11-09: the goal is that agents don't spin endlessly
+when they hit isolation limits, and instead ask for more reach when they need it).
+- **Every refusal says which case it is in the status line**, because many tools show nothing else:
+  `Blocked by wicket sandbox: never allowed`, `… needs human approval (r-…)`, `… denied by a human`, or,
+  in hiding zones, `unknown host`. The body says the sandbox has no other route, and what to do.
+- **Repeats are counted.** From the third block of the same request, the refusal says to stop. After every
+  ten blocks in a run, the operator sees "agent may be stuck".
+- **`request_access`** lets the agent ask ahead, once, for a URL or a path prefix, with a reason shown to the
+  human as the agent's own claim. It then waits with `await_grant`.
+- **Every agent gets the same sandbox notice:** batch runs and wrapped sessions alike.
+
+In a live check, an agent blocked on two hosts waited with `await_grant` and retried each once after
+approval. It didn't probe.
+
+**DNS.** The box has no resolver and no network. Names are resolved only on the host, and only for requests
+a rule allows. So DNS isn't an exfiltration route, and blocked or pending names are never looked up.
+- **Wildcard reach rules are the residual channel:** any name under them is resolved on the host. Prefer
+  exact hosts in sensitive zones.
+- **Showing "no such domain" in `escalate` mode needs an existence check.** A safe one asks only whether the
+  *registered* domain exists (public suffix list), so agent-chosen subdomains are never queried. It's not
+  built; `unlisted_hosts: hide` is the strict alternative.
+- **An in-box resolver, when one is needed,** is wicket's own synthetic one: zone names only, "no such
+  domain" otherwise, and never forwarding an agent-chosen name (§7).
+
 **Denials are recoverable** [05 §10.2-7]. The body lists the remedies policy allows: request this narrower
 grant, spawn a child zone, meet a prerequisite. In APPA, removing remedies dropped utility from 88% to
 35%. Bodies never echo tainted content. E1 also measures retry loops (CapScope's runs took about 2× as long
@@ -1777,6 +1817,25 @@ own channels.
 endpoints [11 §2.9]. So the mode is `vendor_rc{claude | codex}`, with the same rules. Approval answers that
 would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gains
 `answers_are_policy_writes`.
+
+**PoC results (2026-11-09).** Built as `wicket wrap` plus `examples/remote-control`:
+- **The bridge runs on the host.** `CLAUDE_CODE_PROCESS_WRAPPER` puts each session process in a gVisor box,
+  with its stdio connected through.
+- **E-RC1: yes.** A session ran entirely through the egress proxy: the worker registered, the event
+  stream (SSE) worked, model calls worked, and the owner chatted with it live from the Claude desktop app.
+- **E-RC2: yes, with no account credential in the box.**
+  - The box gets a placeholder `.credentials.json` (only the non-secret scope and subscription fields are
+    copied) and a placeholder in place of the bridge's session token.
+  - The egress proxy swaps each placeholder for the real value, in `Authorization` only and only toward
+    `api.anthropic.com`. The login is read by reference, as in §6.
+  - The bridge's messaging socket and its other host paths never enter the box.
+- **E-RC3: a first allowlist from a real session.**
+  - Allowed: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/code/sessions/*/worker/**`, and four profile
+    and bootstrap reads.
+  - Forbidden (zone `forbid` rules): the account's connectors (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`,
+    `/mcp-registry/**`). Wrapped sessions also get wicket's gateway as their only MCP server.
+- **Two layers of approval were visible in the app:** Claude Code's own prompt (advisory, in the box) and
+  wicket's block (decided only in wicket).
 
 **Experiments** [09 §9]:
 - **E-RC1:** does a jailed RC session work through the egress proxy?
