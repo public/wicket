@@ -216,25 +216,26 @@ impl Egress {
                 rb = rb.header(name.as_str(), value.as_bytes());
             }
         }
-        // Inject the zone's credential for this host into its one declared slot.
+        // Inject the zone's credential for this host into its one declared slot. An optional rule
+        // whose secret isn't set sends the request without it (e.g. anonymous reads).
+        let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
-                let secret = self.ctx.vault.get(&rule.secret)?;
-                rb = rb.header(rule.header.as_str(), rule.format.replace("{secret}", &secret));
+                let secret = match self.ctx.vault.get(&rule.secret) {
+                    Ok(s) => s,
+                    Err(_) if rule.optional => break,
+                    Err(e) => return Err(e),
+                };
+                let value = render_credential(&rule.format, &secret);
+                rb = rb.header(rule.header.as_str(), value.as_str());
+                injected.push(secret);
+                injected.push(value);
                 break;
             }
         }
         let resp = rb.body(body).send().await?;
         let status = StatusCode::from_u16(resp.status().as_u16())?;
         let mut out = Response::builder().status(status);
-        let injected: Vec<String> = self
-            .ctx
-            .zone
-            .inject
-            .iter()
-            .filter(|r| host_matches(&r.host, host))
-            .filter_map(|r| self.ctx.vault.get(&r.secret).ok())
-            .collect();
         for (name, value) in resp.headers().iter() {
             if STRIP_RESPONSE.contains(&name.as_str()) {
                 continue;
@@ -247,5 +248,29 @@ impl Egress {
         }
         let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         Ok(out.body(BodyExt::boxed(StreamBody::new(stream)))?)
+    }
+}
+
+/// Renders an injection format: `{secret}` is the secret itself; `{basic:USER}` is
+/// base64("USER:secret"), for HTTP Basic credentials such as git over HTTPS with a token.
+pub fn render_credential(format: &str, secret: &str) -> String {
+    use base64::Engine;
+    let mut out = format.replace("{secret}", secret);
+    while let Some(start) = out.find("{basic:") {
+        let Some(len) = out[start..].find('}') else { break };
+        let user = out[start + 7..start + len].to_string();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        out.replace_range(start..start + len + 1, &enc);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn credential_formats() {
+        assert_eq!(super::render_credential("Bearer {secret}", "tok"), "Bearer tok");
+        // base64("x-access-token:tok")
+        assert_eq!(super::render_credential("Basic {basic:x-access-token}", "tok"), "Basic eC1hY2Nlc3MtdG9rZW46dG9r");
     }
 }
