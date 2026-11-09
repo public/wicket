@@ -33,6 +33,29 @@ pub struct RunCtx {
     pub identity: Option<Arc<IdentityCell>>,
     /// Starts a child agent in its own sandbox; None when the agent may not spawn.
     pub spawner: Option<Spawner>,
+    /// Placeholders the box holds in place of real credentials, swapped at the egress proxy.
+    pub swaps: Vec<CredentialSwap>,
+}
+
+/// A credential the box only ever sees as a placeholder. When a request to `host` carries exactly
+/// `Authorization: Bearer <placeholder>`, the egress proxy sends the real value instead. The
+/// placeholder is worthless anywhere else (it's stripped like every client credential), and the real
+/// value never enters the box.
+#[derive(Clone)]
+pub struct CredentialSwap {
+    /// For logs: what this credential is (never its value).
+    pub name: String,
+    pub host: String,
+    pub placeholder: String,
+    pub real: SwapSource,
+}
+
+#[derive(Clone)]
+pub enum SwapSource {
+    /// A vault secret, read per request (e.g. a reference to the host's login, refreshed there).
+    Vault(String),
+    /// A value handed to wicket by the process that launched the agent, kept in memory only.
+    Value(String),
 }
 
 /// An agent instance's identity: the document wicket issued and the key it signs with on the
@@ -182,7 +205,7 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
     if let Some(id) = request_id {
         body["request_id"] = id.into();
         body["retry_after"] = 30.into();
-        body["hint"] = "A human must approve this request. Do not try another route. Wait (e.g. sleep 30), then retry the same request; it will succeed once approved, or fail with status 'denied'.".into();
+        body["hint"] = format!("Call the wicket MCP tool await_grant with request_id {id} to wait for a human's decision, then retry this same request once. Nothing else will reach this destination from the sandbox.").into();
     }
     let mut b = http::Response::builder()
         .status(status)
@@ -191,8 +214,23 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
     if let Some(id) = request_id {
         b = b.header("x-wicket-request-id", id).header("retry-after", "30");
     }
-    b.body(full(serde_json::to_vec_pretty(&body).unwrap_or_default())).expect("valid response")
+    let mut resp = b.body(full(serde_json::to_vec_pretty(&body).unwrap_or_default())).expect("valid response");
+    // Many tools show only the status line, not the body: make it say what happened.
+    let reason: String = match request_id {
+        Some(id) => format!("{title} ({id})"),
+        None => title.to_string(),
+    }
+    .chars()
+    .filter(|c| c.is_ascii() && !c.is_ascii_control())
+    .collect();
+    if let Ok(r) = hyper::ext::ReasonPhrase::try_from(reason) {
+        resp.extensions_mut().insert(r);
+    }
+    resp
 }
+
+/// What every refusal reminds the agent of: where it is, and that there is no other way out.
+pub(crate) const SANDBOX_FACT: &str = "You are in a wicket sandbox (a gVisor container with no network of its own); wicket's proxy is its only route out, so no other tool, host, mirror or cache will reach this either.";
 
 /// Headers never forwarded from a sandbox to an upstream: hop-by-hop headers and every client
 /// credential (the proxy injects its own).

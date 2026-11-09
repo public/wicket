@@ -33,10 +33,39 @@ pub struct RunOpts<'a> {
     pub ssh_key: Option<&'a Path>,
     pub run_id: Option<String>,
     pub parent_run: Option<String>,
+    /// Wrap this agent command line (launched by another program, e.g. Claude Code Remote Control
+    /// through CLAUDE_CODE_PROCESS_WRAPPER) instead of launching the agent ourselves. Its stdin and
+    /// stdout stay connected to the launcher; wicket's own output goes to a log file.
+    pub wrap: Option<Vec<String>>,
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
-    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } = o;
+    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, wrap } = o;
+    // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
+    // everything wicket prints to a log file instead.
+    let mut agent_stdout: Option<std::os::fd::OwnedFd> = None;
+    if wrap.is_some() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let logs = data_dir().join("wrap-logs");
+        std::fs::create_dir_all(&logs)?;
+        let log = std::fs::File::create(logs.join(format!("{}.log", std::process::id())))?;
+        // SAFETY: plain fd duplication on fds this process owns.
+        let saved = unsafe { libc::dup(1) };
+        if saved < 0 || unsafe { libc::dup2(log.as_raw_fd(), 1) } < 0 {
+            bail!("could not redirect wicket's output for a wrapped agent");
+        }
+        agent_stdout = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) });
+        eprintln!("[wicket] wrapping an agent; wicket's log: {}", logs.join(format!("{}.log", std::process::id())).display());
+    }
+    if wrap.is_some() && node.is_some() {
+        bail!("wrapping an agent runs it on this host; --node isn't supported with it");
+    }
+    // A wrapped agent works in its launcher's directory, mounted at the same path in the box.
+    let wrap_cwd = match &wrap {
+        Some(_) => Some(std::env::current_dir()?),
+        None => None,
+    };
+    let workspace_dir = workspace_dir.or(wrap_cwd.as_deref());
     let raw = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
     let mut m = Manifest::from_yaml(&raw)?;
     if let Some(t) = task {
@@ -170,6 +199,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     };
                     (pc.principal.clone(), Some(pc.act_for_child()))
                 }
+                None if wrap.is_some() => {
+                    // The human driving the session through their claude.ai account.
+                    let who = std::env::var("CLAUDE_CODE_BRIDGE_OWNER_ACCOUNT_UUID").unwrap_or_else(|_| "unknown".into());
+                    (serde_json::json!({ "type": "human", "id": format!("claude.ai account {who}"), "via": "remote-control", "assurance": "claude.ai login" }), None)
+                }
                 None => (crate::cli_principal(), None),
             };
             let spec = wicket_identity::IdentitySpec {
@@ -272,7 +306,43 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some((serde_json::to_value(&a).ok()?, a.summary()))
         }))
     };
-    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute, identity: identity.clone(), spawner };
+    // A wrapped Claude Code session: placeholders in the box, real credentials swapped at the proxy.
+    let wrapped = match &wrap {
+        None => None,
+        Some(argv) => {
+            if m.agent.as_ref().map(|a| a.kind.as_str()) != Some("claude-code") {
+                bail!("only claude-code agents can be wrapped");
+            }
+            // Only the login's non-secret fields (scopes, subscription type) are kept.
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            let login_meta = std::fs::read(home.join(".claude/.credentials.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v.get("claudeAiOauth").cloned())
+                .map(|o| serde_json::json!({ "scopes": o.get("scopes"), "subscriptionType": o.get("subscriptionType"), "rateLimitTier": o.get("rateLimitTier") }))
+                .unwrap_or(serde_json::Value::Null);
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            Some(wicket_agent::claude_code_wrapped_plan(&m, &run, argv, &env, &login_meta).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+    };
+    let swaps = match &wrapped {
+        None => vec![],
+        Some(w) => {
+            let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
+            let mut v = vec![wicket_proxy::CredentialSwap {
+                name: "claude login".into(), host: "api.anthropic.com".into(), placeholder: w.login_placeholder.clone(),
+                real: wicket_proxy::SwapSource::Vault(login_secret),
+            }];
+            if let Some(t) = &w.session_token {
+                v.push(wicket_proxy::CredentialSwap {
+                    name: "remote-control session".into(), host: "api.anthropic.com".into(), placeholder: w.session_placeholder.clone(),
+                    real: wicket_proxy::SwapSource::Value(t.clone()),
+                });
+            }
+            v
+        }
+    };
+    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute, identity: identity.clone(), spawner, swaps };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let gateway = Gateway::new(ctx.clone());
@@ -298,9 +368,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
 
     let is_program = m.program.is_some();
-    let plan = match wicket_agent::program_plan(&m, &run) {
-        Some(p) => p,
-        None => wicket_agent::claude_code_plan(&m, &run),
+    let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped) {
+        (Some(p), _) => (p, vec![]),
+        (None, Some(w)) => (w.plan, w.files),
+        (None, None) => (wicket_agent::claude_code_plan(&m, &run), vec![]),
     };
     // Where the box's directories live: here, or on the remote node (which gets no secrets: only
     // the CA's public certificate, the workspace, and the two forwarded sockets).
@@ -348,11 +419,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         };
         volume_mounts.push(Mount { host, target: v.path.clone(), read_only: false });
     }
-    if let Some(w) = &workspace_dir {
+    for (rel, body) in &wrap_files {
+        let p = box_root.join("state").join(rel);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(&p, body)?;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let (Some(w), None) = (&workspace_dir, &wrap_cwd) {
         // Create the outbox mount point ourselves, so it isn't left behind owned by root.
         std::fs::create_dir_all(w.join("out"))?;
     }
     let workspace_mounts = match &workspace_dir {
+        // A wrapped agent's directory, at the same path it has on the host.
+        Some(w) if wrap_cwd.is_some() => vec![
+            Mount { host: w.clone(), target: w.display().to_string(), read_only: false },
+            Mount { host: box_root.join("workspace/out"), target: format!("{}/out", wicket_agent::WORKSPACE), read_only: false },
+        ],
         // In place: the project directory itself, with this run's outbox mounted over its out/.
         Some(w) => vec![
             Mount { host: w.clone(), target: wicket_agent::WORKSPACE.into(), read_only: false },
@@ -368,7 +452,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
         }
     }
-    let interactive = plan.stdin_task.is_some();
+    let interactive = plan.stdin_task.is_some() || wrap_cwd.is_some();
     let stdin_task = plan.stdin_task.clone();
     let name = format!("wicket-{}", run.0.replace('_', "-"));
     let spec = SandboxSpec {
@@ -390,7 +474,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         cpus: m.zone.limits.cpus,
         pids: m.zone.limits.pids,
         user,
-        workdir: wicket_agent::WORKSPACE.into(),
+        workdir: wrap_cwd.as_ref().map(|c| c.display().to_string()).unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
         interactive,
     };
 
@@ -407,7 +491,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
-    let mut child = docker.spawn(&spec)?;
+    let mut child = match agent_stdout.take() {
+        Some(fd) => docker.spawn_with(&spec, std::process::Stdio::inherit(), std::process::Stdio::from(fd))?,
+        None => docker.spawn(&spec)?,
+    };
     // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rotate_task = match (&identity, id_spec) {
@@ -462,9 +549,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut turn_running = true;
     let mut last_result = std::time::Instant::now();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-    let stdout = child.stdout.take().expect("stdout");
+    // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
+    let mut lines = child.stdout.take().map(|o| BufReader::new(o).lines());
     let stderr = child.stderr.take().expect("stderr");
-    let mut lines = BufReader::new(stdout).lines();
+    let mut wrapped_exit: Option<std::process::ExitStatus> = None;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let log_path = dir.join("agent.stderr.log");
     let err_task = tokio::spawn(async move {
         let mut out = String::new();
@@ -484,7 +573,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut status = "unknown".to_string();
     loop {
         tokio::select! {
-            line = lines.next_line() => match line? {
+            ex = child.wait(), if lines.is_none() => {
+                wrapped_exit = Some(ex?);
+                break;
+            }
+            _ = term.recv() => {
+                println!("[wicket] terminated; stopping the box");
+                docker.kill(&name).await?;
+                status = "interrupted".into();
+            }
+            line = async { lines.as_mut().expect("guarded").next_line().await }, if lines.is_some() => match line? {
                 Some(l) => {
                     use std::io::Write;
                     let _ = writeln!(transcript_f, "{l}");
@@ -548,7 +646,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
         }
     }
-    let exit = child.wait().await?;
+    let exit = match wrapped_exit {
+        Some(e) => e,
+        None => child.wait().await?,
+    };
     while let Ok(ev) = rx.try_recv() {
         print_event(&ev);
     }

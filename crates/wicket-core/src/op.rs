@@ -122,6 +122,35 @@ pub enum Verdict {
 
 const FORBIDDEN_HOSTS: &[&str] = &["169.254.169.254", "metadata.google.internal", "metadata", "100.100.100.200"];
 
+/// What a host is to a zone, before any request to it: decided when the box asks to connect.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostVerdict {
+    /// Requests to it are evaluated one by one.
+    Open,
+    /// Never reachable: refuse the connection, saying so.
+    Forbidden(String),
+    /// Not named by the zone, which hides such hosts: behave as if it doesn't exist.
+    Hidden,
+}
+
+pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
+    if FORBIDDEN_HOSTS.contains(&host) || host == "localhost" || host.ends_with(".localhost") {
+        return HostVerdict::Forbidden(format!("host {host} is never reachable from a sandbox"));
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !is_public_ip(&ip) {
+            return HostVerdict::Forbidden(format!("non-public address {ip}"));
+        }
+    }
+    if zone.forbid.iter().any(|f| f.covers_host(host)) {
+        return HostVerdict::Forbidden(format!("host {host} is forbidden in this zone"));
+    }
+    if zone.unlisted_hosts == crate::manifest::UnlistedHosts::Hide && !zone.reach.iter().any(|r| r.host_matches(host)) {
+        return HostVerdict::Hidden;
+    }
+    HostVerdict::Open
+}
+
 pub fn evaluate(zone: &ZoneSpec, op: &Op) -> Verdict {
     if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
         return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
@@ -130,6 +159,9 @@ pub fn evaluate(zone: &ZoneSpec, op: &Op) -> Verdict {
         if !is_public_ip(&ip) {
             return Verdict::Forbidden(format!("non-public address {ip}"));
         }
+    }
+    if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
+        return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
     }
     for (i, rule) in zone.reach.iter().enumerate() {
         if !rule.host_matches(&op.host) {
@@ -248,5 +280,31 @@ zone:
         let b = op("POST", "api.github.com", "/x");
         assert_ne!(a.digest(), b.digest());
         assert_eq!(a.digest(), op("GET", "API.github.com", "/x").digest());
+    }
+
+    #[test]
+    fn forbid_rules_win_over_reach_and_never_escalate() {
+        let m = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: api.example.com, methods: [GET, POST], paths: [\"/**\"] }]\n  forbid: [{ host: api.example.com, paths: [\"/v1/mcp_servers\"] }, { host: mcp.example.com }]\n").unwrap();
+        let t = TenantId::single();
+        let r = RunId("run_x".into());
+        let op = |host: &str, path: &str| Op::egress(&t, &r, "z", "GET", host, path);
+        assert!(matches!(evaluate(&m.zone, &op("api.example.com", "/v1/mcp_servers")), Verdict::Forbidden(_)));
+        assert!(matches!(evaluate(&m.zone, &op("mcp.example.com", "/anything")), Verdict::Forbidden(_)));
+        assert!(matches!(evaluate(&m.zone, &op("api.example.com", "/v1/messages")), Verdict::AllowByReach(0)));
+    }
+
+    #[test]
+    fn hosts_are_judged_before_any_request() {
+        let z = |extra: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: api.example.com }}, {{ host: \"*.cdn.example\" }}]\n  forbid: [{{ host: mcp.example.com }}, {{ host: api.example.com, paths: [\"/private/**\"] }}]\n{extra}")).unwrap().zone;
+        let open = z("");
+        assert_eq!(host_verdict(&open, "api.example.com"), HostVerdict::Open);
+        assert_eq!(host_verdict(&open, "news.example.org"), HostVerdict::Open, "escalate is the default");
+        assert!(matches!(host_verdict(&open, "mcp.example.com"), HostVerdict::Forbidden(_)));
+        assert!(matches!(host_verdict(&open, "169.254.169.254"), HostVerdict::Forbidden(_)));
+        assert!(matches!(host_verdict(&open, "10.0.0.1"), HostVerdict::Forbidden(_)));
+        let hidden = z("  unlisted_hosts: hide\n");
+        assert_eq!(host_verdict(&hidden, "news.example.org"), HostVerdict::Hidden);
+        assert_eq!(host_verdict(&hidden, "a.cdn.example"), HostVerdict::Open);
+        assert_eq!(host_verdict(&hidden, "api.example.com"), HostVerdict::Open, "a path-limited forbid doesn't hide the host");
     }
 }

@@ -48,6 +48,8 @@ pub struct Request {
     /// Who inside the box asked, as reported by the agent's event stream (one entry per distinct
     /// asker; each is an attribution object). Untrusted: shown to humans, never used to decide.
     pub attribution: Vec<serde_json::Value>,
+    /// The agent asked for every path under `path` (request_access with scope prefix), not one path.
+    pub scope_prefix: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
   method TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, risk TEXT NOT NULL, reason TEXT NOT NULL,
   status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
-  attribution TEXT NOT NULL DEFAULT '[]'
+  attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
 CREATE TABLE IF NOT EXISTS grants (
@@ -166,6 +168,7 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN attribution TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
         Ok(Ledger { conn })
     }
 
@@ -371,6 +374,31 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// An agent asking ahead for access it needs (request_access), rather than a blocked request.
+    /// `prefix` asks for every path under `op.path`. Deduplicated like any pending request.
+    pub fn ask(&self, op: &Op, reason: &str, prefix: bool, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
+        let digest = format!("{}{}", op.digest(), if prefix { ":prefix" } else { "" });
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM requests WHERE tenant = ?1 AND zone = ?2 AND digest = ?3 AND status = 'pending'",
+                params![op.tenant.0, op.zone, digest],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok((id, false));
+        }
+        let id = new_request_id();
+        let attr = serde_json::Value::from(who.cloned().into_iter().collect::<Vec<_>>()).to_string();
+        self.conn.execute(
+            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution, scope_prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
+            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr, prefix as i64],
+        )?;
+        Ok((id, true))
+    }
+
     /// The request a grant was made for, if any.
     pub fn request_for_grant(&self, grant: &str) -> Result<Option<Request>> {
         let rid: Option<Option<String>> = self.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![grant], |r| r.get(0)).optional()?;
@@ -382,7 +410,7 @@ impl Ledger {
 
     pub fn request(&self, id: &str) -> Result<Request> {
         self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
     }
@@ -401,7 +429,7 @@ impl Ledger {
     /// Recently decided requests, newest first.
     pub fn decided(&self, tenant: &TenantId, limit: usize) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
              WHERE tenant = ?1 AND status != 'pending' ORDER BY decided_at DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![tenant.0, limit as i64], row_to_request)?;
@@ -410,7 +438,7 @@ impl Ledger {
 
     pub fn pending(&self, tenant: &TenantId) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
              WHERE tenant = ?1 AND status = 'pending' ORDER BY created_at",
         )?;
         let rows = st.query_map(params![tenant.0], row_to_request)?;
@@ -422,7 +450,7 @@ impl Ledger {
     pub fn approve(&mut self, id: &str, a: &Approval) -> Result<String> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let req = tx
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))?;
         if req.status != "pending" {
@@ -430,6 +458,8 @@ impl Ledger {
         }
         let (path, prefix) = match &a.path_prefix {
             Some(p) if req.path.starts_with(p.as_str()) => (p.clone(), 1),
+            // A prefix ask is granted as asked unless the human narrows it.
+            _ if req.scope_prefix => (req.path.clone(), 1),
             _ => (req.path.clone(), 0),
         };
         let gid = new_grant_id();
@@ -611,6 +641,7 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
         status: r.get(9)?,
         created_at: r.get(10)?,
         attribution: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
+        scope_prefix: r.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -645,6 +676,18 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn a_prefix_ask_is_granted_for_the_prefix() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let ask = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "news.example.org", "/");
+        let (id, fresh) = l.ask(&ask, "need the front page and items", true, None).unwrap();
+        assert!(fresh && l.request(&id).unwrap().scope_prefix);
+        assert_eq!(l.ask(&ask, "again", true, None).unwrap(), (id.clone(), false), "asking twice is one request");
+        l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let later = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "news.example.org", "/item");
+        assert!(l.consume_grant(&later).unwrap().is_some(), "every path under the prefix");
     }
 
     #[test]

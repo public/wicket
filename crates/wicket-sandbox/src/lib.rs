@@ -151,6 +151,14 @@ impl Docker {
         a
     }
 
+    /// Starts the box with the given stdin and stdout (e.g. inherited from whoever launched wicket,
+    /// when wicket wraps an agent another program drives) and stderr piped.
+    pub fn spawn_with(&self, spec: &SandboxSpec, stdin: Stdio, stdout: Stdio) -> Result<Child> {
+        let mut c = self.command_with(self.build_args(spec));
+        c.stdin(stdin).stdout(stdout).stderr(Stdio::piped()).kill_on_drop(true);
+        Ok(c.spawn().context("starting docker run")?)
+    }
+
     /// Starts the box with stdout and stderr piped.
     pub fn spawn(&self, spec: &SandboxSpec) -> Result<Child> {
         let mut c = self.command_with(self.build_args(spec));

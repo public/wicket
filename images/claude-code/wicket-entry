@@ -14,7 +14,8 @@ cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-bundle.pem
 export SSL_CERT_FILE=/tmp/ca-bundle.pem CURL_CA_BUNDLE=/tmp/ca-bundle.pem GIT_SSL_CAINFO=/tmp/ca-bundle.pem \
        REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem
 
-mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" /workspace/out
+mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p /workspace/out 2>/dev/null || true   # absent when the workspace is mounted elsewhere
 
 # Wait (briefly) for the forwarders to listen.
 i=0

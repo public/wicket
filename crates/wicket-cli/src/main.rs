@@ -80,6 +80,18 @@ enum Cmd {
         run: String,
         text: Vec<String>,
     },
+    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
+    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
+    /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
+    Wrap {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = "wicket/claude-code:poc")]
+        image: String,
+        /// The agent command line, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
     /// List pending escalation requests.
     Pending,
     /// Approve a pending request. The grant is never wider than the request.
@@ -307,7 +319,14 @@ async fn main() -> Result<()> {
         Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
             run::run(run::RunOpts {
                 manifest: &manifest, workdir: workdir.as_deref(), workspace_dir: workspace_dir.as_deref(), task, image: &image,
-                node: node.as_deref(), ssh_key: ssh_key.as_deref(), run_id, parent_run,
+                node: node.as_deref(), ssh_key: ssh_key.as_deref(), run_id, parent_run, wrap: None,
+            })
+            .await
+        }
+        Cmd::Wrap { manifest, image, argv } => {
+            run::run(run::RunOpts {
+                manifest: &manifest, workdir: None, workspace_dir: None, task: None, image: &image,
+                node: None, ssh_key: None, run_id: None, parent_run: None, wrap: Some(argv),
             })
             .await
         }
@@ -335,7 +354,7 @@ async fn main() -> Result<()> {
             }
             for r in p {
                 let age = wicket_store::now() - r.created_at;
-                println!("{}  {} {}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, r.risk, r.run, age, r.reason);
+                println!("{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, if r.scope_prefix { "*  (every path under it)" } else { "" }, r.risk, r.run, age, r.reason);
                 println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
                 for a in &r.attribution {
                     println!("    for: {}  (reported by the agent, unverified)", wicket_agent::clip(&wicket_proxy::attribution_line(a), 240));
