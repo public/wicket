@@ -47,6 +47,8 @@ Sources:
   sandboxed runners compared (Omnigent, Agent Substrate, Centaur, inspect_ai, Paperclip, Harbor, …).
 - [`research/17-metaharness-literature.md`](research/17-metaharness-literature.md) — essays, papers and vendor
   docs on harnesses, harness search, evaluation harnesses and harness safety.
+- [`research/22-pause-resume-hibernate.md`](research/22-pause-resume-hibernate.md) — pausing, resuming and
+  hibernating boxes: snapshot mechanisms, storage options, correctness, a layered plan.
 - [`prior-art.md`](prior-art.md) — the consolidated catalogue of papers and projects.
 - Components, processes and dependencies: Claude Doc https://claude.ai/artifact/XDhPxV33xb5G7QG4FpkS2L
 
@@ -1511,8 +1513,9 @@ work item runs inside that standing structure.
   features and lower-layer digests, §7). Otherwise the agent is **rebuilt**: a fresh sandbox from the base
   image, plus the durable workdir, the approved memory version, and the agent's own session resume (Claude
   `--resume`, Codex `thread/resume`, pi `--session-id`). Rebuild must always work; snapshots are an
-  optimisation. Every wake re-binds identity (claim-then-bind, §7.1): new placeholders, a new
-  listener, and a CA from the ceiling.
+  optimisation. Every wake re-binds identity (claim-then-bind, §7.1). A **rebuild** gets new placeholders,
+  a new listener and a CA from the ceiling. A **memory restore** re-binds the old placeholders, and the
+  run's CA must outlive the snapshot, because the restored process already trusts it (research 22).
 - **Wake sources are explicit and authenticated:**
   - an operator message (any operator channel, origin-labelled, §14.1.2);
   - a schedule;
@@ -1537,7 +1540,9 @@ work item runs inside that standing structure.
 - **Trusted text** is the charter (operator-signed, versioned) plus the current work item's text. For
   event-triggered work only the *subscription* is trusted, never the event. "Wake on a new issue and triage
   it" is trusted; the issue's content is a labelled handle.
-- **Sleep is a declassification checkpoint.** Across sleep, the agent's floating label resets to the join
+- **Sleep is a declassification checkpoint, on rebuild only.** A memory restore keeps the agent's full label;
+  a rebuild or a forked session declassifies (research 22). Across a rebuilding sleep, the agent's floating
+  label resets to the join
   of what it *keeps*: approved memory versions, the workdir and its session handles. Ephemeral context is
   discarded at sleep unless it is promoted (§13.4). So a long life doesn't mean unbounded taint creep, and
   a run tainted by one bad page can be ended by sleeping past it, or by forking the session at the last
@@ -1567,7 +1572,8 @@ its label is the join of everything that shaped it.
     point-in-time recovery;
   - cluster and platform mode: Postgres, partitioned per tenant.
 - **Agent state** (snapshots, workdirs, sessions, memory blobs) goes to **S3-compatible object storage**:
-  MinIO locally, then Vultr Object Storage, R2, S3 or GCS. Every blob is encrypted with the agent's data
+  a local directory or Garage/SeaweedFS (MinIO's community repository is archived), then Vultr Object
+  Storage, R2, S3 or GCS. Volumes become durable trees with a single-writer lease. Every blob is encrypted with the agent's data
   key, which is wrapped by the tenant key (BYOK for high tiers). Residency follows the tenant's placement
   rules.
 - **Node loss:** while an agent is active, wicket pushes incremental checkpoints of the workdir, session and
@@ -2264,7 +2270,7 @@ Each milestone ends with the smallest test that could prove it wrong. From M1 on
 | **M4b** | Isolated MCP servers as per-task workloads (§8.2): `wicket-node` direct launch with unbound warm pools (I1); then `wicket-operator` on single-node k3s with reservation pods, Cilium default-deny and gVisor RuntimeClass (I3) | Two third-party MCP servers and the agent each run in their own sandbox. Probing from inside each shows neither server can reach the other, the agent, the API server, the metadata service or DNS, except through the gateway. A pod without a sandboxed RuntimeClass, or a hand-edited CR, is rejected. A changed tool description is refused. State is gone at task end. The same probes pass in single-host mode. A per-task MCP server from the warm pool is `tools/list`-ready within 250 ms, and twenty concurrent instances fit the density budget on one node. |
 | **M5** | Handles (including handles as tool arguments), per-argument sink provenance, labels, typed-only gates, two-zone static topology | **The brief's smuggling test**, built as a GitHub-coding suite in AgentDojo's format: a test-org repo, injection slots in issue comments, docs pages and `CLAUDE.md`, deterministic checks on provider state, and an **adaptive attacker** that sees the policy and denial bodies. Free text vs typed vs handles. Report attack success *and* utility over 3 runs, and require a non-zero baseline attack rate before crediting a defence. If typed already gives zero, handles are optional in v1. |
 | **M6** | `wicket explain` + zone view + timeline | The three-engineer test. |
-| **M7** | Agent lifecycle (§13): agent registry, Active → Idle → Sleeping → Hibernated → Archived → Deleted, gVisor checkpoint, push to object storage (MinIO locally), rebuild path, wake sources (message, schedule, event), memory staging and promotion gate, retention and GC with crypto-shredding | An agent works, sleeps, hibernates to MinIO, and is woken a day later by a schedule. Its node is killed while it's active, and it rebuilds elsewhere from the last checkpoint within the RPO. A skill it wrote is staged, reviewed and only then visible to its next activation; rolling back the memory version removes it. GC deletes an agent after its grace period, and its blobs are unreadable while the audit chain still verifies. Every transition stays within the §13.8 budgets. |
+| **M7** | Agent lifecycle (§13): agent registry, Active → Idle → Sleeping → Hibernated → Archived → Deleted, gVisor checkpoint, push to object storage (a local directory or Garage/SeaweedFS locally), rebuild path, wake sources (message, schedule, event), memory staging and promotion gate, retention and GC with crypto-shredding | An agent works, sleeps, hibernates to MinIO, and is woken a day later by a schedule. Its node is killed while it's active, and it rebuilds elsewhere from the last checkpoint within the RPO. A skill it wrote is staged, reviewed and only then visible to its next activation; rolling back the memory version removes it. GC deletes an agent after its grace period, and its blobs are unreadable while the audit chain still verifies. Every transition stays within the §13.8 budgets. |
 | **M8** | Adapter generator loop | Generated vs hand-written GitHub adapters diffed. Zero too-permissive rules, or find which check missed it. |
 | **M9** | ACP (T2) adapter; `wicket.spawn` dynamic topology | Conformance suite passes for one ACP agent. Child ⊆ parent is enforced and proven by symcc. |
 | **M10** | Many clouds: provisioner with the Vultr (via broker) and AWS or GCP providers, WireGuard + mTLS node join, a KVM pool with Kata/Firecracker, money envelope + human approval for spend, `request_capacity` | One installation spans two providers. An agent's `request_capacity{kvm}` gets a Firecracker sandbox on a newly created per-second-billed host inside the envelope. A Vultr host is released before its next paid hour. Killing the provisioner mid-create leaks nothing, and the daily reconcile matches every provider's charges to the cent. |
