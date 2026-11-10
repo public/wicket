@@ -160,6 +160,29 @@ Everything around that uses standard components:
 The rule: if a mature, standard component does it, wicket integrates with it, and keeps its own code for
 what only an in-path broker can do. Where the best fit is weakly maintained, wicket may fork or vendor it.
 
+**Identity is JWT; authority is Biscuit** (owner, 2026-11-10).
+- **Identity:** who a box is. It stays JWT, as SPIFFE JWT-SVIDs (#52): standard, and readable by anything
+  outside wicket.
+- **Authority:** what a box may do, i.e. zone ceilings, grants and leases. It's a Biscuit capability chain
+  held by the node, never by the box.
+- **Why not JWT for authority:**
+  - A JWT can't be narrowed. Delegating means someone with a signing key mints a new token: either a round
+    trip to the control plane for every spawn or grant (against local decisions, #57), or signing keys on
+    every node, where a compromised node could mint *any* authority.
+  - "The child is within its parent" would be hand-written checks over claims, which have to be right
+    everywhere.
+- **Why Biscuit:**
+  - The holder appends blocks offline, with no issuer key, and blocks can only add checks. So a child
+    can't exceed its parent by construction, and a compromised node can only narrow what it already holds.
+  - Every verifier evaluates the checks the same way.
+  - Approvals can be added as blocks signed by the approving principal.
+  - Revocation ids per block revoke a whole subtree.
+- **What it costs:**
+  - It's less known, and its rule language (Datalog) takes learning.
+  - Fewer libraries, and a smaller project, so it sits behind an interface and can be forked. Plain signed
+    records, i.e. the JWT approach with our own narrowing checks, are the fallback.
+  - Tokens grow with delegation depth (experiments #58–#60).
+
 The survey behind these choices, with the options ruled out and why, is research 18
 (`research/18-authorization-landscape.md`). In short:
 - Cedar is healthy and right for static org rules. Its analyser can't reason about authority stored as data
