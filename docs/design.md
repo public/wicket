@@ -890,6 +890,85 @@ hundred MB) usually dominates; wicket's own overhead is what the budget controls
 
 ---
 
+### 7.2 Isolation tiers, and how one is chosen (owner, 2026-11-10)
+
+From weakest to strongest boundary between a workload and its host:
+
+| Tier | Examples | Boundary | Needs |
+|---|---|---|---|
+| process sandbox | seccomp + namespaces + Landlock (bubblewrap, nsjail; Claude Code's and Codex's own sandboxes); Seatbelt on macOS | the host kernel, with the calls a process may make restricted | nothing |
+| container | `runc` | the host kernel with namespaces and resource limits; packaging more than a security boundary | nothing |
+| user-space kernel | **gVisor** | a kernel in Go intercepts system calls; the host kernel sees a small fixed set | nothing special: runs on any VPS |
+| microVM / VM | **Firecracker**, Cloud Hypervisor, QEMU, libkrun; Apple Virtualization.framework; Hyper-V | the workload's own kernel behind hardware virtualization | hardware virtualization (KVM on Linux) |
+| confidential VM | SEV-SNP, TDX | also protects the guest from the host; not part of wicket's threat model | specific CPUs and clouds |
+
+**Kata Containers** isn't a separate tier. It's a container runtime that runs each container or pod in a
+microVM using one of those hypervisors, so Kubernetes and Docker treat VMs as containers (a Kubernetes
+RuntimeClass). It's the natural VM tier for the Kubernetes backend (#45).
+
+**Why not Firecracker for everything:**
+- **It needs KVM.** Most cheap cloud VMs (this Vultr VPS, Hetzner Cloud) don't expose it. Only bare metal or
+  the few instance types with nested virtualization (some GCP, Azure and newer AWS types) do, at higher cost,
+  and bare metal often bills monthly.
+- **It's Linux only.** Macs use Virtualization.framework (#48), Windows uses Hyper-V.
+- **No GPU passthrough.** GPU work needs Cloud Hypervisor or QEMU.
+- **More machinery than containers:** root filesystems and kernels instead of OCI images, the jailer,
+  snapshot management.
+- **Its own kernel per box** costs memory, so fewer boxes per machine than gVisor, though snapshot restores
+  make starting cheap.
+
+**Ranking for the subset rule:** `process ≈ runc ≈ seatbelt < gvisor < vm`. A zone states its minimum.
+Placement picks **the strongest tier the machine supports, never below the zone's minimum**:
+- Firecracker on Linux hosts with KVM (#64);
+- Virtualization.framework on Macs (#48);
+- gVisor everywhere else.
+
+A zone that requires `vm` where no KVM host exists becomes a `request_capacity` for one (#7). Seatbelt is
+only for macOS-native work (#49), and ranks lowest.
+
+### 7.3 Network modes (owner, 2026-11-10)
+
+Full mediation is the default, but some zones need raw speed. `zone.network` takes one of three values (#63):
+
+| Mode | The box's network | What wicket controls |
+|---|---|---|
+| **`mediated`** (default; built for gVisor and runc) | no interface; its only way out is wicket's endpoints at `wicket.internal` | every request: reach, approvals, credential injection, audit. DNS isn't an exfiltration route |
+| **`filtered`** | a real interface; the host filters by IP and DNS name | allowlisted destinations only; requests themselves aren't inspected |
+| **`direct`** (fast path) | a real interface with open internet | only **steered domains**, the ones with credential injection or request-level rules |
+
+**How steering works in `direct`:**
+- wicket's resolver answers steered domains with `wicket.internal`, so connections to them land at the proxy,
+  which decrypts, checks and injects as usual.
+- Every other name resolves normally and leaves through NAT on the host, UDP and HTTP/3 included.
+- A box that bypasses the resolver reaches steered domains without credentials, which grants nothing.
+- **Credentials never enter the box in any mode.**
+
+**Per tier:**
+
+| Tier | `mediated` | `filtered` / `direct` |
+|---|---|---|
+| gVisor, runc | `--network none`, unix sockets (built) | a veth pair with host-side nftables, NAT and wicket's resolver. gVisor can't run nftables inside, and doesn't need to |
+| Firecracker, Cloud Hypervisor | no network device; vsock to wicket's endpoints | virtio-net on a host TAP with host nftables and NAT; Firecracker's bandwidth limits |
+| Kata | vsock forwarding for wicket's endpoints (to verify) | Kubernetes network policy (e.g. Cilium DNS-aware rules) plus steering |
+| Virtualization.framework | no network device; vsock | a file-handle network device with wicket as the NAT in user space (controlled, slower), or Apple's NAT with `pf` rules |
+| Seatbelt | the profile allows only wicket's forwarders | general outbound, with steering only by proxy environment variables, which programs can ignore. The weakest |
+
+**Policy:**
+- `filtered` and `direct` give up per-request control and audit for unsteered traffic, and `direct` makes DNS an
+  exfiltration route again. They're only for zones with nothing confidential to leak (no private
+  repositories, confidential volumes or tenant data), and only a human grants them.
+- By the subset rule a zone can't give a child a more open mode than its own.
+- The zone view and approval cards say "open internet".
+- With taint tracking (#27), a `direct` zone counts as an untrusted source.
+
+**Performance.** Most of the cost of mediation is avoidable without giving it up (#62):
+- deciding on the node, not the control host (#57);
+- splicing encrypted bytes straight through for hosts wicket doesn't inspect;
+- a zero-copy data path;
+- read-through package caches on each node.
+
+Measure before reaching for `direct`.
+
 ## 8. Infrastructure: hosts, placement and isolated services
 
 *Draft. Owner requirement 2026-11-08. Kubernetes, provider and billing research is in
