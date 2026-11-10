@@ -47,6 +47,8 @@ Sources:
   sandboxed runners compared (Omnigent, Agent Substrate, Centaur, inspect_ai, Paperclip, Harbor, …).
 - [`research/17-metaharness-literature.md`](research/17-metaharness-literature.md) — essays, papers and vendor
   docs on harnesses, harness search, evaluation harnesses and harness safety.
+- [`research/18-authorization-landscape.md`](research/18-authorization-landscape.md) — authorization
+  engines, relationship stores, capability tokens and policy distribution, against wicket's requirements.
 - [`prior-art.md`](prior-art.md) — the consolidated catalogue of papers and projects.
 - Components, processes and dependencies: Claude Doc https://claude.ai/artifact/XDhPxV33xb5G7QG4FpkS2L
 
@@ -146,16 +148,28 @@ Everything around that uses standard components:
 | Need | Reuse | Status |
 |---|---|---|
 | Workload identity, rotation, attestation | **SPIFFE** IDs and SVID formats; a real **SPIRE** deployment can be the issuer | the PoC has its own small issuer with SPIFFE-shaped IDs (#52) |
-| Policy language and evaluation | **Cedar** (§5.2) | the PoC's reach, forbid and host checks are hand-written (#51) |
-| Proving a zone is within another | **Cedar's symbolic analyser (SymCC)** | the PoC's `subset.rs` is hand-written and conservative (#51) |
-| Escalation rights, inspection rights, operator roles | Cedar policy, not more Rust (#50, #34, #11) | not built |
-| Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP; **OpenFGA** or Cedar for sharing between tenants | passkeys enrolled in wicket's console (#53) |
+| Org rules: images, hosts, escalation and inspection rights, operator roles | **Cedar** (the `cedar-policy` crate, embedded), static and reviewed; **SymCC** in CI to diff policy changes (#50, #34, #11) | the PoC's checks are hand-written (#51) |
+| Delegated authority: zone ceilings, grants and leases | **capability chains (Biscuit)**: narrowing by construction, signed, checked offline, revocable by subtree; intersected with the org rules at decision time | the PoC's `subset.rs` is hand-written and conservative (#57) |
+| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed with a freshness lease** (TUF-style), so nodes know when they're stale and fail narrow; no product signs increments or fails narrow | central checks on the control host (#57) |
+| Relationship data: spawn trees, tenants, roles | Cedar entities materialised from wicket's ledger; **OpenFGA** as an optional source in platform mode | the ledger (#11) |
+| Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP | passkeys enrolled in wicket's console (#53) |
 | Downstream credentials | providers' **scoped native credentials** (AWS STS session policies, GCP downscoped tokens, GitHub App installation tokens; §9.4) | whole tokens injected from the vault (#54) |
 | Human just-in-time access workflows | Teleport access requests, AWS Identity Center, Entra PIM, as optional **approval channels** | wicket's own ledger and console |
 | Clusters and scheduling | Kubernetes behind the placement interface (#45) | Vultr + SSH first (#37) |
 
 The rule: if a mature, standard component does it, wicket integrates with it, and keeps its own code for
-what only an in-path broker can do.
+what only an in-path broker can do. Where the best fit is weakly maintained, wicket may fork or vendor it.
+
+The survey behind these choices, with the options ruled out and why, is research 18
+(`research/18-authorization-landscape.md`). In short:
+- Cedar is healthy and right for static org rules. Its analyser can't reason about authority stored as data
+  or about template-linked policies, so it can't be what guarantees delegation.
+- Every system that reliably stops a child exceeding its parent does it by intersection at decision time:
+  AWS session policies, Biscuit attenuation, Kubernetes' escalate/bind rule.
+- Biscuit is the one moderately maintained dependency (Apache-2.0, Eclipse Foundation, small surface),
+  and stays swappable for plain signed records.
+- The local-agent and distribution projects (cedar-local-agent, OPAL, avp-local-agent, Cedarling and
+  Lock) are inactive, AWS-only, or immature for this.
 
 ---
 
