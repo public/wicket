@@ -91,8 +91,10 @@ enters the context window, so compaction can't erode it.
 1. **The box is hostile.** Assume the inner agent is compromised from its first token. Nothing inside the
    box is in the trusted computing base, including the adapter's own config, hooks and the agent's own
    sandbox. Those are telemetry and UX only.
-2. **No secrets in the box, ever.** Sandbox identity is the transport (its netns, UDS or vsock), not a
-   bearer token. Tools get placeholders; real credentials are injected on the way out.
+2. **No secrets in the box by default.** Sandbox identity is the transport (its netns, UDS or vsock), not a
+   bearer token. Tools get placeholders; real credentials are injected on the way out. A workload that must
+   hold a secret itself (e.g. a webhook receiver's HMAC key) gets it only as an explicit, human-granted,
+   visible exception, never the model or injection credentials (owner, 2026-11-09; #36).
 3. **Fail narrow.** Every mistake should cost the agent access (it stalls, someone notices) rather than
    leak access. Unmapped means deny. Undeclared parameter means deny. Unknown risk means R4.
 4. **Judge the request, not the reasoning.** Escalation deciders see a typed request and the trusted task
@@ -123,6 +125,37 @@ enters the context window, so compaction can't erode it.
 13. **Reusable programs run without an agent, never without a boundary** (owner, 2026-11-08). Code an
     agent writes becomes a program only through a reviewed, signed promotion, and every run gets the same
     sandbox, egress control and audit as an agent (§17).
+
+### 2.1 Build versus reuse (owner, 2026-11-10)
+
+wicket shouldn't rebuild what identity and access management systems already do well. Cloud IAM, though,
+doesn't do wicket's core job:
+- **IAM governs calls to one provider's APIs.** wicket governs every crossing out of an agent's box: any
+  website or API (most have no IAM), the model API, MCP tools, git pushes, new sandboxes. It judges per
+  request (method, path, risky patterns).
+- **IAM gives credentials *to* the workload.** wicket keeps them out of the box and adds them outside.
+- **IAM's delegation is static and managed by admins.** wicket's is made by agents at runtime: sub-agents
+  with narrowed authority, and requests and grants in-band. Letting an agent create IAM roles would itself
+  be a high-risk permission change.
+- **IAM has no isolation,** no in-band "wait for a human, then retry", and no taint.
+
+So wicket is the **enforcement point and broker in front of the agent**: the sandbox, the proxies,
+keeping credentials out, the request → approval → retry loop, and runtime delegation between agents.
+Everything around that uses standard components:
+
+| Need | Reuse | Status |
+|---|---|---|
+| Workload identity, rotation, attestation | **SPIFFE** IDs and SVID formats; a real **SPIRE** deployment can be the issuer | the PoC has its own small issuer with SPIFFE-shaped IDs (#52) |
+| Policy language and evaluation | **Cedar** (§5.2) | the PoC's reach, forbid and host checks are hand-written (#51) |
+| Proving a zone is within another | **Cedar's symbolic analyser (SymCC)** | the PoC's `subset.rs` is hand-written and conservative (#51) |
+| Escalation rights, inspection rights, operator roles | Cedar policy, not more Rust (#50, #34, #11) | not built |
+| Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP; **OpenFGA** or Cedar for sharing between tenants | passkeys enrolled in wicket's console (#53) |
+| Downstream credentials | providers' **scoped native credentials** (AWS STS session policies, GCP downscoped tokens, GitHub App installation tokens; §9.4) | whole tokens injected from the vault (#54) |
+| Human just-in-time access workflows | Teleport access requests, AWS Identity Center, Entra PIM, as optional **approval channels** | wicket's own ledger and console |
+| Clusters and scheduling | Kubernetes behind the placement interface (#45) | Vultr + SSH first (#37) |
+
+The rule: if a mature, standard component does it, wicket integrates with it, and keeps its own code for
+what only an in-path broker can do.
 
 ---
 
