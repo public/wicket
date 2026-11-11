@@ -7,6 +7,7 @@
 
 mod chan;
 mod enrol;
+mod image;
 mod mock;
 mod node;
 mod noderun;
@@ -141,7 +142,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Build the agent image.
+    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build).
     Image {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
@@ -707,7 +708,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir } => {
-            wicket_sandbox::Docker::from_env().build_image(&tag, &dir).await?;
+            let ctx = image::context(&dir)?;
+            wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
             println!("built {tag}");
             Ok(())
         }
