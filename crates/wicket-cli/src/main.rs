@@ -30,7 +30,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum IdentityCmd {
-    /// Print the installation issuer's public key (JWK): what verifiers need.
+    /// Set up this installation's identity issuer: its key and its trust domain, which every agent's
+    /// SPIFFE ID is under (spiffe://<domain>/t/…). The domain is fixed once set.
+    Init {
+        /// e.g. wicket.example.com: lowercase letters, digits, '.', '-' and '_'.
+        #[arg(long)]
+        trust_domain: String,
+    },
+    /// Print the installation issuer's public key (JWK) and trust domain: what verifiers need.
     Issuer,
     /// Verify and show the identity wicket issued for a run.
     Show { run: String },
@@ -302,12 +309,14 @@ pub fn cli_principal() -> serde_json::Value {
     serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
 }
 
-pub fn trust_domain() -> String {
-    std::env::var("WICKET_TRUST_DOMAIN").unwrap_or_else(|_| "wicket.local".into())
+/// The trust domain asked for in the environment, if any. The installation's own is recorded with
+/// its issuer key (`wicket identity init`); this only sets it on first use, and must match after.
+pub fn trust_domain() -> Option<String> {
+    std::env::var("WICKET_TRUST_DOMAIN").ok().filter(|s| !s.is_empty())
 }
 
 pub fn issuer() -> Result<wicket_identity::Issuer> {
-    Ok(wicket_identity::Issuer::load_or_create(&issuer_key_path(), &trust_domain())?)
+    Ok(wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref())?)
 }
 
 fn operator() -> String {
@@ -448,7 +457,16 @@ async fn main() -> Result<()> {
         Cmd::Identity { cmd } => {
             let l = Ledger::open(&ledger_path())?;
             match cmd {
-                IdentityCmd::Issuer => println!("{}", serde_json::to_string_pretty(&issuer()?.public_jwk())?),
+                IdentityCmd::Init { trust_domain } => {
+                    let i = wicket_identity::Issuer::load(&issuer_key_path(), Some(&trust_domain))?;
+                    println!("issuer ready: {} (key {})", i.issuer_id(), wicket_identity::key_id(&i.verifying_key()));
+                }
+                IdentityCmd::Issuer => {
+                    let i = issuer()?;
+                    let mut jwk = i.public_jwk();
+                    jwk["trust_domain"] = i.trust_domain.clone().into();
+                    println!("{}", serde_json::to_string_pretty(&jwk)?);
+                }
                 IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
                 IdentityCmd::Revoke { run, reason } => {
                     if l.identity(&run)?.is_none() {
@@ -665,6 +683,13 @@ async fn doctor(image: &str) -> Result<()> {
         Ok(true) => println!("image {image}: present"),
         _ => {
             println!("image {image}: missing (run: wicket image)");
+            ok = false;
+        }
+    }
+    match wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref()) {
+        Ok(i) => println!("identity issuer: {}", i.issuer_id()),
+        Err(e) => {
+            println!("identity issuer: NOT OK ({e})");
             ok = false;
         }
     }
