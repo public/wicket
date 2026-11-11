@@ -274,6 +274,10 @@ pub struct LlmSpec {
     pub max_requests: u64,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u64,
+    /// Optional cap on input tokens, counting cached ones (cache reads and cache writes) too: with
+    /// prompt caching, a long conversation's input is mostly cache reads. None: no input cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
     /// Allow server-side tools (web search/fetch). They bypass the egress proxy, so default false.
     #[serde(default)]
     pub allow_server_tools: bool,

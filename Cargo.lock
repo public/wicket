@@ -2939,6 +2939,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "p256 0.13.2",
+ "rand_core 0.6.4",
  "rpassword",
  "rustls",
  "serde",

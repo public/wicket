@@ -36,6 +36,9 @@
   .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; word-break:break-all; }
   .log { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; }
   .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
+  select, textarea, input.text { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); width:100%; margin-top:6px; }
+  textarea { min-height:70px; }
+  .row .acts { display:flex; gap:6px; } .row .acts button { padding:3px 9px; font-size:13px; }
   #msg { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:14px; display:none; }
 </style>
 </head>
@@ -48,6 +51,8 @@
   <div id="pending"></div>
   <h2>Runs</h2>
   <div class="card" id="runs"></div>
+  <h2>Start a run</h2>
+  <div class="card" id="start"></div>
   <h2>Recent decisions</h2>
   <div class="card" id="decided"></div>
   <h2>Activity</h2>
@@ -99,17 +104,26 @@ async function signIn() {
   try { const { publicKey } = await post("/api/login/begin"); const j = await post("/api/login/finish", await assertWith(publicKey)); toast(j.ok); boot(); }
   catch (e) { toast("sign-in: " + e.message); }
 }
-// Every decision is signed: the passkey challenge is the hash of exactly this decision.
-async function act(kind, body) {
+// Every action is signed: the passkey challenge is the hash of exactly the action the server
+// returns from begin, and the toast spells out that action (not what the page asked for).
+function describe(a) {
+  const s = x => strip(x);
+  if (a.action === "decide") return a.decision + " " + s(a.method + " " + a.host + a.path) + (a.prefix ? "* (every path under it)" : "") + (a.agent ? " for agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
+  if (a.action === "say") return "send to " + s(a.run) + ": \u201c" + s(a.text).slice(0, 80) + "\u201d";
+  if (a.action === "revoke") return "revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
+  if (a.action === "start_run") return "start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
+  return s(a.action);
+}
+async function signed(body) {
   try {
-    const begin = await post("/api/decide/begin", { ...body, decision: kind });
-    const d = begin.decision;
-    toast("Confirm with your passkey: " + d.decision + " " + d.method + " " + d.host + d.path + (d.agent ? " for agent " + d.agent : "") + ((d.requested_by || []).length ? " (" + d.requested_by.join(", ") + ")" : ""));
-    const j = await post("/api/decide/finish", await assertWith(begin.publicKey));
+    const begin = await post("/api/action/begin", body);
+    toast("Confirm with your passkey: " + describe(begin.action));
+    const j = await post("/api/action/finish", await assertWith(begin.publicKey));
     toast(j.ok);
   } catch (e) { toast(e.message); }
   refresh();
 }
+const act = (kind, body) => signed({ ...body, action: "decide", decision: kind });
 
 // The requesting agent's identity, verified by the console against wicket's issuer. Approve is
 // disabled when an agent's identity does not verify: you can't approve without knowing who for.
@@ -157,8 +171,8 @@ function renderPending(s) {
     c.append(renderWho(p.attribution || []));
     c.append(el("div", "meta", p.id + " · zone " + p.zone + " · " + p.run + " · " + ago(s.now, p.created_at)));
     const b = el("div", "buttons");
-    const once = el("button", "approve", "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
-    const hour = el("button", "", "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
+    const once = el("button", "approve", p.scope_prefix ? "Approve prefix once (10 min)" : "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
+    const hour = el("button", "", p.scope_prefix ? "Allow prefix for 1 hour" : "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
     const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
     if (!idOk) { once.disabled = true; hour.disabled = true; }
     if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") b.append(once, deny); else b.append(once, hour, deny);
@@ -183,8 +197,50 @@ function line(op) {
   if (op.kind === "decision") return el("div", b.decision === "approve" ? "ok" : "blocked", b.decision + " " + b.request + " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "operator.passkey_added") return el("div", "", "passkey added: " + strip(b.name) + " via " + strip(b.via));
   if (op.kind === "run.start") return el("div", "", "start  " + op.run + " zone " + strip(b.zone) + " agent " + strip(b.agent));
+  if (op.kind === "operator.message") return el("div", "", "say    " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.signed ? " (passkey-signed)" : ""));
+  if (op.kind === "identity.revoked") return el("div", "blocked", "revoke " + op.run + " by " + strip(b.by) + ": " + strip(b.reason) + (b.signed ? " (passkey-signed)" : ""));
+  if (op.kind === "run.console_start") return el("div", "", "launch " + op.run + " " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
   if (op.kind === "run.end") return el("div", "", "end    " + op.run + " " + strip(b.status) + " · " + b.model_requests + " model calls");
   return el("div", "", op.kind);
+}
+
+// A running agent can be sent a follow-up or have its identity revoked; both are signed.
+function renderRun(s, x) {
+  const d = el("div", "row");
+  const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
+  d.append(left);
+  if (x.status === "running" && x.has_identity && !x.revoked) {
+    const acts = el("span", "acts");
+    const say = el("button", "", "Follow-up…");
+    say.onclick = () => { const text = prompt("Follow-up for " + x.id + " (it arrives as the agent's next turn):"); if (text && text.trim()) signed({ action: "say", run: x.id, text }); };
+    const rev = el("button", "deny", "Revoke…");
+    rev.onclick = () => { const reason = prompt("Revoke " + x.id + "'s identity: its box is stopped and its requests can't be approved. Reason:", "revoked by the operator"); if (reason !== null) signed({ action: "revoke", run: x.id, reason }); };
+    acts.append(say, rev); d.append(acts);
+  }
+  return d;
+}
+
+// Runs start only from manifests the server lists (its allowlisted directories); the page sends a
+// root and a file name, never a path.
+function renderStart(s) {
+  const box = document.getElementById("start");
+  const ms = s.manifests || [];
+  // Rebuild only when the list changes, so what the operator is typing survives the poll.
+  const key = JSON.stringify(ms);
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  box.replaceChildren();
+  if (!ms.length) { box.append(el("div", "empty", "No manifests to start: put one in the installation's manifests directory.")); return; }
+  const sel = el("select");
+  for (const m of ms) {
+    const o = el("option", "", strip(m.root + "/" + m.name) + (m.valid ? " · " + strip(m.agent ? "agent " + m.agent : "program " + m.program) + " · zone " + strip(m.zone) : " · invalid"));
+    o.value = JSON.stringify([m.root, m.name]); o.disabled = !m.valid; sel.append(o);
+  }
+  const task = el("textarea"); task.placeholder = "Task (optional; replaces the manifest's task, agents only)";
+  const b = el("div", "buttons"); const go = el("button", "approve", "Start run");
+  go.onclick = () => { const [root, manifest] = JSON.parse(sel.value); signed({ action: "start_run", root, manifest, task: task.value }); task.value = ""; };
+  b.append(go);
+  box.append(sel, task, b, el("div", "meta", "The run's principal is you (this passkey), not the host user."));
 }
 
 function renderOperator(s) {
@@ -208,7 +264,7 @@ async function boot() {
     const b = el("div", "buttons"); const go = el("button", "approve", "Create passkey"); go.onclick = registerPasskey; b.append(go);
     auth.append(name, b);
   } else if (me.passkeys > 0) {
-    auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on."));
+    auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
   } else {
     auth.append(el("div", "", "No passkey is enrolled yet. Open the one-time enrolment link printed by `wicket serve`."));
@@ -222,7 +278,8 @@ async function refresh() {
     const s = await r.json();
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
-    renderRows("runs", s.runs, x => { const d = el("div", "row"); d.append(el("span", "mono", x.id), el("span", "", strip(x.zone + " · " + x.status + " · " + ago(s.now, x.started_at)))); return d; }, "No runs yet.");
+    renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    renderStart(s);
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
     renderOperator(s);

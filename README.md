@@ -182,6 +182,22 @@ or deny from a browser or phone. It uses **passkeys**:
   signed record, so `wicket audit --verify` re-verifies every decision offline;
 - `wicket operator reset` (host only) revokes passkeys but keeps their public keys for verification.
 
+Signed in, the console can also do what was CLI-only, each action signed with a fresh passkey assertion over
+exactly its parameters, checked again when applied, audited with the passkey that signed it and re-verified by
+`wicket audit --verify`:
+- **start a run** from a manifest in an allowlisted directory, with an optional task override. The directories are
+  the installation's `manifests/` (`$WICKET_HOME/manifests`, by default `~/.local/share/wicket/manifests`) and
+  `examples/` of the directory `wicket serve` was started in. The browser picks a directory and a file name from
+  the list the server offers (regular files named `*.yaml`/`*.yml` directly in them; no symlinks, subdirectories
+  or paths), and the passkey signs the manifest's SHA-256, so a file changed after you saw it is not started. The
+  run is a detached `wicket run` (it outlives the console; its log is `runs/<run>/console.log`), and its principal
+  is you, the passkey-signed-in operator (`passkey:<name>, via console`), not the host's unix user;
+- **send a follow-up** to a running agent (`wicket say`);
+- **revoke an identity** with a reason (`wicket identity revoke`);
+- **answer `request_access` asks**, including prefix asks: the passkey signs that the grant covers every path
+  under the prefix, and, as for every approval, the agent's verified identity. An agent whose identity doesn't
+  verify (or was revoked since you were shown the ask) can be denied, not approved.
+
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
 
