@@ -26,16 +26,18 @@
 //! - **Copying** ([`CopyMode`]): splice(2) through a 256 KiB pipe by default, falling back to
 //!   read/write through a 256 KiB buffer when splice is refused (logged once); `--copy rw` forces
 //!   read/write. Measured with `bench/box.sh` (curl in a `--network none` box, 1 KB GETs on new
-//!   connections and 100 MB downloads, an origin on the host's unix socket; shared 4 vCPU VPS, noisy),
-//!   new connection p50 and download median:
+//!   connections and 100 MB downloads, an origin on the host's unix socket; legs interleaved, the
+//!   old socat image with this binary mounted in; shared 4 vCPU VPS, noisy), new connection p50 and
+//!   download median, over three runs (2–3 rounds each, leg order rotated):
 //!
 //!   | box | socat (before) | `--copy rw` | `--copy splice` |
 //!   |---|---|---|---|
-//!   | gVisor (systrap) | 16–17 ms, 10–19 MB/s | 5.6–7.5 ms, 141–193 MB/s | 6.0–7.3 ms, 170–195 MB/s |
+//!   | gVisor (systrap) | 14–17 ms, 10–33 MB/s | 4.4–7.5 ms, 141–205 MB/s | 4.2–7.3 ms, 170–350 MB/s |
 //!   | runc | 2.3 ms, 366 MB/s | 1.7 ms, 1,070 MB/s | 2.5 ms, 1,160 MB/s |
 //!
-//!   The two copy modes are within noise of each other in gVisor (which implements splice itself);
-//!   splice is the default because it was ahead in both boxes and spends less CPU on the host kernel.
+//!   The two copy modes are within noise of each other in gVisor (which implements splice itself;
+//!   whichever leg ran first in a round did best); splice is the default because it was ahead in
+//!   runc and spends less CPU on the host kernel.
 //! - **Half-close** propagates both ways: end of file on one side shuts down writing on the other, and
 //!   the other direction carries on until its own end of file. An error in either direction (a reset,
 //!   a broken pipe) shuts both sockets down completely, so neither thread is left blocked.
@@ -56,10 +58,11 @@
 //! (experiment #70). The listening sockets survive it, and accept again as soon as the address is
 //! back; the forwarder has no `NET_ADMIN` and can't re-add it itself. Putting it back is
 //! `wicket-entry --restore-hook`'s job, run by gVisor's save/restore hook as root inside the sandbox
-//! before the box is woken (once wicket restores boxes from memory; today it parks them by rebuild). So the forwarder doesn't die and doesn't rebind: a watcher thread checks
+//! before the box is woken (once wicket restores boxes from memory; today it parks them by
+//! rebuild). So the forwarder doesn't die and doesn't rebind: a watcher thread checks
 //! each listen address once a second (a UDP bind to it succeeds only while the address is local) and
 //! logs `address 198.18.0.1 is gone` and `... is back`, so a missing hook shows up in the box's log
-//! instead of as silent retries in the agent.
+//! instead of as silent retries in the agent. `bench/addr-gone.sh` checks all of this in a gVisor box.
 //!
 //! # Datagrams, later (HTTP/3, DNS)
 //!
