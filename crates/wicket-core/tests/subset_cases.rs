@@ -1,28 +1,31 @@
 //! The 28 parent/child zones from experiment #58 (experiments/symcc-zones), with the answers SymCC's
 //! segment model proved. `subset::check` must agree on every one: it missed the forbid cases (22 and
 //! 27) and wrongly refused one session's worker channel under any session's (19) before #73.
+//!
+//! The zones are also used by wicket-authz's oracle tests (which include this file as a module),
+//! hence the `pub` items.
 
 use std::time::Duration;
 use wicket_core::{Manifest, ZoneSpec};
 
-struct Parent {
-    key: &'static str,
-    zone: ZoneSpec,
-    images: Vec<String>,
-    llm_remaining: Option<(u64, u64)>,
-    time_remaining: Duration,
-    child_slots: u32,
+pub struct Parent {
+    pub key: &'static str,
+    pub zone: ZoneSpec,
+    pub images: Vec<String>,
+    pub llm_remaining: Option<(u64, u64)>,
+    pub time_remaining: Duration,
+    pub child_slots: u32,
 }
 
-struct Child {
-    parent: &'static str,
-    name: String,
-    zone: ZoneSpec,
-    image: String,
-    max_children: u32,
+pub struct Child {
+    pub parent: &'static str,
+    pub name: String,
+    pub zone: ZoneSpec,
+    pub image: String,
+    pub max_children: u32,
     /// Expected: within the parent (true) or wider (false), and how.
-    within: bool,
-    note: &'static str,
+    pub within: bool,
+    pub note: &'static str,
 }
 
 fn zone(name: &str, body: &str) -> ZoneSpec {
@@ -37,7 +40,7 @@ fn example(path: &str) -> ZoneSpec {
     Manifest::from_yaml(&std::fs::read_to_string(&p).unwrap()).unwrap().zone
 }
 
-fn parents() -> Vec<Parent> {
+pub fn parents() -> Vec<Parent> {
     vec![
         Parent {
             key: "self-hosting",
@@ -113,7 +116,7 @@ fn sh(name: &str, reach_extra: &str, rest: &str, within: bool, note: &'static st
     }
 }
 
-fn children() -> Vec<Child> {
+pub fn children() -> Vec<Child> {
     let mut v = vec![
         sh("sh-crates-only", "", "", true, "only the crates hosts"),
         sh("sh-issues-reader", &format!("{SH_GIT}    - {{ host: api.github.com, paths: [\"/repos/public/wicket/issues\", \"/repos/public/wicket/issues/**\"] }}\n"), SH_INJ, true, "issues subtree, same git fetch, same injection"),

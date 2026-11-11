@@ -12,6 +12,7 @@ members = [
     "crates/wicket-sandbox",
     "crates/wicket-agent",
     "crates/wicket-cli",
+    "crates/wicket-authz",
 ]
 
 [workspace.package]
@@ -57,3 +58,25 @@ wicket-agent = { path = "crates/wicket-agent" }
 
 [profile.release]
 debug = 1
+
+# The authz tests run the Biscuit fork's generic engine on 100k requests (and verify many Ed25519
+# signatures); unoptimized, that takes minutes. Optimizing these dependencies keeps `cargo test` fast
+# without changing what is tested (limits are step counts, not time).
+[profile.dev.package.biscuit-auth]
+opt-level = 2
+[profile.dev.package.biscuit-parser]
+opt-level = 2
+[profile.dev.package.regex-automata]
+opt-level = 2
+[profile.dev.package.regex-syntax]
+opt-level = 2
+[profile.dev.package.curve25519-dalek]
+opt-level = 2
+[profile.dev.package.ed25519-dalek]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+[profile.dev.package.prost]
+opt-level = 2
+[profile.dev.package.globset]
+opt-level = 2
