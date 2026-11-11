@@ -13,6 +13,8 @@ pub struct Bounds<'a> {
     pub images: Vec<String>,
     /// Model requests and output tokens it has left.
     pub llm_remaining: Option<(u64, u64)>,
+    /// Input tokens it has left, cached ones included, if its zone caps them.
+    pub llm_input_remaining: Option<u64>,
     pub time_remaining: Duration,
     /// How many more boxes it may start.
     pub child_slots: u32,
@@ -86,6 +88,13 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
                 if cl.max_output_tokens > toks {
                     v.push(format!("{} output tokens: only {toks} are left in this zone's budget", cl.max_output_tokens));
                 }
+            }
+            // A capped zone can't start an uncapped child, or one with more input than it has left.
+            match (cl.max_input_tokens, parent.llm_input_remaining) {
+                (_, None) => {}
+                (None, Some(left)) => v.push(format!("no input token cap: this zone caps input tokens, and has {left} left")),
+                (Some(c), Some(left)) if c > left => v.push(format!("{c} input tokens: only {left} are left in this zone's budget")),
+                (Some(_), Some(_)) => {}
             }
         }
     }
@@ -262,6 +271,7 @@ mod tests {
 
     fn bounds(z: &ZoneSpec) -> Bounds<'_> {
         Bounds {
+            llm_input_remaining: None,
             zone: z,
             images: vec!["img:a".into(), "img:b".into()],
             llm_remaining: Some((100, 50_000)),
@@ -421,6 +431,24 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{} unsound proofs, e.g.:\n{}", wrong.len(), wrong[..wrong.len().min(10)].join("\n"));
         assert!(proved > 2_000, "only {proved} proofs: the check got too weak");
+    }
+
+    /// #28: input budgets count cached tokens too; a capped zone can only start capped children,
+    /// within what it has left.
+    #[test]
+    fn input_token_caps_narrow() {
+        let p = parent();
+        let capped = |n: u64| {
+            zone(&format!("  llm: {{ max_requests: 10, max_output_tokens: 1000, max_input_tokens: {n} }}\n  limits: {{ memory: 1g, cpus: 1, timeout: 10m }}\n"))
+        };
+        let uncapped = zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m }\n");
+        let left = |n| Bounds { llm_input_remaining: Some(n), ..bounds(&p) };
+        assert_eq!(check(&ask(&capped(50_000)), &left(100_000)), Ok(()));
+        assert!(check(&ask(&capped(200_000)), &left(100_000)).unwrap_err()[0].contains("only 100000 are left"));
+        assert!(check(&ask(&uncapped), &left(100_000)).unwrap_err()[0].contains("no input token cap"));
+        // An uncapped parent doesn't constrain its children's input.
+        assert_eq!(check(&ask(&uncapped), &bounds(&p)), Ok(()));
+        assert_eq!(check(&ask(&capped(10)), &bounds(&p)), Ok(()));
     }
 
     #[test]

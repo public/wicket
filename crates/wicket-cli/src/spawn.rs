@@ -46,6 +46,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     }
     let time_left = c.deadline.saturating_duration_since(Instant::now());
     let llm_left = c.llm.get().and_then(|l| l.remaining());
+    let llm_input_left = c.llm.get().and_then(|l| l.remaining_input());
     let is_agent = match req.kind.as_str() {
         "agent" => true,
         "program" => false,
@@ -95,6 +96,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 let mut l = pl.clone();
                 l.max_requests = (r / 2).max(1);
                 l.max_output_tokens = (t / 2).max(1);
+                l.max_input_tokens = llm_input_left.map(|i| (i / 2).max(1));
                 z.llm = Some(l);
             }
         }
@@ -142,7 +144,14 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let digest = hex::encode(sha2::Sha256::digest(stated.to_string().as_bytes()));
 
     // Within the parent's authority, or approved by a human for exactly this zone.
-    let bounds = subset::Bounds { zone: &p.zone, images, llm_remaining: llm_left, time_remaining: time_left, child_slots: slots };
+    let bounds = subset::Bounds {
+        zone: &p.zone,
+        images,
+        llm_remaining: llm_left,
+        llm_input_remaining: llm_input_left,
+        time_remaining: time_left,
+        child_slots: slots,
+    };
     let ask = subset::Ask { zone: &cm.zone, image: &image, max_children: req.max_children };
     let mut beyond = false;
     if let Err(violations) = subset::check(&ask, &bounds) {
@@ -183,6 +192,9 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         use std::sync::atomic::Ordering;
         llm.reserved_requests.fetch_add(cl.max_requests, Ordering::SeqCst);
         llm.reserved_output_tokens.fetch_add(cl.max_output_tokens, Ordering::SeqCst);
+        if let Some(i) = cl.max_input_tokens {
+            llm.reserved_input_tokens.fetch_add(i, Ordering::SeqCst);
+        }
     }
 
     // Launch: another `wicket run`, with its own box, sockets, proxies and identity.

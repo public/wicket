@@ -264,6 +264,7 @@ fn subset_check_agrees_with_symcc_on_every_case() {
             zone: &p.zone,
             images: p.images.clone(),
             llm_remaining: p.llm_remaining,
+            llm_input_remaining: None,
             time_remaining: p.time_remaining,
             child_slots: p.child_slots,
         };
