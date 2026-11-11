@@ -109,7 +109,8 @@ pub fn plan(o: &ServeOpts, data: &Path) -> Result<Plan> {
     if !o.trusted_proxy.is_empty() && !o.behind_tls_terminator {
         bail!("--trusted-proxy applies only with --behind-tls-terminator");
     }
-    let trusted = o.trusted_proxy.iter().map(|s| s.parse::<Cidr>().with_context(|| format!("--trusted-proxy {s:?}"))).collect::<Result<Vec<_>>>()?;
+    let trusted =
+        o.trusted_proxy.iter().map(|s| s.parse::<Cidr>().with_context(|| format!("--trusted-proxy {s:?}"))).collect::<Result<Vec<_>>>()?;
     if !addr.ip().is_loopback() && !tls && !o.behind_tls_terminator {
         bail!(
             "refusing to listen on {addr} without TLS: give the console a certificate (--acme-domain, or --tls-cert/--tls-key), \
@@ -124,7 +125,9 @@ pub fn plan(o: &ServeOpts, data: &Path) -> Result<Plan> {
                 bail!("--acme-domain {d:?} is not a DNS name");
             }
             if !o.acme_agree_tos {
-                bail!("ACME: pass --acme-agree-tos to accept the CA's terms of service (Let's Encrypt: https://letsencrypt.org/repository/)");
+                bail!(
+                    "ACME: pass --acme-agree-tos to accept the CA's terms of service (Let's Encrypt: https://letsencrypt.org/repository/)"
+                );
             }
             for c in &o.acme_contact {
                 if !c.starts_with("mailto:") {
@@ -137,7 +140,12 @@ pub fn plan(o: &ServeOpts, data: &Path) -> Result<Plan> {
                 (None, true) => LETS_ENCRYPT_STAGING.into(),
                 (None, false) => LETS_ENCRYPT.into(),
             };
-            Some(AcmeConfig { domain: d, contact: o.acme_contact.clone(), directory, cache: o.acme_cache.clone().unwrap_or_else(|| data.join("acme")) })
+            Some(AcmeConfig {
+                domain: d,
+                contact: o.acme_contact.clone(),
+                directory,
+                cache: o.acme_cache.clone().unwrap_or_else(|| data.join("acme")),
+            })
         }
         None => None,
     };
@@ -157,7 +165,9 @@ pub fn plan(o: &ServeOpts, data: &Path) -> Result<Plan> {
         bail!("--origin {origin}: with TLS (here or at a proxy) the origin is https://");
     }
     if https && !tls && !o.behind_tls_terminator {
-        bail!("--origin {origin}: an https origin needs TLS here (--acme-domain, --tls-cert) or a proxy in front (--behind-tls-terminator)");
+        bail!(
+            "--origin {origin}: an https origin needs TLS here (--acme-domain, --tls-cert) or a proxy in front (--behind-tls-terminator)"
+        );
     }
     if !https && !is_localhost(&host) {
         bail!("--origin {origin}: plain HTTP is for http://localhost only (WebAuthn needs a secure context)");
@@ -331,7 +341,10 @@ mod tests {
     #[test]
     fn plain_http_is_loopback_only() {
         let p = plan(&opts("127.0.0.1:8787"), &data()).unwrap();
-        assert_eq!((p.origin.as_str(), p.rp_id.as_str(), p.authority.as_str(), p.hsts), ("http://localhost:8787", "localhost", "localhost:8787", false));
+        assert_eq!(
+            (p.origin.as_str(), p.rp_id.as_str(), p.authority.as_str(), p.hsts),
+            ("http://localhost:8787", "localhost", "localhost:8787", false)
+        );
         assert!(p.tls.is_none());
         for listen in ["0.0.0.0:8787", "[::]:8787", "192.0.2.10:443"] {
             let e = plan(&opts(listen), &data()).unwrap_err().to_string();
@@ -356,7 +369,10 @@ mod tests {
             ..opts("0.0.0.0:8787")
         };
         let p = plan(&o, &data()).unwrap();
-        assert_eq!((p.origin.as_str(), p.rp_id.as_str(), p.authority.as_str(), p.hsts), ("https://console.example.com", "console.example.com", "console.example.com", true));
+        assert_eq!(
+            (p.origin.as_str(), p.rp_id.as_str(), p.authority.as_str(), p.hsts),
+            ("https://console.example.com", "console.example.com", "console.example.com", true)
+        );
         assert_eq!(p.trusted, vec!["10.0.0.5".parse().unwrap()]);
         assert!(plan(&ServeOpts { origin: None, ..o.clone() }, &data()).is_err());
         assert!(plan(&ServeOpts { origin: Some("http://console.example.com".into()), ..o.clone() }, &data()).is_err());
@@ -375,7 +391,10 @@ mod tests {
             ..opts("0.0.0.0:8443")
         };
         let p = plan(&files, &data()).unwrap();
-        assert_eq!((p.origin.as_str(), p.authority.as_str(), p.hsts), ("https://console.example.com:8443", "console.example.com:8443", true));
+        assert_eq!(
+            (p.origin.as_str(), p.authority.as_str(), p.hsts),
+            ("https://console.example.com:8443", "console.example.com:8443", true)
+        );
         assert!(matches!(p.tls, Some(TlsSource::Files { .. })));
         assert!(plan(&ServeOpts { origin: None, ..files.clone() }, &data()).is_err(), "which name the certificate is for");
         assert!(plan(&ServeOpts { tls_key: None, ..files.clone() }, &data()).is_err());

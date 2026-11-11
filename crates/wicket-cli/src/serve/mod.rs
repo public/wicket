@@ -170,7 +170,14 @@ impl State {
         Ok(Ledger::open(&self.ledger)?)
     }
 
-    fn new(rp: RelyingParty, ledger: PathBuf, data: PathBuf, roots: Vec<(String, PathBuf)>, launcher: Launcher, identity: IdentityCheck) -> State {
+    fn new(
+        rp: RelyingParty,
+        ledger: PathBuf,
+        data: PathBuf,
+        roots: Vec<(String, PathBuf)>,
+        launcher: Launcher,
+        identity: IdentityCheck,
+    ) -> State {
         let authority = rp.origin.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
         let hsts = rp.origin.starts_with("https://");
         State {
@@ -463,7 +470,9 @@ where
     let read = Limited::new(req.into_body(), limits.max_body).collect();
     let b = match tokio::time::timeout(limits.body_timeout, read).await {
         Err(_) => return Err(err(StatusCode::REQUEST_TIMEOUT, "request body too slow")),
-        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
+            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
+        }
         Ok(Err(_)) => return Err(err(StatusCode::BAD_REQUEST, "bad request body")),
         Ok(Ok(b)) => b.to_bytes(),
     };
@@ -751,7 +760,9 @@ fn login_begin(state: &State, ctx: &Ctx) -> Reply {
     let Some(key) = new_challenge(state, random_bytes(32), Purpose::Login, None, limits::ip_key(ctx.client)) else {
         return refused(Refusal::Throttled(Duration::from_secs(5)));
     };
-    ok(json!({ "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": [], "userVerification": "required", "timeout": 120000 } }))
+    ok(
+        json!({ "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": [], "userVerification": "required", "timeout": 120000 } }),
+    )
 }
 
 /// Sign-in, step 2: the assertion. Any failure gets the same answer; the reason goes to the audit log.
@@ -787,7 +798,12 @@ fn login_finish(state: &State, ctx: &Ctx, body: &Value) -> Reply {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    let _ = l.audit(&state.tenant, None, "operator.signed_in", &json!({ "credential": a.oc.id, "name": a.oc.name, "client": ctx.client.to_string() }));
+    let _ = l.audit(
+        &state.tenant,
+        None,
+        "operator.signed_in",
+        &json!({ "credential": a.oc.id, "name": a.oc.name, "client": ctx.client.to_string() }),
+    );
     Reply { cookie: Some(cookie), ..ok(json!({ "ok": format!("signed in with {}", a.oc.name) })) }
 }
 
@@ -996,7 +1012,9 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     let action_json = v.to_string();
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();
-    let Some(key) = new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Some(sid.clone()), sid) else {
+    let Some(key) =
+        new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Some(sid.clone()), sid)
+    else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };
     // `decision` is the older name the page used for the signed JSON.
@@ -1269,11 +1287,16 @@ mod tests {
 
         /// What a browser returns from navigator.credentials.get for `challenge` (base64url).
         fn sign(&mut self, challenge: &str) -> Value {
+            self.sign_flags(challenge, 0x01 | 0x04) // user present, user verified
+        }
+
+        /// [`T::sign`] with the given authenticator flags.
+        fn sign_flags(&mut self, challenge: &str, flags: u8) -> Value {
             self.count += 1;
             let cdj =
                 json!({ "type": "webauthn.get", "challenge": challenge, "origin": ORIGIN, "crossOrigin": false }).to_string().into_bytes();
             let mut ad = sha2::Sha256::digest(b"localhost").to_vec();
-            ad.push(0x01 | 0x04); // user present, user verified
+            ad.push(flags);
             ad.extend_from_slice(&self.count.to_be_bytes());
             let mut msg = ad.clone();
             msg.extend_from_slice(&sha2::Sha256::digest(&cdj));

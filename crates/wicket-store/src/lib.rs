@@ -740,8 +740,10 @@ impl Ledger {
 
     /// Ends one session (sign-out, or rotation at sign-in).
     pub fn end_console_session(&self, id: &str, by: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE console_sessions SET revoked_at = ?2, revoked_by = ?3 WHERE id = ?1 AND revoked_at IS NULL", params![id, now(), by])?;
+        self.conn.execute(
+            "UPDATE console_sessions SET revoked_at = ?2, revoked_by = ?3 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, now(), by],
+        )?;
         Ok(())
     }
 

@@ -8,7 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PEER: &str = "127.0.0.1:50000";
 
-async fn call_from(state: &State, peer: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (StatusCode, HeaderMap, String) {
+async fn call_from(
+    state: &State,
+    peer: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (StatusCode, HeaderMap, String) {
     let mut b = Request::builder().method(method).uri(path);
     if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
         b = b.header("host", "localhost:8787");
@@ -219,7 +226,11 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
             let digest = sha2::Sha256::digest(&a.body);
             assert!(path.contains(&hex::encode(digest)[..16]), "{path} is named by its hash");
             let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
-            assert!(page.contains(&format!("href=\"{path}\" integrity=\"{sri}\"")) || page.contains(&format!("src=\"{path}\" integrity=\"{sri}\"")), "{path}");
+            assert!(
+                page.contains(&format!("href=\"{path}\" integrity=\"{sri}\""))
+                    || page.contains(&format!("src=\"{path}\" integrity=\"{sri}\"")),
+                "{path}"
+            );
         }
     }
     let js = ASSETS.files.iter().find(|(k, _)| k.ends_with(".js")).map(|(_, a)| std::str::from_utf8(&a.body).unwrap()).unwrap();
@@ -270,7 +281,10 @@ async fn sign_in_sets_a_host_only_cookie_and_rotates_the_session() {
     let new = token_of(&cookie);
     assert_ne!(new, old);
     // The session the browser had before signing in is over; the new one works.
-    assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &format!("__Host-wicket_sid={old}"))], b"").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        call(&t.state, "GET", "/api/state", &[("cookie", &format!("__Host-wicket_sid={old}"))], b"").await.0,
+        StatusCode::UNAUTHORIZED
+    );
     let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &format!("__Host-wicket_sid={new}"))], b"").await;
     assert_eq!((status, json_of(&body)["who"]["state"].as_str()), (StatusCode::OK, Some("operator")));
     let signed_in = audits(&t, "operator.signed_in");
@@ -330,7 +344,11 @@ async fn sign_in_failures_are_uniform_limited_locked_out_and_audited() {
     let fresh = "203.0.113.200:4000";
     let a = login_assertion(&mut t, fresh).await;
     let (status, _, body) = post_json_from(&t.state, fresh, "/api/login/finish", None, &a).await;
-    assert_eq!((status, json_of(&body)["error"].as_str()), (StatusCode::UNAUTHORIZED, Some(SIGN_IN_FAILED)), "a locked passkey can't sign in");
+    assert_eq!(
+        (status, json_of(&body)["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some(SIGN_IN_FAILED)),
+        "a locked passkey can't sign in"
+    );
     assert!(audits(&t, "operator.login_failed").last().unwrap()["reason"].as_str().unwrap().contains("locked"));
 
     // Throttled: too many attempts a minute from one address, even all well-formed.
@@ -340,6 +358,22 @@ async fn sign_in_failures_are_uniform_limited_locked_out_and_audited() {
         last = post_json_from(&t.state, busy, "/api/login/begin", None, &json!({})).await.0;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn sign_in_without_user_verification_is_refused_like_any_failure() {
+    let mut t = setup("no-uv");
+    let (_, _, b) = post_json(&t.state, "/api/login/begin", None, &json!({})).await;
+    let begin = json_of(&b);
+    assert_eq!(begin["publicKey"]["userVerification"], "required");
+    let ch = begin["publicKey"]["challenge"].as_str().unwrap().to_string();
+    // A real signature over authenticator data that says "present" but not "verified".
+    let a = t.sign_flags(&ch, 0x01);
+    let (status, headers, body) = post_json(&t.state, "/api/login/finish", None, &a).await;
+    assert_eq!((status, body), (StatusCode::UNAUTHORIZED, json!({ "error": SIGN_IN_FAILED }).to_string()));
+    assert!(!headers.contains_key("set-cookie"));
+    assert_eq!(audits(&t, "operator.login_failed").len(), 1);
+    assert!(audits(&t, "operator.signed_in").is_empty());
 }
 
 #[tokio::test]
@@ -382,7 +416,10 @@ async fn sessions_expire_and_are_revocable_from_the_host() {
     let l = t.ledger();
     let live = l.console_sessions(&TenantId::single(), wicket_store::now()).unwrap();
     assert_eq!(live.len(), 1);
-    assert_eq!((live[0].id.as_str(), live[0].credential.as_deref(), live[0].client.as_str()), (session_id(&sid).as_str(), Some(t.cred.as_str()), "127.0.0.1"));
+    assert_eq!(
+        (live[0].id.as_str(), live[0].credential.as_deref(), live[0].client.as_str()),
+        (session_id(&sid).as_str(), Some(t.cred.as_str()), "127.0.0.1")
+    );
     assert_ne!(live[0].id, sid, "the ledger holds a hash, not the cookie");
     l.revoke_console_sessions(&TenantId::single(), Some(&live[0].id[..12]), "host").unwrap();
     assert_eq!(state_ok(&cookie).await, StatusCode::UNAUTHORIZED);
@@ -471,7 +508,8 @@ async fn posts_need_the_csrf_header_and_the_consoles_origin() {
         assert_eq!(status, want, "{extra:?}: {b}");
     }
     // Sign-in too.
-    let (status, _, _) = call(&t.state, "POST", "/api/login/begin", &[("origin", "https://evil.example"), ("x-wicket-csrf", "1")], b"{}").await;
+    let (status, _, _) =
+        call(&t.state, "POST", "/api/login/begin", &[("origin", "https://evil.example"), ("x-wicket-csrf", "1")], b"{}").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -502,15 +540,59 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
     let seed = std::env::var("WICKET_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5eed_1234_abcd_0001u64);
     let mut rng = Rng(seed);
     let paths = [
-        "/", "/enrol", "/api/me", "/api/state", "/api/login/begin", "/api/login/finish", "/api/register/begin", "/api/register/finish",
-        "/api/action/begin", "/api/action/finish", "/api/decide/begin", "/api/logout", "/manifest.webmanifest", "/static/icon.svg",
-        "//api/state", "/api/state/", "/API/STATE", "/api/state?x=1", "/api/%73tate", "/api/./state", "/api/../api/state", "*",
+        "/",
+        "/enrol",
+        "/api/me",
+        "/api/state",
+        "/api/login/begin",
+        "/api/login/finish",
+        "/api/register/begin",
+        "/api/register/finish",
+        "/api/action/begin",
+        "/api/action/finish",
+        "/api/decide/begin",
+        "/api/logout",
+        "/manifest.webmanifest",
+        "/static/icon.svg",
+        "//api/state",
+        "/api/state/",
+        "/API/STATE",
+        "/api/state?x=1",
+        "/api/%73tate",
+        "/api/./state",
+        "/api/../api/state",
+        "*",
     ];
     let methods = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "PROPFIND", "get", "X"];
-    let header_names = ["cookie", "x-wicket-csrf", "origin", "content-type", "x-forwarded-for", "host", "sec-fetch-site", "content-length", "transfer-encoding", "authorization"];
+    let header_names = [
+        "cookie",
+        "x-wicket-csrf",
+        "origin",
+        "content-type",
+        "x-forwarded-for",
+        "host",
+        "sec-fetch-site",
+        "content-length",
+        "transfer-encoding",
+        "authorization",
+    ];
     let values = [
-        "1", "0", ORIGIN, "https://evil.example", "application/json", "text/plain", "localhost:8787", "evil.example", "same-origin",
-        "__Host-wicket_sid=", "wicket_sid=", "chunked", "-1", "99999999999999999999", "", "Bearer x",
+        "1",
+        "0",
+        ORIGIN,
+        "https://evil.example",
+        "application/json",
+        "text/plain",
+        "localhost:8787",
+        "evil.example",
+        "same-origin",
+        "__Host-wicket_sid=",
+        "wicket_sid=",
+        "chunked",
+        "-1",
+        "99999999999999999999",
+        "",
+        "Bearer x",
     ];
     let bodies: [&[u8]; 8] = [
         b"",
@@ -558,10 +640,7 @@ async fn fuzzed_requests_never_panic_or_reach_an_authenticated_handler() {
         *statuses.entry(status.as_u16()).or_insert(0) += 1;
         assert!(!r.headers().contains_key("set-cookie"), "seed {seed:#x}, request {i}: {method} {path} got a cookie");
         assert!(r.headers().contains_key("content-security-policy"));
-        assert!(
-            [200, 401, 403, 400, 413, 429, 503].contains(&status.as_u16()),
-            "seed {seed:#x}, request {i}: {method} {path} -> {status}"
-        );
+        assert!([200, 401, 403, 400, 413, 429, 503].contains(&status.as_u16()), "seed {seed:#x}, request {i}: {method} {path} -> {status}");
         if status == StatusCode::OK {
             let p = path.split('?').next().unwrap();
             assert!(p == "/" || ASSETS.files.contains_key(p) || p == "/api/login/begin", "seed {seed:#x}: {method} {path} answered 200");
@@ -660,7 +739,9 @@ async fn connections_are_capped_in_all_and_per_client_and_do_not_live_forever() 
     drop(a);
     // Freed slots are reusable.
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(exchange(addr, b"GET / HTTP/1.1\r\nhost: localhost:8787\r\nconnection: close\r\n\r\n", Duration::from_secs(2)).await.starts_with("HTTP/1.1 200"));
+    assert!(exchange(addr, b"GET / HTTP/1.1\r\nhost: localhost:8787\r\nconnection: close\r\n\r\n", Duration::from_secs(2))
+        .await
+        .starts_with("HTTP/1.1 200"));
 }
 
 #[tokio::test]
@@ -673,7 +754,13 @@ async fn random_bytes_on_the_wire_never_take_the_server_down() {
     })
     .await;
     let mut rng = Rng(0xfeed_beef_0000_0042);
-    let prefixes: [&[u8]; 5] = [b"", b"GET / HTTP/1.1\r\n", b"POST /api/login/finish HTTP/1.1\r\nhost: localhost:8787\r\n", b"GET /\x00 HTTP/1.1\r\n", b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"];
+    let prefixes: [&[u8]; 5] = [
+        b"",
+        b"GET / HTTP/1.1\r\n",
+        b"POST /api/login/finish HTTP/1.1\r\nhost: localhost:8787\r\n",
+        b"GET /\x00 HTTP/1.1\r\n",
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+    ];
     for _ in 0..150 {
         let mut req = prefixes[rng.below(prefixes.len())].to_vec();
         let n = rng.below(2000);
@@ -681,5 +768,7 @@ async fn random_bytes_on_the_wire_never_take_the_server_down() {
         let out = exchange(addr, &req, Duration::from_secs(2)).await;
         assert!(!out.contains("set-cookie"), "{out}");
     }
-    assert!(exchange(addr, b"GET / HTTP/1.1\r\nhost: localhost:8787\r\nconnection: close\r\n\r\n", Duration::from_secs(2)).await.starts_with("HTTP/1.1 200"));
+    assert!(exchange(addr, b"GET / HTTP/1.1\r\nhost: localhost:8787\r\nconnection: close\r\n\r\n", Duration::from_secs(2))
+        .await
+        .starts_with("HTTP/1.1 200"));
 }

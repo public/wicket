@@ -48,7 +48,11 @@ fn client(roots: &[CertificateDer<'static>], versions: &[&'static rustls::Suppor
     for r in roots {
         store.add(r.clone()).unwrap();
     }
-    let mut c = ClientConfig::builder_with_provider(ring()).with_protocol_versions(versions).unwrap().with_root_certificates(store).with_no_client_auth();
+    let mut c = ClientConfig::builder_with_provider(ring())
+        .with_protocol_versions(versions)
+        .unwrap()
+        .with_root_certificates(store)
+        .with_no_client_auth();
     c.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     Arc::new(c)
 }
@@ -69,10 +73,20 @@ impl ServerCertVerifier for Grab {
         *self.0.lock().unwrap() = Some(end_entity.to_vec());
         Ok(ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(m, c, d, &ring().signature_verification_algorithms)
     }
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(m, c, d, &ring().signature_verification_algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -92,7 +106,8 @@ async fn alpn_probe(addr: SocketAddr, name: &str) -> (Option<Vec<u8>>, String) {
         .with_no_client_auth();
     c.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let Ok(mut s) = tokio_rustls::TlsConnector::from(Arc::new(c)).connect(ServerName::try_from(name.to_string()).unwrap(), tcp).await else {
+    let Ok(mut s) = tokio_rustls::TlsConnector::from(Arc::new(c)).connect(ServerName::try_from(name.to_string()).unwrap(), tcp).await
+    else {
         return (None, String::new());
     };
     assert_eq!(s.get_ref().1.alpn_protocol(), Some(ACME_TLS_ALPN));
@@ -115,7 +130,10 @@ async fn read_all<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> String {
 }
 
 /// GET / over TLS; returns the negotiated version, cipher suite and ALPN, and the response.
-async fn https_get(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<(rustls::ProtocolVersion, rustls::CipherSuite, Option<Vec<u8>>, String), std::io::Error> {
+async fn https_get(
+    addr: SocketAddr,
+    cfg: Arc<ClientConfig>,
+) -> Result<(rustls::ProtocolVersion, rustls::CipherSuite, Option<Vec<u8>>, String), std::io::Error> {
     let tcp = tokio::net::TcpStream::connect(addr).await?;
     let mut s = tokio_rustls::TlsConnector::from(cfg).connect(ServerName::try_from("localhost").unwrap(), tcp).await?;
     let (version, suite, alpn) = {
@@ -142,7 +160,8 @@ async fn https_uses_tls13_or_strong_tls12_http1_only_and_sends_hsts() {
     resolver.set(Arc::new(wtls::certified_key_from_pem(chain.as_bytes(), key.as_bytes()).unwrap()));
     let (addr, _tmp) = start_tls("https", resolver, false).await;
     let roots = [der];
-    let (v, _, alpn, out) = https_get(addr, client(&roots, &[&rustls::version::TLS13, &rustls::version::TLS12], &[b"h2", b"http/1.1"])).await.unwrap();
+    let (v, _, alpn, out) =
+        https_get(addr, client(&roots, &[&rustls::version::TLS13, &rustls::version::TLS12], &[b"h2", b"http/1.1"])).await.unwrap();
     assert_eq!((v, alpn.as_deref()), (rustls::ProtocolVersion::TLSv1_3, Some(&b"http/1.1"[..])), "h2 is not offered");
     assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     assert!(out.contains(&format!("strict-transport-security: {}", web::HSTS)), "{out}");
@@ -258,7 +277,13 @@ impl MockCa {
             headers.push(("replay-nonce".to_string(), format!("nonce-{}", s.nonce)));
         }
         let order = |s: &CaState| {
-            let status = if s.chain.is_some() { "valid" } else if s.validated { "ready" } else { "pending" };
+            let status = if s.chain.is_some() {
+                "valid"
+            } else if s.validated {
+                "ready"
+            } else {
+                "pending"
+            };
             json!({
                 "status": status, "identifiers": [{ "type": "dns", "value": self.domain }],
                 "authorizations": [format!("{CA}/authz/1")], "finalize": format!("{CA}/finalize/1"),
@@ -278,7 +303,13 @@ impl MockCa {
         match path.as_str() {
             "/acct" => {
                 let k = &protected["jwk"];
-                let canonical = format!(r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#, k["crv"].as_str().unwrap(), k["kty"].as_str().unwrap(), k["x"].as_str().unwrap(), k["y"].as_str().unwrap());
+                let canonical = format!(
+                    r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
+                    k["crv"].as_str().unwrap(),
+                    k["kty"].as_str().unwrap(),
+                    k["x"].as_str().unwrap(),
+                    k["y"].as_str().unwrap()
+                );
                 self.state.lock().unwrap().thumbprint = b64u(&sha2::Sha256::digest(canonical.as_bytes()));
                 assert_eq!(payload["termsOfServiceAgreed"], true);
                 headers.push(("location".into(), format!("{CA}/acct/1")));
@@ -331,7 +362,10 @@ impl MockCa {
 }
 
 impl HttpClient for MockCa {
-    fn request(&self, req: http::Request<BodyWrapper<Bytes>>) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>> {
+    fn request(
+        &self,
+        req: http::Request<BodyWrapper<Bytes>>,
+    ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>> {
         let me = MockCa { state: self.state.clone(), domain: self.domain.clone(), target: self.target, issuer: self.issuer.clone() };
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -363,7 +397,12 @@ async fn an_acme_order_validates_over_tls_alpn_01_and_puts_the_certificate_in_se
     let tmp = tmpdir("acme");
     let dir = &tmp.0;
     let domain = "localhost.example";
-    let cfg = AcmeConfig { domain: domain.into(), contact: vec!["mailto:ops@example.com".into()], directory: format!("{CA}/directory"), cache: dir.join("acme") };
+    let cfg = AcmeConfig {
+        domain: domain.into(),
+        contact: vec!["mailto:ops@example.com".into()],
+        directory: format!("{CA}/directory"),
+        cache: dir.join("acme"),
+    };
     let ca_state = Arc::new(Mutex::new(CaState { token: "tok-123".into(), ..Default::default() }));
     let issuer = issuer();
     let http: HttpFactory = {
@@ -403,7 +442,11 @@ async fn an_acme_order_validates_over_tls_alpn_01_and_puts_the_certificate_in_se
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
     }
     assert_eq!(std::fs::metadata(&cfg.cache).unwrap().permissions().mode() & 0o777, 0o700);
-    let accounts: Vec<_> = std::fs::read_dir(&cfg.cache).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("account-")).collect();
+    let accounts: Vec<_> = std::fs::read_dir(&cfg.cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("account-"))
+        .collect();
     assert_eq!(accounts.len(), 1);
     assert_eq!(cfg.cached().unwrap().end_entity_cert().unwrap().to_vec(), leaf);
     // A fresh certificate isn't due for renewal; a nearly expired one is.

@@ -874,7 +874,12 @@ async fn main() -> Result<()> {
                         _ => bail!("give a session id (wicket operator sessions) or --all"),
                     };
                     let ids = l.revoke_console_sessions(&t, prefix, &operator())?;
-                    l.audit(&t, None, "operator.sessions_revoked", &serde_json::json!({ "sessions": ids, "by": operator(), "via": "host" }))?;
+                    l.audit(
+                        &t,
+                        None,
+                        "operator.sessions_revoked",
+                        &serde_json::json!({ "sessions": ids, "by": operator(), "via": "host" }),
+                    )?;
                     println!("ended {} console session(s)", ids.len());
                 }
                 OperatorCmd::Reset => {

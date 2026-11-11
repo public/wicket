@@ -53,7 +53,11 @@ pub fn valid_domain(s: &str) -> bool {
     s.len() <= 253
         && s.contains('.')
         && s.split('.').all(|l| {
-            !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
         && !s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
@@ -162,7 +166,11 @@ pub fn run(cfg: AcmeConfig, resolver: Arc<CertResolver>, http: HttpFactory, ever
                 let poll = RetryPolicy::new().initial_delay(Duration::from_secs(1)).backoff(1.5).timeout(Duration::from_secs(180));
                 if let Err(e) = order(&cfg, &resolver, &http, poll).await {
                     tracing::warn!("ACME: {e:#}");
-                    eprintln!("wicket serve: ACME certificate for {} failed: {e:#} (retrying in {})", cfg.domain, humantime::format_duration(every));
+                    eprintln!(
+                        "wicket serve: ACME certificate for {} failed: {e:#} (retrying in {})",
+                        cfg.domain,
+                        humantime::format_duration(every)
+                    );
                 }
             }
             tokio::time::sleep(every).await;
