@@ -46,10 +46,7 @@ impl Egress {
             let me = self.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req| me.clone().outer(req));
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), svc)
-                    .with_upgrades()
-                    .await;
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
             });
         }
     }
@@ -116,7 +113,14 @@ impl Egress {
         match wicket_core::host_verdict(&self.ctx.zone, host) {
             wicket_core::HostVerdict::Open => None,
             wicket_core::HostVerdict::Forbidden(why) => {
-                self.ctx.emit(Event::Egress { method: method.into(), host: host.into(), path: "/".into(), risk: "-".into(), outcome: "forbidden".into(), detail: why.clone() });
+                self.ctx.emit(Event::Egress {
+                    method: method.into(),
+                    host: host.into(),
+                    path: "/".into(),
+                    risk: "-".into(),
+                    outcome: "forbidden".into(),
+                    detail: why.clone(),
+                });
                 let note = self.strike(&format!("host {host}"));
                 Some(problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
                     "{why}. This will never be allowed from this sandbox, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
@@ -124,7 +128,14 @@ impl Egress {
                 ), None))
             }
             wicket_core::HostVerdict::Hidden => {
-                self.ctx.emit(Event::Egress { method: method.into(), host: host.into(), path: "/".into(), risk: "-".into(), outcome: "hidden".into(), detail: "not a host this zone can see".into() });
+                self.ctx.emit(Event::Egress {
+                    method: method.into(),
+                    host: host.into(),
+                    path: "/".into(),
+                    risk: "-".into(),
+                    outcome: "hidden".into(),
+                    detail: "not a host this zone can see".into(),
+                });
                 let note = self.strike(&format!("host {host}"));
                 Some(problem(502, "unknown-host", "wicket sandbox: unknown host", &format!(
                     "{host} does not exist as far as this sandbox is concerned: it can only see the hosts its zone names. {} Do not retry it.{note}",
@@ -148,7 +159,8 @@ impl Egress {
             (same, s.1)
         };
         if total == 10 || (total > 10 && total % 10 == 0) {
-            self.ctx.emit(Event::Tool { name: "wicket".into(), detail: format!("agent may be stuck: {total} blocked requests in this run") });
+            self.ctx
+                .emit(Event::Tool { name: "wicket".into(), detail: format!("agent may be stuck: {total} blocked requests in this run") });
         }
         let mut note = String::new();
         if same >= 3 {
@@ -214,7 +226,13 @@ impl Egress {
             }
             Verdict::NeedsGrant(why) if !ctx.escalate => {
                 emit("forbidden", format!("{why}; this run does not escalate (on_pending: fail)"));
-                return problem(403, "forbidden", "Outside this program's reach", &format!("{why}. Programs do not escalate: change the program's approved reach instead."), None);
+                return problem(
+                    403,
+                    "forbidden",
+                    "Outside this program's reach",
+                    &format!("{why}. Programs do not escalate: change the program's approved reach instead."),
+                    None,
+                );
             }
             Verdict::NeedsGrant(why) => {
                 // Who in the box is asking (reported by the agent's own event stream, not proven).

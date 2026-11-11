@@ -197,7 +197,11 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
-            !(v6.is_loopback() || v6.is_unspecified() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 || v6.to_ipv4_mapped().is_some())
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some())
         }
     }
 }
@@ -237,7 +241,9 @@ zone:
 
     #[test]
     fn single_star_does_not_cross_segments() {
-        let z = Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, reach: [{host: h.example, paths: ['/a/*']}], llm: {}}").unwrap().zone;
+        let z = Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, reach: [{host: h.example, paths: ['/a/*']}], llm: {}}")
+            .unwrap()
+            .zone;
         assert_eq!(evaluate(&z, &op("GET", "h.example", "/a/b")), Verdict::AllowByReach(0));
         assert!(matches!(evaluate(&z, &op("GET", "h.example", "/a/b/c")), Verdict::NeedsGrant(_)));
     }
@@ -261,9 +267,25 @@ zone:
 
     #[test]
     fn push_discovery_is_a_push() {
-        let o = Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/octocat/hello.git/info/refs", "service=git-receive-pack");
+        let o = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("r".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/octocat/hello.git/info/refs",
+            "service=git-receive-pack",
+        );
         assert_eq!(o.risk, RiskClass::R4ExecOrPrivilege);
-        let r = Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/octocat/hello.git/info/refs", "service=git-upload-pack");
+        let r = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("r".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/octocat/hello.git/info/refs",
+            "service=git-upload-pack",
+        );
         assert_eq!(r.risk, RiskClass::R1ReadScoped);
     }
 
@@ -295,7 +317,9 @@ zone:
 
     #[test]
     fn hosts_are_judged_before_any_request() {
-        let z = |extra: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: api.example.com }}, {{ host: \"*.cdn.example\" }}]\n  forbid: [{{ host: mcp.example.com }}, {{ host: api.example.com, paths: [\"/private/**\"] }}]\n{extra}")).unwrap().zone;
+        let z = |extra: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: api.example.com }}, {{ host: \"*.cdn.example\" }}]\n  forbid: [{{ host: mcp.example.com }}, {{ host: api.example.com, paths: [\"/private/**\"] }}]\n{extra}")).unwrap().zone
+        };
         let open = z("");
         assert_eq!(host_verdict(&open, "api.example.com"), HostVerdict::Open);
         assert_eq!(host_verdict(&open, "news.example.org"), HostVerdict::Open, "escalate is the default");

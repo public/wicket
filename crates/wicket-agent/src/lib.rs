@@ -99,8 +99,15 @@ pub struct WrappedPlan {
 /// or replaced.
 fn keep_launcher_var(k: &str) -> bool {
     let drop = [
-        "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_PROCESS_WRAPPER",
-        "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "CLAUDE_PID", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_PROCESS_WRAPPER",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     ];
     (k.starts_with("CLAUDE_") || k == "CLAUDECODE") && !drop.contains(&k)
 }
@@ -109,7 +116,13 @@ fn keep_launcher_var(k: &str) -> bool {
 /// launcher's session settings kept, and every credential replaced by a placeholder that wicket's
 /// egress proxy swaps back (design §14.1, `vendor_rc`). `login_meta` holds the non-secret fields of
 /// the host's login (scopes, subscription type) so the placeholder login looks like the real one.
-pub fn claude_code_wrapped_plan(m: &Manifest, run: &RunId, argv: &[String], launcher_env: &[(String, String)], login_meta: &Value) -> anyhow_free::Result<WrappedPlan> {
+pub fn claude_code_wrapped_plan(
+    m: &Manifest,
+    run: &RunId,
+    argv: &[String],
+    launcher_env: &[(String, String)],
+    login_meta: &Value,
+) -> anyhow_free::Result<WrappedPlan> {
     let tag = run.0.replace('_', "-");
     let login_placeholder = format!("sk-ant-oat01-wicket-placeholder-{tag}");
     let session_token = launcher_env.iter().find(|(k, _)| k == "CLAUDE_CODE_SESSION_ACCESS_TOKEN").map(|(_, v)| v.clone());
@@ -149,7 +162,8 @@ pub fn claude_code_wrapped_plan(m: &Manifest, run: &RunId, argv: &[String], laun
     // wicket's tools (await_grant, whoami, …) as the only MCP server: the account's connectors and any
     // project servers stay out of the box.
     out.extend(["--mcp-config".to_string(), WICKET_MCP.to_string(), "--strict-mcp-config".to_string()]);
-    let far = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) + 365 * 86_400_000) as u64;
+    let far =
+        (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) + 365 * 86_400_000) as u64;
     let mut oauth = serde_json::json!({
         "accessToken": login_placeholder,
         "refreshToken": format!("sk-ant-ort01-wicket-placeholder-{tag}"),
@@ -160,17 +174,27 @@ pub fn claude_code_wrapped_plan(m: &Manifest, run: &RunId, argv: &[String], laun
             oauth[k] = v.clone();
         }
     }
-    files.push(("claude/.credentials.json".into(), serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default()));
+    files.push((
+        "claude/.credentials.json".into(),
+        serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default(),
+    ));
     let mut env: Vec<(String, String)> = launcher_env.iter().filter(|(k, _)| keep_launcher_var(k)).cloned().collect();
     if session_token.is_some() {
         env.push(("CLAUDE_CODE_SESSION_ACCESS_TOKEN".into(), session_placeholder.clone()));
     }
     for (k, v) in [
-        ("HTTPS_PROXY", PROXY_URL), ("HTTP_PROXY", PROXY_URL), ("https_proxy", PROXY_URL),
-        ("http_proxy", PROXY_URL), ("NO_PROXY", NO_PROXY), ("no_proxy", NO_PROXY),
-        ("DISABLE_AUTOUPDATER", "1"), ("MCP_TOOL_TIMEOUT", "660000"), ("WICKET_CA_BUNDLE", CA_BUNDLE),
+        ("HTTPS_PROXY", PROXY_URL),
+        ("HTTP_PROXY", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("http_proxy", PROXY_URL),
+        ("NO_PROXY", NO_PROXY),
+        ("no_proxy", NO_PROXY),
+        ("DISABLE_AUTOUPDATER", "1"),
+        ("MCP_TOOL_TIMEOUT", "660000"),
+        ("WICKET_CA_BUNDLE", CA_BUNDLE),
         // Remote Control needs Anthropic's API, but not telemetry or error reporting.
-        ("DISABLE_TELEMETRY", "1"), ("DISABLE_ERROR_REPORTING", "1"),
+        ("DISABLE_TELEMETRY", "1"),
+        ("DISABLE_ERROR_REPORTING", "1"),
     ] {
         env.push((k.into(), v.into()));
     }
@@ -343,14 +367,45 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prompt = dir.join("p.txt");
         std::fs::write(&prompt, "be nice").unwrap();
-        let argv: Vec<String> = ["/host/claude", "--print", "--sdk-url", "https://api.anthropic.com/v1/code/sessions/x", "--append-system-prompt-file", prompt.to_str().unwrap(), "--model", "m"]
-            .iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = [
+            "/host/claude",
+            "--print",
+            "--sdk-url",
+            "https://api.anthropic.com/v1/code/sessions/x",
+            "--append-system-prompt-file",
+            prompt.to_str().unwrap(),
+            "--model",
+            "m",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let env: Vec<(String, String)> = [
-            ("CLAUDE_CODE_SESSION_ACCESS_TOKEN", "REAL-SESSION"), ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/s"), ("CLAUDE_CODE_MESSAGING_TOKEN", "REAL-MSG"),
-            ("CLAUDE_CODE_ENVIRONMENT_KIND", "bridge"), ("CLAUDE_CODE_OAUTH_TOKEN", "REAL-OAUTH"), ("PATH", "/usr/bin"), ("SECRET_THING", "x"),
-        ].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        let w = claude_code_wrapped_plan(&m, &RunId("run_x".into()), &argv, &env, &serde_json::json!({"scopes": ["user:inference"], "subscriptionType": "max", "refreshToken": "REAL-R"})).unwrap();
-        let all = format!("{:?} {:?} {:?}", w.plan.env, w.plan.argv, w.files.iter().map(|(p, b)| (p.clone(), String::from_utf8_lossy(b).to_string())).collect::<Vec<_>>());
+            ("CLAUDE_CODE_SESSION_ACCESS_TOKEN", "REAL-SESSION"),
+            ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/s"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "REAL-MSG"),
+            ("CLAUDE_CODE_ENVIRONMENT_KIND", "bridge"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "REAL-OAUTH"),
+            ("PATH", "/usr/bin"),
+            ("SECRET_THING", "x"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let w = claude_code_wrapped_plan(
+            &m,
+            &RunId("run_x".into()),
+            &argv,
+            &env,
+            &serde_json::json!({"scopes": ["user:inference"], "subscriptionType": "max", "refreshToken": "REAL-R"}),
+        )
+        .unwrap();
+        let all = format!(
+            "{:?} {:?} {:?}",
+            w.plan.env,
+            w.plan.argv,
+            w.files.iter().map(|(p, b)| (p.clone(), String::from_utf8_lossy(b).to_string())).collect::<Vec<_>>()
+        );
         for real in ["REAL-SESSION", "REAL-MSG", "REAL-OAUTH", "REAL-R", "/tmp/s", "SECRET_THING", "/host/claude"] {
             assert!(!all.contains(real), "{real} must not reach the box");
         }

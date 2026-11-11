@@ -45,7 +45,11 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
                         && (!r.allow_dangerous || q.allow_dangerous)
                 });
                 if !covered {
-                    v.push(format!("reach rule {i}: {m} {}{path} is not within this zone's reach{}", r.host, if r.allow_dangerous { " (with allow_dangerous)" } else { "" }));
+                    v.push(format!(
+                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
+                        r.host,
+                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
+                    ));
                 }
             }
         }
@@ -104,7 +108,10 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
         }
     }
     if ask.max_children >= parent.child_slots {
-        v.push(format!("max_children {}: this zone has {} box(es) left to start, including this one", ask.max_children, parent.child_slots));
+        v.push(format!(
+            "max_children {}: this zone has {} box(es) left to start, including this one",
+            ask.max_children, parent.child_slots
+        ));
     }
     if v.is_empty() {
         Ok(())
@@ -176,7 +183,13 @@ mod tests {
     }
 
     fn bounds(z: &ZoneSpec) -> Bounds<'_> {
-        Bounds { zone: z, images: vec!["img:a".into(), "img:b".into()], llm_remaining: Some((100, 50_000)), time_remaining: Duration::from_secs(1800), child_slots: 3 }
+        Bounds {
+            zone: z,
+            images: vec!["img:a".into(), "img:b".into()],
+            llm_remaining: Some((100, 50_000)),
+            time_remaining: Duration::from_secs(1800),
+            child_slots: 3,
+        }
     }
 
     fn ask<'a>(z: &'a ZoneSpec) -> Ask<'a> {
@@ -199,9 +212,22 @@ mod tests {
         a.max_children = 5;
         let errs = check(&a, &bounds(&p)).unwrap_err().join("\n");
         for needle in [
-            "isolation", "PUT api.github.com/repos/acme/**", "/repos/other/**", "*.com", "docs.rs/tokio/**", "example.com/**",
-            "credential injections", "model route must be", "500 model requests", "memory 4g", "cpus 4", "timeout 2h",
-            "image img:root", "images: img:root", "accept_from anyone", "max_children 5",
+            "isolation",
+            "PUT api.github.com/repos/acme/**",
+            "/repos/other/**",
+            "*.com",
+            "docs.rs/tokio/**",
+            "example.com/**",
+            "credential injections",
+            "model route must be",
+            "500 model requests",
+            "memory 4g",
+            "cpus 4",
+            "timeout 2h",
+            "image img:root",
+            "images: img:root",
+            "accept_from anyone",
+            "max_children 5",
         ] {
             assert!(errs.contains(needle), "missing {needle:?} in:\n{errs}");
         }
