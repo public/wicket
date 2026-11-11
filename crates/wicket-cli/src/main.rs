@@ -5,9 +5,12 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod chan;
 mod enrol;
 mod mock;
 mod node;
+mod noderun;
+mod nodesrv;
 mod program;
 mod reap;
 mod run;
@@ -120,6 +123,11 @@ enum Cmd {
     },
     /// Deny a pending request.
     Deny { id: String },
+    /// Grants made by approvals.
+    Grant {
+        #[command(subcommand)]
+        cmd: GrantCmd,
+    },
     /// Show or verify the hash-chained audit log.
     Audit {
         #[arg(long, default_value_t = 40)]
@@ -200,6 +208,13 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum GrantCmd {
+    /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
+    /// published it (at once if the node is reachable).
+    Revoke { id: String },
+}
+
+#[derive(Subcommand)]
 enum NodeCmd {
     /// Print a one-time join token for a node (stored hashed; single use).
     Token {
@@ -242,6 +257,31 @@ enum NodeCmd {
     /// Revoke a node: refuse it from now on (its pinned host key is deleted) and record its CA serials
     /// for the feed's revocation list.
     Revoke { name: String },
+    /// Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node`
+    /// systemd user service that runs `wicket node serve` there.
+    Install {
+        name: String,
+        /// ssh identity (default: the one it was enrolled with).
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// Only copy the binary; don't install or restart the service.
+        #[arg(long)]
+        no_service: bool,
+    },
+    /// On the node: run its boxes and decide their egress locally from the signed feed (the
+    /// `wicket-node` service runs this).
+    Serve {
+        /// The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
+    /// runs over ssh).
+    #[command(hide = true)]
+    Attach {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Issue a node a fresh CA certificate (and CA key, made on the node).
     RenewCa {
         name: String,
@@ -289,6 +329,12 @@ enum SecretCmd {
 
 #[derive(Subcommand)]
 enum DevCmd {
+    /// On a node: send `node serve` its own last freshness statement, tampered and then replayed, and
+    /// print how each was refused (a check for ci/node-e2e.sh). The control connection stays up.
+    NodeFeedProbe {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// A scripted stand-in for the Anthropic Messages API: the first turn runs one Bash command,
     /// the second ends the conversation. Lets the whole path be tested without an API key.
     MockLlm {
@@ -545,6 +591,17 @@ async fn main() -> Result<()> {
             println!("denied {id}");
             Ok(())
         }
+        Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
+            let l = Ledger::open(&ledger_path())?;
+            let g = l.grant(&id)?.with_context(|| format!("no grant {id}"))?;
+            l.revoke_grant(&id)?;
+            l.audit(&TenantId::single(), None, "grant.revoked", &serde_json::json!({ "grant": id, "by": operator(), "node": g.node }))?;
+            match &g.node {
+                Some(n) => println!("revoked {id}; its run pushes the revocation to node {n}"),
+                None => println!("revoked {id}"),
+            }
+            Ok(())
+        }
         Cmd::Identity { cmd } => {
             let l = Ledger::open(&ledger_path())?;
             match cmd {
@@ -593,6 +650,11 @@ async fn main() -> Result<()> {
                 println!("passkey-signed decisions and console actions: {ok} verified offline, {bad} failed");
                 let (iok, ibad) = verify_identities_and_messages(&l)?;
                 println!("agent identities and signed messages: {iok} verified offline, {ibad} failed");
+                for n in l.verify_node_audit()? {
+                    let restarts =
+                        if n.restarts > 0 { format!(" ({} restart(s): the node's data was wiped)", n.restarts) } else { String::new() };
+                    println!("node {} audit chain OK: {} records shipped{restarts}", n.node, n.records);
+                }
                 if bad + ibad > 0 {
                     bail!("{} record(s) failed verification", bad + ibad);
                 }
@@ -683,6 +745,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             NodeCmd::RenewCa { name, hosts, ca_ttl } => enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?).await,
+            NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
+            NodeCmd::Serve { dir } => nodesrv::serve(dir).await,
+            NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
@@ -713,6 +778,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Dev { cmd: DevCmd::MockLlm { listen, command } } => mock::serve(&listen, &command).await,
+        Cmd::Dev { cmd: DevCmd::NodeFeedProbe { dir } } => {
+            for r in nodesrv::probe_tamper(dir).await? {
+                println!("{r}");
+            }
+            Ok(())
+        }
     }
 }
 
