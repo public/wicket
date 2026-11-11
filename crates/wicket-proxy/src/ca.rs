@@ -42,29 +42,121 @@ impl RunCa {
 
     /// A TLS server config presenting a leaf certificate for `host`, signed by this CA (cached).
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            bail!("refusing to mint a certificate for an IP literal");
+        if let Some(c) = self.leaves.lock().expect("lock").get(host) {
+            return Ok(c.clone());
+        }
+        let der = CertificateDer::from(self.cert.der().to_vec());
+        let cfg = leaf_config(host, &self.cert, &self.key, &der, OffsetDateTime::now_utc() + Duration::days(1))?;
+        self.leaves.lock().expect("lock").insert(host.to_string(), cfg.clone());
+        Ok(cfg)
+    }
+}
+
+/// Something that mints TLS server configs for the egress proxy: a run's own CA, or a node's CA.
+pub trait Minter: Send + Sync {
+    fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>>;
+}
+
+impl Minter for RunCa {
+    fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
+        RunCa::server_config(self, host)
+    }
+}
+
+/// A leaf for `host` signed by `issuer`; the chain presented is [leaf, issuer as issued (`issuer_der`)].
+fn leaf_config(
+    host: &str,
+    issuer: &Certificate,
+    issuer_key: &KeyPair,
+    issuer_der: &CertificateDer<'static>,
+    not_after: OffsetDateTime,
+) -> Result<Arc<ServerConfig>> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        bail!("refusing to mint a certificate for an IP literal");
+    }
+    let mut params = CertificateParams::new(vec![host.to_string()])?;
+    params.distinguished_name.push(DnType::CommonName, host);
+    params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
+    params.not_after = not_after;
+    let leaf_key = KeyPair::generate()?;
+    let leaf = params.signed_by(&leaf_key, issuer, issuer_key)?;
+    let chain = vec![CertificateDer::from(leaf.der().to_vec()), issuer_der.clone()];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    // HTTP/1.1 only, so every request is seen and decided one at a time.
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// A node's intermediate CA (#85), as `wicket node serve` uses it to terminate TLS for its boxes:
+/// the certificate the control host issued (`ca.pem`) and the key that never left the node
+/// (`ca.key`). It mints only for hosts inside its own name constraints (read from the certificate),
+/// and nothing at all once expired; the node's forwarding rule (`decide::route`) sends everything
+/// else to the control host. Leaves are presented with the node CA after them, so a box that trusts
+/// the installation root verifies them.
+pub struct NodeCa {
+    /// The node CA as an rcgen issuer: rebuilt from the certificate's parameters and the node's key.
+    issuer: Certificate,
+    /// The certificate as issued (what the box's verifier sees).
+    der: CertificateDer<'static>,
+    key: KeyPair,
+    pub not_after: i64,
+    /// Permitted DNS subtrees, from the certificate's name constraints.
+    pub permitted: Vec<String>,
+    leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
+}
+
+impl NodeCa {
+    pub fn load(cert_pem: &str, key_pem: &str) -> Result<NodeCa> {
+        use x509_parser::extensions::{GeneralName, ParsedExtension};
+        let key = KeyPair::from_pem(key_pem).context("node CA key")?;
+        if key.public_key_der() != spki_of(cert_pem)? {
+            bail!("the node CA certificate is not for the node CA key");
+        }
+        let (_, p) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).map_err(|e| anyhow::anyhow!("node CA PEM: {e}"))?;
+        let der = p.contents.clone();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("node CA: {e}"))?;
+        let mut permitted = vec![];
+        for ext in cert.extensions() {
+            if let ParsedExtension::NameConstraints(nc) = ext.parsed_extension() {
+                for s in nc.permitted_subtrees.iter().flatten() {
+                    if let GeneralName::DNSName(d) = &s.base {
+                        permitted.push(d.to_string());
+                    }
+                }
+            }
+        }
+        if permitted.is_empty() {
+            bail!("the node CA has no DNS name constraints: refusing to use it");
+        }
+        let not_after = cert.validity().not_after.timestamp();
+        let issuer = CertificateParams::from_ca_cert_pem(cert_pem).context("node CA certificate")?.self_signed(&key)?;
+        Ok(NodeCa { issuer, der: CertificateDer::from(der), key, not_after, permitted, leaves: Mutex::new(HashMap::new()) })
+    }
+
+    /// Whether the CA may mint for `host` at `now` (Unix seconds).
+    pub fn may_mint(&self, host: &str, now: i64) -> bool {
+        now < self.not_after && self.permitted.iter().any(|s| crate::decide::subtree_permits(s, host))
+    }
+}
+
+impl Minter for NodeCa {
+    fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if !self.may_mint(host, now) {
+            bail!("the node CA may not mint for {host} (expired, or outside its name constraints)");
         }
         if let Some(c) = self.leaves.lock().expect("lock").get(host) {
             return Ok(c.clone());
         }
-        let mut params = CertificateParams::new(vec![host.to_string()])?;
-        params.distinguished_name.push(DnType::CommonName, host);
-        let now = OffsetDateTime::now_utc();
-        params.not_before = now - Duration::hours(1);
-        params.not_after = now + Duration::days(1);
-        let leaf_key = KeyPair::generate()?;
-        let leaf = params.signed_by(&leaf_key, &self.cert, &self.key)?;
-        let chain = vec![CertificateDer::from(leaf.der().to_vec()), CertificateDer::from(self.cert.der().to_vec())];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut cfg = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?;
-        // HTTP/1.1 only, so every request is seen and decided one at a time.
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let cfg = Arc::new(cfg);
+        // A leaf never outlives its CA; cached leaves are dropped with the process (the CA is renewed
+        // daily, and `node serve` reloads it).
+        let not_after = (OffsetDateTime::now_utc() + Duration::days(1)).min(OffsetDateTime::from_unix_timestamp(self.not_after)?);
+        let cfg = leaf_config(host, &self.issuer, &self.key, &self.der, not_after)?;
         self.leaves.lock().expect("lock").insert(host.to_string(), cfg.clone());
         Ok(cfg)
     }
@@ -76,8 +168,8 @@ impl RunCa {
 ///   reaches a node or a box.
 /// - It signs nothing but node intermediates (`issue_node_ca`), so its path length is 1: root, node CA,
 ///   leaf.
-/// - Local runs still use a per-run [`RunCa`]; boxes on enrolled nodes will trust this root once the
-///   egress proxy moves onto the node (`wicket node serve`, the next step of #57).
+/// - Local runs use a per-run [`RunCa`]. Boxes on enrolled nodes trust this root (for leaves their
+///   node's [`NodeCa`] mints) and their run's own [`RunCa`] (for hosts the control host terminates).
 pub struct InstallationCa {
     cert: Certificate,
     pem: String,
@@ -368,6 +460,45 @@ mod tests {
             }
         }
         assert!(seen, "no name constraints extension");
+    }
+
+    /// A box's TLS client, trusting only the installation root, against a node-minted leaf.
+    async fn handshake(root: &InstallationCa, server: Arc<ServerConfig>, name: &str) -> std::result::Result<(), String> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.cert_der()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move { tokio_rustls::TlsAcceptor::from(server).accept(b).await.map(|_| ()) });
+        let sn = ServerName::try_from(name.to_string()).unwrap();
+        let r = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(sn, a).await.map(|_| ()).map_err(|e| e.to_string());
+        let _ = srv.await;
+        r
+    }
+
+    #[tokio::test]
+    async fn a_node_ca_mints_leaves_a_box_trusting_the_root_accepts_and_nothing_outside_its_constraints() {
+        let root = InstallationCa::generate().unwrap();
+        let (key, cert) = node_ca(&root, &["api.example.com", "*.example.org"]);
+        let ca = NodeCa::load(&cert.pem, &key.serialize_pem()).unwrap();
+        assert_eq!(ca.permitted, vec![".example.org", "api.example.com"]);
+        assert_eq!(ca.not_after, cert.not_after);
+        for host in ["api.example.com", "www.example.org"] {
+            handshake(&root, Minter::server_config(&ca, host).unwrap(), host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        // Never minted: outside the constraints, an IP literal, or once expired.
+        for host in ["evil.example.net", "example.org", "203.0.113.7"] {
+            assert!(Minter::server_config(&ca, host).is_err(), "{host}");
+        }
+        assert!(ca.may_mint("api.example.com", cert.not_after - 1));
+        assert!(!ca.may_mint("api.example.com", cert.not_after));
+        // A key that isn't the certificate's is refused.
+        let other = KeyPair::generate().unwrap();
+        assert!(NodeCa::load(&cert.pem, &other.serialize_pem()).is_err());
     }
 
     #[test]

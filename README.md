@@ -58,13 +58,16 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 
 #### Remote nodes and enrolment
 
-`wicket run --node <name-or-ssh-target>` runs the box on another machine over ssh (prepare one with
-`deploy/vultr/node-setup.sh`). The proxies, ledger and keys stay on the control host; the run's sockets are
-forwarded to the node. Enrol a node first, so its ssh host key is pinned:
+`wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`).
+On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress locally from
+a signed policy feed, so the box keeps working, failing narrow, while the control host is unreachable (#57;
+below). The ledger, the keys that matter, the LLM proxy and the MCP gateway stay on the control host. A
+`--node` ssh target that isn't enrolled still works the old way: docker over ssh, the run's sockets forwarded.
 
 ```sh
 wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)
 wicket node enrol wicket@203.0.113.7 --token wkt_… --host-key 'SHA256:…' --hosts 'api.example.com,*.example.org'
+wicket node install n1                      # copies this wicket binary there, starts the wicket-node service
 wicket run task.yaml --node n1
 wicket node list
 wicket node renew-ca n1                     # a fresh node CA (default 24 h)
@@ -90,7 +93,54 @@ wicket node revoke n1
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
   do until it expires.
 - **Revoking** deletes the pinned key and records the node CA's serials for the feed's revocation list (not
-  distributed yet). Nothing runs on the node yet: egress decisions move there with `wicket node serve` (#57).
+  distributed yet).
+
+##### `wicket node serve`: boxes that outlive the control channel
+
+- **Install.** `wicket node install <name>` copies the control host's own binary to `~/.local/bin/wicket` on the
+  node over the pinned ssh connection, checks its sha256 there, and installs a `systemd --user` unit,
+  `wicket-node`, that runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the
+  unit runs without a login. `serve` refuses a control host running any other build (sha256 of the binary): run
+  `install` again after upgrading.
+- **The node owns the box.** It runs `docker run` itself and relays the box's stdin, stdout and stderr over one
+  multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which joins the ssh
+  session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700). When the channel
+  drops the box keeps running; the node keeps up to 4 MiB of output per stream (oldest dropped first, and the
+  control host reports the gap), replays it when the control host reconnects (backoff 0.5 s to 5 s), and
+  enforces the run's timeout itself. Unsent stdin is resent. Live egress events from the disconnected period
+  aren't shown on the console, but are in the node's audit log.
+- **Decisions on the node.** Each box's egress proxy decides from the node's verified replica of the feed
+  (`wicket-feed`; the zone, and grants bound to the box), with the same proxy code as the control host (only
+  the decision source differs, `wicket_proxy::decide`):
+
+  | node's feed | allowed | out of reach |
+  |---|---|---|
+  | fresh (a statement within the TTL, 30 s) | reach rules and live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
+  | narrow (up to the narrow window after, 120 s) | plain reads (R1) in reach only | 403 "the control plane is unreachable; retry later", no request id |
+  | closed | nothing | 403, the same |
+
+  Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
+  counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
+  a node for the asked path only. `wicket grant revoke <id>` (picked up within 250 ms) and a run revocation
+  (`wicket identity revoke`, within 2 s) are pushed to the node, which applies them as soon as they arrive; a node
+  that hears nothing goes stale within the TTL anyway. A tampered, replayed or rolled-back
+  feed frame is refused.
+- **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
+  the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
+  the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
+  it with the run CA), for: hosts with an `inject` rule or a credential swap (secrets stay on the control host),
+  hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
+  every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
+  fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
+- **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
+  ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
+  recomputes each node's chain. Feed decisions use the wall clock read once at start and advanced by a monotonic
+  clock, so a clock step on the node can't stretch a freshness statement (after a deliberate clock step, restart
+  `wicket-node` so it reads the wall clock again).
+- **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), child
+  agents can't use a served node, plain `http://` to a forwarded host is refused, and the MCP gateway still
+  decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
+  the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
 #### Provisioning nodes (`wicket place`)
 

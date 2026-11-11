@@ -1,8 +1,15 @@
 //! The egress proxy (design §9.1): CONNECT, terminate TLS with the run's CA, canonicalize-or-reject,
 //! decide, then forward with client credentials stripped and the zone's credential injected into
 //! its one declared header slot.
+//!
+//! The same proxy runs on a remote node (`wicket node serve`, #57) with a different [`Decider`]
+//! (the node's feed replica), a different [`Minter`] (the node's name-constrained CA), and a
+//! [`Relay`] to the control host: CONNECTs the node must not terminate (see [`crate::decide::route`])
+//! are tunnelled, raw, to the control host's own egress proxy for the run, which decides and
+//! terminates them there.
 
-use crate::ca::RunCa;
+use crate::ca::{Minter, RunCa};
+use crate::decide::{Central, Decider, Outcome, Route};
 use crate::{full, problem, BoxBody, Event, RunCtx, STRIP_REQUEST, STRIP_RESPONSE};
 use anyhow::Result;
 use bytes::Bytes;
@@ -15,26 +22,50 @@ use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use wicket_core::{canonical_path, manifest::host_matches, Op, Verdict};
+use wicket_core::{canonical_path, manifest::host_matches, Op};
 
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 pub struct Egress {
     ctx: RunCtx,
-    ca: Arc<RunCa>,
+    ca: Arc<dyn Minter>,
+    decider: Arc<dyn Decider>,
+    relay: Option<Arc<dyn Relay>>,
     client: reqwest::Client,
     /// Blocked attempts this run: per request (or host), and in total.
     strikes: std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
 }
 
+/// A byte stream to the control host (one tunnel over the node's control channel).
+pub trait RelayStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream for T {}
+
+/// A node's way to the control host's egress proxy for this run.
+pub trait Relay: Send + Sync {
+    /// Whether the node terminates this host or tunnels it to the control host.
+    fn route(&self, host: &str) -> Route;
+    /// Opens a stream to the run's egress proxy on the control host; an error if the control host is
+    /// unreachable.
+    fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>>;
+}
+
+/// The largest response head (and refusal body) read back from a forwarded CONNECT.
+const MAX_FORWARDED_HEAD: usize = 64 * 1024;
+
 impl Egress {
+    /// The control host's egress proxy for a run: the run's own CA, decisions from the ledger.
     pub fn new(ctx: RunCtx, ca: Arc<RunCa>) -> Result<Arc<Egress>> {
+        Egress::with(ctx, ca, Arc::new(Central), None)
+    }
+
+    /// An egress proxy with its own decision source, CA and (on a node) relay to the control host.
+    pub fn with(ctx: RunCtx, ca: Arc<dyn Minter>, decider: Arc<dyn Decider>, relay: Option<Arc<dyn Relay>>) -> Result<Arc<Egress>> {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
-        Ok(Arc::new(Egress { ctx, ca, client, strikes: Default::default() }))
+        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, strikes: Default::default() }))
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -67,6 +98,11 @@ impl Egress {
             if let Some(r) = self.judge_host(&host, "CONNECT") {
                 return Ok(r);
             }
+            if let Some(relay) = &self.relay {
+                if let Route::Forward(why) = relay.route(&host) {
+                    return Ok(self.clone().forward_connect(req, host, why).await);
+                }
+            }
             let me = self.clone();
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
@@ -86,6 +122,10 @@ impl Egress {
             Some(h) if req.uri().scheme_str() == Some("http") => {
                 if let Some(r) = self.judge_host(&h, req.method().as_str()) {
                     return Ok(r);
+                }
+                if let Some(Route::Forward(why)) = self.relay.as_ref().map(|r| r.route(&h)) {
+                    let method = req.method().to_string();
+                    return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP to {h} isn't served on this node ({why}); use https")));
                 }
                 let me = self.clone();
                 Ok(me.handle(req, h, "http").await)
@@ -107,10 +147,85 @@ impl Egress {
         Ok(())
     }
 
+    /// Tunnels a CONNECT, raw, to the control host's egress proxy for this run (a node's forwarded
+    /// host): the control host decides and terminates TLS there. Its answer to the CONNECT is the
+    /// box's answer; after a 200 the bytes are piped both ways. Unreachable: a 403 that says so.
+    async fn forward_connect(self: Arc<Self>, req: Request<Incoming>, host: String, why: String) -> Response<BoxBody> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let unreachable = |me: &Egress| {
+            me.ctx.emit(Event::Egress {
+                method: "CONNECT".into(),
+                host: host.clone(),
+                path: "/".into(),
+                risk: "-".into(),
+                outcome: "unavailable".into(),
+                detail: format!("served by the control host ({why}), which is unreachable"),
+            });
+            problem(
+                403,
+                "unavailable",
+                "Blocked by wicket sandbox: control plane unreachable",
+                &format!(
+                    "{host} is served by wicket's control host ({why}), which this node can't reach right now; retry later. {}",
+                    crate::SANDBOX_FACT
+                ),
+                None,
+            )
+        };
+        let Some(relay) = self.relay.clone() else { return unreachable(&self) };
+        let mut s = match relay.open().await {
+            Ok(s) => s,
+            Err(_) => return unreachable(&self),
+        };
+        let connect = format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n");
+        if s.write_all(connect.as_bytes()).await.is_err() {
+            return unreachable(&self);
+        }
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match s.read(&mut byte).await {
+                Ok(1) if head.len() < MAX_FORWARDED_HEAD => head.push(byte[0]),
+                _ => return unreachable(&self),
+            }
+        }
+        let Some((status, reason, headers)) = parse_head(&head) else { return unreachable(&self) };
+        self.ctx.emit(Event::Egress {
+            method: "CONNECT".into(),
+            host: host.clone(),
+            path: "/".into(),
+            risk: "-".into(),
+            outcome: "forwarded".into(),
+            detail: format!("to the control host ({why}): {status}"),
+        });
+        if status == 200 {
+            tokio::spawn(async move {
+                if let Ok(up) = hyper::upgrade::on(req).await {
+                    let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(up), &mut s).await;
+                }
+            });
+            return Response::new(full(Bytes::new()));
+        }
+        let len = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
+        let mut body = vec![0u8; len.min(MAX_FORWARDED_HEAD)];
+        if s.read_exact(&mut body).await.is_err() {
+            body.clear();
+        }
+        let mut b = Response::builder().status(status);
+        for (k, v) in headers.iter().filter(|(k, _)| k == "content-type" || k.starts_with("x-wicket") || k == "retry-after") {
+            b = b.header(k.as_str(), v.as_str());
+        }
+        let mut resp = b.body(full(body)).unwrap_or_else(|_| unreachable(&self));
+        if let Ok(r) = hyper::ext::ReasonPhrase::try_from(reason) {
+            resp.extensions_mut().insert(r);
+        }
+        resp
+    }
+
     /// Decides about a host before any request to it (and before TLS): never-reachable hosts are
     /// refused, saying so; in zones that hide unlisted hosts, they behave as if they didn't exist.
     fn judge_host(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
-        match self.ctx.zone.host_verdict(host) {
+        match self.decider.host_verdict(&self.ctx, host) {
             wicket_core::HostVerdict::Open => None,
             wicket_core::HostVerdict::Forbidden(why) => {
                 self.ctx.emit(Event::Egress {
@@ -214,9 +329,11 @@ impl Egress {
                 detail,
             })
         };
-        match ctx.zone.evaluate(&op) {
-            Verdict::AllowByReach(i) => emit("allow", format!("reach rule {i}")),
-            Verdict::Forbidden(why) => {
+        // Who in the box is asking (reported by the agent's own event stream, not proven).
+        let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
+        match self.decider.decide(ctx, &op, who.as_ref()).await {
+            Outcome::Allow(detail) => emit("allow", detail),
+            Outcome::Forbidden(why) => {
                 emit("forbidden", why.clone());
                 let note = self.strike(&op.digest());
                 return problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
@@ -224,7 +341,7 @@ impl Egress {
                     crate::SANDBOX_FACT
                 ), None);
             }
-            Verdict::NeedsGrant(why) if !ctx.escalate => {
+            Outcome::NoEscalation(why) => {
                 emit("forbidden", format!("{why}; this run does not escalate (on_pending: fail)"));
                 return problem(
                     403,
@@ -234,58 +351,34 @@ impl Egress {
                     None,
                 );
             }
-            Verdict::NeedsGrant(why) => {
-                // Who in the box is asking (reported by the agent's own event stream, not proven).
-                let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
-                let mut ledger = ctx.ledger.lock().expect("ledger lock");
-                match ledger.consume_grant(&op) {
-                    Ok(Some(gid)) => {
-                        let approved_for: Vec<String> = ledger
-                            .request_for_grant(&gid)
-                            .ok()
-                            .flatten()
-                            .map(|r| r.attribution.iter().flat_map(crate::attributed_agents).collect())
-                            .unwrap_or_default();
-                        drop(ledger);
-                        let mut detail = format!("grant {gid}");
-                        if let Some((v, line)) = &who {
-                            detail.push_str(&format!("; used by {line}"));
-                            let users = crate::attributed_agents(v);
-                            // The grant is usable by anything in the box; flag use by someone else.
-                            if !approved_for.is_empty() && !users.is_empty() && !users.iter().any(|u| approved_for.contains(u)) {
-                                detail.push_str(&format!("; WARNING: approved for {}", approved_for.join(" | ")));
-                            }
-                        }
-                        emit("allow", detail);
-                    }
-                    Ok(None) => {
-                        if let Ok(Some(rid)) = ledger.denied_recently(&op) {
-                            drop(ledger);
-                            emit("denied", format!("request {rid} was denied"));
-                            let note = self.strike(&op.digest());
-                            return problem(403, "denied", "Blocked by wicket sandbox: denied by a human", &format!(
-                                "A human denied request {rid} for exactly this request. {} Do not retry it; continue without it and tell the user.{note}",
-                                crate::SANDBOX_FACT
-                            ), None);
-                        }
-                        let res = ledger.pending_for(&op, &why, who.as_ref().map(|(v, _)| v));
-                        drop(ledger);
-                        return match res {
-                            Ok((rid, fresh)) => {
-                                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
-                                emit("pending", format!("{rid}{}: {why}{for_line}", if fresh { " (new)" } else { "" }));
-                                let note = self.strike(&op.digest());
-                                problem(403, "pending-approval", "Blocked by wicket sandbox: needs human approval", &format!(
-                                    "{why}. wicket has asked a human to approve request {rid}; until they do, this request fails every time. {} Call await_grant with {rid} to wait, or tell the user that request {rid} is waiting for their approval in wicket (approvals happen in wicket, not in this conversation).{note}",
-                                    crate::SANDBOX_FACT
-                                ), Some(&rid))
-                            }
-                            Err(e) => problem(500, "error", "Ledger error", &e.to_string(), None),
-                        };
-                    }
-                    Err(e) => return problem(500, "error", "Ledger error", &e.to_string(), None),
-                }
+            Outcome::Denied { request: rid } => {
+                emit("denied", format!("request {rid} was denied"));
+                let note = self.strike(&op.digest());
+                return problem(403, "denied", "Blocked by wicket sandbox: denied by a human", &format!(
+                    "A human denied request {rid} for exactly this request. {} Do not retry it; continue without it and tell the user.{note}",
+                    crate::SANDBOX_FACT
+                ), None);
             }
+            Outcome::Pending { request: rid, fresh, why } => {
+                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
+                emit("pending", format!("{rid}{}: {why}{for_line}", if fresh { " (new)" } else { "" }));
+                let note = self.strike(&op.digest());
+                return problem(403, "pending-approval", "Blocked by wicket sandbox: needs human approval", &format!(
+                    "{why}. wicket has asked a human to approve request {rid}; until they do, this request fails every time. {} Call await_grant with {rid} to wait, or tell the user that request {rid} is waiting for their approval in wicket (approvals happen in wicket, not in this conversation).{note}",
+                    crate::SANDBOX_FACT
+                ), Some(&rid));
+            }
+            Outcome::Unavailable(why) => {
+                emit("unavailable", why.clone());
+                return problem(
+                    403,
+                    "unavailable",
+                    "Blocked by wicket sandbox: control plane unreachable",
+                    &format!("{why}. {}", crate::SANDBOX_FACT),
+                    None,
+                );
+            }
+            Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
         match self.forward(req, &host, scheme, &pq).await {
             Ok(r) => r,
@@ -358,6 +451,20 @@ impl Egress {
     }
 }
 
+/// A response head: status, reason phrase, and headers with lowercase names.
+type Head = (u16, String, Vec<(String, String)>);
+
+/// Parses an HTTP/1.1 response head.
+fn parse_head(head: &[u8]) -> Option<Head> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let mut first = lines.next()?.splitn(3, ' ');
+    let status = first.nth(1)?.parse().ok()?;
+    let reason = first.next().unwrap_or("").to_string();
+    let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    Some((status, reason, headers))
+}
+
 /// Renders an injection format: `{secret}` is the secret itself; `{basic:USER}` is
 /// base64("USER:secret"), for HTTP Basic credentials such as git over HTTPS with a token.
 pub fn render_credential(format: &str, secret: &str) -> String {
@@ -374,6 +481,17 @@ pub fn render_credential(format: &str, secret: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forwarded_response_heads_parse_and_garbage_does_not() {
+        let (st, reason, h) =
+            super::parse_head(b"HTTP/1.1 403 Blocked by wicket sandbox: x\r\nContent-Length: 12\r\nX-Wicket: pending-approval\r\n\r\n")
+                .unwrap();
+        assert_eq!((st, reason.as_str()), (403, "Blocked by wicket sandbox: x"));
+        assert!(h.contains(&("x-wicket".into(), "pending-approval".into())));
+        assert!(super::parse_head(b"\xff\xfe").is_none());
+        assert!(super::parse_head(b"HTTP/1.1 x\r\n\r\n").is_none());
+    }
+
     #[test]
     fn credential_formats() {
         assert_eq!(super::render_credential("Bearer {secret}", "tok"), "Bearer tok");
