@@ -243,7 +243,7 @@ impl Gateway {
             Ok(p) => p.to_string(),
             Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
         };
-        match wicket_core::host_verdict(&self.ctx.zone, &host) {
+        match self.ctx.zone.host_verdict(&host) {
             wicket_core::HostVerdict::Forbidden(why) => {
                 return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false)
             }
@@ -251,7 +251,7 @@ impl Gateway {
             wicket_core::HostVerdict::Open => {}
         }
         let op = wicket_core::Op::egress_with_query(&self.ctx.tenant, &self.ctx.run, &self.ctx.zone.name, &method, &host, &path, query);
-        match wicket_core::evaluate(&self.ctx.zone, &op) {
+        match self.ctx.zone.evaluate(&op) {
             wicket_core::Verdict::AllowByReach(_) if !prefix => {
                 return (format!("{method} {host}{path} is already allowed: just make the request."), false)
             }
@@ -551,7 +551,7 @@ mod tests {
             RunCtx {
                 tenant: TenantId(tenant.into()),
                 run: RunId(run.into()),
-                zone: Arc::new(m.zone.clone()),
+                zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
                 ledger: self.ledger.clone(),
                 vault: crate::vault::Vault::new(std::env::temp_dir()),
                 events: tx,

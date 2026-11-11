@@ -202,7 +202,8 @@ impl ForbidRule {
     }
 
     pub fn matches(&self, host: &str, path: &str) -> bool {
-        host_matches(&self.host, host) && self.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(path)).unwrap_or(false))
+        // A glob that doesn't compile counts as matching: a broken forbid rule forbids, never allows.
+        host_matches(&self.host, host) && self.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(path)).unwrap_or(true))
     }
 }
 
