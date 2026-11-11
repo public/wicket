@@ -45,9 +45,22 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
                         && (!r.allow_dangerous || q.allow_dangerous)
                 });
                 if !covered {
-                    v.push(format!("reach rule {i}: {m} {}{path} is not within this zone's reach{}", r.host, if r.allow_dangerous { " (with allow_dangerous)" } else { "" }));
+                    v.push(format!(
+                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
+                        r.host,
+                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
+                    ));
                 }
             }
+        }
+    }
+    // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
+    // forbid rule with the same or a wider host (the paths of one parent rule may be split across
+    // several child rules).
+    for (i, f) in p.forbid.iter().enumerate() {
+        let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
+        if !kept {
+            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
         }
     }
     for i in &c.inject {
@@ -104,7 +117,10 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
         }
     }
     if ask.max_children >= parent.child_slots {
-        v.push(format!("max_children {}: this zone has {} box(es) left to start, including this one", ask.max_children, parent.child_slots));
+        v.push(format!(
+            "max_children {}: this zone has {} box(es) left to start, including this one",
+            ask.max_children, parent.child_slots
+        ));
     }
     if v.is_empty() {
         Ok(())
@@ -130,22 +146,91 @@ fn host_covers(parent: &str, child: &str) -> bool {
     }
 }
 
-/// Whether every path `child` (a glob) matches is matched by one of `parent` (globs). Proven three
-/// ways: the same glob; a literal path the parent matches; or a parent `Q/**` (or `/**`) that the
-/// child's literal prefix lies under. Anything else is unproven, so not covered.
+/// Whether every path `child` (a glob) matches is matched by one of `parent` (globs). Proven by: the
+/// same glob; a literal path a parent glob matches; a parent `Q/**` (literal `Q`) that the child's
+/// literal prefix lies under; or segment by segment (`segments_cover`). Anything else is unproven, so
+/// not covered: this check may refuse a narrower zone, but never accepts a wider one.
 fn path_covered(parent: &[String], child: &str) -> bool {
     if parent.iter().any(|g| g == child || g == "/**") {
         return true;
     }
-    let wild = child.find(['*', '?', '[', '{']);
-    let literal = &child[..wild.unwrap_or(child.len())];
+    let wild = child.find(META);
     if wild.is_none() {
         return parent.iter().any(|g| crate::manifest::compile_glob(g).map(|m| m.is_match(child)).unwrap_or(false));
     }
+    let literal = &child[..wild.unwrap_or(child.len())];
     parent.iter().any(|g| match g.strip_suffix("/**") {
-        Some(q) if !q.contains(['*', '?', '[', '{']) => literal.starts_with(&format!("{q}/")),
-        _ => false,
+        Some(q) if !q.contains(META) && literal.starts_with(&format!("{q}/")) => true,
+        _ => segments_cover(g, child),
     })
+}
+
+/// Glob metacharacters (and `\`, which escapes them).
+const META: [char; 5] = ['*', '?', '[', '{', '\\'];
+
+/// One element of a path glob split at `/`, under the matcher's semantics (`literal_separator`):
+/// a `**` segment matches any number of segments (at least one at the end of a glob, where `/a/**`
+/// doesn't match `/a`); any other segment matches exactly one segment, and its `*` stops at `/`.
+#[derive(Clone, Copy, PartialEq)]
+enum Seg<'a> {
+    Any,
+    One(&'a str),
+}
+
+/// Splits an absolute glob into segments. `None` if it isn't one this proof handles: not absolute, or
+/// a `{…}` or `[…]` group that contains `/`, which splitting at `/` would cut in two.
+fn segments(glob: &str) -> Option<Vec<Seg<'_>>> {
+    let body = glob.strip_prefix('/')?;
+    let (mut depth, mut class) = (0i32, false);
+    for ch in body.chars() {
+        match ch {
+            '{' if !class => depth += 1,
+            '}' if !class => depth -= 1,
+            '[' => class = true,
+            ']' => class = false,
+            '/' if depth != 0 || class => return None,
+            _ => {}
+        }
+    }
+    Some(body.split('/').map(|s| if s == "**" { Seg::Any } else { Seg::One(s) }).collect())
+}
+
+/// Whether every path the glob `child` matches is matched by the glob `parent`, compared segment by
+/// segment. Sound but not complete: a child segment with wildcards is covered only by the same text
+/// or by `*`.
+fn segments_cover(parent: &str, child: &str) -> bool {
+    let (Some(p), Some(c)) = (segments(parent), segments(child)) else { return false };
+    // ok[i][j]: parent segments i.. cover child segments j..
+    let mut ok = vec![vec![false; c.len() + 1]; p.len() + 1];
+    ok[p.len()][c.len()] = true;
+    for i in (0..p.len()).rev() {
+        for j in (0..=c.len()).rev() {
+            ok[i][j] = match p[i] {
+                // A trailing `**` matches one or more segments, so it covers any non-empty rest: that
+                // rest ends in a segment or in a trailing `**`, either of which is at least one segment.
+                Seg::Any if i + 1 == p.len() => j < c.len(),
+                // Elsewhere `**` matches zero or more: skip it, or let it absorb the next child element.
+                Seg::Any => ok[i + 1][j] || (j < c.len() && ok[i][j + 1]),
+                Seg::One(ps) => match c.get(j) {
+                    Some(Seg::One(cs)) => segment_covers(ps, cs) && ok[i + 1][j + 1],
+                    // One parent segment can't cover a child `**` (any number of segments).
+                    Some(Seg::Any) | None => false,
+                },
+            };
+        }
+    }
+    ok[0][0]
+}
+
+/// Whether every segment the pattern `child` matches is matched by the pattern `parent`.
+fn segment_covers(parent: &str, child: &str) -> bool {
+    if parent == child || parent == "*" {
+        return true;
+    }
+    if child.contains(META) {
+        return false;
+    }
+    crate::manifest::compile_glob(parent).map(|m| m.is_match(child)).unwrap_or(false)
 }
 
 /// "1500m", "2g", "512M", "1G", "1048576" → bytes.
@@ -176,7 +261,13 @@ mod tests {
     }
 
     fn bounds(z: &ZoneSpec) -> Bounds<'_> {
-        Bounds { zone: z, images: vec!["img:a".into(), "img:b".into()], llm_remaining: Some((100, 50_000)), time_remaining: Duration::from_secs(1800), child_slots: 3 }
+        Bounds {
+            zone: z,
+            images: vec!["img:a".into(), "img:b".into()],
+            llm_remaining: Some((100, 50_000)),
+            time_remaining: Duration::from_secs(1800),
+            child_slots: 3,
+        }
     }
 
     fn ask<'a>(z: &'a ZoneSpec) -> Ask<'a> {
@@ -199,9 +290,22 @@ mod tests {
         a.max_children = 5;
         let errs = check(&a, &bounds(&p)).unwrap_err().join("\n");
         for needle in [
-            "isolation", "PUT api.github.com/repos/acme/**", "/repos/other/**", "*.com", "docs.rs/tokio/**", "example.com/**",
-            "credential injections", "model route must be", "500 model requests", "memory 4g", "cpus 4", "timeout 2h",
-            "image img:root", "images: img:root", "accept_from anyone", "max_children 5",
+            "isolation",
+            "PUT api.github.com/repos/acme/**",
+            "/repos/other/**",
+            "*.com",
+            "docs.rs/tokio/**",
+            "example.com/**",
+            "credential injections",
+            "model route must be",
+            "500 model requests",
+            "memory 4g",
+            "cpus 4",
+            "timeout 2h",
+            "image img:root",
+            "images: img:root",
+            "accept_from anyone",
+            "max_children 5",
         ] {
             assert!(errs.contains(needle), "missing {needle:?} in:\n{errs}");
         }
@@ -212,6 +316,111 @@ mod tests {
         let p = zone("  unlisted_hosts: hide\n");
         let c = zone("");
         assert!(check(&ask(&c), &Bounds { zone: &p, ..bounds(&p) }).unwrap_err()[0].contains("hide"));
+    }
+
+    #[test]
+    fn forbid_rules_must_be_kept() {
+        let p = zone("  reach:\n    - { host: api.example.com, methods: [GET, POST], paths: [\"/**\"] }\n  forbid:\n    - { host: api.example.com, paths: [\"/private/**\"] }\n    - { host: mcp.example.com }\n  limits: { memory: 2g, cpus: 1, timeout: 1h }\n");
+        let reach = "  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/**\"] }\n  limits: { memory: 1g, cpus: 1, timeout: 10m }\n  llm: { max_requests: 10, max_output_tokens: 1000 }\n";
+        let dropped = zone(reach);
+        let errs = check(&ask(&dropped), &bounds(&p)).unwrap_err().join("\n");
+        assert!(errs.contains("forbid rule 0 (api.example.com /private/**)"), "{errs}");
+        assert!(errs.contains("forbid rule 1 (mcp.example.com /**)"), "{errs}");
+        let narrower = zone(&format!(
+            "{reach}  forbid:\n    - {{ host: api.example.com, paths: [\"/private/x\"] }}\n    - {{ host: mcp.example.com }}\n"
+        ));
+        assert!(check(&ask(&narrower), &bounds(&p)).unwrap_err()[0].contains("forbid rule 0"));
+        let kept = zone(&format!(
+            "{reach}  forbid:\n    - {{ host: api.example.com, paths: [\"/private/**\"] }}\n    - {{ host: mcp.example.com }}\n"
+        ));
+        assert_eq!(check(&ask(&kept), &bounds(&p)), Ok(()));
+        // One parent rule with two paths, kept by two child rules; dropping either path is refused.
+        let two = zone("  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/**\"] }\n  forbid:\n    - { host: api.example.com, paths: [\"/a/**\", \"/b/**\"] }\n  limits: { memory: 2g, cpus: 1, timeout: 1h }\n");
+        let split = |rules: &str| zone(&format!("{reach}  forbid:\n{rules}"));
+        let both = split("    - { host: api.example.com, paths: [\"/a/**\"] }\n    - { host: api.example.com, paths: [\"/b/**\"] }\n");
+        assert_eq!(check(&ask(&both), &bounds(&two)), Ok(()));
+        let one = split("    - { host: api.example.com, paths: [\"/a/**\"] }\n");
+        assert!(check(&ask(&one), &bounds(&two)).unwrap_err()[0].contains("forbid rule 0"));
+        let wider = zone(&format!("{reach}  forbid:\n    - {{ host: \"*.example.com\" }}\n    - {{ host: api.example.com }}\n"));
+        assert_eq!(check(&ask(&wider), &bounds(&p)), Ok(()));
+    }
+
+    #[test]
+    fn segment_globs() {
+        let covered = |p: &str, c: &str| path_covered(&[p.to_string()], c);
+        // #73: one session's worker channel is within any session's.
+        assert!(covered("/v1/code/sessions/*/worker/**", "/v1/code/sessions/abc123/worker/**"));
+        assert!(covered("/v1/code/sessions/*/worker", "/v1/code/sessions/abc123/worker"));
+        assert!(covered("/a/*/c", "/a/b*/c"));
+        assert!(covered("/a/**/z", "/a/b/**/z"));
+        assert!(covered("/a/**/z", "/a/z"));
+        assert!(covered("/a/{b,c}/*", "/a/c/d"));
+        // Not within.
+        assert!(!covered("/v1/code/sessions/*/worker/**", "/v1/code/sessions/**"));
+        assert!(!covered("/a/*/c", "/a/**/c"));
+        assert!(!covered("/a/**", "/a"));
+        assert!(!covered("/a/*", "/a/*/b"));
+        assert!(!covered("/a/b*", "/a/*"));
+        assert!(!covered("/a/**/z", "/a/**"));
+        // A brace or class that contains `/` is never split at it, so stays unproven.
+        assert!(!covered("/a/*/*", "/a/{b/c,d}"));
+    }
+
+    /// The structural check must never claim containment the matcher disagrees with: for small globs
+    /// and paths, every path a "covered" child matches must match the parent.
+    #[test]
+    fn segment_proofs_agree_with_the_matcher() {
+        let segs = ["a", "*", "a*", "**", "{a,b}", ""];
+        let mut globs = vec![];
+        for n in 1..=3 {
+            let mut idx = vec![0; n];
+            loop {
+                globs.push(format!("/{}", idx.iter().map(|&i| segs[i]).collect::<Vec<_>>().join("/")));
+                let mut k = 0;
+                while k < n && idx[k] + 1 == segs.len() {
+                    idx[k] = 0;
+                    k += 1;
+                }
+                if k == n {
+                    break;
+                }
+                idx[k] += 1;
+            }
+        }
+        let parts = ["a", "b", "ab", "c", ""];
+        let mut paths = vec![];
+        for n in 1..=4 {
+            for mut x in 0..parts.len().pow(n) {
+                let mut p = String::new();
+                for _ in 0..n {
+                    p.push('/');
+                    p.push_str(parts[x % parts.len()]);
+                    x /= parts.len();
+                }
+                paths.push(p);
+            }
+        }
+        let matches: Vec<Vec<bool>> = globs
+            .iter()
+            .map(|g| {
+                let m = crate::manifest::compile_glob(g).unwrap();
+                paths.iter().map(|p| m.is_match(p)).collect()
+            })
+            .collect();
+        let (mut proved, mut wrong) = (0, vec![]);
+        for (pi, p) in globs.iter().enumerate() {
+            for (ci, c) in globs.iter().enumerate() {
+                if !path_covered(std::slice::from_ref(p), c) {
+                    continue;
+                }
+                proved += 1;
+                if let Some(k) = (0..paths.len()).find(|&k| matches[ci][k] && !matches[pi][k]) {
+                    wrong.push(format!("{c} ⊆ {p}, but {} matches only the child", paths[k]));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} unsound proofs, e.g.:\n{}", wrong.len(), wrong[..wrong.len().min(10)].join("\n"));
+        assert!(proved > 2_000, "only {proved} proofs: the check got too weak");
     }
 
     #[test]

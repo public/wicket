@@ -33,6 +33,8 @@ pub enum IdError {
     Expired(i64),
     #[error("not issued by this installation (issuer {0})")]
     WrongIssuer(String),
+    #[error("trust domain: {0}")]
+    TrustDomain(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -137,6 +139,21 @@ pub fn principal_label(p: &Value) -> String {
     }
 }
 
+/// The trust domain installations used before it was configurable.
+pub const LEGACY_TRUST_DOMAIN: &str = "wicket.local";
+
+/// Checks a SPIFFE trust domain: 1–255 characters of lowercase letters, digits, `.`, `-` and `_`,
+/// with no scheme, port, path or user info (SPIFFE ID spec §2.1).
+pub fn validate_trust_domain(td: &str) -> Result<()> {
+    let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_');
+    if td.is_empty() || td.len() > 255 || !td.chars().all(ok_char) || td.starts_with('.') || td.ends_with('.') || td.contains("..") {
+        return Err(IdError::TrustDomain(format!(
+            "{td:?} is not a valid trust domain: use lowercase letters, digits, '.', '-' and '_', e.g. wicket.example.com"
+        )));
+    }
+    Ok(())
+}
+
 /// The installation's issuer key.
 pub struct Issuer {
     key: SigningKey,
@@ -148,23 +165,60 @@ impl Issuer {
         Issuer { key: SigningKey::generate(&mut rand_core::OsRng), trust_domain: trust_domain.into() }
     }
 
-    /// Loads the issuer key from `path` (hex seed, mode 0600), creating it on first use, and
-    /// writes the public key next to it (`<path>.pub.json`) for verifiers.
-    pub fn load_or_create(path: &Path, trust_domain: &str) -> Result<Issuer> {
+    /// Loads the installation's issuer: its key from `path` (hex seed, mode 0600) and its trust domain
+    /// from `<path>.trust-domain`, and writes the public key next to them (`<path>.pub.json`) for
+    /// verifiers.
+    ///
+    /// The trust domain is fixed when the key is created, so it can't drift between runs:
+    /// - no key yet: `wanted` is required; the key and the domain are created together;
+    /// - a key and a recorded domain: `wanted`, if given, must be the same;
+    /// - a key from before trust domains were recorded: `wanted`, or the old default `wicket.local`,
+    ///   is recorded now. Documents issued earlier still verify, by key.
+    pub fn load(path: &Path, wanted: Option<&str>) -> Result<Issuer> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        if let Some(w) = wanted {
+            validate_trust_domain(w)?;
+        }
+        let td_path = path.with_extension("trust-domain");
+        let recorded = match std::fs::read_to_string(&td_path) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let issuer = match std::fs::read_to_string(path) {
             Ok(s) => {
-                let seed: [u8; 32] = hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("issuer key file"))?;
-                Issuer { key: SigningKey::from_bytes(&seed), trust_domain: trust_domain.into() }
+                let seed: [u8; 32] =
+                    hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("issuer key file"))?;
+                let td = match (&recorded, wanted) {
+                    (Some(r), Some(w)) if r != w => {
+                        return Err(IdError::TrustDomain(format!(
+                            "this installation's trust domain is {r}, not {w} (it is fixed when the issuer key is created)"
+                        )))
+                    }
+                    (Some(r), _) => r.clone(),
+                    (None, w) => {
+                        let td = w.unwrap_or(LEGACY_TRUST_DOMAIN).to_string();
+                        std::fs::write(&td_path, format!("{td}\n"))?;
+                        td
+                    }
+                };
+                validate_trust_domain(&td)?;
+                Issuer { key: SigningKey::from_bytes(&seed), trust_domain: td }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let td = wanted.ok_or_else(|| {
+                    IdError::TrustDomain(
+                        "not set: run `wicket identity init --trust-domain <domain>` (e.g. wicket.example.com), or set WICKET_TRUST_DOMAIN on first use".into(),
+                    )
+                })?;
                 if let Some(d) = path.parent() {
                     std::fs::create_dir_all(d)?;
                 }
-                let i = Issuer::generate(trust_domain);
+                let i = Issuer::generate(td);
                 let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
                 f.write_all(hex::encode(i.key.to_bytes()).as_bytes())?;
+                std::fs::write(&td_path, format!("{td}\n"))?;
                 i
             }
             Err(e) => return Err(e.into()),
@@ -206,7 +260,11 @@ impl Issuer {
             principal: spec.principal.clone(),
             act: spec.act.clone(),
         };
-        jws_sign(&self.key, json!({ "alg": "EdDSA", "typ": IDENTITY_TYP, "kid": key_id(&self.verifying_key()) }), &serde_json::to_value(claims).expect("claims"))
+        jws_sign(
+            &self.key,
+            json!({ "alg": "EdDSA", "typ": IDENTITY_TYP, "kid": key_id(&self.verifying_key()) }),
+            &serde_json::to_value(claims).expect("claims"),
+        )
     }
 }
 
@@ -321,9 +379,16 @@ mod tests {
 
     fn spec(zone: &str, agent: &str, act: Option<Value>) -> IdentitySpec {
         IdentitySpec {
-            tenant: "t0".into(), zone: zone.into(), agent: agent.into(), run: "run_a".into(), parent_run: None,
-            manifest_sha256: "m".into(), image: "img".into(), node: "local".into(),
-            principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}), act,
+            tenant: "t0".into(),
+            zone: zone.into(),
+            agent: agent.into(),
+            run: "run_a".into(),
+            parent_run: None,
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
+            act,
         }
     }
 
@@ -335,8 +400,18 @@ mod tests {
     fn the_chain_runs_from_the_human_through_each_parent() {
         let i = Issuer::generate("test.local");
         let lead = verify_identity(&issue(&i, &AgentKey::generate(), "research", "lead"), &i.verifying_key(), 1500).unwrap();
-        let child = verify_identity(&i.issue(&spec("research", "fetcher", Some(lead.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
-        let grandchild = verify_identity(&i.issue(&spec("research", "reader", Some(child.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
+        let child = verify_identity(
+            &i.issue(&spec("research", "fetcher", Some(lead.act_for_child())), 1000, 3600, &AgentKey::generate().public()),
+            &i.verifying_key(),
+            1500,
+        )
+        .unwrap();
+        let grandchild = verify_identity(
+            &i.issue(&spec("research", "reader", Some(child.act_for_child())), 1000, 3600, &AgentKey::generate().public()),
+            &i.verifying_key(),
+            1500,
+        )
+        .unwrap();
         assert_eq!(grandchild.chain(), vec!["alice (cli, unix-user)", "lead", "fetcher", "reader"]);
         assert_eq!(grandchild.principal["id"], "alice");
     }
@@ -400,12 +475,35 @@ mod tests {
     }
 
     #[test]
+    fn the_trust_domain_is_required_validated_and_fixed() {
+        let dir = std::env::temp_dir().join(format!("wicket-td-test-{}", std::process::id()));
+        let path = dir.join("root.key");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(Issuer::load(&path, None), Err(IdError::TrustDomain(_))), "required on a fresh install");
+        for bad in ["", "Wicket.Example.com", "spiffe://x", "x:8443", "a/b", ".x", "x..y"] {
+            assert!(matches!(Issuer::load(&path, Some(bad)), Err(IdError::TrustDomain(_))), "{bad:?}");
+        }
+        let a = Issuer::load(&path, Some("wicket.example.com")).unwrap();
+        assert_eq!(a.issuer_id(), "spiffe://wicket.example.com");
+        assert_eq!(Issuer::load(&path, None).unwrap().trust_domain, "wicket.example.com");
+        assert!(matches!(Issuer::load(&path, Some("other.example.com")), Err(IdError::TrustDomain(_))), "fixed once created");
+        // An installation from before trust domains were recorded keeps its key, under the old default,
+        // and documents it issued still verify.
+        let doc = a.issue(&spec("z", "a", None), 1000, 600, &SigningKey::generate(&mut rand_core::OsRng).verifying_key());
+        std::fs::remove_file(path.with_extension("trust-domain")).unwrap();
+        let legacy = Issuer::load(&path, None).unwrap();
+        assert_eq!(legacy.trust_domain, LEGACY_TRUST_DOMAIN);
+        assert!(verify_identity(&doc, &legacy.verifying_key(), 1100).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn issuer_key_is_created_once_with_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wicket-id-test-{}", std::process::id()));
         let path = dir.join("root.key");
-        let a = Issuer::load_or_create(&path, "t.local").unwrap();
-        let b = Issuer::load_or_create(&path, "t.local").unwrap();
+        let a = Issuer::load(&path, Some("t.local")).unwrap();
+        let b = Issuer::load(&path, None).unwrap();
         assert_eq!(a.verifying_key(), b.verifying_key());
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let jwk: Value = serde_json::from_slice(&std::fs::read(path.with_extension("pub.json")).unwrap()).unwrap();
