@@ -38,7 +38,8 @@ jobs:
           curl -sSfLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
           echo "${GITLEAKS_SHA256}  $f" | sha256sum -c -
           tar xzf "$f" gitleaks
-          ./gitleaks git --redact --no-banner --log-opts="--all" --config .gitleaks.toml .
+          # Every commit reachable from the one under test (not other branches, which have their own runs).
+          ./gitleaks git --redact --no-banner --log-opts="HEAD" --config .gitleaks.toml .
 
   rust:
     name: Format, clippy and tests
