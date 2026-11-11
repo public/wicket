@@ -408,9 +408,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // request_capacity (#7): agents may ask when a placement backend is configured; a human decides.
     let capacity = match (&m.agent, crate::capacity::PlacementConfig::load()) {
-        (Some(_), Ok(Some(cfg))) => {
-            Some(crate::capacity::hook(m.tenant.clone(), run.clone(), m.zone.name.clone(), ledger.clone(), cfg))
-        }
+        (Some(_), Ok(Some(cfg))) => Some(crate::capacity::hook(m.tenant.clone(), run.clone(), m.zone.name.clone(), ledger.clone(), cfg)),
         (Some(_), Err(e)) => {
             eprintln!("[wicket] request_capacity is off: {e:#}");
             None

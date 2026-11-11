@@ -342,7 +342,13 @@ impl Gateway {
                 match hook(crate::CapacityCall::Status(lease.to_string())) {
                     Ok(crate::CapacityState::Settled(t)) => return (t, false),
                     Ok(crate::CapacityState::Waiting(t)) if start.elapsed() >= timeout => {
-                        return (format!("{t} (still waiting after {}s; you may call request_capacity with lease {lease} again)", timeout.as_secs()), false)
+                        return (
+                            format!(
+                                "{t} (still waiting after {}s; you may call request_capacity with lease {lease} again)",
+                                timeout.as_secs()
+                            ),
+                            false,
+                        )
                     }
                     Ok(crate::CapacityState::Waiting(_)) => tokio::time::sleep(Duration::from_millis(1000)).await,
                     Err(e) => return (e, true),
@@ -772,8 +778,12 @@ mod tests {
 
     #[test]
     fn request_capacity_arguments_are_typed_and_bounded() {
-        let a = capacity_ask(&json!({ "vcpus": 2, "memory_mib": 4096, "duration_minutes": 90, "max_hourly_usd": 0.03, "reason": "build" })).unwrap();
-        assert_eq!((a.vcpus, a.memory_mib, a.duration_secs, a.max_hourly_usd.as_str(), a.isolation.as_str()), (2, 4096, 5400, "0.03", "gvisor"));
+        let a = capacity_ask(&json!({ "vcpus": 2, "memory_mib": 4096, "duration_minutes": 90, "max_hourly_usd": 0.03, "reason": "build" }))
+            .unwrap();
+        assert_eq!(
+            (a.vcpus, a.memory_mib, a.duration_secs, a.max_hourly_usd.as_str(), a.isolation.as_str()),
+            (2, 4096, 5400, "0.03", "gvisor")
+        );
         assert!(capacity_ask(&json!({ "duration_minutes": 10, "max_hourly_usd": "0.01" })).unwrap_err().contains("reason"));
         assert!(capacity_ask(&json!({ "duration_minutes": 10, "reason": "x" })).unwrap_err().contains("max_hourly_usd"));
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());

@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wicket_placement::boot::{cloud_config, HostKeyPair, NODE_SETUP};
 use wicket_placement::envelope::SpendRequest;
+use wicket_placement::mock::{serve, KEY};
 use wicket_placement::model::Boot;
 use wicket_placement::vultr::{ApiKey, Client, Retry, VultrConfig, VultrProvider};
-use wicket_placement::mock::{serve, KEY};
 use wicket_placement::*;
 
 fn client(base: &str) -> Client {

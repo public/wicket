@@ -278,7 +278,13 @@ pub struct Placed {
 /// Resolves a placement hint. Authority only narrows here too: `{lease}` must be a lease this run
 /// holds and that is active; `{node}` must be the node this run itself runs on, or the node of an
 /// active lease it holds. None: no hint, the child runs where the parent does.
-pub fn placement(l: &Ledger, run: &str, own_node: Option<&str>, hint: Option<&serde_json::Value>, now: i64) -> Result<Option<Placed>, String> {
+pub fn placement(
+    l: &Ledger,
+    run: &str,
+    own_node: Option<&str>,
+    hint: Option<&serde_json::Value>,
+    now: i64,
+) -> Result<Option<Placed>, String> {
     let Some(h) = hint else { return Ok(None) };
     let lease_ok = |id: &str| -> Result<(String, String), String> {
         let x = l.lease(id).map_err(|e| e.to_string())?.filter(|x| x.run == run).ok_or(format!("no lease {id} held by this run"))?;
@@ -295,17 +301,22 @@ pub fn placement(l: &Ledger, run: &str, own_node: Option<&str>, hint: Option<&se
     }
     if let Some(n) = h.get("node").and_then(|v| v.as_str()) {
         let own = own_node.is_some_and(|o| {
-            o == n || l.node(n).ok().flatten().is_some_and(|r| r.target == o) || l.node_by_target(o).ok().flatten().is_some_and(|r| r.name == n)
+            o == n
+                || l.node(n).ok().flatten().is_some_and(|r| r.target == o)
+                || l.node_by_target(o).ok().flatten().is_some_and(|r| r.name == n)
         });
         if own {
             return Ok(Some(Placed { node: n.to_string(), lease: None }));
         }
-        let held = l.leases(&["active"]).map_err(|e| e.to_string())?.into_iter().find(|x| x.run == run && x.node_name.as_deref() == Some(n));
+        let held =
+            l.leases(&["active"]).map_err(|e| e.to_string())?.into_iter().find(|x| x.run == run && x.node_name.as_deref() == Some(n));
         if let Some(x) = held {
             let (lease, node) = lease_ok(&x.id)?;
             return Ok(Some(Placed { node, lease: Some(lease) }));
         }
-        return Err(format!("node {n} is neither where this agent runs nor the node of a lease it holds: ask for one with request_capacity"));
+        return Err(format!(
+            "node {n} is neither where this agent runs nor the node of a lease it holds: ask for one with request_capacity"
+        ));
     }
     Err("placement must be {\"lease\": \"l-…\"} or {\"node\": \"<name>\"}".into())
 }

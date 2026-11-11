@@ -390,7 +390,13 @@ where
         self.did(
             "created",
             &n.id.0,
-            &format!("for lease {} ({}, {}/h, until {})", lease.id, n.plan.as_deref().unwrap_or("?"), n.billing.hourly_rate(), n.lease_until.map(capacity::fmt_time).unwrap_or_default()),
+            &format!(
+                "for lease {} ({}, {}/h, until {})",
+                lease.id,
+                n.plan.as_deref().unwrap_or("?"),
+                n.billing.hourly_rate(),
+                n.lease_until.map(capacity::fmt_time).unwrap_or_default()
+            ),
             Some(&lease.run),
         );
         self.make_ready(&lease.id, n).await
@@ -412,7 +418,12 @@ where
             Ok((name, target)) => {
                 let until = n.lease_until.or(lease.not_after).unwrap_or(self.now + lease.duration_secs);
                 self.ledger.lease_activated(&lease.id, &name, &target, until)?;
-                self.did("lease_active", &lease.id, &format!("node {name} ({target}) until {}", capacity::fmt_time(until)), Some(&lease.run));
+                self.did(
+                    "lease_active",
+                    &lease.id,
+                    &format!("node {name} ({target}) until {}", capacity::fmt_time(until)),
+                    Some(&lease.run),
+                );
             }
             Err(e) => {
                 self.end_lease(&lease, "failed", &format!("setting up its node: {e:#}")).await?;
@@ -632,7 +643,16 @@ pub mod setup {
             if self.hosts.is_empty() {
                 anyhow::bail!("placement.yaml has no node_hosts for the node's CA");
             }
-            let (_, target) = crate::place::bring_up(p, &node.id, &name, &pinned, self.ssh_key.clone(), Some(self.hosts.clone()), std::time::Duration::from_secs(24 * 3600)).await?;
+            let (_, target) = crate::place::bring_up(
+                p,
+                &node.id,
+                &name,
+                &pinned,
+                self.ssh_key.clone(),
+                Some(self.hosts.clone()),
+                std::time::Duration::from_secs(24 * 3600),
+            )
+            .await?;
             crate::enrol::install(&name, self.ssh_key.as_deref(), false).await?;
             Ok((name, target))
         }
@@ -749,8 +769,10 @@ mod tests {
     impl FakeBoxes {
         fn with(boxes: &[(&str, &str, &str)]) -> FakeBoxes {
             let f = FakeBoxes::default();
-            *f.boxes.lock().unwrap() =
-                boxes.iter().map(|(n, r, o)| BoxInfo { name: n.to_string(), run: Some(r.to_string()), owner: Some(o.to_string()) }).collect();
+            *f.boxes.lock().unwrap() = boxes
+                .iter()
+                .map(|(n, r, o)| BoxInfo { name: n.to_string(), run: Some(r.to_string()), owner: Some(o.to_string()) })
+                .collect();
             f
         }
         fn killed(&self) -> Vec<String> {
@@ -1140,7 +1162,8 @@ mod tests {
         let lease = approved_lease(&mut l, &cfg("vultr"), "run_a");
         assert_eq!(l.lease_reservations(&t.0, None, false).unwrap(), (20_000, 20_000));
         let end = NOW + 3000;
-        st.lock().unwrap().instances = vec![vultr_mock::instance("mine", &[o.tag(), o.idem_tag(&lease_key(&lease)), Owner::lease_tag(end)])];
+        st.lock().unwrap().instances =
+            vec![vultr_mock::instance("mine", &[o.tag(), o.idem_tag(&lease_key(&lease)), Owner::lease_tag(end)])];
         let w = World::new(vultr(&base));
         w.pass(&mut l, NOW + 600, false).await;
         assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active");
@@ -1164,6 +1187,8 @@ mod tests {
         assert!(audited(&l, "reconcile.destroyed") >= 1);
     }
 
+    // The pass needs the ledger the hook shares; nothing else takes the lock in this test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn request_capacity_through_the_gateway_hook_from_ask_to_ready() {
         let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));

@@ -236,7 +236,8 @@ pub fn hook(tenant: TenantId, run: RunId, zone: String, ledger: Arc<Mutex<Ledger
 
 /// Files a capacity ask: a pending lease with its money reserved, and the request a human decides.
 pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId, zone: &str, a: &CapacityAsk) -> Result<CapacityState> {
-    let iso = IsolationTier::parse(&a.isolation).with_context(|| format!("isolation must be process, gvisor or vm, not {:?}", a.isolation))?;
+    let iso =
+        IsolationTier::parse(&a.isolation).with_context(|| format!("isolation must be process, gvisor or vm, not {:?}", a.isolation))?;
     let max = MicroUsd::parse_dollars(&a.max_hourly_usd).with_context(|| format!("{:?} is not a dollar amount", a.max_hourly_usd))?;
     let live = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter(|x| x.run == run.0).count();
     if live >= MAX_LIVE_PER_RUN {

@@ -108,29 +108,29 @@ impl Provider for StaticHosts {
         let h =
             self.hosts.iter().find(|h| h.name == spec.offer.plan).ok_or_else(|| anyhow::anyhow!("no static host {}", spec.offer.plan))?;
         self.with(true, |a| {
-        if !spec.offer.resources.fits_in(&Self::free(a, h)) {
-            anyhow::bail!("host {} no longer has room", h.name);
-        }
-        a.next += 1;
-        let id = format!("{}#{}", h.name, a.next);
-        let n = NodeHandle {
-            id: NodeId(id.clone()),
-            backend: "static".into(),
-            name: h.name.clone(),
-            ssh_target: Some(h.ssh_target.clone()),
-            region: h.region.clone(),
-            plan: Some(h.name.clone()),
-            isolation: h.isolation,
-            resources: spec.offer.resources,
-            billing: BillingModel::Free,
-            created_at: now(),
-            lease_until: Owner::lease_from_tags(&spec.tags),
-            host_key: None,
-            tags: spec.tags.clone(),
-            state: NodeState::Active,
-        };
-        a.by_id.insert(id, n.clone());
-        Ok(n)
+            if !spec.offer.resources.fits_in(&Self::free(a, h)) {
+                anyhow::bail!("host {} no longer has room", h.name);
+            }
+            a.next += 1;
+            let id = format!("{}#{}", h.name, a.next);
+            let n = NodeHandle {
+                id: NodeId(id.clone()),
+                backend: "static".into(),
+                name: h.name.clone(),
+                ssh_target: Some(h.ssh_target.clone()),
+                region: h.region.clone(),
+                plan: Some(h.name.clone()),
+                isolation: h.isolation,
+                resources: spec.offer.resources,
+                billing: BillingModel::Free,
+                created_at: now(),
+                lease_until: Owner::lease_from_tags(&spec.tags),
+                host_key: None,
+                tags: spec.tags.clone(),
+                state: NodeState::Active,
+            };
+            a.by_id.insert(id, n.clone());
+            Ok(n)
         })
     }
 

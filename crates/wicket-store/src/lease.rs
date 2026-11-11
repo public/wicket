@@ -133,7 +133,10 @@ impl Ledger {
     pub fn create_lease(&mut self, l: &LeaseRow, budget: LeaseBudget) -> Result<std::result::Result<(), BudgetRefusal>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (hourly, total): (i64, i64) = tx.query_row(
-            &format!("SELECT COALESCE(SUM(hourly_cap), 0), COALESCE(SUM(reserved), 0) FROM leases WHERE tenant = ?1 AND status IN ({})", live_in()),
+            &format!(
+                "SELECT COALESCE(SUM(hourly_cap), 0), COALESCE(SUM(reserved), 0) FROM leases WHERE tenant = ?1 AND status IN ({})",
+                live_in()
+            ),
             params![l.tenant],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -235,7 +238,10 @@ impl Ledger {
     /// Brings an active lease's end forward to `at` (the operator releasing it early): the next
     /// reconcile pass stops what runs on it and destroys its node.
     pub fn set_lease_not_after(&self, id: &str, at: i64) -> Result<bool> {
-        let n = self.conn.execute("UPDATE leases SET not_after = MIN(COALESCE(not_after, ?2), ?2) WHERE id = ?1 AND status = 'active'", params![id, at])?;
+        let n = self.conn.execute(
+            "UPDATE leases SET not_after = MIN(COALESCE(not_after, ?2), ?2) WHERE id = ?1 AND status = 'active'",
+            params![id, at],
+        )?;
         Ok(n == 1)
     }
 
