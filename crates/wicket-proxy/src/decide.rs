@@ -306,6 +306,7 @@ mod tests {
             identity: None,
             spawner: None,
             swaps: vec![],
+            capacity: None,
         }
     }
 

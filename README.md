@@ -29,8 +29,8 @@ What it does:
   human approves or denies them with `wicket approve` / `wicket deny`, and the grant is single-use and expiring by
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
-- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reap`
-  (each box is labelled with the process that owns it); the run ends as `lost`.
+- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reconcile`
+  (or `wicket reap`; each box is labelled with the process that owns it); the run ends as `lost`.
 
 #### Agent identity and child agents
 
@@ -171,8 +171,49 @@ wicket place release <instance-id>                  # destroy now and revoke the
   only that key), enrols the node with `--host-key`, and replaces the instance's user data so the private key
   isn't left in the metadata service. There's no trust on first use: `wicket node enrol --trust-first-use` is
   only for nodes made some other way.
-- **Not yet:** `spawn` with a placement hint, warm reuse across processes, and the reconciler daemon (#38,
-  for which `wicket_placement::reconcile` is the pure decision function).
+- **Not yet:** warm reuse across processes.
+
+#### Capacity leases and the reconciler
+
+An agent asks for a machine of its own with the gateway's `request_capacity` tool (CPU, memory, isolation tier,
+region, duration, an hourly price cap, a reason). Capacity is a **lease**, never a cloud credential:
+
+1. The ask becomes a pending lease in the ledger with its worst case reserved (every started hour at the
+   agent's own cap), atomically against `max_hourly_usd`/`max_total_usd` in `placement.yaml`
+   (`examples/placement.yaml`; without it the tool is off). Over budget is refused before a human sees it.
+2. A human decides it like any escalation (`wicket pending`, `wicket approve`/`deny`, or the console). The
+   approval is bound to that lease: the placer may spend only on its node, and only up to its reservation.
+3. The reconciler acquires the node (a static host, or a fresh Vultr node with its host key pinned before it
+   boots), enrols it and runs `wicket node install`. The agent waits with `request_capacity {lease}`, then
+   starts children there with `spawn` and `placement: {"lease": "l-…"}` (or `{"node": "<name>"}` for the node
+   it runs on, or a leased one). A child runs there through `wicket node serve`.
+4. At the lease's end, or when its holder run ends, the runs placed on it stop and its node is destroyed (on
+   Vultr, before the next paid hour); the lease records what the node billed.
+
+```sh
+wicket reconcile --dry-run        # what one pass would change
+wicket reconcile                  # one pass
+wicket reconcile --every 30s      # the daemon: run it beside `wicket serve`, e.g. as a systemd user service
+wicket lease list                 # status, holder run, node, reserved, end, billed
+wicket lease release <lease>      # end it now (one pass)
+```
+
+One pass (`wicket reconcile`, #38) compares the provider's instances, enrolled nodes and the boxes on this host
+and on every node with the ledger's runs and leases, and makes them agree. `wicket approve` of a capacity ask runs
+a pass at once; everything else (lease ends, approvals on the console) waits for the next `--every` pass.
+
+- **Runs** whose `wicket run` process is gone end as `lost` (a run supervised on another machine is left to it).
+- **Leases** end when their run has ended or their end has passed; denied or withdrawn asks give their
+  reservation back.
+- **Machines.** Only instances tagged `wicket-owner-<installation>` are ever listed. One no live lease needs is
+  destroyed; one that matches a lease the ledger lost track of (a crash between create and record) is adopted,
+  not created again. Ownership is checked again right before every destroy, so a tag changed or a
+  `wicket-protected` tag added since the list saves the machine.
+- **Boxes** (`wicket=1` containers) whose run ended or whose owner process died are stopped; a box whose run this
+  ledger doesn't know is left alone, since Docker may be shared. This subsumes `wicket reap`.
+- Every change is an audit record `reconcile.<what>`. One pass at a time per installation (a file lock).
+- So killing every control-plane process mid-run and restarting leaves no orphaned machine or box after one
+  pass. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).
 
 ## Requirements
 

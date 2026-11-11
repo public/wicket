@@ -137,10 +137,18 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let yaml = serde_yaml::to_string(&cm).map_err(|e| e.to_string())?;
     // An approval binds to the request as the agent stated it (defaults derived at call time, such
     // as the time left, would change between the ask and the retry).
-    let stated = serde_json::json!({
+    let mut stated = serde_json::json!({
         "name": name, "kind": req.kind, "task": req.task, "command": req.command, "image": image,
         "zone": req.zone, "reach_hosts": req.reach_hosts, "max_children": req.max_children,
     });
+    if let Some(p) = &req.placement {
+        stated["placement"] = p.clone();
+    }
+    // Where it runs: decided before anything is asked or carved, so a bad hint costs nothing.
+    let placed = {
+        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
+        placement(&l, &c.run.0, c.node.as_deref(), req.placement.as_ref(), wicket_store::now())?
+    };
     let digest = hex::encode(sha2::Sha256::digest(stated.to_string().as_bytes()));
 
     // Within the parent's authority, or approved by a human for exactly this zone.
@@ -206,11 +214,21 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let log = std::fs::File::create(cdir.join(format!("{}.log", child.0))).map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.args(["run", "--run-id", &child.0, "--parent-run", &c.run.0, "--image", &image]);
-    if let Some(n) = &c.node {
-        cmd.args(["--node", n]);
-    }
-    if let Some(k) = &c.ssh_key {
-        cmd.arg("--ssh-key").arg(k);
+    match &placed {
+        Some(p) => {
+            cmd.args(["--node", &p.node]);
+            if let Some(lease) = &p.lease {
+                cmd.args(["--lease", lease]);
+            }
+        }
+        None => {
+            if let Some(n) = &c.node {
+                cmd.args(["--node", n]);
+            }
+            if let Some(k) = &c.ssh_key {
+                cmd.arg("--ssh-key").arg(k);
+            }
+        }
     }
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     cmd.arg(&yaml_path).stdin(std::process::Stdio::null()).stdout(log2).stderr(log);
@@ -225,8 +243,9 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     c.children.lock().map_err(|_| "children lock")?.push((child.0.clone(), proc));
     let budget =
         cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
+    let at = placed.as_ref().map(|p| format!(" on node {}", p.node)).unwrap_or_default();
     Ok(format!(
-        "started {} {name} as run {}: its own box and identity, zone {zone_name}{}{budget}. {}",
+        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{}{budget}. {}",
         req.kind,
         child.0,
         if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
@@ -236,4 +255,48 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
             "It sends you run_finished when it exits."
         }
     ))
+}
+
+/// Where a child runs, from `spawn`'s placement hint.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Placed {
+    /// The enrolled node (`wicket run --node`).
+    pub node: String,
+    /// The lease it is placed on: the reconciler stops it when the lease ends.
+    pub lease: Option<String>,
+}
+
+/// Resolves a placement hint. Authority only narrows here too: `{lease}` must be a lease this run
+/// holds and that is active; `{node}` must be the node this run itself runs on, or the node of an
+/// active lease it holds. None: no hint, the child runs where the parent does.
+pub fn placement(l: &Ledger, run: &str, own_node: Option<&str>, hint: Option<&serde_json::Value>, now: i64) -> Result<Option<Placed>, String> {
+    let Some(h) = hint else { return Ok(None) };
+    let lease_ok = |id: &str| -> Result<(String, String), String> {
+        let x = l.lease(id).map_err(|e| e.to_string())?.filter(|x| x.run == run).ok_or(format!("no lease {id} held by this run"))?;
+        match (x.status.as_str(), &x.node_name) {
+            ("active", Some(n)) if x.not_after.is_none_or(|t| t > now) => Ok((x.id, n.clone())),
+            ("active", Some(_)) => Err(format!("lease {id} has ended")),
+            ("pending" | "approved", _) => Err(format!("lease {id} is {}: wait for it with request_capacity and lease {id}", x.status)),
+            (s, _) => Err(format!("lease {id} is {s}")),
+        }
+    };
+    if let Some(id) = h.get("lease").and_then(|v| v.as_str()) {
+        let (lease, node) = lease_ok(id)?;
+        return Ok(Some(Placed { node, lease: Some(lease) }));
+    }
+    if let Some(n) = h.get("node").and_then(|v| v.as_str()) {
+        let own = own_node.is_some_and(|o| {
+            o == n || l.node(n).ok().flatten().is_some_and(|r| r.target == o) || l.node_by_target(o).ok().flatten().is_some_and(|r| r.name == n)
+        });
+        if own {
+            return Ok(Some(Placed { node: n.to_string(), lease: None }));
+        }
+        let held = l.leases(&["active"]).map_err(|e| e.to_string())?.into_iter().find(|x| x.run == run && x.node_name.as_deref() == Some(n));
+        if let Some(x) = held {
+            let (lease, node) = lease_ok(&x.id)?;
+            return Ok(Some(Placed { node, lease: Some(lease) }));
+        }
+        return Err(format!("node {n} is neither where this agent runs nor the node of a lease it holds: ask for one with request_capacity"));
+    }
+    Err("placement must be {\"lease\": \"l-…\"} or {\"node\": \"<name>\"}".into())
 }

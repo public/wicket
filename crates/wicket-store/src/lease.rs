@@ -232,6 +232,13 @@ impl Ledger {
         Ok(())
     }
 
+    /// Brings an active lease's end forward to `at` (the operator releasing it early): the next
+    /// reconcile pass stops what runs on it and destroys its node.
+    pub fn set_lease_not_after(&self, id: &str, at: i64) -> Result<bool> {
+        let n = self.conn.execute("UPDATE leases SET not_after = MIN(COALESCE(not_after, ?2), ?2) WHERE id = ?1 AND status = 'active'", params![id, at])?;
+        Ok(n == 1)
+    }
+
     /// Ends a live lease: `status` is `ended`, `failed`, `denied` or `withdrawn`. False if it had
     /// already ended.
     pub fn lease_ended(&self, id: &str, status: &str, detail: &str, billed: Option<i64>) -> Result<bool> {

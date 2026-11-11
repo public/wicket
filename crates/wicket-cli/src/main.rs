@@ -5,6 +5,7 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod capacity;
 mod chan;
 mod enrol;
 mod mock;
@@ -14,6 +15,7 @@ mod nodesrv;
 mod place;
 mod program;
 mod reap;
+mod reconcile;
 mod run;
 mod serve;
 mod spawn;
@@ -88,6 +90,9 @@ enum Cmd {
         /// Internal: the run that started this one (`spawn_agent`).
         #[arg(long, hide = true)]
         parent_run: Option<String>,
+        /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).
+        #[arg(long, hide = true)]
+        lease: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
     /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
@@ -190,6 +195,24 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<PathBuf>,
     },
+    /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
+    /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
+    /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
+    /// ended, here and on enrolled nodes. Records every change in the audit log.
+    Reconcile {
+        /// Only report what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep running, one pass per interval (e.g. 30s).
+        #[arg(long)]
+        every: Option<String>,
+    },
+    /// Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the ask with
+    /// `wicket approve`/`deny` (see `wicket pending`).
+    Lease {
+        #[command(subcommand)]
+        cmd: LeaseCmd,
+    },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         #[arg(long, default_value = "wicket/claude-code:poc")]
@@ -212,6 +235,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DevCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum LeaseCmd {
+    /// Every lease: status, holder run, node, money reserved, end.
+    List,
+    /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
+    Release { id: String },
 }
 
 #[derive(Subcommand)]
@@ -477,7 +508,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease } => {
             run::run(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
@@ -488,6 +519,7 @@ async fn main() -> Result<()> {
                 ssh_key: ssh_key.as_deref(),
                 run_id,
                 parent_run,
+                lease,
                 wrap: None,
             })
             .await
@@ -503,6 +535,7 @@ async fn main() -> Result<()> {
                 ssh_key: None,
                 run_id: None,
                 parent_run: None,
+                lease: None,
                 wrap: Some(argv),
             })
             .await
@@ -565,6 +598,7 @@ async fn main() -> Result<()> {
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
+            let lease = capacity::lease_of_request(&req).map(String::from);
             let gid = l.approve(
                 &id,
                 &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
@@ -589,12 +623,26 @@ async fn main() -> Result<()> {
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
                 humantime::format_duration(ttl)
             );
+            if let Some(lease) = lease.as_deref() {
+                // A capacity ask: provision now rather than at the next pass of a running reconciler.
+                drop(l);
+                println!("provisioning lease {lease} (one reconcile pass)");
+                reconcile::print(&reconcile::pass(false).await?, false);
+                if let Some(x) = Ledger::open(&ledger_path())?.lease(lease)? {
+                    println!("lease {lease}: {} {}", x.status, x.node_name.or(x.detail).unwrap_or_default());
+                }
+            }
             Ok(())
         }
         Cmd::Deny { id } => {
             let l = Ledger::open(&ledger_path())?;
             l.deny(&id, &operator())?;
             l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": id, "decision": "deny", "by": operator() }))?;
+            let req = l.request(&id)?;
+            if let Some(lease) = capacity::lease_of_request(&req) {
+                l.lease_ended(lease, "denied", &format!("request {id} denied by {}", operator()), None)?;
+                println!("lease {lease} denied: its reservation is released");
+            }
             println!("denied {id}");
             Ok(())
         }
@@ -707,6 +755,29 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { image } => doctor(&image).await,
+        Cmd::Reconcile { dry_run, every } => {
+            let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
+            reconcile::command(dry_run, every).await
+        }
+        Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
+        Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
+            let l = Ledger::open(&ledger_path())?;
+            let x = l.lease(&id)?.with_context(|| format!("no lease {id}"))?;
+            let why = format!("released by {}", operator());
+            match x.status.as_str() {
+                "active" => {
+                    l.set_lease_not_after(&id, wicket_store::now())?;
+                }
+                "pending" | "approved" => {
+                    l.lease_ended(&id, "withdrawn", &why, None)?;
+                }
+                s => bail!("lease {id} is {s}"),
+            }
+            l.audit(&TenantId::single(), None, "lease.released", &serde_json::json!({ "lease": id, "by": operator() }))?;
+            drop(l);
+            reconcile::print(&reconcile::pass(false).await?, false);
+            Ok(())
+        }
         Cmd::Reap { dry_run, node, ssh_key } => {
             let docker = match node {
                 Some(n) => wicket_sandbox::Docker::over_ssh(enrol::resolve_installed(&n, ssh_key.as_deref())?.ssh_prefix()),
