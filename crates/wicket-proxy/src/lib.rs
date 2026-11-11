@@ -142,9 +142,29 @@ pub fn attributed_agents(v: &serde_json::Value) -> Vec<String> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
-    Egress { method: String, host: String, path: String, risk: String, outcome: String, detail: String },
-    Llm { model: Option<String>, status: u16, input_tokens: u64, output_tokens: u64, requests: u64, outcome: String },
-    Tool { name: String, detail: String },
+    Egress {
+        method: String,
+        host: String,
+        path: String,
+        risk: String,
+        outcome: String,
+        detail: String,
+    },
+    /// One model call. `input_tokens` is the uncached input; `cached_tokens` the cache reads and
+    /// cache writes on top of it (all three count toward `max_input_tokens`).
+    Llm {
+        model: Option<String>,
+        status: u16,
+        input_tokens: u64,
+        cached_tokens: u64,
+        output_tokens: u64,
+        requests: u64,
+        outcome: String,
+    },
+    Tool {
+        name: String,
+        detail: String,
+    },
 }
 
 impl RunCtx {

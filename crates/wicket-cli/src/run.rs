@@ -747,6 +747,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         "status": status, "seconds": started.elapsed().as_secs(),
         "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
         "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_read_input_tokens": llm.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_creation_input_tokens": llm.cache_creation_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "input_tokens_total": llm.input_total(),
         "output_tokens": llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "pending_requests": pending, "result": result,
     });
@@ -756,8 +759,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         l.audit(&m.tenant, Some(&run), "run.end", &summary)?;
     }
     println!(
-        "\n[wicket] run {run}: {status} in {}s; {} model requests, {} in / {} out tokens",
-        summary["seconds"], summary["model_requests"], summary["input_tokens"], summary["output_tokens"]
+        "\n[wicket] run {run}: {status} in {}s; {} model requests, {} in ({} of them cached) / {} out tokens",
+        summary["seconds"],
+        summary["model_requests"],
+        summary["input_tokens_total"],
+        llm.input_total() - llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        summary["output_tokens"]
     );
     match &result {
         Some(r) => println!("[wicket] result.json: {}", wicket_agent::clip(&r.to_string(), 1200)),
@@ -787,9 +794,9 @@ fn print_event(ev: &Event) {
             }
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
-        Event::Llm { model, status, input_tokens, output_tokens, requests, outcome } => {
+        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
             println!(
-                "[llm]    #{requests} {} → {status}  in {input_tokens} / out {output_tokens}  ({outcome})",
+                "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({outcome})",
                 model.as_deref().unwrap_or("?")
             );
         }
