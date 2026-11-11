@@ -28,6 +28,9 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// One audit entry as `audit_tail` returns it: sequence, timestamp, kind, run, body.
+pub type AuditRow = (i64, i64, String, Option<String>, String);
+
 pub struct Ledger {
     conn: Connection,
 }
@@ -191,10 +194,8 @@ impl Ledger {
     /// Ends a run. Its still-pending requests are withdrawn: a request belongs to the work that
     /// raised it, and must not be approvable after that work is gone.
     pub fn run_ended(&self, run: &RunId, status: &str, detail: &str) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1",
-            params![run.0, status, now(), detail],
-        )?;
+        self.conn
+            .execute("UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1", params![run.0, status, now(), detail])?;
         let n = self.conn.execute(
             "UPDATE requests SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE run = ?1 AND status = 'pending'",
             params![run.0, now()],
@@ -224,7 +225,10 @@ impl Ledger {
                 let mut list: Vec<serde_json::Value> = serde_json::from_str(&attr).unwrap_or_default();
                 if !list.iter().any(|x| same_askers(x, w)) && list.len() < 8 {
                     list.push(w.clone());
-                    self.conn.execute("UPDATE requests SET attribution = ?2 WHERE id = ?1", params![id, serde_json::Value::from(list).to_string()])?;
+                    self.conn.execute(
+                        "UPDATE requests SET attribution = ?2 WHERE id = ?1",
+                        params![id, serde_json::Value::from(list).to_string()],
+                    )?;
                 }
             }
             return Ok((id, false));
@@ -244,7 +248,8 @@ impl Ledger {
     /// Queues a follow-up from the operator for a running agent. Operator text is trusted task text
     /// (it comes from the principal), unlike anything an agent or a web page says.
     pub fn add_operator_message(&self, run: &str, text: &str, by: &str) -> Result<i64> {
-        self.conn.execute("INSERT INTO operator_messages (run, text, by, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, text, by, now()])?;
+        self.conn
+            .execute("INSERT INTO operator_messages (run, text, by, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, text, by, now()])?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -268,7 +273,10 @@ impl Ledger {
     /// Replaces a run's current identity document (rotation) and keeps the old one in history.
     pub fn rotate_identity(&self, run: &str, jws: &str, issued_at: i64, expires_at: i64) -> Result<()> {
         self.conn.execute("UPDATE identities SET jws = ?2, issued_at = ?3 WHERE run = ?1", params![run, jws, issued_at])?;
-        self.conn.execute("INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4)", params![run, jws, issued_at, expires_at])?;
+        self.conn.execute(
+            "INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![run, jws, issued_at, expires_at],
+        )?;
         Ok(())
     }
 
@@ -282,7 +290,10 @@ impl Ledger {
     /// Revokes a run's identity: its messages stop being delivered, its requests can't be
     /// approved, and its runner stops the box. Idempotent.
     pub fn revoke(&self, run: &str, by: &str, reason: &str) -> Result<bool> {
-        Ok(self.conn.execute("INSERT OR IGNORE INTO revocations (run, revoked_at, by, reason) VALUES (?1, ?2, ?3, ?4)", params![run, now(), by, reason])? > 0)
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO revocations (run, revoked_at, by, reason) VALUES (?1, ?2, ?3, ?4)",
+            params![run, now(), by, reason],
+        )? > 0)
     }
 
     /// Whether this run or any run it descends from is revoked: a child acts on its parent's
@@ -301,7 +312,12 @@ impl Ledger {
 
     /// When and why a run's identity was revoked, if it was.
     pub fn revoked(&self, run: &str) -> Result<Option<(i64, String, String)>> {
-        Ok(self.conn.query_row("SELECT revoked_at, by, reason FROM revocations WHERE run = ?1", params![run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+        Ok(self
+            .conn
+            .query_row("SELECT revoked_at, by, reason FROM revocations WHERE run = ?1", params![run], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
     }
 
     /// Records the identity document wicket issued for a run.
@@ -309,21 +325,40 @@ impl Ledger {
         self.conn.execute(
             "INSERT OR REPLACE INTO identities (run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id.run, id.tenant, id.spiffe_id, id.zone, id.agent, id.parent_run, serde_json::Value::from(id.accept_from.clone()).to_string(), id.jws, id.issued_at],
+            params![
+                id.run,
+                id.tenant,
+                id.spiffe_id,
+                id.zone,
+                id.agent,
+                id.parent_run,
+                serde_json::Value::from(id.accept_from.clone()).to_string(),
+                id.jws,
+                id.issued_at
+            ],
         )?;
-        self.conn.execute("INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, 0)", params![id.run, id.jws, id.issued_at])?;
+        self.conn.execute(
+            "INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, 0)",
+            params![id.run, id.jws, id.issued_at],
+        )?;
         Ok(())
     }
 
     pub fn identity(&self, run: &str) -> Result<Option<IdentityRow>> {
         Ok(self
             .conn
-            .query_row("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE run = ?1", params![run], row_to_identity)
+            .query_row(
+                "SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities WHERE run = ?1",
+                params![run],
+                row_to_identity,
+            )
             .optional()?)
     }
 
     pub fn identities(&self) -> Result<Vec<IdentityRow>> {
-        let mut st = self.conn.prepare("SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities ORDER BY issued_at")?;
+        let mut st = self.conn.prepare(
+            "SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities ORDER BY issued_at",
+        )?;
         let rows = st.query_map([], row_to_identity)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -401,7 +436,8 @@ impl Ledger {
 
     /// The request a grant was made for, if any.
     pub fn request_for_grant(&self, grant: &str) -> Result<Option<Request>> {
-        let rid: Option<Option<String>> = self.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![grant], |r| r.get(0)).optional()?;
+        let rid: Option<Option<String>> =
+            self.conn.query_row("SELECT request_id FROM grants WHERE id = ?1", params![grant], |r| r.get(0)).optional()?;
         match rid.flatten() {
             Some(rid) => Ok(Some(self.request(&rid)?)),
             None => Ok(None),
@@ -467,12 +503,22 @@ impl Ledger {
         tx.execute(
             "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![gid, req.tenant, req.zone, req.method, req.host, path, prefix, a.uses, t + a.ttl.as_secs() as i64, req.id, a.decided_by, t],
+            params![
+                gid,
+                req.tenant,
+                req.zone,
+                req.method,
+                req.host,
+                path,
+                prefix,
+                a.uses,
+                t + a.ttl.as_secs() as i64,
+                req.id,
+                a.decided_by,
+                t
+            ],
         )?;
-        tx.execute(
-            "UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1",
-            params![id, t, a.decided_by],
-        )?;
+        tx.execute("UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1", params![id, t, a.decided_by])?;
         tx.commit()?;
         Ok(gid)
     }
@@ -547,7 +593,9 @@ impl Ledger {
     }
 
     fn operator_credentials_where(&self, tenant: &TenantId, filter: &str) -> Result<Vec<OperatorCredential>> {
-        let mut st = self.conn.prepare(&format!("SELECT id, name, x, y, sign_count FROM operator_credentials WHERE tenant = ?1 {filter} ORDER BY created_at"))?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, name, x, y, sign_count FROM operator_credentials WHERE tenant = ?1 {filter} ORDER BY created_at"
+        ))?;
         let rows = st.query_map(params![tenant.0], |r| {
             let x: Vec<u8> = r.get(2)?;
             let y: Vec<u8> = r.get(3)?;
@@ -563,7 +611,8 @@ impl Ledger {
     }
 
     pub fn touch_operator_credential(&self, id: &str, sign_count: u32) -> Result<()> {
-        self.conn.execute("UPDATE operator_credentials SET sign_count = ?2, last_used_at = ?3 WHERE id = ?1", params![id, sign_count, now()])?;
+        self.conn
+            .execute("UPDATE operator_credentials SET sign_count = ?2, last_used_at = ?3 WHERE id = ?1", params![id, sign_count, now()])?;
         Ok(())
     }
 
@@ -591,7 +640,7 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn audit_tail(&self, n: usize) -> Result<Vec<(i64, i64, String, Option<String>, String)>> {
+    pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare("SELECT seq, ts, kind, run, body FROM audit ORDER BY seq DESC LIMIT ?1")?;
         let rows = st.query_map(params![n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
         let mut v = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -662,10 +711,19 @@ fn row_to_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityRow> {
 /// Whether two attribution objects name the same askers (same agents and calls).
 fn same_askers(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     let key = |v: &serde_json::Value| -> Vec<(String, String)> {
-        v.get("requesters").and_then(|r| r.as_array()).map(|rs| rs.iter().map(|r| (
-            r.get("agent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            r.get("call").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        )).collect()).unwrap_or_default()
+        v.get("requesters")
+            .and_then(|r| r.as_array())
+            .map(|rs| {
+                rs.iter()
+                    .map(|r| {
+                        (
+                            r.get("agent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            r.get("call").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     };
     key(a) == key(b)
 }
@@ -718,8 +776,15 @@ mod tests {
     fn identities_are_found_by_run_and_parent() {
         let l = Ledger::open_in_memory().unwrap();
         let row = |run: &str, parent: Option<&str>| IdentityRow {
-            run: run.into(), tenant: "t0".into(), spiffe_id: format!("spiffe://x/{run}"), zone: "z".into(), agent: "a".into(),
-            parent_run: parent.map(String::from), accept_from: vec!["ops".into()], jws: "j".into(), issued_at: 1,
+            run: run.into(),
+            tenant: "t0".into(),
+            spiffe_id: format!("spiffe://x/{run}"),
+            zone: "z".into(),
+            agent: "a".into(),
+            parent_run: parent.map(String::from),
+            accept_from: vec!["ops".into()],
+            jws: "j".into(),
+            issued_at: 1,
         };
         l.put_identity(&row("run_p", None)).unwrap();
         l.put_identity(&row("run_c", Some("run_p"))).unwrap();
@@ -754,7 +819,9 @@ mod tests {
         let r = l.request(&id).unwrap();
         assert_eq!(r.attribution.len(), 2, "same asker twice counts once; a new asker is added");
         assert_eq!(r.attribution[1]["requesters"][0]["agent"], "main agent");
-        let gid = l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let gid = l
+            .approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() })
+            .unwrap();
         assert_eq!(l.request_for_grant(&gid).unwrap().unwrap().id, id);
     }
 
@@ -778,7 +845,8 @@ mod tests {
         let o = op("/o/r/contents/docs/a.md");
         let (id, _) = l.pending_for(&o, "x", None).unwrap();
         // A prefix that is not a prefix of the asked path is ignored: the grant stays exact.
-        l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(60), path_prefix: Some("/other".into()), decided_by: "a".into() }).unwrap();
+        l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(60), path_prefix: Some("/other".into()), decided_by: "a".into() })
+            .unwrap();
         assert!(l.consume_grant(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
         assert!(l.consume_grant(&o).unwrap().is_some());
     }

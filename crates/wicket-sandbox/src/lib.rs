@@ -91,7 +91,12 @@ impl Docker {
     }
 
     pub async fn image_exists(&self, image: &str) -> Result<bool> {
-        let st = self.command_with(["image".to_string(), "inspect".into(), image.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        let st = self
+            .command_with(["image".to_string(), "inspect".into(), image.into()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
         Ok(st.success())
     }
 
@@ -149,12 +154,7 @@ impl Docker {
         }
         for m in &spec.mounts {
             a.push("--mount".into());
-            a.push(format!(
-                "type=bind,source={},target={}{}",
-                m.host.display(),
-                m.target,
-                if m.read_only { ",readonly" } else { "" }
-            ));
+            a.push(format!("type=bind,source={},target={}{}", m.host.display(), m.target, if m.read_only { ",readonly" } else { "" }));
         }
         for (k, v) in &spec.env {
             a.push("--env".into());
@@ -170,14 +170,17 @@ impl Docker {
     pub fn spawn_with(&self, spec: &SandboxSpec, stdin: Stdio, stdout: Stdio) -> Result<Child> {
         let mut c = self.command_with(self.build_args(spec));
         c.stdin(stdin).stdout(stdout).stderr(Stdio::piped()).kill_on_drop(true);
-        Ok(c.spawn().context("starting docker run")?)
+        c.spawn().context("starting docker run")
     }
 
     /// Starts the box with stdout and stderr piped.
     pub fn spawn(&self, spec: &SandboxSpec) -> Result<Child> {
         let mut c = self.command_with(self.build_args(spec));
-        c.stdin(if spec.interactive { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-        Ok(c.spawn().context("starting docker run")?)
+        c.stdin(if spec.interactive { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        c.spawn().context("starting docker run")
     }
 
     pub async fn kill(&self, name: &str) -> Result<()> {
@@ -188,7 +191,10 @@ impl Docker {
     /// Builds an image from a directory, with host networking for the build only (the daemon has no
     /// bridge network; sandboxes never get one).
     pub async fn build_image(&self, tag: &str, dir: &std::path::Path) -> Result<()> {
-        let st = self.command_with(["build".to_string(), "--network".into(), "host".into(), "-t".into(), tag.into(), dir.display().to_string()]).status().await?;
+        let st = self
+            .command_with(["build".to_string(), "--network".into(), "host".into(), "-t".into(), tag.into(), dir.display().to_string()])
+            .status()
+            .await?;
         if !st.success() {
             bail!("docker build failed");
         }
