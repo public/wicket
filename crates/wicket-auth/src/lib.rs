@@ -97,12 +97,7 @@ fn parse_auth_data(a: &[u8]) -> Result<AuthData<'_>> {
     if a.len() < 37 {
         return Err(AuthError::Malformed("authenticator data"));
     }
-    Ok(AuthData {
-        rp_id_hash: &a[..32],
-        flags: a[32],
-        sign_count: u32::from_be_bytes([a[33], a[34], a[35], a[36]]),
-        rest: &a[37..],
-    })
+    Ok(AuthData { rp_id_hash: &a[..32], flags: a[32], sign_count: u32::from_be_bytes([a[33], a[34], a[35], a[36]]), rest: &a[37..] })
 }
 
 impl RelyingParty {
@@ -143,7 +138,8 @@ impl RelyingParty {
     pub fn verify_registration(&self, challenge: &[u8], client_data_json: &[u8], attestation_object: &[u8]) -> Result<Credential> {
         self.check_client_data(client_data_json, "webauthn.create", challenge)?;
         let att: ciborium::Value = ciborium::de::from_reader(attestation_object).map_err(|_| AuthError::Malformed("attestation object"))?;
-        let auth_data = map_get_text(&att, "authData").and_then(|v| v.as_bytes().cloned()).ok_or(AuthError::Malformed("attestation authData"))?;
+        let auth_data =
+            map_get_text(&att, "authData").and_then(|v| v.as_bytes().cloned()).ok_or(AuthError::Malformed("attestation authData"))?;
         let ad = parse_auth_data(&auth_data)?;
         self.check_flags_and_rp(&ad)?;
         if ad.flags & AT == 0 || ad.rest.len() < 18 {
@@ -154,7 +150,8 @@ impl RelyingParty {
             return Err(AuthError::Malformed("credential id"));
         }
         let id = ad.rest[18..18 + id_len].to_vec();
-        let cose: ciborium::Value = ciborium::de::from_reader(&ad.rest[18 + id_len..]).map_err(|_| AuthError::Malformed("credential public key"))?;
+        let cose: ciborium::Value =
+            ciborium::de::from_reader(&ad.rest[18 + id_len..]).map_err(|_| AuthError::Malformed("credential public key"))?;
         let int = |k: i64| map_get_int(&cose, k);
         let is = |k: i64, want: i64| int(k).and_then(|v| v.as_integer()).map(|i| i128::from(i) == want as i128).unwrap_or(false);
         if !(is(1, 2) && is(3, -7) && is(-1, 1)) {
@@ -171,7 +168,14 @@ impl RelyingParty {
 
     /// Verifies a `navigator.credentials.get()` response for `cred`. Returns the new signature
     /// counter, which the caller must store.
-    pub fn verify_assertion(&self, challenge: &[u8], cred: &Credential, client_data_json: &[u8], authenticator_data: &[u8], signature_der: &[u8]) -> Result<u32> {
+    pub fn verify_assertion(
+        &self,
+        challenge: &[u8],
+        cred: &Credential,
+        client_data_json: &[u8],
+        authenticator_data: &[u8],
+        signature_der: &[u8],
+    ) -> Result<u32> {
         self.check_client_data(client_data_json, "webauthn.get", challenge)?;
         let ad = parse_auth_data(authenticator_data)?;
         self.check_flags_and_rp(&ad)?;
