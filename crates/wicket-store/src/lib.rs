@@ -107,7 +107,8 @@ pub struct ConsoleSession {
     pub id: String,
     /// "operator" (signed in with a passkey) or "bootstrap" (opened the one-time enrolment link).
     pub kind: String,
-    /// The passkey it signed in with (operator sessions).
+    /// The passkey it signed in with (operator sessions), or the id of the enrolment link it was
+    /// opened with (bootstrap sessions).
     pub credential: Option<String>,
     /// The client address it signed in from.
     pub client: String,
@@ -212,6 +213,10 @@ CREATE TABLE IF NOT EXISTS console_sessions (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, kind TEXT NOT NULL, credential TEXT, client TEXT NOT NULL,
   created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
   revoked_at INTEGER, revoked_by TEXT
+);
+CREATE TABLE IF NOT EXISTS console_enrol_links (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+  created_by TEXT NOT NULL, used_at INTEGER, used_client TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
@@ -755,6 +760,28 @@ impl Ledger {
         )?)
     }
 
+    // ---- console enrolment links ----
+
+    /// Records a host-issued, single-use enrolment link. `id` is the SHA-256 of its token (hex), so
+    /// reading the ledger does not hand out usable links.
+    pub fn add_enrol_link(&self, tenant: &TenantId, id: &str, expires_at: i64, by: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO console_enrol_links (id, tenant, created_at, expires_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, tenant.0, now(), expires_at, by],
+        )?;
+        Ok(())
+    }
+
+    /// Uses the enrolment link `id` at `at` from `client`, atomically: true only if it exists for
+    /// `tenant`, has not been used, and has not expired. A link works at most once.
+    pub fn use_enrol_link(&self, tenant: &TenantId, id: &str, at: i64, client: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE console_enrol_links SET used_at = ?3, used_client = ?4
+             WHERE tenant = ?1 AND id = ?2 AND used_at IS NULL AND expires_at > ?3",
+            params![tenant.0, id, at, client],
+        )? == 1)
+    }
+
     // ---- audit ----
 
     /// Appends a hash-chained audit record: hash = sha256(prev || kind || body).
@@ -1197,6 +1224,23 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn enrol_links_work_once_before_they_expire() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let at = now();
+        l.add_enrol_link(&t, "l1", at + 600, "host").unwrap();
+        l.add_enrol_link(&t, "l2", at + 600, "host").unwrap();
+        l.add_enrol_link(&t, "old", at - 1, "host").unwrap();
+        assert!(!l.use_enrol_link(&TenantId("other".into()), "l1", at, "192.0.2.1").unwrap(), "another tenant's");
+        assert!(!l.use_enrol_link(&t, "nope", at, "192.0.2.1").unwrap(), "unknown");
+        assert!(!l.use_enrol_link(&t, "old", at, "192.0.2.1").unwrap(), "expired");
+        assert!(!l.use_enrol_link(&t, "l2", at + 600, "192.0.2.1").unwrap(), "expired at its expiry");
+        assert!(l.use_enrol_link(&t, "l1", at, "192.0.2.1").unwrap());
+        assert!(!l.use_enrol_link(&t, "l1", at, "192.0.2.1").unwrap(), "used");
+        assert!(l.add_enrol_link(&t, "l1", at + 600, "host").is_err(), "ids are unique");
     }
 
     #[test]

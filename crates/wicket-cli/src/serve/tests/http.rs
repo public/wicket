@@ -468,26 +468,130 @@ async fn sessions_expire_and_are_revocable_from_the_host() {
     assert_eq!(state_ok(&format!("__Host-wicket_sid={token}")).await, StatusCode::UNAUTHORIZED);
 }
 
+/// A fresh host-issued enrolment link (its path), as `wicket operator enrol-link` makes.
+fn host_link(t: &T, ttl_secs: i64) -> String {
+    format!("/enrol?t={}", issue_enrol_link(&t.ledger(), &TenantId::single(), ttl_secs, "test host").unwrap())
+}
+
+/// Opens an enrolment link; the bootstrap session's token if it worked.
+async fn open_link(t: &T, peer: &str, link: &str) -> Option<String> {
+    let (status, headers, body) = call_from(&t.state, peer, "GET", link, &[], b"").await;
+    if status != StatusCode::SEE_OTHER {
+        assert_eq!((status, body.as_str()), (StatusCode::UNAUTHORIZED, DENIED), "a failed link looks like any 401");
+        assert!(!headers.contains_key("set-cookie"));
+        return None;
+    }
+    let cookie = headers["set-cookie"].to_str().unwrap();
+    assert!(cookie.contains("Secure; HttpOnly; SameSite=Strict") && cookie.contains(&format!("Max-Age={BOOTSTRAP_TTL}")));
+    Some(token_of(cookie))
+}
+
+/// What a browser returns from navigator.credentials.create for `challenge`: a new P-256 passkey,
+/// user present and verified, "none" attestation.
+fn attestation(challenge: &str, key: &SigningKey, id: &[u8]) -> Value {
+    let cdj = json!({ "type": "webauthn.create", "challenge": challenge, "origin": ORIGIN, "crossOrigin": false }).to_string().into_bytes();
+    let mut ad = sha2::Sha256::digest(b"localhost").to_vec();
+    ad.push(0x01 | 0x04 | 0x40); // user present, user verified, attested credential data
+    ad.extend_from_slice(&0u32.to_be_bytes());
+    ad.extend_from_slice(&[0u8; 16]);
+    ad.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    ad.extend_from_slice(id);
+    let p = key.verifying_key().to_encoded_point(false);
+    let cose = ciborium::Value::Map(vec![
+        (1.into(), 2.into()),
+        (3.into(), (-7).into()),
+        ((-1).into(), 1.into()),
+        ((-2).into(), ciborium::Value::Bytes(p.x().unwrap().to_vec())),
+        ((-3).into(), ciborium::Value::Bytes(p.y().unwrap().to_vec())),
+    ]);
+    ciborium::ser::into_writer(&cose, &mut ad).unwrap();
+    let att = ciborium::Value::Map(vec![
+        ("fmt".into(), "none".into()),
+        ("attStmt".into(), ciborium::Value::Map(vec![])),
+        ("authData".into(), ciborium::Value::Bytes(ad)),
+    ]);
+    let mut att_bytes = Vec::new();
+    ciborium::ser::into_writer(&att, &mut att_bytes).unwrap();
+    json!({ "challenge": challenge, "name": "second phone", "clientDataJSON": b64u(&cdj), "attestationObject": b64u(&att_bytes) })
+}
+
+/// Registration step 1 for a session: the status and the challenge, if one was given.
+async fn register_begin_as(t: &T, sid: &str) -> (StatusCode, Option<String>) {
+    let (status, _, body) = post_json(&t.state, "/api/register/begin", Some(sid), &json!({})).await;
+    (status, json_of(&body)["publicKey"]["challenge"].as_str().map(String::from))
+}
+
 #[tokio::test]
 async fn the_enrolment_link_is_single_use_and_its_failures_look_like_any_401() {
     let t = setup("enrol");
-    *t.state.bootstrap.lock().unwrap() = Some(("ab".repeat(24), Instant::now() + Duration::from_secs(60)));
-    let (status, _, body) = call(&t.state, "GET", "/enrol?t=wrong", &[], b"").await;
-    assert_eq!((status, body.as_str()), (StatusCode::UNAUTHORIZED, DENIED));
-    assert_eq!(audits(&t, "operator.enrol_failed").len(), 1);
-    let link = format!("/enrol?t={}", "ab".repeat(24));
-    let (status, headers, _) = call(&t.state, "GET", &link, &[], b"").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    let cookie = headers["set-cookie"].to_str().unwrap();
-    assert!(cookie.contains("Secure; HttpOnly; SameSite=Strict") && cookie.contains(&format!("Max-Age={BOOTSTRAP_TTL}")));
-    let boot = format!("__Host-wicket_sid={}", token_of(cookie));
-    // It enrols, and can't see anything.
-    let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &boot)], b"").await;
+    assert!(open_link(&t, PEER, "/enrol?t=wrong").await.is_none());
+    assert!(open_link(&t, PEER, "/enrol").await.is_none());
+    assert_eq!(audits(&t, "operator.enrol_failed").len(), 2);
+    // setup() already has a passkey: a host link works anyway (another device).
+    let link = host_link(&t, 600);
+    assert_eq!(audits(&t, "operator.enrol_link_issued").len(), 1);
+    let boot = open_link(&t, PEER, &link).await.expect("a fresh link works");
+    let used = audits(&t, "operator.enrol_link_used");
+    assert_eq!((used.len(), used[0]["client"].as_str()), (1, Some("127.0.0.1")));
+    // It can enrol, and can't see anything.
+    let c = format!("__Host-wicket_sid={boot}");
+    let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &c)], b"").await;
     assert_eq!((status, json_of(&body)["who"]["state"].as_str()), (StatusCode::OK, Some("bootstrap")));
-    assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &boot)], b"").await.0, StatusCode::UNAUTHORIZED);
-    // Used: the same link is now just another 401.
-    let (status, _, body) = call(&t.state, "GET", &link, &[], b"").await;
+    assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &c)], b"").await.0, StatusCode::UNAUTHORIZED);
+    let say = json!({ "action": "say", "run": "r", "text": "hi" });
+    assert_eq!(post_json(&t.state, "/api/action/begin", Some(&boot), &say).await.0, StatusCode::UNAUTHORIZED);
+    // Used: the same link is now just another 401, from anywhere.
+    assert!(open_link(&t, PEER, &link).await.is_none());
+    assert!(open_link(&t, "192.0.2.5:1", &link).await.is_none());
+    // Expired: also just a 401.
+    let old = host_link(&t, 0);
+    assert!(open_link(&t, PEER, &old).await.is_none());
+    assert_eq!(audits(&t, "operator.enrol_failed").len(), 5);
+}
+
+#[tokio::test]
+async fn a_host_link_enrols_one_passkey_audited_with_the_link_and_client() {
+    let t = setup("enrol-ok");
+    let link = host_link(&t, 600);
+    let boot = open_link(&t, "192.0.2.44:1", &link).await.unwrap();
+    let (status, ch) = register_begin_as(&t, &boot).await;
+    assert_eq!(status, StatusCode::OK);
+    let key = SigningKey::random(&mut rand_core::OsRng);
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch.unwrap(), &key, b"cred-2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let creds = t.ledger().operator_credentials(&TenantId::single()).unwrap();
+    assert_eq!(creds.len(), 2);
+    assert!(creds.iter().any(|c| c.id == b64u(b"cred-2") && c.name == "second phone"));
+    let added = audits(&t, "operator.passkey_added");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["via"], "enrolment link");
+    assert_eq!(added[0]["client"], "192.0.2.44");
+    assert_eq!(added[0]["link"], audits(&t, "operator.enrol_link_used")[0]["link"]);
+    assert_eq!(added[0]["link"].as_str().unwrap().len(), 16);
+    // The enrolment session ended with its one job: no second passkey from the same link.
+    let (status, ch) = register_begin_as(&t, &boot).await;
+    assert_eq!((status, ch), (StatusCode::UNAUTHORIZED, None));
+    assert!(open_link(&t, PEER, &link).await.is_none());
+}
+
+#[tokio::test]
+async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
+    let t = setup("enrol-op");
+    let op = t.sid.clone().unwrap();
+    // Begin: refused, no challenge.
+    let (status, ch) = register_begin_as(&t, &op).await;
+    assert_eq!((status, ch), (StatusCode::FORBIDDEN, None));
+    // Finish: refused, even with a valid registration challenge (issued to an enrolment session).
+    let boot = open_link(&t, PEER, &host_link(&t, 600)).await.unwrap();
+    let ch = register_begin_as(&t, &boot).await.1.unwrap();
+    let key = SigningKey::random(&mut rand_core::OsRng);
+    let (status, _, _) = post_json(&t.state, "/api/register/finish", Some(&op), &attestation(&ch, &key, b"stolen")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // And without any session: the uniform 401.
+    let (status, _, body) = post_json(&t.state, "/api/register/finish", None, &attestation(&ch, &key, b"anon")).await;
     assert_eq!((status, body.as_str()), (StatusCode::UNAUTHORIZED, DENIED));
+    assert_eq!(t.ledger().operator_credentials(&TenantId::single()).unwrap().len(), 1, "nothing was added");
+    assert!(audits(&t, "operator.passkey_added").is_empty());
 }
 
 #[tokio::test]

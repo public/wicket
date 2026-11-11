@@ -206,8 +206,10 @@ cargo build --release -p wicket-cli
 
 The console (`wicket serve`) shows what's waiting for you, runs, recent decisions and activity, and you approve
 or deny from a browser or phone. It uses **passkeys**:
-- the first passkey is enrolled through a one-time link printed at start-up (single use, 10 minutes, valid only
-  while no passkey exists, and it can do nothing but enrol);
+- passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
+  passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
+  (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey). A
+  signed-in console session can't add a passkey, so a stolen cookie can't either;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
@@ -258,7 +260,7 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
 - **Before sign-in** a client can fetch only the page, its static files (script, stylesheet, manifest, icons)
   and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
-  no runs, counts, passkey ids or version. Enrolment is only via the one-time link printed on the host.
+  no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
   address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
   20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges are bounded

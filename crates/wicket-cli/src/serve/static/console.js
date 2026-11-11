@@ -209,9 +209,9 @@ function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
-  const add = el("button", "", "Add another passkey"); add.onclick = registerPasskey;
   const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
-  b.append(add, out); box.append(b);
+  b.append(out); box.append(b);
+  box.append(el("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
 }
 
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
@@ -232,7 +232,7 @@ async function boot() {
   } else {
     auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
-    auth.append(el("div", "note", "No passkey yet? Open the one-time enrolment link that `wicket serve` printed on the host."));
+    auth.append(el("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
   }
 }
 

@@ -346,6 +346,16 @@ enum OperatorCmd {
     /// Host-only break-glass: revoke every passkey (and every console session), so `wicket serve`
     /// prints a fresh enrolment link.
     Reset,
+    /// Print a fresh single-use link that enrols one passkey in the console (another device, or a
+    /// replacement after `reset`). The only way to add a passkey: a signed-in console session can't.
+    EnrolLink {
+        /// How long the link stays usable (at most 1h).
+        #[arg(long, default_value = "10m")]
+        ttl: String,
+        /// The console's origin, to print the whole link (otherwise just its path).
+        #[arg(long)]
+        origin: Option<String>,
+    },
     /// List live console sessions (id, passkey, client address, times).
     Sessions,
     /// End console sessions now: one by its id (or a unique prefix of it), or all with --all.
@@ -845,6 +855,19 @@ async fn main() -> Result<()> {
                         println!("{}  {}  sign count {}", c.id, c.name, c.sign_count);
                     }
                 }
+                OperatorCmd::EnrolLink { ttl, origin } => {
+                    let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+                    if ttl.is_zero() || ttl > Duration::from_secs(3600) {
+                        bail!("--ttl must be more than 0 and at most 1h");
+                    }
+                    let token = serve::issue_enrol_link(&l, &TenantId::single(), ttl.as_secs() as i64, &operator())?;
+                    let origin = origin.as_deref().map(|o| o.trim_end_matches('/')).unwrap_or("");
+                    println!("open within {} (single use) to enrol a passkey:", humantime::format_duration(ttl));
+                    println!("  {origin}/enrol?t={token}");
+                    if origin.is_empty() {
+                        println!("(prefix the console's origin, e.g. https://console.example.com)");
+                    }
+                }
                 OperatorCmd::Sessions => {
                     let now = wicket_store::now();
                     let ago = |t: i64| humantime::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
@@ -892,7 +915,7 @@ async fn main() -> Result<()> {
                         &serde_json::json!({ "removed": n, "by": operator(), "via": "host break-glass" }),
                     )?;
                     println!(
-                        "revoked {n} passkey(s) (public keys kept for audit verification); restart `wicket serve` for an enrolment link"
+                        "revoked {n} passkey(s) (public keys kept for audit verification); enrol a new one with `wicket operator enrol-link`"
                     );
                 }
             }

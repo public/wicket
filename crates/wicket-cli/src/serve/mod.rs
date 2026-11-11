@@ -2,9 +2,12 @@
 //! to be reachable directly from the internet.
 //!
 //! Security flow:
-//! 1. **Bootstrap.** At start-up, *only if no operator passkey exists yet*, a one-time enrolment link
-//!    is printed on the host. It is single-use, expires after 10 minutes, and the session it creates
-//!    can do one thing: register a passkey. It cannot view runs or decide anything.
+//! 1. **Enrolment** is host-only. At start-up, *only if no operator passkey exists yet*, a one-time
+//!    enrolment link is printed on the host; `wicket operator enrol-link` prints a fresh one at any
+//!    time (another device, a lost passkey). Links are kept in the ledger by the hash of their token,
+//!    are single-use, expire (10 minutes by default), and the session one opens can do one thing:
+//!    register one passkey. It cannot view runs or decide anything. A signed-in operator session
+//!    cannot enrol a passkey, so a stolen session cookie can't add one.
 //! 2. **Sign-in** is a passkey assertion (user verification required; no password, no fallback),
 //!    rate-limited and locked out per client address and per passkey ([`limits`]), with one uniform
 //!    error and every failure and lockout audited. It gives a session (`__Host-` cookie: Secure,
@@ -95,11 +98,18 @@ const MAX_REASON: usize = 500;
 const DENIED: &str = r#"{"error":"sign in with your passkey"}"#;
 /// The one answer to a failed sign-in, whatever failed.
 const SIGN_IN_FAILED: &str = "sign-in failed";
+/// Why a session that didn't come from an enrolment link can't register a passkey.
+const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: run `wicket operator enrol-link` on the host";
 
 #[derive(Clone, Debug, PartialEq)]
 enum SessionKind {
-    Bootstrap,
-    Operator { cred: String },
+    /// Opened with a host-issued enrolment link (its id); may only register a passkey.
+    Bootstrap {
+        link: String,
+    },
+    Operator {
+        cred: String,
+    },
 }
 
 /// A console action, as the server resolved it at `begin`. Applied only with a passkey signature
@@ -152,7 +162,6 @@ struct State {
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
     identity: IdentityCheck,
-    bootstrap: Mutex<Option<(String, Instant)>>,
     challenges: Mutex<HashMap<String, Pending>>,
     limiter: Limiter,
     limits: net::Limits,
@@ -188,7 +197,6 @@ impl State {
             roots,
             launcher,
             identity,
-            bootstrap: Mutex::new(None),
             challenges: Mutex::new(HashMap::new()),
             limiter: Limiter::default(),
             limits: net::Limits::default(),
@@ -263,8 +271,7 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     if has_passkeys {
         println!("sign in with your passkey. (Lost them all? On the host: wicket operator reset)");
     } else {
-        let token = random_hex(24);
-        *state.bootstrap.lock().expect("lock") = Some((token.clone(), Instant::now() + Duration::from_secs(BOOTSTRAP_TTL as u64)));
+        let token = issue_enrol_link(&state.ledger()?, &state.tenant, BOOTSTRAP_TTL, "wicket serve (no passkey yet)")?;
         println!("no operator passkey yet. Enrol one within 10 minutes (single use):");
         println!("  {}/enrol?t={token}", plan.origin);
     }
@@ -306,8 +313,14 @@ fn random_hex(n: usize) -> String {
     hex::encode(random_bytes(n))
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// Issues a single-use enrolment link valid for `ttl_secs` and returns its token (the link is
+/// `ORIGIN/enrol?t=TOKEN`). Only the token's hash is stored. Audited.
+pub fn issue_enrol_link(l: &Ledger, tenant: &TenantId, ttl_secs: i64, by: &str) -> Result<String> {
+    let token = random_hex(24);
+    let id = session_id(&token);
+    l.add_enrol_link(tenant, &id, wicket_store::now() + ttl_secs, by)?;
+    l.audit(tenant, None, "operator.enrol_link_issued", &json!({ "link": &id[..16], "ttl_secs": ttl_secs, "by": by }))?;
+    Ok(token)
 }
 
 fn resp(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
@@ -373,9 +386,9 @@ fn session_id(token: &str) -> String {
 fn set_session(state: &State, kind: SessionKind, client: IpAddr) -> Result<String> {
     let token = random_hex(32);
     let now = wicket_store::now();
-    let ttl = if kind == SessionKind::Bootstrap { BOOTSTRAP_TTL } else { SESSION_ABSOLUTE };
+    let ttl = if matches!(kind, SessionKind::Bootstrap { .. }) { BOOTSTRAP_TTL } else { SESSION_ABSOLUTE };
     let (kind, credential) = match kind {
-        SessionKind::Bootstrap => ("bootstrap", None),
+        SessionKind::Bootstrap { link } => ("bootstrap", Some(link)),
         SessionKind::Operator { cred } => ("operator", Some(cred)),
     };
     state.ledger()?.add_console_session(
@@ -413,7 +426,7 @@ fn session(state: &State, sid: &Option<String>) -> Option<(String, SessionKind)>
         return None;
     }
     let kind = match (s.kind.as_str(), s.credential) {
-        ("bootstrap", _) => SessionKind::Bootstrap,
+        ("bootstrap", Some(link)) => SessionKind::Bootstrap { link },
         ("operator", Some(cred)) => {
             if !l.operator_credentials(&state.tenant).ok()?.iter().any(|c| c.id == cred) {
                 return None;
@@ -594,18 +607,20 @@ fn enrol(state: &State, query: &str, ctx: &Ctx) -> Response<Full<Bytes>> {
         return denied();
     }
     let t = query.split('&').find_map(|kv| kv.strip_prefix("t=")).unwrap_or("");
-    let mut b = state.bootstrap.lock().expect("lock");
-    let good = matches!(&*b, Some((tok, exp)) if *exp > now && ct_eq(tok.as_bytes(), t.as_bytes()));
-    if !good {
-        drop(b);
+    // Looked up by the token's hash, and used atomically: a link works once, before it expires.
+    let link = session_id(t);
+    let used = !t.is_empty()
+        && state
+            .ledger()
+            .and_then(|l| Ok(l.use_enrol_link(&state.tenant, &link, wicket_store::now(), &ctx.client.to_string())?))
+            .unwrap_or(false);
+    if !used {
         audit_failure(state, ctx, None, "enrolment link invalid, used or expired", "operator.enrol_failed");
         return denied();
     }
-    *b = None; // single use
-    drop(b);
-    let Ok(cookie) = set_session(state, SessionKind::Bootstrap, ctx.client) else { return denied() };
+    let Ok(cookie) = set_session(state, SessionKind::Bootstrap { link: link.clone() }, ctx.client) else { return denied() };
     if let Ok(l) = state.ledger() {
-        let _ = l.audit(&state.tenant, None, "operator.enrol_link_used", &json!({ "client": ctx.client.to_string() }));
+        let _ = l.audit(&state.tenant, None, "operator.enrol_link_used", &json!({ "link": &link[..16], "client": ctx.client.to_string() }));
     }
     Response::builder()
         .status(StatusCode::SEE_OTHER)
@@ -667,12 +682,9 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
 }
 
 fn register_begin(state: &State, sess: &Option<(String, SessionKind)>) -> Reply {
-    // Bootstrap sessions may enrol only while no passkey exists; afterwards a signed-in operator must.
-    let n = creds(state).map(|c| c.len()).unwrap_or(0);
-    let allowed = matches!(sess, Some((_, SessionKind::Operator { .. }))) || (matches!(sess, Some((_, SessionKind::Bootstrap))) && n == 0);
-    let Some((sid, _)) = sess.as_ref().filter(|_| allowed) else {
-        return err(StatusCode::FORBIDDEN, "enrolling a passkey needs the enrolment link (first passkey) or a signed-in operator");
-    };
+    // Only a session opened with a host-issued enrolment link may enrol, never a signed-in operator
+    // session: a stolen cookie must not be able to add a passkey.
+    let Some((sid, SessionKind::Bootstrap { .. })) = sess else { return err(StatusCode::FORBIDDEN, ENROL_ON_HOST) };
     let challenge = random_bytes(32);
     let Some(key) = new_challenge(state, challenge, Purpose::Register, Some(sid.clone()), sid.clone()) else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
@@ -689,13 +701,14 @@ fn register_begin(state: &State, sess: &Option<(String, SessionKind)>) -> Reply 
 }
 
 fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
+    let Some((sid, SessionKind::Bootstrap { link })) = sess else { return err(StatusCode::FORBIDDEN, ENROL_ON_HOST) };
     let (Some(ch), Some(cdj), Some(att)) =
         (body.get("challenge").and_then(|c| c.as_str()), field_b64(body, "clientDataJSON"), field_b64(body, "attestationObject"))
     else {
         return err(StatusCode::BAD_REQUEST, "challenge, clientDataJSON and attestationObject are required");
     };
     let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown or expired challenge") };
-    if !matches!(p.purpose, Purpose::Register) || p.session.is_none() || p.session != sess.as_ref().map(|s| s.0.clone()) {
+    if !matches!(p.purpose, Purpose::Register) || p.session.as_ref() != Some(sid) {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     }
     match state.rp.verify_registration(&unb64u(ch).unwrap_or_default(), &cdj, &att) {
@@ -709,11 +722,15 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
             if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
                 return err(StatusCode::CONFLICT, e);
             }
-            let _ = l.audit(&state.tenant, None, "operator.passkey_added", &json!({ "credential": oc.id, "name": oc.name, "via": if matches!(sess, Some((_, SessionKind::Bootstrap))) { "enrolment link" } else { "signed-in operator" } }));
+            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
+            let _ = l.audit(
+                &state.tenant,
+                None,
+                "operator.passkey_added",
+                &json!({ "credential": oc.id, "name": oc.name, "via": "enrolment link", "link": &link[..16.min(link.len())], "client": client }),
+            );
             // The enrolment session has done its one job: end it, so the next step is a real sign-in.
-            if let Some((sid, SessionKind::Bootstrap)) = sess {
-                let _ = l.end_console_session(sid, "enrolled");
-            }
+            let _ = l.end_console_session(sid, "enrolled");
             ok(json!({ "ok": "passkey registered; now sign in with it" }))
         }
         Err(e) => err(StatusCode::FORBIDDEN, e),
