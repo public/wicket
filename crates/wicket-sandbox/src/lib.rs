@@ -170,7 +170,7 @@ impl Docker {
     pub fn spawn_with(&self, spec: &SandboxSpec, stdin: Stdio, stdout: Stdio) -> Result<Child> {
         let mut c = self.command_with(self.build_args(spec));
         c.stdin(stdin).stdout(stdout).stderr(Stdio::piped()).kill_on_drop(true);
-        Ok(c.spawn().context("starting docker run")?)
+        c.spawn().context("starting docker run")
     }
 
     /// Starts the box with stdout and stderr piped.
@@ -180,7 +180,7 @@ impl Docker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        Ok(c.spawn().context("starting docker run")?)
+        c.spawn().context("starting docker run")
     }
 
     pub async fn kill(&self, name: &str) -> Result<()> {

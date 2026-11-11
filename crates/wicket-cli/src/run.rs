@@ -615,7 +615,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     } else {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
-                            if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").map_or(true, |p| p.is_null()) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
                                 turn_running = false;
                                 last_result = std::time::Instant::now();
                                 if stdin.is_some() && !idle.is_zero() {
@@ -779,7 +779,7 @@ fn print_event(ev: &Event) {
             };
             println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));
             if outcome == "pending" {
-                if let Some(id) = detail.split(|c: char| c == ' ' || c == ':').next() {
+                if let Some(id) = detail.split([' ', ':']).next() {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }

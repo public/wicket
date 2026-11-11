@@ -88,7 +88,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     };
     z.forbid = p.zone.forbid.iter().cloned().chain(z.forbid).collect();
     if is_agent {
-        let derived_from_parent = req.zone.as_ref().map_or(true, |v| v.get("llm").is_none());
+        let derived_from_parent = req.zone.as_ref().is_none_or(|v| v.get("llm").is_none());
         if derived_from_parent {
             // Half of what the parent has left, unless the caller says otherwise.
             if let (Some(pl), Some((r, t))) = (&p.zone.llm, llm_left) {

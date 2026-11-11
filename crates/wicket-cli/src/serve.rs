@@ -389,7 +389,7 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
                 Some(body.get("uses").and_then(|u| u.as_u64()).unwrap_or(1).clamp(1, 1000) as u32)
             };
             let ttl_secs = body.get("ttl_secs").and_then(|u| u.as_u64()).unwrap_or(600).clamp(30, 24 * 3600);
-            let req = match Ledger::open(&ledger_path()).and_then(|l| l.request(id).map_err(Into::into)) {
+            let req = match Ledger::open(&ledger_path()).and_then(|l| l.request(id)) {
                 Ok(r) => r,
                 Err(e) => return err(StatusCode::NOT_FOUND, e),
             };

@@ -28,6 +28,9 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// One audit entry as `audit_tail` returns it: sequence, timestamp, kind, run, body.
+pub type AuditRow = (i64, i64, String, Option<String>, String);
+
 pub struct Ledger {
     conn: Connection,
 }
@@ -637,7 +640,7 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn audit_tail(&self, n: usize) -> Result<Vec<(i64, i64, String, Option<String>, String)>> {
+    pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare("SELECT seq, ts, kind, run, body FROM audit ORDER BY seq DESC LIMIT ?1")?;
         let rows = st.query_map(params![n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
         let mut v = rows.collect::<std::result::Result<Vec<_>, _>>()?;
