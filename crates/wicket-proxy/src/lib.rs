@@ -11,7 +11,7 @@ pub mod vault;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
-use wicket_core::{RunId, TenantId, ZoneSpec};
+use wicket_core::{CompiledZone, RunId, TenantId};
 use wicket_store::Ledger;
 
 /// What a run's enforcement points share.
@@ -19,7 +19,8 @@ use wicket_store::Ledger;
 pub struct RunCtx {
     pub tenant: TenantId,
     pub run: RunId,
-    pub zone: Arc<ZoneSpec>,
+    /// The run's zone, its globs compiled once (it dereferences to the `ZoneSpec`).
+    pub zone: Arc<CompiledZone>,
     pub ledger: Arc<Mutex<Ledger>>,
     pub vault: vault::Vault,
     pub events: UnboundedSender<Event>,

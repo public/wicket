@@ -337,7 +337,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let ctx = RunCtx {
         tenant: m.tenant.clone(),
         run: run.clone(),
-        zone: Arc::new(m.zone.clone()),
+        zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone())?),
         ledger: ledger.clone(),
         vault,
         events: tx,
