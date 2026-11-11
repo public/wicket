@@ -135,7 +135,8 @@ wicket node revoke n1
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
   recomputes each node's chain. Feed decisions use the wall clock read once at start and advanced by a monotonic
-  clock, so a clock step on the node can't stretch a freshness statement.
+  clock, so a clock step on the node can't stretch a freshness statement (after a deliberate clock step, restart
+  `wicket-node` so it reads the wall clock again).
 - **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), child
   agents can't use a served node, plain `http://` to a forwarded host is refused, and the MCP gateway still
   decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only

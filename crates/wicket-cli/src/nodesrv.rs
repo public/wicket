@@ -125,6 +125,8 @@ struct Node {
     tunnels: Tunnels,
     next: AtomicU64,
     shipped: AtomicI64,
+    /// One audit shipment at a time (the timer and a reconnect's watermark would send the same batch).
+    shipping: Mutex<()>,
 }
 
 impl Node {
@@ -188,6 +190,7 @@ impl Node {
     }
 
     fn ship_audit(&self) {
+        let _one = self.shipping.lock().expect("shipping");
         let from = self.shipped.load(Ordering::SeqCst);
         if from < 0 || !self.connected() {
             return;
@@ -308,6 +311,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         tunnels: Tunnels::default(),
         next: AtomicU64::new(0),
         shipped: AtomicI64::new(-1),
+        shipping: Mutex::new(()),
     });
     reap_previous(&node.docker, &node.paths.runs()).await;
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
@@ -901,6 +905,7 @@ mod tests {
             tunnels: Tunnels::default(),
             next: AtomicU64::new(0),
             shipped: AtomicI64::new(-1),
+            shipping: Mutex::new(()),
         })
     }
 
