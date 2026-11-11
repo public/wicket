@@ -730,7 +730,6 @@ impl<P: Policy> Replica<P> {
         *self.used.entry(id.to_string()).or_default() += 1;
         Ok(())
     }
-
 }
 
 impl Replica<ZoneSpec> {
@@ -779,7 +778,6 @@ impl Replica<ZoneSpec> {
             }
         }
     }
-
 }
 
 impl<P: Policy> Replica<P> {

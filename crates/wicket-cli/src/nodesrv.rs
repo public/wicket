@@ -31,8 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
-use wicket_core::ZoneSpec;
-use wicket_feed::{Replica, ReplicaConfig};
+use wicket_feed::{BoxAuthority, Replica, ReplicaConfig};
 use wicket_proxy::ca::{Minter, NodeCa};
 use wicket_proxy::decide::{Asked, Clock, ControlLink, NodeDecider, Route};
 use wicket_proxy::egress::{Egress, Relay, RelayStream};
@@ -114,7 +113,7 @@ struct Node {
     paths: NodePaths,
     build: String,
     clock: Clock,
-    replica: Arc<Mutex<Replica<ZoneSpec>>>,
+    replica: Arc<Mutex<Replica<BoxAuthority>>>,
     audit: Arc<Mutex<Ledger>>,
     root_pem: String,
     docker: Docker,
@@ -252,7 +251,7 @@ impl Relay for NodeRelay {
         // The zone as the feed has it now (inject rules may have changed since the box started).
         let spec = {
             let r = self.node.replica.lock().expect("replica");
-            r.state().and_then(|s| s.zones.get(&self.zone.name)).map(|z| z.spec.clone())
+            r.zone_of(&self.run).filter(|z| z.name == self.zone.name).cloned()
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
@@ -280,11 +279,16 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
     let root_key: [u8; 32] = hex::decode(root_hex.trim()).ok().and_then(|b| b.try_into().ok()).context("feed-root.pub is not a key")?;
     let root_key = wicket_identity::VerifyingKey::from_bytes(&root_key).context("feed-root.pub is not a key")?;
     let root_pem = std::fs::read_to_string(paths.root.join("root.pem")).context("root.pem (is this node enrolled?)")?;
-    let replica = match Replica::open(&paths.feed(), &name, root_key, ReplicaConfig::default()) {
+    let authz_hex = std::fs::read_to_string(paths.root.join("authz-root.pub")).context(
+        "authz-root.pub (enrolled before boxes' authority moved to tokens? run `wicket node renew-ca` for this node on the control host)",
+    )?;
+    let authz_root: [u8; 32] = hex::decode(authz_hex.trim()).ok().and_then(|b| b.try_into().ok()).context("authz-root.pub is not a key")?;
+    let authz_root = wicket_authz::PublicKey(authz_root);
+    let replica = match Replica::open_with(&paths.feed(), &name, root_key, ReplicaConfig::default(), authz_root) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[node] the persisted feed does not verify ({e}); starting closed until the control host sends a fresh one");
-            Replica::reset(&paths.feed(), &name, root_key, ReplicaConfig::default())?
+            Replica::reset_with(&paths.feed(), &name, root_key, ReplicaConfig::default(), authz_root)?
         }
     };
     let audit = Ledger::open(&paths.root.join("audit.db"))?;
@@ -597,11 +601,15 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
     }
+    // The box's authority (its token) must be in the feed, for the zone the box is started in.
     let zone = {
         let r = node.replica.lock().expect("replica");
-        r.state().and_then(|s| s.zones.get(&bs.zone)).map(|z| z.spec.clone())
+        r.zone_of(&bs.run).cloned()
     };
-    let zone = zone.with_context(|| format!("zone {} is not in this node's feed", bs.zone))?;
+    let zone = zone.with_context(|| format!("run {} has no authority in this node's feed", bs.run))?;
+    if zone.name != bs.zone {
+        bail!("run {}'s authority is for zone {}, not {}", bs.run, zone.name, bs.zone);
+    }
     if !node.docker.image_exists(&bs.image).await? {
         bail!("image {} not found on node {} (run: wicket image there)", bs.image, node.name);
     }
@@ -894,7 +902,7 @@ mod tests {
             paths: NodePaths::new(Some(dir.to_path_buf())),
             build: build_id().unwrap(),
             clock: node_clock(),
-            replica: Arc::new(Mutex::new(Replica::new("n1", root, ReplicaConfig::default()))),
+            replica: Arc::new(Mutex::new(Replica::new_with("n1", root, ReplicaConfig::default(), wicket_authz::PublicKey([5; 32])))),
             audit: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())),
             root_pem: String::new(),
             docker: Docker::from_env(),

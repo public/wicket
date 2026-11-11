@@ -73,8 +73,16 @@ impl Cp {
         let (root, feed_key) = (FeedKey::generate(&mut rand_core::OsRng), FeedKey::generate(&mut rand_core::OsRng));
         let authz_root = SigningKey::generate();
         let dir = TempDir::new("cp");
-        let p = Publisher::open_with(dir.path(), NODE, &root.verifying_key(), feed_key.clone(), &cert(&root, &feed_key), cfg(), authz_root.public())
-            .unwrap();
+        let p = Publisher::open_with(
+            dir.path(),
+            NODE,
+            &root.verifying_key(),
+            feed_key.clone(),
+            &cert(&root, &feed_key),
+            cfg(),
+            authz_root.public(),
+        )
+        .unwrap();
         Cp { root, feed_key, authz_root, approver: SigningKey::generate(), p, _dir: dir }
     }
 
@@ -127,7 +135,8 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
     // The oracle: the same zones as `ZoneSpec` entries, decided by `CompiledZone` in the replica.
     let oracle_dir = TempDir::new("oracle");
     let mut zp: Publisher<ZoneSpec> =
-        Publisher::open(oracle_dir.path(), NODE, &cp.root.verifying_key(), cp.feed_key.clone(), &cert(&cp.root, &cp.feed_key), cfg()).unwrap();
+        Publisher::open(oracle_dir.path(), NODE, &cp.root.verifying_key(), cp.feed_key.clone(), &cert(&cp.root, &cp.feed_key), cfg())
+            .unwrap();
     // Zone names repeat across the example and subset sets: one box per zone index, and the oracle
     // gets each zone under a unique name.
     let mut boxes = vec![];
@@ -154,7 +163,13 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
                     let o = op(&z.name, run, m, h, p);
                     for (now, mode) in [(T0, "fresh"), (narrow, "narrow")] {
                         let (want, got) = (zr.decide(&o, now), tr.decide(&o, now));
-                        assert_eq!(kind(&got), kind(&want), "{mode} zone {}: {m} {h}{p} ({:?}): token {got:?}, zone {want:?}", z.name, o.risk);
+                        assert_eq!(
+                            kind(&got),
+                            kind(&want),
+                            "{mode} zone {}: {m} {h}{p} ({:?}): token {got:?}, zone {want:?}",
+                            z.name,
+                            o.risk
+                        );
                         *counts.entry((mode, kind(&want))).or_default() += 1;
                     }
                 }
@@ -171,8 +186,12 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
     let path = common::paths_for(&read.paths[0])[0].clone();
     let host = read.host.replace("*.", "a.");
     assert_eq!(kind(&tr.decide(&op(&z.name, run, "GET", &host, &path), T0)), "allow");
-    assert!(matches!(tr.decide(&op(&boxes[1].1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone")));
-    assert!(matches!(tr.decide(&op(&z.name, "run-unknown", "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("no authority")));
+    assert!(
+        matches!(tr.decide(&op(&boxes[1].1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone"))
+    );
+    assert!(
+        matches!(tr.decide(&op(&z.name, "run-unknown", "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("no authority"))
+    );
 }
 
 fn zone(name: &str, paths: &[&str]) -> ZoneSpec {
@@ -259,7 +278,10 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     let issuer = cp.issue("r1", &z);
     cp.put(issuer.publish(&cp.approver, &[]).unwrap(), T0 - 100);
     let dir = TempDir::new("node");
-    let open = |cp: &Cp| Replica::<BoxAuthority>::open_with(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default(), cp.authz_root.public()).unwrap();
+    let open = |cp: &Cp| {
+        Replica::<BoxAuthority>::open_with(dir.path(), NODE, cp.root.verifying_key(), ReplicaConfig::default(), cp.authz_root.public())
+            .unwrap()
+    };
     let mut r = open(&cp);
     sync(&mut cp.p, &mut r, T0);
     let hook = gh("z", "r1", "POST", "/repos/acme/app/hooks"); // R4: needs a grant
@@ -297,7 +319,13 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     // The record can't add authority the token lacks: a listed grant with no block in the token
     // never fires, and neither does a grant for another box.
     let mut forged = issuer.publish(&cp.approver, &[]).unwrap();
-    forged.grants.push(TokenGrant { id: "g3".into(), host: "api.github.com".into(), method: "POST".into(), path: "/repos/acme/app/hooks".into(), uses: None });
+    forged.grants.push(TokenGrant {
+        id: "g3".into(),
+        host: "api.github.com".into(),
+        method: "POST".into(),
+        path: "/repos/acme/app/hooks".into(),
+        uses: None,
+    });
     r.accept(&cp.put(forged, now + 1), now + 1).unwrap();
     assert_eq!(kind(&r.decide(&hook, now + 1)), "needs-grant");
     let other_box = cp.issue("r2", &z);

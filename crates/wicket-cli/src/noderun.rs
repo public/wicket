@@ -3,9 +3,12 @@
 //!
 //! - **Feed.** One [`Publisher`] per node, under `<data dir>/nodes/<name>/feed`: the node's online feed
 //!   key (made here) and its certificate, signed by the installation's feed root. The run publishes
-//!   its zone, then the grants a human approves for its requests (bound to its box; the node counts
-//!   their uses, and the ledger hands them over so it never consumes them too), revocations of those
-//!   grants, and a run revocation. Freshness statements go out every refresh. While a run holds the
+//!   its box's authority as a Biscuit token (`wicket_feed::token`): block 0 minted here with the
+//!   authority root key from the zone's ceiling, until the run's timeout. Each grant a human approves
+//!   for its requests is a third-party block signed here with the approver key; the token is rebuilt
+//!   from its base with the live grants and published whole (bound to its box; the node counts their
+//!   uses, and the ledger hands them over so it never consumes them too). Revocations of those grants
+//!   go by grant id, and a run revocation also revokes the token's block 0 by its revocation id. Freshness statements go out every refresh. While a run holds the
 //!   feed (an exclusive lock), no other run can use the node: one run per node until the reconciler
 //!   (#38) owns the feed.
 //! - **Channel.** `ssh <pinned> <target> wicket node attach` joins the ssh session to the node's
@@ -31,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
-use wicket_feed::{Change, KeyCert, Publisher, PublisherConfig, RevokeKind};
+use wicket_feed::{BoxAuthority, Change, Issuer, KeyCert, LiveGrant, PublishError, Publisher, PublisherConfig, RevokeKind};
 use wicket_store::Ledger;
 
 /// The feed's timings for this control host: the defaults, or the test overrides.
@@ -50,8 +53,23 @@ pub fn feed_config() -> PublisherConfig {
 const CERT_DAYS: i64 = 7;
 
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
-/// the installation's feed root.
-pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<ZoneSpec>> {
+/// the installation's feed root. A delta log from before boxes' authority moved to tokens (zone
+/// entries, which don't parse as box records) is set aside as `deltas.jsonl.zones`, and the feed
+/// starts again under a new certificate version: a re-genesis, so the node takes the new snapshot.
+pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
+    let dir = crate::data_dir().join("nodes").join(name).join("feed");
+    match open_feed_once(name, &cfg, false) {
+        Err(e) if e.downcast_ref::<PublishError>().is_some_and(|e| e.to_string().contains("unreadable")) => {
+            let log = dir.join("deltas.jsonl");
+            std::fs::rename(&log, dir.join("deltas.jsonl.zones")).context("setting aside the old delta log")?;
+            println!("[wicket] node {name}'s feed log predates token authority: set aside, starting a new feed generation");
+            open_feed_once(name, &cfg, true)
+        }
+        r => r,
+    }
+}
+
+fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -79,13 +97,18 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<ZoneSpec>
     let kid = wicket_feed::kid(&key.verifying_key());
     let cert_jws = match old {
         Some((c, j))
-            if c.kid == kid && c.not_after > now + 86_400_000 && c.max_ttl_ms >= cfg.ttl_ms && c.max_narrow_ms >= cfg.narrow_ms =>
+            if !new_generation
+                && c.kid == kid
+                && c.not_after > now + 86_400_000
+                && c.max_ttl_ms >= cfg.ttl_ms
+                && c.max_narrow_ms >= cfg.narrow_ms =>
         {
             j
         }
         old => {
             // Same key: same version (a renewal). A new key needs a new version (a re-genesis).
             let version = match &old {
+                Some((c, _)) if new_generation => c.version + 1,
                 Some((c, _)) if c.kid == kid => c.version,
                 Some((c, _)) => c.version + 1,
                 None => 1,
@@ -96,7 +119,8 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<ZoneSpec>
             j
         }
     };
-    Ok(Publisher::open(&dir, name, &root.verifying_key(), key, &cert_jws, cfg)?)
+    let authz_root = crate::enrol::token_key(&crate::enrol::Paths::installation().authz_root_key)?.public();
+    Ok(Publisher::open_with(&dir, name, &root.verifying_key(), key, &cert_jws, cfg.clone(), authz_root)?)
 }
 
 trait WriteSync {
@@ -137,7 +161,9 @@ pub struct NodeCtl {
     node: String,
     run: String,
     link: Mutex<Option<chan::Out>>,
-    publisher: Arc<Mutex<Publisher<ZoneSpec>>>,
+    publisher: Arc<Mutex<Publisher<BoxAuthority>>>,
+    /// The box's token's block 0 revocation id (hex), and until when it matters (Unix ms).
+    token_root: (String, i64),
     killed: AtomicBool,
     _lock: FeedLock,
 }
@@ -156,11 +182,13 @@ impl NodeCtl {
     /// Revokes the run on the node (every op refused from the moment the delta applies), then stops it.
     pub fn revoke(&self) {
         let now = wicket_feed::now_ms();
-        let frame = self
-            .publisher
-            .lock()
-            .expect("publisher")
-            .commit(vec![Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 }], now);
+        let frame = self.publisher.lock().expect("publisher").commit(
+            vec![
+                Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 },
+                Change::Revoke { kind: RevokeKind::Token, id: self.token_root.0.clone(), until: self.token_root.1.max(now + 86_400_000) },
+            ],
+            now,
+        );
         match frame {
             Ok(f) => {
                 self.send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
@@ -196,6 +224,9 @@ struct Shared {
     ctl: Arc<NodeCtl>,
     tunnels: Tunnels,
     cfg: PublisherConfig,
+    /// The box's base token (block 0), and the key that signs its grant blocks.
+    issuer: Issuer,
+    approver: wicket_authz::SigningKey,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
@@ -205,13 +236,32 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     let cfg = feed_config();
     let mut publisher = open_feed(&name, cfg.clone())?;
     let now = wicket_feed::now_ms();
-    publisher.commit(vec![Change::PutZone { zone: s.zone.clone() }], now).context("publishing the zone")?;
+    let paths = crate::enrol::Paths::installation();
+    let (authz_root, approver) = (crate::enrol::token_key(&paths.authz_root_key)?, crate::enrol::token_key(&paths.approver_key)?);
+    // Until the run's own deadline (the node kills the box then), with an hour's margin.
+    let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
+    let issuer = Issuer::root(
+        &authz_root,
+        &s.tenant.0,
+        &format!("run:{}", s.run),
+        &s.run.0,
+        0,
+        &s.zone,
+        std::slice::from_ref(&s.start.image),
+        not_after,
+        vec![approver.public()],
+    )
+    .context("minting the box's token")?;
+    let authority = issuer.publish(&approver, &[]).context("the box's token")?;
+    publisher.commit(vec![Change::PutZone { zone: authority }], now).context("publishing the box's token")?;
+    let token_root = (issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
     let target_epoch = publisher.epoch();
     let ctl = Arc::new(NodeCtl {
         node: name.clone(),
         run: s.run.0.clone(),
         link: Mutex::new(None),
         publisher: Arc::new(Mutex::new(publisher)),
+        token_root,
         killed: AtomicBool::new(false),
         _lock: lock,
     });
@@ -235,6 +285,8 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
         ctl: ctl.clone(),
         tunnels: Tunnels::default(),
         cfg,
+        issuer,
+        approver,
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -281,6 +333,8 @@ struct Progress {
     next: [u64; 2],
     published: HashSet<String>,
     revoked: HashSet<String>,
+    /// The grants the box's token carries now.
+    live: Vec<LiveGrant>,
     ever: bool,
     exited: bool,
 }
@@ -298,6 +352,7 @@ async fn manage(
         next: [0, 0],
         published: HashSet::new(),
         revoked: HashSet::new(),
+        live: vec![],
         ever: false,
         exited: false,
     };
@@ -602,6 +657,11 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_j
 /// Publishes grants approved for this run's requests to hosts the node terminates (and hands them
 /// over, so the ledger stops consuming them), and revocations of grants it published. Grants for
 /// hosts the node forwards stay in the ledger: the control host's egress proxy decides those.
+///
+/// A grant reaches the node as a block of the box's token: whenever the live grants change, the
+/// token is rebuilt from its base with one block per live grant (signed with the approver key) and
+/// published whole, in the same delta as any grant revocations. At most
+/// [`wicket_feed::token::MAX_GRANTS`] are live at once; more stay in the ledger until some expire.
 fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let (grants, ca) = {
         let l = sh.ledger.lock().expect("ledger");
@@ -612,10 +672,15 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     };
     let now_s = wicket_store::now();
     let mut changes = vec![];
+    let before = p.live.len();
+    p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
+    let mut rebuild = p.live.len() != before;
     for g in grants {
         let mine = g.node.as_deref() == Some(sh.node.as_str());
         if g.revoked && mine && p.published.contains(&g.id) && p.revoked.insert(g.id.clone()) {
             changes.push(Change::Revoke { kind: RevokeKind::Grant, id: g.id.clone(), until: g.expires_at * 1000 });
+            p.live.retain(|l| l.grant.gid != g.id);
+            rebuild = true;
             continue;
         }
         if g.revoked || g.node.is_some() || g.expires_at <= now_s || p.published.contains(&g.id) {
@@ -625,6 +690,16 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if route != wicket_proxy::decide::Route::Terminate {
             continue;
         }
+        if p.live.len() >= wicket_feed::token::MAX_GRANTS {
+            println!(
+                "[wicket] node {} holds {} live grants for {}: grant {} stays with the control host for now",
+                sh.node,
+                p.live.len(),
+                sh.run,
+                g.id
+            );
+            continue;
+        }
         if !sh.ledger.lock().expect("ledger").hand_grant_to_node(&g.id, &sh.node).unwrap_or(false) {
             continue;
         }
@@ -632,30 +707,46 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             println!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
         }
         let op = Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path);
-        changes.push(Change::AddGrant {
-            grant: wicket_feed::Grant {
-                id: g.id.clone(),
-                zone: sh.zone.name.clone(),
-                op: op.digest(),
-                what: format!("{} {}{}", g.method, g.host, g.path),
-                not_after: g.expires_at * 1000,
-                uses: g.uses_left.map(|u| u.max(0) as u32),
-                box_id: Some(sh.run.0.clone()),
+        p.live.push(LiveGrant {
+            grant: wicket_authz::Grant {
+                gid: g.id.clone(),
+                box_id: sh.issuer.box_path.clone(),
+                epoch: sh.issuer.epoch,
+                host: op.host.clone(),
+                method: op.method.clone(),
+                path: op.path.clone(),
+                not_after: u64::try_from(g.expires_at).unwrap_or(0),
+                approver: g.request_id.as_deref().map_or_else(|| "operator".to_string(), |r| format!("request:{r}")),
+                digest: hex::decode(op.digest()).unwrap_or_default(),
             },
+            uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
         });
         p.published.insert(g.id);
+        rebuild = true;
+    }
+    if !rebuild {
+        return vec![];
+    }
+    match sh.issuer.publish(&sh.approver, &p.live) {
+        Ok(a) => changes.push(Change::PutZone { zone: a }),
+        Err(e) => println!("[wicket] could not rebuild the token of {} for node {}: {e}", sh.run, sh.node),
     }
     if changes.is_empty() {
         return vec![];
     }
-    let n = changes.len();
+    let n = p.live.len();
     let committed = {
         let mut p = sh.ctl.publisher.lock().expect("publisher");
         p.commit(changes, wicket_feed::now_ms()).map(|f| (f, p.epoch()))
     };
     match committed {
         Ok((f, epoch)) => {
-            println!("[wicket] published {n} grant change(s) to node {}, epoch {epoch} (at {} ms)", sh.node, wicket_feed::now_ms());
+            println!(
+                "[wicket] published {}'s token with {n} live grant(s) to node {}, epoch {epoch} (at {} ms)",
+                sh.run,
+                sh.node,
+                wicket_feed::now_ms()
+            );
             vec![f]
         }
         Err(e) => {
