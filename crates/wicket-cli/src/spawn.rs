@@ -217,8 +217,17 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     match &placed {
         Some(p) => {
             cmd.args(["--node", &p.node]);
-            if let Some(lease) = &p.lease {
-                cmd.args(["--lease", lease]);
+            match &p.lease {
+                Some(lease) => {
+                    cmd.args(["--lease", lease]);
+                }
+                // The parent's own node: reached the way the parent reaches it. A lease's node
+                // carries the key it was enrolled with.
+                None => {
+                    if let Some(k) = &c.ssh_key {
+                        cmd.arg("--ssh-key").arg(k);
+                    }
+                }
             }
         }
         None => {
@@ -299,4 +308,84 @@ pub fn placement(l: &Ledger, run: &str, own_node: Option<&str>, hint: Option<&se
         return Err(format!("node {n} is neither where this agent runs nor the node of a lease it holds: ask for one with request_capacity"));
     }
     Err("placement must be {\"lease\": \"l-…\"} or {\"node\": \"<name>\"}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wicket_store::{LeaseBudget, LeaseRow};
+
+    const NOW: i64 = 1_000_000;
+
+    /// A lease held by `run` in `status` (`active` ones on node `node`, ending at `not_after`).
+    fn lease(l: &mut Ledger, id: &str, run: &str, status: &str, node: &str, not_after: i64) {
+        let row = LeaseRow {
+            id: id.into(),
+            tenant: "default".into(),
+            run: run.into(),
+            request_id: None,
+            provider: "static".into(),
+            spec: json!({}),
+            hourly_cap: 0,
+            reserved: 0,
+            duration_secs: 1800,
+            created_at: 0,
+            not_after: None,
+            status: "pending".into(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        };
+        l.create_lease(&row, LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+        if status == "pending" {
+            return;
+        }
+        assert!(l.lease_transition(id, &["pending"], "approved", "test").unwrap());
+        if status == "active" {
+            l.lease_activated(id, node, "wicket@203.0.113.9", not_after).unwrap();
+        }
+    }
+
+    fn at(node: &str, lease: Option<&str>) -> Option<Placed> {
+        Some(Placed { node: node.into(), lease: lease.map(String::from) })
+    }
+
+    #[test]
+    fn placement_hints_resolve_only_to_where_the_parent_runs_or_to_leases_it_holds() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        lease(&mut l, "l-mine", "r1", "active", "n-lease", NOW + 600);
+        lease(&mut l, "l-old", "r1", "active", "n-old", NOW - 1);
+        lease(&mut l, "l-wait", "r1", "approved", "", 0);
+        lease(&mut l, "l-ask", "r1", "pending", "", 0);
+        lease(&mut l, "l-theirs", "r2", "active", "n-theirs", NOW + 600);
+        let p = |hint: serde_json::Value, own: Option<&str>| placement(&l, "r1", own, Some(&hint), NOW);
+
+        // No hint: where the parent runs.
+        assert_eq!(placement(&l, "r1", Some("n-own"), None, NOW).unwrap(), None);
+        // A lease it holds and that is active: its node, recorded against the lease.
+        assert_eq!(p(json!({"lease": "l-mine"}), None).unwrap(), at("n-lease", Some("l-mine")));
+        // Someone else's lease, one past its end, one not ready yet, one that doesn't exist.
+        assert!(p(json!({"lease": "l-theirs"}), None).unwrap_err().contains("no lease l-theirs held by this run"));
+        assert!(p(json!({"lease": "l-old"}), None).unwrap_err().contains("has ended"));
+        assert!(p(json!({"lease": "l-wait"}), None).unwrap_err().contains("is approved"));
+        assert!(p(json!({"lease": "l-ask"}), None).unwrap_err().contains("is pending"));
+        assert!(p(json!({"lease": "l-nope"}), None).is_err());
+        // The parent's own node: no lease.
+        assert_eq!(p(json!({"node": "n-own"}), Some("n-own")).unwrap(), at("n-own", None));
+        // The node of a lease it holds: placed on that lease.
+        assert_eq!(p(json!({"node": "n-lease"}), Some("n-own")).unwrap(), at("n-lease", Some("l-mine")));
+        // Another run's lease node, or any other node: refused.
+        assert!(p(json!({"node": "n-theirs"}), Some("n-own")).unwrap_err().contains("request_capacity"));
+        assert!(p(json!({"node": "n-other"}), None).is_err());
+        // A held lease's node, after the lease ended: refused.
+        assert!(p(json!({"node": "n-old"}), None).unwrap_err().contains("has ended"));
+        // Neither form.
+        assert!(p(json!({"host": "x"}), None).unwrap_err().contains("placement must be"));
+        assert!(p(json!("n-own"), Some("n-own")).is_err());
+    }
 }
