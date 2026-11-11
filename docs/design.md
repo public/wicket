@@ -47,6 +47,8 @@ Sources:
   sandboxed runners compared (Omnigent, Agent Substrate, Centaur, inspect_ai, Paperclip, Harbor, …).
 - [`research/17-metaharness-literature.md`](research/17-metaharness-literature.md) — essays, papers and vendor
   docs on harnesses, harness search, evaluation harnesses and harness safety.
+- [`research/18-authorization-landscape.md`](research/18-authorization-landscape.md) — authorization
+  engines, relationship stores, capability tokens and policy distribution, against wicket's requirements.
 - [`prior-art.md`](prior-art.md) — the consolidated catalogue of papers and projects.
 - Components, processes and dependencies: Claude Doc https://claude.ai/artifact/XDhPxV33xb5G7QG4FpkS2L
 
@@ -66,7 +68,7 @@ Things the brief assumed or left open, and what we now know (2026-11-08):
 | Two enforcement surfaces (MCP gateway, egress proxy) | **Three.** The model API is its own surface: an **LLM proxy** (via `ANTHROPIC_BASE_URL`) holds the model key, is the best liveness sensor, and is a taint ingress (Claude's WebSearch runs server-side and is invisible to the egress proxy). [01 §4.5–4.6] |
 | microVMs for speed and lightness | This box (Vultr VC2) has **no KVM**. v1 Linux tiers are a native process jail and gVisor (which also gives checkpoint/restore for parking). Firecracker comes later on bare metal. [02 §1, §10] |
 | Typed escalation à la RFC 9396 | Kept. MCP's own spec now says single-use must be enforced server-side, so use counts and approvals live in a **ledger**, not in tokens. [03 §2.6] |
-| Macaroon/Biscuit attenuation | Kept as a *shape*, deferred as a *format*: v1 is single-host, so grants are values in a capability algebra with a syntactic subset check, stored in the ledger. Biscuit can be added later without changing the model. [03 §7.2] |
+| Macaroon/Biscuit attenuation | Adopted: zone ceilings, grants and leases are Biscuit tokens, checked on the node by a vendored, patched `biscuit-auth` (§2.1). The PoC still uses a capability algebra with a syntactic subset check, stored in the ledger. [03 §7.2] |
 | Claude-style Remote Control and wicket's own UI side by side (owner, 2026-11-08) | Remote Control needs a claude.ai subscription login and Anthropic's own base URL, and its control protocol runs through Anthropic's session service (`--sdk-url`, Anthropic hosts only). So it can't share wicket's default launch. It becomes an opt-in `vendor_rc` zone mode: the RC bridge stays on the host, and its sessions are jailed via `CLAUDE_CODE_PROCESS_WRAPPER`. An observe-only tap at the egress proxy feeds wicket's console, and RC answers are never wicket grants. [09] |
 | Claude Code is the only inner agent that matters | **Codex app-server and pi are T1 too**: native control protocols with host-answered approvals, steering and typed output. pi has no permission layer by design ("the sandbox is your job"). Codex has its own Remote Control. [11] |
 | Hash-pin tool descriptions; label per agent | Tool descriptions poisoned from the start defeat pinning, and the highest-success real attacks tamper with *values inside* allowed calls (MCPTox, MSB). So descriptions are taint, sink arguments need provenance on every R2+ `Op`, and handles can be passed as arguments. [05, 06] |
@@ -91,8 +93,10 @@ enters the context window, so compaction can't erode it.
 1. **The box is hostile.** Assume the inner agent is compromised from its first token. Nothing inside the
    box is in the trusted computing base, including the adapter's own config, hooks and the agent's own
    sandbox. Those are telemetry and UX only.
-2. **No secrets in the box, ever.** Sandbox identity is the transport (its netns, UDS or vsock), not a
-   bearer token. Tools get placeholders; real credentials are injected on the way out.
+2. **No secrets in the box by default.** Sandbox identity is the transport (its netns, UDS or vsock), not a
+   bearer token. Tools get placeholders; real credentials are injected on the way out. A workload that must
+   hold a secret itself (e.g. a webhook receiver's HMAC key) gets it only as an explicit, human-granted,
+   visible exception, never the model or injection credentials (owner, 2026-11-09; #36).
 3. **Fail narrow.** Every mistake should cost the agent access (it stalls, someone notices) rather than
    leak access. Unmapped means deny. Undeclared parameter means deny. Unknown risk means R4.
 4. **Judge the request, not the reasoning.** Escalation deciders see a typed request and the trusted task
@@ -123,6 +127,100 @@ enters the context window, so compaction can't erode it.
 13. **Reusable programs run without an agent, never without a boundary** (owner, 2026-11-08). Code an
     agent writes becomes a program only through a reviewed, signed promotion, and every run gets the same
     sandbox, egress control and audit as an agent (§17).
+
+### 2.1 Build versus reuse (owner, 2026-11-10)
+
+wicket shouldn't rebuild what identity and access management systems already do well. Cloud IAM, though,
+doesn't do wicket's core job:
+- **IAM governs calls to one provider's APIs.** wicket governs every crossing out of an agent's box: any
+  website or API (most have no IAM), the model API, MCP tools, git pushes, new sandboxes. It judges per
+  request (method, path, risky patterns).
+- **IAM gives credentials *to* the workload.** wicket keeps them out of the box and adds them outside.
+- **IAM's delegation is static and managed by admins.** wicket's is made by agents at runtime: sub-agents
+  with narrowed authority, and requests and grants in-band. Letting an agent create IAM roles would itself
+  be a high-risk permission change.
+- **IAM has no isolation,** no in-band "wait for a human, then retry", and no taint.
+
+So wicket is the **enforcement point and broker in front of the agent**: the sandbox, the proxies,
+keeping credentials out, the request → approval → retry loop, and runtime delegation between agents.
+Everything around that uses standard components:
+
+| Need | Reuse | Status |
+|---|---|---|
+| Workload identity, rotation, attestation | **SPIFFE** IDs and SVID formats; a real **SPIRE** deployment can be the issuer | the PoC has its own small issuer with SPIFFE-shaped IDs (#52) |
+| Org rules: images, hosts, escalation and inspection rights, operator roles | **Cedar** (the `cedar-policy` crate, embedded), static and reviewed; **SymCC** in CI to diff policy changes (#50, #34, #11) | the PoC's checks are hand-written (#51) |
+| Delegated authority: zone ceilings, grants and leases | **capability chains in the Biscuit format**, checked by a vendored, patched `biscuit-auth`: narrowing by construction, signed, checked offline, revocable by subtree; intersected with the org rules at decision time | the PoC's `subset.rs` is hand-written and conservative (#57) |
+| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed with a freshness lease** (TUF-style), so nodes know when they're stale and fail narrow; no product signs increments or fails narrow | central checks on the control host (#57) |
+| Relationship data: spawn trees, tenants, roles | Cedar entities materialised from wicket's ledger; **OpenFGA** as an optional source in platform mode | the ledger (#11) |
+| Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP | passkeys enrolled in wicket's console (#53) |
+| Downstream credentials | providers' **scoped native credentials** (AWS STS session policies, GCP downscoped tokens, GitHub App installation tokens; §9.4) | whole tokens injected from the vault (#54) |
+| Human just-in-time access workflows | Teleport access requests, AWS Identity Center, Entra PIM, as optional **approval channels** | wicket's own ledger and console |
+| Clusters and scheduling | Kubernetes behind the placement interface (#45) | Vultr + SSH first (#37) |
+
+The rule: if a mature, standard component does it, wicket integrates with it, and keeps its own code for
+what only an in-path broker can do. Where the best fit is weakly maintained, wicket may fork or vendor it.
+
+**Identity is JWT; authority is Biscuit** (owner, 2026-11-10; confirmed after experiments #59 and its
+follow-up, 2026-11-11).
+- **Identity:** who a box is. It stays JWT, as SPIFFE JWT-SVIDs (#52): standard, and readable by anything
+  outside wicket.
+- **Authority:** what a box may do, i.e. zone ceilings, grants and leases. It's a Biscuit token held by the
+  node, never by the box.
+- **Why not JWT for authority:**
+  - A JWT can't be narrowed. Delegating means someone with a signing key mints a new token: either a round
+    trip to the control plane for every spawn or grant (against local decisions, #57), or signing keys on
+    every node, where a compromised node could mint *any* authority.
+  - "The child is within its parent" would be hand-written checks over claims, which have to be right
+    everywhere.
+- **Why Biscuit:**
+  - The holder appends blocks offline, with no issuer key, and blocks can only add checks. The decision
+    must pass the checks of *every* block. So a child can't exceed its parent by construction, and a
+    compromised node can only narrow what it already holds.
+  - Approvals are third-party blocks signed by the approving principal: the human approval service, or a
+    parent box's grantor key that a zone block trusts.
+  - Each block has a revocation id, so revoking one revokes the subtree under it.
+  - Leases lapse on their own, without invalidating the token.
+  - It's a published format with several implementations, so parties outside wicket can verify a token.
+- **How it's checked fast** (`experiments/biscuit-fast/RESULTS.md`). Stock biscuit-auth 6.0.0 takes about
+  1 ms per request at spawn depth 5 (#59), because it rebuilds the token's rules for every request, and
+  its wall-clock time limit makes denials depend on load. wicket vendors upstream main with three
+  patches:
+  1. load a token once, then add each request's facts on top;
+  2. a step budget instead of the wall-clock limit, so decisions are deterministic;
+  3. a compiled evaluator shared between threads. Anything it can't compile, and any run-time error, goes
+     to the stock engine.
+
+  Result at depth 5: 7–11 µs median and under 30 µs p99 per request. Loading a token costs about 3 ms,
+  once per token.
+- **The rules that come with it:**
+  - A **structural check** runs before a token is loaded:
+    - first-party blocks hold only checks from wicket's fixed vocabulary: no rules, no `.matches`, no
+      `check all`;
+    - third-party blocks hold only `approved(...)` rules, from keys a zone block trusts;
+    - token size and checks per block are capped.
+
+    Without it, a hostile block can burn CPU inside the step budget.
+  - A **differential test in CI** compares the compiled evaluator with the stock engine on random tokens
+    and requests. It runs on every change to the fork and every rebase onto upstream.
+  - Patches 1 and 2 are small and general, and should go upstream. Patch 3 is wicket's to maintain.
+  - The format sits behind wicket's own chain interface.
+- **What it costs:**
+  - About 20k vendored lines and a 1.9k-line fork in the trusted computing base.
+  - The work of rebasing onto upstream.
+  - Tokens are 10 KB at depth 5. That's fine held on the node, but too big for a request header.
+  - Its rule language (Datalog) takes learning, although wicket generates every block, so nobody writes it
+    by hand.
+
+The survey behind these choices, with the options ruled out and why, is research 18
+(`research/18-authorization-landscape.md`). In short:
+- Cedar is healthy and right for static org rules. Its analyser can't reason about authority stored as data
+  or about template-linked policies, so it can't be what guarantees delegation.
+- Every system that reliably stops a child exceeding its parent does it by intersection at decision time:
+  AWS session policies, Biscuit attenuation, Kubernetes' escalate/bind rule.
+- Biscuit is the one moderately maintained capability-token library (Apache-2.0, Eclipse Foundation). Stock,
+  it's too slow for the request path (about 1 ms at depth 5), so wicket vendors and patches it (7–11 µs).
+- The local-agent and distribution projects (cedar-local-agent, OPAL, avp-local-agent, Cedarling and
+  Lock) are inactive, AWS-only, or immature for this.
 
 ---
 
@@ -2266,11 +2364,11 @@ Each milestone ends with the smallest test that could prove it wrong. From M1 on
 | **M6** | `wicket explain` + zone view + timeline | The three-engineer test. |
 | **M7** | Agent lifecycle (§13): agent registry, Active → Idle → Sleeping → Hibernated → Archived → Deleted, gVisor checkpoint, push to object storage (MinIO locally), rebuild path, wake sources (message, schedule, event), memory staging and promotion gate, retention and GC with crypto-shredding | An agent works, sleeps, hibernates to MinIO, and is woken a day later by a schedule. Its node is killed while it's active, and it rebuilds elsewhere from the last checkpoint within the RPO. A skill it wrote is staged, reviewed and only then visible to its next activation; rolling back the memory version removes it. GC deletes an agent after its grace period, and its blobs are unreadable while the audit chain still verifies. Every transition stays within the §13.8 budgets. |
 | **M8** | Adapter generator loop | Generated vs hand-written GitHub adapters diffed. Zero too-permissive rules, or find which check missed it. |
-| **M9** | ACP (T2) adapter; `wicket.spawn` dynamic topology | Conformance suite passes for one ACP agent. Child ⊆ parent is enforced and proven by symcc. |
+| **M9** | ACP (T2) adapter; `wicket.spawn` dynamic topology | Conformance suite passes for one ACP agent. Child ⊆ parent is enforced by the capability algebra, which is tested against SymCC's segment model in CI. |
 | **M10** | Many clouds: provisioner with the Vultr (via broker) and AWS or GCP providers, WireGuard + mTLS node join, a KVM pool with Kata/Firecracker, money envelope + human approval for spend, `request_capacity` | One installation spans two providers. An agent's `request_capacity{kvm}` gets a Firecracker sandbox on a newly created per-second-billed host inside the envelope. A Vultr host is released before its next paid hour. Killing the provisioner mid-create leaks nothing, and the daily reconcile matches every provider's charges to the cent. |
 | **M11** | Mandates (research 15, MD0–MD9): passkey-signed mandates in the ledger, consent screen, connections (OAuth via a wicket page; websites via a remote browser the user logs into), a session-less agent browser with cookies injected at egress, a site adapter, the seven-layer checkout guard | **Demo:** Claude Code builds an Ocado basket under a 48-hour, £120 mandate. Every step past the basket stays pending, no Ocado cookie reaches the box, and no order is placed. The approve-and-submit path is proven on a local fake shop (`wicket-mart`): a price change after approval voids it, and an injected \"add 50\" is refused. |
 | **M12** | Programs: program manifests, source digests, pinned runs without an agent, `on_pending` policy; then promotion from an agent's output with a passkey-signed approval, and `wicket.run_program` as a gateway tool | A program an agent wrote is approved by digest, then runs on a schedule with no model in the loop. A one-line change is refused until re-approved. A request outside its reach fails the run (or parks it), and outputs carry the author's taint. |
-| later | Firecracker (on bare metal via the broker), seatbelt, e2b, wasm codemode; Biscuit if wicket goes multi-host; parent tier on, once its shadow decisions are measured | |
+| later | Firecracker (on bare metal via the broker), seatbelt, e2b, wasm codemode; parent tier on, once its shadow decisions are measured | |
 
 M1 is deliberately first: until Claude Code runs usefully with no credentials and no direct network, none
 of the rest matters.
@@ -2281,8 +2379,8 @@ of the rest matters.
 
 | Decision | Why | Revisit if |
 |---|---|---|
-| Cedar for authored policy + an own capability algebra for grants | Analysable (symcc), explains decisions, fast; grants need a cheap syntactic subset check | symcc can't handle realistic policies (prototype in M0) |
-| No Biscuit in v1; grants in a SQLite ledger | Single host; use counts need server state anyway | Multi-host enforcement or offline delegation |
+| Cedar for authored policy + an own capability algebra for grants | Analysable (SymCC in CI), explains decisions, fast; grants need a cheap syntactic subset check. Experiment #58: SymCC handles realistic org policy diffs in 0–9 ms, but gives `unknown` on some zone globs, so it stays out of the spawn path | Cedar's analysis can decide segment-wise globs quickly and completely |
+| Authority in the Biscuit format, checked by a vendored `biscuit-auth` (upstream main plus three patches), with a structural check before loading and a differential test against the stock engine in CI; use counts stay in the ledger | Narrowing, offline attenuation, third-party approvals and subtree revocation come with the format, which outside parties can verify. The patches take a depth-5 request from about 1 ms to 7–11 µs, deterministically (#59, biscuit-fast) | Upstream takes patches 1 and 2 (then only patch 3 is ours), or the fork's upkeep outweighs it (fall back to plain signed records with the same semantics, measured at under 1 µs) |
 | `rama` 0.4 parts (rustls termination assembled ourselves) behind the `srt` decider seam | Rust, composable, swappable; no ready rustls MITM relay exists anywhere | rama churn hurts → hyper + tokio-rustls |
 | `rmcp` gateway, not agentgateway | agentgateway isn't embeddable (`publish=false`). Its argument rules (CEL guardrails), like ToolHive's and ContextForge's, see raw arguments rather than adapter-bound typed resources. It also passes client headers through by default and runs stdio servers unsandboxed | — |
 | Process jail for development; **gVisor as the floor for valuable zones and all third-party servers**; microVMs later | No KVM here; containers and process jails share the host kernel, and models escape misconfigured ones (SandboxEscapeBench); gVisor gives checkpoint/restore without KVM | Bare-metal dev box available |
