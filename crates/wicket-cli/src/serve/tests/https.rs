@@ -87,7 +87,11 @@ impl ServerCertVerifier for Grab {
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &ring().signature_verification_algorithms)
+        // By the raw key: webpki won't parse a certificate with the critical acmeIdentifier
+        // extension, which real validators (and browsers never shown it) don't mind.
+        let (_, cert) = x509_parser::parse_x509_certificate(c.as_ref()).map_err(|e| rustls::Error::General(e.to_string()))?;
+        let spki = rustls::pki_types::SubjectPublicKeyInfoDer::from(cert.tbs_certificate.subject_pki.raw);
+        rustls::crypto::verify_tls13_signature_with_raw_key(m, &spki, d, &ring().signature_verification_algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         ring().signature_verification_algorithms.supported_schemes()
@@ -99,7 +103,7 @@ impl ServerCertVerifier for Grab {
 async fn alpn_probe(addr: SocketAddr, name: &str) -> (Option<Vec<u8>>, String) {
     let grab = Arc::new(Grab::default());
     let mut c = ClientConfig::builder_with_provider(ring())
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(grab.clone())

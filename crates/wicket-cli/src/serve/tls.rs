@@ -122,7 +122,10 @@ pub fn challenge_cert(domain: &str, key_auth_digest: &[u8]) -> Result<CertifiedK
     let key = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key)?;
     let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    certified_key(vec![cert.der().clone()], &der)
+    // Not `certified_key`: its `keys_match` parses the certificate with webpki, which rejects the
+    // critical acmeIdentifier extension. The pair was just generated together, so it matches.
+    let signing = rustls::crypto::ring::sign::any_supported_type(&der).map_err(|e| anyhow!("private key: {e}"))?;
+    Ok(CertifiedKey::new(vec![cert.der().clone()], signing))
 }
 
 /// A certificate and key from files (`--tls-cert`, `--tls-key`), re-read when either file changes
