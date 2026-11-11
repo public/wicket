@@ -10,6 +10,7 @@ mod enrol;
 mod image;
 mod mock;
 mod node;
+mod nodeauth;
 mod noderun;
 mod nodesrv;
 mod place;
@@ -233,7 +234,8 @@ enum NodeCmd {
         ttl: String,
     },
     /// Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a
-    /// short-lived CA certificate constrained to --hosts, the feed root key and the issuer key.
+    /// short-lived identity certificate for its node key, a short-lived CA certificate constrained to
+    /// --hosts, the feed root key and the issuer key.
     Enrol {
         /// e.g. wicket@203.0.113.7
         target: String,
@@ -259,11 +261,15 @@ enum NodeCmd {
         /// Node CA lifetime.
         #[arg(long, default_value = "24h")]
         ca_ttl: String,
+        /// Node identity certificate lifetime (renewed over the control channel at half-life).
+        #[arg(long, default_value = "24h")]
+        cert_ttl: String,
     },
     /// List enrolled nodes.
     List,
-    /// Revoke a node: refuse it from now on (its pinned host key is deleted) and record its CA serials
-    /// for the feed's revocation list.
+    /// Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates
+    /// are revoked, and runs connected to it drop it) and record its CA serials for the feed's
+    /// revocation list.
     Revoke { name: String },
     /// Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node`
     /// systemd user service that runs `wicket node serve` there.
@@ -290,7 +296,9 @@ enum NodeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Issue a node a fresh CA certificate (and CA key, made on the node).
+    /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
+    /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate
+    /// expired while it was unreachable gets back in.
     RenewCa {
         name: String,
         /// Replace the hosts it is constrained to (default: keep them).
@@ -298,6 +306,9 @@ enum NodeCmd {
         hosts: Vec<String>,
         #[arg(long, default_value = "24h")]
         ca_ttl: String,
+        /// Node identity certificate lifetime.
+        #[arg(long, default_value = "24h")]
+        cert_ttl: String,
     },
 }
 
@@ -738,7 +749,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Node { cmd } => match cmd {
             NodeCmd::Token { name, ttl } => enrol::token(name, humantime::parse_duration(&ttl)?),
-            NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl } => {
+            NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl, cert_ttl } => {
                 enrol::enrol(enrol::EnrolOpts {
                     target,
                     token,
@@ -748,6 +759,7 @@ async fn main() -> Result<()> {
                     trust_first_use,
                     hosts,
                     ca_ttl: humantime::parse_duration(&ca_ttl)?,
+                    cert_ttl: humantime::parse_duration(&cert_ttl)?,
                 })
                 .await
             }
@@ -758,7 +770,9 @@ async fn main() -> Result<()> {
                 println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
                 Ok(())
             }
-            NodeCmd::RenewCa { name, hosts, ca_ttl } => enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?).await,
+            NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => {
+                enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?, humantime::parse_duration(&cert_ttl)?).await
+            }
             NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir } => nodesrv::serve(dir).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,

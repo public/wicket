@@ -15,8 +15,9 @@
 //! - **It keeps an audit log.** A ledger of its own (`audit.db`), hash-chained like the control host's,
 //!   records its decisions; it ships records past the control host's watermark on every connect.
 //! - **One control connection at a time**, on a unix socket in a 0700 directory, reached over ssh
-//!   (`wicket node attach`). A newer connection replaces an older one. The control host must run the
-//!   same wicket build (sha256 of the binary): anything else is refused.
+//!   (`wicket node attach`). A newer connection replaces an older one, but only once it has proved
+//!   this installation's issuer key and accepted the node's certificate (`nodeauth.rs`). The control
+//!   host must also run the same wicket build (sha256 of the binary): anything else is refused.
 //! - **Clock.** Feed decisions use the wall clock read once at start, advanced by a monotonic clock, so
 //!   a wall-clock step while serving can't stretch a freshness statement (wicket-feed's README).
 
@@ -112,6 +113,7 @@ struct Link {
 struct Node {
     name: String,
     paths: NodePaths,
+    ident: crate::nodeauth::NodeIdentity,
     build: String,
     clock: Clock,
     replica: Arc<Mutex<Replica<ZoneSpec>>>,
@@ -287,6 +289,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
             Replica::reset(&paths.feed(), &name, root_key, ReplicaConfig::default())?
         }
     };
+    let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
     let audit = Ledger::open(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
     let ctl = paths.socket();
@@ -298,6 +301,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
     let node = Arc::new(Node {
         name: name.clone(),
         paths,
+        ident,
         build: build_id()?,
         clock: node_clock(),
         replica: Arc::new(Mutex::new(replica)),
@@ -361,7 +365,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
     let hello = tokio::time::timeout(std::time::Duration::from_secs(15), chan::read_frame(&mut rd)).await.context("no hello")??;
     let refuse = |why: String| Frame::Msg(Msg::Refused { why }).encode();
     let observer = match hello {
-        Some(Frame::Msg(Msg::Hello { node: n, build, version, observer })) => {
+        Some(Frame::Msg(Msg::Hello { node: n, build, version, observer, nonce })) => {
             let why = if n != node.name {
                 Some(format!("this is node {}, not {n}", node.name))
             } else if build != node.build {
@@ -377,6 +381,15 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
             if let Some(why) = why {
                 wr.write_all(&refuse(why.clone())).await?;
                 bail!("refused a control host: {why}");
+            }
+            if !observer {
+                // Nothing changes here (the current connection keeps the link) until it has proved
+                // this installation's issuer key.
+                if let Err(e) = crate::nodeauth::node(&mut rd, &mut wr, &node.ident, &node.paths.root, &node.name, &nonce).await {
+                    let why = format!("{e:#}");
+                    wr.write_all(&refuse(why.clone())).await?;
+                    bail!("refused a control host: {why}");
+                }
             }
             observer
         }
@@ -581,6 +594,20 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                 }
             }
             Msg::Close { stream } => node.tunnels.close(stream),
+            Msg::NodeCert { cert } => {
+                let now = (node.clock)() / 1000;
+                let (serial, error) = match node.ident.install_cert(&node.paths.root, cert.trim(), &node.name, now) {
+                    Ok(c) => {
+                        eprintln!("[node] identity certificate renewed: {}… until {}", &c.jti[..12], c.exp);
+                        (c.jti, None)
+                    }
+                    Err(e) => {
+                        eprintln!("[node] refused a renewed identity certificate: {e:#}");
+                        (String::new(), Some(format!("{e:#}")))
+                    }
+                };
+                node.send(Frame::Msg(Msg::NodeCertInstalled { serial, error }));
+            }
             other => bail!("unexpected message from the control host: {other:?}"),
         },
     }
@@ -860,8 +887,14 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
     let tampered = parts.join(".");
     let mut s = UnixStream::connect(paths.socket()).await?;
     s.write_all(
-        &Frame::Msg(Msg::Hello { node: paths.name()?, version: env!("CARGO_PKG_VERSION").into(), build: build_id()?, observer: true })
-            .encode(),
+        &Frame::Msg(Msg::Hello {
+            node: paths.name()?,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: build_id()?,
+            observer: true,
+            nonce: String::new(),
+        })
+        .encode(),
     )
     .await?;
     let mut out = vec![];
@@ -887,11 +920,15 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn test_node(dir: &std::path::Path) -> Arc<Node> {
+    use crate::nodeauth::testkit::Install;
+    use crate::nodeauth::HsError;
+
+    fn test_node(i: &Install) -> Arc<Node> {
         let root = wicket_identity::SigningKey::from_bytes(&[3; 32]).verifying_key();
         Arc::new(Node {
             name: "n1".into(),
-            paths: NodePaths::new(Some(dir.to_path_buf())),
+            paths: NodePaths::new(Some(i.dir.clone())),
+            ident: i.identity(),
             build: build_id().unwrap(),
             clock: node_clock(),
             replica: Arc::new(Mutex::new(Replica::new("n1", root, ReplicaConfig::default()))),
@@ -913,13 +950,35 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(s)).await.unwrap().unwrap().unwrap()
     }
 
-    async fn connect(node: &Arc<Node>, gen: u64, build: &str) -> UnixStream {
+    fn hello(build: &str) -> impl FnOnce(String) -> Msg + '_ {
+        move |nonce| Msg::Hello { node: "n1".into(), version: "t".into(), build: build.into(), observer: false, nonce }
+    }
+
+    /// A control host's connection, authenticated both ways: the stream, and the result of the
+    /// handshake (with the welcome, or why one side refused the other).
+    async fn handshake(node: &Arc<Node>, gen: u64, build: &str, i: &Install, issuer: &wicket_identity::Issuer) -> (UnixStream, Result<Msg, HsError>) {
         let (mut a, b) = UnixStream::pair().unwrap();
         tokio::spawn(connection(node.clone(), b, gen));
-        a.write_all(&Frame::Msg(Msg::Hello { node: "n1".into(), version: "t".into(), build: build.into(), observer: false }).encode())
-            .await
-            .unwrap();
+        let (mut rd, mut wr) = a.split();
+        let r = crate::nodeauth::control(&mut rd, &mut wr, "n1", &i.ledger, issuer, hello(build)).await.map(|a| a.welcome);
+        (a, r)
+    }
+
+    async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
+        let (a, r) = handshake(node, gen, &node.build, i, &i.issuer).await;
+        assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
         a
+    }
+
+    /// The node's id state for a connection that never finished the handshake.
+    async fn wait_link(node: &Node, gen: Option<u64>) {
+        for _ in 0..100 {
+            if node.link.lock().unwrap().as_ref().map(|l| l.gen) == gen {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("link is not {gen:?}");
     }
 
     /// Writes box output as the stdout reader task does.
@@ -935,8 +994,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_reconnecting_control_host_gets_the_output_it_missed_and_its_stdin_is_not_doubled() {
-        let dir = std::env::temp_dir().join(format!("wicket-nodesrv-{}", std::process::id()));
-        let node = test_node(&dir);
+        let inst = Install::new("nodesrv-reconnect");
+        let dir = inst.dir.clone();
+        let node = test_node(&inst);
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
         node.boxes.lock().unwrap().insert(
             "run_a".into(),
@@ -952,12 +1012,12 @@ mod tests {
             },
         );
         // Another build is refused.
-        let mut c = connect(&node, 1, "not-this-build").await;
-        assert!(matches!(next_msg(&mut c).await, Frame::Msg(Msg::Refused { why }) if why.contains("wicket node install n1")));
+        let (_, r) = handshake(&node, 1, "not-this-build", &inst, &inst.issuer).await;
+        assert!(matches!(r, Err(HsError::Refused(why)) if why.contains("wicket node install n1")));
 
         // Connected: output flows, and is acknowledged.
-        let mut c = connect(&node, 2, &node.build).await;
-        assert!(matches!(next_msg(&mut c).await, Frame::Msg(Msg::Welcome { runs, .. }) if runs[0].stdout_total == 0));
+        let (mut c, r) = handshake(&node, 2, &node.build, &inst, &inst.issuer).await;
+        assert!(matches!(r, Ok(Msg::Welcome { runs, .. }) if runs[0].stdout_total == 0));
         box_output(&node, b"hello\n");
         assert_eq!(next_msg(&mut c).await, Frame::Data { stream: 2, offset: 0, bytes: b"hello\n".to_vec() });
         c.write_all(&Frame::Msg(Msg::Ack { stream: 2, upto: 6 }).encode()).await.unwrap();
@@ -981,19 +1041,128 @@ mod tests {
         assert_eq!(node.boxes.lock().unwrap()["run_a"].out[0].start(), 6, "acknowledged output was dropped");
 
         // Reconnect: the welcome says how far stdin and stdout got; a resume replays what was missed.
-        let mut c = connect(&node, 3, &node.build).await;
-        match next_msg(&mut c).await {
-            Frame::Msg(Msg::Welcome { runs, .. }) => {
+        let (mut c, r) = handshake(&node, 3, &node.build, &inst, &inst.issuer).await;
+        match r {
+            Ok(Msg::Welcome { runs, .. }) => {
                 assert_eq!((runs[0].stdin_received, runs[0].stdout_total), (3, 26));
             }
-            other => panic!("{other:?}"),
+            other => panic!("{:?}", other.err()),
         }
         c.write_all(&Frame::Msg(Msg::Resume { run: "run_a".into(), stdout_from: 6, stderr_from: 0 }).encode()).await.unwrap();
         assert_eq!(next_msg(&mut c).await, Frame::Data { stream: 2, offset: 6, bytes: b"while you were away\n".to_vec() });
         // A newer connection replaces this one.
-        let mut c2 = connect(&node, 4, &node.build).await;
-        assert!(matches!(next_msg(&mut c2).await, Frame::Msg(Msg::Welcome { .. })));
+        let _c2 = connect(&node, 4, &inst).await;
         assert!(tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(&mut c)).await.unwrap().unwrap().is_none());
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Done-when for #16: a node with an unexpected certificate is refused (wrong installation, wrong
+    /// key, expired, unrecorded, revoked), and so is a control host that isn't this installation's.
+    /// A refused or unfinished handshake never takes the link from the authenticated connection.
+    #[tokio::test]
+    async fn both_ends_refuse_an_unexpected_identity_and_impostors_never_take_the_link() {
+        let inst = Install::new("nodesrv-auth");
+        let node = test_node(&inst);
+        let cert_path = inst.dir.join(crate::nodeauth::CERT_FILE);
+        let good = std::fs::read_to_string(&cert_path).unwrap();
+        let mut real = connect(&node, 1, &inst).await;
+        wait_link(&node, Some(1)).await;
+        let refused = |r: Result<Msg, HsError>| match r {
+            Err(HsError::Refused(why)) => why,
+            other => panic!("not refused: {:?}", other.ok()),
+        };
+
+        // A control host with another installation's issuer: it can't verify this node's certificate
+        // (so it refuses the node), and the node never sees a proof it accepts.
+        let impostor = wicket_identity::Issuer::generate("test.wicket.example");
+        let why = refused(handshake(&node, 2, &node.build, &inst, &impostor).await.1);
+        assert!(why.contains("not signed by this installation"), "{why}");
+        // One that skips checking the node and just signs with its own key: the node refuses it.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        tokio::spawn(connection(node.clone(), b, 3));
+        let mut hs = wicket_identity::node::ControlHandshake::new("n1", b"");
+        a.write_all(&Frame::Msg(hello(&node.build)(hs.nonce().into())).encode()).await.unwrap();
+        let Frame::Msg(Msg::Challenge { proof }) = next_msg(&mut a).await else { panic!("no challenge") };
+        hs.verify_node(&proof, &inst.issuer.verifying_key(), &inst.key.verifying_key(), wicket_store::now()).unwrap();
+        a.write_all(&Frame::Msg(Msg::Prove { proof: hs.prove(&impostor).unwrap() }).encode()).await.unwrap();
+        assert!(matches!(next_msg(&mut a).await, Frame::Msg(Msg::Refused { why }) if why.contains("issuer key")));
+        // A peer that says hello and then nothing useful.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        tokio::spawn(connection(node.clone(), b, 4));
+        a.write_all(&Frame::Msg(hello(&node.build)(wicket_identity::node::nonce())).encode()).await.unwrap();
+        let _ = next_msg(&mut a).await;
+        a.write_all(&Frame::Msg(Msg::Kill { run: "run_a".into() }).encode()).await.unwrap();
+        assert!(matches!(next_msg(&mut a).await, Frame::Msg(Msg::Refused { .. })));
+        wait_link(&node, Some(1)).await;
+
+        // The node's certificate from another installation (same key and name).
+        let (foreign, _) = impostor.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now(), 3600);
+        std::fs::write(&cert_path, &foreign).unwrap();
+        let why = refused(handshake(&node, 5, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("not signed by this installation"), "{why}");
+        // Expired (by the control host's clock).
+        let (expired, _) = inst.issuer.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now() - 7200, 3600);
+        std::fs::write(&cert_path, &expired).unwrap();
+        let why = refused(handshake(&node, 6, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("expired"), "{why}");
+        // Signed by this issuer, but never recorded (not issued through enrolment or renewal).
+        let (unrecorded, _) = inst.issuer.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now(), 3600);
+        std::fs::write(&cert_path, &unrecorded).unwrap();
+        let why = refused(handshake(&node, 7, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("never recorded"), "{why}");
+        // No certificate at all.
+        std::fs::remove_file(&cert_path).unwrap();
+        let why = refused(handshake(&node, 8, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("no identity certificate"), "{why}");
+        // A node whose key isn't the enrolled one (re-keyed or replaced), with a certificate for it.
+        let other = wicket_identity::SigningKey::generate(&mut rand_core::OsRng);
+        let (theirs, _) = inst.issuer.issue_node_cert("n1", &other.verifying_key(), wicket_store::now(), 3600);
+        std::fs::write(&cert_path, &theirs).unwrap();
+        let why = refused(handshake(&node, 9, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("enrolled key"), "{why}");
+        // Through all of that, the authenticated connection kept the link.
+        wait_link(&node, Some(1)).await;
+        real.write_all(&Frame::Msg(Msg::AuditFrom { seq: 0 }).encode()).await.unwrap();
+
+        // Renewal over the channel: the node checks the certificate and swaps it in.
+        std::fs::write(&cert_path, &good).unwrap();
+        let (renewed, rc) = crate::nodeauth::issue(
+            &inst.ledger.lock().unwrap(),
+            &inst.issuer,
+            "n1",
+            &inst.key.verifying_key(),
+            wicket_store::now(),
+            3600,
+        )
+        .unwrap();
+        real.write_all(&Frame::Msg(Msg::NodeCert { cert: renewed.clone() }).encode()).await.unwrap();
+        loop {
+            match next_msg(&mut real).await {
+                Frame::Msg(Msg::NodeCertInstalled { serial, error }) => {
+                    assert_eq!((serial, error), (rc.jti.clone(), None));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&cert_path).unwrap().trim(), renewed);
+        real.write_all(&Frame::Msg(Msg::NodeCert { cert: theirs.clone() }).encode()).await.unwrap();
+        loop {
+            match next_msg(&mut real).await {
+                Frame::Msg(Msg::NodeCertInstalled { error, .. }) => {
+                    assert!(error.unwrap().contains("another key"));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        // The renewed certificate authenticates the next connection; the earlier one still would.
+        let _c = connect(&node, 10, &inst).await;
+        std::fs::write(&cert_path, &good).unwrap();
+        let _c = connect(&node, 11, &inst).await;
+
+        // Revoked: refused at once, whatever certificate it holds.
+        inst.ledger.lock().unwrap().revoke_node("n1").unwrap();
+        let why = refused(handshake(&node, 12, &node.build, &inst, &inst.issuer).await.1);
+        assert!(why.contains("revoked"), "{why}");
     }
 }

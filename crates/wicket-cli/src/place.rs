@@ -306,6 +306,7 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                     trust_first_use: false,
                     hosts,
                     ca_ttl,
+                    cert_ttl: std::time::Duration::from_secs(wicket_identity::node::NODE_CERT_TTL_SECS as u64),
                 })
                 .await?;
             }

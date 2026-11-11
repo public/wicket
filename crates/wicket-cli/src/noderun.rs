@@ -16,12 +16,17 @@
 //! - **Tunnels.** The node opens tunnels to this run's LLM and MCP gateway sockets, and to its egress
 //!   proxy for hosts the node must not terminate; they are connected here.
 //! - **Asks.** A request the node can't allow is raised here as an ordinary pending request.
+//! - **Identity.** Every connection starts with the mutual authentication in `nodeauth.rs`; at half
+//!   its life the node's certificate is renewed over the channel, and a node revoked meanwhile (from
+//!   another process: `wicket node revoke`) is dropped within a second and not reconnected.
 //!
 //! Test hooks: `WICKET_FEED_TTL_MS`, `WICKET_FEED_REFRESH_MS` and `WICKET_FEED_NARROW_MS` override the
 //! feed's timings (within the certificate's caps, which follow them).
 
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, Tunnels, TUNNEL_BIT};
 use crate::node::Node;
+use crate::nodeauth::HsError;
+use wicket_identity::node::NodeCertClaims;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -196,11 +201,13 @@ struct Shared {
     ctl: Arc<NodeCtl>,
     tunnels: Tunnels,
     cfg: PublisherConfig,
+    issuer: Arc<wicket_identity::Issuer>,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
 pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     let name = s.node.name.clone().context("only enrolled nodes run `wicket node serve`")?;
+    let issuer = Arc::new(crate::issuer()?);
     let lock = lock_feed(&name)?;
     let cfg = feed_config();
     let mut publisher = open_feed(&name, cfg.clone())?;
@@ -235,6 +242,7 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
         ctl: ctl.clone(),
         tunnels: Tunnels::default(),
         cfg,
+        issuer,
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -283,6 +291,12 @@ struct Progress {
     revoked: HashSet<String>,
     ever: bool,
     exited: bool,
+    /// The node's certificate, as last authenticated or renewed.
+    cert: Option<NodeCertClaims>,
+    /// A renewal sent and not yet answered.
+    renewing: Option<NodeCertClaims>,
+    /// No renewal attempt before this (after a failed one).
+    renew_after: i64,
 }
 
 async fn manage(
@@ -300,6 +314,9 @@ async fn manage(
         revoked: HashSet::new(),
         ever: false,
         exited: false,
+        cert: None,
+        renewing: None,
+        renew_after: 0,
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -358,33 +375,30 @@ async fn session(
             s
         })
     };
-    let hello = Msg::Hello {
-        node: sh.node.clone(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        build: crate::nodesrv::build_id()?,
-        observer: false,
-    };
-    // A failed write shows up as no answer below, with the channel's own error.
-    let _ = to.write_all(&Frame::Msg(hello).encode()).await;
-    let welcome = match tokio::time::timeout(std::time::Duration::from_secs(30), chan::read_frame(&mut from)).await {
-        Ok(Ok(Some(Frame::Msg(m)))) => m,
-        Ok(Ok(None)) | Ok(Ok(Some(_))) | Ok(Err(_)) => {
+    let build = crate::nodesrv::build_id()?;
+    let hello = |nonce| Msg::Hello { node: sh.node.clone(), version: env!("CARGO_PKG_VERSION").into(), build, observer: false, nonce };
+    let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
+        Ok(a) => a,
+        Err(HsError::NoAnswer) => {
             let _ = child.start_kill();
             let err = errlog.await.unwrap_or_default();
             let err = err.trim().lines().last().unwrap_or("no error output").to_string();
             bail!("no answer from `wicket node serve` ({err}): is it installed and running? (`wicket node install {}`)", sh.node);
         }
-        Err(_) => bail!("node {} did not answer within 30 s", sh.node),
-    };
-    let (feed, runs) = match welcome {
-        Msg::Welcome { feed, runs, .. } => (feed, runs),
-        Msg::Refused { why } => {
+        Err(e @ HsError::Timeout(_)) => return Err(e.into()),
+        Err(HsError::Refused(why)) => {
+            // Refused either way (identity, revocation, another build): not worth retrying.
             p.ever = false;
-            bail!("node {} refused this control host: {why}", sh.node)
+            bail!("{why}")
         }
-        other => bail!("unexpected first message from node {}: {other:?}", sh.node),
+    };
+    let (feed, runs) = match authed.welcome {
+        Msg::Welcome { feed, runs, .. } => (feed, runs),
+        _ => unreachable!("nodeauth::control returns a welcome"),
     };
     p.ever = true;
+    p.cert = Some(authed.cert);
+    p.renewing = None;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
     let writer = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {
@@ -430,6 +444,7 @@ async fn session(
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis((sh.cfg.refresh_ms / 2).clamp(50, 1000) as u64));
     let mut grants = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut ident = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut buf = vec![0u8; 32 * 1024];
     let result = loop {
         tokio::select! {
@@ -463,6 +478,18 @@ async fn session(
             _ = grants.tick() => {
                 for f in sync_grants(sh, p) {
                     send(feed_frame(f));
+                }
+            }
+            _ = ident.tick() => {
+                if let Some(why) = revoked(sh, p) {
+                    // Stop the box (in case the node still obeys), then drop the node for good.
+                    send(Frame::Msg(Msg::Kill { run: sh.run.0.clone() }));
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    p.ever = false;
+                    break Err(anyhow::anyhow!("{why}: dropping the channel"));
+                }
+                if let Some(f) = renewal(sh, p) {
+                    send(f);
                 }
             }
         }
@@ -577,10 +604,45 @@ async fn on_frame(
                 }
             }
             Msg::Refused { why } => bail!("node {} refused: {why}", sh.node),
+            Msg::NodeCertInstalled { serial, error } => match (p.renewing.take(), error) {
+                (Some(c), None) if c.jti == serial => {
+                    println!("[wicket] node {}'s identity certificate renewed until {}", sh.node, c.exp);
+                    p.cert = Some(c);
+                }
+                (_, e) => {
+                    println!("[wicket] node {} did not take its renewed certificate ({}); retrying in a minute", sh.node, e.unwrap_or(serial));
+                    p.renew_after = wicket_store::now() + 60;
+                }
+            },
             _ => {}
         },
     }
     Ok(())
+}
+
+/// Why the node must be dropped now, if it must (`nodeauth::untrusted`).
+fn revoked(sh: &Shared, p: &Progress) -> Option<String> {
+    crate::nodeauth::untrusted(&sh.ledger.lock().expect("ledger"), &sh.node, p.cert.as_ref(), wicket_store::now())
+}
+
+/// A renewed certificate for the node, when its current one is past half its life.
+fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
+    let now = wicket_store::now();
+    if p.renewing.is_some() || now < p.renew_after {
+        return None;
+    }
+    let issued = crate::nodeauth::renew_if_due(&sh.ledger.lock().expect("ledger"), &sh.issuer, &sh.node, p.cert.as_ref()?, now)?;
+    match issued {
+        Ok((jws, claims)) => {
+            p.renewing = Some(claims);
+            Some(Frame::Msg(Msg::NodeCert { cert: jws }))
+        }
+        Err(e) => {
+            println!("[wicket] could not renew node {}'s certificate: {e:#}", sh.node);
+            p.renew_after = now + 60;
+            None
+        }
+    }
 }
 
 /// Raises (or finds) the pending request for an op the node asks about, if it is this run's.

@@ -15,8 +15,13 @@
 //!   on every ssh call to the node uses a wicket-managed known_hosts file with
 //!   `StrictHostKeyChecking=yes` (`Node::pinned`), so a node with any other key is refused.
 //! - **Node key.** An Ed25519 key generated on the node; the private half never leaves it (mode 0600
-//!   under `~/.local/share/wicket-node`). The control host records the public half. Nothing uses it
-//!   yet: it's what the node will sign feed acknowledgements and its mTLS identity with.
+//!   under `~/.local/share/wicket-node`). The control host records the public half.
+//! - **Node identity certificate.** The issuer certifies the node key (`node-cert.jwt`, 24 h by
+//!   default, `spiffe://<trust domain>/node/<name>`; `wicket_identity::node`), and the ledger records
+//!   its serial. The node proves itself with it at the start of every control connection, and the
+//!   control host proves the issuer key back (`nodeauth.rs`). It is renewed over the channel at
+//!   half-life; `renew-ca` also issues a fresh one over ssh, for a node whose certificate expired
+//!   while it was unreachable (or that was enrolled before certificates existed).
 //! - **Node CA.** The node generates a P-256 key and a certificate signing request; the control host
 //!   signs a short-lived (24 h by default) intermediate under wicket's installation CA, path length 0
 //!   and **name-constrained** to `--hosts` (see `wicket_proxy::ca::permitted_dns_subtrees`). This is
@@ -25,8 +30,9 @@
 //! - **Feed and issuer keys.** The node gets the feed root's public key (created on the control host,
 //!   next to the issuer key, on first use) and the issuer's public JWK, to verify the feed and agent
 //!   identities offline.
-//! - **Revocation** marks the node revoked in the ledger, deletes its pinned key (so ssh refuses it)
-//!   and records its CA serials for the feed's revocation list. Runs naming a revoked node are refused.
+//! - **Revocation** marks the node and its identity certificates revoked in the ledger, deletes its
+//!   pinned key (so ssh refuses it) and records its CA serials for the feed's revocation list. Runs
+//!   naming a revoked node are refused, and runs connected to it drop it within a second.
 
 use crate::node::{Node, Pin};
 use anyhow::{bail, Context, Result};
@@ -276,9 +282,11 @@ fn node_files(
     feed_root: &wicket_identity::VerifyingKey,
     info: serde_json::Value,
     node_pub: Option<&str>,
+    node_cert: &str,
 ) -> Result<Vec<(&'static str, String)>> {
     let issuer = crate::issuer()?;
     let mut f = vec![
+        (crate::nodeauth::CERT_FILE, format!("{node_cert}\n")),
         ("ca.pem", cert.pem.clone()),
         ("ca-chain.pem", format!("{}{}", cert.pem, ca.cert_pem())),
         ("root.pem", ca.cert_pem().to_string()),
@@ -343,11 +351,13 @@ pub struct EnrolOpts {
     pub trust_first_use: bool,
     pub hosts: Vec<String>,
     pub ca_ttl: Duration,
+    pub cert_ttl: Duration,
 }
 
 pub async fn enrol(o: EnrolOpts) -> Result<()> {
     let paths = Paths::installation();
     let ttl = to_time(o.ca_ttl)?;
+    let cert_ttl = crate::nodeauth::cert_ttl(o.cert_ttl)?;
     wicket_proxy::ca::permitted_dns_subtrees(&o.hosts)?;
     let spec = o.host_key.as_deref().map(HostKeySpec::parse).transpose()?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
@@ -364,7 +374,7 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     // Everything the control host needs, before touching the node.
     let ca = InstallationCa::load_or_create(&paths.ca_key)?;
     let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
-    crate::issuer()?;
+    let issuer = crate::issuer()?;
 
     let scanned = match &spec {
         Some(HostKeySpec::Key(_)) => vec![],
@@ -419,6 +429,8 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
         forget();
         return Err(e.into());
     }
+    let vk = crate::nodeauth::enrolled_key(&row.node_key)?;
+    let (node_cert, nc) = crate::nodeauth::issue(&ledger, &issuer, &name, &vk, now, cert_ttl)?;
     ledger.audit(
         &TenantId::single(),
         None,
@@ -426,19 +438,22 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
         &serde_json::json!({
             "name": name, "target": o.target, "host_key_fp": row.host_key_fp, "trust_first_use": spec.is_none(),
             "node_key": row.node_key, "ca_serial": cert.serial, "ca_not_after": cert.not_after, "hosts": cert.permitted,
+            "identity": nc.sub, "cert_serial": nc.jti, "cert_not_after": nc.exp,
         }),
     )?;
     let info = serde_json::json!({ "name": name, "node_key": row.node_key, "hosts": cert.permitted, "ca_serial": cert.serial,
                                    "ca_not_after": cert.not_after, "enrolled_at": now });
-    let script = install_script(&node_files(&ca, &cert, &feed_root, info, Some(&node_pub_pem))?, true)?;
+    let script = install_script(&node_files(&ca, &cert, &feed_root, info, Some(&node_pub_pem), &node_cert)?, true)?;
     node.script("installing the node files", &script).await.with_context(|| {
         format!("node {name} is recorded and its CA (serial {}) issued, but installing it on the node failed: fix that and run `wicket node renew-ca {name}`, or `wicket node revoke {name}`", cert.serial)
     })?;
     println!(
-        "enrolled node {name} ({}): host key {} pinned, node key {}, CA serial {} for {} until {}",
+        "enrolled node {name} ({}): host key {} pinned, node key {}, identity {} until {}, CA serial {} for {} until {}",
         o.target,
         row.host_key_fp,
         &row.node_key[..16],
+        nc.sub,
+        fmt_time(nc.exp),
         cert.serial,
         cert.permitted.join(", "),
         fmt_time(cert.not_after)
@@ -446,9 +461,10 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     Ok(())
 }
 
-pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration) -> Result<()> {
+pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl: Duration) -> Result<()> {
     let paths = Paths::installation();
     let ttl = to_time(ca_ttl)?;
+    let cert_ttl = crate::nodeauth::cert_ttl(cert_ttl)?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
     let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
     if row.status != "active" {
@@ -466,15 +482,18 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration) -> Resul
     let generated = parse_generated(&node.script("generating a new CA key", &keygen_script(name, false)).await?, false)?;
     let cert = ca.issue_node_ca(&generated.csr_pem, name, &hosts, ttl)?;
     ledger.renew_node_ca(&ca_row(name, &cert))?;
+    let vk = crate::nodeauth::enrolled_key(&row.node_key)?;
+    let (node_cert, nc) = crate::nodeauth::issue(&ledger, &crate::issuer()?, name, &vk, wicket_store::now(), cert_ttl)?;
     ledger.audit(
         &TenantId::single(),
         None,
         "node.ca_renewed",
-        &serde_json::json!({ "name": name, "ca_serial": cert.serial, "ca_not_after": cert.not_after, "hosts": cert.permitted }),
+        &serde_json::json!({ "name": name, "ca_serial": cert.serial, "ca_not_after": cert.not_after, "hosts": cert.permitted,
+                             "cert_serial": nc.jti, "cert_not_after": nc.exp }),
     )?;
     let info = serde_json::json!({ "name": name, "node_key": row.node_key, "hosts": cert.permitted, "ca_serial": cert.serial,
                                    "ca_not_after": cert.not_after, "enrolled_at": row.enrolled_at });
-    node.script("installing the node files", &install_script(&node_files(&ca, &cert, &feed_root, info, None)?, false)?)
+    node.script("installing the node files", &install_script(&node_files(&ca, &cert, &feed_root, info, None, &node_cert)?, false)?)
         .await
         .with_context(|| {
             format!(
@@ -482,7 +501,13 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration) -> Resul
                 cert.serial
             )
         })?;
-    println!("renewed node {name}'s CA: serial {} for {} until {}", cert.serial, cert.permitted.join(", "), fmt_time(cert.not_after));
+    println!(
+        "renewed node {name}'s CA: serial {} for {} until {}; identity certificate until {}",
+        cert.serial,
+        cert.permitted.join(", "),
+        fmt_time(cert.not_after),
+        fmt_time(nc.exp)
+    );
     Ok(())
 }
 
@@ -578,7 +603,14 @@ pub fn list() -> Result<()> {
             }
             None => "no CA".into(),
         };
-        println!("{}  {}  {}  host key {}  hosts {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca);
+        let now = wicket_store::now();
+        let id = match l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active") {
+            Some(c) if c.not_after > now => format!("identity until {}", fmt_time(c.not_after)),
+            Some(c) => format!("identity EXPIRED {} (wicket node renew-ca {})", fmt_time(c.not_after), n.name),
+            None if n.status == "active" => format!("no identity certificate (wicket node renew-ca {})", n.name),
+            None => "no identity certificate".into(),
+        };
+        println!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
     }
     Ok(())
 }
