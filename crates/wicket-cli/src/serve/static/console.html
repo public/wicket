@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2f6fde">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="wicket">
+<title>wicket</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<!-- No inline script or style: the CSP allows only these files (named by their content hash). -->
+<link rel="stylesheet" href="{{css}}" integrity="{{css_sri}}">
+<script src="{{js}}" integrity="{{js_sri}}" defer></script>
+</head>
+<body>
+<header><h1>wicket</h1><span id="tenant"></span></header>
+<main>
+  <div id="auth" class="card" hidden></div>
+  <div id="console" hidden>
+  <h2>Waiting for you</h2>
+  <div id="pending"></div>
+  <h2>Runs</h2>
+  <div class="card" id="runs"></div>
+  <form class="card" id="runform" hidden>
+    <div id="runform-title"></div>
+    <textarea id="runform-text"></textarea>
+    <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
+  </form>
+  <h2>Start a run</h2>
+  <div class="card" id="start"></div>
+  <h2>Recent decisions</h2>
+  <div class="card" id="decided"></div>
+  <h2>Activity</h2>
+  <div class="card log" id="audit"></div>
+  <h2>Operator</h2>
+  <div class="card" id="operator"></div>
+  </div>
+</main>
+<div id="msg" hidden></div>
+</body>
+</html>

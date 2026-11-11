@@ -155,19 +155,52 @@ enum Cmd {
         #[arg(long, default_value = "images/claude-code")]
         dir: PathBuf,
     },
-    /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs) on loopback.
+    /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain
+    /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
+    /// --tls-key) or --behind-tls-terminator.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
-        /// Allow a non-loopback listen address (put it behind a tailnet or tunnel anyway).
-        #[arg(long)]
-        allow_remote: bool,
-        /// Browser origin for WebAuthn (default http://localhost:PORT).
+        /// Browser origin for WebAuthn (default: http://localhost:PORT; https://DOMAIN with ACME).
         #[arg(long)]
         origin: Option<String>,
-        /// WebAuthn relying-party id (default localhost).
+        /// WebAuthn relying-party id (default: the origin's host).
         #[arg(long)]
         rp_id: Option<String>,
+        /// Serve HTTPS with this certificate chain (PEM; re-read when it changes).
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// Serve HTTPS with a certificate from an ACME CA (Let's Encrypt) for this name, validated
+        /// with TLS-ALPN-01 on this listener (so listen on :443).
+        #[arg(long)]
+        acme_domain: Option<String>,
+        /// Accept the ACME CA's terms of service (required with --acme-domain).
+        #[arg(long)]
+        acme_agree_tos: bool,
+        /// Contact for the ACME account (mailto:...; repeatable).
+        #[arg(long)]
+        acme_contact: Vec<String>,
+        /// Use Let's Encrypt's staging CA (untrusted certificates; for trying the setup).
+        #[arg(long)]
+        acme_staging: bool,
+        /// Another ACME directory URL.
+        #[arg(long)]
+        acme_directory: Option<String>,
+        /// Where the ACME account and certificate are kept (default $WICKET_HOME/acme).
+        #[arg(long)]
+        acme_cache: Option<PathBuf>,
+        /// A TLS-terminating proxy in front serves the console's https:// --origin; listen in plain HTTP.
+        #[arg(long)]
+        behind_tls_terminator: bool,
+        /// The proxy's address or range (repeatable): its X-Forwarded-For names the client.
+        #[arg(long)]
+        trusted_proxy: Vec<String>,
+        /// Most simultaneous connections.
+        #[arg(long, default_value_t = 256)]
+        max_connections: usize,
     },
     /// Programs: deterministic workloads that run without an agent.
     Program {
@@ -353,8 +386,27 @@ enum ProgramCmd {
 enum OperatorCmd {
     /// List enrolled passkeys.
     List,
-    /// Host-only break-glass: revoke every passkey, so `wicket serve` prints a fresh enrolment link.
+    /// Host-only break-glass: revoke every passkey (and every console session), so `wicket serve`
+    /// prints a fresh enrolment link.
     Reset,
+    /// Print a fresh single-use link that enrols one passkey in the console (another device, or a
+    /// replacement after `reset`). The only way to add a passkey: a signed-in console session can't.
+    EnrolLink {
+        /// How long the link stays usable (at most 1h).
+        #[arg(long, default_value = "10m")]
+        ttl: String,
+        /// The console's origin, to print the whole link (otherwise just its path).
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// List live console sessions (id, passkey, client address, times).
+    Sessions,
+    /// End console sessions now: one by its id (or a unique prefix of it), or all with --all.
+    RevokeSession {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -849,7 +901,40 @@ async fn main() -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
-        Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
+        Cmd::Serve {
+            listen,
+            origin,
+            rp_id,
+            tls_cert,
+            tls_key,
+            acme_domain,
+            acme_agree_tos,
+            acme_contact,
+            acme_staging,
+            acme_directory,
+            acme_cache,
+            behind_tls_terminator,
+            trusted_proxy,
+            max_connections,
+        } => {
+            serve::serve(serve::ServeOpts {
+                listen,
+                origin,
+                rp_id,
+                tls_cert,
+                tls_key,
+                acme_domain,
+                acme_contact,
+                acme_directory,
+                acme_staging,
+                acme_agree_tos,
+                acme_cache,
+                behind_tls_terminator,
+                trusted_proxy,
+                max_connections,
+            })
+            .await
+        }
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
             Ok(())
@@ -862,8 +947,59 @@ async fn main() -> Result<()> {
                         println!("{}  {}  sign count {}", c.id, c.name, c.sign_count);
                     }
                 }
+                OperatorCmd::EnrolLink { ttl, origin } => {
+                    let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+                    if ttl.is_zero() || ttl > Duration::from_secs(3600) {
+                        bail!("--ttl must be more than 0 and at most 1h");
+                    }
+                    let token = serve::issue_enrol_link(&l, &TenantId::single(), ttl.as_secs() as i64, &operator())?;
+                    let origin = origin.as_deref().map(|o| o.trim_end_matches('/')).unwrap_or("");
+                    println!("open within {} (single use) to enrol a passkey:", humantime::format_duration(ttl));
+                    println!("  {origin}/enrol?t={token}");
+                    if origin.is_empty() {
+                        println!("(prefix the console's origin, e.g. https://console.example.com)");
+                    }
+                }
+                OperatorCmd::Sessions => {
+                    let now = wicket_store::now();
+                    let ago = |t: i64| humantime::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
+                    for s in l.console_sessions(&TenantId::single(), now)? {
+                        println!(
+                            "{}  {}  {}  from {}  signed in {} ago, last seen {} ago",
+                            &s.id[..16],
+                            s.kind,
+                            s.credential.as_deref().unwrap_or("-"),
+                            s.client,
+                            ago(s.created_at),
+                            ago(s.last_seen_at)
+                        );
+                    }
+                }
+                OperatorCmd::RevokeSession { id, all } => {
+                    let t = TenantId::single();
+                    let prefix = match (&id, all) {
+                        (Some(p), false) if !p.is_empty() => {
+                            let n = l.console_sessions(&t, wicket_store::now())?.iter().filter(|s| s.id.starts_with(p.as_str())).count();
+                            if n != 1 {
+                                bail!("{p:?} matches {n} live sessions (see wicket operator sessions)");
+                            }
+                            Some(p.as_str())
+                        }
+                        (None, true) => None,
+                        _ => bail!("give a session id (wicket operator sessions) or --all"),
+                    };
+                    let ids = l.revoke_console_sessions(&t, prefix, &operator())?;
+                    l.audit(
+                        &t,
+                        None,
+                        "operator.sessions_revoked",
+                        &serde_json::json!({ "sessions": ids, "by": operator(), "via": "host" }),
+                    )?;
+                    println!("ended {} console session(s)", ids.len());
+                }
                 OperatorCmd::Reset => {
                     let n = l.reset_operator_credentials(&TenantId::single())?;
+                    l.revoke_console_sessions(&TenantId::single(), None, &operator())?;
                     l.audit(
                         &TenantId::single(),
                         None,
@@ -871,7 +1007,7 @@ async fn main() -> Result<()> {
                         &serde_json::json!({ "removed": n, "by": operator(), "via": "host break-glass" }),
                     )?;
                     println!(
-                        "revoked {n} passkey(s) (public keys kept for audit verification); restart `wicket serve` for an enrolment link"
+                        "revoked {n} passkey(s) (public keys kept for audit verification); enrol a new one with `wicket operator enrol-link`"
                     );
                 }
             }

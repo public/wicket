@@ -1,11 +1,19 @@
-//! `wicket serve`: the operator console (design §14.1.3, proof-of-concept cut), signed in and
-//! driven with passkeys.
+//! `wicket serve`: the operator console (design §14.1.3), signed in and driven with passkeys, built
+//! to be reachable directly from the internet.
 //!
 //! Security flow:
-//! 1. **Bootstrap.** At start-up, *only if no operator passkey exists yet*, a one-time enrolment link
-//!    is printed. It is single-use, expires after 10 minutes, and the session it creates can do one
-//!    thing: register a passkey. It cannot view runs or decide anything.
-//! 2. **Sign-in** is a passkey assertion (user verification required) giving a 12-hour session.
+//! 1. **Enrolment** is host-only. At start-up, *only if no operator passkey exists yet*, a one-time
+//!    enrolment link is printed on the host; `wicket operator enrol-link` prints a fresh one at any
+//!    time (another device, a lost passkey). Links are kept in the ledger by the hash of their token,
+//!    are single-use, expire (10 minutes by default), and the session one opens can do one thing:
+//!    register one passkey. It cannot view runs or decide anything. A signed-in operator session
+//!    cannot enrol a passkey, so a stolen session cookie can't add one.
+//! 2. **Sign-in** is a passkey assertion (user verification required; no password, no fallback),
+//!    rate-limited and locked out per client address and per passkey ([`limits`]), with one uniform
+//!    error and every failure and lockout audited. It gives a session (`__Host-` cookie: Secure,
+//!    HttpOnly, SameSite=Strict) that ends after [`SESSION_IDLE`] without requests or [`SESSION_ABSOLUTE`]
+//!    in any case, is a new one at every sign-in, and is kept in the ledger (by the hash of its token)
+//!    so the host can list and revoke sessions (`wicket operator sessions`, `revoke-session`).
 //!    Adding further passkeys needs a signed-in operator.
 //! 3. **Every action is a fresh passkey assertion** whose challenge is
 //!    `sha256(nonce || canonical action JSON)`. The actions: approve or deny a request (its id,
@@ -18,50 +26,90 @@
 //!    re-checks what may have changed in between (the manifest's bytes, the run still running, the
 //!    request still pending and its agent still verified), applies the action, and writes the signed
 //!    triple (clientDataJSON, authenticatorData, signature) into the audit log, so
-//!    `wicket audit --verify` re-verifies every console action offline.
+//!    `wicket audit --verify` re-verifies every console action offline. A stolen session cookie
+//!    alone approves nothing.
+//!
+//! **Pre-auth surface.** Without a session, a client can fetch the page and its static files
+//! ([`web`]), call the sign-in begin/finish endpoints, and open an enrolment link. Every other
+//! request, whatever its method or path, gets the same 401 with the same body: no run names, counts,
+//! passkey ids or version. Requests for another `Host` than the console's origin get it too.
+//!
+//! **Browser.** No inline script or style; a strict CSP, no framing, no CORS, `Referrer-Policy:
+//! no-referrer`, `nosniff`, COOP; HSTS on HTTPS ([`web::secure_headers`] on every response). Every
+//! POST needs the `x-wicket-csrf` header and the console's own `Origin`.
+//!
+//! **Transport** ([`net`], [`tls`], [`acme`]): HTTPS by wicket itself (rustls; certificates from files
+//! or ACME TLS-ALPN-01), or plain HTTP on loopback, or behind a TLS-terminating proxy; bounded
+//! connections, timeouts and sizes.
+//!
+//! **Privilege separation** (#12): nothing here needs root, and runs start only through the
+//! [`Launcher`] callback, so launching can later move behind a separate process unchanged.
 //!
 //! The browser never sends a path. Runs start only from manifests listed in an allowlisted
-//! directory (see [`manifest_roots`]), named by root and file name.
-//!
-//! The console binds to loopback; WebAuthn needs a secure context, so open it as
-//! http://localhost:PORT (or behind HTTPS on a tailnet with --origin/--rp-id). `wicket approve` on the
-//! host remains a break-glass path and is audited as such.
+//! directory (see [`manifest_roots`]), named by root and file name. `wicket approve` on the host
+//! remains a break-glass path and is audited as such.
+
+mod acme;
+mod limits;
+mod net;
+mod tls;
+mod web;
+
+pub use net::ServeOpts;
 
 use crate::{data_dir, ledger_path};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use limits::{Limiter, Refusal};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use wicket_auth::{b64u, decision_challenge, unb64u, Credential, RelyingParty};
 use wicket_core::{Manifest, RunId, TenantId};
-use wicket_store::{Approval, Ledger, OperatorCredential};
+use wicket_store::{Approval, ConsoleSession, Ledger, OperatorCredential};
 
-const PAGE: &str = include_str!("console.html");
-const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+/// A signed-in session ends after this long without a request (seconds)...
+pub const SESSION_IDLE: i64 = 15 * 60;
+/// ...and this long after sign-in in any case.
+pub const SESSION_ABSOLUTE: i64 = 8 * 3600;
+/// An enrolment session lasts as long as its link would have.
+const BOOTSTRAP_TTL: i64 = 600;
+/// How often a session's last-seen time is written back.
+const TOUCH_EVERY: i64 = 15;
+/// The session cookie. `__Host-`: Secure, no Domain, Path=/, so only this exact origin sets or gets it
+/// (browsers treat http://localhost as secure for this).
+const COOKIE: &str = "__Host-wicket_sid";
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
+/// Pending passkey challenges, in all, and per client (sign-in) or session (actions, enrolment).
+const MAX_CHALLENGES: usize = 1024;
+const MAX_CHALLENGES_PER_OWNER: usize = 8;
 /// Longest follow-up or task override the console accepts (characters).
 const MAX_TEXT: usize = 16 * 1024;
 const MAX_REASON: usize = 500;
+/// The one answer to an unauthenticated request for anything but the sign-in surface.
+const DENIED: &str = r#"{"error":"sign in with your passkey"}"#;
+/// The one answer to a failed sign-in, whatever failed.
+const SIGN_IN_FAILED: &str = "sign-in failed";
+/// Why a session that didn't come from an enrolment link can't register a passkey.
+const ENROL_ON_HOST: &str = "adding a passkey needs a one-time enrolment link: run `wicket operator enrol-link` on the host";
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum SessionKind {
-    Bootstrap,
-    Operator { cred: String },
-}
-
-struct Session {
-    kind: SessionKind,
-    expires: Instant,
+    /// Opened with a host-issued enrolment link (its id); may only register a passkey.
+    Bootstrap {
+        link: String,
+    },
+    Operator {
+        cred: String,
+    },
 }
 
 /// A console action, as the server resolved it at `begin`. Applied only with a passkey signature
@@ -82,7 +130,11 @@ enum Purpose {
 
 struct Pending {
     purpose: Purpose,
+    /// The session it was issued to (its id), for enrolment and actions.
     session: Option<String>,
+    /// Whose quota it counts against: the client address (sign-in) or the session.
+    owner: String,
+    created: Instant,
     expires: Instant,
 }
 
@@ -110,14 +162,49 @@ struct State {
     roots: Vec<(String, PathBuf)>,
     launcher: Launcher,
     identity: IdentityCheck,
-    bootstrap: Mutex<Option<(String, Instant)>>,
-    sessions: Mutex<HashMap<String, Session>>,
     challenges: Mutex<HashMap<String, Pending>>,
+    limiter: Limiter,
+    limits: net::Limits,
+    /// Proxies whose X-Forwarded-For is believed (only with --behind-tls-terminator).
+    trusted: Vec<limits::Cidr>,
+    /// The Host requests must name (the origin's authority).
+    authority: String,
+    hsts: bool,
+    /// Requests that reached a handler needing a session (the fuzz test watches it).
+    authed: AtomicU64,
 }
 
 impl State {
     fn ledger(&self) -> Result<Ledger> {
         Ok(Ledger::open(&self.ledger)?)
+    }
+
+    fn new(
+        rp: RelyingParty,
+        ledger: PathBuf,
+        data: PathBuf,
+        roots: Vec<(String, PathBuf)>,
+        launcher: Launcher,
+        identity: IdentityCheck,
+    ) -> State {
+        let authority = rp.origin.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
+        let hsts = rp.origin.starts_with("https://");
+        State {
+            rp,
+            tenant: TenantId::single(),
+            ledger,
+            data,
+            roots,
+            launcher,
+            identity,
+            challenges: Mutex::new(HashMap::new()),
+            limiter: Limiter::default(),
+            limits: net::Limits::default(),
+            trusted: Vec::new(),
+            authority,
+            hsts,
+            authed: AtomicU64::new(0),
+        }
     }
 }
 
@@ -135,56 +222,60 @@ pub fn manifest_roots() -> Vec<(String, PathBuf)> {
     roots
 }
 
-pub async fn serve(listen: &str, allow_remote: bool, origin: Option<String>, rp_id: Option<String>) -> Result<()> {
-    let addr: std::net::SocketAddr = listen.parse()?;
-    if !addr.ip().is_loopback() && !allow_remote {
-        bail!("refusing to listen on {addr}: the PoC console is loopback-only (use an ssh tunnel or tailnet, or pass --allow-remote)");
-    }
-    let origin = origin.unwrap_or_else(|| format!("http://localhost:{}", addr.port()));
-    let rp_id = rp_id.unwrap_or_else(|| "localhost".into());
+pub async fn serve(opts: ServeOpts) -> Result<()> {
+    let plan = net::plan(&opts, &data_dir())?;
     let tenant = TenantId::single();
-    let has_passkeys = !Ledger::open(&ledger_path())?.operator_credentials(&tenant)?.is_empty();
+    let l = Ledger::open(&ledger_path())?;
+    let has_passkeys = !l.operator_credentials(&tenant)?.is_empty();
+    let _ = l.prune_console_sessions(wicket_store::now() - 30 * 86400);
+    drop(l);
     let exe = std::env::current_exe()?;
-    let state = Arc::new(State {
-        rp: RelyingParty { rp_id, origin: origin.clone() },
-        tenant,
-        ledger: ledger_path(),
-        data: data_dir(),
-        roots: manifest_roots(),
-        launcher: Box::new(move |l| launch_detached(&exe, l)),
-        identity: |l, run| crate::verified_identity(l, run, None),
-        bootstrap: Mutex::new(None),
-        sessions: Mutex::new(HashMap::new()),
-        challenges: Mutex::new(HashMap::new()),
-    });
-    let listener = TcpListener::bind(addr).await?;
-    println!("wicket console on {origin}/  (listening on {addr})");
+    let mut state = State::new(
+        RelyingParty { rp_id: plan.rp_id.clone(), origin: plan.origin.clone() },
+        ledger_path(),
+        data_dir(),
+        manifest_roots(),
+        Box::new(move |l| launch_detached(&exe, l)),
+        |l, run| crate::verified_identity(l, run, None),
+    );
+    state.trusted = plan.trusted.clone();
+    state.authority = plan.authority.clone();
+    state.hsts = plan.hsts;
+    state.limits.max_connections = plan.max_connections;
+    let state = Arc::new(state);
+    let listener = TcpListener::bind(plan.addr).await.with_context(|| format!("listening on {}", plan.addr))?;
+    let resolver = Arc::new(tls::CertResolver::default());
+    let acceptor = match &plan.tls {
+        None => None,
+        Some(net::TlsSource::Files { cert, key }) => {
+            let fc = tls::FileCert { cert: cert.clone(), key: key.clone() };
+            resolver.set(Arc::new(fc.load()?));
+            fc.watch(resolver.clone(), Duration::from_secs(60));
+            Some(tokio_rustls::TlsAcceptor::from(tls::server_config(resolver.clone(), false)?))
+        }
+        Some(net::TlsSource::Acme(cfg)) => {
+            acme::run(cfg.clone(), resolver.clone(), acme::reqwest_http(), Duration::from_secs(12 * 3600));
+            println!("ACME ({}): certificate for {} kept in {}", cfg.directory, cfg.domain, cfg.cache.display());
+            Some(tokio_rustls::TlsAcceptor::from(tls::server_config(resolver.clone(), true)?))
+        }
+    };
+    let how = match (&plan.tls, plan.behind_terminator) {
+        (Some(_), _) => "HTTPS",
+        (None, true) => "HTTP behind a TLS terminator",
+        (None, false) => "HTTP, loopback only",
+    };
+    println!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
     for (name, dir) in &state.roots {
         println!("runs can be started from {name}: {}", dir.display());
     }
     if has_passkeys {
         println!("sign in with your passkey. (Lost them all? On the host: wicket operator reset)");
     } else {
-        let token = random_hex(24);
-        *state.bootstrap.lock().expect("lock") = Some((token.clone(), Instant::now() + Duration::from_secs(600)));
+        let token = issue_enrol_link(&state.ledger()?, &state.tenant, BOOTSTRAP_TTL, "wicket serve (no passkey yet)")?;
         println!("no operator passkey yet. Enrol one within 10 minutes (single use):");
-        println!("  {origin}/enrol?t={token}");
+        println!("  {}/enrol?t={token}", plan.origin);
     }
-    run_server(listener, state).await
-}
-
-async fn run_server(listener: TcpListener, state: Arc<State>) -> Result<()> {
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, hyper::Error>(route(req, &state).await) }
-            });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
-        });
-    }
+    net::run(listener, acceptor, state).await
 }
 
 /// Starts `wicket run` for a console launch as its own process (its own process group, so stopping
@@ -214,34 +305,30 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut b = vec![0u8; n];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    }
+    getrandom::getrandom(&mut b).expect("the OS random source");
     b
 }
 
 fn random_hex(n: usize) -> String {
-    random_bytes(n).iter().map(|x| format!("{x:02x}")).collect()
+    hex::encode(random_bytes(n))
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// Issues a single-use enrolment link valid for `ttl_secs` and returns its token (the link is
+/// `ORIGIN/enrol?t=TOKEN`). Only the token's hash is stored. Audited.
+pub fn issue_enrol_link(l: &Ledger, tenant: &TenantId, ttl_secs: i64, by: &str) -> Result<String> {
+    let token = random_hex(24);
+    let id = session_id(&token);
+    l.add_enrol_link(tenant, &id, wicket_store::now() + ttl_secs, by)?;
+    l.audit(tenant, None, "operator.enrol_link_issued", &json!({ "link": &id[..16], "ttl_secs": ttl_secs, "by": by }))?;
+    Ok(token)
 }
 
 fn resp(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("content-type", ctype)
-        .header("cache-control", "no-store")
-        .header("x-frame-options", "DENY")
-        .header("referrer-policy", "no-referrer")
-        .header(
-            "content-security-policy",
-            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
-        )
-        .body(Full::new(body.into()))
-        .expect("response")
+    Response::builder().status(status).header("content-type", ctype).body(Full::new(body.into())).expect("response")
+}
+
+fn denied() -> Response<Full<Bytes>> {
+    resp(StatusCode::UNAUTHORIZED, "application/json", DENIED)
 }
 
 /// A JSON answer from a POST handler (and the session cookie, for sign-in).
@@ -250,14 +337,19 @@ struct Reply {
     status: StatusCode,
     body: Value,
     cookie: Option<String>,
+    retry_after: Option<Duration>,
 }
 
 fn ok(body: Value) -> Reply {
-    Reply { status: StatusCode::OK, body, cookie: None }
+    Reply { status: StatusCode::OK, body, cookie: None, retry_after: None }
 }
 
 fn err(status: StatusCode, msg: impl std::fmt::Display) -> Reply {
-    Reply { status, body: json!({ "error": msg.to_string() }), cookie: None }
+    Reply { status, body: json!({ "error": msg.to_string() }), cookie: None, retry_after: None }
+}
+
+fn refused(r: Refusal) -> Reply {
+    Reply { retry_after: Some(r.retry_after()), ..err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later") }
 }
 
 fn to_response(r: Reply) -> Response<Full<Bytes>> {
@@ -265,40 +357,107 @@ fn to_response(r: Reply) -> Response<Full<Bytes>> {
     if let Some(c) = r.cookie {
         out.headers_mut().insert("set-cookie", c.parse().expect("cookie header"));
     }
+    if let Some(d) = r.retry_after {
+        out.headers_mut().insert("retry-after", d.as_secs().max(1).into());
+    }
     out
 }
 
-fn cookie_sid(req: &Request<Incoming>) -> Option<String> {
-    req.headers()
-        .get_all("cookie")
+/// Who is asking: the session cookie's token (if any) and the client address.
+struct Ctx {
+    sid: Option<String>,
+    client: IpAddr,
+}
+
+fn cookie_sid(h: &HeaderMap) -> Option<String> {
+    h.get_all("cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix("wicket_sid=").map(String::from))
+        .find_map(|c| c.trim().strip_prefix(COOKIE).and_then(|v| v.strip_prefix('=')).map(String::from))
 }
 
-fn set_session(state: &State, kind: SessionKind) -> String {
-    let sid = random_hex(32);
-    let mut s = state.sessions.lock().expect("lock");
-    let now = Instant::now();
-    s.retain(|_, v| v.expires > now);
-    s.insert(sid.clone(), Session { kind, expires: now + SESSION_TTL });
-    format!("wicket_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}", SESSION_TTL.as_secs())
+/// A session's id in the ledger: the SHA-256 of its token.
+fn session_id(token: &str) -> String {
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
 }
 
+/// Starts a session and returns its Set-Cookie value.
+fn set_session(state: &State, kind: SessionKind, client: IpAddr) -> Result<String> {
+    let token = random_hex(32);
+    let now = wicket_store::now();
+    let ttl = if matches!(kind, SessionKind::Bootstrap { .. }) { BOOTSTRAP_TTL } else { SESSION_ABSOLUTE };
+    let (kind, credential) = match kind {
+        SessionKind::Bootstrap { link } => ("bootstrap", Some(link)),
+        SessionKind::Operator { cred } => ("operator", Some(cred)),
+    };
+    state.ledger()?.add_console_session(
+        &state.tenant,
+        &ConsoleSession {
+            id: session_id(&token),
+            kind: kind.into(),
+            credential,
+            client: client.to_string(),
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + ttl,
+        },
+    )?;
+    Ok(format!("{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={ttl}"))
+}
+
+fn clear_cookie() -> String {
+    format!("{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0")
+}
+
+/// The live session a cookie names: not revoked, not past its absolute expiry, not idle for
+/// [`SESSION_IDLE`], and (operator sessions) its passkey still enrolled. Returns its id and kind.
 fn session(state: &State, sid: &Option<String>) -> Option<(String, SessionKind)> {
-    let sid = sid.as_ref()?;
-    let s = state.sessions.lock().expect("lock");
-    s.get(sid).filter(|v| v.expires > Instant::now()).map(|v| (sid.clone(), v.kind.clone()))
+    let token = sid.as_ref()?;
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let id = session_id(token);
+    let now = wicket_store::now();
+    let l = state.ledger().ok()?;
+    let s = l.console_session(&state.tenant, &id, now).ok()??;
+    if now - s.last_seen_at >= SESSION_IDLE {
+        let _ = l.end_console_session(&id, "idle");
+        return None;
+    }
+    let kind = match (s.kind.as_str(), s.credential) {
+        ("bootstrap", Some(link)) => SessionKind::Bootstrap { link },
+        ("operator", Some(cred)) => {
+            if !l.operator_credentials(&state.tenant).ok()?.iter().any(|c| c.id == cred) {
+                return None;
+            }
+            SessionKind::Operator { cred }
+        }
+        _ => return None,
+    };
+    if now - s.last_seen_at >= TOUCH_EVERY {
+        let _ = l.touch_console_session(&id, now);
+    }
+    Some((id, kind))
 }
 
-fn new_challenge(state: &State, challenge: Vec<u8>, purpose: Purpose, session: Option<String>) -> String {
+/// Issues a challenge; None when the store is full (each owner keeps at most
+/// [`MAX_CHALLENGES_PER_OWNER`]: a new one replaces its oldest).
+fn new_challenge(state: &State, challenge: Vec<u8>, purpose: Purpose, session: Option<String>, owner: String) -> Option<String> {
     let key = b64u(&challenge);
     let mut c = state.challenges.lock().expect("lock");
     let now = Instant::now();
     c.retain(|_, v| v.expires > now);
-    c.insert(key.clone(), Pending { purpose, session, expires: now + CHALLENGE_TTL });
-    key
+    let mut mine: Vec<(String, Instant)> = c.iter().filter(|(_, v)| v.owner == owner).map(|(k, v)| (k.clone(), v.created)).collect();
+    if mine.len() >= MAX_CHALLENGES_PER_OWNER {
+        mine.sort_by_key(|m| m.1);
+        c.remove(&mine[0].0);
+    }
+    if c.len() >= MAX_CHALLENGES {
+        return None;
+    }
+    c.insert(key.clone(), Pending { purpose, session, owner, created: now, expires: now + CHALLENGE_TTL });
+    Some(key)
 }
 
 /// Removes and returns a pending challenge (single use).
@@ -311,60 +470,115 @@ fn creds(state: &State) -> Result<Vec<OperatorCredential>> {
     Ok(state.ledger()?.operator_credentials(&state.tenant)?)
 }
 
-async fn json_body(req: Request<Incoming>) -> Option<Value> {
-    let b = Limited::new(req.into_body(), 64 * 1024).collect().await.ok()?.to_bytes();
-    serde_json::from_slice(&b).ok()
+/// Reads a JSON body within the size limit and the body timeout.
+async fn json_body<B>(req: Request<B>, limits: &net::Limits) -> Result<Value, Reply>
+where
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let declared = req.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limits.max_body as u64) {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"));
+    }
+    let read = Limited::new(req.into_body(), limits.max_body).collect();
+    let b = match tokio::time::timeout(limits.body_timeout, read).await {
+        Err(_) => return Err(err(StatusCode::REQUEST_TIMEOUT, "request body too slow")),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
+            return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
+        }
+        Ok(Err(_)) => return Err(err(StatusCode::BAD_REQUEST, "bad request body")),
+        Ok(Ok(b)) => b.to_bytes(),
+    };
+    serde_json::from_slice(&b).map_err(|_| err(StatusCode::BAD_REQUEST, "bad JSON body"))
+}
+
+/// Every POST: the custom header (no cross-site form or simple request can send it) and the
+/// console's own origin (browsers send Origin on every POST).
+fn post_checks(state: &State, h: &HeaderMap) -> Option<Reply> {
+    if h.get("x-wicket-csrf").map(|v| v.as_bytes()) != Some(b"1") {
+        return Some(err(StatusCode::FORBIDDEN, "missing x-wicket-csrf header"));
+    }
+    if h.get("origin").map(|v| v.as_bytes()) != Some(state.rp.origin.as_bytes()) {
+        return Some(err(StatusCode::FORBIDDEN, "cross-origin request refused"));
+    }
+    if h.get("sec-fetch-site").is_some_and(|v| v.as_bytes() != b"same-origin") {
+        return Some(err(StatusCode::FORBIDDEN, "cross-origin request refused"));
+    }
+    None
 }
 
 fn field_b64(v: &Value, k: &str) -> Option<Vec<u8>> {
     v.get(k).and_then(|s| s.as_str()).and_then(|s| unb64u(s).ok())
 }
 
+/// Options for an action's assertion: any of the operator's passkeys may sign.
 fn assertion_options(state: &State, key: &str) -> Value {
     let allow: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
     json!({ "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 })
 }
 
-async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
+/// Every request: security headers on whatever the handlers answer.
+async fn route<B>(req: Request<B>, state: &State, peer: SocketAddr) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let mut r = dispatch(req, state, peer).await;
+    web::secure_headers(r.headers_mut(), state.hsts);
+    r
+}
+
+async fn dispatch<B>(req: Request<B>, state: &State, peer: SocketAddr) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // Only requests for the console's own origin (DNS rebinding, scanners by IP).
+    let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).or(req.uri().authority().map(|a| a.as_str()));
+    if !host.is_some_and(|h| h.eq_ignore_ascii_case(&state.authority)) {
+        return denied();
+    }
+    let forwarded = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), forwarded, &state.trusted) };
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    let sid = cookie_sid(&req);
+
+    // The pre-auth surface: the page, its static files, sign-in, the enrolment link.
+    if method == Method::GET {
+        if path == "/" {
+            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
+        }
+        if let Some(a) = web::ASSETS.files.get(&path) {
+            let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
+            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "public, max-age=3600" };
+            r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
+            return r;
+        }
+        if path == "/enrol" {
+            return enrol(state, req.uri().query().unwrap_or(""), &ctx);
+        }
+    }
+    let sign_in = method == Method::POST && matches!(path.as_str(), "/api/login/begin" | "/api/login/finish");
+    let sess = if sign_in { None } else { session(state, &ctx.sid) };
+    if !sign_in && sess.is_none() {
+        return denied();
+    }
+    if !sign_in {
+        state.authed.fetch_add(1, Ordering::Relaxed);
+    }
 
     if method == Method::GET {
         return match path.as_str() {
-            "/" => resp(StatusCode::OK, "text/html; charset=utf-8", PAGE),
-            "/enrol" => {
-                let t = req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("t=")).unwrap_or("");
-                let mut b = state.bootstrap.lock().expect("lock");
-                let ok = matches!(&*b, Some((tok, exp)) if *exp > Instant::now() && ct_eq(tok.as_bytes(), t.as_bytes()));
-                if !ok {
-                    return resp(StatusCode::FORBIDDEN, "text/plain", "this enrolment link is invalid, used or expired");
-                }
-                *b = None; // single use
-                drop(b);
-                let cookie = set_session(state, SessionKind::Bootstrap);
-                Response::builder()
-                    .status(StatusCode::SEE_OTHER)
-                    .header("location", "/")
-                    .header("set-cookie", cookie)
-                    .body(Full::new(Bytes::new()))
-                    .expect("response")
-            }
-            "/api/me" => {
-                let n = creds(state).map(|c| c.len()).unwrap_or(0);
-                let who = match session(state, &sid) {
-                    Some((_, SessionKind::Operator { cred })) => json!({ "state": "operator", "credential": cred }),
-                    Some((_, SessionKind::Bootstrap)) => json!({ "state": "bootstrap" }),
-                    None => json!({ "state": "none" }),
-                };
-                to_response(ok(json!({ "who": who, "passkeys": n, "rp_id": state.rp.rp_id })))
-            }
-            "/api/state" => match session(state, &sid) {
+            "/api/me" => match &sess {
+                Some((_, SessionKind::Operator { cred })) => to_response(ok(json!({ "who": { "state": "operator", "credential": cred } }))),
+                _ => to_response(ok(json!({ "who": { "state": "bootstrap" } }))),
+            },
+            "/api/state" => match &sess {
                 Some((_, SessionKind::Operator { .. })) => match dashboard(state) {
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
                 },
-                _ => to_response(err(StatusCode::UNAUTHORIZED, "sign in with your passkey")),
+                _ => denied(),
             },
             _ => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
         };
@@ -372,34 +586,81 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
     if method != Method::POST {
         return resp(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed");
     }
-    // Every POST: the custom header (no cross-site form or simple request can send it).
-    if req.headers().get("x-wicket-csrf").map(|v| v.as_bytes()) != Some(b"1") {
-        return to_response(err(StatusCode::FORBIDDEN, "missing x-wicket-csrf header"));
+    if let Some(r) = post_checks(state, req.headers()) {
+        return to_response(r);
     }
-    let Some(body) = json_body(req).await else {
-        return to_response(err(StatusCode::BAD_REQUEST, "bad JSON body"));
+    let body = match json_body(req, &state.limits).await {
+        Ok(b) => b,
+        Err(r) => return to_response(r),
     };
-    match post(state, &path, &sid, &body) {
+    match post(state, &path, &ctx, &body) {
         Some(r) => to_response(r),
         None => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
     }
 }
 
-/// Every POST endpoint, after the CSRF header check and body parsing. None: no such endpoint.
-fn post(state: &State, path: &str, sid: &Option<String>, body: &Value) -> Option<Reply> {
-    let sess = session(state, sid);
+/// The one-time enrolment link. Any failure (no enrolment open, wrong or used token, throttled)
+/// looks exactly like any other unauthenticated request.
+fn enrol(state: &State, query: &str, ctx: &Ctx) -> Response<Full<Bytes>> {
+    let now = Instant::now();
+    if state.limiter.attempt(ctx.client, now).is_err() {
+        return denied();
+    }
+    let t = query.split('&').find_map(|kv| kv.strip_prefix("t=")).unwrap_or("");
+    // Looked up by the token's hash, and used atomically: a link works once, before it expires.
+    let link = session_id(t);
+    let used = !t.is_empty()
+        && state
+            .ledger()
+            .and_then(|l| Ok(l.use_enrol_link(&state.tenant, &link, wicket_store::now(), &ctx.client.to_string())?))
+            .unwrap_or(false);
+    if !used {
+        audit_failure(state, ctx, None, "enrolment link invalid, used or expired", "operator.enrol_failed");
+        return denied();
+    }
+    let Ok(cookie) = set_session(state, SessionKind::Bootstrap { link: link.clone() }, ctx.client) else { return denied() };
+    if let Ok(l) = state.ledger() {
+        let _ = l.audit(&state.tenant, None, "operator.enrol_link_used", &json!({ "link": &link[..16], "client": ctx.client.to_string() }));
+    }
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header("location", "/")
+        .header("set-cookie", cookie)
+        .body(Full::new(Bytes::new()))
+        .expect("response")
+}
+
+/// Records a failed sign-in or enrolment (and any lockout it starts) in the audit log.
+fn audit_failure(state: &State, ctx: &Ctx, cred: Option<&str>, reason: &str, kind: &str) {
+    let cred: Option<String> = cred.map(|c| c.chars().take(200).collect());
+    let locked = cred.as_deref().is_some_and(|c| state.limiter.credential_locked(c, Instant::now()).is_some());
+    // A credential already locked out isn't counted again (that would only lengthen the operator's
+    // own lockout); the client address is.
+    let lockouts = state.limiter.fail(ctx.client, if locked { None } else { cred.as_deref() }, Instant::now());
+    let Ok(l) = state.ledger() else { return };
+    let _ = l.audit(&state.tenant, None, kind, &json!({ "client": ctx.client.to_string(), "credential": cred, "reason": reason }));
+    for lo in lockouts {
+        tracing::warn!("console sign-in lockout: {} {} for {}s", lo.scope, lo.key, lo.duration.as_secs());
+        let _ = l.audit(
+            &state.tenant,
+            None,
+            "operator.lockout",
+            &json!({ "scope": lo.scope, "key": lo.key, "seconds": lo.duration.as_secs(), "client": ctx.client.to_string() }),
+        );
+    }
+}
+
+/// Every POST endpoint, after the CSRF/origin checks and body parsing. None: no such endpoint.
+fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
+    let sess = match path {
+        "/api/login/begin" | "/api/login/finish" => None,
+        _ => session(state, &ctx.sid),
+    };
     Some(match path {
         "/api/register/begin" => register_begin(state, &sess),
         "/api/register/finish" => register_finish(state, &sess, body),
-        "/api/login/begin" => {
-            let list = creds(state).unwrap_or_default();
-            if list.is_empty() {
-                return Some(err(StatusCode::FORBIDDEN, "no passkey enrolled yet"));
-            }
-            let key = new_challenge(state, random_bytes(32), Purpose::Login, None);
-            ok(json!({ "publicKey": assertion_options(state, &key) }))
-        }
-        "/api/login/finish" => login_finish(state, body),
+        "/api/login/begin" => login_begin(state, ctx),
+        "/api/login/finish" => login_finish(state, ctx, body),
         // `/api/decide/*` is the older name for the approve/deny action.
         "/api/action/begin" | "/api/decide/begin" => {
             let mut body = body.clone();
@@ -411,24 +672,23 @@ fn post(state: &State, path: &str, sid: &Option<String>, body: &Value) -> Option
         }
         "/api/action/finish" | "/api/decide/finish" => action_finish(state, &sess, body),
         "/api/logout" => {
-            if let Some(s) = sid {
-                state.sessions.lock().expect("lock").remove(s);
+            if let (Some((id, _)), Ok(l)) = (&sess, state.ledger()) {
+                let _ = l.end_console_session(id, "sign-out");
             }
-            ok(json!({ "ok": "signed out" }))
+            Reply { cookie: Some(clear_cookie()), ..ok(json!({ "ok": "signed out" })) }
         }
         _ => return None,
     })
 }
 
 fn register_begin(state: &State, sess: &Option<(String, SessionKind)>) -> Reply {
-    // Bootstrap sessions may enrol only while no passkey exists; afterwards a signed-in operator must.
-    let n = creds(state).map(|c| c.len()).unwrap_or(0);
-    let allowed = matches!(sess, Some((_, SessionKind::Operator { .. }))) || (matches!(sess, Some((_, SessionKind::Bootstrap))) && n == 0);
-    if !allowed {
-        return err(StatusCode::FORBIDDEN, "enrolling a passkey needs the enrolment link (first passkey) or a signed-in operator");
-    }
+    // Only a session opened with a host-issued enrolment link may enrol, never a signed-in operator
+    // session: a stolen cookie must not be able to add a passkey.
+    let Some((sid, SessionKind::Bootstrap { .. })) = sess else { return err(StatusCode::FORBIDDEN, ENROL_ON_HOST) };
     let challenge = random_bytes(32);
-    let key = new_challenge(state, challenge.clone(), Purpose::Register, sess.as_ref().map(|s| s.0.clone()));
+    let Some(key) = new_challenge(state, challenge, Purpose::Register, Some(sid.clone()), sid.clone()) else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
+    };
     let exclude: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
     ok(json!({ "publicKey": {
         "challenge": key,
@@ -441,13 +701,14 @@ fn register_begin(state: &State, sess: &Option<(String, SessionKind)>) -> Reply 
 }
 
 fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Value) -> Reply {
+    let Some((sid, SessionKind::Bootstrap { link })) = sess else { return err(StatusCode::FORBIDDEN, ENROL_ON_HOST) };
     let (Some(ch), Some(cdj), Some(att)) =
         (body.get("challenge").and_then(|c| c.as_str()), field_b64(body, "clientDataJSON"), field_b64(body, "attestationObject"))
     else {
         return err(StatusCode::BAD_REQUEST, "challenge, clientDataJSON and attestationObject are required");
     };
     let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown or expired challenge") };
-    if !matches!(p.purpose, Purpose::Register) || p.session != sess.as_ref().map(|s| s.0.clone()) {
+    if !matches!(p.purpose, Purpose::Register) || p.session.as_ref() != Some(sid) {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     }
     match state.rp.verify_registration(&unb64u(ch).unwrap_or_default(), &cdj, &att) {
@@ -461,11 +722,15 @@ fn register_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &V
             if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
                 return err(StatusCode::CONFLICT, e);
             }
-            let _ = l.audit(&state.tenant, None, "operator.passkey_added", &json!({ "credential": oc.id, "name": oc.name, "via": if matches!(sess, Some((_, SessionKind::Bootstrap))) { "enrolment link" } else { "signed-in operator" } }));
+            let client = l.console_session(&state.tenant, sid, wicket_store::now()).ok().flatten().map(|s| s.client);
+            let _ = l.audit(
+                &state.tenant,
+                None,
+                "operator.passkey_added",
+                &json!({ "credential": oc.id, "name": oc.name, "via": "enrolment link", "link": &link[..16.min(link.len())], "client": client }),
+            );
             // The enrolment session has done its one job: end it, so the next step is a real sign-in.
-            if let Some((sid, SessionKind::Bootstrap)) = sess {
-                state.sessions.lock().expect("lock").remove(sid);
-            }
+            let _ = l.end_console_session(sid, "enrolled");
             ok(json!({ "ok": "passkey registered; now sign in with it" }))
         }
         Err(e) => err(StatusCode::FORBIDDEN, e),
@@ -503,18 +768,60 @@ fn verify_assertion(state: &State, challenge: &str, body: &Value) -> Result<Asse
     Ok(Asserted { oc, cdj, ad, sig })
 }
 
-fn login_finish(state: &State, body: &Value) -> Reply {
-    let Some(ch) = body.get("challenge").and_then(|c| c.as_str()) else { return err(StatusCode::BAD_REQUEST, "challenge required") };
-    let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown, used or expired challenge") };
+/// Sign-in, step 1: a challenge. The same answer whether or not any passkey is enrolled, and no
+/// `allowCredentials` (passkeys are discoverable), so it discloses no credential ids.
+fn login_begin(state: &State, ctx: &Ctx) -> Reply {
+    if let Err(r) = state.limiter.attempt(ctx.client, Instant::now()) {
+        return refused(r);
+    }
+    let Some(key) = new_challenge(state, random_bytes(32), Purpose::Login, None, limits::ip_key(ctx.client)) else {
+        return refused(Refusal::Throttled(Duration::from_secs(5)));
+    };
+    ok(
+        json!({ "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": [], "userVerification": "required", "timeout": 120000 } }),
+    )
+}
+
+/// Sign-in, step 2: the assertion. Any failure gets the same answer; the reason goes to the audit log.
+fn login_finish(state: &State, ctx: &Ctx, body: &Value) -> Reply {
+    let now = Instant::now();
+    if let Err(r) = state.limiter.attempt(ctx.client, now) {
+        return refused(r);
+    }
+    let cred = body.get("id").and_then(|s| s.as_str());
+    let fail = |reason: &str| {
+        audit_failure(state, ctx, cred, reason, "operator.login_failed");
+        err(StatusCode::UNAUTHORIZED, SIGN_IN_FAILED)
+    };
+    let Some(ch) = body.get("challenge").and_then(|c| c.as_str()) else { return fail("no challenge") };
+    let Some(p) = take_challenge(state, ch) else { return fail("unknown, used or expired challenge") };
     if !matches!(p.purpose, Purpose::Login) {
-        return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
+        return fail("challenge was issued for something else");
+    }
+    if cred.is_some_and(|c| state.limiter.credential_locked(c, now).is_some()) {
+        return fail("passkey locked out");
     }
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return fail(r.body["error"].as_str().unwrap_or("assertion refused")),
     };
-    let cookie = set_session(state, SessionKind::Operator { cred: a.oc.id.clone() });
-    Reply { status: StatusCode::OK, body: json!({ "ok": format!("signed in with {}", a.oc.name) }), cookie: Some(cookie) }
+    state.limiter.succeed(ctx.client, &a.oc.id, now);
+    let Ok(l) = state.ledger() else { return err(StatusCode::INTERNAL_SERVER_ERROR, "ledger unavailable") };
+    // A new session at every sign-in; whatever session the browser had ends.
+    if let Some(old) = &ctx.sid {
+        let _ = l.end_console_session(&session_id(old), "replaced at sign-in");
+    }
+    let cookie = match set_session(state, SessionKind::Operator { cred: a.oc.id.clone() }, ctx.client) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let _ = l.audit(
+        &state.tenant,
+        None,
+        "operator.signed_in",
+        &json!({ "credential": a.oc.id, "name": a.oc.name, "client": ctx.client.to_string() }),
+    );
+    Reply { cookie: Some(cookie), ..ok(json!({ "ok": format!("signed in with {}", a.oc.name) })) }
 }
 
 /// The principal of a run started from the console: the passkey-authenticated operator (the
@@ -722,7 +1029,11 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     let action_json = v.to_string();
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();
-    let key = new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Some(sid));
+    let Some(key) =
+        new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Some(sid.clone()), sid)
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
+    };
     // `decision` is the older name the page used for the signed JSON.
     ok(json!({ "action": v, "decision": v, "publicKey": assertion_options(state, &key) }))
 }
@@ -886,6 +1197,16 @@ mod tests {
     use p256::ecdsa::{Signature, SigningKey};
 
     const ORIGIN: &str = "http://localhost:8787";
+    const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    fn anon() -> Ctx {
+        Ctx { sid: None, client: LOCAL }
+    }
+
+    /// The token in a Set-Cookie value.
+    fn token_of(cookie: &str) -> String {
+        cookie.strip_prefix("__Host-wicket_sid=").unwrap().split(';').next().unwrap().to_string()
+    }
 
     struct T {
         state: State,
@@ -895,6 +1216,25 @@ mod tests {
         count: u32,
         launched: Arc<Mutex<Vec<Launch>>>,
         dir: PathBuf,
+        _tmp: TmpDir,
+    }
+
+    /// A test's temporary directory, removed when the test is done with it.
+    pub(super) struct TmpDir(pub(super) PathBuf);
+
+    impl TmpDir {
+        pub(super) fn new(name: &str) -> TmpDir {
+            let d = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TmpDir(d)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Tests have no issuer key: a run with an identity row named "bad-…" doesn't verify; others do.
@@ -907,8 +1247,8 @@ mod tests {
     }
 
     fn setup(tag: &str) -> T {
-        let dir = std::env::temp_dir().join(format!("wicket-serve-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = TmpDir::new(&format!("wicket-serve-{tag}"));
+        let dir = tmp.0.clone();
         std::fs::create_dir_all(dir.join("manifests")).unwrap();
         std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
         let key = SigningKey::random(&mut rand_core::OsRng);
@@ -929,28 +1269,20 @@ mod tests {
         .unwrap();
         let launched = Arc::new(Mutex::new(Vec::new()));
         let rec = launched.clone();
-        let state = State {
-            rp: RelyingParty { rp_id: "localhost".into(), origin: ORIGIN.into() },
-            tenant: TenantId::single(),
+        let state = State::new(
+            RelyingParty { rp_id: "localhost".into(), origin: ORIGIN.into() },
             ledger,
-            data: dir.clone(),
-            roots: vec![("manifests".into(), dir.join("manifests"))],
-            launcher: Box::new(move |l| {
+            dir.clone(),
+            vec![("manifests".into(), dir.join("manifests"))],
+            Box::new(move |l| {
                 rec.lock().unwrap().push(l.clone());
                 Ok(())
             }),
-            identity: fake_identity,
-            bootstrap: Mutex::new(None),
-            sessions: Mutex::new(HashMap::new()),
-            challenges: Mutex::new(HashMap::new()),
-        };
-        let sid = random_hex(8);
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(sid.clone(), Session { kind: SessionKind::Operator { cred: cred.clone() }, expires: Instant::now() + SESSION_TTL });
-        T { state, key, cred, sid: Some(sid), count: 0, launched, dir }
+            fake_identity,
+        );
+        let cookie = set_session(&state, SessionKind::Operator { cred: cred.clone() }, LOCAL).unwrap();
+        let sid = token_of(&cookie);
+        T { state, key, cred, sid: Some(sid), count: 0, launched, dir, _tmp: tmp }
     }
 
     impl T {
@@ -959,7 +1291,11 @@ mod tests {
         }
 
         fn post(&self, path: &str, body: Value) -> Reply {
-            post(&self.state, path, &self.sid, &body).expect("endpoint")
+            post(&self.state, path, &self.ctx(), &body).expect("endpoint")
+        }
+
+        fn ctx(&self) -> Ctx {
+            Ctx { sid: self.sid.clone(), client: LOCAL }
         }
 
         fn begin(&self, body: Value) -> Reply {
@@ -968,11 +1304,16 @@ mod tests {
 
         /// What a browser returns from navigator.credentials.get for `challenge` (base64url).
         fn sign(&mut self, challenge: &str) -> Value {
+            self.sign_flags(challenge, 0x01 | 0x04) // user present, user verified
+        }
+
+        /// [`T::sign`] with the given authenticator flags.
+        fn sign_flags(&mut self, challenge: &str, flags: u8) -> Value {
             self.count += 1;
             let cdj =
                 json!({ "type": "webauthn.get", "challenge": challenge, "origin": ORIGIN, "crossOrigin": false }).to_string().into_bytes();
             let mut ad = sha2::Sha256::digest(b"localhost").to_vec();
-            ad.push(0x01 | 0x04); // user present, user verified
+            ad.push(flags);
             ad.extend_from_slice(&self.count.to_be_bytes());
             let mut msg = ad.clone();
             msg.extend_from_slice(&sha2::Sha256::digest(&cdj));
@@ -1010,6 +1351,9 @@ mod tests {
             self.ledger().audit_tail(100).unwrap().into_iter().map(|(_, _, k, _, b)| (k, serde_json::from_str(&b).unwrap())).collect()
         }
     }
+
+    mod http;
+    mod https;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);
@@ -1062,7 +1406,7 @@ mod tests {
         t.running("run_c", "lead");
         let say = json!({ "action": "say", "run": "run_c", "text": "hi" });
         // No session (or a bootstrap one): no challenge.
-        assert_refused(&post(&t.state, "/api/action/begin", &None, &say).unwrap(), StatusCode::UNAUTHORIZED, "sign in");
+        assert_refused(&post(&t.state, "/api/action/begin", &anon(), &say).unwrap(), StatusCode::UNAUTHORIZED, "sign in");
         // No assertion at all.
         let b = t.begin(say.clone());
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
@@ -1114,7 +1458,7 @@ mod tests {
         let b = t.begin(json!({ "action": "say", "run": "run_d", "text": "mine" }));
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let a = t.sign(&ch);
-        assert_refused(&post(&t.state, "/api/action/finish", &None, &a).unwrap(), StatusCode::FORBIDDEN, "something else");
+        assert_refused(&post(&t.state, "/api/action/finish", &anon(), &a).unwrap(), StatusCode::FORBIDDEN, "something else");
         let login = t.post("/api/login/begin", json!({}));
         let a = t.sign(login.body["publicKey"]["challenge"].as_str().unwrap());
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "something else");
@@ -1290,7 +1634,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let sid = t.sid.clone().unwrap();
-        tokio::spawn(run_server(listener, Arc::new(t.state)));
+        tokio::spawn(net::run(listener, None, Arc::new(t.state)));
         let send = |csrf: bool| {
             let sid = sid.clone();
             async move {
@@ -1298,7 +1642,7 @@ mod tests {
                 let body = r#"{"action":"say","run":"run_x","text":"hi"}"#;
                 let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let h = if csrf { "x-wicket-csrf: 1\r\n" } else { "" };
-                let req = format!("POST /api/action/begin HTTP/1.1\r\nhost: localhost\r\ncookie: wicket_sid={sid}\r\ncontent-type: application/json\r\n{h}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let req = format!("POST /api/action/begin HTTP/1.1\r\nhost: localhost:8787\r\norigin: http://localhost:8787\r\ncookie: __Host-wicket_sid={sid}\r\ncontent-type: application/json\r\n{h}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 s.write_all(req.as_bytes()).await.unwrap();
                 let mut out = String::new();
                 s.read_to_string(&mut out).await.unwrap();
