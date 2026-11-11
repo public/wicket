@@ -211,6 +211,11 @@ CREATE TABLE IF NOT EXISTS node_cas (
   hosts TEXT NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS node_cas_node ON node_cas (node, status);
+CREATE TABLE IF NOT EXISTS node_certs (
+  serial TEXT PRIMARY KEY, node TEXT NOT NULL, node_key TEXT NOT NULL, issued_at INTEGER NOT NULL,
+  not_after INTEGER NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS node_certs_node ON node_certs (node, issued_at);
 CREATE TABLE IF NOT EXISTS console_sessions (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, kind TEXT NOT NULL, credential TEXT, client TEXT NOT NULL,
   created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
@@ -974,6 +979,33 @@ fn row_to_node_ca(r: &rusqlite::Row) -> rusqlite::Result<NodeCaRow> {
     })
 }
 
+/// One node identity certificate (`wicket_identity::node`) issued to a node.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NodeCertRow {
+    /// The certificate's `jti`.
+    pub serial: String,
+    pub node: String,
+    /// The node key it binds (hex).
+    pub node_key: String,
+    pub issued_at: i64,
+    pub not_after: i64,
+    /// "active" (renewals leave earlier ones active until they expire) or "revoked".
+    pub status: String,
+}
+
+fn row_to_node_cert(r: &rusqlite::Row) -> rusqlite::Result<NodeCertRow> {
+    Ok(NodeCertRow {
+        serial: r.get(0)?,
+        node: r.get(1)?,
+        node_key: r.get(2)?,
+        issued_at: r.get(3)?,
+        not_after: r.get(4)?,
+        status: r.get(5)?,
+    })
+}
+
+const NODE_CERT_COLS: &str = "serial, node, node_key, issued_at, not_after, status";
+
 /// sha256 of a join token: the ledger stores only this.
 fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.trim().as_bytes()))
@@ -1088,8 +1120,42 @@ impl Ledger {
         for s in &serials {
             tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
         }
+        tx.execute("UPDATE node_certs SET status = 'revoked', revoked_at = ?2 WHERE node = ?1 AND status != 'revoked'", params![name, t])?;
         tx.commit()?;
         Ok(serials)
+    }
+
+    /// Records a node identity certificate issued to an active node. Earlier ones stay valid until
+    /// they expire, so a node that lost a renewal on the way still gets in with the one it holds.
+    pub fn record_node_cert(&self, c: &NodeCertRow) -> Result<()> {
+        let status: Option<String> =
+            self.conn.query_row("SELECT status FROM nodes WHERE name = ?1", params![c.node], |r| r.get(0)).optional()?;
+        match status.as_deref() {
+            None => return Err(StoreError::Node(c.node.clone(), "is not enrolled")),
+            Some("active") => {}
+            Some(_) => return Err(StoreError::Node(c.node.clone(), "is revoked")),
+        }
+        self.conn.execute(
+            &format!("INSERT INTO node_certs ({NODE_CERT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, 'active')"),
+            params![c.serial, c.node, c.node_key, c.issued_at, c.not_after],
+        )?;
+        Ok(())
+    }
+
+    /// A node certificate by serial.
+    pub fn node_cert(&self, serial: &str) -> Result<Option<NodeCertRow>> {
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE serial = ?1"), params![serial], row_to_node_cert)
+            .optional()?)
+    }
+
+    /// A node's identity certificates, newest first.
+    pub fn node_certs(&self, node: &str) -> Result<Vec<NodeCertRow>> {
+        let mut st =
+            self.conn.prepare(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE node = ?1 ORDER BY issued_at DESC, rowid DESC"))?;
+        let rows = st.query_map(params![node], row_to_node_cert)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn node(&self, name: &str) -> Result<Option<NodeRow>> {
@@ -1232,6 +1298,31 @@ mod node_tests {
         assert_eq!(l.node("n1").unwrap().unwrap().status, "active");
         assert_eq!(l.revoked_node_cas(now()).unwrap().len(), 2);
         assert_eq!(l.nodes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn node_certificates_are_recorded_for_active_nodes_and_revoked_with_them() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let cert = |serial: &str| NodeCertRow {
+            serial: serial.into(),
+            node: "n1".into(),
+            node_key: "00".repeat(32),
+            issued_at: now(),
+            not_after: now() + 86_400,
+            status: "active".into(),
+        };
+        assert!(l.record_node_cert(&cert("c0")).is_err(), "not enrolled");
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        l.record_node_cert(&cert("c1")).unwrap();
+        l.record_node_cert(&cert("c2")).unwrap();
+        assert_eq!(l.node_cert("c1").unwrap().unwrap(), cert("c1"));
+        assert_eq!(l.node_certs("n1").unwrap().iter().map(|c| c.serial.as_str()).collect::<Vec<_>>(), vec!["c2", "c1"]);
+        assert!(l.record_node_cert(&cert("c2")).is_err(), "serials are unique");
+        l.revoke_node("n1").unwrap();
+        assert!(l.node_certs("n1").unwrap().iter().all(|c| c.status == "revoked"));
+        assert!(l.record_node_cert(&cert("c3")).is_err(), "revoked");
+        assert!(l.node_cert("nope").unwrap().is_none());
     }
 }
 

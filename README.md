@@ -70,7 +70,7 @@ wicket node enrol wicket@203.0.113.7 --token wkt_… --host-key 'SHA256:…' --h
 wicket node install n1                      # copies this wicket binary there, starts the wicket-node service
 wicket run task.yaml --node n1
 wicket node list
-wicket node renew-ca n1                     # a fresh node CA (default 24 h)
+wicket node renew-ca n1                     # a fresh node CA and identity certificate (default 24 h each), over ssh
 wicket node revoke n1
 ```
 
@@ -87,13 +87,25 @@ wicket node revoke n1
   and a P-256 **node CA** key with `openssl`, and neither private key leaves the node. The control host signs the
   CA's request as a short-lived (24 h) intermediate under the installation CA (`ca.key`, next to the issuer key).
   The intermediate has path length 0 and is **name-constrained** to `--hosts`, with all IP addresses excluded.
-  The node also gets the feed root's and the issuer's public keys.
+  The node also gets the feed root's and the issuer's public keys, and a **node identity certificate**
+  (`node-cert.jwt`, below).
+- **Node identity and mutual authentication.** The issuer certifies the node key as
+  `spiffe://<trust domain>/node/<name>` in a short-lived (24 h, `--cert-ttl`) certificate, and the ledger
+  records its serial. Every control connection starts with a handshake on top of ssh: the node signs a fresh
+  challenge with its node key and shows its certificate; the control host signs one with the issuer key. The
+  control host refuses a node whose certificate isn't this installation's, names another node, binds a key
+  other than the enrolled one, has expired, was never recorded or is revoked. The node refuses a control host
+  that can't prove the issuer key, and until one does, the connection it already has is left alone. At
+  half-life the run renews the certificate over the channel; a node that was unreachable until its certificate
+  expired gets a new one with `wicket node renew-ca`. The handshake doesn't depend on ssh: a QUIC or mTLS
+  transport would reuse it, passing its TLS exporter as the channel binding (`wicket_identity::node`).
 - **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
   do until it expires.
-- **Revoking** deletes the pinned key and records the node CA's serials for the feed's revocation list (not
-  distributed yet).
+- **Revoking** deletes the pinned key, revokes the node's identity certificates (a run connected to the node
+  stops its box there and drops it within a second, and nothing reconnects), and records the node CA's serials
+  for the feed's revocation list (not distributed yet).
 
 ##### `wicket node serve`: boxes that outlive the control channel
 
