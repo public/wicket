@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use wicket_core::{canonical_path, evaluate, manifest::host_matches, Op, Verdict};
+use wicket_core::{canonical_path, manifest::host_matches, Op, Verdict};
 
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
@@ -110,7 +110,7 @@ impl Egress {
     /// Decides about a host before any request to it (and before TLS): never-reachable hosts are
     /// refused, saying so; in zones that hide unlisted hosts, they behave as if they didn't exist.
     fn judge_host(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
-        match wicket_core::host_verdict(&self.ctx.zone, host) {
+        match self.ctx.zone.host_verdict(host) {
             wicket_core::HostVerdict::Open => None,
             wicket_core::HostVerdict::Forbidden(why) => {
                 self.ctx.emit(Event::Egress {
@@ -214,7 +214,7 @@ impl Egress {
                 detail,
             })
         };
-        match evaluate(&ctx.zone, &op) {
+        match ctx.zone.evaluate(&op) {
             Verdict::AllowByReach(i) => emit("allow", format!("reach rule {i}")),
             Verdict::Forbidden(why) => {
                 emit("forbidden", why.clone());
