@@ -2826,6 +2826,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicket-feed"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "wicket-core",
+]
+
+[[package]]
 name = "wicket-identity"
 version = "0.0.1"
 dependencies = [

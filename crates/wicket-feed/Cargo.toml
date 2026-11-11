@@ -1,0 +1,21 @@
+[package]
+name = "wicket-feed"
+description = "wicket policy feed: a root-certified, signed snapshot-and-delta feed with freshness statements, the node's verified replica that fails narrow, and the control plane's publisher. No sockets, no threads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wicket-core.workspace = true
+ed25519-dalek = "2"
+base64 = "0.22"
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

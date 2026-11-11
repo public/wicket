@@ -13,6 +13,7 @@ members = [
     "crates/wicket-agent",
     "crates/wicket-cli",
     "crates/wicket-authz",
+    "crates/wicket-feed",
 ]
 
 [workspace.package]
@@ -55,6 +56,7 @@ wicket-identity = { path = "crates/wicket-identity" }
 wicket-proxy = { path = "crates/wicket-proxy" }
 wicket-sandbox = { path = "crates/wicket-sandbox" }
 wicket-agent = { path = "crates/wicket-agent" }
+wicket-feed = { path = "crates/wicket-feed" }
 
 [profile.release]
 debug = 1
