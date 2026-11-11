@@ -1,0 +1,5 @@
+# Pinned so CI is reproducible: bump deliberately, with any new clippy lints fixed in the same PR.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

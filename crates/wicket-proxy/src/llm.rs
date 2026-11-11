@@ -87,11 +87,23 @@ impl Llm {
         let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1 + self.reserved_requests.load(Ordering::SeqCst);
         if n > spec.max_requests {
             self.event(None, 429, 0, 0, "budget: request cap reached");
-            return problem(429, "budget", "Model request budget exhausted", &format!("this run may make at most {} model requests", spec.max_requests), None);
+            return problem(
+                429,
+                "budget",
+                "Model request budget exhausted",
+                &format!("this run may make at most {} model requests", spec.max_requests),
+                None,
+            );
         }
         if self.output_tokens.load(Ordering::SeqCst) + self.reserved_output_tokens.load(Ordering::SeqCst) >= spec.max_output_tokens {
             self.event(None, 429, 0, 0, "budget: output token cap reached");
-            return problem(429, "budget", "Model token budget exhausted", &format!("this run may generate at most {} output tokens", spec.max_output_tokens), None);
+            return problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("this run may generate at most {} output tokens", spec.max_output_tokens),
+                None,
+            );
         }
         match self.forward(req).await {
             Ok(r) => r,

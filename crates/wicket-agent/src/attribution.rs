@@ -41,10 +41,9 @@ impl Attribution {
     pub fn summary(&self) -> String {
         match self.basis {
             "none" => "unknown (no tool call in flight)".into(),
-            "ambiguous" => format!(
-                "one of: {}",
-                self.requesters.iter().map(|r| format!("{} via {}", r.agent, r.tool)).collect::<Vec<_>>().join(" | ")
-            ),
+            "ambiguous" => {
+                format!("one of: {}", self.requesters.iter().map(|r| format!("{} via {}", r.agent, r.tool)).collect::<Vec<_>>().join(" | "))
+            }
             _ => self.requesters.first().map(|r| format!("{} via {}: {}", r.agent, r.tool, crate::clip(&r.call, 80))).unwrap_or_default(),
         }
     }
@@ -91,7 +90,11 @@ impl Tracker {
                     if SUBAGENT_TOOLS.contains(&tool.as_str()) {
                         let kind = input.get("subagent_type").and_then(|s| s.as_str()).unwrap_or("general-purpose");
                         let desc = input.get("description").and_then(|s| s.as_str()).unwrap_or("");
-                        let label = if desc.is_empty() { format!("subagent {kind}") } else { format!("subagent {kind}: {}", crate::clip(desc, 60)) };
+                        let label = if desc.is_empty() {
+                            format!("subagent {kind}")
+                        } else {
+                            format!("subagent {kind}: {}", crate::clip(desc, 60))
+                        };
                         // A subagent started by a subagent: keep the chain visible.
                         let label = if parent.is_some() { format!("{label} (inside {agent})") } else { label };
                         self.subagents.insert(id, label);
@@ -149,11 +152,13 @@ mod tests {
 
     fn assistant(parent: Option<&str>, id: &str, name: &str, input: Value) -> String {
         serde_json::json!({"type":"assistant","parent_tool_use_id":parent,
-            "message":{"content":[{"type":"tool_use","id":id,"name":name,"input":input}]}}).to_string()
+            "message":{"content":[{"type":"tool_use","id":id,"name":name,"input":input}]}})
+        .to_string()
     }
     fn result(parent: Option<&str>, id: &str) -> String {
         serde_json::json!({"type":"user","parent_tool_use_id":parent,
-            "message":{"content":[{"type":"tool_result","tool_use_id":id}]}}).to_string()
+            "message":{"content":[{"type":"tool_result","tool_use_id":id}]}})
+        .to_string()
     }
 
     #[test]
