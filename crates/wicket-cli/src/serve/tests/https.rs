@@ -268,7 +268,7 @@ fn b64(v: &Value, k: &str) -> Vec<u8> {
 }
 
 impl MockCa {
-    async fn answer(&self, method: http::Method, url: String, body: Bytes) -> (StatusCode, Vec<(String, String)>, String) {
+    async fn answer(&self, method: ::http::Method, url: String, body: Bytes) -> (StatusCode, Vec<(String, String)>, String) {
         let path = url.strip_prefix(CA).unwrap_or(&url).to_string();
         let mut headers = vec![];
         {
@@ -290,7 +290,7 @@ impl MockCa {
                 "certificate": s.chain.as_ref().map(|_| format!("{CA}/cert/1")),
             })
         };
-        if method == http::Method::GET && path == "/directory" {
+        if method == ::http::Method::GET && path == "/directory" {
             let d = json!({ "newNonce": format!("{CA}/nonce"), "newAccount": format!("{CA}/acct"), "newOrder": format!("{CA}/new-order") });
             return (StatusCode::OK, headers, d.to_string());
         }
@@ -364,14 +364,14 @@ impl MockCa {
 impl HttpClient for MockCa {
     fn request(
         &self,
-        req: http::Request<BodyWrapper<Bytes>>,
+        req: ::http::Request<BodyWrapper<Bytes>>,
     ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>> {
         let me = MockCa { state: self.state.clone(), domain: self.domain.clone(), target: self.target, issuer: self.issuer.clone() };
         Box::pin(async move {
             let (parts, body) = req.into_parts();
             let body = body.collect().await.unwrap().to_bytes();
             let (status, headers, text) = me.answer(parts.method, parts.uri.to_string(), body).await;
-            let mut r = http::Response::builder().status(status);
+            let mut r = ::http::Response::builder().status(status);
             for (k, v) in headers {
                 r = r.header(k, v);
             }
@@ -414,9 +414,10 @@ async fn an_acme_order_validates_over_tls_alpn_01_and_puts_the_certificate_in_se
     assert!(resolver.current().is_none());
     let poll = instant_acme::RetryPolicy::new().initial_delay(Duration::from_millis(10)).timeout(Duration::from_secs(10));
     acme::order(&cfg, &resolver, &http, poll).await.unwrap();
-    let s = ca_state.lock().unwrap();
-    assert!(s.validated && s.validations == 1, "validated once, over TLS-ALPN-01");
-    drop(s);
+    {
+        let s = ca_state.lock().unwrap();
+        assert!(s.validated && s.validations == 1, "validated once, over TLS-ALPN-01");
+    }
     // In service: a client trusting the mock CA connects with the issued certificate.
     let leaf = resolver.current().unwrap().end_entity_cert().unwrap().to_vec();
     let (_, issued) = x509_parser::parse_x509_certificate(&leaf).unwrap();

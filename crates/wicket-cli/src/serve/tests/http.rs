@@ -172,7 +172,8 @@ async fn every_response_carries_the_security_headers() {
     let js = ASSETS.files.keys().find(|k| k.ends_with(".js")).unwrap().clone();
     for https in [false, true] {
         t.state.hsts = https;
-        let requests: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+        type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+        let requests: Vec<Req> = vec![
             ("GET", "/", vec![]),
             ("GET", &js, vec![]),
             ("GET", "/manifest.webmanifest", vec![]),
@@ -387,10 +388,11 @@ async fn the_challenge_store_is_bounded() {
             first = json_of(&b)["publicKey"]["challenge"].as_str().map(String::from);
         }
     }
-    let c = t.state.challenges.lock().unwrap();
-    assert_eq!(c.values().filter(|p| p.owner == "192.0.2.10").count(), MAX_CHALLENGES_PER_OWNER);
-    assert!(!c.contains_key(first.as_deref().unwrap()), "the oldest went");
-    drop(c);
+    {
+        let c = t.state.challenges.lock().unwrap();
+        assert_eq!(c.values().filter(|p| p.owner == "192.0.2.10").count(), MAX_CHALLENGES_PER_OWNER);
+        assert!(!c.contains_key(first.as_deref().unwrap()), "the oldest went");
+    }
     // In all: when the store is full, sign-in is refused rather than growing it.
     for i in 0..MAX_CHALLENGES {
         let ip: IpAddr = std::net::Ipv4Addr::from(0x0a00_0000 + i as u32).into();
