@@ -8,6 +8,7 @@
 mod mock;
 mod node;
 mod program;
+mod reap;
 mod run;
 mod serve;
 mod spawn;
@@ -158,7 +159,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IdentityCmd,
     },
-    /// Check the environment: Docker, gVisor, image, secrets, ledger.
+    /// Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and
+    /// that Docker kept running with nothing behind them. Their runs end as "lost".
+    Reap {
+        /// Only list what would be stopped.
+        #[arg(long)]
+        dry_run: bool,
+        /// Reap on a remote node over ssh instead (e.g. wicket@203.0.113.7).
+        #[arg(long)]
+        node: Option<String>,
+        /// ssh identity for --node.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+    },
+    /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
@@ -529,6 +543,28 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { image } => doctor(&image).await,
+        Cmd::Reap { dry_run, node, ssh_key } => {
+            let docker = match node {
+                Some(n) => wicket_sandbox::Docker::over_ssh(node::Node::new(&n, ssh_key.as_deref()).ssh_prefix()),
+                None => wicket_sandbox::Docker::from_env(),
+            };
+            let l = Ledger::open(&ledger_path())?;
+            let all = reap::reap(&docker, &l, dry_run).await?;
+            let mut stopped = 0;
+            for r in &all {
+                let run = r.run.as_deref().unwrap_or("?");
+                match &r.verdict {
+                    reap::Verdict::Live => {}
+                    reap::Verdict::Orphan(why) => {
+                        stopped += 1;
+                        println!("{} {} (run {run}): {why}", if dry_run { "would stop" } else { "stopped" }, r.name);
+                    }
+                    reap::Verdict::Unknown(why) => println!("left alone {} (run {run}): {why}", r.name),
+                }
+            }
+            println!("{} box(es), {stopped} orphaned{}", all.len(), if dry_run { " (dry run: nothing stopped)" } else { "" });
+            Ok(())
+        }
         Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
@@ -677,6 +713,14 @@ async fn doctor(image: &str) -> Result<()> {
     }
     let l = Ledger::open(&ledger_path())?;
     println!("ledger: {} (audit chain OK, {} records)", ledger_path().display(), l.verify_audit()?);
+    if let Ok(all) = reap::reap(&d, &l, true).await {
+        let orphans: Vec<_> = all.iter().filter(|r| matches!(r.verdict, reap::Verdict::Orphan(_))).map(|r| r.name.as_str()).collect();
+        if orphans.is_empty() {
+            println!("boxes: {} running, none orphaned", all.len());
+        } else {
+            println!("boxes: {} orphaned, with nothing behind them: {} (run: wicket reap)", orphans.len(), orphans.join(", "));
+        }
+    }
     if !ok {
         bail!("environment not ready");
     }
