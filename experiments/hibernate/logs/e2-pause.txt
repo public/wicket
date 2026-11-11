@@ -1,0 +1,6 @@
+first turn: 6.458734224 s
+pause: .158441796 s; memory while paused: 237.4MiB / 2GiB
+paused 5 s: unpause .142533797 s; next turn answered in 1.074373395 s
+pause: .166283809 s; memory while paused: 241.9MiB / 2GiB
+paused 60 s: unpause .076926500 s; next turn answered in .549987036 s
+api_retry events: 0
