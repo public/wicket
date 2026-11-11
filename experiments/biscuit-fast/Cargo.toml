@@ -1,0 +1,31 @@
+[package]
+name = "biscuit-fast"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Stock release, for the baseline and the differential test.
+biscuit-auth = "=6.0.0"
+# The fork: upstream main (eclipse-biscuit/biscuit-rust aa5a672, 2026-11-09) plus this experiment's patches.
+fork = { package = "biscuit-auth", path = "vendor/biscuit-auth" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+regex = "1"
+# Same version biscuit-auth 6.0.0 uses, only to edit tokens at the protobuf level in the truncation test.
+prost = "=0.10.4"
+
+[profile.release]
+debug = false
+codegen-units = 16
+
+[profile.profiling]
+inherits = "release"
+debug = 1

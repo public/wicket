@@ -1,0 +1,185 @@
+    Updating crates.io index
+     Locking 38 packages to highest compatible versions
+      Adding android_system_properties v0.1.6
+      Adding ansi_term v0.12.1
+      Adding bitflags v2.13.2
+      Adding cc v1.11.1
+      Adding colored-diff v0.2.3
+      Adding core-foundation-sys v0.8.7
+      Adding dissimilar v1.0.11
+      Adding equivalent v1.0.3
+      Adding errno v0.3.14
+      Adding fastrand v2.5.0
+      Adding find-msvc-tools v0.1.15
+      Adding fixedbitset v0.5.9
+      Adding foldhash v0.1.5
+      Adding hashbrown v0.15.5
+      Adding hashbrown v0.17.1
+      Adding heck v0.5.0
+      Adding iana-time-zone v0.1.65
+      Adding iana-time-zone-haiku v0.1.2
+      Adding indexmap v2.14.2
+      Adding linux-raw-sys v0.12.1
+      Adding log v0.4.35
+      Adding multimap v0.10.1
+      Adding petgraph v0.8.3
+      Adding prettyplease v0.3.0
+      Adding prost-build v0.14.5
+      Adding rustix v1.1.6
+      Adding shlex v2.0.1
+      Adding tempfile v3.27.0
+      Adding winapi v0.3.9
+      Adding winapi-i686-pc-windows-gnu v0.4.0
+      Adding winapi-x86_64-pc-windows-gnu v0.4.0
+      Adding windows-core v0.62.2
+      Adding windows-implement v0.60.2
+      Adding windows-interface v0.59.3
+      Adding windows-link v0.2.1
+      Adding windows-result v0.4.1
+      Adding windows-strings v0.5.1
+      Adding windows-sys v0.61.2
+   Compiling rustix v1.1.6
+   Compiling bitflags v2.13.2
+   Compiling prettyplease v0.3.0
+   Compiling foldhash v0.1.5
+   Compiling linux-raw-sys v0.12.1
+   Compiling either v1.19.0
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.3
+   Compiling indexmap v2.14.2
+   Compiling itertools v0.10.5
+   Compiling hashbrown v0.15.5
+   Compiling syn v3.0.10
+   Compiling fixedbitset v0.5.9
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.27.0
+   Compiling petgraph v0.8.3
+   Compiling multimap v0.10.1
+   Compiling log v0.4.35
+   Compiling iana-time-zone v0.1.65
+   Compiling heck v0.5.0
+   Compiling dissimilar v1.0.11
+   Compiling ansi_term v0.12.1
+   Compiling colored-diff v0.2.3
+   Compiling prost-build v0.14.5
+   Compiling chrono v0.4.45
+   Compiling biscuit-auth v6.0.0-fork.0 (vendor/biscuit-auth)
+    Finished `release` profile [optimized] target(s) in 2m 22s
+     Running unittests src/lib.rs (../../target/release/deps/biscuit_auth-68285b393d07cc6e)
+
+running 98 tests
+test crypto::p256::tests::invalid_sizes ... ok
+test crypto::tests::ed25519_der ... ok
+test crypto::tests::ed25519_pem ... ok
+test crypto::tests::parsing_ed25519 ... ok
+test crypto::tests::parsing_errors ... ok
+test crypto::tests::parsing_secp256r1 ... ok
+test crypto::p256::tests::serialization ... ok
+test datalog::expression::tests::all ... ok
+test datalog::expression::tests::any ... ok
+test crypto::tests::roundtrip_from_string ... ok
+test crypto::tests::p256_pem ... ok
+test datalog::expression::tests::array ... ok
+test datalog::expression::tests::bitwise ... ok
+test datalog::expression::tests::checked ... ok
+test datalog::expression::tests::ffi ... ok
+test datalog::expression::tests::laziness ... ok
+test datalog::expression::tests::equal_heterogeneous ... ok
+test crypto::tests::p256_der ... ok
+test datalog::expression::tests::map ... ok
+test datalog::expression::tests::negate ... ok
+test datalog::expression::tests::nested_closures ... ok
+test datalog::expression::tests::null_equal ... ok
+test datalog::expression::tests::null_heterogeneous ... ok
+test datalog::expression::tests::null_not_equal ... ok
+test datalog::expression::tests::printer ... ok
+test datalog::expression::tests::steps ... ok
+test datalog::expression::tests::try_op ... ok
+test datalog::expression::tests::strict_equal_heterogeneous ... ok
+test datalog::expression::tests::variable_shadowing ... ok
+test datalog::tests::date_constraint ... ok
+test datalog::tests::family ... ok
+test datalog::tests::resource ... ok
+test datalog::tests::int_expr ... ok
+test datalog::tests::set_constraint ... ok
+test datalog::tests::numbers ... ok
+test datalog::tests::step_limit_candidates ... ok
+test datalog::tests::step_limit ... ok
+test datalog::tests::str ... ok
+test datalog::tests::unbound_variables ... ok
+test error::tests::error_format_strings ... ok
+test parser::tests::check ... ok
+test parser::tests::block_source_file ... ok
+test format::tests::proto ... FAILED
+test parser::tests::constrained_rule_ordering ... ok
+test parser::tests::constrained_rule ... ok
+test parser::tests::expression ... ok
+test parser::tests::invalid_check ... ok
+test parser::tests::rule ... ok
+test parser::tests::parens ... ok
+test format::tests::test_block_signature_version ... ok
+test parser::tests::rule_with_free_expression_variables ... ok
+test parser::tests::rule_with_free_head_variables ... ok
+test token::authorizer::snapshot::tests::restored_snapshot_keeps_counting_steps ... ok
+test token::authorizer::snapshot::tests::restored_snapshot_enforces_step_limit ... ok
+test token::authorizer::snapshot::tests::roundtrip_builder ... ok
+test parser::tests::source_file ... ok
+test token::authorizer::snapshot::tests::roundtrip_with_eval_error ... ok
+test token::authorizer::snapshot::tests::roundtrip_without_token ... ok
+test token::authorizer::tests::authorizer_display_before_and_after_authorization ... ok
+test token::authorizer::tests::authorizer_is_send_and_sync ... ok
+test token::authorizer::tests::empty_authorizer ... ok
+test token::authorizer::tests::empty_authorizer_display ... ok
+test token::authorizer::snapshot::tests::roundtrip_with_token ... ok
+test token::authorizer::tests::forbid_unbound_parameters ... ok
+test token::authorizer::tests::forbid_unbound_parameters_in_add_code ... ok
+test token::authorizer::tests::parameter_substitution ... ok
+test token::authorizer::tests::query_all_with_limits_enforces_step_limit ... ok
+test token::authorizer::tests::query_authorizer_from_token_string ... ok
+test token::authorizer::tests::query_exactly_one_authorizer_from_token_string ... ok
+test token::authorizer::tests::query_authorizer_from_token_tuple ... ok
+test token::authorizer::tests::query_exactly_one_no_results ... ok
+test token::authorizer::tests::authorizer_with_scopes ... ok
+test token::authorizer::tests::query_exactly_one_too_many_results ... ok
+test token::authorizer::tests::query_with_limits_uses_the_override_for_saturation ... ok
+test token::authorizer::tests::rule_validate_variables ... ok
+test token::builder::tests::empty_set_display ... ok
+test token::authorizer::tests::step_budget_is_shared_across_calls ... ok
+test token::builder::tests::forbid_unbound_parameters_in_set_code ... ok
+test token::builder::tests::set_closure_parameters ... ok
+test token::builder::tests::set_rule_parameters ... ok
+test token::builder::tests::set_code_parameters ... ok
+test token::builder::tests::forbid_unbound_parameters ... ok
+test token::builder::tests::set_rule_scope_parameters ... ok
+test token::tests::authority_signature_v1 ... ok
+test token::tests::authorizer_queries ... ok
+test token::tests::block1_generates_authority_or_ambient ... ok
+test token::tests::check_head_name ... ok
+test token::tests::bytes_constraints ... ok
+test token::tests::check_all ... ok
+test token::tests::basic ... ok
+test token::tests::constraints ... ok
+test token::tests::verif_no_blocks ... ok
+test token::tests::third_party_unsafe_deserialize ... ok
+test token::third_party::tests::third_party_request_roundtrip ... ok
+test token::tests::verified_unverified_consistency ... ok
+test token::tests::folders ... ok
+test token::tests::sealed_token ... ok
+test token::unverified::tests::consistent_with_biscuit ... ok
+
+failures:
+
+---- format::tests::proto stdout ----
+
+thread 'format::tests::proto' (3850978) panicked at vendor/biscuit-auth/src/format/mod.rs:602:78:
+called `Result::unwrap()` on an `Err` value: Custom { kind: NotFound, error: "Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable to the path of the `protoc` binary. To install it on Debian, run `apt-get install protobuf-compiler`. It is also available at https://github.com/protocolbuffers/protobuf/releases  For more information: https://docs.rs/prost-build/#sourcing-protoc" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    format::tests::proto
+
+test result: FAILED. 97 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

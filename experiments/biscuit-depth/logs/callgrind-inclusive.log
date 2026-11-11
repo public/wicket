@@ -1,0 +1,70 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/bd-callgrind.out' (creator: callgrind-3.26.0.codspeed12)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 178168120
+Trigger: Program termination
+Profiled target:  target/release/biscuit-depth profile (PID 3790563, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       99
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+924,789,977 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                    file:function
+--------------------------------------------------------------------------------
+924,415,478 (99.96%)  ???:(below main) [experiments/biscuit-depth/target/release/biscuit-depth]
+924,415,466 (99.96%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+924,415,283 (99.96%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+924,413,475 (99.96%)  ???:main [experiments/biscuit-depth/target/release/biscuit-depth]
+924,413,464 (99.96%)  ???:std::rt::lang_start_internal [experiments/biscuit-depth/target/release/biscuit-depth]
+924,309,272 (99.95%)  ???:std::rt::lang_start::<()>::{closure#0} [experiments/biscuit-depth/target/release/biscuit-depth]
+924,309,266 (99.95%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> [experiments/biscuit-depth/target/release/biscuit-depth]
+924,309,262 (99.95%)  ???:biscuit_depth::main [experiments/biscuit-depth/target/release/biscuit-depth]
+682,810,673 (73.83%)  ???:<biscuit_auth::token::builder::authorizer::AuthorizerBuilder>::build [experiments/biscuit-depth/target/release/biscuit-depth]
+682,809,473 (73.83%)  ???:<biscuit_auth::token::builder::authorizer::AuthorizerBuilder>::build_inner [experiments/biscuit-depth/target/release/biscuit-depth]
+637,539,843 (68.94%)  ???:<alloc::vec::Vec<biscuit_auth::token::block::Block> as alloc::vec::spec_from_iter::SpecFromIter<biscuit_auth::token::block::Block, core::iter::adapters::GenericShunt<core::iter::adapters::map::M
+630,568,406 (68.19%)  ???:<core::iter::adapters::chain::Chain<core::iter::sources::once::Once<core::result::Result<biscuit_auth::token::block::Block, biscuit_auth::error::Token>>, core::iter::adapters::map::Map<core::ite
+523,148,452 (56.57%)  ???:<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip<core::slice::iter::Iter<biscuit_auth::format::schema::Block>, core::slice::iter::Iter<biscuit_auth::crypto::Block>>, <biscuit_auth:
+517,707,850 (55.98%)  ???:biscuit_auth::token::builder::authorizer::load_and_translate_block [experiments/biscuit-depth/target/release/biscuit-depth]
+262,826,883 (28.42%)  ???:<biscuit_auth::token::builder::check::Check as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Check>>::convert [experiments/biscuit-depth/target/release/bi
+260,753,078 (28.20%)  ???:<biscuit_auth::token::builder::rule::Rule as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Rule>>::convert [experiments/biscuit-depth/target/release/biscu
+171,689,639 (18.57%)  ???:__rustc::__rust_alloc [experiments/biscuit-depth/target/release/biscuit-depth]
+170,264,520 (18.41%)  ???:__rustc::__rdl_alloc [experiments/biscuit-depth/target/release/biscuit-depth]
+164,540,803 (17.79%)  ???:__rustc::__rust_dealloc [experiments/biscuit-depth/target/release/biscuit-depth]
+163,115,686 (17.64%)  ???:__rustc::__rdl_dealloc [experiments/biscuit-depth/target/release/biscuit-depth]
+161,691,079 (17.48%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+161,684,687 (17.48%)  ???:<biscuit_auth::token::authorizer::Authorizer>::authorize [experiments/biscuit-depth/target/release/biscuit-depth]
+157,441,016 (17.02%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+148,877,881 (16.10%)  ???:<biscuit_auth::token::authorizer::Authorizer>::authorize_with_limits [experiments/biscuit-depth/target/release/biscuit-depth]
+143,561,259 (15.52%)  ???:biscuit_auth::format::convert::proto_block_to_token_block [experiments/biscuit-depth/target/release/biscuit-depth]
+118,869,301 (12.85%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+114,118,563 (12.34%)  ???:<biscuit_auth::token::builder::check::Check as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Check>>::convert_from [experiments/biscuit-depth/target/relea
+113,041,400 (12.22%)  ???:<biscuit_auth::datalog::Rule>::find_match [experiments/biscuit-depth/target/release/biscuit-depth]
+110,882,594 (11.99%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+108,670,688 (11.75%)  ???:<biscuit_auth::token::builder::rule::Rule as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Rule>>::convert_from [experiments/biscuit-depth/target/release/
+106,485,307 (11.51%)  ???:<biscuit_auth::datalog::symbol::SymbolTable>::insert [experiments/biscuit-depth/target/release/biscuit-depth]
+ 99,375,333 (10.75%)  ???:core::ptr::drop_glue::<biscuit_auth::token::builder::rule::Rule> [experiments/biscuit-depth/target/release/biscuit-depth]
+ 91,744,118 ( 9.92%)  ???:<biscuit_auth::datalog::CombineIt<core::iter::adapters::flatten::Flatten<core::iter::adapters::filter_map::FilterMap<std::collections::hash::map::Iter<biscuit_auth::datalog::origin::Origin, std:
+ 86,246,310 ( 9.33%)  ???:<biscuit_auth::token::builder::predicate::Predicate as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Predicate>>::convert [experiments/biscuit-depth/targe
+ 84,614,632 ( 9.15%)  ???:<biscuit_auth::token::builder::term::Term as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::Term>>::convert [experiments/biscuit-depth/target/release/biscu
+ 75,527,572 ( 8.17%)  ???:<alloc::raw_vec::RawVecInner>::finish_grow [experiments/biscuit-depth/target/release/biscuit-depth]
+ 67,647,405 ( 7.31%)  ???:<biscuit_auth::datalog::CombineIt<core::iter::adapters::flatten::Flatten<core::iter::adapters::filter_map::FilterMap<std::collections::hash::map::Iter<biscuit_auth::datalog::origin::Origin, std:
+ 67,112,235 ( 7.26%)  ???:biscuit_auth::format::convert::proto_check_to_token_check [experiments/biscuit-depth/target/release/biscuit-depth]
+ 62,118,164 ( 6.72%)  ???:<alloc::vec::Vec<biscuit_auth::datalog::expression::Op> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<biscuit_auth::datalog::expression::Op, core::iter::adapters::map::Map<core::slice
+ 61,680,958 ( 6.67%)  ???:biscuit_auth::format::convert::proto_rule_to_token_rule [experiments/biscuit-depth/target/release/biscuit-depth]
+ 61,329,000 ( 6.63%)  ???:<biscuit_auth::token::builder::rule::Rule as core::clone::Clone>::clone [experiments/biscuit-depth/target/release/biscuit-depth]
+ 53,698,057 ( 5.81%)  ???:<biscuit_auth::token::builder::expression::Op as biscuit_auth::token::builder::Convert<biscuit_auth::datalog::expression::Op>>::convert [experiments/biscuit-depth/target
+ 52,917,245 ( 5.72%)  ???:core::iter::adapters::try_process::<core::iter::adapters::map::Map<core::slice::iter::Iter<biscuit_auth::datalog::expression::Expression>, <biscuit_auth::token::builder::rule::Rule as biscuit_au
+ 52,322,045 ( 5.66%)  ???:<alloc::vec::Vec<biscuit_auth::token::builder::expression::Expression> as alloc::vec::spec_from_iter::SpecFromIter<biscuit_auth::token::builder::expression::Expression, core::iter::adapters::Gen
+ 52,265,108 ( 5.65%)  ???:<alloc::string::String as core::clone::Clone>::clone [experiments/biscuit-depth/target/release/biscuit-depth]

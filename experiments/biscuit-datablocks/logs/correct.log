@@ -1,0 +1,440 @@
+
+# Correctness: A checks (step 3)
+
+## Baseline (depth 5, grant at leaf; token 10018 bytes)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] a forged `approved` fact in a holder block is not trusted
+       refused at load: lint: block 7: fact not allowed: approved
+[PASS] a holder rule deriving `approved` is not trusted
+       refused at load: lint: block 7: first-party blocks may not carry rules
+[PASS] a third-party approval signed by an untrusted key is ignored
+       refused at load: lint: block 7 (third-party): signed by a key no first-party block trusts
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       refused at load: lint: block 7 (third-party): signed by a key no first-party block trusts
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T18:03:00Z
+[PASS] a request served for another tenant is refused
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in authorizer: check if tenant($t), request_tenant($t)
+
+## A node can narrow
+[PASS] after appending `method GET only`: A still allowed
+       ok
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°7: check if op($o), $o != "http" or method("GET")
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T18:03:00Z
+[PASS] C after the grant's expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°3: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+[PASS] an approval can't reach a path only the authority block forbids (forbids have no grant escape)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°5 in block n°0: reject if host("api.github.com"), path($p), $p.starts_with("/repos/acme/secr…
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 10018 bytes in turn: 0 variants load
+[PASS] dropping the last block: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Intersection and grant trust under a hostile but well-formed block
+[PASS] a well-formed zone block wider than the leaf doesn't admit B (intersection)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] a holder block trusting an attacker key, plus a grant that key signed: denied by the other blocks
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] a block naming a wider box and a later expiry doesn't admit another subtree
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°1 in block n°2: check if box($b), $b == "b0/b1/b2" || $b.starts_with("b0/b1/b2/"), Check n°…
+[PASS] the scenario's levels each narrow their parent (plain::narrows, the second line at load)
+[PASS] the second line names the widening in the wider block
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+
+A checks (step 3): 46 checks, ALL PASS
+
+# Correctness: B data-only (CompiledZone)
+
+## Baseline (depth 5, grant at leaf; token 7455 bytes)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       denied by a zone block
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       refused at load: extract: block 7: rules, checks and scopes are not allowed
+[PASS] a forged grant fact in a first-party (holder) block is not trusted
+       refused at load: extract: block 7: unexpected grant fact
+[PASS] a holder rule deriving `approved` is not trusted
+       refused at load: extract: block 7: rules, checks and scopes are not allowed
+[PASS] a third-party approval signed by an untrusted key is ignored
+       denied by a zone block
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       denied by a zone block
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       denied by a zone block
+[PASS] a request served for another tenant is refused
+       denied by a zone block
+
+## A node can narrow (B: by appending a narrower zone)
+[PASS] after appending `method GET only`: A still allowed
+       ok
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       denied by a zone block
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       denied by a zone block
+[PASS] C after the grant's expiry: denied
+       denied by a zone block
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       denied by a zone block
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       denied by a zone block
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+[PASS] an approval can't reach a path only the authority block forbids (forbids have no grant escape)
+       denied by a zone block
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 7455 bytes in turn: 0 variants load
+[PASS] dropping the last block: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Intersection and grant trust under a hostile but well-formed block
+[PASS] a well-formed zone block wider than the leaf doesn't admit B (intersection)
+       denied by a zone block
+[PASS] a holder block trusting an attacker key, plus a grant that key signed: denied by the other blocks
+       denied by a zone block
+[PASS] a block naming a wider box and a later expiry doesn't admit another subtree
+       denied by a zone block
+[PASS] the scenario's levels each narrow their parent (plain::narrows, the second line at load)
+[PASS] the second line names the widening in the wider block
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+
+## Data blocks: the extractor refuses anything that isn't exactly one canonical fact
+[PASS] non-canonical JSON (one extra space): refused at load
+       extract: block 7: zone: not in canonical form
+[PASS] an unknown field: refused at load
+       extract: block 7: zone: unknown field `admin`, expected one of `zone`, `box_prefix`, `not_after`, `ops`, `reach`, `forbid`, `max_risk`, `dangerous_ok`, `spawn`, `llm`, `accept_from`, `inject`, `grant_keys` at line 1 column 8
+[PASS] a duplicated key: refused at load
+       extract: block 7: zone: duplicate field `zone` at line 1 column 18
+[PASS] a missing field: refused at load
+       extract: block 7: zone: missing field `grant_keys` at line 1 column 650
+[PASS] two zone facts in one block: refused at load
+       extract: block 7: unexpected zone fact
+[PASS] a zone fact with an integer term: refused at load
+       extract: block 7: zone: must have exactly one string term
+[PASS] narrowing with a Datalog check and no zone fact: refused at load
+       extract: block 7: rules, checks and scopes are not allowed
+[PASS] a zone fact in a third-party block signed by a trusted key: refused at load
+       extract: block 7: unexpected zone fact
+[PASS] an empty block: refused at load
+       extract: block 7: a first-party block needs exactly one zone fact
+[PASS] a zone over the reach cap (65 entries): refused at load
+       extract: block 7: zone: a list is over its cap
+
+B data-only (CompiledZone): 56 checks, ALL PASS
+
+# Correctness: B data-only (model matcher)
+
+## Baseline (depth 5, grant at leaf; token 7455 bytes)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       denied by a zone block
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       refused at load: extract: block 7: rules, checks and scopes are not allowed
+[PASS] a forged grant fact in a first-party (holder) block is not trusted
+       refused at load: extract: block 7: unexpected grant fact
+[PASS] a holder rule deriving `approved` is not trusted
+       refused at load: extract: block 7: rules, checks and scopes are not allowed
+[PASS] a third-party approval signed by an untrusted key is ignored
+       denied by a zone block
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       denied by a zone block
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       denied by a zone block
+[PASS] a request served for another tenant is refused
+       denied by a zone block
+
+## A node can narrow (B: by appending a narrower zone)
+[PASS] after appending `method GET only`: A still allowed
+       ok
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       denied by a zone block
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       denied by a zone block
+[PASS] C after the grant's expiry: denied
+       denied by a zone block
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       denied by a zone block
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       denied by a zone block
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+[PASS] an approval can't reach a path only the authority block forbids (forbids have no grant escape)
+       denied by a zone block
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 7455 bytes in turn: 0 variants load
+[PASS] dropping the last block: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Intersection and grant trust under a hostile but well-formed block
+[PASS] a well-formed zone block wider than the leaf doesn't admit B (intersection)
+       denied by a zone block
+[PASS] a holder block trusting an attacker key, plus a grant that key signed: denied by the other blocks
+       denied by a zone block
+[PASS] a block naming a wider box and a later expiry doesn't admit another subtree
+       denied by a zone block
+[PASS] the scenario's levels each narrow their parent (plain::narrows, the second line at load)
+[PASS] the second line names the widening in the wider block
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+
+## Data blocks: the extractor refuses anything that isn't exactly one canonical fact
+[PASS] non-canonical JSON (one extra space): refused at load
+       extract: block 7: zone: not in canonical form
+[PASS] an unknown field: refused at load
+       extract: block 7: zone: unknown field `admin`, expected one of `zone`, `box_prefix`, `not_after`, `ops`, `reach`, `forbid`, `max_risk`, `dangerous_ok`, `spawn`, `llm`, `accept_from`, `inject`, `grant_keys` at line 1 column 8
+[PASS] a duplicated key: refused at load
+       extract: block 7: zone: duplicate field `zone` at line 1 column 18
+[PASS] a missing field: refused at load
+       extract: block 7: zone: missing field `grant_keys` at line 1 column 650
+[PASS] two zone facts in one block: refused at load
+       extract: block 7: unexpected zone fact
+[PASS] a zone fact with an integer term: refused at load
+       extract: block 7: zone: must have exactly one string term
+[PASS] narrowing with a Datalog check and no zone fact: refused at load
+       extract: block 7: rules, checks and scopes are not allowed
+[PASS] a zone fact in a third-party block signed by a trusted key: refused at load
+       extract: block 7: unexpected zone fact
+[PASS] an empty block: refused at load
+       extract: block 7: a first-party block needs exactly one zone fact
+[PASS] a zone over the reach cap (65 entries): refused at load
+       extract: block 7: zone: a list is over its cap
+
+B data-only (model matcher): 56 checks, ALL PASS
+
+# Correctness: C hybrid (decide A, cross-check B)
+
+## Baseline (depth 5, grant at leaf; token 16490 bytes)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       refused at load: extract: block 7: a first-party block needs exactly one zone_spec fact
+[PASS] a forged grant fact in a first-party (holder) block is not trusted
+       refused at load: lint: block 7: fact not allowed: grant
+[PASS] a holder rule deriving `approved` is not trusted
+       refused at load: lint: block 7: first-party blocks may not carry rules
+[PASS] a third-party approval signed by an untrusted key is ignored
+       refused at load: lint: block 7 (third-party): signed by a key no first-party block trusts
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       refused at load: lint: block 7 (third-party): signed by a key no first-party block trusts
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T18:03:00Z
+[PASS] a request served for another tenant is refused
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in authorizer: check if tenant($t), request_tenant($t)
+
+## A node can narrow (B: by appending a narrower zone)
+[PASS] after appending `method GET only`: A still allowed
+       ok
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°7: check if op($o), $o != "http" or method("GET")
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T18:03:00Z
+[PASS] C after the grant's expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°3: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+[PASS] an approval can't reach a path only the authority block forbids (forbids have no grant escape)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°5 in block n°0: reject if host("api.github.com"), path($p), $p.starts_with("/repos/acme/secr…
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 16490 bytes in turn: 0 variants load
+[PASS] dropping the last block: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("parse: error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Intersection and grant trust under a hostile but well-formed block
+[PASS] a well-formed zone block wider than the leaf doesn't admit B (intersection)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] a holder block trusting an attacker key, plus a grant that key signed: denied by the other blocks
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p…
+[PASS] a block naming a wider box and a later expiry doesn't admit another subtree
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°1 in block n°2: check if box($b), $b == "b0/b1/b2" || $b.starts_with("b0/b1/b2/"), Check n°…
+[PASS] the scenario's levels each narrow their parent (plain::narrows, the second line at load)
+[PASS] the second line names the widening in the wider block
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+
+## Data blocks: the extractor refuses anything that isn't exactly one canonical fact
+[PASS] non-canonical JSON (one extra space): refused at load
+       extract: block 7: zone_spec: not in canonical form
+[PASS] an unknown field: refused at load
+       extract: block 7: zone_spec: unknown field `admin`, expected one of `zone`, `box_prefix`, `not_after`, `ops`, `reach`, `forbid`, `max_risk`, `dangerous_ok`, `spawn`, `llm`, `accept_from`, `inject`, `grant_keys` at line 1 column 8
+[PASS] a duplicated key: refused at load
+       extract: block 7: zone_spec: duplicate field `zone` at line 1 column 18
+[PASS] a missing field: refused at load
+       extract: block 7: zone_spec: missing field `grant_keys` at line 1 column 650
+[PASS] two zone facts in one block: refused at load
+       extract: block 7: unexpected zone_spec fact
+[PASS] a zone fact with an integer term: refused at load
+       lint: block 7: fact not allowed: zone_spec
+[PASS] narrowing with a Datalog check and no zone fact: refused at load
+       extract: block 7: a first-party block needs exactly one zone_spec fact
+[PASS] a zone fact in a third-party block signed by a trusted key: refused at load
+       lint: block 7 (third-party): fact not allowed: zone_spec
+[PASS] an empty block: refused at load
+       extract: block 7: a first-party block needs exactly one zone_spec fact
+[PASS] a zone over the reach cap (65 entries): refused at load
+       lint: block 7: check has too many alternatives
+[PASS] C: B's decision agreed with A's on all 27 decisions made above (0 disagreements)
+
+C hybrid (decide A, cross-check B): 57 checks, ALL PASS
+
+## Summary
+
+A checks (step 3): 46 checks, all pass
+B data-only (CompiledZone): 56 checks, all pass
+B data-only (model matcher): 56 checks, all pass
+C hybrid (decide A, cross-check B): 57 checks, all pass
+
+ALL DESIGNS: ALL PASS

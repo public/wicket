@@ -1,0 +1,68 @@
+{"ev":"listening","port":40161,"ts":1794385869512}
+{"bytes":408,"epoch":null,"ev":"accepted","t":"key","ts":1794385869513}
+{"bytes":420,"epoch":0,"ev":"accepted","t":"snap","ts":1794385869513}
+{"bytes":445,"epoch":0,"ev":"accepted","t":"fresh","ts":1794385869514}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794385869514}
+{"bytes":4919,"epoch":1,"ev":"accepted","t":"delta","ts":1794385869538}
+{"bytes":5185,"epoch":2,"ev":"accepted","t":"delta","ts":1794385869539}
+{"bytes":632,"epoch":3,"ev":"accepted","t":"delta","ts":1794385869539}
+{"bytes":628,"epoch":4,"ev":"accepted","t":"delta","ts":1794385869540}
+{"bytes":628,"epoch":5,"ev":"accepted","t":"delta","ts":1794385869540}
+{"bytes":628,"epoch":6,"ev":"accepted","t":"delta","ts":1794385869540}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385869986}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385870487}
+{"detail":"BadSignature","epoch":6,"ev":"refused","kind":"bad_signature","t":"delta","ts":1794385870742}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385870987}
+{"detail":"Replay(\"delta 2 already applied (held 6)\")","epoch":6,"ev":"refused","kind":"replay","t":"delta","ts":1794385871203}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385871487}
+{"detail":"Rollback(\"snapshot epoch 3 < held 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"snap","ts":1794385871664}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385871990}
+{"detail":"Replay(\"freshness issued_at 1794385871487 not after 1794385871990\")","epoch":6,"ev":"refused","kind":"replay","t":"fresh","ts":1794385872126}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385872491}
+{"detail":"UnknownKey(\"fe812c12f3ab4ce6\")","epoch":6,"ev":"refused","kind":"unknown_key","t":"fresh","ts":1794385872587}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385872991}
+{"detail":"BadSignature","epoch":6,"ev":"refused","kind":"bad_signature","t":"fresh","ts":1794385873048}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385873492}
+{"detail":"TooLong(\"ttl 3600000 ms > certified 30000\")","epoch":6,"ev":"refused","kind":"too_long","t":"fresh","ts":1794385873510}
+{"detail":"FromFuture","epoch":6,"ev":"refused","kind":"from_future","t":"fresh","ts":1794385873971}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385873992}
+{"detail":"Expired","epoch":6,"ev":"refused","kind":"expired","t":"fresh","ts":1794385874432}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385874492}
+{"detail":"BadSignature","epoch":6,"ev":"refused","kind":"bad_signature","t":"key","ts":1794385874893}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385874992}
+{"detail":"WrongType(\"expected wicket-feed-fresh+jws, got wicket-feed-delta+jws\")","epoch":6,"ev":"refused","kind":"wrong_type","t":"fresh","ts":1794385875354}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385875493}
+{"detail":"WrongAudience(\"n2\")","epoch":6,"ev":"refused","kind":"wrong_audience","t":"delta","ts":1794385875816}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385875993}
+{"detail":"Gap { have: 6, got: 8 }","epoch":6,"ev":"refused","kind":"gap","t":"delta","ts":1794385876277}
+{"bytes":408,"epoch":6,"ev":"accepted","t":"key","ts":1794385876478}
+{"detail":"Replay(\"freshness issued_at 1794385875993 not after 1794385875993\")","epoch":6,"ev":"refused","kind":"replay","t":"fresh","ts":1794385876478}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385876493}
+{"detail":"Fork(\"delta 7 prev does not match held head\")","epoch":6,"ev":"refused","kind":"fork","t":"delta","ts":1794385876738}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385876994}
+{"bytes":408,"epoch":6,"ev":"accepted","t":"key","ts":1794385877401}
+{"detail":"Rollback(\"snapshot epoch 3 < held 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"snap","ts":1794385877401}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385877402}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385877704}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385878204}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385878704}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385879205}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385879705}
+{"ev":"mode","from":"fresh","to":"narrow","ts":1794385879994}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385880205}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385880706}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385881206}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385881706}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385882207}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385882707}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385883207}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385883707}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385884207}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385884708}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385885208}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385885708}
+{"ev":"mode","from":"narrow","to":"closed","ts":1794385885993}
+{"detail":"Rollback(\"freshness epoch 3 < last statement's 6\")","epoch":6,"ev":"refused","kind":"rollback","t":"fresh","ts":1794385886209}
+{"bytes":408,"epoch":6,"ev":"accepted","t":"key","ts":1794385886715}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794385886715}
+{"bytes":445,"epoch":6,"ev":"accepted","t":"fresh","ts":1794385886715}

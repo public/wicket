@@ -29,13 +29,16 @@ What it does:
   human approves or denies them with `wicket approve` / `wicket deny`, and the grant is single-use and expiring by
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
+- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reap`
+  (each box is labelled with the process that owns it); the run ends as `lost`.
 
 #### Agent identity and child agents
 
-Every agent run gets an identity issued by the installation (`spiffe://wicket.local/t/<tenant>/z/<zone>/a/<agent>`),
+Every agent run gets an identity issued by the installation (`spiffe://<trust domain>/t/<tenant>/z/<zone>/a/<agent>`),
 an EdDSA-signed document whose key is held by wicket, never by the box.
 
-- Show it: `wicket identity issuer` (public key for verifiers), `wicket identity list`, `wicket identity show <run>`.
+- The trust domain is set once per installation: `wicket identity init --trust-domain wicket.example.com`.
+- Show it: `wicket identity issuer` (public key and trust domain for verifiers), `wicket identity list`, `wicket identity show <run>`.
 - Pending requests show the requesting agent's verified identity. The console won't approve for an agent
   whose identity doesn't verify.
 - Agents talk only through wicket: `send_message` and `await_message` in the gateway. wicket sets and signs the
@@ -68,6 +71,7 @@ Rust (stable) to build.
 ```sh
 cargo build --release -p wicket-cli
 ./target/release/wicket image              # builds wicket/claude-code:poc
+./target/release/wicket identity init --trust-domain wicket.example.com   # once: your installation's domain
 # the model credential is your Claude subscription (never an API key). Either reference the login already on this host
 # (read at each use, never copied, refresh untouched):
 ./target/release/wicket secret link claude-oauth --file ~/.claude/.credentials.json \

@@ -1,0 +1,106 @@
+# callgrind, depth 5, s3: 10000 decisions in 4.201004354s ; command: PROFILE_VARIANT=s3 PROFILE_REQ=0 valgrind --tool=callgrind target/profiling/biscuit-fast profile
+== I   refs:      486,635,899
+
+## inclusive
+Ir                    file:function
+--------------------------------------------------------------------------------
+486,243,742 (99.92%)  ???:(below main) [target/profiling/biscuit-fast]
+486,243,730 (99.92%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+486,243,547 (99.92%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+486,239,146 (99.92%)  ???:main [target/profiling/biscuit-fast]
+486,239,134 (99.92%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/rt.rs:std::rt::lang_start_internal [target/profiling/biscuit-fast]
+486,130,305 (99.90%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:std::rt::lang_start_internal
+486,130,304 (99.90%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/rt.rs:std::rt::lang_start::<()>::{closure#0} [target/profiling/biscuit-fast]
+486,130,298 (99.90%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/backtrace.rs:std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> [target/profiling/biscuit-fast]
+486,130,295 (99.90%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+486,130,294 (99.90%)  src/main.rs:biscuit_fast::main [target/profiling/biscuit-fast]
+454,179,622 (93.33%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::CompiledAuthorizer>::authorize [target/profiling/biscuit-fast]
+454,109,622 (93.32%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::CompiledAuthorizer>::run [target/profiling/biscuit-fast]
+453,469,617 (93.18%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:<std::thread::local::LocalKey<core::cell::RefCell<biscuit_auth::datalog::compiled::Scratch>>>::with::<<biscuit_auth::datalog::compiled::CompiledAuthorizer>::r
+452,939,213 (93.08%)  vendor/biscuit-auth/src/datalog/compiled.rs:<std::thread::local::LocalKey<core::cell::RefCell<biscuit_auth::datalog::compiled::Scratch>>>::with::<<biscuit_auth::datalog::compiled::CompiledAuthorizer>::run::{closure#0}, core::result::Resul
+403,481,692 (82.91%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::decide [target/profiling/biscuit-fast]
+376,220,000 (77.31%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::decide::{closure#2} [target/profiling/biscuit-fast]
+322,130,000 (66.20%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}> [target/profiling/biscuit-fast]
+300,820,000 (61.82%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2 [target/profiling/biscuit-fast]
+172,330,000 (35.41%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::eval [target/profiling/biscuit-fast]
+ 49,067,521 (10.08%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::load_facts [target/profiling/biscuit-fast]
+ 33,482,940 ( 6.88%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::decide::{closure#1}>'2 [target/profiling/biscuit-fast]
+ 19,397,343 ( 3.99%)  src/main.rs:biscuit_fast::build [target/profiling/biscuit-fast]
+ 17,499,898 ( 3.60%)  src/bisc.rs:biscuit_fast::bisc::mint [target/profiling/biscuit-fast]
+ 11,900,735 ( 2.45%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::decide::{closure#1}> [target/profiling/biscuit-fast]
+  9,907,701 ( 2.04%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::push_fact [target/profiling/biscuit-fast]
+  9,860,000 ( 2.03%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/zip.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  9,650,000 ( 1.98%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  8,087,346 ( 1.66%)  registry/biscuit-auth-6.0.0/src/token/mod.rs:<biscuit_auth::token::Biscuit>::append [target/profiling/biscuit-fast]
+  7,008,651 ( 1.44%)  registry/biscuit-auth-6.0.0/src/token/mod.rs:<biscuit_auth::token::Biscuit>::append_with_keypair [target/profiling/biscuit-fast]
+  6,960,000 ( 1.43%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2
+  6,262,571 ( 1.29%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  5,535,675 ( 1.14%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  5,340,465 ( 1.10%)  src/fk.rs:biscuit_fast::fk::prepare [target/profiling/biscuit-fast]
+  5,271,158 ( 1.08%)  src/fk.rs:biscuit_fast::fk::load [target/profiling/biscuit-fast]
+  5,229,210 ( 1.07%)  registry/curve25519-dalek-4.1.3/src/edwards.rs:<curve25519_dalek::edwards::EdwardsPoint>::mul_base [target/profiling/biscuit-fast]
+  5,229,120 ( 1.07%)  registry/curve25519-dalek-4.1.3/src/edwards.rs:<curve25519_dalek::edwards::EdwardsBasepointTable as curve25519_dalek::traits::BasepointTable>::mul_base [target/profiling/biscuit-fast]
+  5,184,656 ( 1.07%)  vendor/biscuit-auth/src/token/mod.rs:biscuit_fast::fk::load
+  5,184,619 ( 1.07%)  vendor/biscuit-auth/src/token/mod.rs:<biscuit_auth::token::Biscuit>::from_with_symbols::<biscuit_auth::crypto::PublicKey> [target/profiling/biscuit-fast]
+  4,730,000 ( 0.97%)  /rust/deps/hashbrown-0.17.1/src/lib.rs:biscuit_auth::datalog::compiled::load_facts
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: src/bisc.rs
+--------------------------------------------------------------------------------
+Ir           
+
+  .           //! The Biscuit encoding: ceilings and grants compiled to Datalog blocks, request facts, authorization.
+  .           
+  .           use crate::model::*;
+  .           use biscuit_auth::builder::{date, fact, int, string, Fact};
+  .           use biscuit_auth::{AuthorizerBuilder, AuthorizerLimits, Biscuit, BlockBuilder, KeyPair, PublicKey};
+  .           use std::time::{Duration, SystemTime, UNIX_EPOCH};
+  .           
+  .           fn q(s: &str) -> String {
+721 ( 0.00%)      format!("{s:?}")
+  .           }
+  .           
+252 ( 0.00%)  fn set(items: &[String]) -> String {
+126 ( 0.00%)      format!("{{{}}}", items.iter().map(|s| q(s)).collect::<Vec<_>>().join(", "))
+
+## self
+Ir                    file:function
+--------------------------------------------------------------------------------
+158,720,000 (32.62%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::eval [target/profiling/biscuit-fast]
+ 62,320,000 (12.81%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}> [target/profiling/biscuit-fast]
+ 45,660,000 ( 9.38%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::decide::{closure#2} [target/profiling/biscuit-fast]
+ 40,690,000 ( 8.36%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2 [target/profiling/biscuit-fast]
+  9,860,000 ( 2.03%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/zip.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  9,650,000 ( 1.98%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  9,389,987 ( 1.93%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::load_facts [target/profiling/biscuit-fast]
+  6,960,000 ( 1.43%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2
+  6,600,000 ( 1.36%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::decide [target/profiling/biscuit-fast]
+  6,262,571 ( 1.29%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  5,535,675 ( 1.14%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,300,000 ( 0.88%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/cmp.rs:<biscuit_auth::datalog::compiled::Ctx>::eval
+  3,690,000 ( 0.76%)  vendor/biscuit-auth/src/datalog/compiled.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::decide::{closure#1}>'2 [target/profiling/biscuit-fast]
+  3,520,000 ( 0.72%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2
+  3,263,065 ( 0.67%)  registry/curve25519-dalek-4.1.3/src/backend/serial/u64/field.rs:<&curve25519_dalek::backend::serial::u64::field::FieldElement51 as core::ops::arith::Mul>::mul [target/profiling/biscuit-fast]
+  3,170,000 ( 0.65%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mut_ptr.rs:biscuit_auth::datalog::compiled::decide::{closure#2}
+  3,090,000 ( 0.63%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:biscuit_auth::datalog::compiled::decide::{closure#2}
+  2,860,003 ( 0.59%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::push_fact [target/profiling/biscuit-fast]
+  2,839,974 ( 0.58%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/non_null.rs:biscuit_auth::datalog::compiled::load_facts
+  2,800,000 ( 0.58%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  2,760,000 ( 0.57%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:biscuit_auth::datalog::compiled::decide::{closure#2}
+  2,470,020 ( 0.51%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/mod.rs:biscuit_auth::datalog::compiled::push_fact
+  2,410,000 ( 0.50%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/zip.rs:biscuit_auth::datalog::compiled::decide
+  2,278,850 ( 0.47%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  2,210,000 ( 0.45%)  vendor/biscuit-auth/src/datalog/compiled.rs:biscuit_auth::datalog::compiled::exists [target/profiling/biscuit-fast]
+  2,070,000 ( 0.43%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/num/uint_macros.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  2,060,000 ( 0.42%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/non_null.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2
+  2,050,000 ( 0.42%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/mod.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  2,040,000 ( 0.42%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/index.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  1,980,000 ( 0.41%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::compiled::V as core::slice::cmp::SliceContains>::slice_contains
+  1,960,000 ( 0.40%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/zip.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>'2
+  1,910,000 ( 0.39%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/mod.rs:biscuit_auth::datalog::compiled::load_facts
+  1,874,006 ( 0.39%)  registry/curve25519-dalek-4.1.3/src/backend/serial/u64/field.rs:<curve25519_dalek::backend::serial::u64::field::FieldElement51>::pow2k [target/profiling/biscuit-fast]
+  1,808,533 ( 0.37%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,750,000 ( 0.36%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:biscuit_auth::datalog::compiled::decide
+  1,720,000 ( 0.35%)  /rust/deps/hashbrown-0.17.1/src/control/tag.rs:biscuit_auth::datalog::compiled::load_facts
+  1,600,000 ( 0.33%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/non_null.rs:<biscuit_auth::datalog::compiled::Ctx>::join::<biscuit_auth::datalog::compiled::exists_match::{closure#0}>
+  1,559,977 ( 0.32%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/mod.rs:biscuit_auth::datalog::compiled::load_facts

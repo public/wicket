@@ -1,0 +1,251 @@
+iterations: mint 2000, cold 3000, warm 20000
+
+### Ed25519 primitives (ed25519-dalek 2, reference)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| sign 400 B |     31.2 |     75.7 |     42.4 |    319.5 |
+| verify 400 B |     59.2 |     92.1 |     63.0 |    115.5 |
+
+## depth 1: 3 blocks, 20 checks, 4456 bytes (5944 base64)
+
+### depth 1: mint and attenuate (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint authority block (parse Datalog + sign) |    482.9 |    823.5 |    503.6 |    862.5 |
+| append spawn block 1 (parse + sign) |    481.7 |    885.1 |    507.3 |    947.3 |
+| append spawn block 1 (pre-parsed builder) |    327.2 |    470.4 |    340.9 |    794.9 |
+| 3p: node makes request (bound to last sig) |      0.2 |      0.2 |      0.2 |      0.5 |
+| 3p: approver signs grant block |     79.7 |    155.6 |     89.5 |   2562.2 |
+| 3p: node appends grant block |    233.4 |    425.6 |    262.1 |    455.9 |
+| serialize token (to_vec) |      1.4 |      3.3 |      1.7 |     25.6 |
+
+### depth 1: per-request verification (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| parse + verify signatures only (Biscuit::from) |    460.1 |    779.3 |    478.2 |    816.6 |
+| revocation ids + lookup in 10k set |      0.3 |      0.4 |      0.3 |      8.2 |
+| COLD A allow (GET in reach): parse+verify+revocation+authorize |    921.4 |   1527.5 |    962.5 |   1912.8 |
+| WARM A allow (GET in reach): cached token, revocation+authorize |    425.4 |    747.8 |    451.8 |   3188.9 |
+|   of which: builder clone + facts + build(A allow (GET in reach)) |    330.1 |    562.8 |    345.2 |    613.6 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (A allow (GET in reach)) |     68.0 |    128.6 |     74.1 |    165.3 |
+| COLD B deny (outside reach): parse+verify+revocation+authorize |   1045.7 |   1730.5 |   1105.1 |   1850.4 |
+| WARM B deny (outside reach): cached token, revocation+authorize |    519.1 |    900.1 |    551.1 |   3370.1 |
+|   of which: builder clone + facts + build(B deny (outside reach)) |    339.3 |    571.3 |    359.7 |   2868.9 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (B deny (outside reach)) |    147.8 |    279.3 |    164.4 |    542.0 |
+| COLD C granted (PUT merge via approval): parse+verify+revocation+authorize |   1032.7 |   1674.7 |   1090.9 |   1812.0 |
+| WARM C granted (PUT merge via approval): cached token, revocation+authorize |    473.6 |    824.8 |    498.5 |   1774.8 |
+|   of which: builder clone + facts + build(C granted (PUT merge via approval)) |    346.0 |    595.7 |    366.3 |   2894.8 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (C granted (PUT merge via approval)) |    114.9 |    228.5 |    128.8 |    301.6 |
+| COLD D spawn (limits): parse+verify+revocation+authorize |   1056.2 |   1624.2 |   1188.7 |  17328.7 |
+| WARM D spawn (limits): cached token, revocation+authorize |    423.1 |    733.1 |    452.8 |   3294.0 |
+|   of which: builder clone + facts + build(D spawn (limits)) |    332.8 |    572.3 |    355.8 |    876.5 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (D spawn (limits)) |     64.0 |    128.3 |     72.4 |    228.1 |
+
+## depth 2: 4 blocks, 29 checks, 5972 bytes (7964 base64)
+
+### depth 2: mint and attenuate (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint authority block (parse Datalog + sign) |    466.4 |    749.7 |    475.8 |    840.4 |
+| append spawn block 2 (parse + sign) |    498.6 |    863.7 |    527.4 |    878.6 |
+| append spawn block 2 (pre-parsed builder) |    356.8 |    631.7 |    398.0 |    658.2 |
+| 3p: node makes request (bound to last sig) |      0.2 |      0.6 |      0.2 |      2.9 |
+| 3p: approver signs grant block |     81.5 |    178.4 |     95.2 |    212.7 |
+| 3p: node appends grant block |    239.3 |    442.0 |    264.3 |   2774.8 |
+| serialize token (to_vec) |      1.8 |      5.6 |      2.1 |     23.1 |
+
+### depth 2: per-request verification (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| parse + verify signatures only (Biscuit::from) |    588.8 |    990.0 |    621.5 |   1162.9 |
+| revocation ids + lookup in 10k set |      0.4 |      0.4 |      0.4 |      9.9 |
+| COLD A allow (GET in reach): parse+verify+revocation+authorize |   1243.4 |   2045.2 |   1311.0 |   4439.3 |
+| WARM A allow (GET in reach): cached token, revocation+authorize |    579.3 |   1002.8 |    610.6 |   3622.2 |
+|   of which: builder clone + facts + build(A allow (GET in reach)) |    459.1 |    739.6 |    476.7 |   3250.2 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (A allow (GET in reach)) |     90.6 |    166.5 |     97.7 |    326.1 |
+| COLD B deny (outside reach): parse+verify+revocation+authorize |   1336.3 |   2224.4 |   1406.4 |   2311.3 |
+| WARM B deny (outside reach): cached token, revocation+authorize |    706.1 |   1229.5 |    748.6 |   3896.1 |
+|   of which: builder clone + facts + build(B deny (outside reach)) |    467.7 |    806.7 |    491.6 |   3301.3 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (B deny (outside reach)) |    206.8 |    393.9 |    220.9 |    661.9 |
+| COLD C granted (PUT merge via approval): parse+verify+revocation+authorize |   1305.1 |   2221.1 |   1365.6 |   2501.1 |
+| WARM C granted (PUT merge via approval): cached token, revocation+authorize |    648.6 |   1130.8 |    682.7 |   3136.6 |
+|   of which: builder clone + facts + build(C granted (PUT merge via approval)) |    465.3 |    793.5 |    509.6 |   3232.2 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (C granted (PUT merge via approval)) |    160.1 |    309.6 |    180.0 |    348.2 |
+| COLD D spawn (limits): parse+verify+revocation+authorize |   1210.0 |   2017.0 |   1269.4 |   2244.2 |
+| WARM D spawn (limits): cached token, revocation+authorize |    569.8 |    976.0 |    599.0 |   1286.6 |
+|   of which: builder clone + facts + build(D spawn (limits)) |    460.3 |    750.7 |    481.2 |    816.9 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (D spawn (limits)) |     84.1 |    154.6 |     91.9 |    213.5 |
+
+## depth 3: 5 blocks, 38 checks, 7432 bytes (9912 base64)
+
+### depth 3: mint and attenuate (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint authority block (parse Datalog + sign) |    494.3 |    842.4 |    524.4 |    856.2 |
+| append spawn block 3 (parse + sign) |    506.7 |    852.9 |    525.9 |    906.6 |
+| append spawn block 3 (pre-parsed builder) |    354.7 |    570.3 |    369.4 |    649.9 |
+| 3p: node makes request (bound to last sig) |      0.2 |      0.3 |      0.2 |      0.6 |
+| 3p: approver signs grant block |     95.1 |    192.3 |    116.1 |    208.0 |
+| 3p: node appends grant block |    250.8 |    335.4 |    266.5 |    458.6 |
+| serialize token (to_vec) |      2.5 |      4.4 |      2.6 |     14.1 |
+
+### depth 3: per-request verification (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| parse + verify signatures only (Biscuit::from) |    726.9 |   1189.2 |    749.2 |   1624.5 |
+| revocation ids + lookup in 10k set |      0.5 |      1.0 |      0.6 |     11.1 |
+| COLD A allow (GET in reach): parse+verify+revocation+authorize |   1539.8 |   2506.0 |   1653.9 |   4244.2 |
+| WARM A allow (GET in reach): cached token, revocation+authorize |    732.9 |   1263.9 |    777.2 |   3746.2 |
+|   of which: builder clone + facts + build(A allow (GET in reach)) |    578.1 |    993.5 |    602.5 |   3424.7 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (A allow (GET in reach)) |    112.9 |    221.1 |    121.6 |    347.2 |
+| COLD B deny (outside reach): parse+verify+revocation+authorize |   1647.7 |   2758.5 |   1744.7 |   3004.9 |
+| WARM B deny (outside reach): cached token, revocation+authorize |    900.2 |   1506.1 |    934.6 |   3617.0 |
+|   of which: builder clone + facts + build(B deny (outside reach)) |    576.4 |   1018.3 |    618.5 |   1537.3 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (B deny (outside reach)) |    244.3 |    514.5 |    270.6 |   2977.3 |
+| COLD C granted (PUT merge via approval): parse+verify+revocation+authorize |   1575.9 |   2661.3 |   1649.1 |   4352.4 |
+| WARM C granted (PUT merge via approval): cached token, revocation+authorize |    818.1 |   1443.6 |    878.4 |   3899.8 |
+|   of which: builder clone + facts + build(C granted (PUT merge via approval)) |    604.6 |    988.2 |    624.6 |   2250.1 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (C granted (PUT merge via approval)) |    200.1 |    375.8 |    220.5 |    718.3 |
+| COLD D spawn (limits): parse+verify+revocation+authorize |   1469.2 |   2486.3 |   1531.3 |   4329.4 |
+| WARM D spawn (limits): cached token, revocation+authorize |    713.7 |   1227.6 |    752.4 |   2562.1 |
+|   of which: builder clone + facts + build(D spawn (limits)) |    572.5 |    969.7 |    606.6 |   1090.1 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (D spawn (limits)) |    103.0 |    193.9 |    112.5 |    303.3 |
+
+## depth 4: 6 blocks, 47 checks, 8746 bytes (11664 base64)
+
+### depth 4: mint and attenuate (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint authority block (parse Datalog + sign) |    466.2 |    775.2 |    488.3 |    852.1 |
+| append spawn block 4 (parse + sign) |    480.4 |    769.8 |    496.0 |   3121.7 |
+| append spawn block 4 (pre-parsed builder) |    351.5 |    595.2 |    360.5 |    667.9 |
+| 3p: node makes request (bound to last sig) |      0.2 |      0.3 |      0.2 |      0.6 |
+| 3p: approver signs grant block |     79.2 |    105.0 |     81.7 |    159.1 |
+| 3p: node appends grant block |    275.6 |    413.3 |    283.3 |    685.0 |
+| serialize token (to_vec) |      2.8 |      4.6 |      2.9 |     15.2 |
+
+### depth 4: per-request verification (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| parse + verify signatures only (Biscuit::from) |    861.1 |   1387.9 |    914.6 |   2114.8 |
+| revocation ids + lookup in 10k set |      0.6 |      1.2 |      0.7 |     15.8 |
+| COLD A allow (GET in reach): parse+verify+revocation+authorize |   1772.4 |   2913.5 |   1846.9 |   4484.9 |
+| WARM A allow (GET in reach): cached token, revocation+authorize |    875.8 |   1495.6 |    925.4 |   3951.1 |
+|   of which: builder clone + facts + build(A allow (GET in reach)) |    700.6 |   1159.4 |    739.3 |   3520.9 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (A allow (GET in reach)) |    138.7 |    269.8 |    152.5 |    439.4 |
+| COLD B deny (outside reach): parse+verify+revocation+authorize |   1899.4 |   3220.2 |   2028.2 |   4675.9 |
+| WARM B deny (outside reach): cached token, revocation+authorize |   1046.0 |   1800.5 |   1099.0 |   4747.7 |
+|   of which: builder clone + facts + build(B deny (outside reach)) |    748.2 |   1219.6 |    824.7 |   5070.8 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (B deny (outside reach)) |    330.9 |    580.0 |    371.3 |   3220.8 |
+| COLD C granted (PUT merge via approval): parse+verify+revocation+authorize |   1896.9 |   3179.8 |   2001.8 |   5114.3 |
+| WARM C granted (PUT merge via approval): cached token, revocation+authorize |    970.3 |   1699.5 |   1035.9 |   3785.3 |
+|   of which: builder clone + facts + build(C granted (PUT merge via approval)) |    671.0 |   1181.8 |    699.9 |   3495.0 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (C granted (PUT merge via approval)) |    234.6 |    443.6 |    248.0 |    589.1 |
+| COLD D spawn (limits): parse+verify+revocation+authorize |   1792.2 |   2716.2 |   1834.3 |   4462.9 |
+| WARM D spawn (limits): cached token, revocation+authorize |    875.7 |   1465.5 |    918.1 |   4119.7 |
+|   of which: builder clone + facts + build(D spawn (limits)) |    677.2 |   1163.5 |    715.8 |   1223.7 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (D spawn (limits)) |    125.0 |    238.5 |    135.0 |    364.1 |
+
+## depth 5: 7 blocks, 56 checks, 10018 bytes (13360 base64)
+
+### depth 5: mint and attenuate (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint authority block (parse Datalog + sign) |    464.5 |    831.8 |    499.6 |   1749.2 |
+| append spawn block 5 (parse + sign) |    482.5 |    760.3 |    490.4 |    924.5 |
+| append spawn block 5 (pre-parsed builder) |    351.1 |    497.0 |    365.0 |    585.6 |
+| 3p: node makes request (bound to last sig) |      0.2 |      1.0 |      0.2 |      2.6 |
+| 3p: approver signs grant block |     80.0 |    154.1 |     89.2 |    192.1 |
+| 3p: node appends grant block |    306.2 |    535.7 |    329.0 |    553.3 |
+| serialize token (to_vec) |      3.8 |     11.5 |      4.1 |    112.3 |
+
+### depth 5: per-request verification (Biscuit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| parse + verify signatures only (Biscuit::from) |    953.0 |   1575.5 |   1008.1 |   3372.8 |
+| revocation ids + lookup in 10k set |      0.9 |      1.4 |      1.0 |     19.9 |
+| COLD A allow (GET in reach): parse+verify+revocation+authorize |   1992.3 |   3306.4 |   2070.5 |   4661.1 |
+| WARM A allow (GET in reach): cached token, revocation+authorize |    994.8 |   1725.4 |   1041.5 |   3526.2 |
+|   of which: builder clone + facts + build(A allow (GET in reach)) |    783.7 |   1355.5 |    831.1 |   1431.0 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (A allow (GET in reach)) |    159.7 |    311.8 |    171.7 |    508.3 |
+| COLD B deny (outside reach): parse+verify+revocation+authorize |   2209.2 |   3742.4 |   2350.3 |   4385.9 |
+| WARM B deny (outside reach): cached token, revocation+authorize |   1230.3 |   2116.1 |   1326.8 |   6134.7 |
+|   of which: builder clone + facts + build(B deny (outside reach)) |    791.2 |   1327.0 |    832.9 |   1811.9 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (B deny (outside reach)) |    345.2 |    633.1 |    369.2 |   1255.3 |
+| COLD C granted (PUT merge via approval): parse+verify+revocation+authorize |   2109.4 |   3512.6 |   2184.3 |   5560.7 |
+| WARM C granted (PUT merge via approval): cached token, revocation+authorize |   1129.0 |   1953.5 |   1193.4 |   4391.4 |
+|   of which: builder clone + facts + build(C granted (PUT merge via approval)) |    774.5 |   1145.5 |    800.9 |   3496.2 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (C granted (PUT merge via approval)) |    274.8 |    457.6 |    286.7 |    655.1 |
+| COLD D spawn (limits): parse+verify+revocation+authorize |   1944.0 |   3200.6 |   2024.4 |   4535.7 |
+| WARM D spawn (limits): cached token, revocation+authorize |    984.6 |   1681.5 |   1032.8 |   4800.0 |
+|   of which: builder clone + facts + build(D spawn (limits)) |    772.7 |   1333.3 |    813.1 |   3669.1 |
+|   of which: Datalog run+checks, as counted against RunLimits.max_time (D spawn (limits)) |    144.0 |    271.9 |    153.5 |    305.8 |
+
+### depth 5: regex path patterns instead of prefixes (WARM)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) (regex paths) |   1250.0 |   2117.9 |   1299.2 |   3775.3 |
+| WARM B deny (outside reach) (regex paths) |   1490.7 |   2559.0 |   1606.3 |   6779.6 |
+
+### depth 1: fallback, plain signed JSON records (3212 bytes)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint whole chain (serialize + sign every link) |    141.1 |    264.8 |    152.0 |    293.8 |
+| append spawn link 1 (serialize + sign) |     50.4 |    122.9 |     67.5 |    157.6 |
+| mint-time narrowing check, link 1 vs parent |      0.5 |      1.2 |      0.5 |     32.1 |
+| parse + verify only |    267.1 |    489.0 |    313.1 |    534.9 |
+| COLD A allow (GET in reach) |    270.9 |    497.2 |    303.6 |    527.9 |
+| WARM A allow (GET in reach) |      0.3 |      0.7 |      0.3 |     20.3 |
+| COLD B deny (outside reach) |    264.3 |    460.9 |    298.8 |   3493.3 |
+| WARM B deny (outside reach) |      0.2 |      0.4 |      0.2 |     13.4 |
+| COLD C granted (PUT merge via approval) |    281.2 |    481.4 |    320.9 |    499.7 |
+| WARM C granted (PUT merge via approval) |      0.6 |      0.8 |      0.6 |     19.0 |
+| COLD D spawn (limits) |    260.1 |    438.2 |    272.3 |    478.2 |
+| WARM D spawn (limits) |      0.2 |      0.4 |      0.2 |     12.1 |
+
+### depth 3: fallback, plain signed JSON records (5492 bytes)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint whole chain (serialize + sign every link) |    237.0 |    301.1 |    245.3 |    397.4 |
+| append spawn link 3 (serialize + sign) |     48.1 |     77.7 |     50.3 |    105.1 |
+| mint-time narrowing check, link 3 vs parent |      0.4 |      0.8 |      0.4 |     12.8 |
+| parse + verify only |    450.0 |    754.6 |    479.4 |   1014.2 |
+| COLD A allow (GET in reach) |    451.1 |    740.5 |    466.0 |    790.4 |
+| WARM A allow (GET in reach) |      0.5 |      0.9 |      0.5 |     14.0 |
+| COLD B deny (outside reach) |    475.2 |    759.7 |    511.3 |   3142.7 |
+| WARM B deny (outside reach) |      0.3 |      0.6 |      0.3 |     11.6 |
+| COLD C granted (PUT merge via approval) |    459.4 |    702.8 |    470.0 |    996.5 |
+| WARM C granted (PUT merge via approval) |      0.4 |      0.9 |      0.5 |     12.8 |
+| COLD D spawn (limits) |    465.7 |    776.1 |    496.2 |    874.0 |
+| WARM D spawn (limits) |      0.3 |      0.7 |      0.4 |     22.5 |
+
+### depth 5: fallback, plain signed JSON records (7337 bytes)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| mint whole chain (serialize + sign every link) |    347.0 |    706.0 |    385.7 |    758.0 |
+| append spawn link 5 (serialize + sign) |     44.9 |     86.8 |     49.6 |    160.7 |
+| mint-time narrowing check, link 5 vs parent |      0.6 |      0.9 |      0.6 |     19.7 |
+| parse + verify only |    661.1 |   1023.6 |    709.4 |   1086.9 |
+| COLD A allow (GET in reach) |    639.1 |   1021.1 |    654.3 |   1075.2 |
+| WARM A allow (GET in reach) |      0.7 |      1.3 |      0.7 |     16.4 |
+| COLD B deny (outside reach) |    646.6 |   1017.2 |    678.6 |   1105.0 |
+| WARM B deny (outside reach) |      0.4 |      0.8 |      0.4 |     13.6 |
+| COLD C granted (PUT merge via approval) |    649.2 |   1021.9 |    678.8 |   1260.3 |
+| WARM C granted (PUT merge via approval) |      0.6 |      1.2 |      0.7 |     11.9 |
+| COLD D spawn (limits) |    643.2 |    939.1 |    652.4 |   1363.8 |
+| WARM D spawn (limits) |      0.4 |      0.9 |      0.5 |     14.3 |

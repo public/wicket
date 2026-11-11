@@ -1,0 +1,23 @@
+[package]
+name = "biscuit-depth"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+biscuit-auth = "=6.0.0"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# Same version biscuit-auth uses, only to edit tokens at the protobuf level in the truncation test.
+prost = "=0.10.4"
+
+[profile.release]
+debug = false
+codegen-units = 16

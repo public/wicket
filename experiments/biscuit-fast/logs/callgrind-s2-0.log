@@ -1,0 +1,106 @@
+# callgrind, depth 5, s2: 2000 decisions in 13.961947153s ; command: PROFILE_VARIANT=s2 PROFILE_REQ=0 valgrind --tool=callgrind target/profiling/biscuit-fast profile
+== I   refs:      1,119,204,051
+
+## inclusive
+Ir                      file:function
+--------------------------------------------------------------------------------
+1,118,811,894 (99.96%)  ???:(below main) [target/profiling/biscuit-fast]
+1,118,811,882 (99.96%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+1,118,811,699 (99.96%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+1,118,809,891 (99.96%)  ???:main [target/profiling/biscuit-fast]
+1,118,809,879 (99.96%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/rt.rs:std::rt::lang_start_internal [target/profiling/biscuit-fast]
+1,118,701,050 (99.96%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:std::rt::lang_start_internal
+1,118,701,049 (99.96%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/rt.rs:std::rt::lang_start::<()>::{closure#0} [target/profiling/biscuit-fast]
+1,118,701,043 (99.96%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/backtrace.rs:std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> [target/profiling/biscuit-fast]
+1,118,701,040 (99.96%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+1,118,701,039 (99.96%)  src/main.rs:biscuit_fast::main [target/profiling/biscuit-fast]
+1,087,888,921 (97.20%)  vendor/biscuit-auth/src/token/authorizer/prepared.rs:<biscuit_auth::token::authorizer::prepared::PreparedSession>::authorize [target/profiling/biscuit-fast]
+  903,559,352 (80.73%)  vendor/biscuit-auth/src/token/authorizer/prepared.rs:<biscuit_auth::token::authorizer::prepared::PreparedSession>::decide::{closure#1} [target/profiling/biscuit-fast]
+  900,019,352 (80.42%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::Rule>::find_match::<biscuit_auth::datalog::FactView> [target/profiling/biscuit-fast]
+  522,728,841 (46.71%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/traits/iterator.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::adapters::map::map_try_fold<core::result::
+  484,500,960 (43.29%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/map.rs:<biscuit_auth::datalog::Rule>::find_match::<biscuit_auth::datalog::FactView>
+  350,433,490 (31.31%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::Rule>::apply::<biscuit_auth::datalog::FactView> [target/profiling/biscuit-fast]
+  274,489,390 (24.53%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next [target/profiling/biscuit-fast]
+  195,947,424 (17.51%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::adapters::map::map_try_fold<core::result::Result<(biscuit_auth::datalog::origin::Origin, std
+  179,233,424 (16.01%)  vendor/biscuit-auth/src/datalog/expression.rs:<biscuit_auth::datalog::expression::Expression>::evaluate [target/profiling/biscuit-fast]
+  156,722,000 (14.00%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::FactView as biscuit_auth::datalog::FactSource>::candidates_for [target/profiling/biscuit-fast]
+  150,812,784 (13.48%)  ???:__rustc::__rust_dealloc [target/profiling/biscuit-fast]
+  149,202,452 (13.33%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/alloc/unix.rs:__rustc::__rdl_dealloc [target/profiling/biscuit-fast]
+  147,592,630 (13.19%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  131,249,490 (11.73%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/traits/iterator.rs:<biscuit_auth::datalog::Rule>::apply::<biscuit_auth::datalog::FactView>
+  126,744,000 (11.32%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/spec_from_iter.rs:<biscuit_auth::datalog::FactView as biscuit_auth::datalog::FactSource>::candidates_for
+  126,380,000 (11.29%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/spec_from_iter_nested.rs:<alloc::vec::Vec<(&biscuit_auth::datalog::origin::Origin, &biscuit_auth::datalog::Fact)> as alloc::vec::spec_from_iter_nested::SpecFromIterNe
+  109,351,714 ( 9.77%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next'2 [target/profiling/biscuit-fast]
+  108,932,565 ( 9.73%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/hash/mod.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32> [target/profiling/biscuit-fast]
+  108,744,244 ( 9.72%)  ???:__rustc::__rust_alloc [target/profiling/biscuit-fast]
+  107,133,910 ( 9.57%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/alloc.rs:__rustc::__rdl_alloc [target/profiling/biscuit-fast]
+  105,523,576 ( 9.43%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/alloc/unix.rs:__rustc::__rdl_alloc
+   97,748,011 ( 8.73%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+   92,643,471 ( 8.28%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+   85,857,960 ( 7.67%)  vendor/biscuit-auth/src/datalog/mod.rs:biscuit_auth::datalog::run_overlay [target/profiling/biscuit-fast]
+   84,949,350 ( 7.59%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/boxed/iter.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next
+   84,891,350 ( 7.58%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/map.rs:<core::iter::adapters::map::Map<biscuit_auth::datalog::CombineIt, <biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next::
+   76,212,164 ( 6.81%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/flatten.rs:<core::iter::adapters::flatten::FlatMap<core::iter::adapters::filter::Filter<core::iter::adapters::flatten::Flatten<core::option::IntoIter<&alloc:
+   70,306,397 ( 6.28%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/collections/hash/map.rs:<std::collections::hash::map::HashMap<u32, core::option::Option<biscuit_auth::datalog::Term>> as core::iter::traits::collect::FromIterator<(u32, cor
+   69,214,000 ( 6.18%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/chain.rs:<alloc::vec::Vec<(&biscuit_auth::datalog::origin::Origin, &biscuit_auth::datalog::Fact)> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<(&
+   67,793,635 ( 6.06%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::MatchedVariables>::complete [target/profiling/biscuit-fast]
+   64,878,297 ( 5.80%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:core::ptr::drop_glue::<biscuit_auth::datalog::CombineIt> [target/profiling/biscuit-fast]
+   63,450,350 ( 5.67%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<std::collections::hash::map::HashMap<u32, core::option::Option<biscuit_auth::datalog::Term>> as core::iter::traits::collect::FromIterator<(u32, core::option::Option<biscuit_auth::datalog::Term>)>>
+   62,628,000 ( 5.60%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:<biscuit_auth::datalog::Rule>::find_match::<biscuit_auth::datalog::FactView>
+   61,582,567 ( 5.50%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/map.rs:<core::iter::adapters::map::Map<core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<biscuit_auth::datalog::Predicate>, core::iter::adapters
+   59,650,521 ( 5.33%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<hashbrown::map::HashMap<u32, core::option::Option<biscuit_auth::datalog::Term>, std::hash::random::RandomState>>::insert [target/profiling/biscuit-fast]
+   59,392,738 ( 5.31%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/boxed/iter.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next'2
+   59,328,738 ( 5.30%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/map.rs:<core::iter::adapters::map::Map<biscuit_auth::datalog::CombineIt, <biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next::
+   57,363,635 ( 5.13%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/collections/hash/map.rs:<biscuit_auth::datalog::MatchedVariables>::complete
+   56,876,295 ( 5.08%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/hash/sip.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32>
+   55,867,635 ( 4.99%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<hashbrown::map::HashMap<u32, biscuit_auth::datalog::Term, std::hash::random::RandomState>>::insert [target/profiling/biscuit-fast]
+   53,096,453 ( 4.74%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<core::iter::adapters::map::Map<core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<biscuit_auth::datalog::Predicate>, core::iter::adapters::filter_map::FilterMap<core::slice::iter::Iter
+   52,976,447 ( 4.73%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<hashbrown::map::HashMap<u32, (), std::hash::random::RandomState>>::insert [target/profiling/biscuit-fast]
+   47,476,505 ( 4.24%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<(u32, biscuit_auth::datalog::Term)>>::reserve_rehash::<hashbrown::map::make_hasher<u32, biscuit_auth::datalog::Term, std::hash::random::RandomState>::{closure#0}> [target/
+   43,950,000 ( 3.93%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next
+   39,107,814 ( 3.49%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/map.rs:biscuit_auth::datalog::run_overlay
+   38,678,178 ( 3.46%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawIterRange<(u32, ())>>::fold_impl::<<hashbrown::map::Iter<u32, ()> as core::iter::traits::iterator::Iterator>::fold<(), <hashbrown::map::Keys<u32, ()> as core::iter::traits::iter
+   36,998,288 ( 3.31%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<(u32, core::option::Option<biscuit_auth::datalog::Term>)> as core::clone::Clone>::clone [target/profiling/biscuit-fast]
+   34,244,138 ( 3.06%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/rc.rs:<alloc::rc::Rc<[alloc::vec::Vec<(&biscuit_auth::datalog::origin::Origin, &biscuit_auth::datalog::Fact)>]>>::drop_slow [target/profiling/biscuit-fast]
+
+## self
+Ir                   file:function
+--------------------------------------------------------------------------------
+87,427,729 ( 7.81%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+72,440,846 ( 6.47%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+45,089,464 ( 4.03%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+32,352,000 ( 2.89%)  vendor/biscuit-auth/src/datalog/expression.rs:<biscuit_auth::datalog::expression::Expression>::evaluate [target/profiling/biscuit-fast]
+30,848,160 ( 2.76%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/hash/sip.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32>
+24,514,223 ( 2.19%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+24,245,586 ( 2.17%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/hash/sip.rs:<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write [target/profiling/biscuit-fast]
+23,136,120 ( 2.07%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/intrinsics/mod.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32>
+19,010,030 ( 1.70%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next [target/profiling/biscuit-fast]
+18,821,699 ( 1.68%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+18,316,095 ( 1.64%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/num/uint_macros.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32>
+18,304,064 ( 1.64%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<(u32, biscuit_auth::datalog::Term)>>::reserve_rehash::<hashbrown::map::make_hasher<u32, biscuit_auth::datalog::Term, std::hash::random::RandomState>::{closure#0}> [target/pro
+15,652,100 ( 1.40%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/adapters/flatten.rs:<core::iter::adapters::flatten::FlatMap<core::iter::adapters::filter::Filter<core::iter::adapters::flatten::Flatten<core::option::IntoIter<&alloc::co
+12,882,672 ( 1.15%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/alloc/unix.rs:__rustc::__rdl_alloc
+11,336,000 ( 1.01%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::adapters::map::map_try_fold<core::result::Result<(biscuit_auth::datalog::origin::Origin, std::c
+10,556,000 ( 0.94%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<(u32, core::option::Option<biscuit_auth::datalog::Term>)> as core::clone::Clone>::clone [target/profiling/biscuit-fast]
+10,042,718 ( 0.90%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:core::ptr::drop_glue::<biscuit_auth::datalog::Term> [target/profiling/biscuit-fast]
+ 9,226,062 ( 0.82%)  /rust/deps/hashbrown-0.17.1/src/map.rs:<hashbrown::map::HashMap<u32, core::option::Option<biscuit_auth::datalog::Term>, std::hash::random::RandomState>>::insert [target/profiling/biscuit-fast]
+ 9,196,000 ( 0.82%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/mod.rs:<biscuit_auth::datalog::expression::Expression>::evaluate
+ 8,784,061 ( 0.78%)  /rust/deps/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<(u32, ())>>::reserve_rehash::<hashbrown::map::make_hasher<u32, (), std::hash::random::RandomState>::{closure#0}> [target/profiling/biscuit-fast]
+ 8,416,000 ( 0.75%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/collections/btree/search.rs:<biscuit_auth::datalog::FactView as biscuit_auth::datalog::FactSource>::candidates_for
+ 7,822,000 ( 0.70%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/vec/spec_from_iter_nested.rs:<alloc::vec::Vec<(&biscuit_auth::datalog::origin::Origin, &biscuit_auth::datalog::Fact)> as alloc::vec::spec_from_iter_nested::SpecFromIterNeste
+ 7,390,000 ( 0.66%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::Rule>::apply::<biscuit_auth::datalog::FactView> [target/profiling/biscuit-fast]
+ 7,359,604 ( 0.66%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 7,053,250 ( 0.63%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/cmp.rs:<biscuit_auth::datalog::symbol::SymbolTable>::insert
+ 6,970,801 ( 0.62%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::symbol::SymbolTable>::insert
+ 6,822,000 ( 0.61%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:<biscuit_auth::datalog::expression::Expression>::evaluate
+ 6,734,000 ( 0.60%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/collections/btree/set.rs:<alloc::collections::btree::set::BTreeSet<usize>>::is_subset [target/profiling/biscuit-fast]
+ 6,552,036 ( 0.59%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:<core::iter::adapters::flatten::FlatMap<core::iter::adapters::filter::Filter<core::iter::adapters::flatten::Flatten<core::option::IntoIter<&alloc::collections::btre
+ 6,374,000 ( 0.57%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:<biscuit_auth::datalog::expression::Expression>::evaluate
+ 6,318,000 ( 0.56%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/tuple.rs:<biscuit_auth::datalog::FactView as biscuit_auth::datalog::FactSource>::candidates_for
+ 6,099,003 ( 0.54%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/non_null.rs:<biscuit_auth::datalog::symbol::SymbolTable>::insert
+ 6,078,304 ( 0.54%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 5,956,000 ( 0.53%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::MatchedVariables>::complete [target/profiling/biscuit-fast]
+ 5,784,030 ( 0.52%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/hash/random.rs:<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&u32>
+ 5,599,008 ( 0.50%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/collections/btree/node.rs:<alloc::collections::btree::map::BTreeMap<usize, alloc::collections::btree::set_val::SetValZST> as core::ops::drop::Drop>::drop
+ 5,538,870 ( 0.49%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:core::ptr::drop_glue::<[biscuit_auth::datalog::Term]> [target/profiling/biscuit-fast]
+ 5,454,000 ( 0.49%)  vendor/biscuit-auth/src/datalog/mod.rs:<biscuit_auth::datalog::CombineIt as core::iter::traits::iterator::Iterator>::next'2 [target/profiling/biscuit-fast]

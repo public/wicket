@@ -1,0 +1,187 @@
+{
+  "accepted_totals": {
+    "delta": 6,
+    "fresh": 17,
+    "key": 4,
+    "snap": 1
+  },
+  "backup_restore": {
+    "backup_epoch": 3,
+    "case": "control plane restored from an old backup",
+    "epoch_after": 6,
+    "last_refusal": "fresh: Rollback(\"freshness epoch 3 < last statement's 6\")",
+    "legit_fresh_until_after_kill_ms": 2793,
+    "modes_after_kill_ms": [
+      [
+        27,
+        "fresh"
+      ],
+      [
+        2794,
+        "narrow"
+      ],
+      [
+        8804,
+        "closed"
+      ]
+    ],
+    "node_epoch": 6,
+    "recovered_with_real_cp_ms": 198,
+    "rollback_refusals": 20
+  },
+  "cases": [
+    {
+      "case": "tampered delta (adds a grant, signature kept)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "bad_signature",
+      "keep_grant_allowed": true,
+      "last_refusal": "delta: BadSignature",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "replayed old delta",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "replay",
+      "keep_grant_allowed": true,
+      "last_refusal": "delta: Replay(\"delta 2 already applied (held 6)\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "rollback to an old signed snapshot",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "rollback",
+      "keep_grant_allowed": true,
+      "last_refusal": "snap: Rollback(\"snapshot epoch 3 < held 6\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "reused freshness statement",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "replay",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: Replay(\"freshness issued_at 1794385871487 not after 1794385871990\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "forged freshness, attacker key",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "unknown_key",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: UnknownKey(\"fe812c12f3ab4ce6\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "forged freshness, attacker key under the real kid",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "bad_signature",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: BadSignature",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "over-long freshness signed by the real feed key (stolen online key)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "too_long",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: TooLong(\"ttl 3600000 ms > certified 30000\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "freshness from the future (issued 60 s ahead)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "from_future",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: FromFuture",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "expired freshness (new issued_at, already past fresh_until)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "expired",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: Expired",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "forged feed-key certificate (attacker signs as root)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "bad_signature",
+      "keep_grant_allowed": true,
+      "last_refusal": "key: BadSignature",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "delta relabelled as a freshness statement",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "wrong_type",
+      "keep_grant_allowed": true,
+      "last_refusal": "fresh: WrongType(\"expected wicket-feed-fresh+jws, got wicket-feed-delta+jws\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "validly signed delta for another node (n2)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "wrong_audience",
+      "keep_grant_allowed": true,
+      "last_refusal": "delta: WrongAudience(\"n2\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "validly signed delta skipping an epoch (gap)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "gap",
+      "keep_grant_allowed": true,
+      "last_refusal": "delta: Gap { have: 6, got: 8 }",
+      "mode": "fresh",
+      "refused_as_expected": true
+    },
+    {
+      "case": "validly signed delta on a different chain (fork)",
+      "epoch": 6,
+      "evil_op_allowed": false,
+      "expected": "fork",
+      "keep_grant_allowed": true,
+      "last_refusal": "delta: Fork(\"delta 7 prev does not match held head\")",
+      "mode": "fresh",
+      "refused_as_expected": true
+    }
+  ],
+  "refused_totals": {
+    "bad_signature": 3,
+    "expired": 1,
+    "fork": 1,
+    "from_future": 1,
+    "gap": 1,
+    "replay": 3,
+    "rollback": 21,
+    "too_long": 1,
+    "unknown_key": 1,
+    "wrong_audience": 1,
+    "wrong_type": 1
+  }
+}

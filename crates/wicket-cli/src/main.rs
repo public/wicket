@@ -8,6 +8,7 @@
 mod mock;
 mod node;
 mod program;
+mod reap;
 mod run;
 mod serve;
 mod spawn;
@@ -30,7 +31,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum IdentityCmd {
-    /// Print the installation issuer's public key (JWK): what verifiers need.
+    /// Set up this installation's identity issuer: its key and its trust domain, which every agent's
+    /// SPIFFE ID is under (spiffe://<domain>/t/…). The domain is fixed once set.
+    Init {
+        /// e.g. wicket.example.com: lowercase letters, digits, '.', '-' and '_'.
+        #[arg(long)]
+        trust_domain: String,
+    },
+    /// Print the installation issuer's public key (JWK) and trust domain: what verifiers need.
     Issuer,
     /// Verify and show the identity wicket issued for a run.
     Show { run: String },
@@ -158,7 +166,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IdentityCmd,
     },
-    /// Check the environment: Docker, gVisor, image, secrets, ledger.
+    /// Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and
+    /// that Docker kept running with nothing behind them. Their runs end as "lost".
+    Reap {
+        /// Only list what would be stopped.
+        #[arg(long)]
+        dry_run: bool,
+        /// Reap on a remote node over ssh instead (e.g. wicket@203.0.113.7).
+        #[arg(long)]
+        node: Option<String>,
+        /// ssh identity for --node.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+    },
+    /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
@@ -302,12 +323,14 @@ pub fn cli_principal() -> serde_json::Value {
     serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
 }
 
-pub fn trust_domain() -> String {
-    std::env::var("WICKET_TRUST_DOMAIN").unwrap_or_else(|_| "wicket.local".into())
+/// The trust domain asked for in the environment, if any. The installation's own is recorded with
+/// its issuer key (`wicket identity init`); this only sets it on first use, and must match after.
+pub fn trust_domain() -> Option<String> {
+    std::env::var("WICKET_TRUST_DOMAIN").ok().filter(|s| !s.is_empty())
 }
 
 pub fn issuer() -> Result<wicket_identity::Issuer> {
-    Ok(wicket_identity::Issuer::load_or_create(&issuer_key_path(), &trust_domain())?)
+    Ok(wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref())?)
 }
 
 fn operator() -> String {
@@ -448,7 +471,16 @@ async fn main() -> Result<()> {
         Cmd::Identity { cmd } => {
             let l = Ledger::open(&ledger_path())?;
             match cmd {
-                IdentityCmd::Issuer => println!("{}", serde_json::to_string_pretty(&issuer()?.public_jwk())?),
+                IdentityCmd::Init { trust_domain } => {
+                    let i = wicket_identity::Issuer::load(&issuer_key_path(), Some(&trust_domain))?;
+                    println!("issuer ready: {} (key {})", i.issuer_id(), wicket_identity::key_id(&i.verifying_key()));
+                }
+                IdentityCmd::Issuer => {
+                    let i = issuer()?;
+                    let mut jwk = i.public_jwk();
+                    jwk["trust_domain"] = i.trust_domain.clone().into();
+                    println!("{}", serde_json::to_string_pretty(&jwk)?);
+                }
                 IdentityCmd::Show { run } => println!("{}", serde_json::to_string_pretty(&verified_identity(&l, &run, None))?),
                 IdentityCmd::Revoke { run, reason } => {
                     if l.identity(&run)?.is_none() {
@@ -529,6 +561,28 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { image } => doctor(&image).await,
+        Cmd::Reap { dry_run, node, ssh_key } => {
+            let docker = match node {
+                Some(n) => wicket_sandbox::Docker::over_ssh(node::Node::new(&n, ssh_key.as_deref()).ssh_prefix()),
+                None => wicket_sandbox::Docker::from_env(),
+            };
+            let l = Ledger::open(&ledger_path())?;
+            let all = reap::reap(&docker, &l, dry_run).await?;
+            let mut stopped = 0;
+            for r in &all {
+                let run = r.run.as_deref().unwrap_or("?");
+                match &r.verdict {
+                    reap::Verdict::Live => {}
+                    reap::Verdict::Orphan(why) => {
+                        stopped += 1;
+                        println!("{} {} (run {run}): {why}", if dry_run { "would stop" } else { "stopped" }, r.name);
+                    }
+                    reap::Verdict::Unknown(why) => println!("left alone {} (run {run}): {why}", r.name),
+                }
+            }
+            println!("{} box(es), {stopped} orphaned{}", all.len(), if dry_run { " (dry run: nothing stopped)" } else { "" });
+            Ok(())
+        }
         Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
@@ -668,6 +722,13 @@ async fn doctor(image: &str) -> Result<()> {
             ok = false;
         }
     }
+    match wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref()) {
+        Ok(i) => println!("identity issuer: {}", i.issuer_id()),
+        Err(e) => {
+            println!("identity issuer: NOT OK ({e})");
+            ok = false;
+        }
+    }
     let v = Vault::new(Vault::default_dir());
     let names = v.list();
     println!("vault: {} secret(s){}", names.len(), if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) });
@@ -677,6 +738,14 @@ async fn doctor(image: &str) -> Result<()> {
     }
     let l = Ledger::open(&ledger_path())?;
     println!("ledger: {} (audit chain OK, {} records)", ledger_path().display(), l.verify_audit()?);
+    if let Ok(all) = reap::reap(&d, &l, true).await {
+        let orphans: Vec<_> = all.iter().filter(|r| matches!(r.verdict, reap::Verdict::Orphan(_))).map(|r| r.name.as_str()).collect();
+        if orphans.is_empty() {
+            println!("boxes: {} running, none orphaned", all.len());
+        } else {
+            println!("boxes: {} orphaned, with nothing behind them: {} (run: wicket reap)", orphans.len(), orphans.join(", "));
+        }
+    }
     if !ok {
         bail!("environment not ready");
     }

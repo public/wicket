@@ -1,0 +1,91 @@
+{
+  "decide": {
+    "forbidden": {
+      "fresh": [
+        false,
+        "GET evil.example/x is forbidden in this zone"
+      ],
+      "fresh_ns": 22112.21931,
+      "narrow": [
+        false,
+        "GET evil.example/x is forbidden in this zone"
+      ],
+      "narrow_ns": 22999.57604
+    },
+    "granted": {
+      "fresh": [
+        true,
+        "grant s-0"
+      ],
+      "fresh_ns": 2663.56502,
+      "narrow": [
+        false,
+        "narrow: grants not honoured while stale (POST api.github.com/repos/acme/r0/issues/0/comments is outside the zone's reach)"
+      ],
+      "narrow_ns": 1924.16703
+    },
+    "needs_grant_denied": {
+      "fresh": [
+        false,
+        "needs a grant: DELETE api.github.com/repos/acme/r3 is outside the zone's reach"
+      ],
+      "fresh_ns": 2102.98448,
+      "narrow": [
+        false,
+        "narrow: grants not honoured while stale (DELETE api.github.com/repos/acme/r3 is outside the zone's reach)"
+      ],
+      "narrow_ns": 1448.75191
+    },
+    "reach_read": {
+      "fresh": [
+        true,
+        "reach rule 0"
+      ],
+      "fresh_ns": 36133.08579,
+      "narrow": [
+        true,
+        "reach rule 0"
+      ],
+      "narrow_ns": 34905.10237
+    },
+    "reach_write": {
+      "fresh": [
+        true,
+        "reach rule 1"
+      ],
+      "fresh_ns": 43652.18266,
+      "narrow": [
+        false,
+        "narrow: R2WriteReversible needs fresh policy"
+      ],
+      "narrow_ns": 47028.6321
+    }
+  },
+  "delta": {
+    "bytes_10_add_grants": 2834,
+    "bytes_1_add_grant": 614,
+    "bytes_1_revoke": 417,
+    "bytes_put_zone": 1274,
+    "sign_us": 48.226234,
+    "verify_and_apply_us": 103.6757665
+  },
+  "fresh": {
+    "bytes": 394,
+    "sign_us": 37.039102,
+    "verify_us": 82.350539
+  },
+  "glob": {
+    "compile_ns": 20360.60985,
+    "match_ns": 129.98412
+  },
+  "snapshot_10000_grants": {
+    "bytes": 2249246,
+    "sign_ms": 29.567798,
+    "verify_and_load_ms": 41.892599
+  },
+  "snapshot_1000_grants": {
+    "bytes": 262046,
+    "sign_ms": 3.8638448,
+    "verify_and_load_ms": 3.7101978
+  }
+}
