@@ -4,4 +4,4 @@ useDefault = true
 
 [[allowlists]]
 description = "third-party code vendored as is"
-paths = ['''^experiments/[^/]+/vendor/''']
+paths = ['''^experiments/[^/]+/vendor/''', '''^third_party/''']

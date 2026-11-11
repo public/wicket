@@ -1,0 +1,254 @@
+/*
+ * Copyright (c) 2019 Geoffroy Couprie <contact@geoffroycouprie.com> and Contributors to the Eclipse Foundation.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#![allow(non_snake_case)]
+use std::{convert::TryInto, hash::Hash};
+
+use p256::ecdsa::{signature::Signer, signature::Verifier, SigningKey, VerifyingKey};
+use p256::elliptic_curve::{
+    rand_core::{CryptoRng, Rng},
+    Generate,
+};
+
+use crate::error::Format;
+
+use super::error;
+use super::Signature;
+
+/// the private part of an secp256r1 keypair
+#[derive(Debug, PartialEq)]
+pub struct PrivateKey(SigningKey);
+
+impl PrivateKey {
+    pub fn new_with_rng<T: Rng + CryptoRng + ?Sized>(rng: &mut T) -> Self {
+        let kp = SigningKey::generate_from_rng(rng);
+
+        Self(kp)
+    }
+
+    /// deserializes from a big endian byte array
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, error::Format> {
+        let kp = SigningKey::from_bytes(bytes.try_into().map_err(|_| Format::InvalidKeySize(bytes.len()))?)
+            .map_err(|s| s.to_string())
+            .map_err(Format::InvalidKey)?;
+
+        Ok(Self(kp))
+    }
+
+    pub fn sign(&self, data: &[u8]) -> Result<Signature, error::Format> {
+        let signature: p256::ecdsa::Signature = self
+            .0
+            .try_sign(data)
+            .map_err(|s| s.to_string())
+            .map_err(error::Signature::InvalidSignatureGeneration)
+            .map_err(error::Format::Signature)?;
+        Ok(Signature(signature.to_der().as_bytes().to_owned()))
+    }
+
+    pub fn public(&self) -> PublicKey {
+        PublicKey(*self.0.verifying_key())
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_private_key_der(bytes: &[u8]) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePrivateKey;
+
+        let kp = SigningKey::from_pkcs8_der(bytes).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(Self(kp))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_private_key_pem(str: &str) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePrivateKey;
+
+        let kp = SigningKey::from_pkcs8_pem(str).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(Self(kp))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_private_key_der(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, error::Format> {
+        use p256::pkcs8::EncodePrivateKey;
+        let kp = self.0.to_pkcs8_der().map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp.to_bytes())
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_private_key_pem(&self) -> Result<zeroize::Zeroizing<String>, error::Format> {
+        use p256::pkcs8::EncodePrivateKey;
+        use p256::pkcs8::LineEnding;
+        let kp = self.0.to_pkcs8_pem(LineEnding::LF).map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp)
+    }
+
+    /// serializes to a big endian byte array
+    pub fn to_bytes(&self) -> zeroize::Zeroizing<Vec<u8>> {
+        let field_bytes = self.0.to_bytes();
+        zeroize::Zeroizing::new(field_bytes.to_vec())
+    }
+
+    /// serializes to an hex-encoded string
+    pub fn to_bytes_hex(&self) -> String {
+        hex::encode(self.to_bytes())
+    }
+
+    /// deserializes from an hex-encoded string
+    pub fn from_bytes_hex(str: &str) -> Result<Self, error::Format> {
+        let bytes = hex::decode(str).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Self::from_bytes(&bytes)
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_der(bytes: &[u8]) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePrivateKey;
+
+        let kp = SigningKey::from_pkcs8_der(bytes).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(PrivateKey(kp))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_pem(str: &str) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePrivateKey;
+
+        let kp = SigningKey::from_pkcs8_pem(str).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(PrivateKey(kp))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_der(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, error::Format> {
+        use p256::pkcs8::EncodePrivateKey;
+        let kp = self.0.to_pkcs8_der().map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp.to_bytes())
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_pem(&self) -> Result<zeroize::Zeroizing<String>, error::Format> {
+        use p256::pkcs8::EncodePrivateKey;
+        use p256::pkcs8::LineEnding;
+        let kp = self.0.to_pkcs8_pem(LineEnding::LF).map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp)
+    }
+}
+
+impl Clone for PrivateKey {
+    fn clone(&self) -> Self {
+        PrivateKey::from_bytes(&self.to_bytes()).unwrap()
+    }
+}
+
+/// the public part of an secp256r1 keypair
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicKey(VerifyingKey);
+
+#[allow(clippy::wrong_self_convention)]
+impl PublicKey {
+    /// serializes to a byte array
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_sec1_point(true).to_bytes().into()
+    }
+
+    /// serializes to an hex-encoded string
+    pub fn to_bytes_hex(&self) -> String {
+        hex::encode(self.to_bytes())
+    }
+
+    /// deserializes from a byte array
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, error::Format> {
+        let k = VerifyingKey::from_sec1_bytes(bytes).map_err(|s| s.to_string()).map_err(Format::InvalidKey)?;
+
+        Ok(Self(k))
+    }
+
+    /// deserializes from an hex-encoded string
+    pub fn from_bytes_hex(str: &str) -> Result<Self, error::Format> {
+        let bytes = hex::decode(str).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Self::from_bytes(&bytes)
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_der(bytes: &[u8]) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePublicKey;
+
+        let pubkey = VerifyingKey::from_public_key_der(bytes).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(PublicKey(pubkey))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn from_pem(str: &str) -> Result<Self, error::Format> {
+        use p256::pkcs8::DecodePublicKey;
+
+        let pubkey = VerifyingKey::from_public_key_pem(str).map_err(|e| error::Format::InvalidKey(e.to_string()))?;
+        Ok(PublicKey(pubkey))
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_der(&self) -> Result<Vec<u8>, error::Format> {
+        use p256::pkcs8::EncodePublicKey;
+        let kp = self.0.to_public_key_der().map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp.to_vec())
+    }
+
+    #[cfg(feature = "pem")]
+    pub fn to_pem(&self) -> Result<String, error::Format> {
+        use p256::pkcs8::EncodePublicKey;
+        use p256::pkcs8::LineEnding;
+        let kp = self.0.to_public_key_pem(LineEnding::LF).map_err(|e| error::Format::PKCS8(e.to_string()))?;
+        Ok(kp)
+    }
+
+    pub fn verify_signature(&self, data: &[u8], signature: &Signature) -> Result<(), error::Format> {
+        let sig = p256::ecdsa::Signature::from_der(&signature.0)
+            .map_err(|e| error::Format::BlockSignatureDeserializationError(format!("block signature deserialization error: {e:?}")))?;
+
+        self.0.verify(data, &sig).map_err(|s| s.to_string()).map_err(error::Signature::InvalidSignature).map_err(error::Format::Signature)
+    }
+
+    pub(crate) fn write(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "secp256r1/{}", hex::encode(self.to_bytes()))
+    }
+    pub fn print(&self) -> String {
+        format!("secp256r1/{}", hex::encode(self.to_bytes()))
+    }
+}
+
+impl Hash for PublicKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (crate::format::schema::public_key::Algorithm::Secp256r1 as i32).hash(state);
+        self.to_bytes().hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialization() {
+        let private = PrivateKey::new_with_rng(&mut rand::rng());
+        let public = private.public();
+        let private_hex = private.to_bytes_hex();
+        let public_hex = public.to_bytes_hex();
+
+        println!("private: {private_hex}");
+        println!("public: {public_hex}");
+
+        let message = "hello world";
+        let signature = private.sign(message.as_bytes()).unwrap();
+        println!("signature: {}", hex::encode(&signature.0));
+
+        let deserialized_priv = PrivateKey::from_bytes_hex(&private_hex).unwrap();
+        let deserialized_pub = PublicKey::from_bytes_hex(&public_hex).unwrap();
+
+        assert_eq!(private.0.to_bytes(), deserialized_priv.0.to_bytes());
+        assert_eq!(public, deserialized_pub);
+
+        deserialized_pub.verify_signature(message.as_bytes(), &signature).unwrap();
+        //panic!();
+    }
+
+    #[test]
+    fn invalid_sizes() {
+        assert_eq!(PrivateKey::from_bytes(&[0xaa]).unwrap_err(), error::Format::InvalidKeySize(1));
+        PublicKey::from_bytes(&[0xaa]).unwrap_err();
+    }
+}

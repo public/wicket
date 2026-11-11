@@ -196,10 +196,12 @@ follow-up, 2026-11-11).
   once per token.
 - **The rules that come with it:**
   - A **structural check** runs before a token is loaded:
-    - first-party blocks hold only checks from wicket's fixed vocabulary: no rules, no `.matches`, no
-      `check all`;
+    - first-party blocks hold only checks from wicket's fixed vocabulary: no rules, no `check all`;
+    - `.matches` only as `$p.matches("<literal>")` on the request path. Path globs become globset's own
+      regex, so tokens match exactly as wicket's matcher does. Patterns are capped at 256 bytes and must
+      compile under a size limit;
     - third-party blocks hold only `approved(...)` rules, from keys a zone block trusts;
-    - token size and checks per block are capped.
+    - blocks (16), token size and checks per block are capped.
 
     Without it, a hostile block can burn CPU inside the step budget.
   - A **differential test in CI** compares the compiled evaluator with the stock engine on random tokens
