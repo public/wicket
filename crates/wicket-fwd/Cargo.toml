@@ -1,0 +1,15 @@
+# Standalone on purpose: `wicket image` copies this crate alone into the image's build context, so it
+# inherits nothing from the workspace and has no dependencies (it builds offline, std only).
+[package]
+name = "wicket-fwd"
+description = "wicket's in-box forwarder: TCP listeners on wicket.internal relayed to the bind-mounted unix sockets of wicket's proxies."
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[[bin]]
+name = "wicket-fwd"
+path = "src/main.rs"
+
+[dependencies]

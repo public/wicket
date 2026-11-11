@@ -8,6 +8,7 @@
 mod capacity;
 mod chan;
 mod enrol;
+mod image;
 mod mock;
 mod node;
 mod noderun;
@@ -146,7 +147,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Build the agent image.
+    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build).
     Image {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
@@ -358,8 +359,10 @@ enum SecretCmd {
         name: String,
         #[arg(long)]
         file: String,
+        /// A JSON pointer into the file (e.g. /claudeAiOauth/accessToken). Without one, the whole file
+        /// is the secret, trimmed (e.g. an API key file).
         #[arg(long)]
-        pointer: String,
+        pointer: Option<String>,
         #[arg(long)]
         expires_pointer: Option<String>,
     },
@@ -738,8 +741,11 @@ async fn main() -> Result<()> {
                     println!("stored secret {name}");
                 }
                 SecretCmd::Link { name, file, pointer, expires_pointer } => {
-                    v.link(&name, &file, &pointer, expires_pointer.as_deref())?;
-                    println!("secret {name} now refers to {file}#{pointer} (read at each use; never copied)");
+                    v.link(&name, &file, pointer.as_deref(), expires_pointer.as_deref())?;
+                    println!(
+                        "secret {name} now refers to {file}{} (read at each use; never copied)",
+                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default()
+                    );
                 }
                 SecretCmd::List => {
                     for n in v.list() {
@@ -750,7 +756,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir } => {
-            wicket_sandbox::Docker::from_env().build_image(&tag, &dir).await?;
+            let ctx = image::context(&dir)?;
+            wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
             println!("built {tag}");
             Ok(())
         }
