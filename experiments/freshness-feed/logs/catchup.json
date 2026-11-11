@@ -1,0 +1,57 @@
+{
+  "cases": [
+    {
+      "case": "short_gap_deltas",
+      "catchup_bytes": 55787,
+      "cut_s": 10,
+      "deltas_received": 101,
+      "epochs_behind": 100,
+      "first_frame_to_caught_up_ms": 19,
+      "modes_during_cut": [
+        [
+          0,
+          "fresh"
+        ],
+        [
+          2931,
+          "narrow"
+        ],
+        [
+          8936,
+          "closed"
+        ]
+      ],
+      "reconnect_ms": 6,
+      "restore_to_fresh_ms": 27,
+      "retain": 150,
+      "snapshots_received": 0
+    },
+    {
+      "case": "long_gap_snapshot",
+      "catchup_bytes": 262504,
+      "cut_s": 30,
+      "deltas_received": 1,
+      "epochs_behind": 299,
+      "first_frame_to_caught_up_ms": 13,
+      "modes_during_cut": [
+        [
+          0,
+          "fresh"
+        ],
+        [
+          2993,
+          "narrow"
+        ],
+        [
+          8996,
+          "closed"
+        ]
+      ],
+      "reconnect_ms": 64,
+      "restore_to_fresh_ms": 78,
+      "retain": 150,
+      "snapshots_received": 1
+    }
+  ],
+  "refused": {}
+}

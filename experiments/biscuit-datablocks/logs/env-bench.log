@@ -1,0 +1,4 @@
+load average (1/5/15 min) before the bench: 0.76 0.65 0.55
+vCPUs: 4
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+load average after the bench: 1.09 1.00 0.74

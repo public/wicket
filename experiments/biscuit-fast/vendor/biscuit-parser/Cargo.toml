@@ -1,0 +1,26 @@
+[package]
+name = "biscuit-parser"
+version = "0.2.0-fork.0"
+edition = "2021"
+authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <contact@geoffroycouprie.com>"]
+description = "Datalog parser used in the biscuit-auth and biscuit-quote crates"
+license = "Apache-2.0"
+documentation = "https://docs.rs/biscuit-auth"
+homepage = "https://github.com/biscuit-auth/biscuit"
+repository = "https://github.com/biscuit-auth/biscuit-rust"
+
+
+[dependencies]
+hex = "0.4.3"
+nom = "8.0.0"
+proc-macro2 = "1"
+quote = "1.0.21"
+serde = { version = "1.0.132", optional = true, features = ["derive"] }
+thiserror = "2.0.18"
+time = {version = "0.3.7", features = ["formatting", "parsing"]}
+
+[features]
+datalog-macro = []
+pem = []
+# used by biscuit-wasm to serialize errors to JSON
+serde-error = ["serde"]

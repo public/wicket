@@ -1,0 +1,116 @@
+iterations: cold 3000, warm 20000; variants ["s3", "s3x"]
+
+## depth 1: 3 blocks, 20 checks, 4456 bytes
+
+### depth 1: WARM, step 3: compiled, shared
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      6.1 |     13.3 |      5.5 |    105.0 |
+| WARM B deny (outside reach) |      6.8 |     17.1 |      6.4 |     53.1 |
+| WARM C granted (PUT merge via approval) |      4.7 |     14.3 |      5.5 |    222.4 |
+| WARM D spawn (limits) |      2.9 |      8.2 |      3.5 |     31.6 |
+
+### depth 1: WARM, step 3: compiled, decision only (early exit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      3.5 |      9.4 |      4.1 |     36.1 |
+| WARM B deny (outside reach) |      2.3 |      6.8 |      2.6 |     44.7 |
+| WARM C granted (PUT merge via approval) |      4.7 |     14.5 |      5.3 |     54.6 |
+| WARM D spawn (limits) |      2.9 |      9.0 |      3.3 |     32.8 |
+
+## depth 2: 4 blocks, 29 checks, 5972 bytes
+
+### depth 2: WARM, step 3: compiled, shared
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      4.6 |     15.9 |      5.7 |     47.5 |
+| WARM B deny (outside reach) |      6.0 |     17.2 |      7.0 |    108.2 |
+| WARM C granted (PUT merge via approval) |      6.3 |     18.4 |      8.1 |     62.8 |
+| WARM D spawn (limits) |      3.8 |     12.2 |      4.3 |     57.4 |
+
+### depth 2: WARM, step 3: compiled, decision only (early exit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      4.6 |     14.0 |      5.1 |     29.2 |
+| WARM B deny (outside reach) |      4.1 |      7.1 |      4.2 |     75.2 |
+| WARM C granted (PUT merge via approval) |      6.4 |     21.1 |      8.4 |    164.8 |
+| WARM D spawn (limits) |      3.9 |     12.7 |      4.4 |     60.7 |
+
+## depth 3: 5 blocks, 38 checks, 7432 bytes
+
+### depth 3: WARM, step 3: compiled, shared
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      5.6 |     17.4 |      6.3 |     43.8 |
+| WARM B deny (outside reach) |      7.4 |     24.4 |      9.1 |    151.6 |
+| WARM C granted (PUT merge via approval) |      7.9 |     21.5 |      8.9 |    114.6 |
+| WARM D spawn (limits) |      4.9 |     14.6 |      5.4 |     32.6 |
+
+### depth 3: WARM, step 3: compiled, decision only (early exit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      5.7 |     18.0 |      6.8 |    135.4 |
+| WARM B deny (outside reach) |      2.4 |      4.6 |      2.6 |     25.2 |
+| WARM C granted (PUT merge via approval) |      8.0 |     23.6 |      9.4 |     96.3 |
+| WARM D spawn (limits) |      5.0 |     17.8 |      6.8 |     42.2 |
+
+## depth 4: 6 blocks, 47 checks, 8746 bytes
+
+### depth 4: WARM, step 3: compiled, shared
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      6.6 |     22.5 |      8.9 |   3152.3 |
+| WARM B deny (outside reach) |      8.7 |     29.1 |     11.7 |     53.6 |
+| WARM C granted (PUT merge via approval) |      9.1 |     24.7 |     11.0 |    146.1 |
+| WARM D spawn (limits) |      5.8 |     19.6 |      7.2 |     57.2 |
+
+### depth 4: WARM, step 3: compiled, decision only (early exit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      6.6 |     20.2 |      7.8 |    283.3 |
+| WARM B deny (outside reach) |      2.4 |     10.6 |      2.8 |     61.3 |
+| WARM C granted (PUT merge via approval) |      9.1 |     26.5 |     10.6 |     99.0 |
+| WARM D spawn (limits) |      5.8 |     22.4 |      7.2 |     54.4 |
+
+## depth 5: 7 blocks, 56 checks, 10018 bytes
+
+### depth 5: WARM, step 3: compiled, shared
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      7.7 |     21.8 |      8.7 |     73.1 |
+| WARM B deny (outside reach) |     10.1 |     28.8 |     11.8 |     77.3 |
+| WARM C granted (PUT merge via approval) |     10.5 |     24.7 |     11.6 |     52.4 |
+| WARM D spawn (limits) |      6.8 |     20.0 |      8.6 |     46.0 |
+
+### depth 5: WARM, step 3: compiled, decision only (early exit)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      7.8 |     25.6 |      9.7 |    103.7 |
+| WARM B deny (outside reach) |      2.5 |      5.5 |      3.1 |     40.6 |
+| WARM C granted (PUT merge via approval) |     10.6 |     28.9 |     13.0 |     59.7 |
+| WARM D spawn (limits) |      6.9 |     14.7 |      7.3 |     41.0 |
+
+## Summary: WARM median / p99 µs
+
+| variant | depth | A | B | C | D |
+|---|---|---|---|---|---|
+| step 3: compiled, shared | 1 | 6.1 / 13.3 | 6.8 / 17.1 | 4.7 / 14.3 | 2.9 / 8.2 |
+| step 3: compiled, decision only (early exit) | 1 | 3.5 / 9.4 | 2.3 / 6.8 | 4.7 / 14.5 | 2.9 / 9.0 |
+| step 3: compiled, shared | 2 | 4.6 / 15.9 | 6.0 / 17.2 | 6.3 / 18.4 | 3.8 / 12.2 |
+| step 3: compiled, decision only (early exit) | 2 | 4.6 / 14.0 | 4.1 / 7.1 | 6.4 / 21.1 | 3.9 / 12.7 |
+| step 3: compiled, shared | 3 | 5.6 / 17.4 | 7.4 / 24.4 | 7.9 / 21.5 | 4.9 / 14.6 |
+| step 3: compiled, decision only (early exit) | 3 | 5.7 / 18.0 | 2.4 / 4.6 | 8.0 / 23.6 | 5.0 / 17.8 |
+| step 3: compiled, shared | 4 | 6.6 / 22.5 | 8.7 / 29.1 | 9.1 / 24.7 | 5.8 / 19.6 |
+| step 3: compiled, decision only (early exit) | 4 | 6.6 / 20.2 | 2.4 / 10.6 | 9.1 / 26.5 | 5.8 / 22.4 |
+| step 3: compiled, shared | 5 | 7.7 / 21.8 | 10.1 / 28.8 | 10.5 / 24.7 | 6.8 / 20.0 |
+| step 3: compiled, decision only (early exit) | 5 | 7.8 / 25.6 | 2.5 / 5.5 | 10.6 / 28.9 | 6.9 / 14.7 |

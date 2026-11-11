@@ -1,0 +1,5 @@
+{"epoch":0,"ev":"cp_open","grants":0,"ts":1794385991951}
+{"ev":"listening","feed":44829,"ts":1794385991951}
+{"catchup":"snapshot","epoch":0,"ev":"served","n":398,"node_epoch":null,"sub":true,"ts":1794385991978}
+{"catchup":"deltas","epoch":141,"ev":"served","n":100,"node_epoch":41,"sub":true,"ts":1794386005059}
+{"catchup":"snapshot","epoch":441,"ev":"served","n":261170,"node_epoch":142,"sub":true,"ts":1794386035154}

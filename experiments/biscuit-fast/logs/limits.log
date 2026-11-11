@@ -1,0 +1,87 @@
+## Fuel used per request (fork, deterministic limits PreparedLimits { max_facts: 256, max_iterations: 8, max_steps: 4000, max_time: None })
+
+| depth | scenario | decision | step 2 steps | step 3 steps | step 3 on the compiled path | facts | iterations | stock 6.0.0 Datalog µs |
+|---|---|---|---|---|---|---|---|---|
+| 1 | A allow (GET in reach) | allow | 75 | 69 | true | 19 | 1 | 102.1 |
+| 1 | B deny (outside reach) | deny | 99 | 93 | true | 19 | 0 | 187.5 |
+| 1 | C granted (PUT merge via approval) | allow | 115 | 109 | true | 19 | 1 | 112.4 |
+| 1 | D spawn (limits) | allow | 64 | 58 | true | 14 | 1 | 63.9 |
+| 1 | (prepare: saturating the token's own facts) | | 0 | | | 5 | | |
+| 2 | A allow (GET in reach) | allow | 104 | 98 | true | 20 | 1 | 184.9 |
+| 2 | B deny (outside reach) | deny | 138 | 132 | true | 20 | 0 | 388.4 |
+| 2 | C granted (PUT merge via approval) | allow | 162 | 156 | true | 20 | 1 | 173.5 |
+| 2 | D spawn (limits) | allow | 90 | 84 | true | 15 | 1 | 135.4 |
+| 2 | (prepare: saturating the token's own facts) | | 0 | | | 6 | | |
+| 3 | A allow (GET in reach) | allow | 133 | 127 | true | 21 | 1 | 123.2 |
+| 3 | B deny (outside reach) | deny | 174 | 168 | true | 21 | 0 | 260.6 |
+| 3 | C granted (PUT merge via approval) | allow | 206 | 200 | true | 21 | 1 | 314.2 |
+| 3 | D spawn (limits) | allow | 116 | 110 | true | 16 | 1 | 114.5 |
+| 3 | (prepare: saturating the token's own facts) | | 0 | | | 7 | | |
+| 4 | A allow (GET in reach) | allow | 162 | 156 | true | 22 | 1 | 158.1 |
+| 4 | B deny (outside reach) | deny | 209 | 203 | true | 22 | 0 | 322.9 |
+| 4 | C granted (PUT merge via approval) | allow | 244 | 238 | true | 22 | 1 | 228.6 |
+| 4 | D spawn (limits) | allow | 142 | 136 | true | 17 | 1 | 123.3 |
+| 4 | (prepare: saturating the token's own facts) | | 0 | | | 8 | | |
+| 5 | A allow (GET in reach) | allow | 191 | 185 | true | 23 | 1 | 179.1 |
+| 5 | B deny (outside reach) | deny | 244 | 238 | true | 23 | 0 | 354.0 |
+| 5 | C granted (PUT merge via approval) | allow | 282 | 276 | true | 23 | 1 | 278.0 |
+| 5 | D spawn (limits) | allow | 168 | 162 | true | 18 | 1 | 145.6 |
+| 5 | (prepare: saturating the token's own facts) | | 0 | | | 9 | | |
+
+most steps any legitimate request used: 282; limit 4000 (14x headroom)
+
+## Same decision whatever the load: a request at the limit
+
+- step 3, request A, max_steps = steps used - 1 (184): ["Reached Datalog execution limits", "Reached Datalog execution limits", "Reached Datalog execution limits", "Reached Datalog execution limits", "Reached Datalog execution limits"] (5 runs)
+- step 3, request A, max_steps = steps used (185): ["allowed", "allowed", "allowed", "allowed", "allowed"] (5 runs)
+
+## Regex cost calibration
+
+- Regex::new for a 37-byte hostile pattern: median 26.4 µs, p99 75.8 µs
+- step 2 engine: request B uses 244 steps in 120.6 µs median: 494 ns per step
+- so one regex compile ≈ 53 steps; the fork charges 16 steps per pattern byte = 592 steps for this pattern
+
+## Hostile holder blocks (appended to the depth-5 chain, request A)
+
+### fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) (token 10615 bytes)
+
+- stock 6.0.0, defaults (1000 facts, 100 iterations, 1 ms): denied: Reached Datalog execution limits — per request median 2606 µs, p99 4059 µs
+- stock 6.0.0, max_time 50 ms: denied: Reached Datalog execution limits — per request median 2530 µs, p99 4848 µs
+- fork prepare (once per token) under fuel: error: Reached Datalog execution limits — median 3280 µs, p99 4178 µs, 1640 steps
+- step 2 per request: denied: Reached Datalog execution limits — median 0.1 µs, p99 0.1 µs, 0 steps
+- step 3: compile 0 µs median (not compiled: prepare error); per request: denied: Reached Datalog execution limits — median 0.0 µs, p99 0.1 µs, 0 steps
+- structural lint: rejected: block 7: first-party blocks may not carry rules — median 372.5 µs, p99 506.6 µs
+
+### iteration chain: 150 rules r_i+1 <- r_i (token 14242 bytes)
+
+- stock 6.0.0, defaults (1000 facts, 100 iterations, 1 ms): denied: Reached Datalog execution limits — per request median 2326 µs, p99 2499 µs
+- stock 6.0.0, max_time 50 ms: denied: Reached Datalog execution limits — per request median 21716 µs, p99 33844 µs
+- fork prepare (once per token) under fuel: error: Reached Datalog execution limits — median 2098 µs, p99 3771 µs, 36 steps
+- step 2 per request: denied: Reached Datalog execution limits — median 0.1 µs, p99 0.1 µs, 0 steps
+- step 3: compile 0 µs median (not compiled: prepare error); per request: denied: Reached Datalog execution limits — median 0.0 µs, p99 0.1 µs, 0 steps
+- structural lint: rejected: block 7: first-party blocks may not carry rules — median 557.3 µs, p99 867.7 µs
+
+### expensive checks: 200 regex checks (token 26022 bytes)
+
+- stock 6.0.0, defaults (1000 facts, 100 iterations, 1 ms): denied: Reached Datalog execution limits — per request median 2579 µs, p99 3026 µs
+- stock 6.0.0, max_time 50 ms: allowed — per request median 12243 µs, p99 19097 µs
+- fork prepare (once per token) under fuel: ok — median 2380 µs, p99 4263 µs, 0 steps
+- step 2 per request: denied: Reached Datalog execution limits — median 396.2 µs, p99 568.8 µs, 4356 steps
+- step 3: compile 6575 µs median; per request: allowed — median 113.8 µs, p99 126.2 µs, 785 steps
+- structural lint: rejected: block 7: 200 checks — median 758.9 µs, p99 792.6 µs
+
+## Lint on the legitimate chains and on the correctness suite's holder blocks
+
+- depth 0: accepted — median 88.5 µs, p99 103.0 µs
+- depth 1: accepted — median 153.3 µs, p99 172.3 µs
+- depth 2: accepted — median 213.0 µs, p99 349.9 µs
+- depth 3: accepted — median 273.3 µs, p99 414.5 µs
+- depth 4: accepted — median 331.0 µs, p99 558.6 µs
+- depth 5: accepted — median 373.3 µs, p99 637.6 µs
+- appended `check if true;`: accepted
+- appended `approved("g-x", "api.github.com", "GET", "/repos/other/x/issues");`: block 7: fact not allowed: approved
+- appended `approved($g, $h, $m, $p) <- host($h), method($m), path($p), uses_left($g, $n);`: block 7: first-party blocks may not carry rules
+- appended `check if op($o), $o != "http" or method("GET");`: accepted
+- appended `check if path($p), $p.matches("^/repos/.*");`: block 7: operator not allowed: Regex
+- appended `check if resource($r);`: block 7: predicate outside the fixed vocabulary: resource/1
+- third-party grant from an untrusted key: block 7 (third-party): signed by a key no first-party block trusts

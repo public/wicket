@@ -1,0 +1,196 @@
+iterations: cold 3000, warm 20000; variants ["stock", "main", "s1", "plain"]
+
+## depth 1: 3 blocks, 20 checks, 4456 bytes
+
+### depth 1: WARM, stock 6.0.0 (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    432.9 |    755.1 |    465.6 |   3257.2 |
+| WARM B deny (outside reach) |    522.3 |    904.6 |    563.1 |   3619.1 |
+| WARM C granted (PUT merge via approval) |    482.4 |    838.3 |    518.2 |   3123.2 |
+| WARM D spawn (limits) |    412.1 |    731.0 |    434.4 |   3067.0 |
+
+### depth 1: WARM, upstream main (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    415.9 |    735.4 |    450.0 |   3282.2 |
+| WARM B deny (outside reach) |    503.8 |    875.7 |    536.9 |   3365.8 |
+| WARM C granted (PUT merge via approval) |    453.5 |    797.0 |    474.9 |   3299.8 |
+| WARM D spawn (limits) |    399.4 |    701.2 |    417.8 |   3029.0 |
+
+### depth 1: WARM, step 1: prepared, per-thread session, overlay
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     44.6 |     95.3 |     47.6 |   2826.2 |
+| WARM B deny (outside reach) |     59.5 |    135.1 |     66.9 |    231.1 |
+| WARM C granted (PUT merge via approval) |     71.7 |    157.6 |     81.4 |   4017.7 |
+| WARM D spawn (limits) |     37.1 |     74.6 |     40.2 |    236.2 |
+
+### depth 1: WARM, plain records
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      0.3 |      0.6 |      0.3 |     26.7 |
+| WARM B deny (outside reach) |      0.2 |      0.5 |      0.2 |     15.1 |
+| WARM C granted (PUT merge via approval) |      0.3 |      0.6 |      0.3 |     16.6 |
+| WARM D spawn (limits) |      0.2 |      0.5 |      0.2 |     19.9 |
+
+## depth 2: 4 blocks, 29 checks, 5972 bytes
+
+### depth 2: WARM, stock 6.0.0 (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    574.4 |   1018.5 |    607.5 |   3694.0 |
+| WARM B deny (outside reach) |    709.6 |   1199.0 |    730.2 |   3413.6 |
+| WARM C granted (PUT merge via approval) |    651.2 |   1133.7 |    690.3 |   3546.5 |
+| WARM D spawn (limits) |    562.3 |    977.6 |    596.1 |   3426.6 |
+
+### depth 2: WARM, upstream main (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    573.6 |    964.8 |    592.1 |   3572.0 |
+| WARM B deny (outside reach) |    679.9 |   1175.2 |    719.9 |   3565.8 |
+| WARM C granted (PUT merge via approval) |    612.8 |   1056.6 |    645.1 |   3515.4 |
+| WARM D spawn (limits) |    548.6 |    985.7 |    582.3 |   3930.1 |
+
+### depth 2: WARM, step 1: prepared, per-thread session, overlay
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     57.2 |    126.5 |     65.6 |    257.5 |
+| WARM B deny (outside reach) |     77.5 |    172.4 |     89.8 |   2681.2 |
+| WARM C granted (PUT merge via approval) |     98.0 |    224.1 |    118.9 |    405.4 |
+| WARM D spawn (limits) |     47.7 |    110.3 |     56.0 |   2989.6 |
+
+## depth 3: 5 blocks, 38 checks, 7432 bytes
+
+### depth 3: WARM, stock 6.0.0 (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    731.1 |   1261.1 |    762.2 |   5697.9 |
+| WARM B deny (outside reach) |    875.3 |   1513.5 |    916.1 |   3751.5 |
+| WARM C granted (PUT merge via approval) |    833.4 |   1403.7 |    865.9 |   3627.2 |
+| WARM D spawn (limits) |    804.0 |   1376.8 |    902.3 |   7799.7 |
+
+### depth 3: WARM, upstream main (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    724.5 |   1233.5 |    790.4 |   4910.6 |
+| WARM B deny (outside reach) |    865.2 |   1470.8 |    936.1 |   5121.0 |
+| WARM C granted (PUT merge via approval) |    795.3 |   1354.9 |    852.3 |   3727.2 |
+| WARM D spawn (limits) |    688.6 |   1183.2 |    727.7 |   3527.3 |
+
+### depth 3: WARM, step 1: prepared, per-thread session, overlay
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     69.6 |    140.1 |     74.8 |   2932.0 |
+| WARM B deny (outside reach) |     94.6 |    222.4 |    112.0 |   2740.3 |
+| WARM C granted (PUT merge via approval) |    119.4 |    258.9 |    137.7 |    474.5 |
+| WARM D spawn (limits) |     58.4 |    127.6 |     64.6 |   2619.8 |
+
+### depth 3: WARM, plain records
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      0.5 |      1.0 |      0.5 |     68.4 |
+| WARM B deny (outside reach) |      0.3 |      0.7 |      0.3 |     11.5 |
+| WARM C granted (PUT merge via approval) |      0.4 |      0.9 |      0.4 |     13.8 |
+| WARM D spawn (limits) |      0.3 |      0.7 |      0.4 |     13.1 |
+
+## depth 4: 6 blocks, 47 checks, 8746 bytes
+
+### depth 4: WARM, stock 6.0.0 (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    875.5 |   1526.4 |    938.9 |   3809.4 |
+| WARM B deny (outside reach) |   1060.1 |   1814.0 |   1130.3 |   5318.4 |
+| WARM C granted (PUT merge via approval) |    973.8 |   1693.1 |   1040.9 |   4086.0 |
+| WARM D spawn (limits) |    878.0 |   1492.9 |    941.4 |   4995.1 |
+
+### depth 4: WARM, upstream main (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    838.1 |   1441.3 |    904.4 |   5506.5 |
+| WARM B deny (outside reach) |    991.4 |   1740.7 |   1062.9 |   5716.4 |
+| WARM C granted (PUT merge via approval) |    909.2 |   1589.3 |    968.9 |   3723.1 |
+| WARM D spawn (limits) |    816.9 |   1411.8 |    881.0 |   5165.1 |
+
+### depth 4: WARM, step 1: prepared, per-thread session, overlay
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     82.4 |    173.6 |     92.5 |    368.8 |
+| WARM B deny (outside reach) |    109.5 |    233.9 |    126.4 |    328.9 |
+| WARM C granted (PUT merge via approval) |    137.8 |    293.1 |    159.0 |    475.6 |
+| WARM D spawn (limits) |     70.0 |    157.2 |     82.7 |    395.4 |
+
+## depth 5: 7 blocks, 56 checks, 10018 bytes
+
+### depth 5: WARM, stock 6.0.0 (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |   1021.4 |   1787.4 |   1126.4 |   5192.0 |
+| WARM B deny (outside reach) |   1213.8 |   2097.7 |   1305.2 |   4163.3 |
+| WARM C granted (PUT merge via approval) |   1138.7 |   1979.3 |   1230.0 |   3911.1 |
+| WARM D spawn (limits) |    993.1 |   1705.9 |   1054.8 |   4972.0 |
+
+### depth 5: WARM, upstream main (build per request)
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |    958.5 |   1630.1 |   1011.7 |   3766.5 |
+| WARM B deny (outside reach) |   1122.3 |   1955.3 |   1189.7 |   3967.5 |
+| WARM C granted (PUT merge via approval) |   1049.6 |   1803.9 |   1113.0 |   3938.9 |
+| WARM D spawn (limits) |    924.3 |   1590.1 |    985.8 |   4112.1 |
+
+### depth 5: WARM, step 1: prepared, per-thread session, overlay
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     94.8 |    206.6 |    114.7 |   2754.4 |
+| WARM B deny (outside reach) |    125.8 |    263.3 |    138.8 |    391.4 |
+| WARM C granted (PUT merge via approval) |    163.2 |    340.2 |    183.3 |    584.7 |
+| WARM D spawn (limits) |     81.2 |    170.8 |     92.1 |   2399.0 |
+
+### depth 5: WARM, plain records
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |      0.7 |      1.5 |      0.8 |     21.1 |
+| WARM B deny (outside reach) |      0.4 |      0.8 |      0.4 |     18.2 |
+| WARM C granted (PUT merge via approval) |      0.6 |      1.3 |      0.7 |     27.1 |
+| WARM D spawn (limits) |      0.7 |      1.1 |      0.7 |     16.5 |
+
+## Summary: WARM median / p99 µs
+
+| variant | depth | A | B | C | D |
+|---|---|---|---|---|---|
+| stock 6.0.0 (build per request) | 1 | 432.9 / 755.1 | 522.3 / 904.6 | 482.4 / 838.3 | 412.1 / 731.0 |
+| upstream main (build per request) | 1 | 415.9 / 735.4 | 503.8 / 875.7 | 453.5 / 797.0 | 399.4 / 701.2 |
+| step 1: prepared, per-thread session, overlay | 1 | 44.6 / 95.3 | 59.5 / 135.1 | 71.7 / 157.6 | 37.1 / 74.6 |
+| plain records | 1 | 0.3 / 0.6 | 0.2 / 0.5 | 0.3 / 0.6 | 0.2 / 0.5 |
+| stock 6.0.0 (build per request) | 2 | 574.4 / 1018.5 | 709.6 / 1199.0 | 651.2 / 1133.7 | 562.3 / 977.6 |
+| upstream main (build per request) | 2 | 573.6 / 964.8 | 679.9 / 1175.2 | 612.8 / 1056.6 | 548.6 / 985.7 |
+| step 1: prepared, per-thread session, overlay | 2 | 57.2 / 126.5 | 77.5 / 172.4 | 98.0 / 224.1 | 47.7 / 110.3 |
+| stock 6.0.0 (build per request) | 3 | 731.1 / 1261.1 | 875.3 / 1513.5 | 833.4 / 1403.7 | 804.0 / 1376.8 |
+| upstream main (build per request) | 3 | 724.5 / 1233.5 | 865.2 / 1470.8 | 795.3 / 1354.9 | 688.6 / 1183.2 |
+| step 1: prepared, per-thread session, overlay | 3 | 69.6 / 140.1 | 94.6 / 222.4 | 119.4 / 258.9 | 58.4 / 127.6 |
+| plain records | 3 | 0.5 / 1.0 | 0.3 / 0.7 | 0.4 / 0.9 | 0.3 / 0.7 |
+| stock 6.0.0 (build per request) | 4 | 875.5 / 1526.4 | 1060.1 / 1814.0 | 973.8 / 1693.1 | 878.0 / 1492.9 |
+| upstream main (build per request) | 4 | 838.1 / 1441.3 | 991.4 / 1740.7 | 909.2 / 1589.3 | 816.9 / 1411.8 |
+| step 1: prepared, per-thread session, overlay | 4 | 82.4 / 173.6 | 109.5 / 233.9 | 137.8 / 293.1 | 70.0 / 157.2 |
+| stock 6.0.0 (build per request) | 5 | 1021.4 / 1787.4 | 1213.8 / 2097.7 | 1138.7 / 1979.3 | 993.1 / 1705.9 |
+| upstream main (build per request) | 5 | 958.5 / 1630.1 | 1122.3 / 1955.3 | 1049.6 / 1803.9 | 924.3 / 1590.1 |
+| step 1: prepared, per-thread session, overlay | 5 | 94.8 / 206.6 | 125.8 / 263.3 | 163.2 / 340.2 | 81.2 / 170.8 |
+| plain records | 5 | 0.7 / 1.5 | 0.4 / 0.8 | 0.6 / 1.3 | 0.7 / 1.1 |

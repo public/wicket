@@ -1,0 +1,29 @@
+| depth | A bytes | B bytes | C bytes | A base64 | B base64 | C base64 |
+|---|---|---|---|---|---|---|
+| 0 | 2875 | 2021 | 4473 | 3836 | 2696 | 5964 |
+| 1 | 4456 | 3282 | 7203 | 5944 | 4376 | 9604 |
+| 2 | 5972 | 4468 | 9793 | 7964 | 5960 | 13060 |
+| 3 | 7432 | 5586 | 12259 | 9912 | 7448 | 16348 |
+| 4 | 8746 | 6526 | 14401 | 11664 | 8704 | 19204 |
+| 5 | 10018 | 7455 | 16490 | 13360 | 9940 | 21988 |
+
+## Per block at depth 5 (bytes added to the serialized token)
+
+| block | A | B | C |
+|---|---|---|---|
+| authority (+ framing) | 2356 | 1533 | 3686 |
+| spawn 1 | 1578 | 1258 | 2724 |
+| spawn 2 | 1513 | 1183 | 2584 |
+| spawn 3 | 1457 | 1115 | 2460 |
+| spawn 4 | 1311 | 937 | 2136 |
+| spawn 5 | 1269 | 926 | 2083 |
+| grant (third-party) | 534 | 503 | 817 |
+
+## Encodings of one spawn zone (level 5)
+
+- A: 1387 bytes of Datalog source, 9 checks
+- B: 799 bytes of canonical JSON
+
+```json
+{"zone":"nightly-ci.w5","box_prefix":"b0/b1/b2/b3/b4/b5","not_after":1794419700,"ops":["http","spawn","llm","msg"],"reach":[{"host":"api.github.com","methods":["GET","HEAD"],"path":{"Prefix":"/repos/acme/api/"}},{"host":"crates.io","methods":["GET","HEAD"],"path":{"Prefix":"/api/v1/crates/"}},{"host":"static.crates.io","methods":["GET"],"path":"Any"}],"forbid":[],"max_risk":2,"dangerous_ok":[],"spawn":{"images":["img:agent","img:rust"],"min_isolation":2,"mem_bytes":268435456,"cpus_milli":500,"pids":64,"timeout_s":7200},"llm":{"max_requests":500,"max_output_tokens":666666},"accept_from":[],"inject":["api.github.com|Authorization|gh-app-acme"],"grant_keys":["d4075544332a054c6a9213b87b701239e02f46c8fecb652460b79d9f0244492f","27f75eb27bbb67f305a3b3c7541b18243863dd9e0b3fa87310d7538f278d2bd8"]}
+```

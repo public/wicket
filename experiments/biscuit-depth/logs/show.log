@@ -1,0 +1,219 @@
+# Depth-5 chain, generated Datalog (as compiled)
+
+## block 0: authority (root key)
+```datalog
+tenant("acme");
+principal("trigger:nightly-ci");
+zone("nightly-ci");
+check if time($t), $t <= 2026-11-11T16:13:00Z;
+check if box($b), $b == "b0" || $b.starts_with("b0/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH"}.contains($m), path($p), $p.starts_with("/repos/acme/")
+  or host($h), $h.ends_with(".githubusercontent.com"), method($m), {"GET", "HEAD"}.contains($m)
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host("index.crates.io"), method("GET")
+  or host("docs.rs"), method("GET"), path($p), $p.starts_with("/tokio/"), path_depth(2)
+  or host("pypi.org"), method("GET"), path($p), $p.starts_with("/simple/")
+  or host("registry.npmjs.org"), method("GET")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f;
+reject if host($h), $h.ends_with(".internal");
+reject if host("api.github.com"), path($p), $p.starts_with("/repos/acme/secrets-vault/");
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"}.contains($m), path($p), $p.starts_with("/repos/acme/scratch/")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust", "img:py"}.contains($i), $iso >= 2, $mem <= 8589934592, $cpu <= 4000, $pids <= 2048, $secs <= 28800;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 3000, $k < 4000000;
+check if op($o), $o != "msg"
+  or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 1: spawn block 1 (box b0/b1)
+```datalog
+zone("nightly-ci.w1");
+check if time($t), $t <= 2026-11-11T14:13:00Z;
+check if box($b), $b == "b0/b1" || $b.starts_with("b0/b1/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH"}.contains($m), path($p), $p.starts_with("/repos/acme/")
+  or host($h), $h.ends_with(".githubusercontent.com"), method($m), {"GET", "HEAD"}.contains($m)
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host("index.crates.io"), method("GET")
+  or host("docs.rs"), method("GET"), path($p), $p.starts_with("/tokio/"), path_depth(2)
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/79868b50bde3cc92c8f79bac376dd2a2eddfb053ebd6fe9a8ce3a574a77df856;
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"}.contains($m), path($p), $p.starts_with("/repos/acme/scratch/")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/79868b50bde3cc92c8f79bac376dd2a2eddfb053ebd6fe9a8ce3a574a77df856;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust"}.contains($i), $iso >= 2, $mem <= 4294967296, $cpu <= 2000, $pids <= 1024, $secs <= 21600;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 1500, $k < 2000000;
+check if op($o), $o != "msg"
+  or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 2: spawn block 2 (box b0/b1/b2)
+```datalog
+zone("nightly-ci.w2");
+check if time($t), $t <= 2026-11-11T13:13:00Z;
+check if box($b), $b == "b0/b1/b2" || $b.starts_with("b0/b1/b2/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST"}.contains($m), path($p), $p.starts_with("/repos/acme/")
+  or host($h), $h.ends_with(".githubusercontent.com"), method($m), {"GET", "HEAD"}.contains($m)
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host("index.crates.io"), method("GET")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/08c990313a09cdf52083dd0f99f1cc1fd60e88ed1fefdc7bcf40fcfe8cbf5e23;
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"}.contains($m), path($p), $p.starts_with("/repos/acme/scratch/")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/08c990313a09cdf52083dd0f99f1cc1fd60e88ed1fefdc7bcf40fcfe8cbf5e23;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust"}.contains($i), $iso >= 2, $mem <= 2147483648, $cpu <= 1000, $pids <= 512, $secs <= 18000;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 1000, $k < 1333333;
+check if op($o), $o != "msg"
+  or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 3: spawn block 3 (box b0/b1/b2/b3)
+```datalog
+zone("nightly-ci.w3");
+check if time($t), $t <= 2026-11-11T12:13:00Z;
+check if box($b), $b == "b0/b1/b2/b3" || $b.starts_with("b0/b1/b2/b3/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST"}.contains($m), path($p), $p.starts_with("/repos/acme/api/")
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host("index.crates.io"), method("GET")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/b7bf4e3b72a82e4c408587ee8ed743714d8f14bd3a33fa11169ffb7d76bec067;
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"}.contains($m), path($p), $p.starts_with("/repos/acme/scratch/")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/b7bf4e3b72a82e4c408587ee8ed743714d8f14bd3a33fa11169ffb7d76bec067;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust"}.contains($i), $iso >= 2, $mem <= 1073741824, $cpu <= 500, $pids <= 256, $secs <= 14400;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 750, $k < 1000000;
+check if op($o), $o != "msg"
+  or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 4: spawn block 4 (box b0/b1/b2/b3/b4)
+```datalog
+zone("nightly-ci.w4");
+check if time($t), $t <= 2026-11-11T11:13:00Z;
+check if box($b), $b == "b0/b1/b2/b3/b4" || $b.starts_with("b0/b1/b2/b3/b4/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD", "POST"}.contains($m), path($p), $p.starts_with("/repos/acme/api/")
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/05cce7678bc2d5e449fb969020ef114d3686c1f2ac9488c8fa1e91a6de716918;
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/05cce7678bc2d5e449fb969020ef114d3686c1f2ac9488c8fa1e91a6de716918;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust"}.contains($i), $iso >= 2, $mem <= 536870912, $cpu <= 500, $pids <= 128, $secs <= 10800;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 600, $k < 800000;
+check if op($o), $o != "msg"
+  or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 5: spawn block 5 (box b0/b1/b2/b3/b4/b5)
+```datalog
+zone("nightly-ci.w5");
+check if time($t), $t <= 2026-11-11T10:13:00Z;
+check if box($b), $b == "b0/b1/b2/b3/b4/b5" || $b.starts_with("b0/b1/b2/b3/b4/b5/");
+check if op($o), {"http", "spawn", "llm", "msg"}.contains($o);
+check if op($o), $o != "http"
+  or host("api.github.com"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/repos/acme/api/")
+  or host("crates.io"), method($m), {"GET", "HEAD"}.contains($m), path($p), $p.starts_with("/api/v1/crates/")
+  or host("static.crates.io"), method("GET")
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/ca69b8b749975947ba085d573912e1eefdba6fcd6a9edf36c4c8dc9e028a320a;
+check if op($o), $o != "http"
+  or risk($r), $r <= 2
+  or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f, ed25519/ca69b8b749975947ba085d573912e1eefdba6fcd6a9edf36c4c8dc9e028a320a;
+check if op($o), $o != "spawn"
+  or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:rust"}.contains($i), $iso >= 2, $mem <= 268435456, $cpu <= 500, $pids <= 64, $secs <= 7200;
+check if op($o), $o != "llm"
+  or llm_used($r, $k), $r < 500, $k < 666666;
+check if op($o), $o != "msg";
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+```
+
+## block 6: third-party grant block (approver key)
+```datalog
+approved("g-7f3a", "api.github.com", "PUT", "/repos/acme/api/pulls/7/merge") <- time($t), $t <= 2026-11-11T08:38:00Z, box("b0/b1/b2/b3/b4/b5"), epoch(3), uses_left("g-7f3a", $n), $n > 0;
+approval("g-7f3a", "human:alex@acme", hex:5f1c0e7a9b3d42e8a1c6f0b7d9e2a4c3b8f1e6d0a7c9b2e4f3a1d8c6b0e9f7a2);
+```
+
+## as printed back by biscuit-auth (block 0 and block 6)
+```
+tenant("acme");
+principal("trigger:nightly-ci");
+zone("nightly-ci");
+check if time($t), $t <= 2026-11-11T16:13:00Z;
+check if box($b), $b == "b0" || $b.starts_with("b0/");
+check if op($o), {"http", "llm", "msg", "spawn"}.contains($o);
+check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method($m), $h.ends_with(".githubusercontent.com"), {"GET", "HEAD"}.contains($m) or host("crates.io"), method($m), path($p), {"GET", "HEAD"}.contains($m), $p.starts_with("/api/v1/crates/") or host("static.crates.io"), method("GET") or host("index.crates.io"), method("GET") or host("docs.rs"), method("GET"), path($p), path_depth(2), $p.starts_with("/tokio/") or host("pypi.org"), method("GET"), path($p), $p.starts_with("/simple/") or host("registry.npmjs.org"), method("GET") or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f;
+reject if host($h), $h.ends_with(".internal");
+reject if host("api.github.com"), path($p), $p.starts_with("/repos/acme/secrets-vault/");
+check if op($o), $o != "http" or risk($r), $r <= 2 or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST", "DELETE", "PUT"}.contains($m), $p.starts_with("/repos/acme/scratch/") or host($h), method($m), path($p), approved($g, $h, $m, $p) trusting ed25519/cc5b44c3b4cf833fd0c88d42d2f14a4b359cf82d19b83b5571f493a73627ef7f;
+check if op($o), $o != "spawn" or spawn($i, $iso, $mem, $cpu, $pids, $secs), {"img:agent", "img:py", "img:rust"}.contains($i), $iso >= 2, $mem <= 8589934592, $cpu <= 4000, $pids <= 2048, $secs <= 28800;
+check if op($o), $o != "llm" or llm_used($r, $k), $r < 3000, $k < 4000000;
+check if op($o), $o != "msg" or msg_from($z), {"ops"}.contains($z);
+reject if inject($k), !{"api.github.com|Authorization|gh-app-acme"}.contains($k);
+
+---
+approval("g-7f3a", "human:alex@acme", hex:5f1c0e7a9b3d42e8a1c6f0b7d9e2a4c3b8f1e6d0a7c9b2e4f3a1d8c6b0e9f7a2);
+approved("g-7f3a", "api.github.com", "PUT", "/repos/acme/api/pulls/7/merge") <- time($t), box("b0/b1/b2/b3/b4/b5"), epoch(3), uses_left("g-7f3a", $n), $t <= 2026-11-11T08:38:00Z, $n > 0;
+
+```
+
+# Sizes
+
+| depth | blocks | checks | raw bytes | base64 chars | plain raw | plain base64 |
+|---|---|---|---|---|---|---|
+| 0 | 2 | 11 | 2875 | 3836 | 1963 | 2618 |
+| 1 | 3 | 20 | 4456 | 5944 | 3212 | 4283 |
+| 2 | 4 | 29 | 5972 | 7964 | 4386 | 5848 |
+| 3 | 5 | 38 | 7432 | 9912 | 5492 | 7323 |
+| 4 | 6 | 47 | 8746 | 11664 | 6420 | 8560 |
+| 5 | 7 | 56 | 10018 | 13360 | 7337 | 9783 |
+
+# Size variant: spawn blocks keep only statements that differ from the parent's
+
+| depth | checks | raw bytes | base64 chars | all scenarios still decide the same |
+|---|---|---|---|---|
+| 0 | 11 | 2875 | 3836 | true |
+| 1 | 17 | 4263 | 5684 | true |
+| 2 | 23 | 5586 | 7448 | true |
+| 3 | 29 | 6853 | 9140 | true |
+| 4 | 35 | 7974 | 10632 | true |
+| 5 | 42 | 9135 | 12180 | true |
+
+# Per-block size (depth-5 chain)
+
+block 0: token 2356 bytes (+2356)
+block 1: token 3934 bytes (+1578)
+block 2: token 5447 bytes (+1513)
+block 3: token 6904 bytes (+1457)
+block 4: token 8215 bytes (+1311)
+block 5: token 9484 bytes (+1269)
+grant block: token 10018 bytes (+534)
+sealed depth-5 token: 10050 bytes

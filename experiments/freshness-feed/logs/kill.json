@@ -1,0 +1,235 @@
+{
+  "before_kill": [
+    [
+      "read_R1",
+      true
+    ],
+    [
+      "write_R2",
+      true
+    ],
+    [
+      "granted_op",
+      true
+    ],
+    [
+      "short_grant",
+      true
+    ],
+    [
+      "new_lease",
+      true
+    ],
+    [
+      "spawn",
+      true
+    ],
+    [
+      "approve",
+      true
+    ],
+    [
+      "forbidden",
+      false
+    ]
+  ],
+  "last_fresh_until_after_kill_ms": 2644,
+  "narrow_until_after_kill_ms": 8644,
+  "node_status": {
+    "accepted": {
+      "delta": 15,
+      "fresh": 2,
+      "key": 2,
+      "snap": 1
+    },
+    "epoch": 15,
+    "fresh_epoch": 13,
+    "fresh_until": 1794385899758,
+    "grants": 1002,
+    "head": "44b186d03d144269ec6a0c9b76e3c40edf1f9137b8e3f0114f7fedee9b828e08",
+    "last_refusal": null,
+    "mode": "fresh",
+    "now": 1794385896902,
+    "refused": {},
+    "vouched": [
+      1794385899758,
+      1794385905758
+    ],
+    "zones": 50
+  },
+  "params": {
+    "grace_ms": 6000,
+    "probe_step_ms": 50,
+    "refresh_ms": 500,
+    "ttl_ms": 3000
+  },
+  "probe_latency_us_per_query": {
+    "max": 438.02125,
+    "mean": 134.01629080310877,
+    "n": 193,
+    "p50": 132.6585,
+    "p90": 160.345875,
+    "p99": 234.699375
+  },
+  "restart": {
+    "after": [
+      [
+        "read_R1",
+        true,
+        "reach rule 0"
+      ],
+      [
+        "write_R2",
+        true,
+        "reach rule 1"
+      ],
+      [
+        "granted_op",
+        false,
+        "needs a grant: POST api.github.com/repos/acme/r0/issues/9999/comments is outside the zone's reach"
+      ],
+      [
+        "short_grant",
+        false,
+        "needs a grant: POST api.github.com/repos/acme/r0/issues/9998/comments is outside the zone's reach"
+      ],
+      [
+        "new_lease",
+        false,
+        "no live grant keep-1"
+      ],
+      [
+        "spawn",
+        true,
+        "spawn z1 from z0"
+      ],
+      [
+        "approve",
+        true,
+        "approved as l-55"
+      ],
+      [
+        "forbidden",
+        false,
+        "GET evil.example/ is forbidden in this zone"
+      ]
+    ],
+    "cp_admin_up_ms": 26,
+    "cp_down_ms": 9670,
+    "epoch": 15,
+    "keep2_allowed": true,
+    "node_fresh_after_restart_ms": 152,
+    "revoke_and_grant_to_caught_up_ms": 1,
+    "wait_fresh_ms": 126
+  },
+  "short_grant_not_after_ms": 1500,
+  "timeline": {
+    "mode": [
+      [
+        1,
+        "fresh"
+      ],
+      [
+        2658,
+        "narrow"
+      ],
+      [
+        8668,
+        "closed"
+      ]
+    ],
+    "probes": {
+      "approve": [
+        [
+          1,
+          true,
+          "approved as l-2"
+        ],
+        [
+          2658,
+          false,
+          "narrow: no new leases, spawns or approvals until fresh"
+        ]
+      ],
+      "forbidden": [
+        [
+          1,
+          false,
+          "GET evil.example/ is forbidden in this zone"
+        ]
+      ],
+      "granted_op": [
+        [
+          1,
+          true,
+          "grant keep-1"
+        ],
+        [
+          2658,
+          false,
+          "narrow: grants not honoured while stale (POST api.github.com/repos/acme/r0/issues/9999/comments is outside the zone's reach)"
+        ]
+      ],
+      "new_lease": [
+        [
+          1,
+          true,
+          "lease on keep-1 until 1794385897078"
+        ],
+        [
+          2658,
+          false,
+          "narrow: no new leases, spawns or approvals until fresh"
+        ]
+      ],
+      "read_R1": [
+        [
+          1,
+          true,
+          "reach rule 0"
+        ],
+        [
+          8668,
+          false,
+          "closed: no state vouched for by a live freshness statement"
+        ]
+      ],
+      "short_grant": [
+        [
+          1,
+          true,
+          "grant keep-short"
+        ],
+        [
+          1504,
+          false,
+          "needs a grant: POST api.github.com/repos/acme/r0/issues/9998/comments is outside the zone's reach"
+        ]
+      ],
+      "spawn": [
+        [
+          1,
+          true,
+          "spawn z1 from z0"
+        ],
+        [
+          2658,
+          false,
+          "narrow: no new leases, spawns or approvals until fresh"
+        ]
+      ],
+      "write_R2": [
+        [
+          1,
+          true,
+          "reach rule 1"
+        ],
+        [
+          2658,
+          false,
+          "narrow: R2WriteReversible needs fresh policy"
+        ]
+      ]
+    }
+  }
+}

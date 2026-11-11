@@ -1,0 +1,66 @@
+iterations: cold 3000, warm 20000; variants ["s2"]
+
+## depth 1: 3 blocks, 20 checks, 4456 bytes
+
+### depth 1: WARM, step 2: as step 1, fuel only
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     40.2 |     93.2 |     45.7 |   3057.2 |
+| WARM B deny (outside reach) |     54.7 |    125.5 |     63.6 |    258.3 |
+| WARM C granted (PUT merge via approval) |     66.7 |    144.9 |     76.5 |   3210.2 |
+| WARM D spawn (limits) |     33.2 |     74.6 |     37.6 |   2405.8 |
+
+## depth 2: 4 blocks, 29 checks, 5972 bytes
+
+### depth 2: WARM, step 2: as step 1, fuel only
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     51.8 |    120.9 |     64.8 |   2721.2 |
+| WARM B deny (outside reach) |     72.9 |    161.8 |     88.9 |   2861.6 |
+| WARM C granted (PUT merge via approval) |     89.9 |    195.9 |    103.0 |    235.2 |
+| WARM D spawn (limits) |     43.6 |    104.5 |     51.9 |    173.0 |
+
+## depth 3: 5 blocks, 38 checks, 7432 bytes
+
+### depth 3: WARM, step 2: as step 1, fuel only
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     66.5 |    149.6 |     87.4 |   3008.7 |
+| WARM B deny (outside reach) |     89.4 |    196.7 |    111.4 |   2760.7 |
+| WARM C granted (PUT merge via approval) |    112.7 |    238.0 |    129.5 |    293.2 |
+| WARM D spawn (limits) |     53.8 |    122.7 |     63.4 |    232.9 |
+
+## depth 4: 6 blocks, 47 checks, 8746 bytes
+
+### depth 4: WARM, step 2: as step 1, fuel only
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     76.5 |    170.9 |     95.7 |   2844.3 |
+| WARM B deny (outside reach) |    106.4 |    226.9 |    129.6 |   2883.1 |
+| WARM C granted (PUT merge via approval) |    140.0 |    278.8 |    160.8 |   2660.1 |
+| WARM D spawn (limits) |     64.4 |    143.5 |     76.7 |   3592.5 |
+
+## depth 5: 7 blocks, 56 checks, 10018 bytes
+
+### depth 5: WARM, step 2: as step 1, fuel only
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| WARM A allow (GET in reach) |     90.6 |    197.9 |    111.8 |    318.9 |
+| WARM B deny (outside reach) |    127.9 |    253.4 |    146.3 |   2927.9 |
+| WARM C granted (PUT merge via approval) |    163.5 |    314.0 |    184.3 |    401.0 |
+| WARM D spawn (limits) |     75.7 |    163.8 |     88.6 |   2751.9 |
+
+## Summary: WARM median / p99 µs
+
+| variant | depth | A | B | C | D |
+|---|---|---|---|---|---|
+| step 2: as step 1, fuel only | 1 | 40.2 / 93.2 | 54.7 / 125.5 | 66.7 / 144.9 | 33.2 / 74.6 |
+| step 2: as step 1, fuel only | 2 | 51.8 / 120.9 | 72.9 / 161.8 | 89.9 / 195.9 | 43.6 / 104.5 |
+| step 2: as step 1, fuel only | 3 | 66.5 / 149.6 | 89.4 / 196.7 | 112.7 / 238.0 | 53.8 / 122.7 |
+| step 2: as step 1, fuel only | 4 | 76.5 / 170.9 | 106.4 / 226.9 | 140.0 / 278.8 | 64.4 / 143.5 |
+| step 2: as step 1, fuel only | 5 | 90.6 / 197.9 | 127.9 / 253.4 | 163.5 / 314.0 | 75.7 / 163.8 |

@@ -1,0 +1,241 @@
+{"ev":"listening","port":38499,"ts":1794385991977}
+{"bytes":408,"epoch":null,"ev":"accepted","t":"key","ts":1794385991978}
+{"bytes":420,"epoch":0,"ev":"accepted","t":"snap","ts":1794385991978}
+{"bytes":445,"epoch":0,"ev":"accepted","t":"fresh","ts":1794385991979}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794385991980}
+{"bytes":45879,"epoch":1,"ev":"accepted","t":"delta","ts":1794385992007}
+{"bytes":24705,"epoch":2,"ev":"accepted","t":"delta","ts":1794385992008}
+{"bytes":24999,"epoch":3,"ev":"accepted","t":"delta","ts":1794385992011}
+{"bytes":24999,"epoch":4,"ev":"accepted","t":"delta","ts":1794385992013}
+{"bytes":24999,"epoch":5,"ev":"accepted","t":"delta","ts":1794385992016}
+{"bytes":24999,"epoch":6,"ev":"accepted","t":"delta","ts":1794385992019}
+{"bytes":24999,"epoch":7,"ev":"accepted","t":"delta","ts":1794385992021}
+{"bytes":24999,"epoch":8,"ev":"accepted","t":"delta","ts":1794385992025}
+{"bytes":24999,"epoch":9,"ev":"accepted","t":"delta","ts":1794385992028}
+{"bytes":25000,"epoch":10,"ev":"accepted","t":"delta","ts":1794385992033}
+{"bytes":25000,"epoch":11,"ev":"accepted","t":"delta","ts":1794385992034}
+{"bytes":633,"epoch":12,"ev":"accepted","t":"delta","ts":1794385992034}
+{"bytes":629,"epoch":13,"ev":"accepted","t":"delta","ts":1794385992136}
+{"bytes":455,"epoch":14,"ev":"accepted","t":"delta","ts":1794385992237}
+{"bytes":629,"epoch":15,"ev":"accepted","t":"delta","ts":1794385992337}
+{"bytes":455,"epoch":16,"ev":"accepted","t":"delta","ts":1794385992437}
+{"bytes":447,"epoch":16,"ev":"accepted","t":"fresh","ts":1794385992452}
+{"bytes":629,"epoch":17,"ev":"accepted","t":"delta","ts":1794385992538}
+{"bytes":455,"epoch":18,"ev":"accepted","t":"delta","ts":1794385992638}
+{"bytes":629,"epoch":19,"ev":"accepted","t":"delta","ts":1794385992739}
+{"bytes":455,"epoch":20,"ev":"accepted","t":"delta","ts":1794385992839}
+{"bytes":629,"epoch":21,"ev":"accepted","t":"delta","ts":1794385992939}
+{"bytes":447,"epoch":21,"ev":"accepted","t":"fresh","ts":1794385992952}
+{"bytes":455,"epoch":22,"ev":"accepted","t":"delta","ts":1794385993040}
+{"bytes":633,"epoch":23,"ev":"accepted","t":"delta","ts":1794385993140}
+{"bytes":455,"epoch":24,"ev":"accepted","t":"delta","ts":1794385993241}
+{"bytes":633,"epoch":25,"ev":"accepted","t":"delta","ts":1794385993341}
+{"bytes":455,"epoch":26,"ev":"accepted","t":"delta","ts":1794385993441}
+{"bytes":447,"epoch":26,"ev":"accepted","t":"fresh","ts":1794385993453}
+{"bytes":633,"epoch":27,"ev":"accepted","t":"delta","ts":1794385993542}
+{"bytes":455,"epoch":28,"ev":"accepted","t":"delta","ts":1794385993642}
+{"bytes":633,"epoch":29,"ev":"accepted","t":"delta","ts":1794385993743}
+{"bytes":453,"epoch":30,"ev":"accepted","t":"delta","ts":1794385993843}
+{"bytes":633,"epoch":31,"ev":"accepted","t":"delta","ts":1794385993943}
+{"bytes":447,"epoch":31,"ev":"accepted","t":"fresh","ts":1794385993953}
+{"bytes":455,"epoch":32,"ev":"accepted","t":"delta","ts":1794385994044}
+{"bytes":633,"epoch":33,"ev":"accepted","t":"delta","ts":1794385994144}
+{"bytes":455,"epoch":34,"ev":"accepted","t":"delta","ts":1794385994245}
+{"bytes":633,"epoch":35,"ev":"accepted","t":"delta","ts":1794385994345}
+{"bytes":455,"epoch":36,"ev":"accepted","t":"delta","ts":1794385994445}
+{"bytes":447,"epoch":36,"ev":"accepted","t":"fresh","ts":1794385994453}
+{"bytes":633,"epoch":37,"ev":"accepted","t":"delta","ts":1794385994546}
+{"bytes":455,"epoch":38,"ev":"accepted","t":"delta","ts":1794385994647}
+{"bytes":633,"epoch":39,"ev":"accepted","t":"delta","ts":1794385994747}
+{"bytes":455,"epoch":40,"ev":"accepted","t":"delta","ts":1794385994847}
+{"bytes":633,"epoch":41,"ev":"accepted","t":"delta","ts":1794385994948}
+{"bytes":447,"epoch":41,"ev":"accepted","t":"fresh","ts":1794385994954}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385995838}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385996239}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385997441}
+{"ev":"mode","from":"fresh","to":"narrow","ts":1794385997954}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385998644}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385998844}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385999045}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385999446}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385999646}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794385999847}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386000247}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386000448}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386000648}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386000849}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386001250}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386001450}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386002252}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386002653}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386003455}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386003855}
+{"ev":"mode","from":"narrow","to":"closed","ts":1794386003953}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386004056}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386004858}
+{"bytes":408,"epoch":41,"ev":"accepted","t":"key","ts":1794386005059}
+{"bytes":455,"epoch":42,"ev":"accepted","t":"delta","ts":1794386005059}
+{"bytes":633,"epoch":43,"ev":"accepted","t":"delta","ts":1794386005060}
+{"bytes":455,"epoch":44,"ev":"accepted","t":"delta","ts":1794386005060}
+{"bytes":633,"epoch":45,"ev":"accepted","t":"delta","ts":1794386005060}
+{"bytes":455,"epoch":46,"ev":"accepted","t":"delta","ts":1794386005061}
+{"bytes":633,"epoch":47,"ev":"accepted","t":"delta","ts":1794386005061}
+{"bytes":455,"epoch":48,"ev":"accepted","t":"delta","ts":1794386005061}
+{"bytes":633,"epoch":49,"ev":"accepted","t":"delta","ts":1794386005061}
+{"bytes":455,"epoch":50,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":633,"epoch":51,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":455,"epoch":52,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":633,"epoch":53,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":455,"epoch":54,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":633,"epoch":55,"ev":"accepted","t":"delta","ts":1794386005062}
+{"bytes":455,"epoch":56,"ev":"accepted","t":"delta","ts":1794386005063}
+{"bytes":633,"epoch":57,"ev":"accepted","t":"delta","ts":1794386005063}
+{"bytes":455,"epoch":58,"ev":"accepted","t":"delta","ts":1794386005063}
+{"bytes":633,"epoch":59,"ev":"accepted","t":"delta","ts":1794386005063}
+{"bytes":453,"epoch":60,"ev":"accepted","t":"delta","ts":1794386005063}
+{"bytes":633,"epoch":61,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":455,"epoch":62,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":632,"epoch":63,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":453,"epoch":64,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":632,"epoch":65,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":455,"epoch":66,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":632,"epoch":67,"ev":"accepted","t":"delta","ts":1794386005064}
+{"bytes":455,"epoch":68,"ev":"accepted","t":"delta","ts":1794386005065}
+{"bytes":632,"epoch":69,"ev":"accepted","t":"delta","ts":1794386005065}
+{"bytes":455,"epoch":70,"ev":"accepted","t":"delta","ts":1794386005065}
+{"bytes":632,"epoch":71,"ev":"accepted","t":"delta","ts":1794386005065}
+{"bytes":455,"epoch":72,"ev":"accepted","t":"delta","ts":1794386005065}
+{"bytes":633,"epoch":73,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":453,"epoch":74,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":633,"epoch":75,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":455,"epoch":76,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":633,"epoch":77,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":455,"epoch":78,"ev":"accepted","t":"delta","ts":1794386005066}
+{"bytes":633,"epoch":79,"ev":"accepted","t":"delta","ts":1794386005067}
+{"bytes":455,"epoch":80,"ev":"accepted","t":"delta","ts":1794386005067}
+{"bytes":633,"epoch":81,"ev":"accepted","t":"delta","ts":1794386005067}
+{"bytes":455,"epoch":82,"ev":"accepted","t":"delta","ts":1794386005067}
+{"bytes":633,"epoch":83,"ev":"accepted","t":"delta","ts":1794386005067}
+{"bytes":455,"epoch":84,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":633,"epoch":85,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":455,"epoch":86,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":633,"epoch":87,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":455,"epoch":88,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":633,"epoch":89,"ev":"accepted","t":"delta","ts":1794386005068}
+{"bytes":455,"epoch":90,"ev":"accepted","t":"delta","ts":1794386005069}
+{"bytes":633,"epoch":91,"ev":"accepted","t":"delta","ts":1794386005069}
+{"bytes":455,"epoch":92,"ev":"accepted","t":"delta","ts":1794386005069}
+{"bytes":633,"epoch":93,"ev":"accepted","t":"delta","ts":1794386005069}
+{"bytes":455,"epoch":94,"ev":"accepted","t":"delta","ts":1794386005069}
+{"bytes":633,"epoch":95,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":455,"epoch":96,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":633,"epoch":97,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":455,"epoch":98,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":633,"epoch":99,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":456,"epoch":100,"ev":"accepted","t":"delta","ts":1794386005070}
+{"bytes":635,"epoch":101,"ev":"accepted","t":"delta","ts":1794386005071}
+{"bytes":456,"epoch":102,"ev":"accepted","t":"delta","ts":1794386005071}
+{"bytes":635,"epoch":103,"ev":"accepted","t":"delta","ts":1794386005071}
+{"bytes":456,"epoch":104,"ev":"accepted","t":"delta","ts":1794386005071}
+{"bytes":635,"epoch":105,"ev":"accepted","t":"delta","ts":1794386005071}
+{"bytes":456,"epoch":106,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":635,"epoch":107,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":456,"epoch":108,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":635,"epoch":109,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":456,"epoch":110,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":635,"epoch":111,"ev":"accepted","t":"delta","ts":1794386005072}
+{"bytes":456,"epoch":112,"ev":"accepted","t":"delta","ts":1794386005073}
+{"bytes":636,"epoch":113,"ev":"accepted","t":"delta","ts":1794386005073}
+{"bytes":456,"epoch":114,"ev":"accepted","t":"delta","ts":1794386005073}
+{"bytes":636,"epoch":115,"ev":"accepted","t":"delta","ts":1794386005073}
+{"bytes":456,"epoch":116,"ev":"accepted","t":"delta","ts":1794386005073}
+{"bytes":636,"epoch":117,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":456,"epoch":118,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":636,"epoch":119,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":456,"epoch":120,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":636,"epoch":121,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":456,"epoch":122,"ev":"accepted","t":"delta","ts":1794386005074}
+{"bytes":637,"epoch":123,"ev":"accepted","t":"delta","ts":1794386005075}
+{"bytes":456,"epoch":124,"ev":"accepted","t":"delta","ts":1794386005075}
+{"bytes":637,"epoch":125,"ev":"accepted","t":"delta","ts":1794386005075}
+{"bytes":456,"epoch":126,"ev":"accepted","t":"delta","ts":1794386005075}
+{"bytes":637,"epoch":127,"ev":"accepted","t":"delta","ts":1794386005075}
+{"bytes":456,"epoch":128,"ev":"accepted","t":"delta","ts":1794386005076}
+{"bytes":637,"epoch":129,"ev":"accepted","t":"delta","ts":1794386005076}
+{"bytes":456,"epoch":130,"ev":"accepted","t":"delta","ts":1794386005076}
+{"bytes":637,"epoch":131,"ev":"accepted","t":"delta","ts":1794386005076}
+{"bytes":455,"epoch":132,"ev":"accepted","t":"delta","ts":1794386005077}
+{"bytes":637,"epoch":133,"ev":"accepted","t":"delta","ts":1794386005077}
+{"bytes":456,"epoch":134,"ev":"accepted","t":"delta","ts":1794386005077}
+{"bytes":637,"epoch":135,"ev":"accepted","t":"delta","ts":1794386005077}
+{"bytes":456,"epoch":136,"ev":"accepted","t":"delta","ts":1794386005077}
+{"bytes":637,"epoch":137,"ev":"accepted","t":"delta","ts":1794386005078}
+{"bytes":456,"epoch":138,"ev":"accepted","t":"delta","ts":1794386005078}
+{"bytes":637,"epoch":139,"ev":"accepted","t":"delta","ts":1794386005078}
+{"bytes":456,"epoch":140,"ev":"accepted","t":"delta","ts":1794386005078}
+{"bytes":637,"epoch":141,"ev":"accepted","t":"delta","ts":1794386005078}
+{"bytes":448,"epoch":141,"ev":"accepted","t":"fresh","ts":1794386005079}
+{"bytes":455,"epoch":142,"ev":"accepted","t":"delta","ts":1794386005079}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794386005080}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386005482}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386007485}
+{"ev":"mode","from":"fresh","to":"narrow","ts":1794386008059}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386008287}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386008889}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386010091}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386010291}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386011293}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386011494}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386011694}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386012696}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386012897}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386013298}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386013699}
+{"ev":"mode","from":"narrow","to":"closed","ts":1794386014060}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386014100}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386014901}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386015302}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386016304}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386016505}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386016906}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386017107}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386017508}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386018309}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386018710}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386018911}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386019112}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386019512}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386019713}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386020515}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386021718}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386022119}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386022519}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386022720}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386022920}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386023121}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386024725}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386024925}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386025727}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386025927}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386026128}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386026329}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386026530}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386026730}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386027331}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386027933}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386028334}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386028734}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386029937}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386031139}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386032342}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386033544}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386033745}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386033945}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386034146}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386034346}
+{"error":"Connection reset by peer (os error 104)","ev":"feed_error","ts":1794386034747}
+{"bytes":408,"epoch":142,"ev":"accepted","t":"key","ts":1794386035149}
+{"bytes":261192,"epoch":441,"ev":"accepted","t":"snap","ts":1794386035162}
+{"bytes":448,"epoch":441,"ev":"accepted","t":"fresh","ts":1794386035162}
+{"bytes":456,"epoch":442,"ev":"accepted","t":"delta","ts":1794386035163}
+{"ev":"mode","from":"closed

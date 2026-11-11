@@ -1,0 +1,73 @@
+{"ev":"listening","port":44885,"ts":1794385886722}
+{"bytes":408,"epoch":null,"ev":"accepted","t":"key","ts":1794385886723}
+{"bytes":420,"epoch":0,"ev":"accepted","t":"snap","ts":1794385886724}
+{"bytes":445,"epoch":0,"ev":"accepted","t":"fresh","ts":1794385886724}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794385886725}
+{"bytes":45879,"epoch":1,"ev":"accepted","t":"delta","ts":1794385886752}
+{"bytes":24705,"epoch":2,"ev":"accepted","t":"delta","ts":1794385886753}
+{"bytes":24999,"epoch":3,"ev":"accepted","t":"delta","ts":1794385886755}
+{"bytes":24999,"epoch":4,"ev":"accepted","t":"delta","ts":1794385886757}
+{"bytes":24999,"epoch":5,"ev":"accepted","t":"delta","ts":1794385886759}
+{"bytes":24999,"epoch":6,"ev":"accepted","t":"delta","ts":1794385886761}
+{"bytes":24999,"epoch":7,"ev":"accepted","t":"delta","ts":1794385886763}
+{"bytes":24999,"epoch":8,"ev":"accepted","t":"delta","ts":1794385886765}
+{"bytes":24999,"epoch":9,"ev":"accepted","t":"delta","ts":1794385886767}
+{"bytes":25000,"epoch":10,"ev":"accepted","t":"delta","ts":1794385886772}
+{"bytes":25000,"epoch":11,"ev":"accepted","t":"delta","ts":1794385886774}
+{"bytes":633,"epoch":12,"ev":"accepted","t":"delta","ts":1794385886775}
+{"bytes":639,"epoch":13,"ev":"accepted","t":"delta","ts":1794385886776}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385887277}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385887477}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385887678}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385887878}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385888079}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385888279}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385888479}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385888680}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385888880}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385889081}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385889281}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385889481}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385889682}
+{"ev":"mode","from":"fresh","to":"narrow","ts":1794385889720}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385889882}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385890083}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385890283}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385890484}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385890684}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385890885}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385891086}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385891287}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385891487}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385891688}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385891888}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385892089}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385892289}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385892489}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385892690}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385892890}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385893091}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385893291}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385893492}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385893692}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385893892}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385894093}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385894293}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385894493}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385894694}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385894894}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385895094}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385895295}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385895495}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385895695}
+{"ev":"mode","from":"narrow","to":"closed","ts":1794385895720}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385895896}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385896096}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385896296}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385896497}
+{"error":"Connection refused (os error 111)","ev":"feed_error","ts":1794385896697}
+{"bytes":408,"epoch":13,"ev":"accepted","t":"key","ts":1794385896898}
+{"bytes":447,"epoch":13,"ev":"accepted","t":"fresh","ts":1794385896898}
+{"bytes":456,"epoch":14,"ev":"accepted","t":"delta","ts":1794385896899}
+{"bytes":633,"epoch":15,"ev":"accepted","t":"delta","ts":1794385896899}
+{"ev":"mode","from":"closed","to":"fresh","ts":1794385896899}

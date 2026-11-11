@@ -1,0 +1,2704 @@
+[
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 51
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 101
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 151
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 201
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 251
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 301
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 351
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 401
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 452
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 502
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 552
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 602
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 653
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 703
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 753
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 803
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 853
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 903
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 953
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1004
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1054
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1104
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1154
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1204
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1254
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1304
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1354
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1404
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": true,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1454
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1504
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1554
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1604
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1654
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1704
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1754
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1804
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1855
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1906
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 1956
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2006
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2057
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2107
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2157
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2207
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2257
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2307
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2357
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2407
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2458
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2508
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2558
+  },
+  {
+    "allow": {
+      "approve": true,
+      "forbidden": false,
+      "granted_op": true,
+      "new_lease": true,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": true,
+      "write_R2": true
+    },
+    "mode": "fresh",
+    "t": 2608
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2658
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2708
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2758
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2808
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2858
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2908
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 2958
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3008
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3058
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3108
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3158
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3208
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3258
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3308
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3358
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3408
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3458
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3508
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3558
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3608
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3658
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3708
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3758
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3809
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3859
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3909
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 3959
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4009
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4059
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4110
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4160
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4210
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4260
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4310
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4360
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4410
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4461
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4511
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4561
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4612
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4662
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4712
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4762
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4813
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4863
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4913
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 4964
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5014
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5064
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5114
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5164
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5214
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5264
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5314
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5364
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5414
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5464
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5514
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5564
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5614
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5664
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5714
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5764
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5814
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5864
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5914
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 5964
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6014
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6064
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6114
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6164
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6214
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6264
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6314
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6364
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6414
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6464
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6514
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6564
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6614
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6664
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6715
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6765
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6815
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6865
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6915
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 6965
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7015
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7065
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7115
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7165
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7215
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7265
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7315
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7365
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7415
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7465
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7515
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7566
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7616
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7666
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7716
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7766
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7816
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7866
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7916
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 7966
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8016
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8066
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8116
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8166
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8216
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8267
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8317
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8367
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8417
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8468
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8518
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8568
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": true,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "narrow",
+    "t": 8618
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8668
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8718
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8768
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8819
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8869
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8919
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 8969
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9019
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9069
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9119
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9169
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9219
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9270
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9320
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9370
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9420
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9470
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9520
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9570
+  },
+  {
+    "allow": {
+      "approve": false,
+      "forbidden": false,
+      "granted_op": false,
+      "new_lease": false,
+      "read_R1": false,
+      "short_grant": false,
+      "spawn": false,
+      "write_R2": false
+    },
+    "mode": "closed",
+    "t": 9620
+  }
+]

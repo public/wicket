@@ -1,0 +1,41 @@
+## World size per request (generous limits)
+
+| depth | scenario | facts | iterations | min max_facts | min max_iterations | run time µs |
+|---|---|---|---|---|---|---|
+| 1 | A allow (GET in reach) | 19 | 1 | 20 | 2 | 85.8 |
+| 1 | B deny (outside reach) | 19 | 1 | 1 | 1 | 155.9 |
+| 1 | C granted (PUT merge via approval) | 19 | 1 | 20 | 2 | 119.8 |
+| 1 | D spawn (limits) | 14 | 1 | 15 | 2 | 66.4 |
+| 2 | A allow (GET in reach) | 20 | 1 | 21 | 2 | 157.0 |
+| 2 | B deny (outside reach) | 20 | 1 | 1 | 1 | 201.5 |
+| 2 | C granted (PUT merge via approval) | 20 | 1 | 21 | 2 | 159.3 |
+| 2 | D spawn (limits) | 15 | 1 | 16 | 2 | 82.7 |
+| 3 | A allow (GET in reach) | 21 | 1 | 22 | 2 | 160.6 |
+| 3 | B deny (outside reach) | 21 | 1 | 1 | 1 | 267.3 |
+| 3 | C granted (PUT merge via approval) | 21 | 1 | 22 | 2 | 193.7 |
+| 3 | D spawn (limits) | 16 | 1 | 17 | 2 | 101.6 |
+| 4 | A allow (GET in reach) | 22 | 1 | 23 | 2 | 139.9 |
+| 4 | B deny (outside reach) | 22 | 1 | 1 | 1 | 298.4 |
+| 4 | C granted (PUT merge via approval) | 22 | 1 | 23 | 2 | 271.2 |
+| 4 | D spawn (limits) | 17 | 1 | 18 | 2 | 125.8 |
+| 5 | A allow (GET in reach) | 23 | 1 | 24 | 2 | 187.3 |
+| 5 | B deny (outside reach) | 23 | 1 | 1 | 1 | 351.1 |
+| 5 | C granted (PUT merge via approval) | 23 | 1 | 24 | 2 | 281.8 |
+| 5 | D spawn (limits) | 18 | 1 | 19 | 2 | 151.6 |
+
+## What happens at each limit (depth 5, request A)
+
+- max_facts = facts - 1: denied: Reached Datalog execution limits
+- max_facts = facts: denied: Reached Datalog execution limits
+- max_iterations = 1: denied: Reached Datalog execution limits
+- max_time = 1 µs: denied: Reached Datalog execution limits
+- defaults (1000 facts, 100 iterations, 1 ms): allowed
+
+## Hostile holder blocks: an appended block that tries to exhaust the verifier
+
+- fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) [defaults]: denied: Reached Datalog execution limits — time to decide median 2752 µs, p99 3539 µs, token 10615 bytes
+- fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) [max_facts 1000, max_iterations 100, max_time 50ms]: denied: Reached Datalog execution limits — time to decide median 2884 µs, p99 5179 µs, token 10615 bytes
+- iteration chain: 150 rules r_i+1 <- r_i [defaults]: denied: Reached Datalog execution limits — time to decide median 2400 µs, p99 3431 µs, token 14242 bytes
+- iteration chain: 150 rules r_i+1 <- r_i [max_facts 1000, max_iterations 100, max_time 50ms]: denied: Reached Datalog execution limits — time to decide median 22316 µs, p99 40157 µs, token 14242 bytes
+- expensive checks: 200 regex checks [defaults]: denied: Reached Datalog execution limits — time to decide median 2658 µs, p99 3978 µs, token 26022 bytes
+- expensive checks: 200 regex checks [max_facts 1000, max_iterations 100, max_time 50ms]: allowed — time to decide median 13016 µs, p99 24523 µs, token 26022 bytes

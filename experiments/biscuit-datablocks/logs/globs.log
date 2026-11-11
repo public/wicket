@@ -1,0 +1,6 @@
+| model pattern | wicket glob | path | A (prefix + path_depth) | B (CompiledZone) |
+|---|---|---|---|---|
+| OneSegment("/tokio/") | `/tokio/*` | `/tokio/` | false | true |
+| OneSegment("/tokio/") | `/tokio/*` | `/tokio/latest/` | true | false |
+
+2 of 72 (pattern, path) pairs differ

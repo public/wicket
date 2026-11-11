@@ -1,0 +1,56 @@
+differential test: 2000 random chains × 50 random requests, seed 76
+reference: design A, the fork's compiled evaluator (step 3) with fuel PreparedLimits { max_facts: 256, max_iterations: 8, max_steps: 4000, max_time: None }, decided whether or not the lint accepts the token
+
+DIVERGENCE [Wicket] chain 55 (leaf 1, grant signer approver, holder None): A deny / B allow
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/", risk: 0, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1/b9", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 2, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 2, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 1, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 0, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 3, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 2, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+DIVERGENCE [Wicket] chain 317 (leaf 1, grant signer attacker, holder None): A allow / B deny
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0/b1", epoch: 4, op: Http { host: "docs.rs", method: "GET", path: "/tokio/latest/", risk: 0, inject: Some("api.github.com|Authorization|gh-app-acme") }, uses_left: [("g-7f3a", 1)] }
+... 500 chains, 25000 requests, 7 s
+DIVERGENCE [Wicket] chain 738 (leaf 0, grant signer approver, holder None): A deny / B allow
+  request: Request { time: 1794413520, tenant: "acme", node: "node-lon-1", box_id: "b0", epoch: 4, op: Http { host: "docs.rs", method: "GET", path: "/tokio/", risk: 0, inject: None }, uses_left: [("g-7f3a", 1)] }
+... 1000 chains, 50000 requests, 13 s
+... 1500 chains, 75000 requests, 21 s
+... 2000 chains, 100000 requests, 27 s
+
+100000 requests: design A allowed 17783, denied 82217.
+1537 of 2000 chains have a link wider than its parent somewhere (plain::narrows); all were decided by intersection.
+design A's lint would reject 591 of 2000 chains (decided anyway): {"`check all` not allowed": 41, "fact not allowed: approved": 36, "first-party blocks may not carry rules": 43, "signed by a key no first-party block trusts": 440, "term not allowed: Map({})": 31}
+
+## Decisions on tokens the design loaded
+
+| design | same as A | different |
+|---|---|---|
+| B, CompiledZone | 95942 | 8 |
+| B, model matcher | 95950 | 0 |
+| C (decides with A) | 70450 | 0 |
+
+C's built-in cross-check (B's decision next to A's on C tokens): 2 disagreements in 70450 decisions.
+
+## B (CompiledZone) disagreements by cause
+
+- 6: matcher: wicket glob vs A's prefix (A allow, B deny, path /tokio/latest/)
+- 2: matcher: wicket glob vs A's prefix (A deny, B allow, path /tokio/)
+
+## Tokens refused at load (B: extractor; C: lint + extractor)
+
+| reason | chains | requests design A allowed on them |
+|---|---|---|
+| B: extract: rules, checks and scopes are not allowed | 43 | 359 |
+| B: extract: unexpected grant fact | 38 | 345 |
+| C: lint: `check all` not allowed | 41 | 134 |
+| C: lint: fact not allowed: approved | 36 | 337 |
+| C: lint: first-party blocks may not carry rules | 43 | 359 |
+| C: lint: signed by a key no first-party block trusts | 440 | 3709 |
+| C: lint: term not allowed: Map({}) | 31 | 155 |
+
+elapsed 27 s

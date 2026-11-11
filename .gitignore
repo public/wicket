@@ -1,3 +1,6 @@
 refs/papers/
 refs/repos/
 target/
+# Experiments: build output and downloaded solver binaries stay local.
+experiments/*/target/
+experiments/*/tools/
