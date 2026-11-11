@@ -3286,6 +3286,7 @@ dependencies = [
  "wicket-core",
  "wicket-feed",
  "wicket-identity",
+ "wicket-placement",
  "wicket-proxy",
  "wicket-sandbox",
  "wicket-store",
@@ -3335,6 +3336,28 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "wicket-placement"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]

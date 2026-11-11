@@ -1,0 +1,67 @@
+== what Claude Code left in state/ (bytes, files)
+./claude                                    1010807     5
+./claude/.claude.json                           892     1
+./claude/.last-cleanup                           24     1
+./claude/backups                                 84     1
+./claude/plugins                                 92     1
+./claude/projects                           1009715     1
+./claude/session-env                              0     0
+./claude/sessions                                 0     0
+./claude/shell-snapshots                          0     0
+./home                                         3316     1
+./home/.cache                                  3316     1
+session jsonl: 113 lines, 1009715 bytes
+== push (hibernate): minimal bundle = projects/ + workspace + volume
+push total .487941307 s
+time digest:state/claude/projects .019896895
+time pack:state/claude/projects .030195157
+time upload:state/claude/projects .009061088
+time digest:workspace .141797675
+time pack:workspace .097498473
+time upload:workspace .019129473
+time digest:vol-cache .015176755
+time pack:vol-cache .014048184
+time upload:vol-cache .006152782
+store bytes 9641342
+  state/claude/projects    raw    1009715  stored    201750
+  workspace                raw   11270750  stored   9411655
+  vol-cache                raw     108894  stored     27236
+== a second push of the same seq is refused (put-if-absent manifest)
+manifest seq 1 already exists: refused
+== wake 1: pull + unpack + verify, then rebuild and resume
+ok state/claude/projects
+ok workspace
+ok vol-cache
+pull total .447389160 s
+time download:state/claude/projects .006808746
+time unpack:state/claude/projects .025383599
+time verify:state/claude/projects .030965487
+time download:workspace .013517942
+time unpack:workspace .160365309
+time verify:workspace .104831022
+time download:vol-cache .004357665
+time unpack:vol-cache .014817351
+time verify:vol-cache .012858919
+box run total 4.773397014 s; whole wake (pull..exit) 5.234111602 s
+first stdout line (init)   at 3.539 s after docker run
+first assistant event      at 3.939 s
+result event               at 4.500 s
+agent said: RESUMED messages_before_wake=46 task_marker=True t1_done_marker=True
+ids in output: "session_id":"<the hibernated session>"
+workspace edit survived: 2 edited lines; volume: 20000 lines
+== negative control: wake with the workspace but without projects/ (session lost)
+stdout: 2.482 {"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"<session>","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creatio
+stderr: No conversation found with session ID: <session> 
+== cwd matters: same bundle, workspace mounted at /work instead of /workspace
+stdout: RESUMED messages_before_wake=51 task_marker=True t1_done_marker=True
+stderr: 
+project dirs after: -work -workspace ; jsonl files: -workspace/<id>.jsonl 
+== --fork-session: a new session id from the same transcript; the original is untouched
+original jsonl unchanged: yes; jsonl files now: 2
+agent said: RESUMED messages_before_wake=51 task_marker=True t1_done_marker=True
+== cleanupPeriodDays: a 40-day-old transcript, then a new session kept open 30 s (the sweep is not immediate)
+cleanupPeriodDays=default: .last-cleanup written; old transcript DELETED
+cleanupPeriodDays=3650: .last-cleanup written; old transcript kept
+== the same, but the wake resumes the old session itself (default settings)
+resumed wake, default cleanupPeriodDays: answered 1 turn; transcript kept
+done
