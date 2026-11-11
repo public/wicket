@@ -1,0 +1,19 @@
+# Session 1 of the hibernate experiment: a scripted ~20-step coding session (mock_llm.py), with a
+# workspace mounted in place and one named volume, so every tree a hibernate bundle holds exists.
+task: |
+  HIB-TASK-ALPHA Survey this repository, keep notes in /workspace/notes, and stop.
+agent:
+  name: hib
+  max_turns: 40
+  idle_timeout: 5s
+zone:
+  name: hib
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  volumes:
+    - { name: cache, path: /volumes/cache }
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:9971
+  limits: { memory: 2g, cpus: 1, timeout: 10m }

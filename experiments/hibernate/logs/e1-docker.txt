@@ -1,0 +1,6 @@
+docker box answered: 1 result
+runsc root used by Docker: /run/docker/runtime-runc/moby
+runsc checkpoint of the Docker container: exit 0 in .262145142 s; 
+image bytes: 115358367
+docker now says: 
+(the box used --rm, so Docker removed it: there is no container left to 'docker start --checkpoint' into)
