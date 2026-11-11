@@ -139,7 +139,7 @@ enum Cmd {
         #[arg(long, default_value = "images/claude-code")]
         dir: PathBuf,
     },
-    /// Serve the operator console (runs, pending approvals, activity) on loopback.
+    /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs) on loopback.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
@@ -378,11 +378,26 @@ pub fn issuer_key_path() -> PathBuf {
     home.join(".config/wicket/identity/issuer.key")
 }
 
-/// The principal behind a run started from this CLI: the local unix user. That is all the PoC CLI
-/// knows; runs started from the console would carry the passkey-authenticated operator instead.
+/// The principal behind a root run: the local unix user, which is all the PoC CLI knows, unless
+/// WICKET_PRINCIPAL names one. The console sets it for the runs it starts, to the passkey-signed-in
+/// operator (serve::console_principal), and records the passkey assertion over it (with the run id
+/// and the manifest's digest) in the audit log; that signed record is what binds operator, run and
+/// principal. The variable itself carries no more assurance than $USER: anyone who can run `wicket`
+/// as this user could set either. It must be a JSON object with string `type`, `id` and `via`, or
+/// it is ignored.
 pub fn cli_principal() -> serde_json::Value {
+    if let Some(p) = principal_from_env(std::env::var("WICKET_PRINCIPAL").ok().as_deref()) {
+        return p;
+    }
     let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
     serde_json::json!({ "type": "human", "id": user, "via": "cli", "assurance": "unix-user" })
+}
+
+/// WICKET_PRINCIPAL's value, if it is a well-formed principal.
+fn principal_from_env(v: Option<&str>) -> Option<serde_json::Value> {
+    let p: serde_json::Value = serde_json::from_str(v?).ok()?;
+    let is_str = |k: &str| p.get(k).is_some_and(|v| v.is_string());
+    (p.is_object() && is_str("type") && is_str("id") && is_str("via")).then_some(p)
 }
 
 /// The trust domain asked for in the environment, if any. The installation's own is recorded with
@@ -575,7 +590,7 @@ async fn main() -> Result<()> {
                 let n = l.verify_audit()?;
                 println!("audit chain OK: {n} records");
                 let (ok, bad) = verify_signed_decisions(&l)?;
-                println!("passkey-signed decisions: {ok} verified offline, {bad} failed");
+                println!("passkey-signed decisions and console actions: {ok} verified offline, {bad} failed");
                 let (iok, ibad) = verify_identities_and_messages(&l)?;
                 println!("agent identities and signed messages: {iok} verified offline, {ibad} failed");
                 if bad + ibad > 0 {
@@ -701,8 +716,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Re-verifies every passkey-signed decision in the audit log from the stored public keys alone: the
-/// signature must cover exactly the recorded decision.
 /// Verifies every issued identity (at its issue time) and every stored envelope (at its send time).
 fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize)> {
     let (mut ok, mut bad) = (0, 0);
@@ -745,24 +758,35 @@ fn verify_identities_and_messages(l: &Ledger) -> Result<(usize, usize)> {
     Ok((ok, bad))
 }
 
+/// Re-verifies every passkey-signed record in the audit log (decisions and the console's other
+/// actions) from the stored public keys alone: the signature must cover exactly what was recorded.
 fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
     use wicket_auth::{decision_challenge, unb64u, Credential, RelyingParty};
     let keys = l.operator_credentials_all(&TenantId::single())?;
     let (mut ok, mut bad) = (0, 0);
-    for (seq, _, kind, _, body) in l.audit_tail(usize::MAX >> 1)? {
-        if kind != "decision" {
-            continue;
-        }
+    for (seq, _, kind, run, body) in l.audit_tail(usize::MAX >> 1)? {
         let v: serde_json::Value = serde_json::from_str(&body)?;
         let Some(s) = v.get("signed") else { continue };
         let get = |k: &str| s.get(k).and_then(|x| x.as_str()).unwrap_or("");
         let result = (|| -> Result<()> {
             let key = keys.iter().find(|k| k.id == get("credential")).ok_or_else(|| anyhow::anyhow!("unknown credential"))?;
             let rp = RelyingParty { rp_id: get("rp_id").into(), origin: get("origin").into() };
-            let challenge = decision_challenge(&unb64u(get("nonce"))?, get("decision_json"));
-            let decided: serde_json::Value = serde_json::from_str(get("decision_json"))?;
-            if decided.get("request") != v.get("request") || decided.get("decision") != v.get("decision") {
-                bail!("record does not match the signed decision");
+            let signed_json = if kind == "decision" { get("decision_json") } else { get("action_json") };
+            let challenge = decision_challenge(&unb64u(get("nonce"))?, signed_json);
+            let decided: serde_json::Value = serde_json::from_str(signed_json)?;
+            // The record must say what was signed: the same request and decision, or the same action
+            // on the same run (and, for a started run, the same manifest bytes).
+            let same = |k: &str| decided.get(k) == v.get(k);
+            let matches = if kind == "decision" {
+                same("request") && same("decision")
+            } else {
+                same("action")
+                    && same("run")
+                    && run.as_deref() == decided.get("run").and_then(|r| r.as_str())
+                    && (kind != "run.console_start" || (same("manifest_sha256") && same("principal") && same("task")))
+            };
+            if !matches {
+                bail!("record does not match the signed {}", if kind == "decision" { "decision" } else { "action" });
             }
             let cred = Credential { id: unb64u(&key.id)?, x: key.x, y: key.y, sign_count: 0 };
             rp.verify_assertion(
