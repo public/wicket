@@ -703,7 +703,8 @@ commercial Materialize streams are used.)*
    usable without templates. It's all Rust and needs no cloud. It lets a parent agent grant on its own
    node (#50) with no control-plane round trip, and a spawned child carry its authority to another node
    (#57). Its weak point is one moderately maintained dependency, Biscuit, which can be forked and is
-   swappable by design.
+   swappable by design. *(Experiment #59 found Biscuit too slow for the request path, so A uses plain
+   signed records with the same semantics; §6.1.)*
 2. **Architecture B**, if the owner prefers one language and the healthiest single dependency. It's
    simpler to explain. It costs a solver in the spawn path, delegation proofs that live in the ledger
    rather than in a portable artifact, and harder cross-node and federated delegation. It's a reasonable
@@ -719,6 +720,8 @@ commercial Materialize streams are used.)*
   `biscuit-auth`. Distribution is wicket's own signed snapshot and delta feed with a TUF-style freshness
   lease; that's the piece that makes "bounded revocation" and "fail narrow" true. Grants as Biscuit, which
   the issue already mentions, becomes the main path, not an option.
+  *(Updated by experiment #59, §6.1: the node embeds `cedar-policy` only. Grants are plain signed
+  records with Biscuit's semantics, and `biscuit-auth` is a CI dependency.)*
 - §2.1 table: "OpenFGA or Cedar for sharing between tenants" becomes "Cedar entities, materialised from
   wicketd; OpenFGA as an optional source in platform mode".
 
@@ -731,6 +734,92 @@ commercial Materialize streams are used.)*
    new leases, spawns and approvals stop at expiry, and measure revocation latency with push on and off.
 4. The Cedar org schema for #11, #34 and #50 (roles, inspection, request/grant flags), with a Cedar
    Analysis diff in CI.
+
+
+### 6.1 Experiment results (2026-11-11)
+
+Experiments 1–3 ran in `experiments/` (PR #75). Each directory has a `RESULTS.md` with the method, the
+numbers and raw logs. They were run on a shared 4 vCPU VPS, so timings are ±30%. **Architecture A stands,
+with one change: authority is plain signed records rather than Biscuit tokens.**
+
+**1. SymCC on zones (#58): B is not viable; SymCC belongs in CI.** [H, measured]
+- Two encodings of a zone in Cedar were tested (cedar-policy 4.14.1, cedar-policy-symcc 0.8.1, cvc5):
+  - *path as one string*: 25 of 28 containment cases correct, median 131 ms. cvc5 returns `unknown` (after
+    10 s and after 60 s, on cvc5 1.3.1 and 1.4.2) on globs with `*` mid-path, such as
+    `/v1/code/sessions/*/worker/**`;
+  - *path as segment attributes* (depth ≤ 8): 28 of 28 correct, median 229 ms, up to 3.2 s.
+- Both scale superlinearly: at 100 reach rules, 13 s (string) and 2.6 s (segment); at 300, a timeout and
+  30 s. Pruning rules whose hosts can't overlap helps.
+- SymCC is 10³–10⁵ times slower than `subset.rs`, and returns one counterexample per action, not every
+  violation. Once translated back to zone terms, the counterexamples read well.
+- So B would still need A's structural check as a fallback for `unknown` and for listing every
+  violation. Keep A.
+- Uses in CI, all fast enough:
+  - org policy diffs: 0–9 ms per request environment, and the counterexamples name the deciding policies;
+  - *floor ⊆ manifest ⊆ ceiling*: 0.05–0.7 s with the segment model;
+  - a differential oracle for `subset.rs`.
+- CI settings:
+  - pin cvc5 1.3.1;
+  - pass `--tlimit-per`, not `--tlimit` (`LocalSolver::cvc5()`'s default kills the process after 60 s);
+  - treat `unknown` as a failure;
+  - keep range assumptions (such as `0 ≤ risk ≤ 4`) in a shared assumption policy;
+  - list every loosening by blocking each counterexample and re-querying.
+- SymCC found three gaps in the hand-written check (#73):
+  - `subset.rs` ignores forbid rules (safe today only because `spawn.rs` copies the parent's);
+  - it wrongly refuses `…/abc123/worker/**` under `…/*/worker/**`;
+  - `canonical_path` accepts `//`.
+
+**2. Biscuit at depth 5 (#59): the right semantics at the wrong cost.** [H, measured]
+- biscuit-auth 6.0.0 passed all 45 property checks: intersection over every link, attenuation only adds
+  checks, a third-party approval block, revocation by block, and lease expiry.
+- But at spawn depth 5 (56 checks, one approval), a request against an already-verified token costs about
+  1.0–1.2 ms median and 1.7–2.1 ms p99. The cost grows by about 140 µs per level. Plain Ed25519 signed
+  records with the same semantics cost 0.4–0.7 µs.
+- §4's assumption that "each check is microseconds" holds per check (about 3 µs, mostly allocation),
+  not per request.
+- The default `RunLimits` `max_time` of 1 ms is within 2× of the p99, and was exceeded at the maximum, so
+  denials would depend on load. Raising it also raises what a hostile block can burn (13–22 ms seen).
+- The token is 10.0 KB at depth 5, against 7.3 KB of JSON records.
+- Decision:
+  - plain signed records, about 250 lines, with each link signed by a per-box grantor key and bound to the
+    previous link's hash;
+  - the Biscuit compilation is kept as a differential oracle in CI;
+  - avoid `.matches()` and `check all` in any Biscuit encoding;
+  - revisit if biscuit-auth gets a reusable authorizer that evaluates about 50 checks in under 50 µs.
+
+**3. Feed and freshness (#60): fail-narrow works as designed.** [H, measured]
+- The prototype is about 1,050 lines, at the low end of the 1–2k estimate. It covers a per-node
+  root-certified online key, a signed snapshot, hash-chained signed deltas, and a freshness statement
+  re-signed on a timer and pushed, with polling as the fallback.
+- A node has three modes: *fresh*; *narrow*, where only R1 reads continue; and *closed*.
+- With TTL 30 s and a 120 s narrow window, grants and writes stopped at 30 s and reads at 150 s. A node was
+  fresh again 131 ms after the control plane restarted.
+- Revocation latency: 0.74 ms p50 with push; at most the polling interval with polling (971 ms max at 1 s);
+  and at most the TTL with no contact (2.95 s against a 3 s TTL).
+- All 14 kinds of bad update were refused, including a stolen online key used past its certificate and a
+  control plane restored from an old backup.
+- Catch-up: 101 deltas in 27 ms, and a 262 KB snapshot in 78 ms. Traffic is 5.5 KB/s per node at 10
+  updates a second.
+- Two protocol fixes:
+  - accept a freshness statement naming an *older* epoch only if its head matches the node's own recorded
+    head at that epoch (a different head is a fork);
+  - re-sign the statement when serving a catch-up, so a node that just loaded a snapshot doesn't wait a
+    refresh.
+- Recommendations for #57:
+  - fsync the delta log before publishing;
+  - a root-signed "re-genesis" to recover from a restore (TUF's root rotation, applied to the feed);
+  - persist the verified feed on the node, so a reboot during an outage doesn't come up closed;
+  - cap the effective deadline at `receipt + (fresh_until − issued_at)` against clock skew;
+  - batch deltas;
+  - fuzz the parser.
+- It also found that `wicket_core::evaluate` compiles globs on every call: about 20 µs, against 0.13 µs per
+  match (#74).
+- **Bounds for 0.0.1** (TTL 30 s, refresh 5 s, narrow window 120 s):
+  - revocation of grants, leases and runs: ≤ 30 s worst case, about 1 ms with push;
+  - removing a reach rule on a partitioned node: ≤ 150 s for plain reads;
+  - a partitioned node refuses everything after 150 s.
+
+Experiment 4 (the Cedar org schema) is part of #11, #34 and #50.
 
 ---
 
