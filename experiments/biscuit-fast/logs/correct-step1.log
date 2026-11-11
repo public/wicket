@@ -1,0 +1,260 @@
+
+# Correctness: stock 6.0.0
+
+## Baseline (depth 5, 56 checks, grant at leaf)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a forged `approved` fact in a holder block is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a holder rule deriving `approved` is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a third-party approval signed by an untrusted key is ignored
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°5: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), method($m)…
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] a request served for another tenant is refused (authorizer tenant check)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in authorizer: check if tenant($t), request_tenant($t)
+
+## A node can narrow
+[PASS] after appending `method GET only`: A still allowed
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°7: check if op($o), $o != "http" or method("GET")
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] C after the grant's expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°3: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "POST"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), me…
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 10018 bytes in turn: 0 variants parse
+[PASS] dropping the last block (the node holds only this token's proof): rejected
+       Some("error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Fallback (plain records) checks
+[PASS] plain: A allowed, B denied, C granted, D allowed
+       [true, false, true, true]
+[PASS] plain: a widening link signed by a node key doesn't admit B (intersection)
+[PASS] plain: the mint-time narrowing check names the widening
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+[PASS] plain: flipping each of the 7337 bytes: 0 variants verify
+[PASS] plain: every scenario level narrows its parent (hand-written check)
+
+stock 6.0.0: 45 checks, ALL PASS
+
+# Correctness: upstream main
+
+## Baseline (depth 5, 56 checks, grant at leaf)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a forged `approved` fact in a holder block is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a holder rule deriving `approved` is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a third-party approval signed by an untrusted key is ignored
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°5: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), method($m)…
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] a request served for another tenant is refused (authorizer tenant check)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in authorizer: check if tenant($t), request_tenant($t)
+
+## A node can narrow
+[PASS] after appending `method GET only`: A still allowed
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°7: check if op($o), $o != "http" or method("GET")
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] C after the grant's expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°3: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "POST"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), me…
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 10018 bytes in turn: 0 variants parse
+[PASS] dropping the last block (the node holds only this token's proof): rejected
+       Some("error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Fallback (plain records) checks
+[PASS] plain: A allowed, B denied, C granted, D allowed
+       [true, false, true, true]
+[PASS] plain: a widening link signed by a node key doesn't admit B (intersection)
+[PASS] plain: the mint-time narrowing check names the widening
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+[PASS] plain: flipping each of the 7337 bytes: 0 variants verify
+[PASS] plain: every scenario level narrows its parent (hand-written check)
+
+upstream main: 45 checks, ALL PASS
+
+# Correctness: step 1 prepared
+
+## Baseline (depth 5, 56 checks, grant at leaf)
+[PASS] A allow (GET in reach): allowed
+[PASS] B deny (outside reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] C granted (PUT merge via approval): allowed
+[PASS] D spawn (limits): allowed
+
+## A holder can't widen
+[PASS] appending `check if true` does not admit B (outside reach)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a forged `approved` fact in a holder block is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a holder rule deriving `approved` is not trusted
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a third-party approval signed by an untrusted key is ignored
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] a box can't self-grant (no block trusts the leaf's own grantor key)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°5: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), method($m)…
+[PASS] a block can't carry an allow policy (parse error)
+[PASS] a later expiry in a new block does not extend the leaf's
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] a request served for another tenant is refused (authorizer tenant check)
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in authorizer: check if tenant($t), request_tenant($t)
+
+## A node can narrow
+[PASS] after appending `method GET only`: A still allowed
+[PASS] after appending `method GET only`: C (granted PUT) now denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°7: check if op($o), $o != "http" or method("GET")
+[PASS] after appending `no spawn`: D denied
+
+## Expiry and lease state
+[PASS] A at exactly the leaf expiry: allowed
+[PASS] A one second after the leaf expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°0 in block n°5: check if time($t), $t <= 2026-11-11T12:52:00Z
+[PASS] C after the grant's expiry: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] A after the grant's expiry: still allowed (an expired lease doesn't kill the chain)
+[PASS] C with uses_left = 0 (ledger): denied
+[PASS] C with no ledger entry: denied
+[PASS] C in a later box epoch: denied
+[PASS] C from the leaf's child b6 (inherits the grant block): denied
+[PASS] A from b6: allowed
+[PASS] A presented for a box outside the chain's subtree: denied
+
+## Agent grants (#50): signed by the parent box's grantor key
+[PASS] parent (b4) grants POST /repos/acme/api/issues (within b4, outside leaf): allowed
+       ok
+[PASS] parent (b4) grants POST /repos/acme/infra/issues (outside b4's own reach): denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°3: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "POST"}.contains($m), $p.starts_with("/repos/acme/api/") or host("crates.io"), me…
+[PASS] parent (b4) grants a risk-3 PUT it couldn't do itself: denied
+       authorization failed: an allow policy matched (policy index: 0), and the following checks failed: Check n°3 in block n°0: check if op($o), $o != "http" or host("api.github.com"), method($m), path($p), {"GET", "HEAD", "PATCH", "POST"}.contains($m), $p.starts_with("/repos/acme/") or host($h), method…
+[PASS] the human approval service grants the same PUT: allowed
+       ok
+
+## Revocation ids identify every block; revoking one kills its subtree
+[PASS] siblings share the revocation ids of their common prefix (blocks 0-3) and differ at block 4
+[PASS] revoking c1's own block: c1 revoked, c2 and parent not
+[PASS] revoking b2's spawn block: b2's whole subtree (b3, c1, c2) revoked
+[PASS] the third-party grant block has its own id (revoke one lease without the zone)
+
+## Tampering
+[PASS] flipping each of the 10018 bytes in turn: 0 variants parse
+[PASS] dropping the last block (the node holds only this token's proof): rejected
+       Some("error deserializing or verifying the token")
+[PASS] removing a middle spawn block (block 3): rejected
+       Some("error deserializing or verifying the token")
+[PASS] reordering two spawn blocks: rejected
+       Some("error deserializing or verifying the token")
+[PASS] the token under the wrong root key fails
+[PASS] a third-party block made for chain c1 can't be moved to sibling c2
+       Some("error deserializing or verifying the token")
+[PASS] a sealed token can't be attenuated further
+
+## Fallback (plain records) checks
+[PASS] plain: A allowed, B denied, C granted, D allowed
+       [true, false, true, true]
+[PASS] plain: a widening link signed by a node key doesn't admit B (intersection)
+[PASS] plain: the mint-time narrowing check names the widening
+       Some(["reach 3 (api.github.com [\"GET\"])"])
+[PASS] plain: flipping each of the 7337 bytes: 0 variants verify
+[PASS] plain: every scenario level narrows its parent (hand-written check)
+
+step 1 prepared: 45 checks, ALL PASS
+
+ALL ENGINES: ALL PASS

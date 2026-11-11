@@ -1,0 +1,19 @@
+biscuit-auth and biscuit-parser, vendored for the wicket experiment biscuit-fast.
+
+Source: https://github.com/eclipse-biscuit/biscuit-rust, branch main, commit
+aa5a6725191894b324509596fd2328bfe8638348 (2026-11-09), directories biscuit-auth/ and
+biscuit-parser/. Copyright (c) 2019 Geoffroy Couprie and Contributors to the Eclipse Foundation.
+Licensed under the Apache License, Version 2.0 (see biscuit-auth/LICENSE and
+biscuit-parser/LICENSE).
+
+Changes by the wicket project (2026-11-11), all marked "fork" in the source:
+- biscuit-auth/Cargo.toml, biscuit-parser/Cargo.toml: versions 6.0.0-fork.0 / 0.2.0-fork.0, no
+  biscuit-quote (datalog-macro feature off), dev-dependencies trimmed; samples/, examples/ and
+  benches/ removed.
+- biscuit-auth/src/datalog/mod.rs: FactSource / FactView (read facts from a shared base plus an
+  overlay), FactSet::contains, run_overlay, StepBudget::steps.
+- biscuit-auth/src/datalog/expression.rs: `.matches()` charges steps by pattern and input length.
+- biscuit-auth/src/datalog/symbol.rs, origin.rs: small accessors.
+- biscuit-auth/src/token/mod.rs, lib.rs: Biscuit::block_datalog, exports.
+- biscuit-auth/src/token/authorizer.rs: module declaration.
+- new: biscuit-auth/src/token/authorizer/prepared.rs, biscuit-auth/src/datalog/compiled.rs.

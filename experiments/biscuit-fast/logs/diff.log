@@ -1,0 +1,20 @@
+differential test: 2000 random chains × 50 random requests, seed 59
+engines: stock 6.0.0 (reference) vs upstream main (build per request), step 1 (wall-clock limits), step 2 and step 3 (fuel PreparedLimits { max_facts: 256, max_iterations: 8, max_steps: 4000, max_time: None })
+
+... 500 chains, 25000 requests, 45 s
+... 1000 chains, 50000 requests, 94 s
+... 1500 chains, 75000 requests, 139 s
+... 2000 chains, 100000 requests, 183 s
+
+100000 requests (17948 allowed, 82052 denied by stock; 2010 with an ill-typed fact); 603 of 2000 chains would be rejected by the lint (decided anyway)
+
+step 3: 1983 of 2000 chains compiled (not compiled: {"arrays and maps": 17}); 1679 requests fell back to the generic engine (expression errors)
+
+| fork path | same decision | different | of which run limits |
+|---|---|---|---|
+| upstream main | 100000 | 0 | 0 |
+| step 1 | 100000 | 0 | 0 |
+| step 2 | 100000 | 0 | 0 |
+| step 3 | 100000 | 0 | 0 |
+
+elapsed 183 s

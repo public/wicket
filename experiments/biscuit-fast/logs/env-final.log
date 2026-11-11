@@ -1,0 +1,7 @@
+correct start: load average: 1.19, 0.97, 0.95
+limits start: load average: 1.19, 0.99, 0.96
+threads start: load average: 1.13, 0.99, 0.96
+diff start: load average: 1.13, 0.99, 0.96
+bench start: load average: 1.06, 1.03, 0.99
+bench end: load average: 1.28, 1.15, 1.04
+FINISHED
