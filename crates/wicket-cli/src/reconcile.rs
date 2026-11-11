@@ -1080,116 +1080,18 @@ mod tests {
 
     // ---- the Vultr backend against a local mock of its API ----
 
-    mod vultr_mock {
-        use bytes::Bytes;
-        use http_body_util::{BodyExt, Full};
-        use serde_json::{json, Value};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Default)]
-        pub struct Mock {
-            pub instances: Vec<Value>,
-            /// (method, path) of every request.
-            pub seen: Vec<(String, String)>,
-            /// GET /instances/{id} returns the instance without tags.
-            pub strip_on_get: bool,
-        }
-
-        pub type Shared = Arc<Mutex<Mock>>;
-
-        pub fn instance(id: &str, tags: &[String]) -> Value {
-            json!({ "id": id, "main_ip": "203.0.113.60", "date_created": "2023-11-14T22:03:20+00:00", "status": "active",
-                    "power_status": "running", "server_status": "ok", "plan": "vc2-1c-2gb", "region": "lhr", "label": id,
-                    "tags": tags, "vcpu_count": 1, "ram": 2048 })
-        }
-
-        fn handle(m: &mut Mock, method: &str, path: &str, query: &str, body: &Value) -> (u16, Value) {
-            let tag = query.split('&').find_map(|kv| kv.strip_prefix("tag=")).map(|t| t.to_string());
-            let segs: Vec<&str> = path.trim_start_matches("/v2/").split('/').collect();
-            match (method, segs.as_slice()) {
-                ("GET", ["plans"]) => (
-                    200,
-                    json!({ "plans": [{ "id": "vc2-1c-2gb", "vcpu_count": 1, "ram": 2048, "disk": 55, "monthly_cost": 10, "hourly_cost": 0.014, "type": "vc2", "locations": ["lhr"] }],
-                            "meta": { "total": 1, "links": { "next": "", "prev": "" } } }),
-                ),
-                ("GET", ["instances"]) => {
-                    let v: Vec<Value> = m
-                        .instances
-                        .iter()
-                        .filter(|i| tag.as_ref().is_none_or(|t| i["tags"].as_array().is_some_and(|a| a.iter().any(|x| x == t.as_str()))))
-                        .cloned()
-                        .collect();
-                    (200, json!({ "instances": v, "meta": { "total": 1, "links": { "next": "", "prev": "" } } }))
-                }
-                ("GET", ["instances", id]) => match m.instances.iter().find(|i| i["id"] == *id) {
-                    Some(i) => {
-                        let mut i = i.clone();
-                        if m.strip_on_get {
-                            i["tags"] = json!([]);
-                        }
-                        (200, json!({ "instance": i }))
-                    }
-                    None => (404, json!({ "error": "Invalid instance-id.", "status": 404 })),
-                },
-                ("DELETE", ["instances", id]) => {
-                    m.instances.retain(|i| i["id"] != *id);
-                    (204, Value::Null)
-                }
-                ("POST", ["instances"]) => {
-                    let tags: Vec<String> = serde_json::from_value(body["tags"].clone()).unwrap_or_default();
-                    let i = instance(&format!("new-{}", m.instances.len()), &tags);
-                    m.instances.push(i.clone());
-                    (202, json!({ "instance": i }))
-                }
-                _ => (404, json!({ "error": "Not found", "status": 404 })),
-            }
-        }
-
-        pub async fn serve() -> (String, Shared) {
-            let state: Shared = Arc::default();
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            let st = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    let (sock, _) = l.accept().await.unwrap();
-                    let st = st.clone();
-                    tokio::spawn(async move {
-                        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                            let st = st.clone();
-                            async move {
-                                let method = req.method().to_string();
-                                let path = req.uri().path().to_string();
-                                let query = req.uri().query().unwrap_or("").to_string();
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                                let (status, out) = {
-                                    let mut m = st.lock().unwrap();
-                                    m.seen.push((method.clone(), path.clone()));
-                                    handle(&mut m, &method, &path, &query, &body)
-                                };
-                                let bytes = if out.is_null() { Bytes::new() } else { Bytes::from(out.to_string()) };
-                                Ok::<_, std::convert::Infallible>(hyper::Response::builder().status(status).body(Full::new(bytes)).unwrap())
-                            }
-                        });
-                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(sock), svc).await;
-                    });
-                }
-            });
-            (format!("http://{addr}/v2"), state)
-        }
-    }
+    use wicket_placement::mock as vultr_mock;
 
     fn vultr(base: &str) -> wicket_placement::vultr::VultrProvider {
         use wicket_placement::vultr::*;
-        let c = Client::with_base(base, ApiKey::new("test-key-not-a-real-one"))
+        let c = Client::with_base(base, ApiKey::new(vultr_mock::KEY))
             .unwrap()
             .with_retry(Retry { attempts: 2, base: std::time::Duration::from_millis(1) });
         VultrProvider::new(c, VultrConfig { sshkey_ids: vec!["k1".into()], ..VultrConfig::default() })
     }
 
     fn deletes(st: &vultr_mock::Shared) -> Vec<String> {
-        st.lock().unwrap().seen.iter().filter(|(m, _)| m == "DELETE").map(|(_, p)| p.rsplit('/').next().unwrap().to_string()).collect()
+        st.lock().unwrap().seen.iter().filter(|s| s.method == "DELETE").map(|s| s.path.rsplit('/').next().unwrap().to_string()).collect()
     }
 
     #[tokio::test]
@@ -1213,7 +1115,7 @@ mod tests {
         let w = World::new(vultr(&base));
         let d = w.pass(&mut l, t, false).await;
         assert_eq!(deletes(&st), vec!["orphan"], "{d:?}");
-        assert!(!st.lock().unwrap().seen.iter().any(|(m, _)| m == "POST"), "nothing created: the lease's node was adopted");
+        assert!(!st.lock().unwrap().seen.iter().any(|s| s.method == "POST"), "nothing created: the lease's node was adopted");
         let x = l.lease(&lease).unwrap().unwrap();
         assert_eq!((x.status.as_str(), x.node_id.as_deref()), ("active", Some("mine")));
 
@@ -1226,6 +1128,70 @@ mod tests {
         assert_eq!(x.billed, Some(20_000), "one started hour at $0.014, rounded up to the cent");
         let left: Vec<String> = st.lock().unwrap().instances.iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
         assert_eq!(left, vec!["control-host", "broker"]);
+    }
+
+    #[tokio::test]
+    async fn a_paid_lease_past_its_end_loses_its_node_and_runs_and_gives_its_money_back() {
+        let (base, st) = vultr_mock::serve().await;
+        let o = Owner::new("example");
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        started(&l, "run_a", "alive:1");
+        let lease = approved_lease(&mut l, &cfg("vultr"), "run_a");
+        assert_eq!(l.lease_reservations(&t.0, None, false).unwrap(), (20_000, 20_000));
+        let end = NOW + 3000;
+        st.lock().unwrap().instances = vec![vultr_mock::instance("mine", &[o.tag(), o.idem_tag(&lease_key(&lease)), Owner::lease_tag(end)])];
+        let w = World::new(vultr(&base));
+        w.pass(&mut l, NOW + 600, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active");
+        // A child placed on it; its holder is still alive.
+        started(&l, "run_child", "alive:2");
+        l.set_run_lease("run_child", &lease).unwrap();
+        // Before the end nothing changes; a dry run past it changes nothing either.
+        w.pass(&mut l, end - 1, false).await;
+        let d = w.pass(&mut l, end + 1, true).await;
+        assert!(kinds(&d).contains(&"destroy"), "{d:?}");
+        assert!(deletes(&st).is_empty());
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active");
+        assert_eq!(l.run_status("run_child").unwrap().as_deref(), Some("running"));
+        // At the end: the child stops, the node goes, the lease ends and its reservation is released.
+        w.pass(&mut l, end + 1, false).await;
+        assert_eq!(deletes(&st), vec!["mine"]);
+        assert_eq!(l.run_status("run_child").unwrap().as_deref(), Some(LOST));
+        assert_eq!(l.run_status("run_a").unwrap().as_deref(), Some("running"), "the holder keeps running");
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "ended");
+        assert_eq!(l.lease_reservations(&t.0, None, false).unwrap(), (0, 0));
+        assert!(audited(&l, "reconcile.destroyed") >= 1);
+    }
+
+    #[tokio::test]
+    async fn request_capacity_through_the_gateway_hook_from_ask_to_ready() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let ledger = Arc::new(Mutex::new(l));
+        let hook = capacity::hook(TenantId::single(), RunId("run_a".into()), "z".into(), ledger.clone(), c.clone());
+        let CapacityState::Waiting(msg) = hook(wicket_proxy::CapacityCall::Ask(capacity_ask(30, "0"))).unwrap() else {
+            panic!("an ask waits for a human")
+        };
+        let lease = ledger.lock().unwrap().leases(&["pending"]).unwrap().pop().unwrap();
+        assert!(msg.contains(&lease.id), "the agent is told its lease id: {msg}");
+        assert!(matches!(hook(wicket_proxy::CapacityCall::Status(lease.id.clone())).unwrap(), CapacityState::Waiting(_)));
+        {
+            let mut l = ledger.lock().unwrap();
+            let grant = Grant { uses: Some(1), ttl: std::time::Duration::from_secs(60), path_prefix: None, decided_by: "test".into() };
+            l.approve(lease.request_id.as_deref().unwrap(), &grant).unwrap();
+            w.pass(&mut l, NOW, false).await;
+        }
+        let CapacityState::Settled(s) = hook(wicket_proxy::CapacityCall::Status(lease.id.clone())).unwrap() else { panic!("not settled") };
+        assert!(s.starts_with("ready:"), "{s}");
+        // Another run can't read it.
+        let other = capacity::hook(TenantId::single(), RunId("run_b".into()), "z".into(), ledger.clone(), c);
+        assert!(other(wicket_proxy::CapacityCall::Status(lease.id.clone())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
