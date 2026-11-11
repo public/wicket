@@ -32,6 +32,7 @@ fn oracle1_single_block_equals_compiled_zone() {
                     let o = op(&z.name, m, h, p);
                     let want = kind_of_verdict(&cz.evaluate(&o));
                     let got = l.decide(&http_request("b0", &o));
+                    assert!(wicket_core::never_reachable(h).is_some() || !l.last_fell_back());
                     max_steps = max_steps.max(l.last_steps());
                     if checked % 8 == 0 && wicket_core::never_reachable(h).is_none() {
                         // The generic engine (the compiled evaluator's fallback) on a sample.
@@ -143,6 +144,7 @@ fn oracle2_chain_equals_intersection_of_zones() {
             .collect();
         let tok = mint_chain(&cs, &keys);
         let l = load_ok(&tok, &keys);
+        assert!(l.is_compiled(), "chain {chain} isn't compiled");
         let zr: Vec<&ZoneSpec> = zones.iter().collect();
         let (hosts, paths) = probes(&zr);
         for _ in 0..150 {
@@ -257,7 +259,9 @@ fn oracle3_tokens() -> Vec<(usize, Loaded)> {
             variants.push(grant(&plain, &keys.grantor[depth - 1], &g).unwrap());
         }
         for t in variants {
-            tokens.push((depth, load_ok(&t, &keys)));
+            let l = load_ok(&t, &keys);
+            assert!(l.is_compiled(), "depth {depth} isn't compiled");
+            tokens.push((depth, l));
         }
     }
     tokens
@@ -290,6 +294,7 @@ fn differential(n: usize, stock_every: usize) {
         let (depth, l) = &tokens[k];
         let r = random_request(&mut rng, *depth);
         let fast = l.authorize_compiled(&r);
+        assert!(!l.last_fell_back(), "request {i} ran in the generic engine: the comparison would be generic vs generic");
         max_compiled = max_compiled.max(l.last_steps());
         let (slow, steps) = sessions[k].authorize(&r);
         max_generic = max_generic.max(steps);

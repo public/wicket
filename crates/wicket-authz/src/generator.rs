@@ -220,6 +220,13 @@ pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'
     Ok(c)
 }
 
+/// A spawn block for `ceiling`, unchecked (tests: tokens over the caps, built to show that a node
+/// refuses them).
+#[doc(hidden)]
+pub fn ceiling_block(ceiling: &Ceiling) -> Result<BlockBuilder, AuthzError> {
+    ceiling_code(ceiling, None)?.block()
+}
+
 /// The Datalog for one grant (a third-party block).
 pub(crate) fn grant_code(g: &Grant) -> Code {
     let mut c = Code::default();

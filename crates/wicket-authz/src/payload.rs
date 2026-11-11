@@ -145,7 +145,8 @@ impl Ceiling {
     /// The ceiling for a zone, the common case: reach, forbid rules, injections, images, limits, the
     /// model budget and `accept_from` come from the zone. Op kinds: all four, except `llm` for a zone
     /// without a model route. Host patterns and methods are normalised the way wicket-core compares
-    /// them (lower-case hosts, upper-case methods).
+    /// them (lower-case hosts, upper-case methods). `spawn.images` is the zone's `images` only: a box
+    /// may also start boxes from its own image, which the zone doesn't name, so the caller adds it.
     pub fn from_zone(zone: &ZoneSpec, box_prefix: &str, not_after: u64, grant_keys: Vec<PublicKey>) -> Result<Ceiling, AuthzError> {
         let bad = |m: String| AuthzError::Ceiling(format!("zone {}: {m}", zone.name));
         let mem = wicket_core::subset::parse_bytes(&zone.limits.memory).ok_or_else(|| bad(format!("memory {:?}", zone.limits.memory)))?;
@@ -252,7 +253,9 @@ pub struct Request {
     pub box_id: String,
     pub epoch: i64,
     pub action: Action,
-    /// From the node's ledger: (grant id, uses left).
+    /// From the node's ledger: (grant id, uses left), for this token's grants only. Each is a fact,
+    /// and a request may have at most 256 facts in all: passing a whole ledger could make a request
+    /// fail closed.
     pub uses_left: Vec<(String, i64)>,
 }
 

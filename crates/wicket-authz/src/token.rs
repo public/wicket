@@ -35,6 +35,14 @@ impl std::fmt::Debug for SigningKey {
     }
 }
 
+/// Runs the structural check a node runs at load on a token this crate just built, so a ceiling
+/// that no node would accept (over a cap) is an error where it is made, not at every node.
+fn checked(b: Biscuit) -> Result<Token, AuthzError> {
+    let len = b.to_vec().map_err(enc)?.len();
+    crate::structure::check(&b, len, &crate::structure::Policy::default()).map_err(AuthzError::Structure)?;
+    Ok(Token(b))
+}
+
 pub(crate) fn biscuit_key(k: &PublicKey) -> Result<biscuit_auth::PublicKey, AuthzError> {
     biscuit_auth::PublicKey::from_bytes(&k.0, Algorithm::Ed25519).map_err(|e| AuthzError::Load(format!("bad public key: {e}")))
 }
@@ -44,10 +52,11 @@ pub(crate) fn biscuit_key(k: &PublicKey) -> Result<biscuit_auth::PublicKey, Auth
 pub struct Token(pub(crate) Biscuit);
 
 /// The control plane mints a run's token: block 0, signed by the root key, with the tenant, the
-/// principal it acts for and the root ceiling.
+/// principal it acts for and the root ceiling. Fails if the result wouldn't pass a node's
+/// structural check (e.g. a zone over the per-block caps).
 pub fn mint(root: &SigningKey, tenant: &str, principal: &str, ceiling: &Ceiling) -> Result<Token, AuthzError> {
     let code = ceiling_code(ceiling, Some(&AuthorityInfo { tenant, principal }))?;
-    code.authority()?.build(&root.0).map(Token).map_err(enc)
+    checked(code.authority()?.build(&root.0).map_err(enc)?)
 }
 
 impl Token {
@@ -62,9 +71,12 @@ impl Token {
     }
 
     /// Appends a spawn block: the child's ceiling as checks. Whatever it says, the child's authority
-    /// is the intersection with every earlier block, so the result never exceeds this token.
+    /// is the intersection with every earlier block, so the result never exceeds this token. Fails if
+    /// the result wouldn't pass a node's structural check (too many blocks or bytes, a child zone over
+    /// the per-block caps). Grants are not checked here: [`crate::load`] refuses one from a key no
+    /// block trusts.
     pub fn attenuate(&self, child: &Ceiling) -> Result<Token, AuthzError> {
-        self.0.append(ceiling_code(child, None)?.block()?).map(Token).map_err(enc)
+        checked(self.0.append(ceiling_code(child, None)?.block()?).map_err(enc)?)
     }
 
     /// The request a node sends an approver (the approval service, or the parent box's grantor) to

@@ -65,25 +65,34 @@ fn refused_at_load() {
 fn too_many_blocks_or_bytes() {
     let keys = Keys::new(20);
     let mut cs = ceilings(5, &keys);
-    // 16 blocks load; a 17th is refused.
+    // 16 blocks load; a 17th is refused, both when attenuating and (appended by other means) at load.
     let mut t = mint_chain(&cs, &keys);
     while t.block_count() < 16 {
         t = t.attenuate(&cs[5]).unwrap();
     }
     load_ok(&t, &keys);
-    let t = t.attenuate(&cs[5]).unwrap();
-    assert!(load_err(&t, &keys).contains("17 blocks"));
+    assert!(matches!(t.attenuate(&cs[5]), Err(AuthzError::Structure(e)) if e.contains("17 blocks")));
+    let raw = Token::from_biscuit(t.biscuit().append(wicket_authz::generator::ceiling_block(&cs[5]).unwrap()).unwrap());
+    assert!(load_err(&raw, &keys).contains("17 blocks"));
     // Token bytes: blocks with many long, distinct globs (Biscuit interns repeated strings), until
     // the token is over the cap.
     let mut t = mint_chain(&cs, &keys);
-    let mut j = 0;
-    while t.to_bytes().unwrap().len() <= Policy::default().max_token_bytes {
+    for j in 0.. {
         cs[5].reach[0].paths = (0..60).map(|i| format!("/repos/acme/{}-{j}-{i}/**", "x".repeat(180))).collect();
-        t = t.attenuate(&cs[5]).unwrap();
-        j += 1;
+        match t.attenuate(&cs[5]) {
+            Ok(next) => t = next,
+            Err(AuthzError::Structure(e)) => {
+                assert!(e.contains("bytes"), "{e}");
+                let raw = Token::from_biscuit(t.biscuit().append(wicket_authz::generator::ceiling_block(&cs[5]).unwrap()).unwrap());
+                assert!(load_err(&raw, &keys).contains("bytes"));
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
     }
-    assert!(t.block_count() <= 16);
-    assert!(load_err(&t, &keys).contains("bytes"));
+    // A child zone over a per-block cap is refused where it's made.
+    cs[5].reach[0].paths = (0..70).map(|i| format!("/repos/acme/p{i}/**")).collect();
+    assert!(matches!(mint_chain(&cs[..5], &keys).attenuate(&cs[5]), Err(AuthzError::Structure(e)) if e.contains("alternatives")));
 }
 
 #[test]

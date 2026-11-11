@@ -159,6 +159,12 @@ impl Loaded {
         self.compiled.last_run().steps
     }
 
+    /// Whether the last request on this thread ran in the generic engine instead of the compiled one.
+    #[doc(hidden)]
+    pub fn last_fell_back(&self) -> bool {
+        self.compiled.last_run().fallback
+    }
+
     /// The raw result of the compiled evaluator (tests: the differential against the generic engine).
     #[doc(hidden)]
     pub fn authorize_compiled(&self, r: &Request) -> Result<usize, TokenError> {

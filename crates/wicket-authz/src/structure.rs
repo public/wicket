@@ -243,6 +243,9 @@ fn query(q: &Rule, p: &Policy, trusted: &mut Vec<PublicKeyData>, regexes: &mut u
     Ok(())
 }
 
+/// A check's class follows from its shape. A hostile block can shape a hard bound to read `host` and
+/// so turn a `Forbidden` into a `NeedsGrant`; that only changes whether the proxy offers to escalate,
+/// never what is allowed (a grant must still pass every block).
 fn classify(queries: &[Rule], kind: &CheckKind) -> CheckClass {
     let reads = |n: &str| queries.iter().any(|q| q.body.iter().any(|pr| pr.name == n));
     if *kind == CheckKind::One && (reads("host") || reads("risk") || reads("approved")) {
