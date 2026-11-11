@@ -956,7 +956,13 @@ mod tests {
 
     /// A control host's connection, authenticated both ways: the stream, and the result of the
     /// handshake (with the welcome, or why one side refused the other).
-    async fn handshake(node: &Arc<Node>, gen: u64, build: &str, i: &Install, issuer: &wicket_identity::Issuer) -> (UnixStream, Result<Msg, HsError>) {
+    async fn handshake(
+        node: &Arc<Node>,
+        gen: u64,
+        build: &str,
+        i: &Install,
+        issuer: &wicket_identity::Issuer,
+    ) -> (UnixStream, Result<Msg, HsError>) {
         let (mut a, b) = UnixStream::pair().unwrap();
         tokio::spawn(connection(node.clone(), b, gen));
         let (mut rd, mut wr) = a.split();
@@ -1125,15 +1131,9 @@ mod tests {
 
         // Renewal over the channel: the node checks the certificate and swaps it in.
         std::fs::write(&cert_path, &good).unwrap();
-        let (renewed, rc) = crate::nodeauth::issue(
-            &inst.ledger.lock().unwrap(),
-            &inst.issuer,
-            "n1",
-            &inst.key.verifying_key(),
-            wicket_store::now(),
-            3600,
-        )
-        .unwrap();
+        let (renewed, rc) =
+            crate::nodeauth::issue(&inst.ledger.lock().unwrap(), &inst.issuer, "n1", &inst.key.verifying_key(), wicket_store::now(), 3600)
+                .unwrap();
         real.write_all(&Frame::Msg(Msg::NodeCert { cert: renewed.clone() }).encode()).await.unwrap();
         loop {
             match next_msg(&mut real).await {

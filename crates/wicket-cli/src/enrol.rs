@@ -496,11 +496,11 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
     node.script("installing the node files", &install_script(&node_files(&ca, &cert, &feed_root, info, None, &node_cert)?, false)?)
         .await
         .with_context(|| {
-            format!(
-                "CA serial {} is recorded for node {name}, but installing it failed (the node keeps its old CA): run renew-ca again",
-                cert.serial
-            )
-        })?;
+        format!(
+            "CA serial {} is recorded for node {name}, but installing it failed (the node keeps its old CA): run renew-ca again",
+            cert.serial
+        )
+    })?;
     println!(
         "renewed node {name}'s CA: serial {} for {} until {}; identity certificate until {}",
         cert.serial,

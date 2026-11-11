@@ -26,7 +26,6 @@
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, Tunnels, TUNNEL_BIT};
 use crate::node::Node;
 use crate::nodeauth::HsError;
-use wicket_identity::node::NodeCertClaims;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -37,6 +36,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
 use wicket_feed::{Change, KeyCert, Publisher, PublisherConfig, RevokeKind};
+use wicket_identity::node::NodeCertClaims;
 use wicket_store::Ledger;
 
 /// The feed's timings for this control host: the defaults, or the test overrides.
@@ -610,7 +610,11 @@ async fn on_frame(
                     p.cert = Some(c);
                 }
                 (_, e) => {
-                    println!("[wicket] node {} did not take its renewed certificate ({}); retrying in a minute", sh.node, e.unwrap_or(serial));
+                    println!(
+                        "[wicket] node {} did not take its renewed certificate ({}); retrying in a minute",
+                        sh.node,
+                        e.unwrap_or(serial)
+                    );
                     p.renew_after = wicket_store::now() + 60;
                 }
             },

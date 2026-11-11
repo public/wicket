@@ -1002,9 +1002,8 @@ impl Ledger {
 
     /// A node's identity certificates, newest first.
     pub fn node_certs(&self, node: &str) -> Result<Vec<NodeCertRow>> {
-        let mut st = self
-            .conn
-            .prepare(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE node = ?1 ORDER BY issued_at DESC, rowid DESC"))?;
+        let mut st =
+            self.conn.prepare(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE node = ?1 ORDER BY issued_at DESC, rowid DESC"))?;
         let rows = st.query_map(params![node], row_to_node_cert)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }

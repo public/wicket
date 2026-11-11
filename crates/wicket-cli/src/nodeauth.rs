@@ -128,9 +128,9 @@ where
             return Err(refused(format!("node {node} is {}", row.status)));
         }
         let key = enrolled_key(&row.node_key).map_err(|e| refused(format!("{e:#}")))?;
-        let c = hs
-            .verify_node(&proof, &issuer.verifying_key(), &key, now)
-            .map_err(|e| refused(format!("node {node} failed authentication: {e} (renew it with `wicket node renew-ca {node}`, or revoke it)")))?;
+        let c = hs.verify_node(&proof, &issuer.verifying_key(), &key, now).map_err(|e| {
+            refused(format!("node {node} failed authentication: {e} (renew it with `wicket node renew-ca {node}`, or revoke it)"))
+        })?;
         match l.node_cert(&c.jti).map_err(|e| refused(e.to_string()))? {
             Some(r) if r.node == node && r.status == "active" => {}
             Some(r) => return Err(refused(format!("node {node} presented certificate {} which is {}", c.jti, r.status))),
@@ -162,13 +162,17 @@ impl NodeIdentity {
     /// Loads `node.key` and `issuer.pub.json` from the node's directory, and warns if the certificate
     /// held there is missing, expired or for another key.
     pub fn load(root: &Path, name: &str, now: i64) -> Result<NodeIdentity> {
-        let pem = std::fs::read_to_string(root.join("node.key")).with_context(|| format!("{} (is this node enrolled?)", root.join("node.key").display()))?;
+        let pem = std::fs::read_to_string(root.join("node.key"))
+            .with_context(|| format!("{} (is this node enrolled?)", root.join("node.key").display()))?;
         let key = wicket_identity::node::signing_key_from_pkcs8_pem(&pem).context("node.key")?;
-        let jwk: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("issuer.pub.json")).context("issuer.pub.json (is this node enrolled?)")?)?;
+        let jwk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("issuer.pub.json")).context("issuer.pub.json (is this node enrolled?)")?)?;
         let issuer = wicket_identity::verifying_key_from_jwk(&jwk).context("issuer.pub.json")?;
         let id = NodeIdentity { key, issuer };
         match std::fs::read_to_string(root.join(CERT_FILE)) {
-            Err(_) => eprintln!("[node] no identity certificate ({CERT_FILE}): control hosts will refuse this node until `wicket node renew-ca {name}`"),
+            Err(_) => eprintln!(
+                "[node] no identity certificate ({CERT_FILE}): control hosts will refuse this node until `wicket node renew-ca {name}`"
+            ),
             Ok(c) => match id.check_cert(c.trim(), name, now) {
                 Ok(c) => eprintln!("[node] identity {} (certificate {}…, expires in {} s)", c.sub, &c.jti[..12], c.exp - now),
                 Err(e) => eprintln!("[node] the identity certificate is unusable ({e:#}): renew it with `wicket node renew-ca {name}`"),
@@ -211,7 +215,9 @@ where
         .map_err(|_| anyhow::anyhow!("this node has no identity certificate: run `wicket node renew-ca {name}` from the control host"))?;
     let (hs, proof) = NodeHandshake::answer(name, &id.key, &cert, nonce, b"")?;
     wr.write_all(&Frame::Msg(Msg::Challenge { proof }).encode()).await?;
-    let answer = tokio::time::timeout(std::time::Duration::from_secs(15), chan::read_frame(rd)).await.context("no proof from the control host")??;
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(15), chan::read_frame(rd))
+        .await
+        .context("no proof from the control host")??;
     match answer {
         Some(Frame::Msg(Msg::Prove { proof })) => Ok(hs.verify_control(&proof, &id.issuer)?),
         _ => anyhow::bail!("the control host sent no proof"),
@@ -400,12 +406,8 @@ mod tests {
             return;
         }
         let i = Install::new("openssl");
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(crate::enrol::keygen_script("n1", true))
-            .env("HOME", &i.dir)
-            .output()
-            .unwrap();
+        let out =
+            std::process::Command::new("sh").arg("-c").arg(crate::enrol::keygen_script("n1", true)).env("HOME", &i.dir).output().unwrap();
         assert!(out.status.success());
         let g = crate::enrol::parse_generated(&String::from_utf8_lossy(&out.stdout), true).unwrap();
         let pem = std::fs::read_to_string(i.dir.join(crate::enrol::NODE_DIR).join("node.key.new")).unwrap();

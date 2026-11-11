@@ -101,7 +101,8 @@ pub fn verify_node_cert(jws: &str, issuer: &VerifyingKey, node: &str, now: i64) 
     if jws_header(jws)?.get("typ").and_then(|t| t.as_str()) != Some(NODE_CERT_TYP) {
         return Err(IdError::WrongType(NODE_CERT_TYP));
     }
-    let (_, payload) = jws_verify(jws, issuer).map_err(|_| IdError::WrongIssuer("the certificate is not signed by this installation".into()))?;
+    let (_, payload) =
+        jws_verify(jws, issuer).map_err(|_| IdError::WrongIssuer("the certificate is not signed by this installation".into()))?;
     let c: NodeCertClaims = serde_json::from_value(payload).map_err(|_| IdError::Malformed("node certificate claims"))?;
     let td = c.iss.strip_prefix("spiffe://").ok_or(IdError::Malformed("iss"))?;
     if c.node != node || c.sub != node_spiffe_id(td, node) {
@@ -223,7 +224,13 @@ impl ControlHandshake {
         if &claims.key()? != enrolled_key {
             return Err(IdError::Refused(format!("the certificate binds a key other than node {}'s enrolled key", self.node)));
         }
-        let t = Transcript { node: self.node.clone(), cn: self.cn.clone(), nn: p.nonce.clone(), cert: digest(&p.cert), bind: self.bind.clone() };
+        let t = Transcript {
+            node: self.node.clone(),
+            cn: self.cn.clone(),
+            nn: p.nonce.clone(),
+            cert: digest(&p.cert),
+            bind: self.bind.clone(),
+        };
         t.check(&p.proof, enrolled_key, "node").map_err(|_| IdError::BadSignature("the node's proof does not verify"))?;
         self.verified = Some(t);
         Ok(claims)
@@ -254,7 +261,9 @@ impl NodeHandshake {
 
     /// Checks the control host's proof against this installation's issuer key.
     pub fn verify_control(&self, p: &ControlProof, issuer: &VerifyingKey) -> Result<()> {
-        self.t.check(&p.proof, issuer, "control").map_err(|_| IdError::WrongIssuer("the control host did not prove this installation's issuer key".into()))
+        self.t
+            .check(&p.proof, issuer, "control")
+            .map_err(|_| IdError::WrongIssuer("the control host did not prove this installation's issuer key".into()))
     }
 }
 
@@ -399,11 +408,15 @@ mod tests {
     #[test]
     fn pkcs8_ed25519_keys_load() {
         // RFC 8410 §10.3's example private key.
-        let pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
+        let pem =
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
         let k = signing_key_from_pkcs8_pem(pem).unwrap();
         assert_eq!(hex::encode(k.to_bytes()), "d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842");
         // …whose public key is the RFC's.
         assert_eq!(hex::encode(k.verifying_key().to_bytes()), "19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1");
-        assert!(signing_key_from_pkcs8_pem("-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----\n").is_err());
+        assert!(signing_key_from_pkcs8_pem(
+            "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----\n"
+        )
+        .is_err());
     }
 }
