@@ -703,8 +703,8 @@ commercial Materialize streams are used.)*
    usable without templates. It's all Rust and needs no cloud. It lets a parent agent grant on its own
    node (#50) with no control-plane round trip, and a spawned child carry its authority to another node
    (#57). Its weak point is one moderately maintained dependency, Biscuit, which can be forked and is
-   swappable by design. *(Experiment #59 found Biscuit too slow for the request path, so A uses plain
-   signed records with the same semantics; §6.1.)*
+   swappable by design. *(Experiment #59 found stock Biscuit too slow for the request path, and its
+   follow-up made a patched fork fast enough; A keeps Biscuit, vendored; §6.1.)*
 2. **Architecture B**, if the owner prefers one language and the healthiest single dependency. It's
    simpler to explain. It costs a solver in the spawn path, delegation proofs that live in the ledger
    rather than in a portable artifact, and harder cross-node and federated delegation. It's a reasonable
@@ -720,8 +720,8 @@ commercial Materialize streams are used.)*
   `biscuit-auth`. Distribution is wicket's own signed snapshot and delta feed with a TUF-style freshness
   lease; that's the piece that makes "bounded revocation" and "fail narrow" true. Grants as Biscuit, which
   the issue already mentions, becomes the main path, not an option.
-  *(Updated by experiment #59, §6.1: the node embeds `cedar-policy` only. Grants are plain signed
-  records with Biscuit's semantics, and `biscuit-auth` is a CI dependency.)*
+  *(Updated after §6.1: the node embeds `cedar-policy` and a vendored, patched `biscuit-auth`; the stock
+  engine is the differential oracle in CI.)*
 - §2.1 table: "OpenFGA or Cedar for sharing between tenants" becomes "Cedar entities, materialised from
   wicketd; OpenFGA as an optional source in platform mode".
 
@@ -740,7 +740,7 @@ commercial Materialize streams are used.)*
 
 Experiments 1–3 ran in `experiments/` (PR #75). Each directory has a `RESULTS.md` with the method, the
 numbers and raw logs. They were run on a shared 4 vCPU VPS, so timings are ±30%. **Architecture A stands,
-with one change: authority is plain signed records rather than Biscuit tokens.**
+and Biscuit stays the authority format, checked by a vendored, patched `biscuit-auth` (result 2b).**
 
 **1. SymCC on zones (#58): B is not viable; SymCC belongs in CI.** [H, measured]
 - Two encodings of a zone in Cedar were tested (cedar-policy 4.14.1, cedar-policy-symcc 0.8.1, cvc5):
@@ -780,12 +780,35 @@ with one change: authority is plain signed records rather than Biscuit tokens.**
 - The default `RunLimits` `max_time` of 1 ms is within 2× of the p99, and was exceeded at the maximum, so
   denials would depend on load. Raising it also raises what a hostile block can burn (13–22 ms seen).
 - The token is 10.0 KB at depth 5, against 7.3 KB of JSON records.
-- Decision:
-  - plain signed records, about 250 lines, with each link signed by a per-box grantor key and bound to the
-    previous link's hash;
-  - the Biscuit compilation is kept as a differential oracle in CI;
-  - avoid `.matches()` and `check all` in any Biscuit encoding;
-  - revisit if biscuit-auth gets a reusable authorizer that evaluates about 50 checks in under 50 µs.
+- This experiment's verdict was plain signed records (about 250 lines, 0.4–0.7 µs) with Biscuit as a CI
+  oracle. Result 2b replaced it. Lessons kept: avoid `.matches()` and `check all` in wicket's encoding.
+
+**2b. A vendored, patched Biscuit (follow-up to #59, `experiments/biscuit-fast/`).** [H, measured]
+- Built on upstream main `aa5a672` (2026-11-09). That commit already has a step counter and a `Sync`
+  authorizer, but no way to reuse a loaded token, and still a wall-clock limit.
+- Depth 5, warm, median (p99) after each patch:
+
+  | | median | p99 |
+  |---|---|---|
+  | stock 6.0.0 | 965–1,168 µs | 2.1 ms |
+  | upstream main, unchanged | 932–1,149 µs | 2.0 ms |
+  | 1: load once, add request facts on top | 87–179 µs | 308 µs |
+  | 2: a step budget, no wall clock | 84–163 µs | 330 µs |
+  | 3: compiled evaluator, shared between threads | **6.9–10.7 µs** | **28 µs** |
+
+- Correctness: all 45 property checks pass after every patch. A differential test of 100,000 random
+  requests over 2,000 random chains got the same decision as stock 6.0.0 every time.
+- Limits: legitimate requests use at most 282 steps of a 4,000-step budget, and a request at the limit
+  gets the same outcome on every run.
+- Hostile blocks: the fact explosion and the 150-rule chain are refused when the token is loaded. The
+  200-regex block is allowed after 0.11 ms with patch 3; the structural check rejects all three in
+  0.4–0.8 ms.
+- Cost:
+  - 7 upstream files changed (+199/−11), plus two new files of 439 and 1,233 lines;
+  - loading a token takes 3.2 ms instead of 2.0 ms, once per token.
+- Patches 1 and 2 are general and upstreamable. Patch 3 is a second evaluator, unlikely to be taken.
+- **Decision (owner, 2026-11-11): Biscuit format, vendored with all three patches.** Required alongside
+  it: the structural check before loading, and the differential test in CI.
 
 **3. Feed and freshness (#60): fail-narrow works as designed.** [H, measured]
 - The prototype is about 1,050 lines, at the low end of the 1–2k estimate. It covers a per-node
