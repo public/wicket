@@ -29,6 +29,8 @@ What it does:
   human approves or denies them with `wicket approve` / `wicket deny`, and the grant is single-use and expiring by
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
+- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reap`
+  (each box is labelled with the process that owns it); the run ends as `lost`.
 
 #### Agent identity and child agents
 
