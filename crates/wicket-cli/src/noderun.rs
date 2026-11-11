@@ -357,6 +357,12 @@ async fn session(
     started: &mut Option<oneshot::Sender<Option<String>>>,
     target_epoch: u64,
 ) -> Result<()> {
+    // Revoked while the channel was down: its pinned host key is gone too, so ssh would fail with
+    // a host key error that looks like an outage. Give up instead of retrying.
+    if let Some(why) = crate::nodeauth::untrusted(&sh.ledger.lock().expect("ledger"), &sh.node, None, wicket_store::now()) {
+        p.ever = false;
+        bail!("{why}: not reconnecting");
+    }
     let mut child = tokio::process::Command::new(&sh.argv[0])
         .args(&sh.argv[1..])
         .stdin(std::process::Stdio::piped())
