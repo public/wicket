@@ -253,7 +253,12 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     )
     .context("minting the box's token")?;
     let authority = issuer.publish(&approver, &[]).context("the box's token")?;
-    publisher.commit(vec![Change::PutZone { zone: authority }], now).context("publishing the box's token")?;
+    // One run per node holds the feed (the lock above): earlier runs' tokens go in the same delta, so
+    // the feed and the node's snapshot don't grow with every run.
+    let mut changes: Vec<Change<BoxAuthority>> =
+        publisher.state().zones.keys().filter(|k| **k != s.run.0).map(|k| Change::DropZone { name: k.clone() }).collect();
+    changes.push(Change::PutZone { zone: authority });
+    publisher.commit(changes, now).context("publishing the box's token")?;
     let token_root = (issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
     let target_epoch = publisher.epoch();
     let ctl = Arc::new(NodeCtl {
@@ -672,6 +677,12 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     };
     let now_s = wicket_store::now();
     let mut changes = vec![];
+    let ctx = sh.ctl.publisher.lock().expect("publisher").state().ctx;
+    // Whether the token with these grants would load on a node (the publisher refuses it otherwise).
+    let loads = |live: &[LiveGrant]| -> Result<(), String> {
+        let a = sh.issuer.publish(&sh.approver, live).map_err(|e| e.to_string())?;
+        wicket_feed::Policy::compile(&a, &ctx, &|_, _| false).map(|_| ())
+    };
     let before = p.live.len();
     p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
     let mut rebuild = p.live.len() != before;
@@ -700,14 +711,8 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             );
             continue;
         }
-        if !sh.ledger.lock().expect("ledger").hand_grant_to_node(&g.id, &sh.node).unwrap_or(false) {
-            continue;
-        }
-        if g.prefix {
-            println!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
-        }
         let op = Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path);
-        p.live.push(LiveGrant {
+        let live = LiveGrant {
             grant: wicket_authz::Grant {
                 gid: g.id.clone(),
                 box_id: sh.issuer.box_path.clone(),
@@ -720,7 +725,23 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
                 digest: hex::decode(op.digest()).unwrap_or_default(),
             },
             uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
-        });
+        };
+        let mut trial = p.live.clone();
+        trial.push(live.clone());
+        if let Err(e) = loads(&trial) {
+            // Never handed over: the control host keeps deciding it.
+            if p.published.insert(g.id.clone()) {
+                println!("[wicket] grant {} can't go in {}'s token ({e}); it stays with the control host", g.id, sh.run);
+            }
+            continue;
+        }
+        if !sh.ledger.lock().expect("ledger").hand_grant_to_node(&g.id, &sh.node).unwrap_or(false) {
+            continue;
+        }
+        if g.prefix {
+            println!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
+        }
+        p.live.push(live);
         p.published.insert(g.id);
         rebuild = true;
     }
@@ -735,9 +756,20 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         return vec![];
     }
     let n = p.live.len();
+    let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     let committed = {
         let mut p = sh.ctl.publisher.lock().expect("publisher");
-        p.commit(changes, wicket_feed::now_ms()).map(|f| (f, p.epoch()))
+        let mut r = p.commit(changes, wicket_feed::now_ms());
+        if r.is_err() && !revokes.is_empty() {
+            // The rebuilt token was refused: the revocations must still go out.
+            println!(
+                "[wicket] could not publish {}'s rebuilt token ({}); publishing its grant revocations alone",
+                sh.run,
+                r.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            r = p.commit(revokes, wicket_feed::now_ms());
+        }
+        r.map(|f| (f, p.epoch()))
     };
     match committed {
         Ok((f, epoch)) => {
