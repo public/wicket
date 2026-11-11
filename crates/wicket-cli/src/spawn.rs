@@ -32,7 +32,9 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let p = &c.parent;
     let pa = p.agent.as_ref().ok_or("only agents start boxes")?;
     let name = &req.name;
-    let ok_name = !name.is_empty() && name.len() <= 32 && name.starts_with(|ch: char| ch.is_ascii_lowercase())
+    let ok_name = !name.is_empty()
+        && name.len() <= 32
+        && name.starts_with(|ch: char| ch.is_ascii_lowercase())
         && name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
     if !ok_name {
         return Err("name must match ^[a-z][a-z0-9-]{0,31}$".into());
@@ -86,7 +88,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     };
     z.forbid = p.zone.forbid.iter().cloned().chain(z.forbid).collect();
     if is_agent {
-        let derived_from_parent = req.zone.as_ref().map_or(true, |v| v.get("llm").is_none());
+        let derived_from_parent = req.zone.as_ref().is_none_or(|v| v.get("llm").is_none());
         if derived_from_parent {
             // Half of what the parent has left, unless the caller says otherwise.
             if let (Some(pl), Some((r, t))) = (&p.zone.llm, llm_left) {
@@ -149,7 +151,12 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         match l.consume_grant(&op).map_err(|e| e.to_string())? {
             Some(gid) => {
                 beyond = true;
-                let _ = l.audit(&p.tenant, Some(&c.run), "spawn.beyond_parent", &serde_json::json!({ "zone": zone_name, "grant": gid, "exceeds": violations }));
+                let _ = l.audit(
+                    &p.tenant,
+                    Some(&c.run),
+                    "spawn.beyond_parent",
+                    &serde_json::json!({ "zone": zone_name, "grant": gid, "exceeds": violations }),
+                );
             }
             None if !req.ask_human => {
                 return Err(format!(
@@ -204,12 +211,17 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     c.children.lock().map_err(|_| "children lock")?.push((child.0.clone(), proc));
-    let budget = cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
+    let budget =
+        cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
     Ok(format!(
         "started {} {name} as run {}: its own box and identity, zone {zone_name}{}{budget}. {}",
         req.kind,
         child.0,
         if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
-        if is_agent { "Use await_message for its messages and its final run_finished." } else { "It sends you run_finished when it exits." }
+        if is_agent {
+            "Use await_message for its messages and its final run_finished."
+        } else {
+            "It sends you run_finished when it exits."
+        }
     ))
 }

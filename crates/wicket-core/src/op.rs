@@ -1,7 +1,8 @@
 //! `Op`: the normalised form of every boundary crossing, its risk class, and the pure decision.
 
-use crate::manifest::{compile_glob, ZoneSpec};
+use crate::manifest::{compile_glob, host_matches, ManifestError, ZoneSpec};
 use crate::{RunId, TenantId};
+use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -151,35 +152,89 @@ pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
     HostVerdict::Open
 }
 
+/// A zone with its path globs compiled once, so a decision costs a few matches rather than compiling
+/// globs on every request. A run's zone doesn't change while it runs (grants live in the ledger), so
+/// the run builds one when it starts and every proxy shares it. It dereferences to the `ZoneSpec`.
+pub struct CompiledZone {
+    spec: ZoneSpec,
+    /// Per forbid rule, its path matchers (same order as `spec.forbid`).
+    forbid: Vec<Vec<GlobMatcher>>,
+    /// Per reach rule, its path matchers (same order as `spec.reach`: the first match decides).
+    reach: Vec<Vec<GlobMatcher>>,
+}
+
+impl CompiledZone {
+    /// Compiles every glob. A glob that doesn't compile is an error, never "doesn't match", so a broken
+    /// forbid rule can't silently allow.
+    pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
+        let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
+        let forbid = spec.forbid.iter().map(|f| globs(&f.paths)).collect::<Result<_, _>>()?;
+        let reach = spec.reach.iter().map(|r| globs(&r.paths)).collect::<Result<_, _>>()?;
+        Ok(Self { spec, forbid, reach })
+    }
+
+    pub fn spec(&self) -> &ZoneSpec {
+        &self.spec
+    }
+
+    /// Whether a connection to `host` may be opened at all (see `host_verdict`).
+    pub fn host_verdict(&self, host: &str) -> HostVerdict {
+        host_verdict(&self.spec, host)
+    }
+
+    /// The decision for one request: forbidden outright, allowed by the first matching reach rule, or
+    /// needing a grant.
+    pub fn evaluate(&self, op: &Op) -> Verdict {
+        let zone = &self.spec;
+        if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
+            return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
+        }
+        if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
+            if !is_public_ip(&ip) {
+                return Verdict::Forbidden(format!("non-public address {ip}"));
+            }
+        }
+        let forbidden = zone
+            .forbid
+            .iter()
+            .zip(&self.forbid)
+            .any(|(f, globs)| host_matches(&f.host, &op.host) && globs.iter().any(|g| g.is_match(&op.path)));
+        if forbidden {
+            return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
+        }
+        for (i, (rule, globs)) in zone.reach.iter().zip(&self.reach).enumerate() {
+            if !rule.host_matches(&op.host) {
+                continue;
+            }
+            if !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method)) {
+                continue;
+            }
+            if !globs.iter().any(|g| g.is_match(&op.path)) {
+                continue;
+            }
+            if op.risk >= RiskClass::R3ExternalOrIrreversible && !rule.allow_dangerous {
+                return Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")));
+            }
+            return Verdict::AllowByReach(i);
+        }
+        Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path))
+    }
+}
+
+impl std::ops::Deref for CompiledZone {
+    type Target = ZoneSpec;
+    fn deref(&self) -> &ZoneSpec {
+        &self.spec
+    }
+}
+
+/// One decision against a zone that isn't compiled yet: compiles it first, so it's slow. Callers on the
+/// request path hold a `CompiledZone`. A zone whose globs don't compile forbids everything.
 pub fn evaluate(zone: &ZoneSpec, op: &Op) -> Verdict {
-    if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
-        return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
+    match CompiledZone::new(zone.clone()) {
+        Ok(z) => z.evaluate(op),
+        Err(e) => Verdict::Forbidden(format!("this zone's policy is invalid: {e}")),
     }
-    if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
-        if !is_public_ip(&ip) {
-            return Verdict::Forbidden(format!("non-public address {ip}"));
-        }
-    }
-    if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
-        return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
-    }
-    for (i, rule) in zone.reach.iter().enumerate() {
-        if !rule.host_matches(&op.host) {
-            continue;
-        }
-        if !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method)) {
-            continue;
-        }
-        let path_ok = rule.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(&op.path)).unwrap_or(false));
-        if !path_ok {
-            continue;
-        }
-        if op.risk >= RiskClass::R3ExternalOrIrreversible && !rule.allow_dangerous {
-            return Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")));
-        }
-        return Verdict::AllowByReach(i);
-    }
-    Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path))
 }
 
 fn is_public_ip(ip: &std::net::IpAddr) -> bool {
@@ -197,7 +252,11 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
-            !(v6.is_loopback() || v6.is_unspecified() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 || v6.to_ipv4_mapped().is_some())
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some())
         }
     }
 }
@@ -237,7 +296,9 @@ zone:
 
     #[test]
     fn single_star_does_not_cross_segments() {
-        let z = Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, reach: [{host: h.example, paths: ['/a/*']}], llm: {}}").unwrap().zone;
+        let z = Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, reach: [{host: h.example, paths: ['/a/*']}], llm: {}}")
+            .unwrap()
+            .zone;
         assert_eq!(evaluate(&z, &op("GET", "h.example", "/a/b")), Verdict::AllowByReach(0));
         assert!(matches!(evaluate(&z, &op("GET", "h.example", "/a/b/c")), Verdict::NeedsGrant(_)));
     }
@@ -261,9 +322,25 @@ zone:
 
     #[test]
     fn push_discovery_is_a_push() {
-        let o = Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/octocat/hello.git/info/refs", "service=git-receive-pack");
+        let o = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("r".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/octocat/hello.git/info/refs",
+            "service=git-receive-pack",
+        );
         assert_eq!(o.risk, RiskClass::R4ExecOrPrivilege);
-        let r = Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/octocat/hello.git/info/refs", "service=git-upload-pack");
+        let r = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("r".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/octocat/hello.git/info/refs",
+            "service=git-upload-pack",
+        );
         assert_eq!(r.risk, RiskClass::R1ReadScoped);
     }
 
@@ -295,7 +372,9 @@ zone:
 
     #[test]
     fn hosts_are_judged_before_any_request() {
-        let z = |extra: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: api.example.com }}, {{ host: \"*.cdn.example\" }}]\n  forbid: [{{ host: mcp.example.com }}, {{ host: api.example.com, paths: [\"/private/**\"] }}]\n{extra}")).unwrap().zone;
+        let z = |extra: &str| {
+            Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone:\n  name: z\n  llm: {{}}\n  reach: [{{ host: api.example.com }}, {{ host: \"*.cdn.example\" }}]\n  forbid: [{{ host: mcp.example.com }}, {{ host: api.example.com, paths: [\"/private/**\"] }}]\n{extra}")).unwrap().zone
+        };
         let open = z("");
         assert_eq!(host_verdict(&open, "api.example.com"), HostVerdict::Open);
         assert_eq!(host_verdict(&open, "news.example.org"), HostVerdict::Open, "escalate is the default");
@@ -306,5 +385,101 @@ zone:
         assert_eq!(host_verdict(&hidden, "news.example.org"), HostVerdict::Hidden);
         assert_eq!(host_verdict(&hidden, "a.cdn.example"), HostVerdict::Open);
         assert_eq!(host_verdict(&hidden, "api.example.com"), HostVerdict::Open, "a path-limited forbid doesn't hide the host");
+    }
+
+    /// The decision as it was before zones were compiled (globs compiled on every call): the oracle
+    /// `CompiledZone::evaluate` must agree with.
+    fn evaluate_uncompiled(zone: &ZoneSpec, op: &Op) -> Verdict {
+        if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
+            return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
+        }
+        if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
+            if !is_public_ip(&ip) {
+                return Verdict::Forbidden(format!("non-public address {ip}"));
+            }
+        }
+        if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
+            return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
+        }
+        for (i, rule) in zone.reach.iter().enumerate() {
+            if !rule.host_matches(&op.host) || !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method)) {
+                continue;
+            }
+            if !rule.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(&op.path)).unwrap_or(false)) {
+                continue;
+            }
+            if op.risk >= RiskClass::R3ExternalOrIrreversible && !rule.allow_dangerous {
+                return Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")));
+            }
+            return Verdict::AllowByReach(i);
+        }
+        Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path))
+    }
+
+    /// Paths a glob matches, and near misses: `*` and `**` filled in, the glob's parent, and siblings.
+    fn paths_for(glob: &str) -> Vec<String> {
+        let fill = |g: &str, one: &str, many: &str| g.replace("**", many).replace('*', one).replace(['{', '}'], "").replace(',', "");
+        let mut v = vec![fill(glob, "x", "a/b"), fill(glob, "", "z"), fill(glob, "abc123", "abc123/worker")];
+        if let Some((parent, _)) = glob.rsplit_once('/') {
+            v.push(format!("{}/", fill(parent, "x", "a")));
+            v.push(fill(parent, "x", "a"));
+            v.push(format!("{}/other", fill(parent, "x", "a")));
+        }
+        v.into_iter().map(|p| if p.starts_with('/') { p } else { format!("/{p}") }).collect()
+    }
+
+    #[test]
+    fn compiled_zones_decide_as_before() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        let files = ["demo.yaml", "hello-github.yaml", "mock-github.yaml", "remote-control/manifest.yaml", "self-hosting/manifest.yaml"];
+        let mut zones: Vec<ZoneSpec> =
+            files.iter().map(|f| Manifest::from_yaml(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap()).unwrap().zone).collect();
+        zones.push(zone());
+        zones.push(
+            Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: f\n  llm: {}\n  reach:\n    - { host: \"*.example.com\", methods: [GET, POST], paths: [\"/**\"] }\n    - { host: api.example.com, methods: [PUT, DELETE], paths: [\"/v1/*/items/**\"], allow_dangerous: true }\n  forbid:\n    - { host: api.example.com, paths: [\"/v1/admin/**\", \"/v1/*/secrets\"] }\n    - { host: mcp.example.com }\n")
+                .unwrap()
+                .zone,
+        );
+        let (t, r) = (TenantId("t0".into()), RunId("r".into()));
+        let (mut checked, mut kinds) = (0, [0usize; 3]);
+        for z in &zones {
+            let compiled = CompiledZone::new(z.clone()).unwrap();
+            let mut hosts: Vec<String> =
+                z.reach.iter().map(|x| &x.host).chain(z.forbid.iter().map(|f| &f.host)).map(|h| h.replace("*.", "a.")).collect();
+            hosts.extend(["github.com", "api.github.com", "example.com", "169.254.169.254", "localhost"].map(String::from));
+            let mut paths: Vec<String> = z
+                .reach
+                .iter()
+                .flat_map(|x| x.paths.iter())
+                .chain(z.forbid.iter().flat_map(|f| f.paths.iter()))
+                .flat_map(|g| paths_for(g))
+                .collect();
+            paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack"].map(String::from));
+            for h in &hosts {
+                for p in &paths {
+                    for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"] {
+                        let op = Op::egress(&t, &r, &z.name, m, h, p);
+                        let v = compiled.evaluate(&op);
+                        assert_eq!(v, evaluate_uncompiled(z, &op), "zone {} {m} {h}{p}", z.name);
+                        kinds[match v {
+                            Verdict::AllowByReach(_) => 0,
+                            Verdict::Forbidden(_) => 1,
+                            Verdict::NeedsGrant(_) => 2,
+                        }] += 1;
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("{checked} decisions: {} allowed, {} forbidden, {} need a grant", kinds[0], kinds[1], kinds[2]);
+        assert!(checked > 10_000 && kinds.iter().all(|&k| k > 500), "too few decisions of some kind: {kinds:?} of {checked}");
+    }
+
+    #[test]
+    fn a_zone_with_a_broken_glob_does_not_compile_and_forbids() {
+        let mut z = zone();
+        z.forbid.push(crate::manifest::ForbidRule { host: "api.github.com".into(), paths: vec!["/a/[".into()] });
+        assert!(CompiledZone::new(z.clone()).is_err());
+        assert!(matches!(evaluate(&z, &op("GET", "api.github.com", "/repos/octocat/hello/x")), Verdict::Forbidden(_)));
     }
 }
