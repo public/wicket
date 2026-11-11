@@ -15,6 +15,9 @@ G=${AS##*:}
 drop() { setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --bounding-set=-all -- "$@"; }
 
 ip addr add "$WICKET_ADDR/32" dev lo
+# Addresses for links to other boxes (198.18.1.1-32, one per linked name): added now, while this
+# script still can. wicket relays each link and names it in the box's hosts file, which it owns.
+for i in $(seq 1 32); do ip addr add "198.18.1.$i/32" dev lo; done
 
 SOCK=/wicket/sock
 drop socat TCP-LISTEN:3128,bind=$WICKET_ADDR,fork,reuseaddr UNIX-CONNECT:$SOCK/egress.sock &

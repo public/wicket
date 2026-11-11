@@ -154,8 +154,6 @@ impl Docker {
             "SETGID".into(),
             "--cap-add".into(),
             "SETPCAP".into(),
-            "--add-host".into(),
-            "wicket.internal:198.18.0.1".into(),
             "--workdir".into(),
             spec.workdir.clone(),
             "--label".into(),
@@ -164,6 +162,11 @@ impl Docker {
         for (k, v) in &spec.labels {
             a.push("--label".into());
             a.push(format!("{k}={v}"));
+        }
+        // wicket.internal's name, unless wicket mounts its own hosts file (which links add names to).
+        if !spec.mounts.iter().any(|m| m.target == "/etc/hosts") {
+            a.push("--add-host".into());
+            a.push("wicket.internal:198.18.0.1".into());
         }
         if spec.interactive {
             a.push("--interactive".into());
@@ -179,6 +182,30 @@ impl Docker {
         a.push(spec.image.clone());
         a.extend(spec.argv.iter().cloned());
         a
+    }
+
+    /// `docker exec` into a running box as `user` (uid:gid), with extra flags such as `-i` or `-d`.
+    pub fn exec_args(&self, container: &str, user: &str, flags: &[&str], argv: &[String]) -> Vec<String> {
+        let mut a = vec!["exec".to_string(), "--user".into(), user.into()];
+        a.extend(flags.iter().map(|f| f.to_string()));
+        a.push(container.into());
+        a.extend(argv.iter().cloned());
+        a
+    }
+
+    /// As [`Docker::exec_args`], as a command to spawn.
+    pub fn exec(&self, container: &str, user: &str, flags: &[&str], argv: &[String]) -> Command {
+        self.command_with(self.exec_args(container, user, flags, argv))
+    }
+
+    /// As [`Docker::exec`], for blocking callers.
+    pub fn exec_blocking(&self, container: &str, user: &str, flags: &[&str], argv: &[String]) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.cmd[0]);
+        c.args(&self.cmd[1..]);
+        for a in self.exec_args(container, user, flags, argv) {
+            c.arg(if self.quote { shell_quote(&a) } else { a });
+        }
+        c
     }
 
     /// Starts the box with the given stdin and stdout (e.g. inherited from whoever launched wicket,
@@ -281,6 +308,13 @@ mod tests {
         assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
         assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
+        // With wicket's own hosts file mounted (links add names to it), no --add-host.
+        let mut own = spec.clone();
+        own.mounts.push(Mount { host: "/run/hosts".into(), target: "/etc/hosts".into(), read_only: true });
+        let a = d.build_args(&own).join(" ");
+        assert!(!a.contains("--add-host") && a.contains("source=/run/hosts,target=/etc/hosts,readonly"));
+        let e = d.exec_args("wicket-x", "1000:1000", &["-i"], &["socat".into(), "-".into()]).join(" ");
+        assert_eq!(e, "exec --user 1000:1000 -i wicket-x socat -");
         assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));
     }

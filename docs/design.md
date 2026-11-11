@@ -1147,6 +1147,17 @@ Instance state is memory (§12). `PerTask` is the default. `PerZone` is for serv
 startup. `Shared` is only for servers declared stateless *and* restored from a clean template per task.
 Warm pools and snapshot clones (§7.1) make per-task instances cheap.
 
+**Links between boxes (PoC, #6).** Boxes reach each other's ports only through links wicket relays:
+`expose(port)`, `connect(box, port)` (which returns `<name>.wicket.internal:<port>`), and `link(from, to,
+port)` for a caller that controls both ends. A box's own children are connectable by default; any other
+box must have exposed the port and accept the connector's zone (`accept_from`), or a human approves. A link
+lends the connector the target's authority, so the target's reach must be within the connector's
+(`subset::reach_within`), or a human approves. Each linked name gets an address from 198.18.1.1–32, added
+at box start, and a line in a hosts file wicket owns. Under gVisor the box can't offer a socket to the host,
+so wicket reaches into the target with `docker exec` per connection. Every link is audited and closes when
+cut, revoked at either end, or when either run ends. Labels don't cross links yet (no label mechanism).
+See `examples/links/`.
+
 ### 8.3 Substrate: Kubernetes for capacity, direct launch for the hot path
 
 *Owner direction (2026-11-08): use Kubernetes rather than build our own scheduler. Research 10 refines this

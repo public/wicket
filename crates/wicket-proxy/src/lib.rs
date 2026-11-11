@@ -6,6 +6,7 @@ pub mod ca;
 pub mod decide;
 pub mod egress;
 pub mod gateway;
+pub mod link;
 pub mod llm;
 pub mod vault;
 
@@ -37,6 +38,8 @@ pub struct RunCtx {
     pub spawner: Option<Spawner>,
     /// Placeholders the box holds in place of real credentials, swapped at the egress proxy.
     pub swaps: Vec<CredentialSwap>,
+    /// The boxes links reach (`expose`, `connect`, `link`); None where this box can't link.
+    pub boxes: Option<Arc<dyn link::BoxOps>>,
 }
 
 /// A credential the box only ever sees as a placeholder. When a request to `host` carries exactly

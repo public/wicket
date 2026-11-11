@@ -84,7 +84,7 @@ impl Gateway {
                 "protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "wicket", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "wicket mediates this sandbox. When a request returns 403 pending-approval with a request_id, call await_grant with that id, then retry the request once it is granted. Agents talk to each other only through send_message and await_message; wicket signs and verifies who sent each message."
+                "instructions": "wicket mediates this sandbox. When a request returns 403 pending-approval with a request_id, call await_grant with that id, then retry the request once it is granted. Agents talk to each other only through send_message and await_message; wicket signs and verifies who sent each message. Boxes reach each other's ports only through links: expose, connect, link."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -110,6 +110,21 @@ impl Gateway {
             "spawn_agent" => self.spawn_agent(&args),
             "spawn" => self.spawn(&args),
             "request_access" => self.request_access(&args),
+            "expose" => crate::link::expose(
+                &self.ctx,
+                args.get("port").and_then(|v| v.as_u64()).filter(|p| *p <= 65535).unwrap_or(0) as u16,
+                args.get("name").and_then(|v| v.as_str()),
+            ),
+            "connect" => {
+                let b = args.get("box").and_then(|v| v.as_str()).unwrap_or("");
+                crate::link::connect(&self.ctx, b, args.get("port").and_then(|v| v.as_u64())).await
+            }
+            "link" => {
+                let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                crate::link::link(&self.ctx, &s("from"), &s("to"), args.get("port").and_then(|v| v.as_u64())).await
+            }
+            "unlink" => crate::link::unlink(&self.ctx, args.get("link").and_then(|v| v.as_str()).unwrap_or("")),
+            "links" => crate::link::list(&self.ctx),
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
@@ -487,6 +502,62 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "expose",
+            "description": "Offer a TCP port of this box (a server you run on 127.0.0.1 or 0.0.0.0) to other boxes. Your parent may connect without it; other boxes may if your zone's accept_from lists theirs, or a human approves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "name": { "type": "string", "description": "the name connectors see it under: <name>.wicket.internal (default: your agent name)" }
+                },
+                "required": ["port"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "connect",
+            "description": "Reach a TCP port of another box: one of your children (by name or run id, no expose needed), or a box that exposed the port. Returns the address to use here, <name>.wicket.internal:<port>, relayed by wicket (boxes have no network). Connecting lends you the target's authority, so a target that reaches beyond your zone needs a human: you get a request_id for await_grant, then call connect again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "box": { "type": "string", "description": "a child's name, a run id, or \"parent\"" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                },
+                "required": ["box", "port"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "link",
+            "description": "Wire two boxes you control (yourself, \"self\", or your own children): box `from` gets <name>.wicket.internal:<port>, reaching `port` of box `to`. The same policy as connect: `to`'s reach must be within `from`'s, or a human approves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                },
+                "required": ["from", "to", "port"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "unlink",
+            "description": "Close a link you opened or are an end of (its id, l-…). Live connections over it are dropped.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "link": { "type": "string" } },
+                "required": ["link"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "links",
+            "description": "The links you opened or are an end of, open and closed.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
             "name": "pending_requests",
             "description": "List this run's requests that are still waiting for a human decision.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
@@ -560,6 +631,7 @@ mod tests {
                 identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))),
                 spawner: None,
                 swaps: vec![],
+                boxes: None,
             }
         }
     }

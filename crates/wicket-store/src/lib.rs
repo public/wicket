@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
+mod links;
 mod node;
+pub use links::{ExposeRow, LinkRow};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -191,6 +193,7 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(links::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -204,6 +207,7 @@ impl Ledger {
     pub fn open_in_memory() -> Result<Ledger> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(links::SCHEMA)?;
         Ok(Ledger { conn })
     }
 
@@ -226,6 +230,7 @@ impl Ledger {
             "UPDATE requests SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE run = ?1 AND status = 'pending'",
             params![run.0, now()],
         )?;
+        self.close_links_of(&run.0)?;
         Ok(n)
     }
 
