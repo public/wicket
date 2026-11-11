@@ -270,50 +270,15 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                 );
             }
 
-            let ledger = Ledger::open(&crate::ledger_path())?;
-            ledger.audit(
+            Ledger::open(&crate::ledger_path())?.audit(
                 &TenantId::single(),
                 None,
                 "placement.node_created",
                 &serde_json::json!({ "backend": n.backend, "id": n.id.0, "name": name, "plan": n.plan, "region": n.region,
                                      "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
             )?;
-            let ready = placer.provider().wait_active(&n.id, Duration::from_secs(5), Duration::from_secs(600)).await;
-            let ready = match ready {
-                Ok(r) => r,
-                Err(e) => return Err(e.context(format!("{} is still billing: `wicket place release {}`", n.id, n.id))),
-            };
-            let target = ready.ssh_target.clone().context("no address")?;
-            println!("{} is active at {target}; waiting for node setup (host key pinned: {})", n.id, pinned);
-            boot::wait_ssh_ready(&target, &pinned, ssh_key.as_deref(), Duration::from_secs(10), Duration::from_secs(900))
-                .await
-                .with_context(|| format!("{} is still billing: `wicket place release {}`", n.id, n.id))?;
-            if !no_enrol {
-                let token = ledger.create_node_token(&TenantId::single(), &name, 600)?;
-                ledger.audit(
-                    &TenantId::single(),
-                    None,
-                    "node.token",
-                    &serde_json::json!({ "name": name, "ttl_secs": 600, "by": "place" }),
-                )?;
-                drop(ledger); // enrol opens its own
-                crate::enrol::enrol(crate::enrol::EnrolOpts {
-                    target: target.clone(),
-                    token,
-                    name: Some(name.clone()),
-                    ssh_key,
-                    host_key: Some(pinned),
-                    trust_first_use: false,
-                    hosts,
-                    ca_ttl,
-                    cert_ttl: std::time::Duration::from_secs(wicket_identity::node::NODE_CERT_TTL_SECS as u64),
-                })
-                .await?;
-            }
-            // The private host key no longer needs to be in the metadata service.
-            if let Err(e) = placer.provider().client().set_user_data(&n.id.0, SCRUBBED_USER_DATA).await {
-                eprintln!("warning: could not replace {}'s user data (it still holds the boot host key): {e:#}", n.id);
-            }
+            let hosts = (!no_enrol).then_some(hosts);
+            let (ready, _) = bring_up(placer.provider(), &n.id, &name, &pinned, ssh_key, hosts, ca_ttl).await?;
             if let Some(next) = placer.next_paid_hour_at(&ready) {
                 println!("next paid hour starts {}; release before then: wicket place release {}", fmt_time(next), n.id);
             }
@@ -346,4 +311,51 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// After a Vultr node is created: waits until it is active and its setup has finished (logging in with
+/// only `pinned` accepted), enrols it under `name` with that key pinned (unless `hosts` is None), and
+/// replaces its user data so the boot host key leaves the metadata service. Returns the node as it is
+/// now and its ssh target. Errors say the node is still billing.
+pub async fn bring_up(
+    p: &VultrProvider,
+    id: &NodeId,
+    name: &str,
+    pinned: &str,
+    ssh_key: Option<PathBuf>,
+    hosts: Option<Vec<String>>,
+    ca_ttl: Duration,
+) -> Result<(NodeHandle, String)> {
+    let ready = match p.wait_active(id, Duration::from_secs(5), Duration::from_secs(600)).await {
+        Ok(r) => r,
+        Err(e) => return Err(e.context(format!("{id} is still billing: `wicket place release {id}`"))),
+    };
+    let target = ready.ssh_target.clone().context("no address")?;
+    println!("{id} is active at {target}; waiting for node setup (host key pinned: {pinned})");
+    boot::wait_ssh_ready(&target, pinned, ssh_key.as_deref(), Duration::from_secs(10), Duration::from_secs(900))
+        .await
+        .with_context(|| format!("{id} is still billing: `wicket place release {id}`"))?;
+    if let Some(hosts) = hosts {
+        let ledger = Ledger::open(&crate::ledger_path())?;
+        let token = ledger.create_node_token(&TenantId::single(), name, 600)?;
+        ledger.audit(&TenantId::single(), None, "node.token", &serde_json::json!({ "name": name, "ttl_secs": 600, "by": "place" }))?;
+        drop(ledger); // enrol opens its own
+        crate::enrol::enrol(crate::enrol::EnrolOpts {
+            target: target.clone(),
+            token,
+            name: Some(name.to_string()),
+            ssh_key,
+            host_key: Some(pinned.to_string()),
+            trust_first_use: false,
+            hosts,
+            ca_ttl,
+            cert_ttl: std::time::Duration::from_secs(wicket_identity::node::NODE_CERT_TTL_SECS as u64),
+        })
+        .await?;
+    }
+    // The private host key no longer needs to be in the metadata service.
+    if let Err(e) = p.client().set_user_data(&id.0, SCRUBBED_USER_DATA).await {
+        eprintln!("warning: could not replace {id}'s user data (it still holds the boot host key): {e:#}");
+    }
+    Ok((ready, target))
 }

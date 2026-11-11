@@ -37,7 +37,40 @@ pub struct RunCtx {
     pub spawner: Option<Spawner>,
     /// Placeholders the box holds in place of real credentials, swapped at the egress proxy.
     pub swaps: Vec<CredentialSwap>,
+    /// Asks for capacity leases (`request_capacity`, #7); None when this run may not.
+    pub capacity: Option<CapacityHook>,
 }
+
+/// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CapacityAsk {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    /// `process`, `gvisor` or `vm`: the weakest isolation the node may offer.
+    pub isolation: String,
+    pub region: Option<String>,
+    pub duration_secs: i64,
+    /// The most the node may cost per hour, in dollars (e.g. "0.02").
+    pub max_hourly_usd: String,
+    pub reason: String,
+}
+
+pub enum CapacityCall {
+    /// File a request (a pending lease and its approval request).
+    Ask(CapacityAsk),
+    /// Where a lease is.
+    Status(String),
+}
+
+pub enum CapacityState {
+    /// Still waiting (for a human, or for the node to come up): what to tell the agent.
+    Waiting(String),
+    /// Decided: usable, refused, or ended.
+    Settled(String),
+}
+
+/// Ok: what to tell the agent. Err: why not.
+pub type CapacityHook = Arc<dyn Fn(CapacityCall) -> std::result::Result<CapacityState, String> + Send + Sync>;
 
 /// A credential the box only ever sees as a placeholder. When a request to `host` carries exactly
 /// `Authorization: Bearer <placeholder>`, the egress proxy sends the real value instead. The
@@ -107,6 +140,9 @@ pub struct SpawnRequest {
     pub ask_human: bool,
     /// spawn_agent's shorthand: the parent's zone, narrowed to these hosts.
     pub reach_hosts: Option<Vec<String>>,
+    /// Where to run it: `{"lease": "l-…"}` (a capacity lease this run holds) or `{"node": "<name>"}`.
+    /// Default: where the parent runs.
+    pub placement: Option<serde_json::Value>,
 }
 
 /// Ok: what to tell the agent (started, or waiting for approval). Err: why not.

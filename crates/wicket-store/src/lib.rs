@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
+mod lease;
 mod node;
+pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +126,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
-  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT
+  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -183,6 +185,13 @@ CREATE TABLE IF NOT EXISTS node_certs (
   not_after INTEGER NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS node_certs_node ON node_certs (node, issued_at);
+CREATE TABLE IF NOT EXISTS leases (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, request_id TEXT, provider TEXT NOT NULL, spec TEXT NOT NULL,
+  hourly_cap INTEGER NOT NULL, reserved INTEGER NOT NULL, duration_secs INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  not_after INTEGER, status TEXT NOT NULL, node_id TEXT, node_name TEXT, ssh_target TEXT, host_key TEXT, billed INTEGER,
+  ended_at INTEGER, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS leases_status ON leases (tenant, status);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
@@ -203,6 +212,9 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before grants could be handed to a node.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN node TEXT", []);
+        // Ledgers created before runs recorded their supervising process.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
         Ok(Ledger { conn })
     }
 
@@ -229,6 +241,11 @@ impl Ledger {
             .execute("UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1", params![run.0, status, now(), detail])?;
         let n = self.conn.execute(
             "UPDATE requests SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE run = ?1 AND status = 'pending'",
+            params![run.0, now()],
+        )?;
+        // A lease nobody has approved yet goes with the run that asked for it.
+        self.conn.execute(
+            "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
             params![run.0, now()],
         )?;
         Ok(n)

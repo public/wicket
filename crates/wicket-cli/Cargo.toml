@@ -46,5 +46,6 @@ getrandom.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+wicket-placement = { workspace = true, features = ["mock"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
