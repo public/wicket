@@ -16,13 +16,14 @@ All four ran on 2026-11-11 on a shared 4 vCPU Vultr VPS, so expect ±30% noise o
 
 ## What changes as a result
 
-- **Authority** is a signed capability chain made of plain records, with Biscuit-compatible semantics:
-  - intersection over every link;
-  - per-box grantor keys;
-  - each grant bound to the previous link's hash;
-  - leases that lapse without invalidating the chain.
+- **Authority** stays in the Biscuit format (owner, after `biscuit-fast`). Stock biscuit-auth is too slow
+  for the request path (#59), so wicket vendors upstream main with three patches from `biscuit-fast`:
+  - load a token once, then add each request's facts on top;
+  - a step budget instead of the wall-clock limit;
+  - a compiled evaluator, with the stock engine as fallback.
 
-  It replaces "authority is Biscuit" in the design (#57).
+  The patched version needs a structural check before loading and a differential test against the
+  stock engine in CI. `biscuit-depth`'s plain records are the measured fallback.
 - **SymCC in CI** (#51):
   - the segment model;
   - cvc5 1.3.1 pinned, run with `--tlimit-per` (`--tlimit` kills the process);
