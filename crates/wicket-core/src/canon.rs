@@ -42,6 +42,9 @@ pub fn canonical_path(path_and_query: &str) -> Result<&str, CanonError> {
     }
     // Skip the leading empty segment; a single trailing slash is allowed.
     let body = &path[1..];
+    if body.starts_with('/') {
+        return Err(CanonError::EmptySegment); // "//", which the trailing-slash rule below would accept
+    }
     let body = body.strip_suffix('/').unwrap_or(body);
     if body.is_empty() {
         return Ok(path);
@@ -72,6 +75,9 @@ mod tests {
         assert_eq!(canonical_path("/a/../b"), Err(CanonError::DotSegment));
         assert_eq!(canonical_path("/a/./b"), Err(CanonError::DotSegment));
         assert_eq!(canonical_path("/a//b"), Err(CanonError::EmptySegment));
+        assert_eq!(canonical_path("//"), Err(CanonError::EmptySegment));
+        assert_eq!(canonical_path("//a"), Err(CanonError::EmptySegment));
+        assert_eq!(canonical_path("/a//"), Err(CanonError::EmptySegment));
         assert!(matches!(canonical_path("/a/%2e%2e/b"), Err(CanonError::EncodedSeparator(_))));
         assert!(matches!(canonical_path("/a%2Fb"), Err(CanonError::EncodedSeparator(_))));
         assert_eq!(canonical_path("/a\\b"), Err(CanonError::BadCharacter));
