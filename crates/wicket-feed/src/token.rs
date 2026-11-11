@@ -150,6 +150,16 @@ fn request(spec: &BoxAuthority, op: &Op, now_ms: i64) -> authz::Request {
     }
 }
 
+/// The reason shown to people (`wicket pending`, the agent's 403): the zone's own wording when the
+/// zone agrees with the token's decision, else the token's failed checks.
+fn reason(c: &CompiledAuthority, op: &Op, forbidden: bool, token: String) -> String {
+    match c.zone.evaluate(op) {
+        wicket_core::Verdict::Forbidden(why) if forbidden => why,
+        wicket_core::Verdict::NeedsGrant(why) if !forbidden => why,
+        _ => token,
+    }
+}
+
 /// What a token decision found, before the replica records a use (which needs it mutably).
 enum Found {
     Done(Decision),
@@ -183,15 +193,17 @@ impl Replica<BoxAuthority> {
                         Ok(c) => {
                             let mut req = request(&entry.spec, op, now);
                             match c.loaded.decide(&req) {
-                                authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(r)),
+                                authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
                                 authz::Decision::Allow if mode == Mode::Fresh || op.risk <= NARROW_MAX_RISK => {
                                     Found::Done(Decision::Allow(Allowed::Ceiling))
                                 }
                                 authz::Decision::Allow => Found::Done(refused(format!("narrow: {:?} needs fresh policy", op.risk))),
                                 authz::Decision::NeedsGrant(r) if mode != Mode::Fresh => {
+                                    let r = reason(c, op, false, r);
                                     Found::Done(refused(format!("narrow: grants are not honoured while stale ({r})")))
                                 }
                                 authz::Decision::NeedsGrant(r) => {
+                                    let r = reason(c, op, false, r);
                                     let candidates = entry.spec.grants.iter().filter(|g| {
                                         g.host.eq_ignore_ascii_case(&op.host)
                                             && g.method.eq_ignore_ascii_case(&op.method)
