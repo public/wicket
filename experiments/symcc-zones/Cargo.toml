@@ -1,0 +1,20 @@
+[package]
+name = "symcc-zones"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of the main wicket workspace.
+[workspace]
+
+[dependencies]
+cedar-policy = "=4.14.1"
+cedar-policy-symcc = "=0.8.1"
+wicket-core = { path = "../../crates/wicket-core" }
+tokio = { version = "1", features = ["rt", "macros", "process"] }
+serde_yaml = "0.9"
+anyhow = "1"
+libc = "0.2"
+
+[profile.release]
+debug = 0

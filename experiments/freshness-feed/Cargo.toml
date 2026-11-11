@@ -1,0 +1,23 @@
+[package]
+name = "freshness-feed"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Experiment #60: signed snapshot-and-delta policy feed with a TUF-style freshness statement, and fail-narrow on the node."
+
+# Standalone: not a member of the repo workspace.
+[workspace]
+
+[dependencies]
+wicket-core = { path = "../../crates/wicket-core" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+globset = "0.4" # harness only: glob compile vs match cost
+
+[profile.release]
+debug = 1

@@ -1,0 +1,34 @@
+   Compiling freshness-feed v0.0.0 (experiments/freshness-feed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 15.36s
+     Running unittests src/lib.rs (target/release/deps/freshness_feed-9ea6f28b70df2e9e)
+
+running 2 tests
+test feed::tests::modes_follow_freshness ... ok
+test feed::tests::refusals ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cp.rs (target/release/deps/cp-33c67866f07b6fa7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/harness.rs (target/release/deps/harness-46b14bed63040256)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/node.rs (target/release/deps/node-65b7f872704611c1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests freshness_feed
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

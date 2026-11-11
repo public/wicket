@@ -1,0 +1,10 @@
+
+### depth 5, request A: pieces of the WARM path
+
+| what | median µs | p99 µs | mean µs | max µs |
+|---|---|---|---|---|
+| AuthorizerBuilder clone (static policies) |      0.7 |      1.3 |      0.7 |     16.1 |
+| clone + add 13 request facts |      3.5 |      8.1 |      3.8 |     30.2 |
+| build(token) alone (decode + translate 7 blocks) |    804.2 |   1399.8 |    853.3 |   2237.4 |
+| clone of a built Authorizer (token + facts loaded) |     90.6 |    197.7 |    106.4 |    289.8 |
+| clone built Authorizer + authorize (projected path with an add-facts API) |    261.5 |    475.4 |    277.0 |    814.4 |

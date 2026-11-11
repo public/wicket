@@ -1,0 +1,3 @@
+{"epoch":0,"ev":"cp_open","grants":0,"ts":1794386035169}
+{"ev":"listening","feed":36127,"ts":1794386035169}
+{"catchup":"snapshot","epoch":0,"ev":"served","n":398,"node_epoch":null,"sub":true,"ts":1794386035195}

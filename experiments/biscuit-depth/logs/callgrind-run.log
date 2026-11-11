@@ -1,0 +1,11 @@
+==3790563== Callgrind, a call-graph generating cache profiler
+==3790563== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==3790563== Using Valgrind-3.26.0.codspeed12 and LibVEX; rerun with -h for copyright info
+==3790563== Command: target/release/biscuit-depth profile
+==3790563== 
+==3790563== For interactive control, run 'callgrind_control -h'.
+==3790563== 
+==3790563== Events    : Ir
+==3790563== Collected : 924789977
+==3790563== 
+==3790563== I   refs:      924,789,977

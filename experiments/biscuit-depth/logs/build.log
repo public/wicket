@@ -1,0 +1,25 @@
+   Compiling biscuit-depth v0.0.0 (experiments/biscuit-depth)
+warning: variant `Llm` is never constructed
+  --> src/model.rs:91:5
+   |
+88 | pub enum Op {
+   |          -- variant in this enum
+...
+91 |     Llm { used_requests: i64, used_tokens: i64 },
+   |     ^^^
+   |
+   = note: `Op` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `n` is never read
+ --> src/stats.rs:4:9
+  |
+3 | pub struct Stats {
+  |            ----- field in this struct
+4 |     pub n: usize,
+  |         ^
+
+warning: `biscuit-depth` (bin "biscuit-depth") generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 15.68s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
