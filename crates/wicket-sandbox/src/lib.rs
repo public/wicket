@@ -31,6 +31,18 @@ pub struct SandboxSpec {
     pub workdir: String,
     /// Keep the agent's stdin open (the supervisor writes its task and follow-ups there).
     pub interactive: bool,
+    /// Extra labels, e.g. which run and which process own the box (`wicket reap` reads them).
+    pub labels: Vec<(String, String)>,
+}
+
+/// A wicket box Docker is running, as `Docker::boxes` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoxInfo {
+    pub name: String,
+    /// The run it belongs to (`wicket.run`), if labelled.
+    pub run: Option<String>,
+    /// The process that supervises it (`wicket.owner`), if labelled.
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +161,10 @@ impl Docker {
             "--label".into(),
             "wicket=1".into(),
         ];
+        for (k, v) in &spec.labels {
+            a.push("--label".into());
+            a.push(format!("{k}={v}"));
+        }
         if spec.interactive {
             a.push("--interactive".into());
         }
@@ -183,6 +199,26 @@ impl Docker {
         c.spawn().context("starting docker run")
     }
 
+    /// Every running wicket box (label `wicket=1`).
+    pub async fn boxes(&self) -> Result<Vec<BoxInfo>> {
+        let out = self
+            .command_with([
+                "ps".to_string(),
+                "--filter".into(),
+                "label=wicket=1".into(),
+                "--format".into(),
+                "{{.Names}}\t{{.Label \"wicket.run\"}}\t{{.Label \"wicket.owner\"}}".into(),
+            ])
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker ps")?;
+        if !out.status.success() {
+            bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(parse_boxes(&String::from_utf8_lossy(&out.stdout)))
+    }
+
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
         Ok(())
@@ -200,6 +236,18 @@ impl Docker {
         }
         Ok(())
     }
+}
+
+/// Parses `docker ps` lines of `name<TAB>run<TAB>owner`.
+fn parse_boxes(out: &str) -> Vec<BoxInfo> {
+    let some = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut f = l.split('\t');
+            BoxInfo { name: f.next().unwrap_or("").trim().to_string(), run: some(f.next()), owner: some(f.next()) }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -222,8 +270,10 @@ mod tests {
             user: "1000:1000".into(),
             workdir: "/workspace".into(),
             interactive: true,
+            labels: vec![("wicket.run".into(), "run_1".into())],
         };
         let a = d.build_args(&spec).join(" ");
+        assert!(a.contains("--label wicket=1 --label wicket.run=run_1"));
         assert!(a.contains("--network none"));
         assert!(a.contains("--runtime runsc"));
         assert!(a.contains("--cap-drop ALL"));
@@ -233,6 +283,18 @@ mod tests {
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
         assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));
+    }
+
+    #[test]
+    fn docker_ps_lines_parse_into_boxes() {
+        let out = "wicket-run-1\trun_1\tm1:42:9000\nwicket-old\t\t\n\n";
+        assert_eq!(
+            parse_boxes(out),
+            vec![
+                BoxInfo { name: "wicket-run-1".into(), run: Some("run_1".into()), owner: Some("m1:42:9000".into()) },
+                BoxInfo { name: "wicket-old".into(), run: None, owner: None },
+            ]
+        );
     }
 
     #[test]

@@ -481,6 +481,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         user,
         workdir: wrap_cwd.as_ref().map(|c| c.display().to_string()).unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
         interactive,
+        labels: vec![("wicket.run".into(), run.0.clone()), ("wicket.owner".into(), crate::reap::owner_label())],
     };
 
     println!(
