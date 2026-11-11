@@ -14,7 +14,8 @@ It is a library: no sockets, no threads, no timers. Every call that depends on t
 | | where | what |
 |---|---|---|
 | format | `src/format.rs`, `src/jws.rs` | `KeyCert`, `Snapshot`, `Delta`, `Fresh`, `Frame`; compact JWS (Ed25519), `typ` per kind |
-| state | `src/state.rs` | zone policies behind the `Policy` trait (a `wicket_core::ZoneSpec`, compiled once into a `CompiledZone`), grants, revocations, epoch and head |
+| state | `src/state.rs` | policy entries behind the `Policy` trait, compiled once when applied; grants, revocations, epoch and head |
+| tokens | `src/token.rs` | `BoxAuthority`: one box's authority as a Biscuit token chain (`wicket-authz`), what nodes decide with; `Issuer`: the control plane's side |
 | node | `src/replica.rs` | `Replica`: verify, persist, apply, refuse; `mode`; `decide`; `escalate` |
 | control plane | `src/publisher.rs` | `Publisher`: durable delta log, batching, snapshots, statements, catch-up, re-genesis |
 
@@ -30,6 +31,43 @@ It is a library: no sockets, no threads, no timers. Every call that depends on t
   clock), an optional use count (counted on the node) and an optional box (run id).
 - **Revocations** name a grant, run or token id, with `until` (the revoked thing's own expiry):
   snapshots drop entries past it, so the set stays bounded.
+
+## Payloads
+
+The feed is generic over its entries (`Policy`):
+
+- **`BoxAuthority`** (what `wicket node serve` runs on, #76 design A), keyed by run id:
+  - the box's whole token: block 0 minted by the control plane's authority root key with the
+    zone's ceiling, a spawn block per link below it, and a third-party block per live grant;
+  - the box's path and epoch (the token's `box` and `epoch` facts);
+  - the zone block 0 was minted from, used only where it can't widen authority: the pre-TLS host
+    verdict, which hosts are forwarded, and limits;
+  - each grant's id, request and use cap.
+
+  A node loads each token once, when its delta applies: signatures against the pinned authority
+  root (`authz-root.pub`, installed at enrolment), every block's revocation id against the feed's
+  revocation list, the strict structural check, then the compiled evaluator under its step budget.
+  Requests are decided by `wicket_authz` (Allow / NeedsGrant / Forbidden), mapped onto the modes
+  below. A `NeedsGrant` tries the record's grants for that exact request one at a time (the token's
+  grant rule needs a `uses_left` fact, which the node supplies from its own count), so the node
+  knows which grant to count, and a grant without a block in the token never fires.
+- **`ZoneSpec`**, the original payload: zone policies compiled into `CompiledZone`, with the feed's own
+  grant records. Kept as the differential oracle (`tests/tokens.rs` checks token decisions match it
+  on every example and subset-test zone, fresh and narrow).
+
+**Revocation by block id.** `Revoke { kind: Token, id }` names a block's revocation id (hex) and
+refuses every token containing that block. Revoking a spawn block therefore revokes the box it
+started and every box below it. Held revocations are checked at load; one that arrives later
+invalidates loaded tokens when its delta applies. `Revoke { kind: Grant }` stops one grant.
+
+**Grant blocks are appended on the control host, and the whole token is shipped.** Biscuit can't
+parse a lone third-party block (`wicket_authz::SignedGrant` has no `from_bytes`). The control host
+holds the approver key, so it has no need to send one. It rebuilds the token from its unchanged base
+with the live grants whenever they change. Dead grants then drop out, the chain stays under the
+structural block cap (at most `token::MAX_GRANTS` = 10 live grants per box), and the base's
+revocation ids stay stable. The alternative, a parser in the vendored fork, is only needed once
+approvals are signed somewhere else (an approval service, or a parent box's grantor on another
+node).
 
 ## Modes
 
@@ -102,6 +140,12 @@ everything rather than being refused (refusing a signed delta would desynchronis
   whether the node is fresh enough to ask for or honour one.
 
 ## Not done here
+
+- Child boxes on a node. `Issuer::child` appends spawn blocks, and the tests cover subtree
+  revocation on the node, but `wicket run --node` mints every run's token from block 0. A run
+  started under a parent run doesn't yet get its parent's chain plus a spawn block.
+- Spawn, model and message decisions through the token on the node. Those stay on the control
+  host for now; the node decides egress.
 
 - The transport and the subscriber loop (push over the ssh node channel, polling as fallback).
 - Rotating the root key itself.
