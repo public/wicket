@@ -1,0 +1,59 @@
+wicket run run_<id>  tenant t0  zone hib  agent hib (claude-code)
+  isolation Gvisor, no network; egress and model calls via wicket only
+  identity spiffe://hib.wicket.test/t/t0/z/hib/a/hib  (valid 600s, re-issued every 300s)
+  acting for <user> (cli, unix-user) → hib
+  approve escalations from another terminal: wicket pending / wicket approve <id>
+  run dir $WICKET_HOME/runs/run_<id>
+[agent] started: model claude-sonnet-5-5, 30 tools
+[llm]    #1 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: git log --oneline | head -80 && ls -la
+[llm]    #2 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/README.md
+[llm]    #3 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: rg -n 'pub fn ' crates | head -300
+[llm]    #4 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/docs/design.md
+[llm]    #5 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 0  (ok)
+[llm]    #6 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/crates/wicket-cli/src/run.rs
+[llm]    #7 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 0  (ok)
+[llm]    #8 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/crates/wicket-sandbox/src/lib.rs
+[llm]    #9 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Write: /workspace/notes/hibernate.md
+[llm]    #10 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/notes/hibernate.md
+[llm]    #11 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Edit: /workspace/notes/hibernate.md
+[llm]    #12 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: git diff --stat HEAD~20 | tail -40
+[llm]    #13 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/crates/wicket-agent/src/lib.rs
+[llm]    #14 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/docs/research/22-pause-resume-hibernate.md
+[llm]    #15 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: mkdir -p /volumes/cache && seq 1 20000 > /volumes/cache/seq.txt && du -sh /volumes/cache
+[llm]    #16 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: rg -c 'fn ' crates | sort -t: -k2 -n | tail -40
+[llm]    #17 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/crates/wicket-cli/src/mock.rs
+[llm]    #18 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Edit: /workspace/notes/hibernate.md
+[llm]    #19 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: cat Cargo.toml && wc -l crates/*/src/*.rs | tail -1
+[llm]    #20 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Read: /workspace/docs/research/02-isolation.md
+[llm]    #21 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 0  (ok)
+[llm]    #22 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: git log -p -3 --stat | head -400
+[llm]    #23 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[tool]  Bash: date -u +%FT%TZ > /workspace/notes/when.txt && cat /workspace/notes/when.txt
+[llm]    #24 claude-sonnet-5-5 → 200  in 10 (+0 cached) / out 20  (ok)
+[agent] HIB-T1-DONE: surveyed the workspace in 20 steps.
+[wicket] turn done; follow-ups for 5s: wicket say run_<id> "…"
+[agent] finished: success, 21 turns, $0.0046 (agent's estimate)
+[wicket] no follow-up for 5s; closing the session
+
+[wicket] run run_<id>: succeeded in 17s; 24 model requests, 240 in (0 of them cached) / 420 out tokens
+[wicket] no valid result.json in the outbox
+[wicket] transcript $WICKET_HOME/runs/run_<id>/transcript.jsonl
