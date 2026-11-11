@@ -32,6 +32,7 @@ pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   wait 2>/dev/null || true
+  rm -f "${manifest:-}"
   echo "logs: $work"
 }
 trap cleanup EXIT
@@ -61,13 +62,19 @@ else
   [ -n "$row" ] || { echo "node $NODE is not enrolled here"; exit 1; }
   target=$(awk '{print $3}' <<<"$row")
   pin="${WICKET_HOME:-$HOME/.local/share/wicket}/nodes/$NODE/known_hosts"
-  node_sh() { ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$pin" -o GlobalKnownHostsFile=/dev/null \
+  # WICKET_E2E_SSH_KEY: the identity for the node, if ssh's default keys don't reach it.
+  node_sh() { ssh ${WICKET_E2E_SSH_KEY:+-i "$WICKET_E2E_SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$pin" -o GlobalKnownHostsFile=/dev/null \
     -o "HostKeyAlias=wicket-node-$NODE" "$target" "$1"; }
   nodedir='$HOME/.local/share/wicket-node'
 fi
 
 log "wicket run --node $NODE"
-"$WICKET" run ci/node-e2e/e2e.yaml --image wicket/claude-code:poc --node "$NODE" >"$work/run.log" 2>&1 &
+# The probe must outlast the cut (TTL + narrow window) and the steps after it; 110 s fits the test
+# timings, and longer timings stretch it. The copy sits next to the original so `source: .` still works.
+probe_secs=$(( TTL + NARROW + 70 > 110 ? TTL + NARROW + 70 : 110 ))
+manifest=ci/node-e2e/.e2e-run.yaml
+sed "s/\"110\"/\"$probe_secs\"/" ci/node-e2e/e2e.yaml > "$manifest"
+"$WICKET" run "$manifest" --image wicket/claude-code:poc --node "$NODE" >"$work/run.log" 2>&1 &
 run_pid=$!
 pids+=($run_pid)
 for _ in $(seq 120); do grep -q ' read=' "$work/run.log" && break; sleep 1; done

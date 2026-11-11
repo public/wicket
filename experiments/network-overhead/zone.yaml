@@ -1,0 +1,13 @@
+# The bench zone: the self-hosting example's reach, plus the local origin allowed wholesale (every
+# method, every path, nothing injected), so the splice-through prototype may skip interception for it.
+task: network overhead bench
+program: { name: netbench, command: ["true"] }
+zone:
+  name: netbench
+  isolation: gvisor
+  reach:
+    - { host: index.crates.io }
+    - { host: static.crates.io }
+    - { host: github.com, methods: [GET, POST], paths: ["/public/wicket.git/info/refs", "/public/wicket.git/git-upload-pack"] }
+    - { host: api.github.com, paths: ["/repos/public/wicket", "/repos/public/wicket/**"] }
+    - { host: origin.test, methods: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS] }
