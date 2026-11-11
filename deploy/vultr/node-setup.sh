@@ -41,5 +41,5 @@ install -m 600 -o wicket -g wicket /root/.ssh/authorized_keys /home/wicket/.ssh/
 loginctl enable-linger wicket
 
 docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
-runsc --version | head -1
+runsc --version | sed -n 1p   # sed reads it all: head would close the pipe early (SIGPIPE under pipefail)
 echo "node ready"

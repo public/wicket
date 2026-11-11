@@ -1,0 +1,37 @@
+[package]
+name = "network-overhead"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Experiment #62: what wicket's TLS-intercepting egress proxy costs, where the time goes, and what a host-only splice-through would save."
+
+# Standalone: not a member of the repo workspace.
+[workspace]
+
+[dependencies]
+wicket-core = { path = "../../crates/wicket-core" }
+wicket-store = { path = "../../crates/wicket-store" }
+wicket-proxy = { path = "../../crates/wicket-proxy" } # RunCa, as the proxy uses it
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+futures-util = "0.3"
+# As the workspace has it (no http2 feature: the proxy's upstream side is HTTP/1.1 only).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.13"
+libc = "0.2"
+base64 = "0.22"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "netbench"
+path = "src/main.rs"

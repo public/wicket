@@ -148,6 +148,38 @@ wicket node revoke n1
   decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
+#### Provisioning nodes (`wicket place`)
+
+`crates/wicket-placement` is the placement interface (#37): request capacity (CPU, memory, isolation tier,
+region and plan hints, a price limit, an idempotency key) and get a node back; list, get and release owned
+nodes. Backends are the operator's own machines (static hosts) and Vultr. `wicket place` drives the Vultr one:
+
+```sh
+wicket secret set vultr-api-key                     # read from the terminal; only ever sent as the API's bearer token
+wicket place plans --region lhr                     # plans and their hourly price
+wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
+  --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id of a key in the Vultr account> --ssh-key <its private key> \
+  --hosts 'api.example.com'
+wicket place list                                   # owned nodes, lease end and next paid hour
+wicket place release <instance-id>                  # destroy now and revoke the enrolment
+```
+
+- **Money.** `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
+  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused, and
+  everything inside it still waits for `yes` on the terminal, with the plan, rate and worst case shown. Vultr
+  bills per started hour, each line rounded up to the cent, with a 672 h monthly cap, so a node's lease ends at
+  minute 50 of its last hour and `list` shows when the next paid hour starts.
+- **Ownership.** Instances are tagged `wicket-owner-<installation>` (`--owner`, default the trust domain).
+  Nothing without that tag, or with `wicket-protected`, is listed or destroyed. A retried `create` with the same
+  `--idempotency-key` finds the first instance by its tag instead of making a second one.
+- **Host key.** wicket generates the node's ssh host key, installs it through cloud-init as the node's only
+  host key, and pins it before the node boots. Then it waits for `node-setup.sh` to finish (over ssh, accepting
+  only that key), enrols the node with `--host-key`, and replaces the instance's user data so the private key
+  isn't left in the metadata service. There's no trust on first use: `wicket node enrol --trust-first-use` is
+  only for nodes made some other way.
+- **Not yet:** `spawn` with a placement hint, warm reuse across processes, and the reconciler daemon (#38,
+  for which `wicket_placement::reconcile` is the pure decision function).
+
 ## Requirements
 
 Linux with Docker and gVisor (`runsc`) registered as a Docker runtime with `--host-uds=open`:
