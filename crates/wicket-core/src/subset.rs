@@ -54,10 +54,11 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             }
         }
     }
-    // The parent's forbid rules bind the child too: each must be kept, by a child forbid rule at least
-    // as wide (same or wider host, and covering every forbidden path).
+    // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
+    // forbid rule with the same or a wider host (the paths of one parent rule may be split across
+    // several child rules).
     for (i, f) in p.forbid.iter().enumerate() {
-        let kept = c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && f.paths.iter().all(|fp| path_covered(&g.paths, fp)));
+        let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
         if !kept {
             v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
         }
@@ -333,6 +334,13 @@ mod tests {
             "{reach}  forbid:\n    - {{ host: api.example.com, paths: [\"/private/**\"] }}\n    - {{ host: mcp.example.com }}\n"
         ));
         assert_eq!(check(&ask(&kept), &bounds(&p)), Ok(()));
+        // One parent rule with two paths, kept by two child rules; dropping either path is refused.
+        let two = zone("  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/**\"] }\n  forbid:\n    - { host: api.example.com, paths: [\"/a/**\", \"/b/**\"] }\n  limits: { memory: 2g, cpus: 1, timeout: 1h }\n");
+        let split = |rules: &str| zone(&format!("{reach}  forbid:\n{rules}"));
+        let both = split("    - { host: api.example.com, paths: [\"/a/**\"] }\n    - { host: api.example.com, paths: [\"/b/**\"] }\n");
+        assert_eq!(check(&ask(&both), &bounds(&two)), Ok(()));
+        let one = split("    - { host: api.example.com, paths: [\"/a/**\"] }\n");
+        assert!(check(&ask(&one), &bounds(&two)).unwrap_err()[0].contains("forbid rule 0"));
         let wider = zone(&format!("{reach}  forbid:\n    - {{ host: \"*.example.com\" }}\n    - {{ host: api.example.com }}\n"));
         assert_eq!(check(&ask(&wider), &bounds(&p)), Ok(()));
     }
