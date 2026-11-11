@@ -22,7 +22,7 @@ pub enum Surface {
     Llm,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Op {
     pub tenant: TenantId,
     pub run: RunId,

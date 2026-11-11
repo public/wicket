@@ -1,8 +1,9 @@
 //! Node enrolment (#16; step 2 of #57's plan): `wicket node token | enrol | list | revoke | renew-ca`.
 //!
 //! **Trust model (kept deliberately small).**
-//! - The operator runs everything on the control host. The node runs nothing of wicket's yet (no
-//!   daemon until `wicket node serve`); enrolment drives it over ssh, using `openssl` there.
+//! - The operator runs everything on the control host. Enrolment drives the node over ssh, using
+//!   `openssl` there; afterwards `wicket node install` puts wicket itself on the node, to run
+//!   `wicket node serve` (`nodesrv.rs`).
 //! - **Join token.** `wicket node token` mints a one-time, short-lived token for an intended node name
 //!   (the ledger keeps its hash). `enrol` checks it before any remote work and redeems it atomically
 //!   with recording the node. It proves the person who minted it meant *this* name to join; it is not
@@ -482,6 +483,67 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration) -> Resul
             )
         })?;
     println!("renewed node {name}'s CA: serial {} for {} until {}", cert.serial, cert.permitted.join(", "), fmt_time(cert.not_after));
+    Ok(())
+}
+
+/// The systemd user unit `wicket node install` writes. Lingering (`loginctl enable-linger`, done by
+/// `deploy/vultr/node-setup.sh`) keeps it running without a login session.
+pub const NODE_UNIT: &str = "[Unit]
+Description=wicket node: runs this node's boxes and decides their egress locally
+After=docker.service
+
+[Service]
+ExecStart=%h/.local/bin/wicket node serve
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+";
+
+/// `wicket node install <name>`: copies this control host's own wicket binary to the node over the
+/// pinned ssh connection (`~/.local/bin/wicket`), checks its sha256 there, and (unless `no_service`)
+/// installs and restarts the `wicket-node` systemd user service that runs `wicket node serve`. The
+/// node's `serve` refuses a control host running any other build, so run this again after upgrading.
+pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Result<()> {
+    use sha2::Digest;
+    let ledger = Ledger::open(&crate::ledger_path())?;
+    let row = ledger.node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    if row.status != "active" {
+        bail!("node {name} is {}", row.status);
+    }
+    let node = pinned_node(&Paths::installation().nodes_dir, &row, ssh_key)?;
+    let arch = node.sh("uname -m").await?;
+    if arch != std::env::consts::ARCH {
+        bail!("node {name} is {arch}, this control host's wicket is {}: install a {arch} build there yourself", std::env::consts::ARCH);
+    }
+    let exe = std::env::current_exe().context("finding this binary")?;
+    let bytes = std::fs::read(&exe)?;
+    let sha = hex::encode(Sha256::digest(&bytes));
+    let home = node.sh("echo $HOME").await?;
+    let dest = format!("{home}/.local/bin/wicket");
+    node.sh(&format!("mkdir -p {}", wicket_sandbox::shell_quote(&format!("{home}/.local/bin")))).await?;
+    node.put(&format!("{dest}.new"), &bytes).await?;
+    let q = wicket_sandbox::shell_quote(&dest);
+    node.script(
+        "checking and installing the binary",
+        &format!("set -eu\necho '{sha}  '{q}.new | sha256sum -c --quiet\nchmod 755 {q}.new\nmv -f {q}.new {q}\n"),
+    )
+    .await?;
+    println!("installed wicket on node {name} ({} MB, sha256 {}…)", bytes.len() >> 20, &sha[..16]);
+    if no_service {
+        println!("no service installed: run `{dest} node serve` on the node yourself");
+        return Ok(());
+    }
+    let unit_dir = format!("{home}/.config/systemd/user");
+    let script = format!(
+        "set -eu\nexport XDG_RUNTIME_DIR=/run/user/$(id -u)\nmkdir -p {d}\ncat > {d}/wicket-node.service <<'WICKET_UNIT_EOF'\n{NODE_UNIT}WICKET_UNIT_EOF\n\
+         systemctl --user daemon-reload\nsystemctl --user enable wicket-node >/dev/null 2>&1\nsystemctl --user restart wicket-node\n\
+         sleep 1\nsystemctl --user is-active wicket-node\n",
+        d = wicket_sandbox::shell_quote(&unit_dir)
+    );
+    let state = node.script("installing the wicket-node service (is lingering enabled for this user?)", &script).await?;
+    println!("wicket-node service on {name}: {state}");
     Ok(())
 }
 

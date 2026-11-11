@@ -8,6 +8,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
+mod node;
+pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -133,7 +136,8 @@ CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, s
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
-  request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+  request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+  node TEXT
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -192,6 +196,8 @@ impl Ledger {
         // Ledgers created before requests recorded who asked.
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN attribution TEXT NOT NULL DEFAULT '[]'", []);
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
+        // Ledgers created before grants could be handed to a node.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN node TEXT", []);
         Ok(Ledger { conn })
     }
 
@@ -563,6 +569,7 @@ impl Ledger {
             .query_row(
                 "SELECT id, uses_left FROM grants
                  WHERE tenant = ?1 AND zone = ?2 AND method = ?3 AND host = ?4 AND revoked = 0 AND expires_at > ?5
+                   AND node IS NULL
                    AND (uses_left IS NULL OR uses_left > 0)
                    AND ((prefix = 0 AND path = ?6) OR (prefix = 1 AND substr(?6, 1, length(path)) = path))
                  ORDER BY prefix ASC, created_at ASC LIMIT 1",
@@ -686,7 +693,8 @@ impl Ledger {
     }
 }
 
-fn chain_hash(prev: &str, kind: &str, body: &str) -> String {
+/// An audit record's hash: sha256(prev, 0, kind, 0, body), hex. Nodes chain their own logs the same way.
+pub fn chain_hash(prev: &str, kind: &str, body: &str) -> String {
     let mut h = Sha256::new();
     h.update(prev.as_bytes());
     h.update([0u8]);

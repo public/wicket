@@ -19,6 +19,68 @@ fn identity_ttl() -> i64 {
     std::env::var("WICKET_IDENTITY_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(600).max(20)
 }
 
+/// Whether `id` is a run id wicket made (`run_` and 26 lowercase letters or digits).
+pub fn check_run_id(id: &str) -> Result<()> {
+    if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        Ok(())
+    } else {
+        bail!("bad run id {id:?}")
+    }
+}
+
+/// Stops a run's box: Docker here (or over ssh), or the box's node.
+#[derive(Clone)]
+enum Stopper {
+    Docker(Docker, String),
+    Node(Arc<crate::noderun::NodeCtl>),
+}
+
+impl Stopper {
+    async fn kill(&self) -> Result<()> {
+        match self {
+            Stopper::Docker(d, name) => d.kill(name).await,
+            Stopper::Node(c) => {
+                c.kill();
+                Ok(())
+            }
+        }
+    }
+
+    /// The run's identity was revoked: on a node, publish the revocation first (the node refuses its
+    /// ops as soon as the delta applies), then stop the box.
+    async fn revoke(&self) {
+        match self {
+            Stopper::Docker(d, name) => {
+                let _ = d.kill(name).await;
+            }
+            Stopper::Node(c) => c.revoke(),
+        }
+    }
+}
+
+/// The box's process: `docker run` here, or the exit a node reports.
+enum BoxProc {
+    Local(tokio::process::Child),
+    Node(tokio::sync::oneshot::Receiver<i32>),
+}
+
+impl BoxProc {
+    async fn wait(&mut self) -> Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        match self {
+            BoxProc::Local(c) => Ok(c.wait().await?),
+            // A node that never reported an exit (the channel gave up, or the run stopped waiting): a failure.
+            BoxProc::Node(rx) => {
+                let code = tokio::time::timeout(std::time::Duration::from_secs(2), &mut *rx).await.ok().and_then(|r| r.ok()).unwrap_or(255);
+                Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8))
+            }
+        }
+    }
+}
+
+type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+type Writer = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
 /// What `wicket run` was asked to do.
 pub struct RunOpts<'a> {
     pub manifest: &'a Path,
@@ -128,21 +190,23 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
         }
     }
-    // An enrolled node is reached with its host key pinned; a revoked one is refused.
+    // An enrolled node is reached with its host key pinned; a revoked one is refused. It runs the box
+    // through its own `wicket node serve`; an unenrolled target gets docker over ssh, as before.
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
+    let served = node.as_ref().is_some_and(|n| n.name.is_some());
     let docker = match &node {
         Some(n) => Docker::over_ssh(n.ssh_prefix()),
         None => Docker::from_env(),
     };
-    if !docker.image_exists(image).await? {
+    if !served && !docker.image_exists(image).await? {
         bail!("image {image} not found{} (run: wicket image)", node.as_ref().map(|n| format!(" on {}", n.target)).unwrap_or_default());
     }
 
     let run = match run_id {
-        Some(id) if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) => {
+        Some(id) => {
+            check_run_id(&id).with_context(|| "--run-id".to_string())?;
             RunId(id)
         }
-        Some(id) => bail!("bad --run-id {id:?}"),
         None => RunId::new(),
     };
     let dir = data_dir().join("runs").join(&run.0);
@@ -380,8 +444,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, None) => (wicket_agent::claude_code_plan(&m, &run), vec![]),
     };
     // Where the box's directories live: here, or on the remote node (which gets no secrets: only
-    // the CA's public certificate, the workspace, and the two forwarded sockets).
+    // the CA's public certificate, the workspace, and the two forwarded sockets). A served node makes
+    // them itself, from what the run sends it.
     let (box_root, user, _forward) = match &node {
+        Some(_) if served => (dir.clone(), String::new(), None),
         None => {
             let uid = std::process::Command::new("id").arg("-u").output()?;
             let gid = std::process::Command::new("id").arg("-g").output()?;
@@ -408,7 +474,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // Volumes persist per tenant and zone, on whichever host runs the box.
     let mut volume_mounts = Vec::new();
-    for v in &m.zone.volumes {
+    for v in m.zone.volumes.iter().filter(|_| !served) {
         let host = match &node {
             None => {
                 let d = data_dir().join("volumes").join(&m.tenant.0).join(&m.zone.name).join(&v.name);
@@ -451,9 +517,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         None => vec![Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false }],
     };
     // The agent's adapter settings (allowlisted keys only), in its own config dir.
+    let mut state_files: Vec<(String, String)> = vec![];
     if let Some(a) = m.agent.as_ref().filter(|a| !a.adapter_settings.is_empty()) {
         let json = serde_json::to_vec_pretty(&serde_json::Value::Object(a.adapter_settings.clone()))?;
         match &node {
+            Some(_) if served => {
+                use base64::Engine;
+                state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
+            }
             None => std::fs::write(box_root.join("state/claude/settings.json"), json)?,
             Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
         }
@@ -501,20 +572,78 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         println!("  acting for {}", c.chain().join(" → "));
     }
     if let Some(n) = &node {
-        println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
+        if served {
+            println!("  node {} via wicket node serve (egress decided there from the signed feed; secrets stay here)", n.label());
+        } else {
+            println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
+        }
     }
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
-    let mut child = match agent_stdout.take() {
-        Some(fd) => docker.spawn_with(&spec, std::process::Stdio::inherit(), std::process::Stdio::from(fd))?,
-        None => docker.spawn(&spec)?,
+    let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = match &node {
+        Some(n) if served => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let start = crate::chan::BoxStart {
+                run: run.0.clone(),
+                tenant: m.tenant.0.clone(),
+                zone: m.zone.name.clone(),
+                image: spec.image.clone(),
+                isolation: spec.isolation,
+                env: spec.env.clone(),
+                argv: spec.argv.clone(),
+                memory: spec.memory.clone(),
+                cpus: spec.cpus,
+                pids: spec.pids,
+                interactive: spec.interactive,
+                timeout_secs: m.zone.limits.timeout()?.as_secs(),
+                escalate,
+                ca_pem: ca.cert_pem(),
+                workspace_tar: b64.encode(crate::noderun::tar_dir(&dir.join("workspace"))?),
+                state_files: state_files.clone(),
+                volumes: m.zone.volumes.iter().map(|v| (v.name.clone(), v.path.clone())).collect(),
+                streams: [1, 2, 3],
+            };
+            let nb = crate::noderun::start(crate::noderun::Start {
+                node: n,
+                tenant: m.tenant.clone(),
+                run: run.clone(),
+                zone: m.zone.clone(),
+                dir: dir.clone(),
+                ledger: ledger.clone(),
+                events: ctx.events.clone(),
+                start,
+            })
+            .await?;
+            (
+                BoxProc::Node(nb.exit),
+                Stopper::Node(nb.ctl),
+                nb.stdin.map(|s| Box::new(s) as Writer),
+                Some(Box::new(nb.stdout) as Reader),
+                Box::new(nb.stderr) as Reader,
+            )
+        }
+        _ => {
+            let mut c = match agent_stdout.take() {
+                Some(fd) => docker.spawn_with(&spec, std::process::Stdio::inherit(), std::process::Stdio::from(fd))?,
+                None => docker.spawn(&spec)?,
+            };
+            let (i, o, e) = (c.stdin.take(), c.stdout.take(), c.stderr.take().expect("stderr"));
+            (
+                BoxProc::Local(c),
+                Stopper::Docker(docker.clone(), name.clone()),
+                i.map(|s| Box::new(s) as Writer),
+                o.map(|s| Box::new(s) as Reader),
+                Box::new(e) as Reader,
+            )
+        }
     };
     // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rotate_task = match (&identity, id_spec) {
         (Some(cell), Some(spec)) => {
-            let (cell, ledger, docker, name, revoked) = (cell.clone(), ledger.clone(), docker.clone(), name.clone(), revoked.clone());
+            let (cell, ledger, stopper, revoked) = (cell.clone(), ledger.clone(), stopper.clone(), revoked.clone());
             let tenant = m.tenant.clone();
             let run2 = run.clone();
             Some(tokio::spawn(async move {
@@ -530,7 +659,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         let whose = if r == run2.0 { "this agent's".to_string() } else { format!("ancestor {r}'s") };
                         println!("[wicket] {whose} identity was revoked by {by} ({reason}); stopping the box");
                         revoked.store(true, std::sync::atomic::Ordering::SeqCst);
-                        let _ = docker.kill(&name).await;
+                        stopper.revoke().await;
                         return;
                     }
                     let now = wicket_store::now();
@@ -560,7 +689,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
     // written the same way while the session is open; closing stdin ends it.
-    let mut stdin = child.stdin.take();
+    let mut stdin = stdin;
     if let (Some(si), Some(t)) = (stdin.as_mut(), &stdin_task) {
         use tokio::io::AsyncWriteExt;
         si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
@@ -570,8 +699,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut last_result = std::time::Instant::now();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
-    let mut lines = child.stdout.take().map(|o| BufReader::new(o).lines());
-    let stderr = child.stderr.take().expect("stderr");
+    let mut lines = stdout.map(|o| BufReader::new(o).lines());
     let mut wrapped_exit: Option<std::process::ExitStatus> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let log_path = dir.join("agent.stderr.log");
@@ -590,6 +718,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let timeout = m.zone.limits.timeout()?;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    let mut timed_out = false;
+    // After a stop, how long to wait for a node's box to end: a node that can't be reached stops it
+    // itself at the run's timeout.
+    let give_up = tokio::time::sleep(std::time::Duration::from_secs(86_400 * 365));
+    tokio::pin!(give_up);
+    let mut stopping = false;
+    let stop_grace = std::time::Duration::from_secs(30);
     let mut status = "unknown".to_string();
     // A program's last lines of output: its result, when it reports to a parent.
     let mut program_tail: Vec<String> = Vec::new();
@@ -601,8 +736,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             _ = term.recv() => {
                 println!("[wicket] terminated; stopping the box");
-                docker.kill(&name).await?;
+                stopper.kill().await?;
                 status = "interrupted".into();
+                if !stopping {
+                    stopping = true;
+                    give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                }
             }
             line = async { lines.as_mut().expect("guarded").next_line().await }, if lines.is_some() => match line? {
                 Some(l) => {
@@ -660,15 +799,28 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     stdin = None; // EOF: the agent finishes and exits
                 }
             }
-            _ = &mut deadline => {
+            _ = &mut deadline, if !timed_out => {
+                timed_out = true;
                 println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
-                docker.kill(&name).await?;
+                stopper.kill().await?;
                 status = "timeout".into();
+                if !stopping {
+                    stopping = true;
+                    give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                }
+            }
+            _ = &mut give_up, if stopping && served => {
+                println!("[wicket] node unreachable; not waiting for the box any longer (the node stops it at the run's timeout)");
+                break;
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("[wicket] interrupted; stopping the box");
-                docker.kill(&name).await?;
+                stopper.kill().await?;
                 status = "interrupted".into();
+                if !stopping {
+                    stopping = true;
+                    give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                }
             }
         }
     }
@@ -679,7 +831,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     while let Ok(ev) = rx.try_recv() {
         print_event(&ev);
     }
-    let stderr_text = err_task.await.unwrap_or_default();
+    // (A node box that couldn't be reached has no end of stderr: don't wait for one.)
+    let stderr_text = match tokio::time::timeout(std::time::Duration::from_secs(if served { 5 } else { 3600 }), err_task).await {
+        Ok(r) => r.unwrap_or_default(),
+        Err(_) => String::new(),
+    };
     if let Some(t) = &rotate_task {
         t.abort();
     }
@@ -699,8 +855,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     l_task.abort();
     g_task.abort();
 
-    // Typed output: the outbox, parsed and size-limited outside the box.
-    if let Some(n) = &node {
+    // Typed output: the outbox, parsed and size-limited outside the box. (A served node sent it with
+    // the exit.)
+    if let Some(n) = node.as_ref().filter(|_| !served) {
         let rd = box_root.display().to_string();
         if let Ok(s) = n.sh(&format!("head -c 65537 {rd}/workspace/out/result.json 2>/dev/null || true")).await {
             let _ = std::fs::write(dir.join("workspace/out/result.json"), s);
@@ -784,6 +941,8 @@ fn print_event(ev: &Event) {
                 "allow" => "ALLOW  ",
                 "pending" => "PENDING",
                 "denied" => "DENIED ",
+                "forwarded" => "FORWARD",
+                "unavailable" => "STALE  ",
                 _ => "BLOCKED",
             };
             println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));

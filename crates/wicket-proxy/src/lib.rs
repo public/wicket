@@ -3,6 +3,7 @@
 //! ever needed inside the box.
 
 pub mod ca;
+pub mod decide;
 pub mod egress;
 pub mod gateway;
 pub mod llm;
@@ -139,7 +140,7 @@ pub fn attributed_agents(v: &serde_json::Value) -> Vec<String> {
 }
 
 /// Live events for the operator's console and the audit log.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     Egress {
