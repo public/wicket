@@ -3,7 +3,7 @@
 //! there (`spawn` with `placement: {lease}`) until the lease ends and the node is destroyed.
 //!
 //! **Configuration** is `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`). Without it, agents can't
-//! ask, and the reconciler only looks after runs and boxes. See `examples/placement.yaml`.
+//! ask, and the reconciler only looks after runs and boxes. See `examples/placement/placement.yaml`.
 //!
 //! **Money.** A lease reserves its worst case *at the agent's own price cap* (`max_hourly_usd` for
 //! every started hour of its duration) the moment it is asked for, in the ledger, atomically against
