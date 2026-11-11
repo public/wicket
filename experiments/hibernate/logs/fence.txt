@@ -1,0 +1,8 @@
+races: 500 x 8 concurrent wakers; winners per race: min 1 max 1; 9.55 ms per race (claim + commit)
+wake A: gen 501; proxy accepts A: True
+wake B while A holds the lease: None
+A's lease expired; wake B: gen 502; proxy accepts B: True; proxy accepts stale A: False
+stale A pushes seq 502: refused: stale generation or seq
+B pushes seq 502: committed
+B is hibernated again; stale A tries once more: refused: stale generation or seq; proxy accepts A: False
+=> the head only moves under the current generation; A's manifest object is an orphan for GC.
