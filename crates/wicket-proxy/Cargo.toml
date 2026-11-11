@@ -28,3 +28,6 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 time.workspace = true
 tracing.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+x509-parser = "0.16"
