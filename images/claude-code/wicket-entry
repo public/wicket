@@ -13,6 +13,7 @@ WICKET_ADDR=198.18.0.1
 # runs this as root inside the sandbox, with GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE=save, resume or restore. A
 # restore drops wicket.internal's address from lo (experiment #70); wicket-fwd's listeners survive it
 # and accept again as soon as the address is back, so putting it back is all a restore needs.
+# Not wired yet: wicket parks boxes by rebuild today; this is for memory restore (experiment #70, H2).
 if [ "${1:-}" = --restore-hook ]; then
   case "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE:-restore}" in
     restore|resume) ip addr replace "$WICKET_ADDR/32" dev lo ;;

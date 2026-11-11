@@ -56,7 +56,7 @@
 //! (experiment #70). The listening sockets survive it, and accept again as soon as the address is
 //! back; the forwarder has no `NET_ADMIN` and can't re-add it itself. Putting it back is
 //! `wicket-entry --restore-hook`'s job, run by gVisor's save/restore hook as root inside the sandbox
-//! before the box is woken. So the forwarder doesn't die and doesn't rebind: a watcher thread checks
+//! before the box is woken (once wicket restores boxes from memory; today it parks them by rebuild). So the forwarder doesn't die and doesn't rebind: a watcher thread checks
 //! each listen address once a second (a UDP bind to it succeeds only while the address is local) and
 //! logs `address 198.18.0.1 is gone` and `... is back`, so a missing hook shows up in the box's log
 //! instead of as silent retries in the agent.
@@ -218,17 +218,18 @@ struct Gate {
     used: Mutex<usize>,
     freed: Condvar,
     max: usize,
+    quiet: Mutex<Quiet>,
 }
 
 impl Gate {
     fn new(max: usize) -> Gate {
-        Gate { used: Mutex::new(0), freed: Condvar::new(), max: max.max(1) }
+        Gate { used: Mutex::new(0), freed: Condvar::new(), max: max.max(1), quiet: Mutex::new(Quiet { last: None, dropped: 0 }) }
     }
 
     fn enter(self: &Arc<Self>) -> Permit {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         if *used >= self.max {
-            log!("at the connection limit ({}); new connections wait", self.max);
+            Quiet::say(&self.quiet, format_args!("at the connection limit ({}); new connections wait", self.max));
             while *used >= self.max {
                 used = self.freed.wait(used).unwrap_or_else(|e| e.into_inner());
             }
