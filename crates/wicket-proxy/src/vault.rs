@@ -53,11 +53,19 @@ impl Vault {
     fn get_ref(&self, name: &str, r: &std::path::Path) -> Result<String> {
         let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r)?)?;
         let file = spec.get("file").and_then(|v| v.as_str()).with_context(|| format!("{name}.ref needs \"file\""))?;
-        let pointer = spec.get("pointer").and_then(|v| v.as_str()).with_context(|| format!("{name}.ref needs \"pointer\""))?;
+        // No pointer: the whole file is the secret (e.g. an API key file).
+        let pointer = spec.get("pointer").and_then(|v| v.as_str());
         let meta = std::fs::metadata(file).with_context(|| format!("secret {name} refers to {file}, which is missing"))?;
         if meta.permissions().mode() & 0o077 != 0 {
             bail!("{file} (referenced by secret {name}) must not be readable by group or others");
         }
+        let Some(pointer) = pointer else {
+            let v = std::fs::read_to_string(file)?;
+            if v.trim().is_empty() {
+                bail!("secret {name} is empty");
+            }
+            return Ok(v.trim().to_string());
+        };
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file)?)?;
         if let Some(ep) = spec.get("expires_pointer").and_then(|v| v.as_str()) {
             if let Some(ms) = doc.pointer(ep).and_then(|v| v.as_i64()) {
@@ -74,8 +82,12 @@ impl Vault {
         Ok(v.trim().to_string())
     }
 
-    /// Makes `name` a reference to a JSON field in another file (never copied into the vault).
-    pub fn link(&self, name: &str, file: &str, pointer: &str, expires_pointer: Option<&str>) -> Result<()> {
+    /// Makes `name` a reference to another file (never copied into the vault): a JSON field in it,
+    /// or with no `pointer`, the whole file, trimmed.
+    pub fn link(&self, name: &str, file: &str, pointer: Option<&str>, expires_pointer: Option<&str>) -> Result<()> {
+        if pointer.is_none() && expires_pointer.is_some() {
+            bail!("an expiry pointer needs a JSON pointer: a whole-file reference has no fields");
+        }
         let p = self.path(name)?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
@@ -137,7 +149,7 @@ mod tests {
         let far = 32503680000000i64; // year 3000, in ms
         write("tok-1", far);
         let v = Vault::new(dir.join("vault"));
-        v.link("claude-oauth", creds.to_str().unwrap(), "/o/accessToken", Some("/o/expiresAt")).unwrap();
+        v.link("claude-oauth", creds.to_str().unwrap(), Some("/o/accessToken"), Some("/o/expiresAt")).unwrap();
         assert_eq!(v.get("claude-oauth").unwrap(), "tok-1");
         write("tok-2", far); // the owner refreshed it: we see the new value
         assert_eq!(v.get("claude-oauth").unwrap(), "tok-2");
@@ -145,6 +157,31 @@ mod tests {
         assert!(v.get("claude-oauth").unwrap_err().to_string().contains("expired"));
         std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(v.get("claude-oauth").is_err(), "world-readable source refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_whole_file_reference_reads_the_file_at_each_use() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-raw-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("api-key");
+        std::fs::write(&key, "key-1\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = Vault::new(dir.join("vault"));
+        assert!(v.link("api", key.to_str().unwrap(), None, Some("/exp")).is_err(), "no expiry without a JSON pointer");
+        v.link("api", key.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(v.get("api").unwrap(), "key-1", "trimmed");
+        std::fs::write(&key, "key-2").unwrap();
+        assert_eq!(v.get("api").unwrap(), "key-2", "re-read, never copied");
+        assert!(
+            !std::fs::read_dir(dir.join("vault"))
+                .unwrap()
+                .any(|e| std::fs::read_to_string(e.unwrap().path()).unwrap_or_default().contains("key-")),
+            "the vault holds only the reference"
+        );
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(v.get("api").is_err(), "world-readable source refused");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
