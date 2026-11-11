@@ -105,7 +105,7 @@ pub enum NodeState {
 }
 
 /// A node: a machine (or a slice of one) that boxes can run on.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeHandle {
     pub id: NodeId,
     pub backend: String,

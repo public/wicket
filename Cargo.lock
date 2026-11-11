@@ -3326,6 +3326,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicket-fwd"
+version = "0.0.1"
+
+[[package]]
 name = "wicket-identity"
 version = "0.0.1"
 dependencies = [
@@ -3359,6 +3363,7 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+ "wicket-placement",
 ]
 
 [[package]]

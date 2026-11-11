@@ -38,7 +38,7 @@ pub fn owner_label() -> String {
 
 /// Whether the process an owner label names is still running: None if it's on another machine (or
 /// the label is unreadable), so this machine can't tell.
-fn owner_alive(label: &str) -> Option<bool> {
+pub fn owner_alive(label: &str) -> Option<bool> {
     let mut f = label.splitn(3, ':');
     let (machine, pid, start) = (f.next()?, f.next()?.parse::<u32>().ok()?, f.next()?.parse::<u64>().ok()?);
     if machine != machine_id() {

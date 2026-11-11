@@ -56,5 +56,6 @@ time.workspace = true
 
 [dev-dependencies]
 ciborium = "0.2"
+wicket-placement = { workspace = true, features = ["mock"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
