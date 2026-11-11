@@ -1,5 +1,9 @@
 # Experiment: data-only blocks or Datalog checks? (token layout for #76)
 
+> **Decision (owner, 2026-11-11): design A, not this experiment's recommendation of B.** wicket needs
+> approval blocks, offline grants and narrowing by Biscuit's own semantics. The step budget and the
+> structural check bound attacker-written checks. B stays the fallback and a CI oracle. See #76.
+
 **Question.** Should wicket's spawn and grant blocks carry Datalog checks (today's draft, design A),
 or one typed fact each, intersected by wicket's own code (design B)? Or both, cross-checked (design C)?
 Research 23 §4 found that Agent Mesh and limes chose B. The cost is that "a child can't exceed its
