@@ -32,6 +32,7 @@ probe='v=$(cat /proc/version); d=$(dmesg 2>/dev/null | head -3 | tr "\n" " "); '
 'jq -n --arg v "$v" --arg d "$d" --arg a "$a" --arg o "$o" --arg n "$n" --arg c "$c" '\
 '"{version:\$v,dmesg:\$d,allowed:\$a,outside:\$o,direct:\$n,real_credentials:\$c}" > /workspace/out/result.json'
 
+"$WICKET" identity init --trust-domain ci.wicket.test >/dev/null
 printf 'mock-model-credential' | "$WICKET" secret set mock >/dev/null
 
 "$WICKET" dev mock-llm --listen 127.0.0.1:9999 --command "$probe" 2>"$work/mock.log" &
