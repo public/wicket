@@ -327,7 +327,10 @@ async fn a_pooled_node_is_destroyed_before_its_next_paid_hour_and_not_claimed_la
     assert!(p.pooled().await.is_empty());
     // m, released 5 minutes into its first hour, is kept until its minute 50 (95 minutes in our clock);
     // a request for an hour would run past that, so it gets a new node instead.
-    assert_eq!(p.release(&m.id, ReleaseMode::Billing { more_work_expected: true }).await.unwrap(), Released::Pooled { until: 45 * 60 + 50 * 60 });
+    assert_eq!(
+        p.release(&m.id, ReleaseMode::Billing { more_work_expected: true }).await.unwrap(),
+        Released::Pooled { until: 45 * 60 + 50 * 60 }
+    );
     let k = p.acquire(&req("third", H)).await.unwrap();
     assert_ne!(k.id, m.id);
     assert_eq!(f.creates(), 3);

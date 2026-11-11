@@ -2953,6 +2953,7 @@ dependencies = [
  "wicket-auth",
  "wicket-core",
  "wicket-identity",
+ "wicket-placement",
  "wicket-proxy",
  "wicket-sandbox",
  "wicket-store",

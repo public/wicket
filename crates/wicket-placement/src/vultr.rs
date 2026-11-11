@@ -214,7 +214,13 @@ impl Client {
     }
 
     /// One request, retried on 429 and 5xx. Returns None for 404 (the caller decides what that means).
-    async fn call(&self, method: reqwest::Method, path: &str, query: &[(&str, String)], body: Option<&serde_json::Value>) -> anyhow::Result<Option<serde_json::Value>> {
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
         let url = format!("{}{}", self.base, path);
         let mut attempt = 0;
         loop {
@@ -276,7 +282,10 @@ impl Client {
     }
 
     pub async fn create_instance(&self, body: &CreateInstance) -> anyhow::Result<Instance> {
-        let v = self.call(reqwest::Method::POST, "/instances", &[], Some(&serde_json::to_value(body)?)).await?.context("Vultr API POST /instances: 404")?;
+        let v = self
+            .call(reqwest::Method::POST, "/instances", &[], Some(&serde_json::to_value(body)?))
+            .await?
+            .context("Vultr API POST /instances: 404")?;
         serde_json::from_value(v.get("instance").cloned().context("Vultr API POST /instances: no instance in the response")?)
             .context("Vultr API POST /instances: unexpected instance")
     }
@@ -406,7 +415,13 @@ impl VultrProvider {
                 return Ok(self.handle(&i, &plans));
             }
             if tokio::time::Instant::now() + poll > deadline {
-                bail!("instance {id} is not active after {:?} (status {}, power {}, server {})", timeout, i.status, i.power_status, i.server_status);
+                bail!(
+                    "instance {id} is not active after {:?} (status {}, power {}, server {})",
+                    timeout,
+                    i.status,
+                    i.power_status,
+                    i.server_status
+                );
             }
             tokio::time::sleep(poll).await;
         }

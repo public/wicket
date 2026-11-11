@@ -247,7 +247,9 @@ pub trait Provider: Send + Sync {
 pub enum Released {
     Destroyed,
     /// Kept warm, already paid for, until then.
-    Pooled { until: Timestamp },
+    Pooled {
+        until: Timestamp,
+    },
     AlreadyGone,
 }
 

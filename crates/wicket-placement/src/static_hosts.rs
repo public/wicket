@@ -77,7 +77,8 @@ impl Provider for StaticHosts {
     }
 
     async fn create(&self, spec: &CreateSpec) -> anyhow::Result<NodeHandle> {
-        let h = self.hosts.iter().find(|h| h.name == spec.offer.plan).ok_or_else(|| anyhow::anyhow!("no static host {}", spec.offer.plan))?;
+        let h =
+            self.hosts.iter().find(|h| h.name == spec.offer.plan).ok_or_else(|| anyhow::anyhow!("no static host {}", spec.offer.plan))?;
         let mut a = self.allocs.lock().expect("allocs");
         if !spec.offer.resources.fits_in(&Self::free(&a, h)) {
             anyhow::bail!("host {} no longer has room", h.name);

@@ -5,7 +5,8 @@ Claude subscription token, the per-run CA key and the ledger stay on the control
 sockets are forwarded to the node with `ssh -R`. Nothing on the node listens on its public IP.
 
 Create a small Vultr instance (any plan with 2 GB RAM is plenty; Ubuntu 24.04), with an SSH key you hold on the
-control host. The PoC doesn't create instances itself yet (design §8, milestone I2).
+control host. `wicket place create` (see the main README) creates, sets up and enrols one in a single step, with
+its host key pinned at creation; the steps below do the same by hand.
 
 ```sh
 IP=<the node's IP>; K=<path to the SSH private key>

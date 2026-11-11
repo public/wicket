@@ -127,7 +127,13 @@ pub fn pinned_ssh_args(known_hosts: &Path, alias: &str, identity: Option<&Path>,
 }
 
 /// Logs in to `target` with only `host_key_line` accepted, until node setup has finished or `timeout`.
-pub async fn wait_ssh_ready(target: &str, host_key_line: &str, identity: Option<&Path>, poll: Duration, timeout: Duration) -> anyhow::Result<()> {
+pub async fn wait_ssh_ready(
+    target: &str,
+    host_key_line: &str,
+    identity: Option<&Path>,
+    poll: Duration,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = std::env::temp_dir().join(format!("wicket-probe-{}", ulid::Ulid::new()));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
@@ -138,7 +144,8 @@ pub async fn wait_ssh_ready(target: &str, host_key_line: &str, identity: Option<
         std::io::Write::write_all(&mut f, format!("{alias} {host_key_line}\n").as_bytes())?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let out = tokio::process::Command::new("ssh").args(pinned_ssh_args(&kh, alias, identity, target)).output().await.context("ssh")?;
+            let out =
+                tokio::process::Command::new("ssh").args(pinned_ssh_args(&kh, alias, identity, target)).output().await.context("ssh")?;
             if out.status.success() {
                 return Ok(());
             }
@@ -173,7 +180,9 @@ mod tests {
         let c = cloud_config(NODE_SETUP, &pair()).unwrap();
         assert!(c.starts_with("#cloud-config\n"));
         assert!(c.contains("ssh_deletekeys: true\nssh_genkeytypes: []\n"));
-        assert!(c.contains("  ed25519_private: |\n    KEY-PLACEHOLDER line one\n    KEY-PLACEHOLDER line two\n  ed25519_public: 'ssh-ed25519 "));
+        assert!(
+            c.contains("  ed25519_private: |\n    KEY-PLACEHOLDER line one\n    KEY-PLACEHOLDER line two\n  ed25519_public: 'ssh-ed25519 ")
+        );
         let b64 = c.lines().find_map(|l| l.trim().strip_prefix("content: ")).unwrap();
         let setup = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(String::from_utf8(setup).unwrap(), NODE_SETUP);

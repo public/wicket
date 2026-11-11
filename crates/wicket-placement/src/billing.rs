@@ -1,7 +1,7 @@
 //! How a provider bills a node, as data (design §8.4), and the release rules that follow from it (§8.5).
 
-use crate::money::MicroUsd;
 use crate::model::Timestamp;
+use crate::money::MicroUsd;
 
 pub const HOUR: i64 = 3600;
 /// Vultr's monthly cap: no instance bills more than 672 hours in a month.
@@ -118,7 +118,13 @@ pub enum ReleaseDecision {
 
 /// Whether a node nobody is using should go now or stay warm until shortly before its next paid hour.
 /// It stays only if more work may come and enough of the paid hour is left to be worth it.
-pub fn release_decision(model: &BillingModel, created: Timestamp, now: Timestamp, more_work_expected: bool, rules: &PoolRules) -> ReleaseDecision {
+pub fn release_decision(
+    model: &BillingModel,
+    created: Timestamp,
+    now: Timestamp,
+    more_work_expected: bool,
+    rules: &PoolRules,
+) -> ReleaseDecision {
     match model.next_paid_hour_at(created, now) {
         Some(next) if more_work_expected && next - now >= rules.pool_min_left && next - rules.margin > now => {
             ReleaseDecision::KeepUntil(next - rules.margin)

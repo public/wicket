@@ -1,7 +1,7 @@
 //! The money envelope (design §8.5) and the human approval hook.
 
-use crate::money::MicroUsd;
 use crate::model::{NodeHandle, Timestamp};
+use crate::money::MicroUsd;
 use std::future::Future;
 
 /// The limits no approval can widen.

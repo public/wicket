@@ -46,7 +46,14 @@ pub enum Action {
     Ignore { node: NodeId, reason: IgnoreReason },
 }
 
-pub fn reconcile(owner: &Owner, desired: &[Desired], observed: &[NodeHandle], now: Timestamp, warm_pool: bool, rules: &PoolRules) -> Vec<Action> {
+pub fn reconcile(
+    owner: &Owner,
+    desired: &[Desired],
+    observed: &[NodeHandle],
+    now: Timestamp,
+    warm_pool: bool,
+    rules: &PoolRules,
+) -> Vec<Action> {
     let mut actions = vec![];
     // Owned, live nodes by idempotency tag, oldest first.
     let mut by_tag: BTreeMap<String, Vec<&NodeHandle>> = BTreeMap::new();
@@ -147,17 +154,14 @@ mod tests {
         let a = reconcile(&me, &[d("a", 3000, false), d("b", 3000, false), d("old", 10, false)], &obs, 100, false, &PoolRules::default());
         assert_eq!(
             a,
-            vec![
-                Action::Keep { node: NodeId("n1".into()), idempotency_key: "a".into() },
-                Action::Create { idempotency_key: "b".into() },
-            ]
+            vec![Action::Keep { node: NodeId("n1".into()), idempotency_key: "a".into() }, Action::Create { idempotency_key: "b".into() },]
         );
     }
 
     #[test]
     fn orphans_after_a_crash_are_destroyed_or_pooled_by_paid_time() {
         let me = Owner::new("example");
-        let obs = vec![node(&me, "orphan", Some("gone"), 0, &[]), node(&me, "late", Some("gone2"), 0, &[])];
+        let obs = [node(&me, "orphan", Some("gone"), 0, &[]), node(&me, "late", Some("gone2"), 0, &[])];
         // No warm pool: everything without a lease goes.
         let a = reconcile(&me, &[], &obs[..1], 15 * 60, false, &PoolRules::default());
         assert_eq!(a, vec![Action::Destroy { node: NodeId("orphan".into()), reason: DestroyReason::NoLease }]);
