@@ -1,0 +1,15 @@
+design A
+  generator: bisc.rs compile + grant_code + helpers: 109
+  gate: lint.rs: 227
+  fork, prepared.rs (steps 1-2): 370
+  fork, compiled.rs (step 3): 1076
+  fork, edits to upstream files: 199 added lines (biscuit-fast logs/fork.diff)
+  upstream biscuit-auth src (Datalog engine, parser, format, crypto): 16525
+design B
+  generator: zf.rs generator section: 59
+  gate: zf.rs extractor section (shape, caps, canonical JSON, compile): 194
+  evaluator: zf.rs evaluator section (intersection, grants, liveness): 76
+  fork patch needed: Biscuit::block_datalog + BlockDatalog: 17 + 8 lines
+  wicket-core reused: CompiledZone (op.rs) 60 lines, plus manifest.rs host_matches/compile_glob 20 lines
+  second line (optional): plain.rs narrows: 62
+design C: A's pieces plus B's generator and extractor (and B's evaluator for the cross-check)

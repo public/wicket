@@ -1,0 +1,38 @@
+## 1. biscuit-fast's hostile Datalog blocks (§4.2 there), appended in every design
+
+| appended block | design | token | load result | load median / p99 | request A: decision, median / p99 |
+|---|---|---|---|---|---|
+| fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) | A checks (step 3) | 10615 B | refused: lint: block 7: first-party blocks may not carry rules | 1429 / 1702 µs | denied (token refused) |
+| fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) | B data-only (CompiledZone) | 8058 B | refused: extract: block 7: rules, checks and scopes are not allowed | 1929 / 3021 µs | denied (token refused) |
+| fact explosion: 40 q() facts, p($a,$b) <- q($a), q($b) (1600 facts) | C hybrid (decide A, cross-check B) | 17087 B | refused: lint: block 7: first-party blocks may not carry rules | 1610 / 2352 µs | denied (token refused) |
+| iteration chain: 150 rules r_i+1 <- r_i | A checks (step 3) | 14242 B | refused: lint: block 7: first-party blocks may not carry rules | 1914 / 3004 µs | denied (token refused) |
+| iteration chain: 150 rules r_i+1 <- r_i | B data-only (CompiledZone) | 11679 B | refused: extract: block 7: rules, checks and scopes are not allowed | 2182 / 2996 µs | denied (token refused) |
+| iteration chain: 150 rules r_i+1 <- r_i | C hybrid (decide A, cross-check B) | 20714 B | refused: lint: block 7: first-party blocks may not carry rules | 1808 / 2425 µs | denied (token refused) |
+| expensive checks: 200 regex checks | A checks (step 3) | 26022 B | refused: lint: block 7: 200 checks | 2312 / 3795 µs | denied (token refused) |
+| expensive checks: 200 regex checks | B data-only (CompiledZone) | 23462 B | refused: extract: block 7: rules, checks and scopes are not allowed | 2884 / 3890 µs | denied (token refused) |
+| expensive checks: 200 regex checks | C hybrid (decide A, cross-check B) | 32494 B | refused: lint: block 7: 200 checks | 2432 / 2867 µs | denied (token refused) |
+
+## 2. Hostile data blocks (design B; C refuses the same, since it runs the same extractor)
+
+| appended block | design | token | load result | load median / p99 | request A: decision, median / p99 |
+|---|---|---|---|---|---|
+| zone fact with a 1 MiB string | B data-only (CompiledZone) | 1056949 B | refused: token is 1056949 bytes, cap 32768 | 0 / 0 µs | denied (token refused) |
+| same, with no token cap (zone cap 8 KiB) | B data-only (CompiledZone) | 1056949 B | refused: extract: block 7: zone: 1049362 bytes, cap 8192 | 9330 / 11218 µs | denied (token refused) |
+| JSON nested 3,000 deep (6 KB) | B data-only (CompiledZone) | 14383 B | refused: extract: block 7: zone: invalid type: sequence, expected a string at line 1 column 87 | 1792 / 3077 µs | denied (token refused) |
+| 4,000 extra zone facts in one block | B data-only (CompiledZone) | 78473 B | refused: extract: block 7: unexpected zone fact | 5769 / 11980 µs | denied (token refused) |
+| same, under the 32 KiB token cap | B data-only (CompiledZone) | 78473 B | refused: token is 78473 bytes, cap 32768 | 0 / 0 µs | denied (token refused) |
+| 10 more copies of the leaf zone (17 blocks) | B data-only (CompiledZone) | 8695 B | refused: extract: 17 blocks | 1496 / 2869 µs | denied (token refused) |
+| a reach path with glob metacharacters | B data-only (CompiledZone) | 8231 B | refused: extract: block 7: zone: bad reach entry | 1853 / 2324 µs | denied (token refused) |
+| an upper-case host and lower-case method | B data-only (CompiledZone) | 8211 B | refused: extract: block 7: zone: bad reach entry | 1926 / 2280 µs | denied (token refused) |
+| 9 blocks of 64-entry zones (7401 B of JSON each): the costliest token the caps allow | B data-only (CompiledZone) | 15977 B | loaded | 20726 / 35978 µs | allowed, 36.9 / 65.7 µs |
+| the same 9 zones as design A blocks | A checks (step 3) | 87837 B | refused: lint: token is 87837 bytes | 3301 / 4865 µs | denied (token refused) |
+
+## 3. If B carried wicket-core globs verbatim (a full ZoneSpec), what a hostile glob costs
+
+| glob | bytes | CompiledZone::new | median / p99 µs | one match median µs |
+|---|---|---|---|---|
+| `/repos/acme/**` | 14 | ok | 32 / 68 | 0.50 |
+| `/{a0,b0}{a1,b1}{a2,b2}{a3,b3}{a4,b4}{a5,b5}{a6,b…` | 344 | ok | 372 / 462 | 0.56 |
+| `/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**…` | 181 | ok | 34 / 72 | 2.27 |
+| `/*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*…` | 242 | ok | 402 / 555 | 0.56 |
+| `/[abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrst…` | 240 | ok | 93 / 157 | 0.47 |
