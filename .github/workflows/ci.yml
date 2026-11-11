@@ -71,8 +71,12 @@ jobs:
           curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
-          sudo apt-get update -q
-          sudo apt-get install -y -q runsc
+          # gVisor's apt repository is sometimes caught mid-sync ("File has unexpected size"): retry.
+          for i in 1 2 3 4; do
+            if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
+            [ "$i" = 4 ] && exit 1
+            echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
+          done
           # Keep the runner's own Docker settings; add runsc with host unix sockets (wicket's proxies).
           cfg=/etc/docker/daemon.json
           [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
