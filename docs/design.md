@@ -361,7 +361,7 @@ refreshed, in case an agent's environment is compromised or a key is exfiltrated
 the human user if there is one).
 - **Every identity names its `principal`:** the human or trigger at the root of the chain, and how wicket
   knew it was them. A run started from the PoC CLI is `{type: human, id: <unix user>, via: cli,
-  assurance: unix-user}`. A run started from the console will carry the passkey-authenticated operator.
+  assurance: unix-user}`. A run started from the console carries the passkey-authenticated operator.
   A schedule or webhook carries itself and the human who created it (§13.2).
 - **Delegation through agents is recorded in `act`** (RFC 8693 actor chain). A child's `act` is its
   parent, whose `act` is its own parent, and so on down to the principal.
@@ -404,8 +404,14 @@ Also built since then:
 
 Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
 name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, mTLS node certificates,
-the separate system user, root and issuing key separation, console-started runs (passkey principal),
-and federation with other installations.
+the separate system user, root and issuing key separation, and federation with other installations.
+
+Built since (#24): the console starts runs (from allowlisted manifest directories, the manifest's digest
+signed), sends follow-ups, revokes identities and answers prefix asks, each with a passkey assertion over
+exactly that action. A console-started run's principal is the passkey-authenticated operator
+(`{type: human, id: passkey:<name>, via: console, assurance: passkey (user verification)}`), handed to
+the detached `wicket run` in `WICKET_PRINCIPAL`; the signed audit record binds operator, run id and
+principal.
 
 **Granularity is the sandbox.** Subagents inside one box share a process and a uid, so per-subagent
 *cryptographic* identity is impossible there. Per-subagent attribution is reported, not proven (§11.1).
