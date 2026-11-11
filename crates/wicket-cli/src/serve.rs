@@ -132,7 +132,10 @@ fn resp(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Response<Ful
         .header("cache-control", "no-store")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
-        .header("content-security-policy", "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+        )
         .body(Full::new(body.into()))
         .expect("response")
 }
@@ -215,7 +218,12 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
                 *b = None; // single use
                 drop(b);
                 let cookie = set_session(state, SessionKind::Bootstrap);
-                Response::builder().status(StatusCode::SEE_OTHER).header("location", "/").header("set-cookie", cookie).body(Full::new(Bytes::new())).expect("response")
+                Response::builder()
+                    .status(StatusCode::SEE_OTHER)
+                    .header("location", "/")
+                    .header("set-cookie", cookie)
+                    .body(Full::new(Bytes::new()))
+                    .expect("response")
             }
             "/api/me" => {
                 let n = creds(state).map(|c| c.len()).unwrap_or(0);
@@ -251,24 +259,31 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
         "/api/register/begin" => {
             // Bootstrap sessions may enrol only while no passkey exists; afterwards a signed-in operator must.
             let n = creds(state).map(|c| c.len()).unwrap_or(0);
-            let allowed = matches!(&sess, Some((_, SessionKind::Operator { .. }))) || (matches!(&sess, Some((_, SessionKind::Bootstrap))) && n == 0);
+            let allowed =
+                matches!(&sess, Some((_, SessionKind::Operator { .. }))) || (matches!(&sess, Some((_, SessionKind::Bootstrap))) && n == 0);
             if !allowed {
                 return err(StatusCode::FORBIDDEN, "enrolling a passkey needs the enrolment link (first passkey) or a signed-in operator");
             }
             let challenge = random_bytes(32);
             let key = new_challenge(state, challenge.clone(), Purpose::Register, sess.map(|s| s.0));
-            let exclude: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
-            json_resp(StatusCode::OK, json!({ "publicKey": {
-                "challenge": key,
-                "rp": { "id": state.rp.rp_id, "name": "wicket" },
-                "user": { "id": b64u(format!("operator-{}", state.tenant).as_bytes()), "name": "operator", "displayName": "wicket operator" },
-                "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
-                "authenticatorSelection": { "residentKey": "required", "userVerification": "required" },
-                "attestation": "none", "timeout": 120000, "excludeCredentials": exclude
-            }}))
+            let exclude: Vec<Value> =
+                creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
+            json_resp(
+                StatusCode::OK,
+                json!({ "publicKey": {
+                    "challenge": key,
+                    "rp": { "id": state.rp.rp_id, "name": "wicket" },
+                    "user": { "id": b64u(format!("operator-{}", state.tenant).as_bytes()), "name": "operator", "displayName": "wicket operator" },
+                    "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
+                    "authenticatorSelection": { "residentKey": "required", "userVerification": "required" },
+                    "attestation": "none", "timeout": 120000, "excludeCredentials": exclude
+                }}),
+            )
         }
         "/api/register/finish" => {
-            let (Some(ch), Some(cdj), Some(att)) = (body.get("challenge").and_then(|c| c.as_str()), field_b64(&body, "clientDataJSON"), field_b64(&body, "attestationObject")) else {
+            let (Some(ch), Some(cdj), Some(att)) =
+                (body.get("challenge").and_then(|c| c.as_str()), field_b64(&body, "clientDataJSON"), field_b64(&body, "attestationObject"))
+            else {
                 return err(StatusCode::BAD_REQUEST, "challenge, clientDataJSON and attestationObject are required");
             };
             let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown or expired challenge") };
@@ -279,7 +294,10 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
                 Ok(c) => {
                     let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("passkey").chars().take(40).collect::<String>();
                     let oc = OperatorCredential { id: b64u(&c.id), name, x: c.x, y: c.y, sign_count: c.sign_count };
-                    let l = match Ledger::open(&ledger_path()) { Ok(l) => l, Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e) };
+                    let l = match Ledger::open(&ledger_path()) {
+                        Ok(l) => l,
+                        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+                    };
                     if let Err(e) = l.add_operator_credential(&state.tenant, &oc) {
                         return err(StatusCode::CONFLICT, e);
                     }
@@ -300,27 +318,43 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
             }
             let key = new_challenge(state, random_bytes(32), Purpose::Login, None);
             let allow: Vec<Value> = list.iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
-            json_resp(StatusCode::OK, json!({ "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 }}))
+            json_resp(
+                StatusCode::OK,
+                json!({ "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 }}),
+            )
         }
         "/api/login/finish" | "/api/decide/finish" => {
-            let Some(ch) = body.get("challenge").and_then(|c| c.as_str()).map(String::from) else { return err(StatusCode::BAD_REQUEST, "challenge required") };
+            let Some(ch) = body.get("challenge").and_then(|c| c.as_str()).map(String::from) else {
+                return err(StatusCode::BAD_REQUEST, "challenge required");
+            };
             let Some(p) = take_challenge(state, &ch) else { return err(StatusCode::FORBIDDEN, "unknown, used or expired challenge") };
             let decision = path == "/api/decide/finish";
             match (&p.purpose, decision) {
                 (Purpose::Login, false) => {}
-                (Purpose::Decision { .. }, true) if p.session == sess.as_ref().map(|s| s.0.clone()) && matches!(&sess, Some((_, SessionKind::Operator { .. }))) => {}
+                (Purpose::Decision { .. }, true)
+                    if p.session == sess.as_ref().map(|s| s.0.clone()) && matches!(&sess, Some((_, SessionKind::Operator { .. }))) => {}
                 _ => return err(StatusCode::FORBIDDEN, "challenge was issued for something else"),
             }
-            let (Some(id), Some(cdj), Some(ad), Some(sig)) = (body.get("id").and_then(|s| s.as_str()), field_b64(&body, "clientDataJSON"), field_b64(&body, "authenticatorData"), field_b64(&body, "signature")) else {
+            let (Some(id), Some(cdj), Some(ad), Some(sig)) = (
+                body.get("id").and_then(|s| s.as_str()),
+                field_b64(&body, "clientDataJSON"),
+                field_b64(&body, "authenticatorData"),
+                field_b64(&body, "signature"),
+            ) else {
                 return err(StatusCode::BAD_REQUEST, "id, clientDataJSON, authenticatorData and signature are required");
             };
-            let Some(oc) = creds(state).unwrap_or_default().into_iter().find(|c| c.id == id) else { return err(StatusCode::FORBIDDEN, "unknown passkey") };
+            let Some(oc) = creds(state).unwrap_or_default().into_iter().find(|c| c.id == id) else {
+                return err(StatusCode::FORBIDDEN, "unknown passkey");
+            };
             let cred = Credential { id: unb64u(&oc.id).unwrap_or_default(), x: oc.x, y: oc.y, sign_count: oc.sign_count };
             let count = match state.rp.verify_assertion(&unb64u(&ch).unwrap_or_default(), &cred, &cdj, &ad, &sig) {
                 Ok(c) => c,
                 Err(e) => return err(StatusCode::FORBIDDEN, e),
             };
-            let l = match Ledger::open(&ledger_path()) { Ok(l) => l, Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e) };
+            let l = match Ledger::open(&ledger_path()) {
+                Ok(l) => l,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
             let _ = l.touch_operator_credential(&oc.id, count);
             drop(l);
             if !decision {
@@ -339,7 +373,9 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
             }
         }
         "/api/decide/begin" => {
-            let Some((sid, SessionKind::Operator { .. })) = sess.clone() else { return err(StatusCode::UNAUTHORIZED, "sign in with your passkey") };
+            let Some((sid, SessionKind::Operator { .. })) = sess.clone() else {
+                return err(StatusCode::UNAUTHORIZED, "sign in with your passkey");
+            };
             let Some(id) = body.get("id").and_then(|s| s.as_str()) else { return err(StatusCode::BAD_REQUEST, "id required") };
             let approve = match body.get("decision").and_then(|s| s.as_str()) {
                 Some("approve") => true,
@@ -347,9 +383,13 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
                 _ => return err(StatusCode::BAD_REQUEST, "decision must be approve or deny"),
             };
             let unlimited = body.get("unlimited").and_then(|u| u.as_bool()).unwrap_or(false);
-            let uses = if !approve || unlimited { None } else { Some(body.get("uses").and_then(|u| u.as_u64()).unwrap_or(1).clamp(1, 1000) as u32) };
+            let uses = if !approve || unlimited {
+                None
+            } else {
+                Some(body.get("uses").and_then(|u| u.as_u64()).unwrap_or(1).clamp(1, 1000) as u32)
+            };
             let ttl_secs = body.get("ttl_secs").and_then(|u| u.as_u64()).unwrap_or(600).clamp(30, 24 * 3600);
-            let req = match Ledger::open(&ledger_path()).and_then(|l| l.request(id).map_err(Into::into)) {
+            let req = match Ledger::open(&ledger_path()).and_then(|l| l.request(id)) {
                 Ok(r) => r,
                 Err(e) => return err(StatusCode::NOT_FOUND, e),
             };
@@ -361,7 +401,10 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
             let unverified = identity.get("verified").and_then(|v| v.as_bool()) != Some(true)
                 && !identity.get("error").and_then(|e| e.as_str()).unwrap_or("").starts_with("no identity was issued");
             if approve && unverified {
-                return err(StatusCode::CONFLICT, format!("{id}: the requesting agent's identity does not verify; it can be denied, not approved"));
+                return err(
+                    StatusCode::CONFLICT,
+                    format!("{id}: the requesting agent's identity does not verify; it can be denied, not approved"),
+                );
             }
             // The exact decision the passkey will sign. Field order is fixed.
             let decision_json = json!({
@@ -379,12 +422,20 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
             .to_string();
             let nonce = random_bytes(16);
             let challenge = decision_challenge(&nonce, &decision_json).to_vec();
-            let key = new_challenge(state, challenge, Purpose::Decision { decision_json: decision_json.clone(), nonce, request: req.id.clone(), approve, uses, ttl_secs }, Some(sid));
+            let key = new_challenge(
+                state,
+                challenge,
+                Purpose::Decision { decision_json: decision_json.clone(), nonce, request: req.id.clone(), approve, uses, ttl_secs },
+                Some(sid),
+            );
             let allow: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
-            json_resp(StatusCode::OK, json!({
-                "decision": serde_json::from_str::<Value>(&decision_json).unwrap_or(Value::Null),
-                "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 }
-            }))
+            json_resp(
+                StatusCode::OK,
+                json!({
+                    "decision": serde_json::from_str::<Value>(&decision_json).unwrap_or(Value::Null),
+                    "publicKey": { "challenge": key, "rpId": state.rp.rp_id, "allowCredentials": allow, "userVerification": "required", "timeout": 120000 }
+                }),
+            )
         }
         "/api/logout" => {
             if let Some(s) = sid {
@@ -397,7 +448,19 @@ async fn route(req: Request<Incoming>, state: &State) -> Response<Full<Bytes>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply(state: &State, request: &str, approve: bool, uses: Option<u32>, ttl_secs: u64, oc: &OperatorCredential, decision_json: &str, nonce: &[u8], cdj: &[u8], ad: &[u8], sig: &[u8]) -> Result<String> {
+fn apply(
+    state: &State,
+    request: &str,
+    approve: bool,
+    uses: Option<u32>,
+    ttl_secs: u64,
+    oc: &OperatorCredential,
+    decision_json: &str,
+    nonce: &[u8],
+    cdj: &[u8],
+    ad: &[u8],
+    sig: &[u8],
+) -> Result<String> {
     let mut l = Ledger::open(&ledger_path())?;
     let by = format!("passkey:{}", oc.name);
     let signed = json!({
@@ -406,7 +469,12 @@ fn apply(state: &State, request: &str, approve: bool, uses: Option<u32>, ttl_sec
     });
     if approve {
         let gid = l.approve(request, &Approval { uses, ttl: Duration::from_secs(ttl_secs), path_prefix: None, decided_by: by.clone() })?;
-        l.audit(&state.tenant, None, "decision", &json!({ "request": request, "decision": "approve", "grant": gid, "by": by, "signed": signed }))?;
+        l.audit(
+            &state.tenant,
+            None,
+            "decision",
+            &json!({ "request": request, "decision": "approve", "grant": gid, "by": by, "signed": signed }),
+        )?;
         Ok(format!("approved {request} → {gid} (signed with {})", oc.name))
     } else {
         l.deny(request, &by)?;

@@ -1,0 +1,7 @@
+# gitleaks' default rules, minus third-party code vendored as is (its tests carry public keys).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "third-party code vendored as is"
+paths = ['''^experiments/[^/]+/vendor/''']
