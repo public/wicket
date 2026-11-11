@@ -32,7 +32,7 @@ KNOWN_IPS = {"8.8.8.8", "1.1.1.1", "168.63.129.16", "100.100.100.200"}
 PLACEHOLDER = re.compile(r"placeholder|example|x{6,}|…", re.I)
 # Files that describe the patterns themselves, and third-party code vendored as is.
 SKIP = {"ci/check-public.py"}
-SKIP_DIRS = re.compile(r"^experiments/[^/]+/vendor/")
+SKIP_DIRS = re.compile(r"^(experiments/[^/]+/vendor/|third_party/)")
 
 
 def tracked():
