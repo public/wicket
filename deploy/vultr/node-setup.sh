@@ -22,7 +22,7 @@ cat > /etc/docker/daemon.json <<'JSON'
 }
 JSON
 apt-get update -q
-apt-get install -y -q docker.io curl gnupg ca-certificates >/dev/null
+apt-get install -y -q docker.io curl gnupg ca-certificates openssl >/dev/null
 
 # gVisor from its signed apt repository.
 curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg

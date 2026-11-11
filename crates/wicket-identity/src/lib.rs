@@ -268,6 +268,35 @@ impl Issuer {
     }
 }
 
+/// The policy feed's root key (#57): what nodes check the feed against. It lives on the control
+/// host next to the issuer key (hex seed, mode 0600), created on first use, with its public half in
+/// `<path>.pub` (hex), the format the feed prototype uses. Nodes get only the public half, at
+/// enrolment. Returns the public key.
+pub fn load_or_create_feed_root(path: &Path) -> Result<VerifyingKey> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let key = match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let seed: [u8; 32] =
+                hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("feed root key file"))?;
+            SigningKey::from_bytes(&seed)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(d) = path.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            let k = SigningKey::generate(&mut rand_core::OsRng);
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+            f.write_all(hex::encode(k.to_bytes()).as_bytes())?;
+            k
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let public = key.verifying_key();
+    std::fs::write(path.with_extension("pub"), hex::encode(public.to_bytes()))?;
+    Ok(public)
+}
+
 /// A key id: the first 16 hex digits of sha256(public key).
 pub fn key_id(k: &VerifyingKey) -> String {
     hex::encode(&Sha256::digest(k.to_bytes())[..8])
@@ -509,5 +538,18 @@ mod tests {
         let jwk: Value = serde_json::from_slice(&std::fs::read(path.with_extension("pub.json")).unwrap()).unwrap();
         assert_eq!(verifying_key_from_jwk(&jwk).unwrap(), a.verifying_key());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_feed_root_key_is_created_once_private_with_its_public_half_beside_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wicket-feed-root-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("feed-root.key");
+        let a = load_or_create_feed_root(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_or_create_feed_root(&path).unwrap(), a);
+        assert_eq!(std::fs::read_to_string(path.with_extension("pub")).unwrap(), hex::encode(a.to_bytes()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

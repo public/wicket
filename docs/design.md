@@ -324,7 +324,7 @@ assert identity *on the box's behalf*:
 
 | Who needs the proof | Mechanism |
 |---|---|
-| wicket's own proxies | The socket a request arrives on *is* the box (no token; already the PoC's model). On remote nodes, the forwarded socket rides an SSH or mTLS channel to a node wicket enrolled, with the host key pinned at provisioning. The PoC still trusts the host key on first use. |
+| wicket's own proxies | The socket a request arrives on *is* the box (no token; already the PoC's model). On remote nodes, the forwarded socket rides an SSH or mTLS channel to a node wicket enrolled, with the host key pinned at provisioning. The PoC pins it at `wicket node enrol` (#16); targets that aren't enrolled are still trusted on first use, with a warning. |
 | Other zones, other tenants (§15 sharing), the console | Every gate message, handle and output is wrapped by the gateway in a **signed envelope**: issuer, identity record digest, content digest, labels. A receiver verifies wicket's signature, never the sender's claim. |
 | External services | `wicket-egress` signs outbound requests with **HTTP Message Signatures** (RFC 9421), as Web Bot Auth does. It is opt-in per reach rule, and carries a `Signature-Agent` that resolves to the zone's identity. |
 | Anyone auditing a result later | A **launch attestation** signed at start (the identity record) and a **result attestation** signed at end (output digests, the egress decisions, grants used). This is in-toto/SLSA-style provenance, chained into the audit log. |
@@ -402,7 +402,8 @@ Also built since then:
 - revocation that cascades to children and stops boxes;
 - the principal and delegation chain in every identity, shown with every request.
 
-Not built: signed result attestations, RFC 9421 egress signatures, node enrolment and pinned host keys,
+Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
+name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, mTLS node certificates,
 the separate system user, root and issuing key separation, console-started runs (passkey principal),
 and federation with other installations.
 

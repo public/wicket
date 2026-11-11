@@ -5,6 +5,7 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod enrol;
 mod mock;
 mod node;
 mod program;
@@ -70,10 +71,11 @@ enum Cmd {
         /// Agent image.
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
-        /// Run the box on a remote node over ssh (e.g. wicket@203.0.113.7). The node gets no secrets.
+        /// Run the box on a remote node over ssh: an enrolled node's name (its host key pinned), or an
+        /// ssh target (e.g. wicket@203.0.113.7; not pinned, with a warning). The node gets no secrets.
         #[arg(long)]
         node: Option<String>,
-        /// ssh identity for --node.
+        /// ssh identity for --node (default: the one it was enrolled with).
         #[arg(long)]
         ssh_key: Option<PathBuf>,
         /// Internal: the run id to use (set by a parent starting a child agent).
@@ -184,10 +186,70 @@ enum Cmd {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
     },
+    /// Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node
+    /// key and a name-constrained node CA; listing, revoking, renewing the CA.
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
     /// Development helpers.
     Dev {
         #[command(subcommand)]
         cmd: DevCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Print a one-time join token for a node (stored hashed; single use).
+    Token {
+        /// The node's name (default: a generated one, printed).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+    },
+    /// Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a
+    /// short-lived CA certificate constrained to --hosts, the feed root key and the issuer key.
+    Enrol {
+        /// e.g. wicket@203.0.113.7
+        target: String,
+        /// From `wicket node token`.
+        #[arg(long)]
+        token: String,
+        /// The node name (must match the token's).
+        #[arg(long)]
+        name: Option<String>,
+        /// ssh identity to log in with (remembered for later runs).
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// The node's ssh host key (`ssh-ed25519 AAAA…`) or its fingerprint (`SHA256:…`), from the
+        /// provider's console, cloud-init output or the image: not from the network.
+        #[arg(long, conflicts_with = "trust_first_use")]
+        host_key: Option<String>,
+        /// No --host-key: pin whatever key the node presents now, and print its fingerprint.
+        #[arg(long)]
+        trust_first_use: bool,
+        /// Hosts the node's CA may mint certificates for: `api.example.com`, `*.example.org` (comma-separated).
+        #[arg(long, value_delimiter = ',', required = true)]
+        hosts: Vec<String>,
+        /// Node CA lifetime.
+        #[arg(long, default_value = "24h")]
+        ca_ttl: String,
+    },
+    /// List enrolled nodes.
+    List,
+    /// Revoke a node: refuse it from now on (its pinned host key is deleted) and record its CA serials
+    /// for the feed's revocation list.
+    Revoke { name: String },
+    /// Issue a node a fresh CA certificate (and CA key, made on the node).
+    RenewCa {
+        name: String,
+        /// Replace the hosts it is constrained to (default: keep them).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+        #[arg(long, default_value = "24h")]
+        ca_ttl: String,
     },
 }
 
@@ -563,7 +625,7 @@ async fn main() -> Result<()> {
         Cmd::Doctor { image } => doctor(&image).await,
         Cmd::Reap { dry_run, node, ssh_key } => {
             let docker = match node {
-                Some(n) => wicket_sandbox::Docker::over_ssh(node::Node::new(&n, ssh_key.as_deref()).ssh_prefix()),
+                Some(n) => wicket_sandbox::Docker::over_ssh(enrol::resolve_installed(&n, ssh_key.as_deref())?.ssh_prefix()),
                 None => wicket_sandbox::Docker::from_env(),
             };
             let l = Ledger::open(&ledger_path())?;
@@ -583,6 +645,30 @@ async fn main() -> Result<()> {
             println!("{} box(es), {stopped} orphaned{}", all.len(), if dry_run { " (dry run: nothing stopped)" } else { "" });
             Ok(())
         }
+        Cmd::Node { cmd } => match cmd {
+            NodeCmd::Token { name, ttl } => enrol::token(name, humantime::parse_duration(&ttl)?),
+            NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl } => {
+                enrol::enrol(enrol::EnrolOpts {
+                    target,
+                    token,
+                    name,
+                    ssh_key,
+                    host_key,
+                    trust_first_use,
+                    hosts,
+                    ca_ttl: humantime::parse_duration(&ca_ttl)?,
+                })
+                .await
+            }
+            NodeCmd::List => enrol::list(),
+            NodeCmd::Revoke { name } => {
+                let mut l = Ledger::open(&ledger_path())?;
+                let serials = enrol::revoke(&mut l, &enrol::Paths::installation().nodes_dir, &name)?;
+                println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
+                Ok(())
+            }
+            NodeCmd::RenewCa { name, hosts, ca_ttl } => enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?).await,
+        },
         Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);

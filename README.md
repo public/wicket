@@ -56,6 +56,42 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - `wicket audit --verify` re-checks every identity ever issued (rotations included) and every message signature,
   offline.
 
+#### Remote nodes and enrolment
+
+`wicket run --node <name-or-ssh-target>` runs the box on another machine over ssh (prepare one with
+`deploy/vultr/node-setup.sh`). The proxies, ledger and keys stay on the control host; the run's sockets are
+forwarded to the node. Enrol a node first, so its ssh host key is pinned:
+
+```sh
+wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)
+wicket node enrol wicket@203.0.113.7 --token wkt_… --host-key 'SHA256:…' --hosts 'api.example.com,*.example.org'
+wicket run task.yaml --node n1
+wicket node list
+wicket node renew-ca n1                     # a fresh node CA (default 24 h)
+wicket node revoke n1
+```
+
+- **Host key.** `--host-key` takes the node's key line or its `SHA256:` fingerprint, which should come from
+  somewhere other than the network (the provider's console, cloud-init output, the image). Without it,
+  `enrol` refuses unless you pass `--trust-first-use`, and then prints the fingerprint it pinned. After that, every
+  ssh call uses a wicket-managed known_hosts (`<data dir>/nodes/<name>/known_hosts`) with
+  `StrictHostKeyChecking=yes`, so a node with any other key is refused. A `--node` target that isn't enrolled
+  still works the old way (trust on first use), with a warning. A revoked node is refused.
+- **Join token.** It's single-use, expires, and names the node. The operator redeems it on the control host
+  with `enrol`. It shows that whoever minted it meant that name to join, and it never goes to the node. Passed as `--token`,
+  it shows up in `ps` and shell history, which is acceptable only because it's single-use and short-lived.
+- **What the node gets** (in `~/.local/share/wicket-node`, mode 0600). It generates its own **Ed25519 node key**
+  and a P-256 **node CA** key with `openssl`, and neither private key leaves the node. The control host signs the
+  CA's request as a short-lived (24 h) intermediate under the installation CA (`ca.key`, next to the issuer key).
+  The intermediate has path length 0 and is **name-constrained** to `--hosts`, with all IP addresses excluded.
+  The node also gets the feed root's and the issuer's public keys.
+- **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
+  `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
+  "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
+  do until it expires.
+- **Revoking** deletes the pinned key and records the node CA's serials for the feed's revocation list (not
+  distributed yet). Nothing runs on the node yet: egress decisions move there with `wicket node serve` (#57).
+
 ## Requirements
 
 Linux with Docker and gVisor (`runsc`) registered as a Docker runtime with `--host-uds=open`:

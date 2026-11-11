@@ -128,7 +128,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
         }
     }
-    let node = node.map(|n| Node::new(n, ssh_key));
+    // An enrolled node is reached with its host key pinned; a revoked one is refused.
+    let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
     let docker = match &node {
         Some(n) => Docker::over_ssh(n.ssh_prefix()),
         None => Docker::from_env(),
@@ -194,7 +195,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let now = wicket_store::now();
             let ttl = identity_ttl;
             let manifest_sha256 = hex::encode(sha2::Sha256::digest(text.as_bytes()));
-            let node_name = node.as_ref().map(|n| n.target.clone()).unwrap_or_else(|| "local".into());
+            let node_name = node.as_ref().map(Node::label).unwrap_or_else(|| "local".into());
             // Who this agent acts for. A root run: the human who started it, and how wicket knows
             // (the PoC CLI knows only the local unix user). A child: its parent's principal, with the
             // parent prepended to the delegation chain, read from the parent's verified identity

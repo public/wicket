@@ -20,6 +20,12 @@ pub enum StoreError {
     NotPending(String, String),
     #[error("audit chain broken at seq {0}")]
     ChainBroken(i64),
+    #[error("join token: {0}")]
+    Token(&'static str),
+    #[error("node {0}: {1}")]
+    Node(String, &'static str),
+    #[error("random: {0}")]
+    Random(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -154,6 +160,20 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL, delivered_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
+CREATE TABLE IF NOT EXISTS node_tokens (
+  hash TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS nodes (
+  name TEXT PRIMARY KEY, tenant TEXT NOT NULL, target TEXT NOT NULL, host_key TEXT NOT NULL, host_key_fp TEXT NOT NULL,
+  node_key TEXT NOT NULL, ssh_key TEXT, hosts TEXT NOT NULL DEFAULT '[]', enrolled_at INTEGER NOT NULL,
+  status TEXT NOT NULL, revoked_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS node_cas (
+  serial TEXT PRIMARY KEY, node TEXT NOT NULL, issued_at INTEGER NOT NULL, not_after INTEGER NOT NULL,
+  hosts TEXT NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS node_cas_node ON node_cas (node, status);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
@@ -726,6 +746,335 @@ fn same_askers(a: &serde_json::Value, b: &serde_json::Value) -> bool {
             .unwrap_or_default()
     };
     key(a) == key(b)
+}
+
+/// An enrolled node (design §8, #16): where it is, how it's pinned, and its key.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeRow {
+    pub name: String,
+    pub tenant: String,
+    /// The ssh target, e.g. `wicket@203.0.113.7`.
+    pub target: String,
+    /// The pinned ssh host key, `<type> <base64>`.
+    pub host_key: String,
+    /// Its SHA256 fingerprint, as `ssh-keygen -l` prints it.
+    pub host_key_fp: String,
+    /// The node's Ed25519 public key (hex), generated on the node.
+    pub node_key: String,
+    /// The ssh identity the control host logs in with, if not the default.
+    pub ssh_key: Option<String>,
+    /// The hosts the node's CA is constrained to.
+    pub hosts: Vec<String>,
+    pub enrolled_at: i64,
+    /// "active" or "revoked".
+    pub status: String,
+    pub revoked_at: Option<i64>,
+}
+
+/// One intermediate CA certificate issued to a node.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeCaRow {
+    /// Hex, big-endian.
+    pub serial: String,
+    pub node: String,
+    pub issued_at: i64,
+    pub not_after: i64,
+    /// The permitted DNS subtrees it carries.
+    pub hosts: Vec<String>,
+    /// "active", "superseded" (replaced by `renew-ca`) or "revoked" (the node was revoked).
+    pub status: String,
+}
+
+const NODE_COLS: &str = "name, tenant, target, host_key, host_key_fp, node_key, ssh_key, hosts, enrolled_at, status, revoked_at";
+
+fn row_to_node(r: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
+    let hosts: String = r.get(7)?;
+    Ok(NodeRow {
+        name: r.get(0)?,
+        tenant: r.get(1)?,
+        target: r.get(2)?,
+        host_key: r.get(3)?,
+        host_key_fp: r.get(4)?,
+        node_key: r.get(5)?,
+        ssh_key: r.get(6)?,
+        hosts: serde_json::from_str(&hosts).unwrap_or_default(),
+        enrolled_at: r.get(8)?,
+        status: r.get(9)?,
+        revoked_at: r.get(10)?,
+    })
+}
+
+fn row_to_node_ca(r: &rusqlite::Row) -> rusqlite::Result<NodeCaRow> {
+    let hosts: String = r.get(4)?;
+    Ok(NodeCaRow {
+        serial: r.get(0)?,
+        node: r.get(1)?,
+        issued_at: r.get(2)?,
+        not_after: r.get(3)?,
+        hosts: serde_json::from_str(&hosts).unwrap_or_default(),
+        status: r.get(5)?,
+    })
+}
+
+/// sha256 of a join token: the ledger stores only this.
+fn token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.trim().as_bytes()))
+}
+
+/// Node enrolment (#16).
+///
+/// **Join tokens** are one-time and short-lived. `wicket node token` makes one for an intended node
+/// name; the ledger keeps only its sha256, the name and the expiry. The operator redeems it on the
+/// control host with `wicket node enrol`: the token is proof that whoever minted it meant *this* name
+/// to join, so a typo or a stale command can't enrol (or re-key) a node by accident. It is checked
+/// before any remote work and redeemed atomically, together with recording the node, at the end.
+impl Ledger {
+    /// Makes a join token for node `name`, valid for `ttl_secs`. Returns the token, shown once.
+    pub fn create_node_token(&self, tenant: &TenantId, name: &str, ttl_secs: i64) -> Result<String> {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
+        let token = format!("wkt_{}", hex::encode(b));
+        let t = now();
+        self.conn.execute(
+            "INSERT INTO node_tokens (hash, tenant, name, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![token_hash(&token), tenant.0, name, t, t + ttl_secs],
+        )?;
+        Ok(token)
+    }
+
+    /// The node name a token was made for, if it is still redeemable at `at`. Doesn't redeem it.
+    pub fn check_node_token(&self, token: &str, at: i64) -> Result<String> {
+        let row: Option<(String, i64, Option<i64>)> = self
+            .conn
+            .query_row("SELECT name, expires_at, used_at FROM node_tokens WHERE hash = ?1", params![token_hash(token)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        match row {
+            None => Err(StoreError::Token("unknown")),
+            Some((_, _, Some(_))) => Err(StoreError::Token("already used")),
+            Some((_, exp, None)) if exp <= at => Err(StoreError::Token("expired")),
+            Some((name, _, None)) => Ok(name),
+        }
+    }
+
+    /// Redeems `token` for `node.name` and records the node and its first CA certificate, in one
+    /// transaction: either all of it happens or none. Refused if the token is unknown, used, expired
+    /// or for another name, or if a node of that name is enrolled and not revoked.
+    pub fn enrol_node(&mut self, token: &str, node: &NodeRow, ca: &NodeCaRow) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "UPDATE node_tokens SET used_at = ?2 WHERE hash = ?1 AND name = ?3 AND used_at IS NULL AND expires_at > ?2",
+            params![token_hash(token), now(), node.name],
+        )?;
+        if n != 1 {
+            return Err(StoreError::Token("unknown, already used, expired, or for another node name"));
+        }
+        let existing: Option<String> =
+            tx.query_row("SELECT status FROM nodes WHERE name = ?1", params![node.name], |r| r.get(0)).optional()?;
+        if existing.as_deref().is_some_and(|s| s != "revoked") {
+            return Err(StoreError::Node(node.name.clone(), "is already enrolled (revoke it first)"));
+        }
+        tx.execute(
+            &format!("INSERT OR REPLACE INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL)"),
+            params![
+                node.name,
+                node.tenant,
+                node.target,
+                node.host_key,
+                node.host_key_fp,
+                node.node_key,
+                node.ssh_key,
+                serde_json::Value::from(node.hosts.clone()).to_string(),
+                node.enrolled_at
+            ],
+        )?;
+        insert_node_ca(&tx, ca)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a renewed CA certificate for an active node; its earlier active ones become "superseded".
+    pub fn renew_node_ca(&mut self, ca: &NodeCaRow) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx.query_row("SELECT status FROM nodes WHERE name = ?1", params![ca.node], |r| r.get(0)).optional()?;
+        match status.as_deref() {
+            None => return Err(StoreError::Node(ca.node.clone(), "is not enrolled")),
+            Some("active") => {}
+            Some(_) => return Err(StoreError::Node(ca.node.clone(), "is revoked")),
+        }
+        tx.execute("UPDATE node_cas SET status = 'superseded' WHERE node = ?1 AND status = 'active'", params![ca.node])?;
+        insert_node_ca(&tx, ca)?;
+        tx.execute("UPDATE nodes SET hosts = ?2 WHERE name = ?1", params![ca.node, serde_json::Value::from(ca.hosts.clone()).to_string()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks a node revoked, and its unexpired CA certificates with it. Returns their serials (for the
+    /// feed's revocation list). Revoking twice is refused.
+    pub fn revoke_node(&mut self, name: &str) -> Result<Vec<String>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let t = now();
+        let n =
+            tx.execute("UPDATE nodes SET status = 'revoked', revoked_at = ?2 WHERE name = ?1 AND status != 'revoked'", params![name, t])?;
+        if n != 1 {
+            return Err(StoreError::Node(name.into(), "is not enrolled, or already revoked"));
+        }
+        let serials = {
+            let mut st = tx.prepare(
+                "SELECT serial FROM node_cas WHERE node = ?1 AND status != 'revoked' AND not_after > ?2 ORDER BY issued_at, rowid",
+            )?;
+            let rows = st.query_map(params![name, t], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for s in &serials {
+            tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
+        }
+        tx.commit()?;
+        Ok(serials)
+    }
+
+    pub fn node(&self, name: &str) -> Result<Option<NodeRow>> {
+        Ok(self.conn.query_row(&format!("SELECT {NODE_COLS} FROM nodes WHERE name = ?1"), params![name], row_to_node).optional()?)
+    }
+
+    /// The node enrolled most recently under ssh target `target`, if any.
+    pub fn node_by_target(&self, target: &str) -> Result<Option<NodeRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {NODE_COLS} FROM nodes WHERE target = ?1 ORDER BY enrolled_at DESC LIMIT 1"),
+                params![target],
+                row_to_node,
+            )
+            .optional()?)
+    }
+
+    pub fn nodes(&self) -> Result<Vec<NodeRow>> {
+        let mut st = self.conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY name"))?;
+        let rows = st.query_map([], row_to_node)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// A node's CA certificates, newest first.
+    pub fn node_cas(&self, node: &str) -> Result<Vec<NodeCaRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT serial, node, issued_at, not_after, hosts, status FROM node_cas WHERE node = ?1 ORDER BY issued_at DESC, rowid DESC",
+        )?;
+        let rows = st.query_map(params![node], row_to_node_ca)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Revoked node CA certificates that haven't expired at `at`: what the feed's revocation list will
+    /// carry. (Superseded ones are left to expire: renewal replaces the key on the node.)
+    pub fn revoked_node_cas(&self, at: i64) -> Result<Vec<NodeCaRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT serial, node, issued_at, not_after, hosts, status FROM node_cas WHERE status = 'revoked' AND not_after > ?1 ORDER BY revoked_at",
+        )?;
+        let rows = st.query_map(params![at], row_to_node_ca)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+fn insert_node_ca(tx: &rusqlite::Transaction, ca: &NodeCaRow) -> Result<()> {
+    tx.execute(
+        "INSERT INTO node_cas (serial, node, issued_at, not_after, hosts, status) VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+        params![ca.serial, ca.node, ca.issued_at, ca.not_after, serde_json::Value::from(ca.hosts.clone()).to_string()],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+
+    fn node(name: &str) -> NodeRow {
+        NodeRow {
+            name: name.into(),
+            tenant: TenantId::single().0,
+            target: "wicket@203.0.113.7".into(),
+            host_key: "ssh-ed25519 AAAA".into(),
+            host_key_fp: "SHA256:x".into(),
+            node_key: "00".repeat(32),
+            ssh_key: None,
+            hosts: vec!["api.example.com".into()],
+            enrolled_at: now(),
+            status: "active".into(),
+            revoked_at: None,
+        }
+    }
+
+    fn ca(node: &str, serial: &str) -> NodeCaRow {
+        NodeCaRow {
+            serial: serial.into(),
+            node: node.into(),
+            issued_at: now(),
+            not_after: now() + 86_400,
+            hosts: vec!["api.example.com".into()],
+            status: "active".into(),
+        }
+    }
+
+    #[test]
+    fn a_join_token_is_single_use_and_for_one_name() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        assert!(t.starts_with("wkt_") && t.len() == 68);
+        assert_eq!(l.check_node_token(&t, now()).unwrap(), "n1");
+        let stored: String = l.conn.query_row("SELECT hash FROM node_tokens", [], |r| r.get(0)).unwrap();
+        assert_ne!(stored, t, "only the hash is stored");
+        assert!(l.enrol_node(&t, &node("n2"), &ca("n2", "01")).is_err(), "another name");
+        assert!(l.node("n2").unwrap().is_none(), "nothing recorded when refused");
+        l.enrol_node(&t, &node("n1"), &ca("n1", "01")).unwrap();
+        assert!(matches!(l.check_node_token(&t, now()), Err(StoreError::Token("already used"))));
+        let t2 = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        assert!(l.enrol_node(&t2, &node("n1"), &ca("n1", "02")).is_err(), "n1 is enrolled already");
+        assert!(l.enrol_node(&t, &node("n1"), &ca("n1", "03")).is_err(), "second use");
+        assert!(matches!(l.check_node_token("wkt_nope", now()), Err(StoreError::Token("unknown"))));
+    }
+
+    #[test]
+    fn a_join_token_expires() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 60).unwrap();
+        assert!(l.check_node_token(&t, now() + 30).is_ok());
+        assert!(matches!(l.check_node_token(&t, now() + 61), Err(StoreError::Token("expired"))));
+        let gone = l.create_node_token(&TenantId::single(), "n1", 0).unwrap();
+        assert!(l.enrol_node(&gone, &node("n1"), &ca("n1", "01")).is_err());
+        assert!(l.node("n1").unwrap().is_none());
+    }
+
+    #[test]
+    fn nodes_are_recorded_renewed_and_revoked_with_their_ca_serials() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        let n = l.node("n1").unwrap().unwrap();
+        assert_eq!(
+            (n.status.as_str(), n.target.as_str(), n.hosts.clone()),
+            ("active", "wicket@203.0.113.7", vec!["api.example.com".to_string()])
+        );
+        assert_eq!(l.node_by_target("wicket@203.0.113.7").unwrap().unwrap().name, "n1");
+        l.renew_node_ca(&ca("n1", "0b")).unwrap();
+        let cas = l.node_cas("n1").unwrap();
+        assert_eq!(
+            cas.iter().map(|c| (c.serial.as_str(), c.status.as_str())).collect::<Vec<_>>(),
+            vec![("0b", "active"), ("0a", "superseded")]
+        );
+        let revoked = l.revoke_node("n1").unwrap();
+        assert_eq!(revoked, vec!["0a", "0b"]);
+        assert_eq!(l.node("n1").unwrap().unwrap().status, "revoked");
+        assert_eq!(l.revoked_node_cas(now()).unwrap().len(), 2);
+        assert!(l.revoked_node_cas(now() + 90_000).unwrap().is_empty(), "expired ones drop off the list");
+        assert!(l.revoke_node("n1").is_err());
+        assert!(l.renew_node_ca(&ca("n1", "0c")).is_err(), "no new CA for a revoked node");
+        // Re-enrolling a revoked name takes a fresh token, and keeps the old serials revoked.
+        let t2 = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t2, &node("n1"), &ca("n1", "0d")).unwrap();
+        assert_eq!(l.node("n1").unwrap().unwrap().status, "active");
+        assert_eq!(l.revoked_node_cas(now()).unwrap().len(), 2);
+        assert_eq!(l.nodes().unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]
