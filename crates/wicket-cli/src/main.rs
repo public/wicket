@@ -327,8 +327,10 @@ enum SecretCmd {
         name: String,
         #[arg(long)]
         file: String,
+        /// A JSON pointer into the file (e.g. /claudeAiOauth/accessToken). Without one, the whole file
+        /// is the secret, trimmed (e.g. an API key file).
         #[arg(long)]
-        pointer: String,
+        pointer: Option<String>,
         #[arg(long)]
         expires_pointer: Option<String>,
     },
@@ -690,8 +692,11 @@ async fn main() -> Result<()> {
                     println!("stored secret {name}");
                 }
                 SecretCmd::Link { name, file, pointer, expires_pointer } => {
-                    v.link(&name, &file, &pointer, expires_pointer.as_deref())?;
-                    println!("secret {name} now refers to {file}#{pointer} (read at each use; never copied)");
+                    v.link(&name, &file, pointer.as_deref(), expires_pointer.as_deref())?;
+                    println!(
+                        "secret {name} now refers to {file}{} (read at each use; never copied)",
+                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default()
+                    );
                 }
                 SecretCmd::List => {
                     for n in v.list() {
