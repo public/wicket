@@ -12,7 +12,8 @@
 //! - `PATCH /instances/{id}` with `{"user_data": …}` (to drop the boot host key after enrolment)
 //! - `DELETE /instances/{id}` → `204`; `404` counts as already gone
 //!
-//! Errors are `{"error": "…", "status": N}`. `429` and `5xx` are retried with backoff a few times.
+//! Errors are `{"error": "…", "status": N}`. `429` is retried with backoff a few times, and `5xx` too
+//! except after a POST (the create may have happened).
 //!
 //! **The API key** is an [`ApiKey`]: it prints as `[redacted]`, goes only into the `Authorization`
 //! header, never into a URL, an error or a log. The CLI reads it from wicket's vault by name.
@@ -126,8 +127,10 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// Active, running and addressed. `server_status` is left out on purpose: the ssh probe after this
+    /// (node setup finished, pinned host key) is the real readiness gate.
     pub fn is_ready(&self) -> bool {
-        self.status == "active" && self.power_status == "running" && self.server_status == "ok" && self.has_ip()
+        self.status == "active" && self.power_status == "running" && self.has_ip()
     }
 
     fn has_ip(&self) -> bool {
@@ -234,7 +237,11 @@ impl Client {
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) && attempt + 1 < self.retry.attempts {
+            // A 5xx after a POST may follow a create that happened: retrying could make a second
+            // instance. The next acquire finds the first by its idempotency tag instead.
+            let retryable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || (status.is_server_error() && method != reqwest::Method::POST);
+            if retryable && attempt + 1 < self.retry.attempts {
                 tokio::time::sleep(self.retry.base * 2u32.pow(attempt)).await;
                 attempt += 1;
                 continue;

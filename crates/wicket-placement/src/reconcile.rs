@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 pub struct Desired {
     pub idempotency_key: String,
     pub lease_until: Timestamp,
-    /// A task or parked snapshot is on it: keep it past its lease until that is resolved.
+    /// A task or parked snapshot is on it: keep it past its lease until that is resolved. A pinned
+    /// lease whose node is gone still yields `Create`, which restores nothing that was on it; #38
+    /// decides what a lost pinned node means for its task.
     pub pinned: bool,
 }
 

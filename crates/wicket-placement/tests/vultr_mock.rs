@@ -216,6 +216,24 @@ async fn errors_carry_vultrs_message_and_not_the_key_and_429_is_retried() {
     assert_eq!(st.lock().unwrap().seen.len(), n + 1);
     let e = format!("{e} {e:?}");
     assert!(e.contains("Invalid plan chosen."), "{e}");
+    // A 5xx after a POST is not retried: the create may have happened.
+    st.lock().unwrap().injected.push_back((502, json!({"error": "bad gateway", "status": 502})));
+    let n = st.lock().unwrap().seen.len();
+    let body = wicket_placement::vultr::CreateInstance {
+        region: "lhr".into(),
+        plan: "vc2-1c-2gb".into(),
+        os_id: 2284,
+        label: "n".into(),
+        hostname: "n".into(),
+        tags: vec![],
+        sshkey_id: vec![],
+        user_data: None,
+        backups: "disabled",
+        enable_ipv6: false,
+        activation_email: false,
+    };
+    assert!(c.create_instance(&body).await.unwrap_err().to_string().contains("HTTP 502"));
+    assert_eq!(st.lock().unwrap().seen.len(), n + 1);
     // A wrong key: 401, and the key never appears in what we report.
     let bad = Client::with_base(&base, ApiKey::new("wrong-key-value")).unwrap();
     let e = bad.list_instances(None).await.unwrap_err();

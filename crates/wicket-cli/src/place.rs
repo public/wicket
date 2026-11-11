@@ -296,6 +296,7 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                     "node.token",
                     &serde_json::json!({ "name": name, "ttl_secs": 600, "by": "place" }),
                 )?;
+                drop(ledger); // enrol opens its own
                 crate::enrol::enrol(crate::enrol::EnrolOpts {
                     target: target.clone(),
                     token,
