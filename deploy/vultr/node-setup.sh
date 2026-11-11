@@ -2,8 +2,9 @@
 # Prepare a fresh Ubuntu 24.04 Vultr instance as a wicket sandbox node (proof of concept).
 #
 # The node gets Docker + gVisor and an unprivileged `wicket` user that wicket's control host logs in as.
-# It never receives a secret: the model key, proxies, CA key and ledger stay on the control host, and
-# each run's two unix sockets are forwarded to the node over ssh. Run as root:
+# The model key, the installation CA key and the ledger stay on the control host. After enrolment,
+# `wicket node install <name>` puts wicket's binary in ~wicket/.local/bin and runs `wicket node serve` as
+# a systemd user service (lingering, enabled below, keeps it running without a login). Run as root:
 #   ssh root@NODE 'bash -s' < deploy/vultr/node-setup.sh
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -36,6 +37,8 @@ id wicket >/dev/null 2>&1 || useradd --create-home --shell /bin/bash wicket
 usermod -aG docker wicket
 install -d -m 700 -o wicket -g wicket /home/wicket/.ssh
 install -m 600 -o wicket -g wicket /root/.ssh/authorized_keys /home/wicket/.ssh/authorized_keys
+# `wicket node serve` runs as a systemd user service of `wicket`: keep its user manager running.
+loginctl enable-linger wicket
 
 docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
 runsc --version | head -1
