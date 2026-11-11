@@ -39,6 +39,9 @@
 //! or ACME TLS-ALPN-01), or plain HTTP on loopback, or behind a TLS-terminating proxy; bounded
 //! connections, timeouts and sizes.
 //!
+//! **Privilege separation** (#12): nothing here needs root, and runs start only through the
+//! [`Launcher`] callback, so launching can later move behind a separate process unchanged.
+//!
 //! The browser never sends a path. Runs start only from manifests listed in an allowlisted
 //! directory (see [`manifest_roots`]), named by root and file name. `wicket approve` on the host
 //! remains a break-glass path and is audited as such.
@@ -1178,6 +1181,25 @@ mod tests {
         count: u32,
         launched: Arc<Mutex<Vec<Launch>>>,
         dir: PathBuf,
+        _tmp: TmpDir,
+    }
+
+    /// A test's temporary directory, removed when the test is done with it.
+    pub(super) struct TmpDir(pub(super) PathBuf);
+
+    impl TmpDir {
+        pub(super) fn new(name: &str) -> TmpDir {
+            let d = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TmpDir(d)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Tests have no issuer key: a run with an identity row named "bad-…" doesn't verify; others do.
@@ -1190,8 +1212,8 @@ mod tests {
     }
 
     fn setup(tag: &str) -> T {
-        let dir = std::env::temp_dir().join(format!("wicket-serve-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = TmpDir::new(&format!("wicket-serve-{tag}"));
+        let dir = tmp.0.clone();
         std::fs::create_dir_all(dir.join("manifests")).unwrap();
         std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
         let key = SigningKey::random(&mut rand_core::OsRng);
@@ -1225,7 +1247,7 @@ mod tests {
         );
         let cookie = set_session(&state, SessionKind::Operator { cred: cred.clone() }, LOCAL).unwrap();
         let sid = token_of(&cookie);
-        T { state, key, cred, sid: Some(sid), count: 0, launched, dir }
+        T { state, key, cred, sid: Some(sid), count: 0, launched, dir, _tmp: tmp }
     }
 
     impl T {
@@ -1291,6 +1313,7 @@ mod tests {
     }
 
     mod http;
+    mod https;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);

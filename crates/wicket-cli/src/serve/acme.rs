@@ -145,7 +145,8 @@ pub async fn order(cfg: &AcmeConfig, resolver: &CertResolver, http: &HttpFactory
     Ok(())
 }
 
-fn due(resolver: &CertResolver, now: i64) -> bool {
+/// Whether it is time to order: no certificate, or less than [`RENEW_BEFORE`] left.
+pub(crate) fn due(resolver: &CertResolver, now: i64) -> bool {
     resolver.current().and_then(|ck| tls::not_after(&ck).ok()).is_none_or(|t| t - now < RENEW_BEFORE)
 }
 
