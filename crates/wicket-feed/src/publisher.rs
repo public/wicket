@@ -190,6 +190,13 @@ impl<P: Policy> Publisher<P> {
             return Err(PublishError::Invalid("a delta needs at least one change".into()));
         }
         for c in &changes {
+            // Uses are counted on the node that holds the box, so a counted grant must name its box:
+            // one box lives on one node, which makes that node's count the only count.
+            if let Change::AddGrant { grant } = c {
+                if grant.uses.is_some() && grant.box_id.is_none() {
+                    return Err(PublishError::Invalid(format!("grant {}: a grant with a use count must name its box", grant.id)));
+                }
+            }
             if let Change::PutZone { zone } = c {
                 zone.compile().map_err(|e| PublishError::Invalid(format!("zone {}: {e}", zone.zone_name())))?;
             }

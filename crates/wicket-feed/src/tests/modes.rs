@@ -138,7 +138,7 @@ fn grant_expiry_is_by_the_node_clock_in_every_mode() {
 fn use_counts_and_box_binding() {
     let (mut cp, mut r) = setup();
     let merge = |run: &str| op("z", run, "POST", "api.github.com", "/repos/acme/app/merge");
-    let twice = Grant { uses: Some(2), ..grant("twice", &evil(), T0 + 3_600_000) };
+    let twice = Grant { uses: Some(2), box_id: Some("r1".into()), ..grant("twice", &evil(), T0 + 3_600_000) };
     let r2_only = Grant { box_id: Some("r2".into()), ..grant("r2-only", &merge("r2"), T0 + 3_600_000) };
     let d = cp.p.commit(vec![add(twice), add(r2_only)], T0 + 1).unwrap();
     r.accept(&d, T0 + 1).unwrap();
@@ -156,6 +156,20 @@ fn use_counts_and_box_binding() {
         r.decide(&op("z2", "r1", "POST", "api.github.com", "/repos/acme/app/issues/1/comments"), T0 + 6),
         Decision::Forbidden(_)
     ));
+}
+
+/// Use counts are kept on the node holding the box, so a counted grant must name its box: otherwise
+/// two nodes could each honour it `uses` times.
+#[test]
+fn a_counted_grant_must_name_its_box() {
+    let (mut cp, mut r) = setup();
+    let unbound = Grant { uses: Some(1), ..grant("unbound", &evil(), T0 + 3_600_000) };
+    assert!(cp.p.commit(vec![add(unbound.clone())], T0 + 1).is_err(), "the publisher refuses it");
+    // One that arrives anyway (e.g. from an older publisher) is never honoured.
+    let d = Delta { feed: NODE.into(), version: 1, epoch: 2, prev: cp.p.state().head.clone(), issued_at: T0, changes: vec![add(unbound)] };
+    r.accept(&Frame::new(FrameKind::Delta, sign(&cp.feed_key, TYP_DELTA, &d)), T0 + 1).unwrap();
+    assert!(matches!(r.decide(&evil(), T0 + 2), Decision::NeedsGrant(_)));
+    assert_eq!(r.uses("unbound"), 0);
 }
 
 #[test]

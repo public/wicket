@@ -689,6 +689,9 @@ impl<P: Policy> Replica<P> {
             && g.not_after > now
             && !st.is_revoked(RevokeKind::Grant, &g.id)
             && g.box_id.as_ref().is_none_or(|b| *b == op.run.0)
+            // A counted grant without a box could be honoured on several nodes, each counting
+            // separately: never here (the publisher refuses to publish one; this covers older feeds).
+            && (g.uses.is_none() || g.box_id.is_some())
             && g.uses.is_none_or(|max| self.uses(&g.id) < max)
     }
 

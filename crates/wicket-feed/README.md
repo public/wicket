@@ -93,7 +93,8 @@ everything rather than being refused (refusing a signed delta would desynchronis
   node is closed between accepting the new certificate and its snapshot, which catch-up sends right
   after it. Renewing a certificate (same version and key, later `not_after`) is routine.
 - **Uses of counted grants are appended to `uses.log` and fsynced before the op is allowed.** Counts
-  are per node: a grant replicated to two nodes can be used `uses` times on each.
+  are per node, so a counted grant must name its box: one box lives on one node. The publisher refuses a
+  counted grant without a box, and a node never honours one.
 - **Use counts survive `Replica::reset`**: they are local and only ever restrictive.
 - **The publisher trusts its own log's signatures** (it checks the chain, feed and versions on open,
   not the signatures, which older versions' keys made).

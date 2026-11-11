@@ -17,7 +17,12 @@ fn persisted() -> (Cp, TempDir) {
     let frames = cp.p.catch_up(&r.hello(), T0).unwrap();
     feed(&mut r, frames, T0);
     for i in 0..2 {
-        let d = cp.p.commit(vec![add(Grant { uses: Some(3), ..grant(&format!("g-{i}"), &evil(), T0 + 3_600_000) })], T0 + 1 + i).unwrap();
+        let d =
+            cp.p.commit(
+                vec![add(Grant { uses: Some(3), box_id: Some("r1".into()), ..grant(&format!("g-{i}"), &evil(), T0 + 3_600_000) })],
+                T0 + 1 + i,
+            )
+            .unwrap();
         r.accept(&d, T0 + 5).unwrap();
     }
     r.accept(&cp.p.statement(T0 + 10), T0 + 10).unwrap();
