@@ -11,6 +11,7 @@ mod mock;
 mod node;
 mod noderun;
 mod nodesrv;
+mod place;
 mod program;
 mod reap;
 mod run;
@@ -199,6 +200,12 @@ enum Cmd {
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
+    },
+    /// Nodes from a provider (#37): Vultr plans, owned nodes, create inside a money envelope with a
+    /// terminal approval and enrol with the host key pinned at creation, release.
+    Place {
+        #[command(subcommand)]
+        cmd: place::PlaceCmd,
     },
     /// Development helpers.
     Dev {
@@ -749,6 +756,7 @@ async fn main() -> Result<()> {
             NodeCmd::Serve { dir } => nodesrv::serve(dir).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
+        Cmd::Place { cmd } => place::run(cmd).await,
         Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
