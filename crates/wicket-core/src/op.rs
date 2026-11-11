@@ -134,14 +134,21 @@ pub enum HostVerdict {
     Hidden,
 }
 
-pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
+/// Why `host` is never reachable from a sandbox, whatever the zone says: metadata endpoints,
+/// localhost and non-public addresses. `None` for every other host.
+pub fn never_reachable(host: &str) -> Option<String> {
     if FORBIDDEN_HOSTS.contains(&host) || host == "localhost" || host.ends_with(".localhost") {
-        return HostVerdict::Forbidden(format!("host {host} is never reachable from a sandbox"));
+        return Some(format!("host {host} is never reachable from a sandbox"));
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if !is_public_ip(&ip) {
-            return HostVerdict::Forbidden(format!("non-public address {ip}"));
-        }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if !is_public_ip(&ip) => Some(format!("non-public address {ip}")),
+        _ => None,
+    }
+}
+
+pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
+    if let Some(why) = never_reachable(host) {
+        return HostVerdict::Forbidden(why);
     }
     if zone.forbid.iter().any(|f| f.covers_host(host)) {
         return HostVerdict::Forbidden(format!("host {host} is forbidden in this zone"));
@@ -159,7 +166,7 @@ pub struct CompiledZone {
     spec: ZoneSpec,
     /// Per forbid rule, its path matchers (same order as `spec.forbid`).
     forbid: Vec<Vec<GlobMatcher>>,
-    /// Per reach rule, its path matchers (same order as `spec.reach`: the first match decides).
+    /// Per reach rule, its path matchers (same order as `spec.reach`).
     reach: Vec<Vec<GlobMatcher>>,
 }
 
@@ -182,17 +189,17 @@ impl CompiledZone {
         host_verdict(&self.spec, host)
     }
 
-    /// The decision for one request: forbidden outright, allowed by the first matching reach rule, or
-    /// needing a grant.
+    /// The decision for one request: forbidden outright, allowed by reach, or needing a grant.
+    ///
+    /// Reach rules are a set, not an ordered list: a request is allowed by reach if *some* rule that
+    /// matches its host, method and path allows it (its risk is R2 or lower, or the rule has
+    /// `allow_dangerous`), and the verdict names the first such rule. A request that only matches rules
+    /// without `allow_dangerous`, or matches none, needs a grant. Order-independence is what lets the
+    /// same zone be written as Biscuit checks (wicket-authz), where alternatives have no order.
     pub fn evaluate(&self, op: &Op) -> Verdict {
         let zone = &self.spec;
-        if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
-            return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
-        }
-        if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
-            if !is_public_ip(&ip) {
-                return Verdict::Forbidden(format!("non-public address {ip}"));
-            }
+        if let Some(why) = never_reachable(&op.host) {
+            return Verdict::Forbidden(why);
         }
         let forbidden = zone
             .forbid
@@ -202,6 +209,8 @@ impl CompiledZone {
         if forbidden {
             return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
         }
+        let risky = op.risk >= RiskClass::R3ExternalOrIrreversible;
+        let mut first_match = None;
         for (i, (rule, globs)) in zone.reach.iter().zip(&self.reach).enumerate() {
             if !rule.host_matches(&op.host) {
                 continue;
@@ -212,12 +221,15 @@ impl CompiledZone {
             if !globs.iter().any(|g| g.is_match(&op.path)) {
                 continue;
             }
-            if op.risk >= RiskClass::R3ExternalOrIrreversible && !rule.allow_dangerous {
-                return Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")));
+            if !risky || rule.allow_dangerous {
+                return Verdict::AllowByReach(i);
             }
-            return Verdict::AllowByReach(i);
+            first_match.get_or_insert(i);
         }
-        Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path))
+        match first_match {
+            Some(i) => Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; "))),
+            None => Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path)),
+        }
     }
 }
 
@@ -387,8 +399,13 @@ zone:
         assert_eq!(host_verdict(&hidden, "api.example.com"), HostVerdict::Open, "a path-limited forbid doesn't hide the host");
     }
 
-    /// The decision as it was before zones were compiled (globs compiled on every call): the oracle
-    /// `CompiledZone::evaluate` must agree with.
+    /// The decision with globs compiled on every call: the oracle `CompiledZone::evaluate` must agree
+    /// with. It follows the same reach semantics (some matching rule that allows the risk decides;
+    /// see `CompiledZone::evaluate`), written independently as "collect every matching rule, then
+    /// pick", so the test checks that compiling globs once changes nothing. Before reach rules became
+    /// order-independent this oracle let the first matching rule decide; the only decisions that
+    /// changed are R3+ requests whose first matching rule lacks `allow_dangerous` while a later one
+    /// has it (`a_later_dangerous_rule_allows_what_an_earlier_rule_matches`).
     fn evaluate_uncompiled(zone: &ZoneSpec, op: &Op) -> Verdict {
         if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
             return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
@@ -401,19 +418,40 @@ zone:
         if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
             return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
         }
-        for (i, rule) in zone.reach.iter().enumerate() {
-            if !rule.host_matches(&op.host) || !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method)) {
-                continue;
-            }
-            if !rule.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(&op.path)).unwrap_or(false)) {
-                continue;
-            }
-            if op.risk >= RiskClass::R3ExternalOrIrreversible && !rule.allow_dangerous {
-                return Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; ")));
-            }
+        let matching: Vec<usize> = (0..zone.reach.len())
+            .filter(|&i| {
+                let rule = &zone.reach[i];
+                rule.host_matches(&op.host)
+                    && rule.methods.iter().any(|m| m.eq_ignore_ascii_case(&op.method))
+                    && rule.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(&op.path)).unwrap_or(false))
+            })
+            .collect();
+        let risky = op.risk >= RiskClass::R3ExternalOrIrreversible;
+        if let Some(&i) = matching.iter().find(|&&i| !risky || zone.reach[i].allow_dangerous) {
             return Verdict::AllowByReach(i);
         }
-        Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path))
+        match matching.first() {
+            Some(i) => Verdict::NeedsGrant(format!("matches reach rule {i} but is {:?}: {}", op.risk, op.effects.join("; "))),
+            None => Verdict::NeedsGrant(format!("{} {}{} is outside the zone's reach", op.method, op.host, op.path)),
+        }
+    }
+
+    #[test]
+    fn a_later_dangerous_rule_allows_what_an_earlier_rule_matches() {
+        let z = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach:\n    - { host: api.github.com, methods: [GET, POST], paths: [\"/repos/acme/**\"] }\n    - { host: api.github.com, methods: [POST], paths: [\"/repos/acme/scratch/**\"], allow_dangerous: true }\n").unwrap().zone;
+        // R3 (posts visible content): the first rule matches but isn't dangerous-ok; the second is.
+        let o = op("POST", "api.github.com", "/repos/acme/scratch/issues");
+        assert_eq!(o.risk, RiskClass::R3ExternalOrIrreversible);
+        assert_eq!(evaluate(&z, &o), Verdict::AllowByReach(1));
+        // Outside the dangerous rule's paths, only the first rule matches: a grant is needed.
+        assert!(matches!(evaluate(&z, &op("POST", "api.github.com", "/repos/acme/api/issues")), Verdict::NeedsGrant(_)));
+        // A low-risk request is allowed by the first matching rule.
+        assert_eq!(evaluate(&z, &op("POST", "api.github.com", "/repos/acme/scratch/x")), Verdict::AllowByReach(0));
+        // Rule order doesn't matter.
+        let mut swapped = z.clone();
+        swapped.reach.swap(0, 1);
+        assert_eq!(evaluate(&swapped, &o), Verdict::AllowByReach(0));
+        assert_eq!(evaluate(&swapped, &op("POST", "api.github.com", "/repos/acme/scratch/x")), Verdict::AllowByReach(0));
     }
 
     /// Paths a glob matches, and near misses: `*` and `**` filled in, the glob's parent, and siblings.
@@ -437,6 +475,11 @@ zone:
         zones.push(zone());
         zones.push(
             Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: f\n  llm: {}\n  reach:\n    - { host: \"*.example.com\", methods: [GET, POST], paths: [\"/**\"] }\n    - { host: api.example.com, methods: [PUT, DELETE], paths: [\"/v1/*/items/**\"], allow_dangerous: true }\n  forbid:\n    - { host: api.example.com, paths: [\"/v1/admin/**\", \"/v1/*/secrets\"] }\n    - { host: mcp.example.com }\n")
+                .unwrap()
+                .zone,
+        );
+        zones.push(
+            Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: o\n  llm: {}\n  reach:\n    - { host: api.github.com, methods: [GET, POST, PUT], paths: [\"/repos/acme/**\"] }\n    - { host: api.github.com, methods: [POST, PUT], paths: [\"/repos/acme/*/issues\", \"/repos/acme/*/pulls/*/merge\"], allow_dangerous: true }\n")
                 .unwrap()
                 .zone,
         );
