@@ -178,7 +178,10 @@ impl RunCtx {
         } else if rec.accept_from.iter().any(|z| z == &self.zone.name) {
             "peer"
         } else {
-            return Err(format!("zone {} does not accept messages from zone {} (its accept_from does not list it)", rec.zone, self.zone.name));
+            return Err(format!(
+                "zone {} does not accept messages from zone {} (its accept_from does not list it)",
+                rec.zone, self.zone.name
+            ));
         };
         let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
         let payload = serde_json::json!({
@@ -187,9 +190,14 @@ impl RunCtx {
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         l.add_message(&id, &self.tenant, &self.run.0, to_run, &env).map_err(|e| e.to_string())?;
-        let _ = l.audit(&self.tenant, Some(&self.run), "message", &serde_json::json!({
-            "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
-        }));
+        let _ = l.audit(
+            &self.tenant,
+            Some(&self.run),
+            "message",
+            &serde_json::json!({
+                "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
+            }),
+        );
         Ok(id)
     }
 
@@ -223,10 +231,7 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
         body["retry_after"] = 30.into();
         body["hint"] = format!("Call the wicket MCP tool await_grant with request_id {id} to wait for a human's decision, then retry this same request once. Nothing else will reach this destination from the sandbox.").into();
     }
-    let mut b = http::Response::builder()
-        .status(status)
-        .header("content-type", "application/problem+json")
-        .header("x-wicket", kind);
+    let mut b = http::Response::builder().status(status).header("content-type", "application/problem+json").header("x-wicket", kind);
     if let Some(id) = request_id {
         b = b.header("x-wicket-request-id", id).header("retry-after", "30");
     }
@@ -251,8 +256,20 @@ pub(crate) const SANDBOX_FACT: &str = "You are in a wicket sandbox (a gVisor con
 /// Headers never forwarded from a sandbox to an upstream: hop-by-hop headers and every client
 /// credential (the proxy injects its own).
 pub(crate) const STRIP_REQUEST: &[&str] = &[
-    "connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "te", "trailer",
-    "transfer-encoding", "upgrade", "host", "content-length", "authorization", "x-api-key", "cookie",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+    "authorization",
+    "x-api-key",
+    "cookie",
 ];
 
 pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length"];

@@ -101,16 +101,16 @@ pub struct AgentSpec {
 
 /// Adapter settings a manifest may set: presentation and commit metadata only. Hooks, permissions,
 /// MCP servers, environment, credential helpers and the like stay under wicket's control.
-pub const ADAPTER_SETTINGS_ALLOWED: [&str; 6] = ["includeCoAuthoredBy", "attribution", "outputStyle", "alwaysThinkingEnabled", "cleanupPeriodDays", "language"];
+pub const ADAPTER_SETTINGS_ALLOWED: [&str; 6] =
+    ["includeCoAuthoredBy", "attribution", "outputStyle", "alwaysThinkingEnabled", "cleanupPeriodDays", "language"];
 
 fn zero() -> String {
     "0s".into()
 }
 
 /// Environment variables a manifest may not set: wicket's routes, trust and placeholders.
-pub const RESERVED_ENV_PREFIXES: [&str; 12] = [
-    "ANTHROPIC_", "CLAUDE_", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_", "CURL_", "NODE_", "MCP_", "GIT_SSL", "WICKET_",
-];
+pub const RESERVED_ENV_PREFIXES: [&str; 12] =
+    ["ANTHROPIC_", "CLAUDE_", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_", "CURL_", "NODE_", "MCP_", "GIT_SSL", "WICKET_"];
 
 impl AgentSpec {
     pub fn idle(&self) -> Result<std::time::Duration, ManifestError> {
@@ -352,7 +352,10 @@ impl Manifest {
                 }
                 a.idle()?;
                 if let Some(k) = a.adapter_settings.keys().find(|k| !ADAPTER_SETTINGS_ALLOWED.contains(&k.as_str())) {
-                    return Err(ManifestError::Invalid(format!("agent.adapter_settings may not set {k:?} (allowed: {})", ADAPTER_SETTINGS_ALLOWED.join(", "))));
+                    return Err(ManifestError::Invalid(format!(
+                        "agent.adapter_settings may not set {k:?} (allowed: {})",
+                        ADAPTER_SETTINGS_ALLOWED.join(", ")
+                    )));
                 }
                 for k in a.env.keys() {
                     let ok = !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
@@ -397,7 +400,10 @@ impl Manifest {
             let name_ok = !v.name.is_empty() && v.name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
             let path_ok = v.path.starts_with("/volumes/") && !v.path.contains("..") && v.path.len() > "/volumes/".len();
             if !name_ok || !path_ok || !names.insert(v.name.clone()) {
-                return Err(ManifestError::Invalid(format!("volume {:?} at {:?}: names are [a-z0-9-]+ and unique; paths live under /volumes/", v.name, v.path)));
+                return Err(ManifestError::Invalid(format!(
+                    "volume {:?} at {:?}: names are [a-z0-9-]+ and unique; paths live under /volumes/",
+                    v.name, v.path
+                )));
             }
         }
         self.zone.limits.timeout()?;

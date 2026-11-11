@@ -1,0 +1,16 @@
+# CI smoke test (ci/smoke.sh): Claude Code in a gVisor box, driven by the scripted mock model, so no
+# model credential is involved. The mock asks the agent to run the probe in ci/smoke.sh, which records
+# what the box can and can't reach in /workspace/out/result.json.
+task: Run the command you are given and stop.
+agent:
+  name: smoke
+  max_turns: 4
+zone:
+  name: ci-smoke
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:9999
+  limits: { memory: 1500m, cpus: 1, timeout: 5m }

@@ -155,7 +155,8 @@ impl Issuer {
         use std::os::unix::fs::OpenOptionsExt;
         let issuer = match std::fs::read_to_string(path) {
             Ok(s) => {
-                let seed: [u8; 32] = hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("issuer key file"))?;
+                let seed: [u8; 32] =
+                    hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("issuer key file"))?;
                 Issuer { key: SigningKey::from_bytes(&seed), trust_domain: trust_domain.into() }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -206,7 +207,11 @@ impl Issuer {
             principal: spec.principal.clone(),
             act: spec.act.clone(),
         };
-        jws_sign(&self.key, json!({ "alg": "EdDSA", "typ": IDENTITY_TYP, "kid": key_id(&self.verifying_key()) }), &serde_json::to_value(claims).expect("claims"))
+        jws_sign(
+            &self.key,
+            json!({ "alg": "EdDSA", "typ": IDENTITY_TYP, "kid": key_id(&self.verifying_key()) }),
+            &serde_json::to_value(claims).expect("claims"),
+        )
     }
 }
 
@@ -321,9 +326,16 @@ mod tests {
 
     fn spec(zone: &str, agent: &str, act: Option<Value>) -> IdentitySpec {
         IdentitySpec {
-            tenant: "t0".into(), zone: zone.into(), agent: agent.into(), run: "run_a".into(), parent_run: None,
-            manifest_sha256: "m".into(), image: "img".into(), node: "local".into(),
-            principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}), act,
+            tenant: "t0".into(),
+            zone: zone.into(),
+            agent: agent.into(),
+            run: "run_a".into(),
+            parent_run: None,
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
+            act,
         }
     }
 
@@ -335,8 +347,18 @@ mod tests {
     fn the_chain_runs_from_the_human_through_each_parent() {
         let i = Issuer::generate("test.local");
         let lead = verify_identity(&issue(&i, &AgentKey::generate(), "research", "lead"), &i.verifying_key(), 1500).unwrap();
-        let child = verify_identity(&i.issue(&spec("research", "fetcher", Some(lead.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
-        let grandchild = verify_identity(&i.issue(&spec("research", "reader", Some(child.act_for_child())), 1000, 3600, &AgentKey::generate().public()), &i.verifying_key(), 1500).unwrap();
+        let child = verify_identity(
+            &i.issue(&spec("research", "fetcher", Some(lead.act_for_child())), 1000, 3600, &AgentKey::generate().public()),
+            &i.verifying_key(),
+            1500,
+        )
+        .unwrap();
+        let grandchild = verify_identity(
+            &i.issue(&spec("research", "reader", Some(child.act_for_child())), 1000, 3600, &AgentKey::generate().public()),
+            &i.verifying_key(),
+            1500,
+        )
+        .unwrap();
         assert_eq!(grandchild.chain(), vec!["alice (cli, unix-user)", "lead", "fetcher", "reader"]);
         assert_eq!(grandchild.principal["id"], "alice");
     }

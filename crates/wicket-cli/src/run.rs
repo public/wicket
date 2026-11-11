@@ -3,6 +3,7 @@
 use crate::node::Node;
 use crate::{data_dir, ledger_path};
 use anyhow::{bail, Context, Result};
+use sha2::Digest;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
 use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::{Docker, Mount, SandboxSpec};
-use sha2::Digest;
 use wicket_store::Ledger;
 
 /// How long an agent identity is valid (seconds). Re-issued at half-life. WICKET_IDENTITY_TTL
@@ -103,7 +103,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None => None,
             };
             match (&p.digest, &digest) {
-                (Some(want), Some(got)) if want != got => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
+                (Some(want), Some(got)) if want != got => {
+                    bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name)
+                }
                 (Some(_), None) => bail!("program {} pins a digest but has no source", p.name),
                 (None, Some(got)) => println!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
                 _ => {}
@@ -136,7 +138,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
 
     let run = match run_id {
-        Some(id) if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) => RunId(id),
+        Some(id) if id.len() == 30 && id.starts_with("run_") && id[4..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) => {
+            RunId(id)
+        }
         Some(id) => bail!("bad --run-id {id:?}"),
         None => RunId::new(),
     };
@@ -156,12 +160,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
-        l.audit(&m.tenant, Some(&run), "run.start", &serde_json::json!({
-            "zone": m.zone.name, "agent": workload, "kind": workload_kind, "isolation": m.zone.isolation, "image": image,
-            "reach": m.zone.reach.len(), "task": m.task,
-            "program_digest": program_src.as_ref().map(|(_, d)| d.clone()),
-            "program_pinned": m.program.as_ref().map(|p| p.digest.is_some()),
-        }))?;
+        l.audit(
+            &m.tenant,
+            Some(&run),
+            "run.start",
+            &serde_json::json!({
+                "zone": m.zone.name, "agent": workload, "kind": workload_kind, "isolation": m.zone.isolation, "image": image,
+                "reach": m.zone.reach.len(), "task": m.task,
+                "program_digest": program_src.as_ref().map(|(_, d)| d.clone()),
+                "program_pinned": m.program.as_ref().map(|p| p.digest.is_some()),
+            }),
+        )?;
     }
 
     // Enforcement points, on unix sockets that only this box gets.
@@ -194,8 +203,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 Some(p) => {
                     let l = ledger.lock().expect("ledger");
                     let pc = match l.identity(p)? {
-                        Some(pi) if pi.tenant == m.tenant.0 && l.run_status(p)?.as_deref() == Some("running") && l.revoked_in_chain(p)?.is_none() => {
-                            wicket_identity::verify_identity(&pi.jws, &issuer.verifying_key(), now).with_context(|| format!("parent {p}'s identity"))?
+                        Some(pi)
+                            if pi.tenant == m.tenant.0
+                                && l.run_status(p)?.as_deref() == Some("running")
+                                && l.revoked_in_chain(p)?.is_none() =>
+                        {
+                            wicket_identity::verify_identity(&pi.jws, &issuer.verifying_key(), now)
+                                .with_context(|| format!("parent {p}'s identity"))?
                         }
                         _ => bail!("parent run {p} is not a running, unrevoked agent of this tenant"),
                     };
@@ -204,13 +218,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None if wrap.is_some() => {
                     // The human driving the session through their claude.ai account.
                     let who = std::env::var("CLAUDE_CODE_BRIDGE_OWNER_ACCOUNT_UUID").unwrap_or_else(|_| "unknown".into());
-                    (serde_json::json!({ "type": "human", "id": format!("claude.ai account {who}"), "via": "remote-control", "assurance": "claude.ai login" }), None)
+                    (
+                        serde_json::json!({ "type": "human", "id": format!("claude.ai account {who}"), "via": "remote-control", "assurance": "claude.ai login" }),
+                        None,
+                    )
                 }
                 None => (crate::cli_principal(), None),
             };
             let spec = wicket_identity::IdentitySpec {
-                tenant: m.tenant.0.clone(), zone: m.zone.name.clone(), agent: wname.clone(), run: run.0.clone(), parent_run: parent_run.clone(),
-                manifest_sha256: manifest_sha256.clone(), image: image.to_string(), node: node_name.clone(), principal, act,
+                tenant: m.tenant.0.clone(),
+                zone: m.zone.name.clone(),
+                agent: wname.clone(),
+                run: run.0.clone(),
+                parent_run: parent_run.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                image: image.to_string(),
+                node: node_name.clone(),
+                principal,
+                act,
             };
             let jws = issuer.issue(&spec, now, ttl, &key.public());
             id_spec = Some(spec);
@@ -218,8 +243,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             {
                 let l = ledger.lock().expect("ledger");
                 l.put_identity(&wicket_store::IdentityRow {
-                    run: run.0.clone(), tenant: m.tenant.0.clone(), spiffe_id: claims.sub.clone(), zone: m.zone.name.clone(), agent: wname.clone(),
-                    parent_run: parent_run.clone(), accept_from: m.zone.accept_from.clone(), jws: jws.clone(), issued_at: now,
+                    run: run.0.clone(),
+                    tenant: m.tenant.0.clone(),
+                    spiffe_id: claims.sub.clone(),
+                    zone: m.zone.name.clone(),
+                    agent: wname.clone(),
+                    parent_run: parent_run.clone(),
+                    accept_from: m.zone.accept_from.clone(),
+                    jws: jws.clone(),
+                    issued_at: now,
                 })?;
                 l.audit(&m.tenant, Some(&run), "identity.issued", &serde_json::json!({
                     "id": claims.sub, "parent_run": parent_run, "identity_sha256": wicket_identity::identity_digest(&jws),
@@ -286,19 +318,35 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(w) => {
             let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
             let mut v = vec![wicket_proxy::CredentialSwap {
-                name: "claude login".into(), host: "api.anthropic.com".into(), placeholder: w.login_placeholder.clone(),
+                name: "claude login".into(),
+                host: "api.anthropic.com".into(),
+                placeholder: w.login_placeholder.clone(),
                 real: wicket_proxy::SwapSource::Vault(login_secret),
             }];
             if let Some(t) = &w.session_token {
                 v.push(wicket_proxy::CredentialSwap {
-                    name: "remote-control session".into(), host: "api.anthropic.com".into(), placeholder: w.session_placeholder.clone(),
+                    name: "remote-control session".into(),
+                    host: "api.anthropic.com".into(),
+                    placeholder: w.session_placeholder.clone(),
                     real: wicket_proxy::SwapSource::Value(t.clone()),
                 });
             }
             v
         }
     };
-    let ctx = RunCtx { tenant: m.tenant.clone(), run: run.clone(), zone: Arc::new(m.zone.clone()), ledger: ledger.clone(), vault, events: tx, escalate, attribute, identity: identity.clone(), spawner, swaps };
+    let ctx = RunCtx {
+        tenant: m.tenant.clone(),
+        run: run.clone(),
+        zone: Arc::new(m.zone.clone()),
+        ledger: ledger.clone(),
+        vault,
+        events: tx,
+        escalate,
+        attribute,
+        identity: identity.clone(),
+        spawner,
+        swaps,
+    };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
@@ -435,7 +483,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         interactive,
     };
 
-    println!("wicket run {}  tenant {}  zone {}  {} {} ({})", run, m.tenant, m.zone.name, if is_program { "program" } else { "agent" }, workload, workload_kind);
+    println!(
+        "wicket run {}  tenant {}  zone {}  {} {} ({})",
+        run,
+        m.tenant,
+        m.zone.name,
+        if is_program { "program" } else { "agent" },
+        workload,
+        workload_kind
+    );
     println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
     if let Some(i) = &identity {
         let c = i.current().claims.clone();
@@ -484,9 +540,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let Ok(claims) = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now) else { continue };
                     if let Ok(l) = ledger.lock() {
                         let _ = l.rotate_identity(&run2.0, &jws, now, claims.exp);
-                        let _ = l.audit(&tenant, Some(&run2), "identity.rotated", &serde_json::json!({
-                            "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp,
-                        }));
+                        let _ = l.audit(
+                            &tenant,
+                            Some(&run2),
+                            "identity.rotated",
+                            &serde_json::json!({
+                                "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp,
+                            }),
+                        );
                     }
                     cell.replace(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() });
                     next = now + identity_ttl / 2;
@@ -554,7 +615,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     } else {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
-                            if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").map_or(true, |p| p.is_null()) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
                                 turn_running = false;
                                 last_result = std::time::Instant::now();
                                 if stdin.is_some() && !idle.is_zero() {
@@ -645,7 +706,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let _ = n.sh(&format!("rm -rf {rd}")).await;
     }
     let outbox = dir.join("workspace/out/result.json");
-    let result = std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let result =
+        std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     // A child reports back to its parent with a signed message, before its run is marked ended.
     if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {
         let output: String = program_tail.join("\n").chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
@@ -691,8 +753,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let _ = l.run_ended(&run, &status, &summary.to_string())?;
         l.audit(&m.tenant, Some(&run), "run.end", &summary)?;
     }
-    println!("\n[wicket] run {run}: {status} in {}s; {} model requests, {} in / {} out tokens",
-        summary["seconds"], summary["model_requests"], summary["input_tokens"], summary["output_tokens"]);
+    println!(
+        "\n[wicket] run {run}: {status} in {}s; {} model requests, {} in / {} out tokens",
+        summary["seconds"], summary["model_requests"], summary["input_tokens"], summary["output_tokens"]
+    );
     match &result {
         Some(r) => println!("[wicket] result.json: {}", wicket_agent::clip(&r.to_string(), 1200)),
         None => println!("[wicket] no valid result.json in the outbox"),
@@ -715,14 +779,17 @@ fn print_event(ev: &Event) {
             };
             println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));
             if outcome == "pending" {
-                if let Some(id) = detail.split(|c: char| c == ' ' || c == ':').next() {
+                if let Some(id) = detail.split([' ', ':']).next() {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Llm { model, status, input_tokens, output_tokens, requests, outcome } => {
-            println!("[llm]    #{requests} {} → {status}  in {input_tokens} / out {output_tokens}  ({outcome})", model.as_deref().unwrap_or("?"));
+            println!(
+                "[llm]    #{requests} {} → {status}  in {input_tokens} / out {output_tokens}  ({outcome})",
+                model.as_deref().unwrap_or("?")
+            );
         }
     }
 }

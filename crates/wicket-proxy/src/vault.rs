@@ -104,7 +104,16 @@ impl Vault {
 
     pub fn list(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(&self.dir)
-            .map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.ends_with(".tmp")).map(|n| match n.strip_suffix(".ref") { Some(b) => format!("{b} (reference)"), None => n }).collect())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| !n.ends_with(".tmp"))
+                    .map(|n| match n.strip_suffix(".ref") {
+                        Some(b) => format!("{b} (reference)"),
+                        None => n,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         v.sort();
         v

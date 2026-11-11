@@ -9,8 +9,8 @@ mod mock;
 mod node;
 mod program;
 mod run;
-mod spawn;
 mod serve;
+mod spawn;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -77,10 +77,7 @@ enum Cmd {
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
     /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
-    Say {
-        run: String,
-        text: Vec<String>,
-    },
+    Say { run: String, text: Vec<String> },
     /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
     /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
@@ -244,7 +241,13 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
     let check = || -> anyhow::Result<wicket_identity::AgentClaims> {
         let issuer = issuer()?;
         let c = wicket_identity::verify_identity(&row.jws, &issuer.verifying_key(), at.unwrap_or(row.issued_at))?;
-        if c.run != row.run || c.tenant != row.tenant || c.zone != row.zone || c.agent != row.agent || c.sub != row.spiffe_id || c.parent_run != row.parent_run {
+        if c.run != row.run
+            || c.tenant != row.tenant
+            || c.zone != row.zone
+            || c.agent != row.agent
+            || c.sub != row.spiffe_id
+            || c.parent_run != row.parent_run
+        {
             anyhow::bail!("the ledger's record does not match the signed identity");
         }
         Ok(c)
@@ -272,7 +275,11 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
 pub fn identity_line(v: &serde_json::Value) -> String {
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
     if v.get("verified").and_then(|b| b.as_bool()) == Some(true) {
-        let chain = v.get("acting_for").and_then(|c| c.as_array()).map(|c| c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" → ")).unwrap_or_default();
+        let chain = v
+            .get("acting_for")
+            .and_then(|c| c.as_array())
+            .map(|c| c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" → "))
+            .unwrap_or_default();
         format!("{} [verified]  acting for: {chain}", g("id"))
     } else {
         format!("NOT VERIFIED: {}", g("error"))
@@ -319,15 +326,31 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
             run::run(run::RunOpts {
-                manifest: &manifest, workdir: workdir.as_deref(), workspace_dir: workspace_dir.as_deref(), task, image: &image,
-                node: node.as_deref(), ssh_key: ssh_key.as_deref(), run_id, parent_run, wrap: None,
+                manifest: &manifest,
+                workdir: workdir.as_deref(),
+                workspace_dir: workspace_dir.as_deref(),
+                task,
+                image: &image,
+                node: node.as_deref(),
+                ssh_key: ssh_key.as_deref(),
+                run_id,
+                parent_run,
+                wrap: None,
             })
             .await
         }
         Cmd::Wrap { manifest, image, argv } => {
             run::run(run::RunOpts {
-                manifest: &manifest, workdir: None, workspace_dir: None, task: None, image: &image,
-                node: None, ssh_key: None, run_id: None, parent_run: None, wrap: Some(argv),
+                manifest: &manifest,
+                workdir: None,
+                workspace_dir: None,
+                task: None,
+                image: &image,
+                node: None,
+                ssh_key: None,
+                run_id: None,
+                parent_run: None,
+                wrap: Some(argv),
             })
             .await
         }
@@ -343,7 +366,12 @@ async fn main() -> Result<()> {
                 None => bail!("no run {run}"),
             }
             l.add_operator_message(&run, &text, &operator())?;
-            l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "operator.message", &serde_json::json!({ "by": operator(), "chars": text.len() }))?;
+            l.audit(
+                &TenantId::single(),
+                Some(&wicket_core::RunId(run.clone())),
+                "operator.message",
+                &serde_json::json!({ "by": operator(), "chars": text.len() }),
+            )?;
             println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
             Ok(())
         }
@@ -355,10 +383,24 @@ async fn main() -> Result<()> {
             }
             for r in p {
                 let age = wicket_store::now() - r.created_at;
-                println!("{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}", r.id, r.method, r.host, r.path, if r.scope_prefix { "*  (every path under it)" } else { "" }, r.risk, r.run, age, r.reason);
+                println!(
+                    "{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}",
+                    r.id,
+                    r.method,
+                    r.host,
+                    r.path,
+                    if r.scope_prefix { "*  (every path under it)" } else { "" },
+                    r.risk,
+                    r.run,
+                    age,
+                    r.reason
+                );
                 println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
                 for a in &r.attribution {
-                    println!("    for: {}  (reported by the agent, unverified)", wicket_agent::clip(&wicket_proxy::attribution_line(a), 240));
+                    println!(
+                        "    for: {}  (reported by the agent, unverified)",
+                        wicket_agent::clip(&wicket_proxy::attribution_line(a), 240)
+                    );
                 }
             }
             Ok(())
@@ -370,15 +412,30 @@ async fn main() -> Result<()> {
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
-            let gid = l.approve(&id, &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() })?;
-            l.audit(&TenantId::single(), None, "decision", &serde_json::json!({
-                "request": id, "decision": "approve", "grant": gid, "by": operator(),
-                "method": req.method, "host": req.host, "path": req.path,
-                "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
-                "agent_identity": verified_identity(&l, &req.run, None),
-                "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
-            }))?;
-            println!("approved {id} → grant {gid}: {} {}{} ({}, {})", req.method, req.host, prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") }, humantime::format_duration(ttl));
+            let gid = l.approve(
+                &id,
+                &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
+            )?;
+            l.audit(
+                &TenantId::single(),
+                None,
+                "decision",
+                &serde_json::json!({
+                    "request": id, "decision": "approve", "grant": gid, "by": operator(),
+                    "method": req.method, "host": req.host, "path": req.path,
+                    "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
+                    "agent_identity": verified_identity(&l, &req.run, None),
+                    "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
+                }),
+            )?;
+            println!(
+                "approved {id} → grant {gid}: {} {}{} ({}, {})",
+                req.method,
+                req.host,
+                prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path),
+                if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
+                humantime::format_duration(ttl)
+            );
             Ok(())
         }
         Cmd::Deny { id } => {
@@ -398,8 +455,16 @@ async fn main() -> Result<()> {
                         bail!("no identity was issued for {run}");
                     }
                     let fresh = l.revoke(&run, &operator(), &reason)?;
-                    l.audit(&TenantId::single(), Some(&wicket_core::RunId(run.clone())), "identity.revoked", &serde_json::json!({ "run": run, "by": operator(), "reason": reason }))?;
-                    println!("{} {run}: its runner stops the box within seconds; its messages and approvals are refused", if fresh { "revoked" } else { "already revoked" });
+                    l.audit(
+                        &TenantId::single(),
+                        Some(&wicket_core::RunId(run.clone())),
+                        "identity.revoked",
+                        &serde_json::json!({ "run": run, "by": operator(), "reason": reason }),
+                    )?;
+                    println!(
+                        "{} {run}: its runner stops the box within seconds; its messages and approvals are refused",
+                        if fresh { "revoked" } else { "already revoked" }
+                    );
                 }
                 IdentityCmd::List => {
                     for row in l.identities()? {
@@ -479,8 +544,15 @@ async fn main() -> Result<()> {
                 }
                 OperatorCmd::Reset => {
                     let n = l.reset_operator_credentials(&TenantId::single())?;
-                    l.audit(&TenantId::single(), None, "operator.reset", &serde_json::json!({ "removed": n, "by": operator(), "via": "host break-glass" }))?;
-                    println!("revoked {n} passkey(s) (public keys kept for audit verification); restart `wicket serve` for an enrolment link");
+                    l.audit(
+                        &TenantId::single(),
+                        None,
+                        "operator.reset",
+                        &serde_json::json!({ "removed": n, "by": operator(), "via": "host break-glass" }),
+                    )?;
+                    println!(
+                        "revoked {n} passkey(s) (public keys kept for audit verification); restart `wicket serve` for an enrolment link"
+                    );
                 }
             }
             Ok(())
@@ -553,7 +625,13 @@ fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
                 bail!("record does not match the signed decision");
             }
             let cred = Credential { id: unb64u(&key.id)?, x: key.x, y: key.y, sign_count: 0 };
-            rp.verify_assertion(&challenge, &cred, &unb64u(get("client_data_json"))?, &unb64u(get("authenticator_data"))?, &unb64u(get("signature"))?)?;
+            rp.verify_assertion(
+                &challenge,
+                &cred,
+                &unb64u(get("client_data_json"))?,
+                &unb64u(get("authenticator_data"))?,
+                &unb64u(get("signature"))?,
+            )?;
             Ok(())
         })();
         match result {

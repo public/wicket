@@ -63,10 +63,16 @@ impl Gateway {
             Err(_) => return body(StatusCode::PAYLOAD_TOO_LARGE, None),
         };
         let Ok(msg) = serde_json::from_slice::<Value>(&raw) else {
-            return body(StatusCode::OK, Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } })));
+            return body(
+                StatusCode::OK,
+                Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } })),
+            );
         };
         if msg.is_array() {
-            return body(StatusCode::OK, Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "batches are not accepted" } })));
+            return body(
+                StatusCode::OK,
+                Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "batches are not accepted" } })),
+            );
         }
         let Some(id) = msg.get("id").cloned() else {
             return body(StatusCode::ACCEPTED, None); // a notification
@@ -130,13 +136,21 @@ impl Gateway {
                 return (format!("request {id} does not belong to this run"), true);
             }
             match req.status.as_str() {
-                "granted" => return (format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path), false),
+                "granted" => {
+                    return (
+                        format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path),
+                        false,
+                    )
+                }
                 "denied" => return (format!("denied: {id} was denied by a human. Do not retry it or look for another route."), false),
                 "withdrawn" => return (format!("withdrawn: {id} is no longer pending."), false),
                 _ => {}
             }
             if start.elapsed() >= timeout {
-                return (format!("pending: {id} is still waiting for a human after {}s. You may call await_grant again.", timeout.as_secs()), false);
+                return (
+                    format!("pending: {id} is still waiting for a human after {}s. You may call await_grant again.", timeout.as_secs()),
+                    false,
+                );
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -147,7 +161,9 @@ impl Gateway {
         let me = cell.current();
         let children: Vec<Value> = {
             let l = self.ctx.ledger.lock().expect("ledger");
-            l.children(&self.ctx.run.0).unwrap_or_default().into_iter()
+            l.children(&self.ctx.run.0)
+                .unwrap_or_default()
+                .into_iter()
                 .map(|c| json!({ "agent": c.agent, "run": c.run, "status": l.run_status(&c.run).ok().flatten() }))
                 .collect()
         };
@@ -186,10 +202,12 @@ impl Gateway {
         loop {
             let m = {
                 let mut l = self.ctx.ledger.lock().expect("ledger");
-                l.take_message(&self.ctx.run.0).map(|m| m.map(|m| {
-                    let revoked = l.revoked_in_chain(&m.from_run).ok().flatten().is_some();
-                    (m, revoked)
-                }))
+                l.take_message(&self.ctx.run.0).map(|m| {
+                    m.map(|m| {
+                        let revoked = l.revoked_in_chain(&m.from_run).ok().flatten().is_some();
+                        (m, revoked)
+                    })
+                })
             };
             match m {
                 Ok(Some((m, sender_revoked))) => return deliver(&cell.current(), &self.ctx.run.0, &m, sender_revoked),
@@ -205,7 +223,9 @@ impl Gateway {
 
     /// An agent asking ahead for reach it needs: one URL, or every path under a prefix on a host.
     fn request_access(&self, args: &Value) -> (String, bool) {
-        let Some(url) = args.get("url").and_then(|v| v.as_str()) else { return ("`url` is required, e.g. https://example.org/docs/".into(), true) };
+        let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
+            return ("`url` is required, e.g. https://example.org/docs/".into(), true);
+        };
         let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
         if reason.is_empty() {
             return ("`reason` is required: say what you need it for, in a sentence".into(), true);
@@ -224,21 +244,30 @@ impl Gateway {
             Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
         };
         match wicket_core::host_verdict(&self.ctx.zone, &host) {
-            wicket_core::HostVerdict::Forbidden(why) => return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false),
+            wicket_core::HostVerdict::Forbidden(why) => {
+                return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false)
+            }
             wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host this sandbox can see."), false),
             wicket_core::HostVerdict::Open => {}
         }
         let op = wicket_core::Op::egress_with_query(&self.ctx.tenant, &self.ctx.run, &self.ctx.zone.name, &method, &host, &path, query);
         match wicket_core::evaluate(&self.ctx.zone, &op) {
-            wicket_core::Verdict::AllowByReach(_) if !prefix => return (format!("{method} {host}{path} is already allowed: just make the request."), false),
-            wicket_core::Verdict::Forbidden(why) => return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false),
+            wicket_core::Verdict::AllowByReach(_) if !prefix => {
+                return (format!("{method} {host}{path} is already allowed: just make the request."), false)
+            }
+            wicket_core::Verdict::Forbidden(why) => {
+                return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false)
+            }
             _ => {}
         }
         let who = self.ctx.attribute.as_ref().and_then(|f| f(&host, &path)).map(|(v, _)| v);
         let res = {
             let l = self.ctx.ledger.lock().expect("ledger");
             if let Ok(Some(rid)) = l.denied_recently(&op) {
-                return (format!("not requested: a human denied {rid} for this a few minutes ago. Don't ask again; continue without it."), false);
+                return (
+                    format!("not requested: a human denied {rid} for this a few minutes ago. Don't ask again; continue without it."),
+                    false,
+                );
             }
             l.ask(&op, &format!("asked by the agent: {reason}"), prefix, who.as_ref())
         };
@@ -259,8 +288,15 @@ impl Gateway {
         if task.trim().is_empty() {
             return ("`task` is required".into(), true);
         }
-        let reach_hosts = args.get("reach_hosts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect());
-        match spawn(crate::SpawnRequest { name: name.into(), kind: "agent".into(), task: Some(task.into()), reach_hosts, ..Default::default() }) {
+        let reach_hosts =
+            args.get("reach_hosts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect());
+        match spawn(crate::SpawnRequest {
+            name: name.into(),
+            kind: "agent".into(),
+            task: Some(task.into()),
+            reach_hosts,
+            ..Default::default()
+        }) {
             Ok(msg) => (msg, false),
             Err(e) => (format!("not started: {e}"), true),
         }
@@ -274,7 +310,11 @@ impl Gateway {
             name: s("name").unwrap_or_default(),
             kind: s("kind").unwrap_or_else(|| "agent".into()),
             task: s("task"),
-            command: args.get("command").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            command: args
+                .get("command")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
             image: s("image"),
             zone: args.get("zone").cloned().filter(|z| z.is_object()),
             max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
@@ -326,7 +366,10 @@ fn deliver(me: &crate::RunIdentity, my_run: &str, m: &wicket_store::StoredMessag
     if sender_revoked {
         return (format!("message {id} was dropped: the sender's identity has been revoked"), true);
     }
-    if payload.get("to_run").and_then(|v| v.as_str()) != Some(my_run) || sender.run != m.from_run || payload.get("jti").and_then(|v| v.as_str()) != Some(id.as_str()) {
+    if payload.get("to_run").and_then(|v| v.as_str()) != Some(my_run)
+        || sender.run != m.from_run
+        || payload.get("jti").and_then(|v| v.as_str()) != Some(id.as_str())
+    {
         return (format!("message {id} was dropped: its envelope does not match its delivery"), true);
     }
     let relation = if me.claims.parent_run.as_deref() == Some(sender.run.as_str()) {
@@ -469,13 +512,22 @@ mod tests {
     impl World {
         /// Starts an agent run with a wicket-issued identity and returns its context.
         fn agent(&self, tenant: &str, zone: &str, name: &str, run: &str, parent: Option<&str>, accept_from: &[&str]) -> RunCtx {
-            let yaml = format!("tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n");
+            let yaml = format!(
+                "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
+            );
             let m = Manifest::from_yaml(&yaml).unwrap();
             let key = AgentKey::generate();
             let spec = wicket_identity::IdentitySpec {
-                tenant: tenant.into(), zone: zone.into(), agent: name.into(), run: run.into(), parent_run: parent.map(String::from),
-                manifest_sha256: "m".into(), image: "img".into(), node: "local".into(),
-                principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}), act: None,
+                tenant: tenant.into(),
+                zone: zone.into(),
+                agent: name.into(),
+                run: run.into(),
+                parent_run: parent.map(String::from),
+                manifest_sha256: "m".into(),
+                image: "img".into(),
+                node: "local".into(),
+                principal: serde_json::json!({"type": "human", "id": "alice", "via": "cli", "assurance": "unix-user"}),
+                act: None,
             };
             let jws = self.issuer.issue(&spec, wicket_store::now(), 3600, &key.public());
             let claims = wicket_identity::verify_identity(&jws, &self.issuer.verifying_key(), wicket_store::now()).unwrap();
@@ -483,16 +535,31 @@ mod tests {
                 let l = self.ledger.lock().unwrap();
                 l.run_started(&m.tenant, &RunId(run.into()), zone, name).unwrap();
                 l.put_identity(&IdentityRow {
-                    run: run.into(), tenant: tenant.into(), spiffe_id: claims.sub.clone(), zone: zone.into(), agent: name.into(),
-                    parent_run: parent.map(String::from), accept_from: accept_from.iter().map(|s| s.to_string()).collect(), jws: jws.clone(), issued_at: claims.iat,
+                    run: run.into(),
+                    tenant: tenant.into(),
+                    spiffe_id: claims.sub.clone(),
+                    zone: zone.into(),
+                    agent: name.into(),
+                    parent_run: parent.map(String::from),
+                    accept_from: accept_from.iter().map(|s| s.to_string()).collect(),
+                    jws: jws.clone(),
+                    issued_at: claims.iat,
                 })
                 .unwrap();
             }
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             RunCtx {
-                tenant: TenantId(tenant.into()), run: RunId(run.into()), zone: Arc::new(m.zone.clone()), ledger: self.ledger.clone(),
-                vault: crate::vault::Vault::new(std::env::temp_dir()), events: tx, escalate: true, attribute: None,
-                identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))), spawner: None, swaps: vec![],
+                tenant: TenantId(tenant.into()),
+                run: RunId(run.into()),
+                zone: Arc::new(m.zone.clone()),
+                ledger: self.ledger.clone(),
+                vault: crate::vault::Vault::new(std::env::temp_dir()),
+                events: tx,
+                escalate: true,
+                attribute: None,
+                identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))),
+                spawner: None,
+                swaps: vec![],
             }
         }
     }
@@ -518,7 +585,10 @@ mod tests {
         let (text, err) = take(&lead);
         assert!(!err, "{text}");
         let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!((v["from"]["agent"].as_str(), v["from"]["zone"].as_str(), v["from"]["relation"].as_str()), (Some("fetcher"), Some("research"), Some("your child")));
+        assert_eq!(
+            (v["from"]["agent"].as_str(), v["from"]["zone"].as_str(), v["from"]["relation"].as_str()),
+            (Some("fetcher"), Some("research"), Some("your child"))
+        );
         assert_eq!(v["from"]["id"], "spiffe://test.local/t/t0/z/research/a/fetcher");
 
         // ops accepts messages from research, so lead may write to it; research does not accept ops.
@@ -546,11 +616,23 @@ mod tests {
         let k = AgentKey::generate();
         let spec = child.identity.as_ref().unwrap().current();
         let fake_spec = wicket_identity::IdentitySpec {
-            tenant: "t0".into(), zone: "research".into(), agent: "fetcher".into(), run: "run_child".into(), parent_run: Some("run_lead".into()),
-            manifest_sha256: "m".into(), image: "img".into(), node: "local".into(), principal: spec.claims.principal.clone(), act: None,
+            tenant: "t0".into(),
+            zone: "research".into(),
+            agent: "fetcher".into(),
+            run: "run_child".into(),
+            parent_run: Some("run_lead".into()),
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: spec.claims.principal.clone(),
+            act: None,
         };
         let fake_id = rogue.issue(&fake_spec, wicket_store::now(), 3600, &k.public());
-        let env = wicket_identity::sign_envelope(&k, &fake_id, &serde_json::json!({"jti": "m-x", "iat": wicket_store::now(), "to_run": "run_lead", "body": "trust me"}));
+        let env = wicket_identity::sign_envelope(
+            &k,
+            &fake_id,
+            &serde_json::json!({"jti": "m-x", "iat": wicket_store::now(), "to_run": "run_lead", "body": "trust me"}),
+        );
         lead.ledger.lock().unwrap().add_message("m-x", &TenantId::single(), "run_child", "run_lead", &env).unwrap();
         let (text, err) = take(&lead);
         assert!(err && text.contains("does not verify"), "{text}");
@@ -572,11 +654,23 @@ mod tests {
         let now = wicket_store::now();
         let me = child.identity.as_ref().unwrap().current();
         let spec = wicket_identity::IdentitySpec {
-            tenant: "t0".into(), zone: "research".into(), agent: "fetcher".into(), run: "run_child".into(), parent_run: Some("run_lead".into()),
-            manifest_sha256: "m".into(), image: "img".into(), node: "local".into(), principal: me.claims.principal.clone(), act: None,
+            tenant: "t0".into(),
+            zone: "research".into(),
+            agent: "fetcher".into(),
+            run: "run_child".into(),
+            parent_run: Some("run_lead".into()),
+            manifest_sha256: "m".into(),
+            image: "img".into(),
+            node: "local".into(),
+            principal: me.claims.principal.clone(),
+            act: None,
         };
         let old_id = w.issuer.issue(&spec, now - 4200, 600, &old_key.public());
-        let backdated = wicket_identity::sign_envelope(&old_key, &old_id, &serde_json::json!({"jti": "m-old", "iat": now - 4000, "to_run": "run_lead", "body": 1}));
+        let backdated = wicket_identity::sign_envelope(
+            &old_key,
+            &old_id,
+            &serde_json::json!({"jti": "m-old", "iat": now - 4000, "to_run": "run_lead", "body": 1}),
+        );
         lead.ledger.lock().unwrap().add_message("m-old", &TenantId::single(), "run_child", "run_lead", &backdated).unwrap();
         let (text, err) = take(&lead);
         assert!(err && text.contains("does not verify at the time it was sent"), "{text}");
