@@ -31,6 +31,15 @@ tokio.workspace = true
 serde_json.workspace = true
 humantime.workspace = true
 rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+# ACME (Let's Encrypt) client for the console's certificates (serve/acme.rs). ring, not aws-lc-rs (ring is
+# already in the tree and needs no C toolchain). Its hyper-rustls client is off: wicket supplies the HTTP
+# client (reqwest, already a dependency), which is also the seam the tests' mock ACME server plugs into.
+# (Its ring feature pulls rcgen 0.14 for CSRs; wicket's own certificates stay on the workspace rcgen.)
+instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
+x509-parser = "0.16"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hyper.workspace = true
@@ -46,6 +55,7 @@ getrandom.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+ciborium = "0.2"
 wicket-placement = { workspace = true, features = ["mock"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

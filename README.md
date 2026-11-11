@@ -247,8 +247,10 @@ cargo build --release -p wicket-cli
 
 The console (`wicket serve`) shows what's waiting for you, runs, recent decisions and activity, and you approve
 or deny from a browser or phone. It uses **passkeys**:
-- the first passkey is enrolled through a one-time link printed at start-up (single use, 10 minutes, valid only
-  while no passkey exists, and it can do nothing but enrol);
+- passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
+  passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
+  (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey). A
+  signed-in console session can't add a passkey, so a stolen cookie can't either;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
@@ -273,6 +275,56 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
+
+#### The console on the public internet
+
+The console is built to be reachable directly from the internet, with no VPN or access proxy in front (#23).
+Passkeys stay the only authentication.
+
+```sh
+# HTTPS from wicket itself, with a Let's Encrypt certificate validated over TLS-ALPN-01 on this listener:
+wicket serve --listen 0.0.0.0:443 --acme-domain console.example.com --acme-agree-tos \
+    --acme-contact mailto:ops@example.com          # --acme-staging to try it out first
+# ...or with certificate files (re-read when they change, e.g. after certbot renews them):
+wicket serve --listen 0.0.0.0:443 --origin https://console.example.com \
+    --tls-cert /etc/wicket/fullchain.pem --tls-key /etc/wicket/privkey.pem
+# ...or behind a TLS-terminating proxy (which then must be the only way in):
+wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://console.example.com \
+    --trusted-proxy 10.0.0.2
+```
+
+- **Transport.** A non-loopback listener refuses to start in plain HTTP unless `--behind-tls-terminator` is given
+  with an `https://` `--origin`. TLS is rustls: TLS 1.3, and TLS 1.2 with ECDHE and AEAD suites only; HTTP/1.1
+  only (no h2, so there is one HTTP implementation to bound). HTTPS responses carry
+  `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (submitting the domain to the
+  preload list is your step). ACME keeps its account and certificate in `$WICKET_HOME/acme` (0700/0600) and
+  renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
+- **Before sign-in** a client can fetch only the page, its static files (script, stylesheet, manifest, icons)
+  and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
+  no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
+- **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
+  address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
+  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges are bounded
+  (1024 in all, 8 per client, 2-minute expiry). Every failure looks the same to the client, and every failure
+  and lockout is in the audit log.
+- **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
+  sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
+  host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately
+  passkey-signed, so a stolen cookie alone approves nothing.
+- **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
+  Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
+  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
+  `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
+- **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
+  handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB
+  bodies. A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
+  checks it never panics and never reaches a signed-in handler.
+- **Installable:** the console has a web app manifest and icons, so it can be added to a phone's home screen.
+- **Privilege separation** is #12: the console is meant to run as the unprivileged wicket system user. Nothing
+  here needs root (bind :443 with `CAP_NET_BIND_SERVICE` instead), its TLS and ACME state is in its own files,
+  and it starts runs through one launch callback (a detached `wicket run`), so moving launching behind a
+  separate, more privileged process later changes only that callback.
 
 ![console](docs/console-passkey.png)
 
