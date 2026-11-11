@@ -18,6 +18,7 @@ wicket-sandbox.workspace = true
 wicket-agent.workspace = true
 wicket-auth.workspace = true
 wicket-identity.workspace = true
+wicket-placement.workspace = true
 wicket-feed.workspace = true
 serde.workspace = true
 thiserror.workspace = true

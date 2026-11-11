@@ -1,0 +1,49 @@
+== A: start (runsc run), resume the session, one turn
+start + resume + turn: 3.074974282 s (from the result wait; box started 3.226425859 s ago)
+agent said: RESUMED messages_before_wake=51 task_marker=True t1_done_marker=True
+memory (runsc events --stats): 466305024 bytes
+clock before: realtime 1794428878.36 monotonic 5.28 uptime 5.28
+== B: checkpoint, uncompressed (the box stops)
+checkpoint: .225153657 s, exit 0
+image: 114510319 bytes; files: checkpoint.img=186590 pages.img=114282496 pages_meta.img=41233 
+pages.img zstd -3: 19714343 bytes in .483067730 s
+runsc run after checkpoint: exited 0
+stdout tail after checkpoint: putTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":0,"canonicalModel":"claude-sonnet-5-5","provider":"firstParty","costBasis":"list"}}} 
+== C: sleep 30 s, restart the host listener (new socket inode), restore (background, default)
+restore returned: .158748986 s; state running
+clock after: realtime 1794428910.72 monotonic 5.70 uptime 37.64  (host seconds since 'clock before': 32.390548029)
+probe after restore: lo=[127.0.0.1/8 ::1/128 ] via-forwarder:000  direct-uds:200
+re-added wicket.internal in .046620426 s
+probe after re-add: lo=[127.0.0.1/8 198.18.0.1/32 ::1/128 ] via-forwarder:200  direct-uds:200
+message on the restore process's stdin -> result: .536553631 s; restore -> result 1.997686765 s
+out2 starts with 6779 NUL bytes (the restored stdout fd kept its file offset); out1 still has 1 result
+agent said: RESUMED messages_before_wake=55 task_marker=True t1_done_marker=True
+mock requests so far: 4
+== D: checkpoint --leave-running, flate-best-speed
+checkpoint (leave-running, flate): .718573457 s, 26408441 bytes, state running
+probe after leave-running: lo=[127.0.0.1/8 198.18.0.1/32 ::1/128 ] via-forwarder:200  direct-uds:200
+still answers after leave-running: .444512983 s
+== E: a request in flight (mock holds it 20 s); checkpoint 3 s in; restore at once (--background=false)
+checkpoint with a request in flight: .171478595 s
+restore (--background=false) returned: .307943720 s
+re-added wicket.internal in .094696920 s
+in-flight turn completed after restore: 21.116805586 s
+model requests for the in-flight step: 2 (1 = no retry; the first one's answer hit a closed socket)
+out3:       2 RESUMED messages_before_wake=63 task_marker=True t1_done_marker=True       1 "subtype":"api_retry"       1 "subtype":"success" 
+== F: double wake: restore img-a a second time as another container while hib-ck runs
+second restore of the same image: ACCEPTED in .164228864 s; states: hib-ck running, hib-ck2 running
+twin answered: .616308627 s
+both appended to the same transcript (shared bind mount): 3 matching lines
+== G: the same fix as gVisor's restore hook (--save-restore-exec-argv), no host-side re-add
+checkpoint with hook: .246470861 s
+restore returned: .189443806 s; probe: lo=[127.0.0.1/8 ::1/128 ] via-forwarder:200  direct-uds:200
+hook log: hook mode=save uid=0 hook mode=restore uid=0 
+turn after hooked restore: .683267610 s
+== H1: checkpoint G's box again, without the hook flag, and restore
+probe: lo=[127.0.0.1/8 ::1/128 ] via-forwarder:200  direct-uds:200; hook log: hook mode=save uid=0 hook mode=restore uid=0 hook mode=restore uid=0 
+== H2: restore img-a (no hook) once more, send a message, put the address back only after 40 s
+after 40 s: 7 api_retry events, 0 results; delays ms: 535 1170 2228 4599 9988 19979 39047 
+re-added wicket.internal in .050696869 s
+turn completed after the late re-add: 38.787005092 s
+image fingerprint: release-20261102.0; cpu features stored: 57 flags
+done
