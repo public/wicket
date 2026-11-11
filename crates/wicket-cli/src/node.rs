@@ -7,7 +7,13 @@
 //! An **enrolled** node (`wicket node enrol`, see `enrol.rs`) is reached with its host key pinned:
 //! every ssh call checks it against a known_hosts file wicket manages, with `StrictHostKeyChecking=yes`,
 //! so a node presenting any other key is refused. A target that isn't enrolled is still reached the old
-//! way (trust on first use), with a warning.
+//! way (trust on first use), with a warning. Runs on an enrolled node go through its `wicket node
+//! serve` (`noderun.rs`); runs on an unenrolled target still run docker over ssh, as described above.
+//!
+//! **Test hook.** `WICKET_NODE_SSH` replaces `ssh <options> <target>` for every command sent to a node
+//! with the command it names (split on spaces; it gets the remote command as one argument, as ssh
+//! does), e.g. `env HOME=/tmp/node sh -c` to treat a directory on this machine as the node. Everything
+//! but the ssh hop itself is then exercised (`ci/node-e2e.sh --local`).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -21,6 +27,8 @@ pub struct Node {
     /// The enrolled node's name; None for a target reached by trust on first use.
     pub name: Option<String>,
     base: Vec<String>,
+    /// `WICKET_NODE_SSH`: the whole prefix, target included.
+    hook: Option<Vec<String>>,
 }
 
 /// Where an enrolled node's host key is pinned.
@@ -59,7 +67,11 @@ impl Node {
             base.push("-o".into());
             base.push(o.clone());
         }
-        Node { target: target.to_string(), name: name.map(String::from), base }
+        let hook = std::env::var("WICKET_NODE_SSH")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| h.split_whitespace().map(String::from).collect());
+        Node { target: target.to_string(), name: name.map(String::from), base, hook }
     }
 
     /// The name runs and identities record: the enrolled name, else the ssh target.
@@ -69,6 +81,9 @@ impl Node {
 
     /// The ssh command up to and including the target (for Docker::over_ssh).
     pub fn ssh_prefix(&self) -> Vec<String> {
+        if let Some(h) = &self.hook {
+            return h.clone();
+        }
         let mut v = self.base.clone();
         v.push(self.target.clone());
         v

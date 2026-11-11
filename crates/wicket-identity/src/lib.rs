@@ -13,13 +13,13 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use ed25519_dalek::{Signature, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub use ed25519_dalek::VerifyingKey;
+pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdError {
@@ -273,6 +273,12 @@ impl Issuer {
 /// `<path>.pub` (hex), the format the feed prototype uses. Nodes get only the public half, at
 /// enrolment. Returns the public key.
 pub fn load_or_create_feed_root(path: &Path) -> Result<VerifyingKey> {
+    Ok(load_or_create_feed_root_signing(path)?.verifying_key())
+}
+
+/// The feed root's signing key itself, created on first use like [`load_or_create_feed_root`]. Only
+/// the control host holds it: it certifies each node feed's online key (`wicket node serve`, #57).
+pub fn load_or_create_feed_root_signing(path: &Path) -> Result<SigningKey> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let key = match std::fs::read_to_string(path) {
@@ -292,9 +298,8 @@ pub fn load_or_create_feed_root(path: &Path) -> Result<VerifyingKey> {
         }
         Err(e) => return Err(e.into()),
     };
-    let public = key.verifying_key();
-    std::fs::write(path.with_extension("pub"), hex::encode(public.to_bytes()))?;
-    Ok(public)
+    std::fs::write(path.with_extension("pub"), hex::encode(key.verifying_key().to_bytes()))?;
+    Ok(key)
 }
 
 /// A key id: the first 16 hex digits of sha256(public key).
