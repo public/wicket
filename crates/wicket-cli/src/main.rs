@@ -8,8 +8,8 @@
 mod capacity;
 mod chan;
 mod enrol;
-mod links;
 mod image;
+mod links;
 mod mock;
 mod node;
 mod noderun;

@@ -11,8 +11,8 @@
 //! Both boxes need `wicket-fwd` (every image built on wicket's agent image has it). Boxes on remote
 //! nodes can't link yet.
 
-use std::net::Ipv4Addr;
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use wicket_core::{Manifest, ZoneSpec};
