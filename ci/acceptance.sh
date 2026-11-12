@@ -336,7 +336,8 @@ cat "$work/rec.log"
 check "reconcile adopted its run: the same box runs on, supervised again (#151)" 'grep -q "^run_adopted .*$orphan" "$work/rec.log" && [ "$(box_of "$orphan")" = "$orphan_box" ]'
 wait_for 30 'w audit --tail 50 | grep -q "run.attach *$orphan"' || true
 wroot identity revoke "$orphan" --reason "acceptance: end the adopted orphan" >/dev/null 2>&1 || true
-wait_for 60 '[ -z "$(box_of "$orphan")" ]' || true
+# Its new supervisor stops the box, then records the run's end.
+wait_for 60 '[ -z "$(box_of "$orphan")" ] && w audit --tail 200 | grep -E "run\.end" | grep -q "$orphan"' || true
 check "  and revoking it stops its box and ends its run" '[ -z "$(box_of "$orphan")" ] && w audit --tail 200 | grep -E "run\.end" | grep -q "$orphan"'
 wroot reconcile --dry-run >"$work/rec-dry2.log" 2>&1 || true
 check "then a dry run has nothing to change" 'grep -q "^reconcile: 0 change(s)" "$work/rec-dry2.log"'
