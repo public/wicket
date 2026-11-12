@@ -35,15 +35,19 @@ pub const LEASE_SECS: i64 = 30;
 /// can be woken again.
 pub const BUSY_LEASE_SECS: i64 = 900;
 
-/// The object store agent state goes to: a directory under wicket's data dir (S3-compatible
-/// backends later).
-pub fn store() -> Result<SealedStore<DirStore>> {
-    Ok(SealedStore::new(DirStore::new(data_dir().join("objects")), &state_key()?))
+/// The object store agent state goes to, sealed under `state.key`: the installation's S3-compatible
+/// store if `state-store.yaml` puts bundles there (#154), or a directory under wicket's data dir.
+pub fn store() -> Result<SealedStore<Box<dyn wicket_store::objects::ObjectStore>>> {
+    let inner: Box<dyn wicket_store::objects::ObjectStore> = match crate::statestore::StateStore::load()? {
+        Some(s) if s.bundles == crate::statestore::Where::S3 => Box::new(s.open_s3()?),
+        _ => Box::new(DirStore::new(data_dir().join("objects"))),
+    };
+    Ok(SealedStore::new(inner, &state_key()?))
 }
 
 /// The key agent state is sealed with at rest (`<data dir>/state.key`, 0600, made on first use): it
 /// stays on the control host, which bundles and restores agents; nodes never see it.
-fn state_key() -> Result<[u8; 32]> {
+pub fn state_key() -> Result<[u8; 32]> {
     use std::os::unix::fs::OpenOptionsExt;
     let p = data_dir().join("state.key");
     let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|s| hex::decode(s.trim()).ok()).and_then(|b| b.try_into().ok());

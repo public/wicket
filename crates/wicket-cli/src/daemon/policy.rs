@@ -11,7 +11,7 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd};
+use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd, StateCmd};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -105,6 +105,13 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         // Spends money after a terminal prompt.
         Cmd::Place { .. } => Forward(Privileged),
+        // The kit holds every key and secret; a restore replaces the ledger; the roots are the roots.
+        Cmd::State { cmd } => match cmd {
+            StateCmd::Check => Forward(Read),
+            StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
+            StateCmd::Kit { .. } | StateCmd::Restore { .. } => Forward(Privileged),
+        },
+        Cmd::Keys { .. } => Forward(Privileged),
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
             DevCmd::NodeFeedProbe { .. } => Local,

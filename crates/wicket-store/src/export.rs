@@ -115,6 +115,65 @@ impl Ledger {
     pub fn audit_hash_at(&self, seq: i64) -> Result<Option<String>> {
         Ok(self.conn.query_row("SELECT hash FROM audit WHERE seq = ?1", params![seq], |r| r.get(0)).optional()?)
     }
+
+    /// Every audit record of one kind, oldest first.
+    pub fn audit_of_kind(&self, kind: &str) -> Result<Vec<crate::AuditRecord>> {
+        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit WHERE kind = ?1 ORDER BY seq")?;
+        let rows = st.query_map(params![kind], |r| {
+            Ok(crate::AuditRecord {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                tenant: r.get(2)?,
+                run: r.get(3)?,
+                kind: r.get(4)?,
+                body: r.get(5)?,
+                prev: r.get(6)?,
+                hash: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// After a restore (#154): appends records exported before the control host was lost, as they
+    /// were, where they continue the restored chain. Stops at the first that doesn't (its seq, prev
+    /// or hash), and returns how many were appended.
+    pub fn import_exported_audit(&self, recs: &[crate::AuditRecord]) -> Result<usize> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = (|| {
+            let (mut seq, mut prev) = self.audit_head()?.unwrap_or((0, crate::CHAIN_ZERO.to_string()));
+            let mut sum = crate::ChainSummary::default();
+            let mut n = 0;
+            let start = seq;
+            for r in recs.iter().skip_while(|r| r.seq <= start) {
+                let f = crate::ChainFields { seq: r.seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body: &r.body };
+                if r.seq != seq + 1 || r.prev != prev || !sum.accept(&prev, &f, &r.hash) {
+                    break;
+                }
+                self.conn.execute(
+                    "INSERT INTO audit (seq, ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![r.seq, r.ts, r.tenant, r.run, r.kind, r.body, r.prev, r.hash],
+                )?;
+                (seq, prev) = (r.seq, r.hash.clone());
+                n += 1;
+            }
+            Ok(n)
+        })();
+        let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        r
+    }
+
+    /// Moves every export cursor back to at most `seq` (a restored chain ends there), so what comes
+    /// after it is exported again.
+    pub fn rewind_exports(&self, seq: i64) -> Result<()> {
+        self.conn.execute("UPDATE audit_export SET seq = MIN(seq, ?1), holder = NULL, lease_until = 0", params![seq])?;
+        Ok(())
+    }
+
+    /// After a restore (#154): moves every agent's generation past any a lost control host may have
+    /// handed out after the restore point, so a box still running at one of those is fenced off.
+    pub fn bump_agent_generations(&self, by: i64) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE agents SET generation = generation + ?1, lease_until = 0", params![by])?)
+    }
 }
 
 #[cfg(test)]

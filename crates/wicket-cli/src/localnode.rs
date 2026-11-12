@@ -136,8 +136,8 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     let node_key = hex::encode(key.verifying_key().to_bytes());
     let paths = crate::enrol::Paths::installation();
     let ca = wicket_proxy::ca::InstallationCa::load_or_create(&paths.ca_key)?;
-    let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
-    let authz_root = crate::enrol::token_key(&paths.authz_root_key)?.public();
+    let feed_root = crate::roots::feed_root_public()?;
+    let authz_root = crate::roots::authz_root_public()?;
     let issuer = crate::issuer()?;
     let now = wicket_store::now();
     let files: [(&str, String); 6] = [

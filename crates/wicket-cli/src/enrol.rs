@@ -53,10 +53,6 @@ pub struct Paths {
     pub nodes_dir: PathBuf,
     /// The installation CA's key (its certificate is beside it, `.pem`).
     pub ca_key: PathBuf,
-    /// The feed root key (its public half is beside it, `.pub`).
-    pub feed_root_key: PathBuf,
-    /// The authority root key (#76): signs block 0 of every box's token. Nodes pin its public half.
-    pub authz_root_key: PathBuf,
     /// The approval service's key: signs grant blocks. Tokens name it; nodes needn't know it.
     pub approver_key: PathBuf,
 }
@@ -67,8 +63,6 @@ impl Paths {
         Paths {
             nodes_dir: crate::data_dir().join("nodes"),
             ca_key: id.with_file_name("ca.key"),
-            feed_root_key: id.with_file_name("feed-root.key"),
-            authz_root_key: id.with_file_name("authz-root.key"),
             approver_key: id.with_file_name("approver.key"),
         }
     }
@@ -392,8 +386,8 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     }
     // Everything the control host needs, before touching the node.
     let ca = InstallationCa::load_or_create(&paths.ca_key)?;
-    let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
-    let authz_root = token_key(&paths.authz_root_key)?.public();
+    let feed_root = crate::roots::feed_root_public()?;
+    let authz_root = crate::roots::authz_root_public()?;
     let issuer = crate::issuer()?;
 
     let scanned = match &spec {
@@ -497,8 +491,8 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
         hosts
     };
     let ca = InstallationCa::load_or_create(&paths.ca_key)?;
-    let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
-    let authz_root = token_key(&paths.authz_root_key)?.public();
+    let feed_root = crate::roots::feed_root_public()?;
+    let authz_root = crate::roots::authz_root_public()?;
     let node = pinned_node(&paths.nodes_dir, &row, None)?;
     let generated = parse_generated(&node.script("generating a new CA key", &keygen_script(name, false)).await?, false)?;
     let cert = ca.issue_node_ca(&generated.csr_pem, name, &hosts, ttl)?;

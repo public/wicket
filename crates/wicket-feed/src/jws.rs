@@ -17,6 +17,8 @@ pub const TYP_SNAP: &str = "wicket-feed-snapshot+jws";
 pub const TYP_DELTA: &str = "wicket-feed-delta+jws";
 /// `typ` of a freshness statement.
 pub const TYP_FRESH: &str = "wicket-feed-fresh+jws";
+/// An authority issuing key's certificate, signed by the authority root (#154).
+pub const TYP_AUTHZ_KEY: &str = "wicket-authz-key+jws";
 
 /// The key id: the first 8 bytes of sha256 of the public key, in hex.
 pub fn kid(k: &VerifyingKey) -> String {

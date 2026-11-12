@@ -58,9 +58,9 @@ pub fn feed_config() -> PublisherConfig {
 /// A node's delta log past this size starts a new feed generation when no box holds authority from it.
 const COMPACT_BYTES: u64 = 1 << 20;
 
-/// How long a node feed key's certificate lasts; it is renewed (same key and version) when a run
-/// starts with less than a day left.
-const CERT_DAYS: i64 = 7;
+/// A node feed's directory holds this file when its feed must start a new generation the next time
+/// it is opened (after a restore, #154: its delta log stayed behind).
+pub const REGENESIS: &str = "regenesis";
 
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
 /// the installation's feed root. A delta log from before boxes' authority moved to tokens (zone
@@ -68,6 +68,16 @@ const CERT_DAYS: i64 = 7;
 /// starts again under a new certificate version: a re-genesis, so the node takes the new snapshot.
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
+    if dir.join(REGENESIS).exists() {
+        let log = dir.join("deltas.jsonl");
+        if log.exists() {
+            std::fs::rename(&log, dir.join("deltas.jsonl.restored")).context("setting aside the old delta log")?;
+        }
+        let p = open_feed_once(name, &cfg, true).context("starting the feed's new generation after a restore")?;
+        std::fs::remove_file(dir.join(REGENESIS))?;
+        println!("[wicket] node {name}'s feed starts a new generation (restored)");
+        return Ok(p);
+    }
     match open_feed_once(name, &cfg, false) {
         Err(e) if e.downcast_ref::<PublishError>().is_some_and(|e| e.to_string().contains("unreadable")) => {
             let log = dir.join("deltas.jsonl");
@@ -83,7 +93,6 @@ fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Re
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let root = wicket_identity::load_or_create_feed_root_signing(&crate::enrol::Paths::installation().feed_root_key)?;
     let key_path = dir.join("feed.key");
     let key = match std::fs::read_to_string(&key_path) {
         Ok(s) => {
@@ -105,17 +114,27 @@ fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Re
     let want_ttl = cfg.ttl_ms.max(wicket_feed::DEFAULT_TTL_MS);
     let want_narrow = cfg.narrow_ms.max(wicket_feed::DEFAULT_NARROW_MS);
     let kid = wicket_feed::kid(&key.verifying_key());
+    // With the roots offline (#154) a certificate is used to its end (`wicket keys certify` renews it);
+    // with them here, renewed when under a day is left.
+    let offline = crate::roots::offline();
+    let margin = if offline { 0 } else { 86_400_000 };
     let cert_jws = match old {
         Some((c, j))
             if !new_generation
                 && c.kid == kid
-                && c.not_after > now + 86_400_000
+                && c.not_after > now + margin
                 && c.max_ttl_ms >= cfg.ttl_ms
                 && c.max_narrow_ms >= cfg.narrow_ms =>
         {
+            if offline && c.not_after < now + 7 * 86_400_000 {
+                eprintln!(
+                    "[wicket] node {name}'s feed certificate ends in under a week: renew it with `WICKET_ROOTS=<dir> wicket keys certify`"
+                );
+            }
             j
         }
         old => {
+            let root = crate::roots::feed_root_signing().with_context(|| format!("node {name}'s feed needs a certificate"))?;
             // Same key: same version (a renewal). A new key needs a new version (a re-genesis).
             let version = match &old {
                 Some((c, _)) if new_generation => c.version + 1,
@@ -123,14 +142,14 @@ fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Re
                 Some((c, _)) => c.version + 1,
                 None => 1,
             };
-            let c = KeyCert::new(&key.verifying_key(), version, now + CERT_DAYS * 86_400_000, want_ttl, want_narrow);
+            let c = KeyCert::new(&key.verifying_key(), version, now + crate::roots::cert_ms(), want_ttl, want_narrow);
             let j = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &c);
             std::fs::write(&cert_path, &j)?;
             j
         }
     };
-    let authz_root = crate::enrol::token_key(&crate::enrol::Paths::installation().authz_root_key)?.public();
-    Ok(Publisher::open_with(&dir, name, &root.verifying_key(), key, &cert_jws, cfg.clone(), authz_root)?)
+    let authz_root = crate::roots::authz_root_public()?;
+    Ok(Publisher::open_with(&dir, name, &crate::roots::feed_root_public()?, key, &cert_jws, cfg.clone(), authz_root)?)
 }
 
 trait WriteSync {
@@ -209,7 +228,8 @@ impl SharedFeed {
         // generation, which nodes take as a snapshot.
         let log = p.log_path().to_path_buf();
         let cap = std::env::var("WICKET_FEED_COMPACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(COMPACT_BYTES);
-        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > cap && p.state().zones.is_empty() {
+        // (Not while the roots are offline: a new generation needs the feed root.)
+        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > cap && p.state().zones.is_empty() && !crate::roots::offline() {
             std::fs::rename(&log, log.with_extension("jsonl.old")).context("setting the old delta log aside")?;
             p = open_feed_once(name, &cfg, true)?;
         }
@@ -375,11 +395,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let feed = Arc::new(SharedFeed::open(&name, cfg.clone())?);
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
-    let (authz_root, approver) = (crate::enrol::token_key(&paths.authz_root_key)?, crate::enrol::token_key(&paths.approver_key)?);
+    // Block 0 is minted by the authority root, or by its certified issuing key while the roots are
+    // offline (#154).
+    let ((minter, issuer_cert), approver) = (crate::roots::minting_key()?, crate::enrol::token_key(&paths.approver_key)?);
     // Until the run's own deadline (the node kills the box then), with an hour's margin.
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
-    let token_issuer = wicket_feed::Issuer::root(
-        &authz_root,
+    let mut token_issuer = wicket_feed::Issuer::root(
+        &minter,
         &s.tenant.0,
         &format!("run:{}", s.run),
         &s.run.0,
@@ -390,6 +412,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         vec![approver.public()],
     )
     .context("minting the box's token")?;
+    token_issuer.issuer_cert = issuer_cert;
     // A re-attached run's token carries the grants the ledger already handed this node for it, so
     // nothing a human approved is lost with the supervisor that published them.
     let carried: Vec<LiveGrant> = match s.attach {
