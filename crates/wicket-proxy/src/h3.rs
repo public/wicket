@@ -164,7 +164,9 @@ impl H3 {
         if let Some(m) = self.opts.box_mtu {
             ep_cfg.max_udp_payload_size(m.clamp(1200, MAX_PAYLOAD as u16))?;
         }
-        let ep = quinn::Endpoint::new_with_abstract_socket(ep_cfg, None, socket, Arc::new(quinn::TokioRuntime))?;
+        // quinn surfaces incoming connections only to an endpoint with a server config; each is then
+        // accepted with its own host's config, so this one never serves a handshake.
+        let ep = quinn::Endpoint::new_with_abstract_socket(ep_cfg, Some(self.placeholder()?), socket, Arc::new(quinn::TokioRuntime))?;
         let me = self.clone();
         let accept = tokio::spawn(async move {
             while let Some(inc) = ep.accept().await {
@@ -225,6 +227,20 @@ impl H3 {
             _ => {}
         }
         Some(reply)
+    }
+
+    /// A server config that only lets quinn surface incoming connections (see [`H3::relay`]):
+    /// a throwaway self-signed certificate, never presented.
+    fn placeholder(&self) -> Result<quinn::ServerConfig> {
+        let ck = rcgen::generate_simple_self_signed(vec!["placeholder.invalid".to_string()])?;
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(vec![ck.cert.der().clone()], key)?;
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let qc = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| anyhow!("QUIC TLS config: {e}"))?;
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(qc)))
     }
 
     /// The QUIC server config for `host`: a leaf from the run's minter, HTTP/3 only, no early data.
