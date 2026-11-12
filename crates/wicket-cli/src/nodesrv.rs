@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use wicket_feed::{BoxAuthority, Replica, ReplicaConfig};
 use wicket_proxy::ca::{Minter, NodeCa};
@@ -448,7 +448,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     std::fs::create_dir_all(ctl_dir)?;
     std::fs::set_permissions(ctl_dir, std::fs::Permissions::from_mode(0o700))?;
     let _ = std::fs::remove_file(&ctl);
-    let listener = UnixListener::bind(&ctl).with_context(|| format!("listening on {}", ctl.display()))?;
+    let listener = wicket_proxy::sockpath::bind(&ctl).with_context(|| format!("listening on {}", ctl.display()))?;
     let node = Arc::new(Node {
         name: name.clone(),
         paths,
@@ -1191,7 +1191,7 @@ fn listen(node: &Arc<Node>, gen: u64, run: &str, sock: &str) -> Result<()> {
     let b = boxes.get_mut(run).filter(|b| b.exited.is_none()).with_context(|| format!("run {run} has no running box on this node"))?;
     let path = b.dir.join("sock").join(sock);
     let _ = std::fs::remove_file(&path);
-    let l = UnixListener::bind(&path).with_context(|| format!("listening on {sock}"))?;
+    let l = wicket_proxy::sockpath::bind(&path).with_context(|| format!("listening on {sock}"))?;
     let (n, run2, target) = (node.clone(), run.to_string(), format!("link:{sock}"));
     let task = tokio::spawn(async move {
         while let Ok((c, _)) = l.accept().await {
@@ -1461,7 +1461,7 @@ impl StdinFeed {
     /// Serves the box's forwarder (`wicket-fwd --stdin-from`) on `path`.
     fn serve(self: Arc<Self>, path: &std::path::Path) -> Result<tokio::task::JoinHandle<()>> {
         let _ = std::fs::remove_file(path);
-        let l = UnixListener::bind(path)?;
+        let l = wicket_proxy::sockpath::bind(path)?;
         Ok(tokio::spawn(async move {
             while let Ok((c, _)) = l.accept().await {
                 let me = self.clone();
@@ -1904,7 +1904,7 @@ async fn serve_box(
     {
         let gs = sock.join("gateway.sock");
         let _ = std::fs::remove_file(&gs);
-        let l = UnixListener::bind(&gs)?;
+        let l = wicket_proxy::sockpath::bind(&gs)?;
         let (n, run) = (node.clone(), bs.run.clone());
         tasks.push(tokio::spawn(async move {
             while let Ok((c, _)) = l.accept().await {

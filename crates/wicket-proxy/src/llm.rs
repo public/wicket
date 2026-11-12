@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::UnixListener;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// How long a response is still read to its end after the agent stopped reading it, so its final
@@ -191,7 +190,7 @@ impl Llm {
 
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();
