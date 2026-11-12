@@ -69,7 +69,7 @@ impl BoxOps for LocalBoxes {
         }
         // Started in the background; still alive a moment later means it bound. Prints its pid.
         let script = format!(
-            "wicket-fwd --listen {addr}:{port}={sock} --bind-timeout 1 </dev/null >/dev/null 2>&1 & p=$!; sleep 0.3; kill -0 $p 2>/dev/null && echo $p"
+            "wicket-fwd --listen {addr}:{port}={sock} --bind-timeout 0 </dev/null >/dev/null 2>&1 & p=$!; sleep 0.3; kill -0 $p 2>/dev/null && echo $p"
         );
         let out = self
             .docker
