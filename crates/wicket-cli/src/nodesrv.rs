@@ -2484,6 +2484,69 @@ mod tests {
         assert!(tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(&mut c)).await.unwrap().unwrap().is_none());
     }
 
+    /// #152, #153: an ask queued while the run's control host was away is raised when it resumes the
+    /// box, with its node-local id and time, and leaves the queue once answered; a lease's budget
+    /// slice is kept on disk; a protocol-1 control host gets none of the version-2 messages.
+    #[tokio::test]
+    async fn a_queued_ask_is_raised_on_resume_and_a_lease_keeps_its_slice() {
+        const RUN: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
+        let inst = Install::new("nodesrv-queued");
+        let node = test_node(&inst);
+        let mut st = BoxState {
+            streams: [1, 2, 3],
+            name: format!("wicket-{RUN}"),
+            dir: inst.dir.join("runs").join(RUN),
+            stdin: None,
+            stdin_next: 0,
+            out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+            exited: None,
+            tasks: vec![],
+            user: String::new(),
+            cpus: 0.0,
+            memory_mib: 0,
+            listeners: HashMap::new(),
+            owner: None,
+            record: fake_record(RUN),
+        };
+        st.record.start.run = RUN.into();
+        node.boxes.lock().unwrap().insert(RUN.into(), st);
+        let op =
+            wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", "GET", "x.example", "/a");
+        // Cut off: the decider's ask is queued, once.
+        let ctl = Control(node.clone(), RUN.into());
+        let id = ctl.queue(&op, "out of reach", None).unwrap();
+        assert_eq!(ctl.queue(&op, "out of reach", None).unwrap(), id);
+        let (mut c, r) = handshake(&node, 2, chan::PROTOCOL, &inst, &inst.issuer).await;
+        assert!(r.is_ok(), "{:?}", r.err());
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        let (mid, queued) = match next_msg(&mut c).await {
+            Frame::Msg(Msg::Ask { id, run, op: o, queued, .. }) if run == RUN && *o == op => (id, queued),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(queued.as_ref().map(|q| q.0.as_str()), Some(id.as_str()));
+        assert_eq!(node.queue.of(RUN).len(), 1, "kept until answered");
+        c.write_all(&Frame::Msg(Msg::Asked { id: mid, pending: Some(("r-1".into(), true)), denied: None, error: None }).encode())
+            .await
+            .unwrap();
+        // A lease's slice: kept on disk for a restarted `serve`.
+        let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
+        c.write_all(
+            &Frame::Msg(Msg::Lease { run: RUN.into(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }).encode(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            if node.queue.of(RUN).is_empty() && node.slices.get(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(node.queue.of(RUN).is_empty(), "answered: off the queue");
+        assert_eq!(node.slices.get(RUN), Some(slice));
+        assert!(crate::nodesecrets::Asks::open(&inst.dir).of(RUN).is_empty(), "and off the disk");
+        assert_eq!(node.proto_of(RUN), chan::PROTOCOL);
+    }
+
     /// Done-when for #16: a node with an unexpected certificate is refused (wrong installation, wrong
     /// key, expired, unrecorded, revoked), and so is a control host that isn't this installation's.
     /// A refused or unfinished handshake never takes the link from the authenticated connection.
