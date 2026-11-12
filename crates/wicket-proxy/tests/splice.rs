@@ -35,9 +35,13 @@ fn zone() -> ZoneSpec {
             {"host": "open.test", "methods": ALL},
             {"host": "checked.test", "methods": ["GET"]},
             {"host": "fenced.test", "methods": ALL},
-            {"host": "private.test", "methods": ALL}
+            {"host": "private.test", "methods": ALL},
+            {"host": "registry.test", "methods": ["GET"]}
         ],
-        "forbid": [{"host": "fenced.test", "paths": ["/admin/**"]}]
+        "forbid": [
+            {"host": "fenced.test", "paths": ["/admin/**"]},
+            {"host": "registry.test", "paths": ["/@evil/**"]}
+        ]
     }))
     .unwrap()
 }
@@ -56,6 +60,7 @@ async fn origins(ca: &RunCa, names: &[&str]) -> HashMap<String, SocketAddr> {
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(s).await else { return };
                     let svc = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
+                        // The path exactly as it arrived, escapes and all.
                         let p = req.uri().path().to_string();
                         let body = match p.strip_prefix("/bytes/").and_then(|n| n.parse::<usize>().ok()) {
                             Some(n) => Bytes::from(vec![b'x'; n]),
@@ -83,7 +88,7 @@ impl World {
     async fn new() -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
-        let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test"]).await;
+        let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test", "registry.test"]).await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         // This run is generation 1 of a long-lived agent, so a later wake supersedes it (#70).
         let mut ledger = wicket_store::Ledger::open_in_memory().unwrap();
@@ -346,4 +351,43 @@ async fn a_spliced_connection_is_cut_when_its_activation_is_superseded() {
     settle().await;
     let ev = w.events();
     assert!(ev.iter().any(|e| e.1 == "spliced" && e.2.contains("cut:") && e.2.contains("generation 2")), "{ev:?}");
+}
+
+/// #143: npm asks an inspected registry for a scoped package as `GET /@scope%2fname`. It is decided
+/// as `/@scope/name` (so the forbid on `/@evil/**` holds) and sent upstream as written; any other
+/// encoded separator is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn npm_scoped_packages_pass_an_inspected_registry() {
+    let w = World::new().await;
+    for (path, want) in [
+        ("/@types%2fnode", "origin /@types%2fnode"),
+        ("/@eslint-community%2Feslint-utils", "origin /@eslint-community%2Feslint-utils"),
+        ("/@babel%2fcore/7.26.0", "origin /@babel%2fcore/7.26.0"),
+        ("/@types/node", "origin /@types/node"),
+    ] {
+        let (status, s) = w.connect("registry.test").await;
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let (issuer, body) = get(s, "registry.test", path).await;
+        assert_eq!(issuer, "wicket run CA run_splice", "the registry is inspected, not spliced");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.lines().any(|l| l == want), "{path}: {body}");
+    }
+    settle().await;
+    let ev = w.events();
+    assert_eq!(ev.iter().filter(|e| e.0 == "registry.test" && e.1 == "allow").count(), 4, "{ev:?}");
+    for (path, refusal) in [
+        ("/@evil%2fpkg", "never allowed"),
+        ("/@evil/pkg", "never allowed"),
+        ("/x%2fy", "malformed request"),
+        ("/@types%2fnode%2fx", "malformed request"),
+        ("/-/package/@types%2fnode/dist-tags", "malformed request"),
+    ] {
+        let (_, s) = w.connect("registry.test").await;
+        let (_, body) = get(s, "registry.test", path).await;
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(refusal) && !body.contains("origin"), "{path}: {body}");
+    }
+    settle().await;
+    let ev = w.events();
+    assert_eq!(ev.iter().filter(|e| e.1 == "forbidden").count(), 5, "{ev:?}");
 }

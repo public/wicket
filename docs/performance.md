@@ -165,12 +165,12 @@ What holds across both runs:
 - `cargo fetch` keeps HTTP/2 when spliced: its 366 crate downloads went over 2 connections to
   `static.crates.io`. Intercepted, they were 366 HTTP/1.1 requests.
 
-**npm scoped packages fail when intercepted.** npm asks for a scoped package as `@scope%2fname`. The
-intercepting proxy refuses an encoded `/` in a path as ambiguous
-([#114](https://github.com/public/wicket/issues/114)), so `npm install` of anything that depends on a
-scoped package fails through an inspected registry
-([#143](https://github.com/public/wicket/issues/143)). A spliced registry isn't affected. The npm project
-above has no scoped packages, so both arms could run.
+**npm scoped packages through an inspected registry.** npm asks for a scoped package as
+`@scope%2fname`. The intercepting proxy refuses an encoded `/` in a path as ambiguous
+([#114](https://github.com/public/wicket/issues/114)), with one exception
+([#143](https://github.com/public/wicket/issues/143)): a first segment of exactly that shape is decided
+as `/@scope/name` and sent upstream as written. The npm project above has no scoped packages; these
+runs predate the exception.
 
 ## The audit writer
 

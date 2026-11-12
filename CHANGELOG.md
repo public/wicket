@@ -133,6 +133,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 - A console approval of a prefix ask signed an exact path while granting the whole prefix
   ([#87](https://github.com/public/wicket/pull/87)).
 - ACME TLS-ALPN-01 certificates never loaded under rustls 0.23.46 ([#99](https://github.com/public/wicket/pull/99)).
+- `npm install` of a project with scoped dependencies (`@types/node`, `@babel/core`) failed through an
+  inspected registry: npm's `@scope%2fname` is now decided as `/@scope/name`, so rules on the decoded
+  path apply, and is forwarded as written; every other encoded separator is still refused
+  ([#145](https://github.com/public/wicket/pull/145)).
 
 ### Upgrading from a development checkout
 

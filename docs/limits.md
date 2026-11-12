@@ -35,8 +35,6 @@ not a permanent decision.
   connection, no per-request decisions, no header filtering and no Host pinning, so behind a shared
   CDN it can reach other sites on the same CDN. `wicket zone MANIFEST` lists spliced hosts. A forbid
   rule on the host keeps it inspected (`docs/performance.md`).
-- **npm scoped packages fail through an inspected registry:** `@scope%2fname` is refused as an
-  ambiguous path ([#143](https://github.com/public/wicket/issues/143)). A spliced registry works.
 - **Request bodies over 64 MiB fail,** and uploads are buffered rather than streamed
   ([#93](https://github.com/public/wicket/pull/93)).
 - **MCP is wicket's own gateway only.** Adapter-generated tools and isolated third-party MCP servers

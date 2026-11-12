@@ -2,6 +2,7 @@
 //! than normalised, so wicket and the upstream can never disagree about which resource a request
 //! names.
 
+use std::borrow::Cow;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -61,8 +62,11 @@ pub fn canonical_host(raw: &str) -> Result<String, CanonError> {
 
 const MAX_PATH: usize = 4096;
 
-/// Returns the path part (without query) if it is canonical, else an error.
-pub fn canonical_path(path_and_query: &str) -> Result<&str, CanonError> {
+/// The path a request is decided on, if it is canonical, else an error. Usually the path part of
+/// `path_and_query` as written (borrowed); the one exception is npm's scoped-package form (#143),
+/// whose first segment `@scope%2fname` is decided as `/@scope/name` (see [`npm_scoped`]). The
+/// request still goes upstream as the client wrote it: only the decision uses the decoded form.
+pub fn canonical_path(path_and_query: &str) -> Result<Cow<'_, str>, CanonError> {
     let path = path_and_query.split('?').next().unwrap_or("");
     if path.len() > MAX_PATH {
         return Err(CanonError::TooLong(MAX_PATH));
@@ -70,6 +74,16 @@ pub fn canonical_path(path_and_query: &str) -> Result<&str, CanonError> {
     if !path.starts_with('/') {
         return Err(CanonError::NotAbsolute);
     }
+    let path = match npm_scoped(path) {
+        Some(decoded) => Cow::Owned(decoded),
+        None => Cow::Borrowed(path),
+    };
+    check_plain(&path)?;
+    Ok(path)
+}
+
+/// The checks every decided path passes: no odd characters, parameters, escapes or segments.
+fn check_plain(path: &str) -> Result<(), CanonError> {
     if path.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f) {
         return Err(CanonError::BadCharacter);
     }
@@ -85,7 +99,7 @@ pub fn canonical_path(path_and_query: &str) -> Result<&str, CanonError> {
     }
     let body = body.strip_suffix('/').unwrap_or(body);
     if body.is_empty() {
-        return Ok(path);
+        return Ok(());
     }
     for seg in body.split('/') {
         match seg {
@@ -94,7 +108,30 @@ pub fn canonical_path(path_and_query: &str) -> Result<&str, CanonError> {
             _ => {}
         }
     }
-    Ok(path)
+    Ok(())
+}
+
+/// npm asks a registry for a scoped package as `GET /@scope%2fname` (#143). If `path`'s first
+/// segment is exactly that shape, the path with that one `%2f` (or `%2F`) decoded to `/`, so a rule
+/// on `/@scope/name` or `/@scope/**` decides it as it would the unencoded spelling. Scope and name
+/// are npm's lower-case URL-safe characters and don't start with `.` (so neither can be a dot
+/// segment); anything else in the segment (another escape, a second `%2f`, `%252f`) is not this
+/// shape and is left for `check_escapes` to refuse.
+fn npm_scoped(path: &str) -> Option<String> {
+    let first = path[1..].split('/').next().unwrap_or("");
+    let rest = &path[1 + first.len()..];
+    let scoped = first.strip_prefix('@')?;
+    let at = scoped.find('%')?;
+    let (scope, name) = (&scoped[..at], &scoped[at..]);
+    let name = name.strip_prefix("%2f").or_else(|| name.strip_prefix("%2F"))?;
+    let part = |s: &str| {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && b.len() <= 214
+            && b[0] != b'.'
+            && b.iter().all(|&c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'))
+    };
+    (part(scope) && part(name)).then(|| format!("/@{scope}/{name}{rest}"))
 }
 
 /// Every `%` must start an escape of two upper-case hex digits, for a byte that has to be escaped:
@@ -132,9 +169,9 @@ mod tests {
 
     #[test]
     fn accepts_plain_paths() {
-        assert_eq!(canonical_path("/repos/a/b/contents/x.md?ref=main"), Ok("/repos/a/b/contents/x.md"));
-        assert_eq!(canonical_path("/"), Ok("/"));
-        assert_eq!(canonical_path("/a/b/"), Ok("/a/b/"));
+        assert_eq!(canonical_path("/repos/a/b/contents/x.md?ref=main").as_deref(), Ok("/repos/a/b/contents/x.md"));
+        assert_eq!(canonical_path("/").as_deref(), Ok("/"));
+        assert_eq!(canonical_path("/a/b/").as_deref(), Ok("/a/b/"));
     }
 
     #[test]
@@ -194,6 +231,54 @@ mod tests {
         assert!(matches!(canonical_path("/a%2e%2E"), Err(CanonError::EncodedSeparator(_))));
         assert!(matches!(canonical_path("/a%2E"), Err(CanonError::EncodedSeparator(_))));
         // Escapes of bytes that must be escaped are fine.
-        assert_eq!(canonical_path("/a%20b/caf%C3%A9?q=%41"), Ok("/a%20b/caf%C3%A9"));
+        assert_eq!(canonical_path("/a%20b/caf%C3%A9?q=%41").as_deref(), Ok("/a%20b/caf%C3%A9"));
+    }
+
+    /// #143: npm's scoped-package form is decided with its one `%2f` decoded; nothing else is.
+    #[test]
+    fn npm_scoped_packages_decode_one_separator() {
+        for (raw, want) in [
+            ("/@types%2fnode", "/@types/node"),
+            ("/@types%2Fnode", "/@types/node"),
+            ("/@eslint-community%2feslint-utils", "/@eslint-community/eslint-utils"),
+            ("/@babel%2fcore?write=true", "/@babel/core"),
+            ("/@scope%2fname/1.2.3", "/@scope/name/1.2.3"),
+            ("/@scope%2fname/", "/@scope/name/"),
+            ("/@0x%2fa.b_c~d", "/@0x/a.b_c~d"),
+            ("/@_x%2f_y", "/@_x/_y"),
+        ] {
+            let got = canonical_path(raw);
+            assert_eq!(got.as_deref(), Ok(want), "{raw}");
+            assert!(matches!(got, Ok(Cow::Owned(_))), "{raw}");
+        }
+        // The unencoded spelling decides the same and is borrowed as written.
+        assert!(matches!(canonical_path("/@types/node"), Ok(Cow::Borrowed("/@types/node"))));
+        for p in [
+            "/x/@scope%2fname", // not the first segment
+            "/-/package/@scope%2fname/dist-tags",
+            "/@scope%2fname%2fmore", // double
+            "/@sc%2fope%2fname",     // in the scope
+            "/@scope%2f%2fname",
+            "/%40scope%2fname", // `@` escaped
+            "/scope%2fname",    // no `@`
+            "/@%2fname",        // empty scope
+            "/@scope%2f",       // empty name
+            "/@scope%2f..",     // dot segment once decoded
+            "/@..%2fname",
+            "/@scope%2f.name",
+            "/@.scope%2fname",
+            "/@Scope%2fname",    // upper case
+            "/@scope%2fna%20me", // another escape in the segment
+            "/@scope%5cname",
+            "/@scope%2Ename",
+        ] {
+            assert!(matches!(canonical_path(p), Err(CanonError::EncodedSeparator(_))), "{p}: {:?}", canonical_path(p));
+        }
+        assert!(matches!(canonical_path("/@scope%252fname"), Err(CanonError::EncodedSeparator(_))));
+        assert!(canonical_path("/@scope%2fname%41").is_err());
+        assert_eq!(canonical_path("/@scope%2fname/../x"), Err(CanonError::DotSegment));
+        assert_eq!(canonical_path("/@scope%2fname//x"), Err(CanonError::EmptySegment));
+        assert_eq!(canonical_path("/@scope%2fname;x"), Err(CanonError::Parameter));
+        assert_eq!(canonical_path("/@scope%2fname/a\\b"), Err(CanonError::BadCharacter));
     }
 }
