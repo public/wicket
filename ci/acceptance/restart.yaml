@@ -1,0 +1,17 @@
+# Acceptance (ci/acceptance.sh): a long-lived agent that stays up between turns, for the control-host
+# restart check (#151): its supervisor and everything else wicket runs on the control host is killed,
+# and its box must survive, be taken over again, and keep its model and gateway.
+task: Run the command you are given and stop.
+agent:
+  name: restart
+  max_turns: 8
+  idle_timeout: 20m
+zone:
+  name: acc-restart
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:MOCK_PORT
+  limits: { memory: 1500m, cpus: 1, timeout: 20m }

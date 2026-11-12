@@ -87,6 +87,7 @@
 pub mod copy;
 pub mod frame;
 pub mod spec;
+pub mod stdin;
 mod sys;
 pub mod udp;
 

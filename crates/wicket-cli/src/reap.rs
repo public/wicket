@@ -82,12 +82,23 @@ pub struct Reaped {
 /// in the ledger (which withdraws their pending requests).
 pub async fn reap(docker: &Docker, ledger: &Ledger, dry_run: bool) -> Result<Vec<Reaped>> {
     let mut out = vec![];
-    for b in docker.boxes().await? {
+    for mut b in docker.boxes().await? {
         let status = match &b.run {
             Some(r) => ledger.run_status(r)?,
             None => None,
         };
-        let verdict = judge(&b, status.as_deref());
+        // Judged by the run's supervisor as the ledger has it (it changes when one re-attaches, #151),
+        // and a running run whose supervisor is gone is left to `wicket reconcile`, which re-attaches
+        // to it or ends it.
+        if let Some(o) = b.run.as_deref().map(|r| ledger.run_owner(r)).transpose()?.flatten() {
+            b.owner = Some(o);
+        }
+        let verdict = match judge(&b, status.as_deref()) {
+            Verdict::Orphan(_) if status.as_deref() == Some("running") => {
+                Verdict::Unknown("its supervisor is gone: `wicket reconcile` re-attaches to its run or ends it".into())
+            }
+            v => v,
+        };
         if let (Verdict::Orphan(why), false) = (&verdict, dry_run) {
             docker.kill(&b.name).await?;
             if let Some(r) = &b.run {

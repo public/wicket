@@ -1,17 +1,24 @@
 //! `wicket node serve` (#57, step 3): the node process that owns its boxes and decides their egress
 //! locally, so a box keeps working (for allowed requests) while the control host is unreachable.
 //!
-//! - **It owns the box.** The control host asks it to start a box ([`Msg::Start`]); it runs `docker run`
-//!   here and relays the box's stdin, stdout and stderr over the control channel. When the channel
-//!   drops, the box keeps running and its output is kept (up to [`OUTPUT_CAP`] bytes per stream, oldest
-//!   dropped first; the control host reports a gap) and replayed when the control host reconnects. The
-//!   node also enforces the run's timeout itself.
+//! - **It owns the box.** The control host asks it to start a box ([`Msg::Start`]); it starts it
+//!   detached (`docker run -d`) and relays its stdin (over the box's `sock/stdin.sock`, which
+//!   `wicket-fwd --stdin-from` reads), stdout and stderr (from `docker logs`) over the control channel.
+//!   When the channel drops, the box keeps running and its output is kept (up to [`OUTPUT_CAP`] bytes
+//!   per stream, oldest dropped first; the control host reports a gap) and replayed when the control
+//!   host reconnects. The node also enforces the run's timeout itself, and holds the control host's
+//!   lease of the run ([`Msg::RunLease`], #151).
+//! - **Its boxes outlive it** (#151). A record of each box (`node-box.json`) lets a restarted `serve`
+//!   adopt the boxes the last one started (`adopt_previous`).
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
 //!   node's verified feed replica (`wicket_proxy::decide::NodeDecider`) and terminating TLS with the
 //!   node's name-constrained CA. Hosts the node must not terminate (an `inject` rule, a credential
 //!   swap, outside the CA's constraints, or an expired CA) are tunnelled to the control host's egress
-//!   proxy for the run. The LLM proxy and the MCP gateway stay on the control host too: the box's
-//!   `llm.sock` and `gateway.sock` here are tunnels to them.
+//!   proxy for the run.
+//! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy checks each call and
+//!   relays it to the run's own on the control host, which holds the credential and checks it again;
+//!   the gateway relays each call to the run's, which decides every tool, and answers MCP's own
+//!   handshake itself while the control host can't be reached.
 //! - **It keeps an audit log.** A ledger of its own (`audit.db`), hash-chained like the control host's,
 //!   records its decisions; it ships records past the control host's watermark on every connect.
 //! - **One control connection per run** (its scope; #146), on a unix socket in a 0700 directory,
@@ -151,7 +158,7 @@ struct BoxState {
     streams: [u64; 3],
     name: String,
     dir: PathBuf,
-    stdin: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    stdin: Option<Arc<StdinFeed>>,
     stdin_next: u64,
     out: [OutBuf; 2],
     exited: Option<(i32, Option<String>)>,
@@ -163,6 +170,10 @@ struct BoxState {
     memory_mib: u64,
     /// Link relay sockets listened on in its socket directory, by name.
     listeners: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// The control host's lease of the run (Unix ms; 0: none yet).
+    lease_until: i64,
+    /// What a restarted `serve` adopts it from.
+    record: BoxRecord,
     /// The control connection that started or last resumed it: its stdio, events, asks and
     /// tunnels go there.
     owner: Option<u64>,
@@ -459,7 +470,40 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
     }
-    reap_previous(&node.docker, &node.paths.runs()).await;
+    adopt_previous(&node).await;
+    {
+        // A run whose lease has lapsed (its control host gone longer than the feed window): kept
+        // running by default, as before run leases; `WICKET_NODE_LEASE_EXPIRY=stop` stops it instead.
+        let n = node.clone();
+        let stop = std::env::var("WICKET_NODE_LEASE_EXPIRY").is_ok_and(|v| v == "stop");
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                t.tick().await;
+                let now = wicket_feed::now_ms();
+                let lapsed: Vec<(String, String)> = n
+                    .boxes
+                    .lock()
+                    .expect("boxes")
+                    .iter_mut()
+                    .filter(|(_, b)| b.exited.is_none() && b.lease_until > 0 && b.lease_until < now)
+                    .map(|(r, b)| {
+                        b.lease_until = 0;
+                        (r.clone(), b.name.clone())
+                    })
+                    .collect();
+                for (run, name) in lapsed {
+                    if stop {
+                        eprintln!("[node] {run}: its control host's lease lapsed; stopping the box (WICKET_NODE_LEASE_EXPIRY=stop)");
+                        let _ = n.docker.unpause(&name).await;
+                        let _ = n.docker.kill(&name).await;
+                    } else {
+                        eprintln!("[node] {run}: its control host's lease lapsed; the box keeps running on the feed held");
+                    }
+                }
+            }
+        });
+    }
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     eprintln!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
     {
@@ -512,21 +556,62 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     }
 }
 
-/// Stops boxes a previous `node serve` from this directory started (their run directory is under its
-/// `runs/`): their owner is gone, so nobody holds their stdio or decides their egress. Any other
-/// container, wicket's or not, is left alone.
-async fn reap_previous(docker: &Docker, runs: &std::path::Path) {
-    let Ok(boxes) = docker.boxes().await else { return };
+/// Takes over the boxes a previous `node serve` from this directory started (#151): each running box
+/// with its record (`node-box.json`) is adopted (its proxies started again, its output read from the
+/// start, its stdin fed, its timeout kept) and waits for its control host to resume it. A box whose
+/// run has no authority in the feed any more is stopped, and so is one from before records (as
+/// before: nobody can supervise it). Any other container, wicket's or not, is left alone.
+async fn adopt_previous(node: &Arc<Node>) {
+    let runs = node.paths.runs();
+    let Ok(boxes) = node.docker.boxes().await else { return };
     for b in boxes {
-        let ours = b.run.as_deref().is_some_and(|r| crate::run::check_run_id(r).is_ok() && runs.join(r).is_dir());
-        if !ours {
-            continue;
-        }
-        if let crate::reap::Verdict::Orphan(why) = crate::reap::judge(&b, None) {
-            eprintln!("[node] stopping {} ({why})", b.name);
-            let _ = docker.kill(&b.name).await;
+        let Some(run) = b.run.as_deref().filter(|r| crate::run::check_run_id(r).is_ok() && runs.join(r).is_dir()) else { continue };
+        let dir = runs.join(run);
+        match BoxRecord::load(&dir).filter(|r| r.name == b.name && r.start.run == run) {
+            Some(rec) => {
+                let zone = node.replica.lock().expect("replica").zone_of(run).cloned();
+                match zone {
+                    Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z).await {
+                        Ok(tasks) => {
+                            eprintln!("[node] {run}: adopted box {} from a previous serve", b.name);
+                            wire(node, None, rec, dir, tasks, ids());
+                        }
+                        Err(e) => {
+                            eprintln!("[node] {run}: could not adopt box {} ({e:#}); stopping it", b.name);
+                            let _ = node.docker.kill(&b.name).await;
+                        }
+                    },
+                    _ => {
+                        eprintln!("[node] {run}: box {} has no authority in this node's feed; stopping it", b.name);
+                        let _ = node.docker.kill(&b.name).await;
+                    }
+                }
+            }
+            // This host's own node shares the run directories with every other node on this Docker:
+            // a box without its record isn't its to judge (it is another node's, or the reconciler's).
+            None if node.paths.shares_host() => {}
+            None => {
+                if let crate::reap::Verdict::Orphan(why) = crate::reap::judge(&b, None) {
+                    eprintln!("[node] stopping {} ({why})", b.name);
+                    let _ = node.docker.kill(&b.name).await;
+                }
+            }
         }
     }
+    // Boxes that exited while no `serve` ran: their exit is kept for the control host.
+    for (name, run) in node.docker.exited_boxes().await.unwrap_or_default() {
+        let dir = runs.join(&run);
+        let Some(rec) = BoxRecord::load(&dir).filter(|r| r.name == name && crate::run::check_run_id(&run).is_ok()) else { continue };
+        let code = node.docker.state(&name).await.ok().flatten().map(|s| s.1).unwrap_or(-1);
+        wire_exited(node, rec, dir, code).await;
+    }
+}
+
+/// A box that exited while no `serve` ran: kept as exited (with its output from the logs), so a
+/// resuming control host gets it all and its exit.
+async fn wire_exited(node: &Arc<Node>, rec: BoxRecord, dir: PathBuf, code: i32) {
+    let _ = code;
+    wire(node, None, rec, dir, vec![], ids());
 }
 
 async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()> {
@@ -621,6 +706,9 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
             stdout_total: b.out[0].end(),
             stderr_total: b.out[1].end(),
             exited: b.exited.clone(),
+            stdout_start: b.out[0].start(),
+            stderr_start: b.out[1].start(),
+            lease_until: b.lease_until,
         })
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
@@ -701,7 +789,9 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             if let Some(b) = boxes.values_mut().find(|b| b.owner == Some(gen) && b.streams[0] == stream) {
                 let (fresh, _) = accept_at(&mut b.stdin_next, offset, &bytes);
                 if let (Some(s), false) = (&b.stdin, fresh.is_empty()) {
-                    let _ = s.send(fresh);
+                    s.push(&fresh);
+                    b.record.stdin_received = b.stdin_next;
+                    let _ = b.record.save(&b.dir);
                 }
             }
         }
@@ -751,7 +841,21 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             }
             Msg::StdinClose { run } => {
                 if let Some(b) = node.boxes.lock().expect("boxes").get_mut(&run) {
-                    b.stdin = None;
+                    if let Some(f) = b.stdin.take() {
+                        f.close();
+                        b.record.stdin_closed = true;
+                        let _ = b.record.save(&b.dir);
+                    }
+                }
+            }
+            Msg::RunLease { run, until } => {
+                if let Some(b) = node.boxes.lock().expect("boxes").get_mut(&run) {
+                    b.lease_until = until;
+                    // Kept on disk (every 10 s at most) for a restarted `serve`.
+                    if until > b.record.lease_until + 10_000 {
+                        b.record.lease_until = until;
+                        let _ = b.record.save(&b.dir);
+                    }
                 }
             }
             Msg::Kill { run } => {
@@ -955,6 +1059,76 @@ fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u64, run: &st
     }
 }
 
+type GwBody = http_body_util::Full<bytes::Bytes>;
+
+/// One MCP gateway call from a box: relayed to the run's gateway on the control host, whole (the
+/// answers are small), so a call cut short by the control host going away gets a clear, retryable
+/// tool error instead of a broken response.
+async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<GwBody> {
+    use http_body_util::BodyExt;
+    let (parts, body) = req.into_parts();
+    let body = match http_body_util::Limited::new(body, 1 << 20).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return gw_reply(
+                413,
+                serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "request too large" } }),
+            )
+        }
+    };
+    let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let relayed = async {
+        let io = node.open_tunnel(run, "gateway").await?;
+        let (mut send, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.map_err(std::io::Error::other)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut rb = hyper::Request::builder().method(parts.method.clone()).uri(parts.uri.clone());
+        for (k, v) in parts.headers.iter() {
+            rb = rb.header(k, v);
+        }
+        let resp =
+            send.send_request(rb.body(GwBody::new(body.clone())).map_err(std::io::Error::other)?).await.map_err(std::io::Error::other)?;
+        let (rp, rb) = resp.into_parts();
+        let bytes = rb.collect().await.map_err(std::io::Error::other)?.to_bytes();
+        Ok::<_, std::io::Error>(hyper::Response::from_parts(rp, GwBody::new(bytes)))
+    }
+    .await;
+    match relayed {
+        Ok(r) => r,
+        Err(e) => gateway_offline(&rpc, &e.to_string()),
+    }
+}
+
+/// What the gateway answers while the control host can't be reached: MCP's own handshake, and a
+/// clear refusal for every tool (each needs the control plane).
+fn gateway_offline(rpc: &serde_json::Value, why: &str) -> hyper::Response<GwBody> {
+    let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let result = match method {
+        "initialize" => serde_json::json!({
+            "protocolVersion": rpc["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26"),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "wicket", "version": env!("CARGO_PKG_VERSION") },
+        }),
+        "ping" => serde_json::json!({}),
+        _ if id.is_null() => return gw_reply(202, serde_json::Value::Null),
+        _ => serde_json::json!({
+            "content": [{ "type": "text", "text": format!(
+                "the control plane is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
+            ) }],
+            "isError": true,
+        }),
+    };
+    gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn gw_reply(status: u16, v: serde_json::Value) -> hyper::Response<GwBody> {
+    let body = if v.is_null() { bytes::Bytes::new() } else { bytes::Bytes::from(v.to_string()) };
+    hyper::Response::builder().status(status).header("content-type", "application/json").body(GwBody::new(body)).expect("response")
+}
+
 /// A run's tree on this node: `workspace`, `state`, `tmp` or `volume.<name>`.
 fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
     crate::run::check_run_id(run)?;
@@ -1099,7 +1273,518 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
     }
 
-    // The box's enforcement points: egress decided here; LLM and MCP gateway tunnelled to the control host.
+    let tasks = serve_box(node, &bs, &dir, zone).await?;
+    let sock = dir.join("sock");
+
+    let spec = SandboxSpec {
+        // The name the control host gives it (its box prefix), else wicket's own.
+        name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
+        image: bs.image.clone(),
+        isolation: bs.isolation,
+        mounts: vec![
+            Mount { host: sock, target: wicket_agent::SOCK_DIR.into(), read_only: false },
+            Mount { host: dir.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
+            Mount { host: dir.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
+            // wicket's own hosts file, which links add names to (`BoxCtl` "hosts").
+            Mount { host: dir.join("hosts"), target: "/etc/hosts".into(), read_only: true },
+        ]
+        .into_iter()
+        // The workspace: the run's, or (on the control host's own node) a directory of the control
+        // host's own, mounted in place, as the binds say.
+        .chain((!bs.binds.iter().any(|(_, t, _)| t == wicket_agent::WORKSPACE)).then(|| Mount {
+            host: dir.join("workspace"),
+            target: wicket_agent::WORKSPACE.into(),
+            read_only: false,
+        }))
+        .chain(bs.binds.iter().map(|(h, t, ro)| Mount { host: PathBuf::from(h), target: t.clone(), read_only: *ro }))
+        .chain(volume_mounts)
+        // A long-lived agent's /tmp is a directory here, kept with the rest of its state.
+        .chain(bs.long_lived.then(|| Mount { host: dir.join("tmp"), target: "/tmp".into(), read_only: false }))
+        .collect(),
+        // An interactive box's stdin comes over `sock/stdin.sock` (see `wire`), not Docker's.
+        env: bs
+            .env
+            .iter()
+            .cloned()
+            .chain(bs.interactive.then(|| ("WICKET_STDIN_SOCK".to_string(), format!("{}/stdin.sock", wicket_agent::SOCK_DIR))))
+            .collect(),
+        argv: bs.argv.clone(),
+        memory: bs.memory.clone(),
+        cpus: bs.cpus,
+        pids: bs.pids,
+        user: ids(),
+        workdir: bs
+            .workdir
+            .clone()
+            .filter(|w| w.starts_with('/') && node.paths.shares_host())
+            .unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
+        interactive: false,
+        // Its owner: on the control host's own node, the run's process (what the reconciler there
+        // judges); elsewhere this `serve` (what the next `serve` judges, `reap_previous`).
+        labels: vec![
+            ("wicket.run".into(), bs.run.clone()),
+            (
+                "wicket.owner".into(),
+                bs.owner
+                    .clone()
+                    .filter(|o| node.paths.shares_host() && o.len() <= 200 && !o.contains(['\n', '=']))
+                    .unwrap_or_else(crate::reap::owner_label),
+            ),
+        ],
+    };
+    let name = spec.name.clone();
+    let cap = bs.output_cap.max(64 << 10);
+    // Detached, so the box outlives this `serve` (a restarted one adopts it, `adopt_previous`).
+    node.docker.start_detached(&spec, cap).await?;
+    let rec = BoxRecord {
+        start: bs,
+        name: name.clone(),
+        started_ms: wicket_feed::now_ms(),
+        stdin_received: 0,
+        stdin_closed: false,
+        lease_until: 0,
+        out_end: [0, 0],
+        out_tail: [String::new(), String::new()],
+        out_saved_ms: 0,
+    };
+    rec.save(&dir)?;
+    wire(node, Some(gen), rec, dir, tasks, spec.user.clone());
+    eprintln!("[node] box {name} started");
+    Ok(())
+}
+
+/// What a node keeps of a box it started, in its run directory (`node-box.json`): enough for a
+/// restarted `serve` to adopt it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BoxRecord {
+    start: BoxStart,
+    name: String,
+    started_ms: i64,
+    /// Bytes of stdin taken from the control host, and whether it closed it.
+    stdin_received: u64,
+    #[serde(default)]
+    stdin_closed: bool,
+    /// The control host's lease of the run (Unix ms; 0: none yet).
+    lease_until: i64,
+    /// How far into its stdout and stderr this node has read (bytes read, whatever Docker has rotated
+    /// away since), the last bytes read of each (base64; to line a replay up again), and when.
+    #[serde(default)]
+    out_end: [u64; 2],
+    #[serde(default)]
+    out_tail: [String; 2],
+    #[serde(default)]
+    out_saved_ms: i64,
+}
+
+/// How many of a stream's last bytes a box's record keeps, to find its place in a replay.
+const TAIL: usize = 1024;
+
+impl BoxRecord {
+    const FILE: &'static str = "node-box.json";
+
+    fn save(&self, dir: &std::path::Path) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = dir.join(format!("{}.new", Self::FILE));
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all_sync(&serde_json::to_vec(self)?)?;
+        std::fs::rename(&tmp, dir.join(Self::FILE))?;
+        Ok(())
+    }
+
+    fn load(dir: &std::path::Path) -> Option<BoxRecord> {
+        serde_json::from_slice(&std::fs::read(dir.join(Self::FILE)).ok()?).ok()
+    }
+}
+
+/// An interactive box's stdin, kept (up to [`OUTPUT_CAP`]) so the box's forwarder gets every byte
+/// once, however often it reconnects.
+struct StdinFeed {
+    buf: std::sync::Mutex<(OutBuf, bool)>,
+    more: tokio::sync::Notify,
+    /// The box's forwarder has connected at least once.
+    seen: std::sync::atomic::AtomicBool,
+}
+
+impl StdinFeed {
+    fn new(at: u64, closed: bool) -> StdinFeed {
+        StdinFeed {
+            buf: std::sync::Mutex::new((OutBuf::starting_at(OUTPUT_CAP, at), closed)),
+            more: tokio::sync::Notify::new(),
+            seen: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, b: &[u8]) {
+        self.buf.lock().expect("stdin").0.write(b);
+        self.more.notify_waiters();
+    }
+
+    fn close(&self) {
+        self.buf.lock().expect("stdin").1 = true;
+        self.more.notify_waiters();
+    }
+
+    /// Serves the box's forwarder (`wicket-fwd --stdin-from`) on `path`.
+    fn serve(self: Arc<Self>, path: &std::path::Path) -> Result<tokio::task::JoinHandle<()>> {
+        let _ = std::fs::remove_file(path);
+        let l = UnixListener::bind(path)?;
+        Ok(tokio::spawn(async move {
+            while let Ok((c, _)) = l.accept().await {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let _ = me.feed(c).await;
+                });
+            }
+        }))
+    }
+
+    async fn feed(&self, mut c: UnixStream) -> std::io::Result<()> {
+        let mut off = [0u8; 8];
+        c.read_exact(&mut off).await?;
+        self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut at = u64::from_be_bytes(off);
+        loop {
+            let more = self.more.notified();
+            tokio::pin!(more);
+            more.as_mut().enable();
+            let (from, bytes, closed) = {
+                let g = self.buf.lock().expect("stdin");
+                let (from, bytes) = g.0.since(at);
+                (from, bytes, g.1)
+            };
+            for chunk in bytes.chunks(64 * 1024) {
+                c.write_all(&(chunk.len() as u32).to_be_bytes()).await?;
+                c.write_all(chunk).await?;
+            }
+            at = from + bytes.len() as u64;
+            if closed {
+                c.write_all(&0u32.to_be_bytes()).await?;
+                // Held open until the forwarder hangs up, so it never reconnects for more.
+                let mut sink = [0u8; 1];
+                let _ = c.read(&mut sink).await;
+                return Ok(());
+            }
+            more.await;
+        }
+    }
+}
+
+trait WriteSync {
+    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()>;
+}
+impl WriteSync for std::fs::File {
+    fn write_all_sync(&mut self, b: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(self, b)
+    }
+}
+
+/// Connects a running box to this `serve`: its stdin (`docker attach`), its output from the start
+/// (`docker logs`, so a restarted `serve` replays it and the control host drops what it already has),
+/// its exit, and its timeout, counted from when it started.
+fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, tasks: Vec<tokio::task::JoinHandle<()>>, user: String) {
+    let bs = &rec.start;
+    let name = rec.name.clone();
+    let mut tasks = tasks;
+    // An interactive box's stdin: a feed the box's forwarder reads over `sock/stdin.sock`
+    // (`wicket-fwd --stdin-from`), reconnecting if this `serve` goes away.
+    let feed = bs.interactive.then(|| Arc::new(StdinFeed::new(rec.stdin_received, rec.stdin_closed)));
+    if let Some(f) = &feed {
+        match f.clone().serve(&dir.join("sock/stdin.sock")) {
+            Ok(t) => tasks.push(t),
+            Err(e) => eprintln!("[node] {}: the box's stdin socket failed: {e:#}", bs.run),
+        }
+        // An image from before stdin came over a socket never asks for it, and its agent would wait
+        // for ever: stopped, saying why (on the box's stderr, which the control host shows).
+        let (n, f, run, name) = (node.clone(), f.clone(), bs.run.clone(), name.clone());
+        tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            if f.seen.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let why =
+                "[wicket] the box never read its stdin: its image predates wicket's stdin socket (#151); rebuild it with `wicket image`\n";
+            eprintln!("[node] {run}: {}", why.trim());
+            let frame = {
+                let mut boxes = n.boxes.lock().expect("boxes");
+                boxes.get_mut(&run).filter(|b| b.exited.is_none()).map(|b| {
+                    let at = b.out[1].write(why.as_bytes());
+                    Frame::Data { stream: b.streams[2], offset: at, bytes: why.as_bytes().to_vec() }
+                })
+            };
+            if let Some(fr) = frame {
+                n.send_run(&run, fr);
+                let _ = n.docker.kill(&name).await;
+            }
+        }));
+    }
+    node.boxes.lock().expect("boxes").insert(
+        bs.run.clone(),
+        BoxState {
+            streams: bs.streams,
+            name: name.clone(),
+            dir: dir.clone(),
+            stdin: feed,
+            stdin_next: rec.stdin_received,
+            out: [OutBuf::starting_at(OUTPUT_CAP, rec.out_end[0]), OutBuf::starting_at(OUTPUT_CAP, rec.out_end[1])],
+            exited: None,
+            tasks,
+            user,
+            cpus: bs.cpus,
+            memory_mib: bs.memory.parse::<u64>().map(|b| b >> 20).unwrap_or(0),
+            listeners: HashMap::new(),
+            owner,
+            lease_until: rec.lease_until,
+            record: rec.clone(),
+        },
+    );
+    // A box read before (adopted): Docker's logs since a little before the last save, lined up on
+    // the last bytes read (rotation may have dropped their start).
+    let since = (rec.out_saved_ms > 0).then(|| {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis((rec.out_saved_ms - 10_000).max(0) as u64);
+        humantime::format_rfc3339_millis(t).to_string()
+    });
+    let logs = node.docker.logs(&name, since.as_deref()).spawn();
+    let readers: Vec<_> = match logs {
+        Err(e) => {
+            eprintln!("[node] {}: reading the box's output failed: {e}", bs.run);
+            vec![]
+        }
+        Ok(mut child) => {
+            let rs: Vec<_> = [
+                child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+                child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            ]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.map(|r| (i, r)))
+            .map(|(i, r)| {
+                use base64::Engine;
+                let tail = base64::engine::general_purpose::STANDARD.decode(&rec.out_tail[i]).unwrap_or_default();
+                tokio::spawn(read_output(node.clone(), bs.run.clone(), name.clone(), i, r, tail, bs.output_cap, bs.output_stop))
+            })
+            .collect();
+            // The log reader lives as long as its readers.
+            let mut rs = rs;
+            rs.push(tokio::spawn(async move {
+                let _ = child.wait().await;
+            }));
+            rs
+        }
+    };
+    // The node enforces the run's timeout itself, connected or not, from when the box started.
+    let (n, run, box_name) = (node.clone(), bs.run.clone(), name.clone());
+    let left = (rec.started_ms + (bs.timeout_secs.max(1) as i64) * 1000 - wicket_feed::now_ms()).max(1000);
+    tokio::spawn(async move {
+        let deadline = tokio::time::sleep(std::time::Duration::from_millis(left as u64));
+        tokio::pin!(deadline);
+        let code = tokio::select! {
+            c = n.docker.wait(&box_name) => c.unwrap_or(-1),
+            _ = &mut deadline => {
+                eprintln!("[node] {run}: past its timeout; stopping the box");
+                let _ = n.docker.unpause(&box_name).await;
+                let _ = n.docker.kill(&box_name).await;
+                n.docker.wait(&box_name).await.unwrap_or(-1)
+            }
+        };
+        for r in readers {
+            let _ = r.await;
+        }
+        finish(&n, &run, &box_name, code).await;
+    });
+}
+
+/// Lines an adopted box's replayed output up on the last bytes its node read of it before (#151).
+struct Aligner {
+    tail: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+impl Aligner {
+    /// Takes replayed bytes: once the whole tail has been seen, what follows it.
+    fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        self.pending.extend_from_slice(data);
+        let t = self.tail.as_slice();
+        let p = self.pending.windows(t.len()).position(|w| w == t)?;
+        Some(self.pending.split_off(p + t.len()))
+    }
+
+    /// No whole tail in the replay: if it starts inside the tail (at least 64 bytes of its end, or
+    /// all of a shorter one), what follows; otherwise all of it (the replay starts after the tail, or
+    /// Docker rotated part of it away). The flag says whether it was lined up.
+    fn give_up(&mut self) -> (Vec<u8>, bool) {
+        let p = std::mem::take(&mut self.pending);
+        let t = &self.tail;
+        for k in (t.len().min(64)..t.len()).rev() {
+            if p.starts_with(&t[t.len() - k..]) {
+                return (p[k..].to_vec(), true);
+            }
+        }
+        (p, false)
+    }
+}
+
+/// Reads one of a box's streams from Docker's logs into the node's buffer. Offsets count the bytes
+/// this node has read: what Docker rotated away before it was read is never seen, nor counted.
+///
+/// - **Lining a replay up** (an adopted box): until the stream's last recorded bytes (`tail`) are
+///   found in what Docker replays, nothing is passed on; what follows them continues at the recorded
+///   offset. If they aren't found within 3 s (`Aligner::give_up`), the replay continues at the
+///   recorded offset, and a gap that can't be lined up is put in the node's audit (`box.output.gap`).
+///   Output that repeats itself exactly can line up on an earlier copy of the tail.
+/// - **The cap**: Docker keeps at most `cap` bytes on the host, so the oldest are rotated away
+///   (`box.output` records at exit how many at least), or with `stop` the box is stopped once it has
+///   written more, saying why on its stderr.
+#[allow(clippy::too_many_arguments)]
+async fn read_output<R: tokio::io::AsyncRead + Unpin>(
+    n: Arc<Node>,
+    run: String,
+    name: String,
+    i: usize,
+    mut r: R,
+    tail: Vec<u8>,
+    cap: u64,
+    stop: bool,
+) {
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut aligner = (!tail.is_empty()).then(|| Aligner { tail, pending: Vec::new() });
+    let t0 = std::time::Instant::now();
+    let mut last_save = std::time::Instant::now();
+    let mut stopped = false;
+    loop {
+        // While lining up, a quiet box's replay mustn't be held back: reads time out at 3 s.
+        let read = match aligner {
+            Some(_) => tokio::time::timeout(std::time::Duration::from_secs(3).saturating_sub(t0.elapsed()), r.read(&mut buf)).await.ok(),
+            None => Some(r.read(&mut buf).await),
+        };
+        let timed_out = read.is_none();
+        let (k, eof) = match read {
+            Some(Ok(0)) | Some(Err(_)) => (0, true),
+            Some(Ok(k)) => (k, false),
+            None => (0, false),
+        };
+        let data = match aligner.as_mut() {
+            None => buf[..k].to_vec(),
+            Some(a) => match a.feed(&buf[..k]) {
+                Some(d) => {
+                    aligner = None;
+                    d
+                }
+                None if eof || timed_out || a.pending.len() > (8 << 20) => {
+                    let (d, lined) = a.give_up();
+                    aligner = None;
+                    if !lined {
+                        let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
+                        eprintln!("[node] {run}: its output's replay couldn't be lined up: resuming at offset {at}");
+                        let _ = n.audit.lock().expect("audit").audit(
+                            &wicket_core::TenantId::single(),
+                            Some(&wicket_core::RunId(run.clone())),
+                            "box.output.gap",
+                            &serde_json::json!({ "stream": if i == 0 { "stdout" } else { "stderr" }, "offset": at }),
+                        );
+                    }
+                    d
+                }
+                None => continue,
+            },
+        };
+        if data.is_empty() {
+            if eof {
+                break;
+            }
+            continue;
+        }
+        let (frame, over) = {
+            let mut boxes = n.boxes.lock().expect("boxes");
+            let Some(b) = boxes.get_mut(&run) else { break };
+            let at = b.out[i].write(&data);
+            b.record.out_end[i] = b.out[i].end();
+            if last_save.elapsed() > std::time::Duration::from_secs(2) {
+                save_output(b);
+                last_save = std::time::Instant::now();
+            }
+            let over = stop && !stopped && b.record.out_end[0] + b.record.out_end[1] > cap;
+            (Frame::Data { stream: b.streams[i + 1], offset: at, bytes: data }, over)
+        };
+        n.send_run(&run, frame);
+        if over {
+            stopped = true;
+            let why =
+                format!("[wicket] the box's output passed its zone's limits.output ({cap} bytes): stopping it (on_output_full: stop)\n");
+            eprintln!("[node] {run}: {}", why.trim());
+            let frame = {
+                let mut boxes = n.boxes.lock().expect("boxes");
+                boxes.get_mut(&run).map(|b| {
+                    let at = b.out[1].write(why.as_bytes());
+                    Frame::Data { stream: b.streams[2], offset: at, bytes: why.as_bytes().to_vec() }
+                })
+            };
+            if let Some(f) = frame {
+                n.send_run(&run, f);
+            }
+            let _ = n.docker.kill(&name).await;
+        }
+        if eof {
+            break;
+        }
+    }
+    // The tail as of the end of this read, for a `serve` that comes after.
+    if let Some(b) = n.boxes.lock().expect("boxes").get_mut(&run) {
+        save_output(b);
+    }
+}
+
+/// Saves how far into each of a box's streams this node has read, with the bytes that end there.
+fn save_output(b: &mut BoxState) {
+    use base64::Engine;
+    for i in 0..2 {
+        let end = b.out[i].end();
+        let (_, s) = b.out[i].since(end.saturating_sub(TAIL as u64));
+        b.record.out_end[i] = end;
+        b.record.out_tail[i] = base64::engine::general_purpose::STANDARD.encode(&s[s.len().saturating_sub(TAIL)..]);
+    }
+    b.record.out_saved_ms = wicket_feed::now_ms();
+    let _ = b.record.save(&b.dir);
+}
+
+/// A box exited: its exit and result are kept for the control host, and its container removed.
+async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
+    let dir = n.boxes.lock().expect("boxes").get(run).map(|b| b.dir.clone());
+    let result = dir.as_ref().and_then(|d| crate::hibernate::read_outbox(d, 64 * 1024)).and_then(|b| String::from_utf8(b).ok());
+    let output = n.boxes.lock().expect("boxes").get_mut(run).map(|b| {
+        b.exited = Some((code, result.clone()));
+        if let Some(f) = b.stdin.take() {
+            f.close();
+        }
+        (b.record.out_end, b.record.start.output_cap, b.record.start.tenant.clone())
+    });
+    // What the box wrote, against what its node keeps of it (#151): counted from what this node read,
+    // so what Docker rotated away unread isn't in it, and the drop is a lower bound.
+    if let Some(([o, e], cap, tenant)) = output {
+        let dropped = (o + e).saturating_sub(cap);
+        let _ = n.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId(tenant),
+            Some(&wicket_core::RunId(run.to_string())),
+            "box.output",
+            &serde_json::json!({ "stdout_read": o, "stderr_read": e, "cap": cap, "dropped_from_host_at_least": dropped }),
+        );
+        n.ship_audit();
+    }
+    let _ = n.docker.remove(box_name).await;
+    if let Some(d) = &dir {
+        let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
+    }
+    eprintln!("[node] {run}: box exited ({code})");
+    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result }));
+}
+
+/// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
+/// on the control host. Started for a new box, and again for one a restarted `serve` adopts.
+async fn serve_box(
+    node: &Arc<Node>,
+    bs: &BoxStart,
+    dir: &std::path::Path,
+    zone: wicket_core::ZoneSpec,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let compiled = Arc::new(wicket_core::CompiledZone::new(zone)?);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
     let ctx = wicket_proxy::RunCtx {
@@ -1131,6 +1816,22 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
     let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
+    // The model proxy (#151): the run's checks here (allowed routes and models, server tools, the
+    // budget), then on to the run's own proxy on the control host, which adds the credential, checks
+    // again and is the one that counts the call. Its events stay here (the control host's are shown).
+    let llm = {
+        let (quiet, _) = mpsc::unbounded_channel::<wicket_proxy::Event>();
+        let mut c = ctx.clone();
+        c.events = quiet;
+        let (n, run) = (node.clone(), bs.run.clone());
+        let relay: wicket_proxy::llm::LlmRelay = Arc::new(move || {
+            let (n, run) = (n.clone(), run.clone());
+            Box::pin(async move { n.open_tunnel(&run, "llm").await })
+        });
+        let l = wicket_proxy::llm::Llm::relayed(c, relay)?;
+        l.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
+        l
+    };
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
     // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
     // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
@@ -1155,17 +1856,31 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             }
         }
     }));
-    for target in ["llm", "gateway"] {
-        let _ = std::fs::remove_file(sock.join(format!("{target}.sock")));
-        let l = UnixListener::bind(sock.join(format!("{target}.sock")))?;
+    tasks.push(tokio::spawn({
+        let ls = sock.join("llm.sock");
+        async move {
+            if let Err(e) = llm.serve(&ls).await {
+                eprintln!("[node] model proxy ended: {e:#}");
+            }
+        }
+    }));
+    // The MCP gateway (#151): served here, each call relayed to the run's gateway on the control
+    // host, which decides every tool (they read or write the ledger). While it can't be reached, the
+    // node answers MCP's own handshake itself and refuses tool calls clearly.
+    {
+        let gs = sock.join("gateway.sock");
+        let _ = std::fs::remove_file(&gs);
+        let l = UnixListener::bind(&gs)?;
         let (n, run) = (node.clone(), bs.run.clone());
         tasks.push(tokio::spawn(async move {
-            while let Ok((mut c, _)) = l.accept().await {
+            while let Ok((c, _)) = l.accept().await {
                 let (n, run) = (n.clone(), run.clone());
                 tokio::spawn(async move {
-                    if let Ok(mut t) = n.open_tunnel(&run, target).await {
-                        let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
-                    }
+                    let svc = hyper::service::service_fn(move |req| {
+                        let (n, run) = (n.clone(), run.clone());
+                        async move { Ok::<_, hyper::Error>(gateway_call(&n, &run, req).await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(c), svc).await;
                 });
             }
         }));
@@ -1187,140 +1902,7 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let spec = SandboxSpec {
-        // The name the control host gives it (its box prefix), else wicket's own.
-        name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
-        image: bs.image.clone(),
-        isolation: bs.isolation,
-        mounts: vec![
-            Mount { host: sock, target: wicket_agent::SOCK_DIR.into(), read_only: false },
-            Mount { host: dir.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
-            Mount { host: dir.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
-            // wicket's own hosts file, which links add names to (`BoxCtl` "hosts").
-            Mount { host: dir.join("hosts"), target: "/etc/hosts".into(), read_only: true },
-        ]
-        .into_iter()
-        // The workspace: the run's, or (on the control host's own node) a directory of the control
-        // host's own, mounted in place, as the binds say.
-        .chain((!bs.binds.iter().any(|(_, t, _)| t == wicket_agent::WORKSPACE)).then(|| Mount {
-            host: dir.join("workspace"),
-            target: wicket_agent::WORKSPACE.into(),
-            read_only: false,
-        }))
-        .chain(bs.binds.iter().map(|(h, t, ro)| Mount { host: PathBuf::from(h), target: t.clone(), read_only: *ro }))
-        .chain(volume_mounts)
-        // A long-lived agent's /tmp is a directory here, kept with the rest of its state.
-        .chain(bs.long_lived.then(|| Mount { host: dir.join("tmp"), target: "/tmp".into(), read_only: false }))
-        .collect(),
-        env: bs.env.clone(),
-        argv: bs.argv.clone(),
-        memory: bs.memory.clone(),
-        cpus: bs.cpus,
-        pids: bs.pids,
-        user: ids(),
-        workdir: bs
-            .workdir
-            .clone()
-            .filter(|w| w.starts_with('/') && node.paths.shares_host())
-            .unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
-        interactive: bs.interactive,
-        // Its owner: on the control host's own node, the run's process (what the reconciler there
-        // judges); elsewhere this `serve` (what the next `serve` judges, `reap_previous`).
-        labels: vec![
-            ("wicket.run".into(), bs.run.clone()),
-            (
-                "wicket.owner".into(),
-                bs.owner
-                    .clone()
-                    .filter(|o| node.paths.shares_host() && o.len() <= 200 && !o.contains(['\n', '=']))
-                    .unwrap_or_else(crate::reap::owner_label),
-            ),
-        ],
-    };
-    let name = spec.name.clone();
-    let mut child = node.docker.spawn(&spec)?;
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    if let Some(mut si) = child.stdin.take() {
-        tasks.push(tokio::spawn(async move {
-            while let Some(b) = stdin_rx.recv().await {
-                if si.write_all(&b).await.is_err() {
-                    break;
-                }
-            }
-        }));
-    }
-    node.boxes.lock().expect("boxes").insert(
-        bs.run.clone(),
-        BoxState {
-            streams: bs.streams,
-            name: name.clone(),
-            dir: dir.clone(),
-            stdin: bs.interactive.then_some(stdin_tx),
-            stdin_next: 0,
-            out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
-            exited: None,
-            tasks,
-            user: spec.user.clone(),
-            cpus: bs.cpus,
-            memory_mib: bs.memory.parse::<u64>().map(|b| b >> 20).unwrap_or(0),
-            listeners: HashMap::new(),
-            owner: Some(gen),
-        },
-    );
-    let readers: Vec<_> = [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-    ]
-    .into_iter()
-    .enumerate()
-    .filter_map(|(i, r)| r.map(|r| (i, r)))
-    .map(|(i, mut r)| {
-        let (n, run) = (node.clone(), bs.run.clone());
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 32 * 1024];
-            while let Ok(k) = r.read(&mut buf).await {
-                if k == 0 {
-                    break;
-                }
-                let frame = {
-                    let mut boxes = n.boxes.lock().expect("boxes");
-                    let Some(b) = boxes.get_mut(&run) else { break };
-                    let at = b.out[i].write(&buf[..k]);
-                    Frame::Data { stream: b.streams[i + 1], offset: at, bytes: buf[..k].to_vec() }
-                };
-                n.send_run(&run, frame);
-            }
-        })
-    })
-    .collect();
-    // The node enforces the run's timeout itself, connected or not.
-    let (n, run, timeout, box_name) = (node.clone(), bs.run.clone(), bs.timeout_secs, name.clone());
-    tokio::spawn(async move {
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout.max(1)));
-        tokio::pin!(deadline);
-        let status = tokio::select! {
-            s = child.wait() => s.ok(),
-            _ = &mut deadline => {
-                eprintln!("[node] {run}: past its timeout; stopping the box");
-                let _ = n.docker.unpause(&box_name).await;
-                let _ = n.docker.kill(&box_name).await;
-                child.wait().await.ok()
-            }
-        };
-        for r in readers {
-            let _ = r.await;
-        }
-        let code = status.and_then(|s| s.code()).unwrap_or(-1);
-        let result = crate::hibernate::read_outbox(&dir, 64 * 1024).and_then(|b| String::from_utf8(b).ok());
-        if let Some(b) = n.boxes.lock().expect("boxes").get_mut(&run) {
-            b.exited = Some((code, result.clone()));
-            b.stdin = None;
-        }
-        eprintln!("[node] {run}: box exited ({code})");
-        n.send_run(&run.clone(), Frame::Msg(Msg::Exited { run, code, result }));
-    });
-    eprintln!("[node] {}: box {name} started", bs.run);
-    Ok(())
+    Ok(tasks)
 }
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
@@ -1424,6 +2006,86 @@ mod tests {
         })
     }
 
+    /// The stdin a box's feed holds, once it holds `n` bytes.
+    async fn fed(f: &StdinFeed, n: usize) -> Vec<u8> {
+        for _ in 0..200 {
+            let b = f.buf.lock().unwrap().0.since(0).1;
+            if b.len() >= n {
+                return b;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the feed never got {n} bytes");
+    }
+
+    /// #151: an adopted box's replay is lined up on the last bytes read before, wherever it starts.
+    #[test]
+    fn a_replay_lines_up_on_the_last_bytes_read() {
+        let tail: Vec<u8> = (0..100).map(|k| b"abcdefghij"[k % 10] ^ (k as u8)).collect();
+        // The whole tail in the replay, after older bytes: only what follows it, in pieces.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        let mut replay = b"older output\n".to_vec();
+        replay.extend_from_slice(&tail);
+        assert_eq!(a.feed(&replay[..50]), None);
+        assert_eq!(a.feed(&[&replay[50..], b"fresh"].concat()), Some(b"fresh".to_vec()));
+        // The replay starts inside the tail (Docker's entries since the save start mid-way).
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.feed(&[&tail[30..], b"fresh"].concat()), None);
+        assert_eq!(a.give_up(), (b"fresh".to_vec(), true));
+        // Nothing of the tail (the replay starts after it): all of it, not lined up.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.feed(b"after"), None);
+        assert_eq!(a.give_up(), (b"after".to_vec(), false));
+        // A quiet stream: nothing replayed, nothing passed on.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.give_up(), (vec![], false));
+        // Output that repeats itself: lined up on the first copy of the tail.
+        let mut a = Aligner { tail: b"yy\n".to_vec(), pending: vec![] };
+        assert_eq!(a.feed(b"yy\nyy\nz"), Some(b"yy\nz".to_vec()));
+    }
+
+    fn fake_record(run: &str) -> BoxRecord {
+        BoxRecord {
+            start: BoxStart {
+                run: run.into(),
+                tenant: "t0".into(),
+                zone: "z".into(),
+                image: "img".into(),
+                isolation: wicket_core::Isolation::Gvisor,
+                env: vec![],
+                argv: vec![],
+                memory: "1".into(),
+                cpus: 1.0,
+                pids: 1,
+                interactive: true,
+                timeout_secs: 60,
+                escalate: true,
+                ca_pem: String::new(),
+                workspace_tar: String::new(),
+                state_files: vec![],
+                volumes: vec![],
+                streams: [1, 2, 3],
+                binds: vec![],
+                workdir: None,
+                owner: None,
+                long_lived: false,
+                durable: vec![],
+                name: None,
+                llm_prior: (0, 0, 0),
+                output_cap: 64 << 20,
+                output_stop: false,
+            },
+            name: format!("wicket-{run}"),
+            started_ms: 0,
+            stdin_received: 0,
+            stdin_closed: false,
+            lease_until: 0,
+            out_end: [0, 0],
+            out_tail: [String::new(), String::new()],
+            out_saved_ms: 0,
+        }
+    }
+
     async fn next_msg(s: &mut UnixStream) -> Frame {
         tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(s)).await.unwrap().unwrap().unwrap()
     }
@@ -1504,14 +2166,14 @@ mod tests {
         let inst = Install::new("nodesrv-reconnect");
         let dir = inst.dir.clone();
         let node = test_node(&inst);
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+        let feed = Arc::new(StdinFeed::new(0, false));
         node.boxes.lock().unwrap().insert(
             "run_a".into(),
             BoxState {
                 streams: [1, 2, 3],
                 name: "wicket-run-a".into(),
                 dir: dir.join("runs/run_a"),
-                stdin: Some(stdin_tx),
+                stdin: Some(feed.clone()),
                 stdin_next: 0,
                 out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                 exited: None,
@@ -1521,6 +2183,8 @@ mod tests {
                 memory_mib: 0,
                 listeners: HashMap::new(),
                 owner: Some(2),
+                lease_until: 0,
+                record: fake_record("run_a"),
             },
         );
         // Another build is refused.
@@ -1537,8 +2201,7 @@ mod tests {
         for (off, b) in [(0, &b"ab"[..]), (1, &b"bc"[..])] {
             c.write_all(&Frame::Data { stream: 1, offset: off, bytes: b.to_vec() }.encode()).await.unwrap();
         }
-        assert_eq!(stdin_rx.recv().await.unwrap(), b"ab");
-        assert_eq!(stdin_rx.recv().await.unwrap(), b"c");
+        assert_eq!(fed(&feed, 3).await, b"abc");
 
         // The channel drops; the box keeps writing.
         drop(c);
@@ -1681,15 +2344,15 @@ mod tests {
         let node = test_node(&inst);
         let mut stdins = HashMap::new();
         for (run, gen) in [("run_a", 1), ("run_b", 2)] {
-            let (tx, rx) = mpsc::unbounded_channel();
-            stdins.insert(run, rx);
+            let f = Arc::new(StdinFeed::new(0, false));
+            stdins.insert(run, f.clone());
             node.boxes.lock().unwrap().insert(
                 run.into(),
                 BoxState {
                     streams: [1, 2, 3],
                     name: format!("wicket-{run}"),
                     dir: inst.dir.join("runs").join(run),
-                    stdin: Some(tx),
+                    stdin: Some(f),
                     stdin_next: 0,
                     out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                     exited: None,
@@ -1699,6 +2362,8 @@ mod tests {
                     memory_mib: 0,
                     listeners: HashMap::new(),
                     owner: Some(gen),
+                    lease_until: 0,
+                    record: fake_record(run),
                 },
             );
         }
@@ -1719,8 +2384,8 @@ mod tests {
         assert_eq!(next_msg(&mut b).await, Frame::Data { stream: 2, offset: 0, bytes: b"for b\n".to_vec() });
         // The same stream ids on two connections: each reaches its own box only.
         a.write_all(&Frame::Data { stream: 1, offset: 0, bytes: b"x".to_vec() }.encode()).await.unwrap();
-        assert_eq!(stdins.get_mut("run_a").unwrap().recv().await.unwrap(), b"x");
-        assert!(stdins.get_mut("run_b").unwrap().try_recv().is_err());
+        assert_eq!(fed(&stdins["run_a"], 1).await, b"x");
+        assert!(stdins["run_b"].buf.lock().unwrap().0.since(0).1.is_empty());
         // run_b reconnects: its old connection ends, run_a's stays.
         let _b2 = connect_run(&node, 3, &inst, "run_b").await;
         assert!(tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(&mut b)).await.unwrap().unwrap().is_none());

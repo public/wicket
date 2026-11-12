@@ -91,13 +91,35 @@ wicket node revoke n1
   `wicket-node`, that runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the
   unit runs without a login. `serve` refuses a control host running any other build (sha256 of the binary): run
   `install` again after upgrading.
-- **The node owns the box.** It runs `docker run` itself and relays the box's stdin, stdout and stderr over one
-  multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which joins the ssh
-  session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700). When the channel
-  drops the box keeps running; the node keeps up to 4 MiB of output per stream (oldest dropped first, and the
-  control host reports the gap), replays it when the control host reconnects (backoff 0.5 s to 5 s), and
-  enforces the run's timeout itself. Unsent stdin is resent. Live egress events from the disconnected period
-  aren't shown on the console, but are in the node's audit log.
+- **The node owns the box.** It starts the box detached (`docker run -d`) and relays its stdin, stdout and
+  stderr over one multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which
+  joins the ssh session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700).
+  When the channel drops the box keeps running; the node keeps up to 4 MiB of output per stream (oldest dropped
+  first, and the control host reports the gap), replays it when the control host reconnects (backoff 0.5 s to
+  5 s), and enforces the run's timeout itself. Unsent stdin is resent. Live egress events from the disconnected
+  period aren't shown on the console, but are in the node's audit log.
+- **Boxes outlive `serve` too** (#151). Nothing of a box depends on the `serve` process: its output is read
+  from `docker logs` (from its start), and an interactive box's stdin comes over `sock/stdin.sock`, read in
+  the box by `wicket-fwd --stdin-from`, which reconnects when the node comes back and closes the agent's
+  stdin only when the control host closes it. The node keeps a record of each box (`node-box.json` in its
+  run directory), and a restarted `serve` **adopts** every running box it has a record for: its proxies
+  start again, its output is replayed from a little before the last offset it recorded (lined up on the
+  last bytes it read; the control host drops what it already has), its
+  timeout is still counted from when it started. A box whose run has no authority in the feed any more is
+  stopped. Exited boxes are kept until their exit is read, then removed.
+- **Run leases** (#151). The control host leases each run it supervises to its node with every freshness
+  statement, for the feed's window (TTL plus the narrow window, 150 s by default); the node shows the lease
+  in what it reports. A lapsed lease keeps the box running on the feed it holds, as before leases
+  (`ci/node-e2e.sh` relies on that); `WICKET_NODE_LEASE_EXPIRY=stop` on the node stops it instead. How long
+  a node runs alone, and whether it stops its boxes then, are open decisions (research doc 24, §6.4).
+- **The model proxy and the MCP gateway run on the node** (#151), per box. The model proxy checks each call
+  as on the control host (routes, models, server tools, the budget, starting from what the run already
+  spent) and relays it over the channel to the run's own model proxy on the control host, which adds the
+  credential (it never reaches the node), **checks it again**, counts it and shows it: a node can't skip the
+  checks that matter. The gateway relays each call whole to the run's gateway, which decides every tool (they
+  read or write the ledger); while the control host can't be reached the node answers MCP's own handshake
+  (`initialize`, `ping`) and refuses each tool call with a clear, retryable error. Model calls and tools
+  that need the control host stop while it is away (phase 2, #152, moves credentials).
 - **Decisions on the node.** Each box's egress proxy decides from the node's verified replica of the feed
   (`wicket-feed`; the zone, and grants bound to the box), with the same proxy code as the control host (only
   the decision source differs, `wicket_proxy::decide`):
@@ -141,8 +163,8 @@ wicket node revoke n1
   connection into the target box are execs on that box's node; its hosts file is rewritten there. A box on
   another node than the relaying run's is reached over a connection of the relay's own (scope
   `links:<run>`), so the bytes pass through the control host. Reach, approval and audit are those of any link.
-- **For now.** Plain `http://` to a forwarded host is refused, and the MCP gateway still
-  decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
+- **For now.** Plain `http://` to a forwarded host is refused, and every gateway tool is still decided on the
+  control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
 ## Provisioning nodes (`wicket place`)
@@ -205,15 +227,25 @@ One pass (`wicket reconcile`, #38) compares the provider's instances, enrolled n
 and on every node with the ledger's runs and leases, and makes them agree. `wicket approve` of a capacity ask runs
 a pass at once; everything else (lease ends, approvals on the console) waits for the next `--every` pass.
 
-- **Runs** whose `wicket run` process is gone end as `lost` (a run supervised on another machine is left to it).
+- **Runs** whose supervisor is gone (#151) are asked about on their node. If it still has the box, the run
+  is **adopted**: `wicket attach <run>` takes it over (logged in `<run dir>/ctl/attach.log`), the box
+  untouched. If the node says the box is gone, the run ends as `lost`; if the node can't be reached, the run is
+  left for the next pass. A run supervised on another machine is left to it.
+- **A restart of the control host** is a pass away from normal: kill every wicket process on it, start
+  again, and one `wicket reconcile` restarts this host's own node (whose `serve` adopts its boxes) and takes
+  every run over, on every node. What a supervisor needs for that is in the run's `ctl/` directory: the run's
+  record (`run.json`), its run CA's key, its model spend and output offsets as it goes (`progress.json`); its
+  identity is re-issued and its box's token re-minted with the grants already on the node.
+  `ci/acceptance.sh` checks it, on this host's node and (`--nodes local`) another.
 - **Leases** end when their run has ended or their end has passed; denied or withdrawn asks give their
   reservation back.
 - **Machines.** Only instances tagged `wicket-owner-<installation>` are ever listed. One no live lease needs is
   destroyed; one that matches a lease the ledger lost track of (a crash between create and record) is adopted,
   not created again. Ownership is checked again right before every destroy, so a tag changed or a
   `wicket-protected` tag added since the list saves the machine.
-- **Boxes** (`wicket=1` containers) whose run ended or whose owner process died are stopped; a box whose run this
-  ledger doesn't know is left alone, since Docker may be shared. This subsumes `wicket reap`.
+- **Boxes** (`wicket=1` containers) whose run ended are stopped; a running run's box is left to its run (above);
+  a box whose run this ledger doesn't know is left alone, since Docker may be shared. This subsumes
+  `wicket reap`, which now leaves a running run whose supervisor is gone to `wicket reconcile`.
 - Every change is an audit record `reconcile.<what>`. One pass at a time per installation (a file lock).
 - So killing every control-plane process mid-run and restarting leaves no orphaned machine or box after one
-  pass. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).
+  pass, and every run whose box still runs is supervised again. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).

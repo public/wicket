@@ -29,8 +29,12 @@
 #   - `link` wires two of the agent's boxes, and one fetches a page from the other across it;
 #   - revoking the agent's identity stops its whole subtree (children and a grandchild);
 #   - an agent hibernates and is woken: its files and its session survive;
-#   - an orphaned box (its `wicket run` killed hard) is stopped by `wicket reconcile`, and after
-#     that a dry run has nothing to change;
+#   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
+#     it is revoked a dry run has nothing to change;
+#   - a control-host restart (#151): every wicket process of the control host killed hard, the boxes
+#     on this host's own node and (--nodes local) on the other node survive, reconcile adopts their
+#     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
+#     killed and restarted, and the same boxes take one more turn each;
 #   - `wicket audit --verify`, and audit export to a JSON-lines sink checked with `--against` (a
 #     tampered copy of the export is refused).
 #
@@ -305,6 +309,8 @@ check "  and the model saw the earlier conversation, then the operator's text" '
 check "  and the generation went up by one" '[ "$(agent_field generation)" = $((gen1 + 1)) ]'
 
 # ---- 3. reconcile: an orphaned box ----
+# Its supervisor killed hard, the box runs on (on this host's own node); reconcile takes its run over
+# instead of ending it (#151), and the run ends when it is revoked.
 log "reconcile: a box whose wicket run was killed hard"
 HOME=$HOMEW "$W" run "$(manifest orphan)" --image "$IMAGE_TAG" >"$work/orphan.log" 2>&1 &
 orphan_pid=$!
@@ -321,23 +327,143 @@ if [ "$mode" = dev ]; then kill -9 "$sup" 2>/dev/null || true; else sudo -n kill
 kill -9 "$orphan_pid" 2>/dev/null || true
 wait "$orphan_pid" 2>/dev/null || true
 sleep 2
-check "the orphan's box outlives its killed wicket run" '[ -n "$orphan" ] && [ -n "$(box_of "$orphan")" ]'
+orphan_box=$(box_of "$orphan")
+check "the orphan's box outlives its killed wicket run" '[ -n "$orphan" ] && [ -n "$orphan_box" ]'
 wroot reconcile --dry-run >"$work/rec-dry1.log" 2>&1 || true
-check "reconcile --dry-run reports it, and changes nothing" 'grep -q "$orphan" "$work/rec-dry1.log" && [ -n "$(box_of "$orphan")" ]'
+check "reconcile --dry-run reports taking it over, and changes nothing" 'grep -q "^run_adopted .*$orphan" "$work/rec-dry1.log" && [ "$(box_of "$orphan")" = "$orphan_box" ]'
 wroot reconcile >"$work/rec.log" 2>&1 || cat "$work/rec.log"
 cat "$work/rec.log"
-check "reconcile stopped the orphaned box" '[ -z "$(box_of "$orphan")" ]'
-check "  and ended its run as lost" 'w audit --tail 200 | grep -E "reconcile\.|run\.lost|lost" | grep -q "$orphan"'
+check "reconcile adopted its run: the same box runs on, supervised again (#151)" 'grep -q "^run_adopted .*$orphan" "$work/rec.log" && [ "$(box_of "$orphan")" = "$orphan_box" ]'
+wait_for 30 'w audit --tail 50 | grep -q "run.attach *$orphan"' || true
+wroot identity revoke "$orphan" --reason "acceptance: end the adopted orphan" >/dev/null 2>&1 || true
+# Its new supervisor stops the box, then records the run's end.
+wait_for 60 '[ -z "$(box_of "$orphan")" ] && w audit --tail 200 | grep -E "run\.end" | grep -q "$orphan"' || true
+check "  and revoking it stops its box and ends its run" '[ -z "$(box_of "$orphan")" ] && w audit --tail 200 | grep -E "run\.end" | grep -q "$orphan"'
 wroot reconcile --dry-run >"$work/rec-dry2.log" 2>&1 || true
 check "then a dry run has nothing to change" 'grep -q "^reconcile: 0 change(s)" "$work/rec-dry2.log"'
 check "no box of ours is left" '[ -z "$(our_boxes)" ]'
+
+# ---- 3b. a box flooding its output (#151) ----
+# A box's output is kept on its node's host only up to its zone's limits.output (Docker's log, rotated),
+# and the box's audit records what the host dropped. A burst faster than the node reads loses what Docker
+# rotates away unread (keep_newest); output at a pace the node keeps up with arrives whole across
+# rotations, each line once. With on_output_full: stop, the box is stopped instead.
+log "a box flooding its output"
+HOME=$HOMEW "$W" run "$(manifest flood)" --image "$IMAGE_TAG" >"$work/flood.log" 2>&1 &
+flood_pid=$!
+pids+=("$flood_pid")
+wait_for 120 'grep -q acc-flood-done "$work/flood.log" 2>/dev/null' || true
+flood=$(run_id_of "$work/flood.log")
+our_runs+=("$flood")
+flood_box=$(box_of "$flood" | head -1)
+flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
+flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
+echo "   20 MB burst, then 3 MB paced; ${flood_kept:-?} bytes kept in the host's log"
+check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+seq_ok() { grep -oE 'acc-seq-[0-9]{8}' "$work/flood.log" | awk '{ if (substr($0, 9) + 0 != NR) bad = 1 } END { exit !(NR == 30000 && !bad) }'; }
+check "  and its paced output arrived whole across rotations, each line once, in order" seq_ok
+wait "$flood_pid" 2>/dev/null || true
+flood_drop() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE 'dropped_from_host_at_least[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | tail -1; }
+wait_for 30 '[ -n "$(flood_drop)" ]' || true
+echo "   box.output: dropped_from_host_at_least $(flood_drop)"
+check "  and its audit records the bytes dropped from the host (at least)" '[ "$(flood_drop)" -ge 1000000 ]'
+HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood-stop.log" 2>&1 || true
+flood_stop=$(run_id_of "$work/flood-stop.log")
+our_runs+=("$flood_stop")
+check "with on_output_full: stop, the box is stopped, saying why, and its run ends" 'grep -q "on_output_full: stop" "$work/flood-stop.log" && [ -z "$(box_of "$flood_stop")" ] && w audit --tail 300 | grep -E "run\.end" | grep -q "$flood_stop"'
 
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
   multihost
 fi
 
-# ---- 5. audit ----
+# ---- 5. a control-host restart (#151) ----
+# Every wicket process this test started on the control host is killed hard (the runs' supervisors,
+# this host's own node's `serve`), except the mock model (it stands in for the model's upstream) and
+# the `serve` of the node acc-n1 (another machine's, in --nodes local). Then one reconcile pass: the
+# boxes must still run, the same containers, their runs taken over, and each agent's next turn must
+# reach its model and its gateway (MCP's ping and whoami).
+# A restart-check run's result: in its run directory here, or on the other node for a box there.
+restart_result() {
+  data "runs/$1/workspace/out/result.json" 2>/dev/null \
+    || cat "${nodehome:-/nonexistent}/.local/share/wicket-node/runs/$1/workspace/out/result.json" 2>/dev/null || true
+}
+restart_start() {   # $1: label, then wicket run options
+  local label=$1; shift
+  local ws; ws=$(workdir restart)
+  HOME=$HOMEW "$W" run "$(manifest restart)" --workdir "$ws" --image "$IMAGE_TAG" "$@" >"$work/restart-$label.log" 2>&1 &
+  pids+=("$!")
+  wait_for 90 '[ -n "$(run_id_of "$work/restart-$label.log")" ]' || true
+  local r; r=$(run_id_of "$work/restart-$label.log")
+  our_runs+=("$r")
+  wait_for 120 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 1 ]' || true
+  echo "$r"
+}
+restart_flow() {
+  log "a control-host restart: boxes survive, reconcile adopts their runs"
+  local runs=() labels=() boxes=() r l b
+  r=$(restart_start local); runs+=("$r"); labels+=(local)
+  if [ "$nodes" = local ]; then r=$(restart_start node --node "$NODE"); runs+=("$r"); labels+=("$NODE"); fi
+  for r in "${runs[@]}"; do boxes+=("$(box_of "$r")"); done
+  echo "   runs: ${runs[*]}; boxes: ${boxes[*]}"
+  local killed=0 p
+  for p in $(pgrep -f "$W" 2>/dev/null); do
+    tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"dev mock-llm"* | *"${nodehome:-/nonexistent}"*) continue ;; esac
+    kill -9 "$p" 2>/dev/null && killed=$((killed + 1))
+  done
+  echo "   killed $killed wicket processes"
+  sleep 3
+  for i in "${!runs[@]}"; do
+    check "  the box on ${labels[$i]} survived the restart" '[ -n "${boxes[$i]}" ] && [ "$(box_of "${runs[$i]}")" = "${boxes[$i]}" ]'
+  done
+  wroot reconcile >"$work/rec-restart.log" 2>&1 || true
+  cat "$work/rec-restart.log"
+  for i in "${!runs[@]}"; do
+    r=${runs[$i]} l=${labels[$i]}
+    check "  reconcile adopted the run on $l" 'grep -q "^run_adopted .*$r" "$work/rec-restart.log"'
+    wait_for 60 'grep -q "run.attach\|reconnected" "$WICKET_HOME/runs/'"$r"'/ctl/attach.log" 2>/dev/null' || true
+    w say "$r" "Again, after the restart." >/dev/null 2>&1 || true
+    wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
+    local res; res=$(restart_result "$r")
+    echo "   $l: $res"
+    check "  its next turn reached the model, on the same box ($l)" '[ "$(jq -r .turn <<<"$res")" = 2 ] && [ "$(box_of "$r")" = "${boxes[$i]}" ]'
+    check "  and its gateway: MCP ping and whoami ($l)" '[ "$(jq -r .ping <<<"$res")" = "{}" ] && [ "$(jq -r .whoami_run <<<"$res")" = "$r" ]'
+  done
+  # Then a node's `serve` alone dies (#151): this host's own is started again by its runs'
+  # supervisors; acc-n1's by this script, as its service manager would. Its boxes are adopted, and
+  # one `wicket say` is one turn (stdin neither lost nor doubled).
+  log "a node's serve restarts alone: its boxes are adopted"
+  for p in $(pgrep -f "$W" 2>/dev/null); do
+    tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"node serve"*) kill -9 "$p" 2>/dev/null ;; esac
+  done
+  if [ "$nodes" = local ] && [ -n "${node_serve_pid:-}" ]; then
+    kill -9 "$node_serve_pid" 2>/dev/null || true
+    sleep 1
+    HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >>"$work/node-serve.log" 2>&1 &
+    node_serve_pid=$!
+    pids+=("$node_serve_pid")
+  fi
+  sleep 3
+  for i in "${!runs[@]}"; do
+    r=${runs[$i]} l=${labels[$i]}
+    w say "$r" "Once more, after the node restarted." >/dev/null 2>&1 || true
+    wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 3 ]' || true
+    sleep 5
+    res=$(restart_result "$r")
+    echo "   $l: $res"
+    check "  after its node's serve restarted, the same box took one more turn, once ($l)" '[ "$(jq -r .turn <<<"$res")" = 3 ] && [ "$(box_of "$r")" = "${boxes[$i]}" ]'
+    check "  with its gateway ($l)" '[ "$(jq -r .ping <<<"$res")" = "{}" ] && [ "$(jq -r .whoami_run <<<"$res")" = "$r" ]'
+    wroot identity revoke "$r" --reason "acceptance: restart check done" >/dev/null 2>&1 || true
+  done
+  for r in "${runs[@]}"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done
+  wroot reconcile --dry-run >"$work/rec-restart2.log" 2>&1 || true
+  check "  then a dry run has nothing to change" 'grep -q "^reconcile: 0 change(s)" "$work/rec-restart2.log"'
+}
+if [ "$mode" = dev ]; then restart_flow; else skip "a control-host restart" "dev mode only (installed: wicketd's processes)"; fi
+
+# ---- 6. audit ----
 log "audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
 if [ -n "${sink:-}" ]; then

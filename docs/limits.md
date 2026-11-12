@@ -119,12 +119,30 @@ not a permanent decision.
   not its signatures ([#84](https://github.com/public/wicket/pull/84)).
 - **A node's clock is read once.** Feed freshness uses the wall clock at start plus a monotonic clock.
   After a deliberate clock step, restart `wicket-node`.
+- **Runs survive a control-host restart, within limits** (#151). A run's new supervisor resumes from
+  what the last one saved: its model counts from its last 3-second save (a long-lived agent's lifetime
+  spend from its agent row), a parent's spawn slots are rebuilt from the children it started but its
+  list of children to stop when it ends isn't (each child is adopted as its own run), and the grants re-minted into its box's token get the use
+  counts the ledger had at handover. A wrapped session can't be taken over (its launcher was the dead
+  process): it ends as `lost` and its box is stopped. A node that can't be reached leaves its runs
+  running until it can, it is revoked, or they pass their timeout. By default a node keeps running a
+  box whose run lease lapses (`WICKET_NODE_LEASE_EXPIRY=stop` stops it).
+- **A box's output on its node's host is capped, and a burst can outrun it** (#151). The node's host
+  keeps at most the zone's `limits.output` of a box's output (Docker's log, rotated). The node reads it
+  from Docker as it comes, but a box writing faster than that (megabytes a second) loses what Docker
+  rotates away before it is read, as it does while its node's `serve` is down: that output never reaches
+  the control host, and isn't counted. `box.output` in the node's audit has the bytes read and a lower
+  bound on what the host dropped; offsets count bytes read. Output that repeats itself exactly can be
+  lined up on the wrong copy when an adopted box's replay is resumed (`box.output.gap` notes one that
+  can't be lined up at all). The control host's run transcript isn't capped.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's
   own node), plain `http://` to a host the
-  node forwards, and MCP decisions on the node (the gateway decides on
-  the control host). Egress events from a disconnected period reach the audit log, not the live console
+  node forwards, and tool decisions on the node: the gateway and the model proxy run on the node (#151)
+  but relay every call to the control host, which decides the tools, holds the model credential and
+  re-checks and counts each model call (its count is the authoritative one); while it is away only MCP's
+  own handshake answers, and model calls stop (#152 moves credentials). Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
   [#103](https://github.com/public/wicket/pull/103)). A link to a box on a remote node passes through the
   control host, and each connection into the target box costs a `docker exec` there.

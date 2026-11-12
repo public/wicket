@@ -350,8 +350,9 @@ impl Calls {
 /// relay's). Authenticated like a run's; it carries no feed and owns no box.
 pub struct Link {
     pub calls: Arc<Calls>,
-    /// What the node reported when this connection was made.
+    /// What the node reported when this connection was made: its capacity, and the runs it has.
     pub capacity: Option<crate::chan::NodeCapacity>,
+    pub runs: Vec<crate::chan::RunState>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -380,9 +381,9 @@ impl Link {
         let authed = crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello)
             .await
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
-        let capacity = match authed.welcome {
-            Msg::Welcome { capacity, .. } => capacity,
-            _ => None,
+        let (capacity, runs) = match authed.welcome {
+            Msg::Welcome { capacity, runs, .. } => (capacity, runs),
+            _ => (None, vec![]),
         };
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -404,6 +405,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, capacity, task })
+        Ok(Link { calls, capacity, runs, task })
     }
 }

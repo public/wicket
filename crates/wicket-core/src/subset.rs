@@ -72,6 +72,13 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     if !(cc.is_finite() && cc >= crate::manifest::MIN_CPUS && cc <= pc) {
         v.push(format!("cpus {cc}: more than this zone's {pc} (or below {})", crate::manifest::MIN_CPUS));
     }
+    match (parse_bytes(&c.limits.output), parse_bytes(&p.limits.output)) {
+        (Some(c), Some(p)) if c >= 1 && c <= p => {}
+        _ => v.push(format!("output {}: more than this zone's {} (or zero, or unreadable)", c.limits.output, p.limits.output)),
+    }
+    if c.limits.on_output_full != p.limits.on_output_full && p.limits.on_output_full == crate::manifest::OnOutputFull::Stop {
+        v.push("on_output_full: this zone stops a box whose output is full; a child can't keep going".into());
+    }
     if !(c.limits.pids >= 1 && c.limits.pids <= p.limits.pids) {
         v.push(format!("pids {}: more than this zone's {} (or zero)", c.limits.pids, p.limits.pids));
     }

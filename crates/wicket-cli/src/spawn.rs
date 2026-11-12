@@ -30,6 +30,27 @@ pub struct SpawnCtx {
     pub deadline: Instant,
 }
 
+/// The slots a run's children already hold (#125), from the children it has started (their spawn
+/// records in `<run dir>/children/`): one each plus their own `max_children`, as `spawn` charged them,
+/// at most `max`. A re-attached run (#151) starts from this, so a restart doesn't reset its bound.
+/// Like a run that never restarted, a child that has ended still counts.
+pub fn reserved_slots(dir: &std::path::Path, max: u32) -> u32 {
+    let Ok(rd) = std::fs::read_dir(dir.join("children")) else { return 0 };
+    let used = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
+        .map(|e| {
+            let kids = std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|y| Manifest::from_yaml(&y).ok())
+                .and_then(|m| m.agent.map(|a| a.max_children))
+                .unwrap_or(0);
+            kids.saturating_add(1)
+        })
+        .fold(0u32, u32::saturating_add);
+    used.min(max)
+}
+
 pub fn spawner(c: SpawnCtx) -> wicket_proxy::Spawner {
     Arc::new(move |req| spawn(&c, req))
 }
@@ -396,7 +417,14 @@ fn launch(c: &SpawnCtx, yaml: &str, image: &str, placed: Option<&Placed>) -> Res
     }
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     cmd.arg(&yaml_path).stdin(std::process::Stdio::null()).stdout(log2).stderr(log);
-    let mut proc = cmd.spawn().map_err(|e| format!("starting the box: {e}"))?;
+    let mut proc = match cmd.spawn() {
+        Ok(p) => p,
+        Err(e) => {
+            // Never started: no spawn record, so a re-attach doesn't count it (`reserved_slots`).
+            let _ = std::fs::remove_file(&yaml_path);
+            return Err(format!("starting the box: {e}"));
+        }
+    };
     // The child records its identity before its box starts; wait for it so the parent can message it.
     for _ in 0..100 {
         if matches!(proc.try_wait(), Ok(Some(_))) {
@@ -607,6 +635,42 @@ mod tests {
         assert_eq!(*p.ctx.slots.lock().unwrap(), 0);
         Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
         assert!(spawn(&p.ctx, program("a")).unwrap().starts_with("started"));
+    }
+
+    /// #151: a re-attached parent's slots are rebuilt from the children it started, so a parent at
+    /// its limit is still refused after a restart.
+    #[test]
+    fn a_reattached_parent_keeps_its_spawn_bound() {
+        let p = parent(3, ZONE);
+        let agent =
+            SpawnRequest { kind: "agent".into(), task: Some("work".into()), command: vec![], zone: None, max_children: 1, ..program("a") };
+        assert!(spawn(&p.ctx, agent).unwrap().starts_with("started"));
+        assert!(spawn(&p.ctx, program("b")).unwrap().starts_with("started"));
+        assert!(spawn(&p.ctx, program("c")).unwrap_err().contains("at most 3"));
+        // The control host restarts: a new supervisor, a new context for the same run directory.
+        let reserved = reserved_slots(&p.dir, 3);
+        assert_eq!(reserved, 3);
+        let ctx = SpawnCtx {
+            parent: p.ctx.parent.clone(),
+            slots: Arc::new(Mutex::new(reserved)),
+            exe: Some("/bin/true".into()),
+            run: p.ctx.run.clone(),
+            dir: p.dir.clone(),
+            image: "img:a".into(),
+            node: None,
+            ssh_key: None,
+            ledger: p.ctx.ledger.clone(),
+            children: Default::default(),
+            llm: Default::default(),
+            deadline: Instant::now() + std::time::Duration::from_secs(3600),
+        };
+        let e = spawn(&ctx, program("c")).unwrap_err();
+        assert!(e.contains("at most 3 boxes (theirs included), and has used 3"), "{e}");
+        // A launch that never started leaves no record behind.
+        let mut q = parent(1, ZONE);
+        Arc::get_mut(&mut q.ctx).unwrap().exe = Some("/nonexistent/wicket".into());
+        assert!(spawn(&q.ctx, program("a")).is_err());
+        assert_eq!(reserved_slots(&q.dir, 1), 0);
     }
 
     /// #127: a spawned zone's name carries the parent run, so no other run can make it.

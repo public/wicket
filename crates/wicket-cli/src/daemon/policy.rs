@@ -91,7 +91,7 @@ pub fn route(cmd: &Cmd) -> Route {
             IdentityCmd::Init { .. } => Forward(Privileged),
         },
         // Both stop things, and a reconcile pass can create machines a lease needs.
-        Cmd::Reap { .. } | Cmd::Reconcile { .. } => Forward(Privileged),
+        Cmd::Reap { .. } | Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
         Cmd::Lease { cmd } => match cmd {
             LeaseCmd::List => Forward(Read),
             LeaseCmd::Release { .. } => Forward(Revoke),

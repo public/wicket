@@ -58,6 +58,13 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   addresses excluded), the feed's token and grants, splice-through and the node's audit shipping; the
   separate run-local box layout and decision path are gone
   ([#146](https://github.com/public/wicket/issues/146)).
+- Runs survive a restart of the control host: boxes outlive their node's `serve` (detached, stdin over
+  a socket, output from `docker logs`) and a restarted `serve` adopts them; `wicket reconcile` takes over a
+  run whose supervisor is gone instead of ending it; the model proxy and the MCP gateway run on the box's
+  node, relaying to the control host, which keeps the credential and re-checks each call. A box's output
+  kept on its node's host is capped by the zone's new `limits.output` (default `64m`, the newest kept,
+  or `on_output_full: stop`), and a re-attached parent keeps its spawn bound
+  ([#151](https://github.com/public/wicket/issues/151)).
 - Remote nodes splice too, while their feed replica is fresh: only for top-level boxes, and only
   for hosts the box's token itself allows for every method. When the replica narrows or closes, the
   node cuts its spliced connections within 2 s and inspects new ones

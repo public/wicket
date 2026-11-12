@@ -40,6 +40,20 @@ impl RunCa {
         self.cert.pem()
     }
 
+    /// The CA's private key (PEM), for a supervisor that re-attaches to the run (#151): kept beside
+    /// the run's other control-host files, never where the box can read it.
+    pub fn key_pem(&self) -> String {
+        self.key.serialize_pem()
+    }
+
+    /// The run CA again from its certificate and key: leaves it signs verify against the certificate
+    /// the box already trusts.
+    pub fn load(cert_pem: &str, key_pem: &str) -> Result<RunCa> {
+        let key = KeyPair::from_pem(key_pem).context("run CA key")?;
+        let cert = CertificateParams::from_ca_cert_pem(cert_pem).context("run CA certificate")?.self_signed(&key)?;
+        Ok(RunCa { cert, key, leaves: Mutex::new(HashMap::new()) })
+    }
+
     /// A TLS server config presenting a leaf certificate for `host`, signed by this CA (cached).
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
         if let Some(c) = self.leaves.lock().expect("lock").get(host) {
