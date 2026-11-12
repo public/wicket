@@ -47,7 +47,7 @@ that, `Loaded::decide(&Request)` returns `Allow`, `NeedsGrant` or `Forbidden` fo
   over a cap fails where it is made rather than at every node. Grants aren't checked there: a node's
   `load` refuses a grant from a key that no block trusts.
 - **The step budget is 25,000 steps**, with no wall clock. The largest legitimate requests measured
-  took 308 steps compiled and 5,597 in the generic engine. A token at every cap is cut off at the
+  took 308 steps compiled and 6,605 in the generic engine. A token at every cap is cut off at the
   budget, in about 0.1 ms.
 - **Grant blocks travel in-process only.** `SignedGrant` has no `from_bytes`: Biscuit has no parser
   for a lone third-party block. The feed doesn't need one. The control host signs grants and appends

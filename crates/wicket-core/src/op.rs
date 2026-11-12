@@ -1,6 +1,6 @@
 //! `Op`: the normalised form of every boundary crossing, its risk class, and the pure decision.
 
-use crate::manifest::{compile_glob, host_matches, ManifestError, ZoneSpec};
+use crate::manifest::{compile_glob, fold_case_glob, host_matches, ManifestError, ZoneSpec};
 use crate::{RunId, TenantId};
 use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
@@ -175,7 +175,18 @@ impl CompiledZone {
     /// forbid rule can't silently allow.
     pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
         let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
-        let forbid = spec.forbid.iter().map(|f| globs(&f.paths)).collect::<Result<_, _>>()?;
+        // Forbid globs ignore ASCII case (see `ForbidRule::paths`). A glob that doesn't compile is
+        // reported as written.
+        let forbid = spec
+            .forbid
+            .iter()
+            .map(|f| {
+                f.paths
+                    .iter()
+                    .map(|p| compile_glob(p).and_then(|_| compile_glob(&fold_case_glob(p))))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<_, _>>()?;
         let reach = spec.reach.iter().map(|r| globs(&r.paths)).collect::<Result<_, _>>()?;
         Ok(Self { spec, forbid, reach })
     }
@@ -498,6 +509,9 @@ zone:
                 .flat_map(|g| paths_for(g))
                 .collect();
             paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack"].map(String::from));
+            // Case-flipped spellings (#115: forbids ignore case, reach doesn't).
+            let flipped: Vec<String> = paths.iter().map(|p| p.to_ascii_uppercase()).collect();
+            paths.extend(flipped);
             for h in &hosts {
                 for p in &paths {
                     for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"] {
@@ -516,6 +530,37 @@ zone:
         }
         println!("{checked} decisions: {} allowed, {} forbidden, {} need a grant", kinds[0], kinds[1], kinds[2]);
         assert!(checked > 10_000 && kinds.iter().all(|&k| k > 500), "too few decisions of some kind: {kinds:?} of {checked}");
+    }
+
+    /// #115: a forbid narrower than reach can't be dodged by spelling the path in another case.
+    #[test]
+    fn forbids_ignore_case() {
+        let z = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: api.github.com, methods: [GET, PUT], paths: [\"/repos/**\"] }]\n  forbid: [{ host: api.github.com, paths: [\"/repos/acme/prod/**\", \"/repos/[a-c]x/Secret\"] }]\n").unwrap().zone;
+        let cz = CompiledZone::new(z.clone()).unwrap();
+        for p in ["/repos/acme/prod/x", "/repos/ACME/prod/x", "/repos/acme/PROD/contents/a", "/repos/Acme/Prod/x", "/repos/BX/secret", "/repos/ax/SECRET"] {
+            assert!(matches!(cz.evaluate(&op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
+            assert!(matches!(evaluate_uncompiled(&z, &op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
+        }
+        for p in ["/repos/acme/production/x", "/repos/dx/secret", "/repos/ACME/app/x"] {
+            assert!(matches!(cz.evaluate(&op("PUT", "api.github.com", p)), Verdict::AllowByReach(0)), "{p}");
+        }
+        // Reach stays case-sensitive.
+        assert!(matches!(cz.evaluate(&op("GET", "api.github.com", "/REPOS/x")), Verdict::NeedsGrant(_)));
+    }
+
+    #[test]
+    fn folded_globs_match_ignoring_case() {
+        use crate::manifest::fold_case_glob;
+        assert_eq!(fold_case_glob("/a1/*"), "/[aA]1/*");
+        assert_eq!(fold_case_glob("/[a-c]/[!x]/\\q/\\*"), "/[a-cA-C]/[!xX]/[qQ]/\\*");
+        for (g, yes, no) in [
+            ("/repos/{acme,octo}/**", "/REPOS/Octo/x", "/repos/other/x"),
+            ("/x/[]a]", "/X/A", "/x/b"),
+            ("/caf\u{e9}/**", "/CAF\u{e9}/y", "/CAF\u{c9}/y"),
+        ] {
+            let m = compile_glob(&fold_case_glob(g)).unwrap();
+            assert!(m.is_match(yes) && !m.is_match(no), "{g}");
+        }
     }
 
     #[test]

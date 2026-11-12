@@ -29,7 +29,9 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
 A **zone** is the boundary a box runs in. It is declared in the manifest:
 
 - **reach:** the hosts, methods and paths requests may go to without asking;
-- **forbid:** hosts or paths refused outright, with no request and no grant;
+- **forbid:** hosts or paths refused outright, with no request and no grant (forbid paths match ignoring
+  ASCII case, since many upstreams fold it; request paths with another spelling of a path, such as
+  `%64` for `d`, a `;` parameter or a dot segment, are refused before any decision);
 - **`unlisted_hosts`:** what happens to a host the zone doesn't name (`escalate`, or `hide` to make it
   look like it doesn't exist);
 - **inject:** credentials added to requests for a host, from the vault;
