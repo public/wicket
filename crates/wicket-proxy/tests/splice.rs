@@ -73,6 +73,8 @@ async fn origins(ca: &RunCa, names: &[&str]) -> HashMap<String, SocketAddr> {
 
 struct World {
     sock: PathBuf,
+    ledger: Arc<Mutex<wicket_store::Ledger>>,
+    agent: String,
     events: Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>,
     dir: PathBuf,
 }
@@ -83,11 +85,30 @@ impl World {
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test"]).await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // This run is generation 1 of a long-lived agent, so a later wake supersedes it (#70).
+        let mut ledger = wicket_store::Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "splicezone",
+                name: "a",
+                run: "run_splice",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        let ledger = Arc::new(Mutex::new(ledger));
         let ctx = RunCtx {
             tenant: TenantId::single(),
             run: RunId("run_splice".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
-            ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
+            ledger: ledger.clone(),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,
             escalate: true,
@@ -97,7 +118,7 @@ impl World {
             swaps: vec![],
             boxes: None,
             capacity: None,
-            fence: None,
+            fence: Some(wicket_proxy::Fence { agent: agent.clone(), generation: 1 }),
             waker: None,
         };
         let mut up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
@@ -113,7 +134,7 @@ impl World {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        World { sock, events: Mutex::new(rx), dir }
+        World { sock, ledger, agent, events: Mutex::new(rx), dir }
     }
 
     fn events(&self) -> Vec<(String, String, String)> {
@@ -288,4 +309,41 @@ async fn a_spliced_host_resolving_to_a_private_address_is_not_dialled() {
     assert!(status.contains("non-public"), "{status}");
     let ev = w.events();
     assert!(ev.iter().any(|e| e.0 == "private.test" && e.1 == "forbidden" && e.2.contains("non-public")), "{ev:?}");
+}
+
+/// A spliced connection is cut once its activation is superseded (#70): a newer wake of the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spliced_connection_is_cut_when_its_activation_is_superseded() {
+    let w = World::new().await;
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("open.test").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
+    // Kept alive: one request works, then the agent is woken again elsewhere.
+    tls.write_all(b"GET /a HTTP/1.1\r\nHost: open.test\r\n\r\n").await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tls.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("origin /a"));
+    assert_eq!(w.ledger.lock().unwrap().claim_wake(&w.agent, "run_new", 0).unwrap(), Some(2));
+    // Within a fence check or two, the connection is closed under the client.
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the spliced connection outlived its activation");
+    settle().await;
+    let ev = w.events();
+    assert!(ev.iter().any(|e| e.1 == "spliced" && e.2.contains("cut:") && e.2.contains("generation 2")), "{ev:?}");
 }
