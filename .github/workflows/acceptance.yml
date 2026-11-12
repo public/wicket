@@ -3,8 +3,8 @@ name: Acceptance
 # The release acceptance test (#41, ci/acceptance.sh): its local flows run on every PR in the smoke
 # job (ci.yml). The longer variants run here, nightly and on demand: development mode with localhost
 # as a node (the static placement backend, the node e2e flow), then as an operator against a fresh
-# install in a container (ci/install-acceptance.sh). The Vultr flow (--nodes vultr) spends money and
-# is never run here.
+# install in a container (ci/install-acceptance.sh), then the self-update test (ci/update.sh). The
+# Vultr flow (--nodes vultr) spends money and is never run here.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -58,3 +58,5 @@ jobs:
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh --nodes local
       - name: Acceptance, as an operator against a fresh install
         run: IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/install-acceptance.sh target/debug/wicket ubuntu:24.04
+      - name: Self update (A to B and back, two local nodes, live agents)
+        run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:acc ci/update.sh

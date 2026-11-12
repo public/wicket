@@ -9,7 +9,8 @@
 //! **Test hook.** `WICKET_NODE_SSH` replaces `ssh <options> <target>` for every command sent to a node
 //! with the command it names (split on spaces; it gets the remote command as one argument, as ssh
 //! does), e.g. `env HOME=/tmp/node sh -c` to treat a directory on this machine as the node. Everything
-//! but the ssh hop itself is then exercised (`ci/node-e2e.sh --local`).
+//! but the ssh hop itself is then exercised (`ci/node-e2e.sh --local`). A `%t` in it is replaced by
+//! the node's ssh target, so one hook can stand in for several nodes (`ci/update.sh`).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -66,7 +67,7 @@ impl Node {
         let hook = std::env::var("WICKET_NODE_SSH")
             .ok()
             .filter(|h| !h.trim().is_empty())
-            .map(|h| h.split_whitespace().map(String::from).collect());
+            .map(|h| h.split_whitespace().map(|w| w.replace("%t", target)).collect());
         Node { target: target.to_string(), name: name.map(String::from), base, hook }
     }
 

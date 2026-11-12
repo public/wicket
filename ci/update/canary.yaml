@@ -1,0 +1,12 @@
+# ci/update.sh: the canary a new build runs during `wicket self update` (--canary): a box on this
+# host's own node that must reach example.com through the new build's egress.
+task: Check egress and stop.
+program:
+  name: canary
+  command: [sh, -c, 'c=$(curl -s -m 20 -o /dev/null -w "%{http_code}" https://example.com/ || true); echo "canary: $c"; [ "$c" = 200 ]']
+zone:
+  name: upd-canary
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  limits: { memory: 256m, cpus: 1, timeout: 3m }

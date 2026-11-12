@@ -46,6 +46,57 @@ pub enum StoreError {
     Writer(String),
     #[error("not requested: {0}")]
     Refused(String),
+    #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
+    TooNew { version: u32, floor: u32 },
+}
+
+/// The ledger's schema version (#162). Every migration bumps it, and records what kind it is:
+/// - **expand** (a new table, a new column with a default, a new index): older binaries ignore it,
+///   so a rollback across it is safe. [`SCHEMA_FLOOR`] stays.
+/// - **contract** (dropping or rewriting anything an older binary reads): [`SCHEMA_FLOOR`] is raised
+///   to this version, and binaries below it refuse to open the ledger ([`StoreError::TooNew`]), so
+///   `wicket self rollback` refuses to go back across it. A contract step ships only in a release
+///   after the one whose expand step made it unnecessary to read the old shape.
+///
+/// Version 1 is every migration up to #162 (all of them expand steps: `CREATE ... IF NOT EXISTS`
+/// and `ADD COLUMN`).
+pub const SCHEMA_VERSION: u32 = 1;
+/// The oldest schema whose binaries may open a ledger this build has opened.
+pub const SCHEMA_FLOOR: u32 = 1;
+
+/// A ledger's recorded schema: the newest version that has opened it, and its floor (both 0 for a
+/// ledger from before #162).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Schema {
+    pub version: u32,
+    pub floor: u32,
+}
+
+const SCHEMA_META: &str = "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);";
+
+fn read_schema(conn: &Connection) -> Result<Schema> {
+    let get = |k: &str| -> Result<u32> {
+        Ok(conn.query_row("SELECT value FROM schema_meta WHERE key = ?1", [k], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) as u32)
+    };
+    Ok(Schema { version: get("version")?, floor: get("floor")? })
+}
+
+/// Checks this build may open the database, then records its version and floor (never lowering
+/// either). Runs before any migration.
+fn check_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_META)?;
+    let s = read_schema(conn)?;
+    if SCHEMA_VERSION < s.floor {
+        return Err(StoreError::TooNew { version: s.version, floor: s.floor });
+    }
+    if s.version < SCHEMA_VERSION || s.floor < SCHEMA_FLOOR {
+        conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('version', ?1), ('floor', ?2)
+             ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+            params![SCHEMA_VERSION, SCHEMA_FLOOR],
+        )?;
+    }
+    Ok(())
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -262,6 +313,8 @@ impl Ledger {
             let _ = std::fs::create_dir_all(dir);
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
@@ -286,8 +339,30 @@ impl Ledger {
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
+    /// A ledger's recorded schema, read without migrating it (`wicket self rollback` checks it
+    /// against the target build's).
+    pub fn schema_of(path: &Path) -> Result<Schema> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let exists: bool = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'", [], |r| r.get::<_, i64>(0))?
+            > 0;
+        if !exists {
+            return Ok(Schema { version: 0, floor: 0 });
+        }
+        read_schema(&conn)
+    }
+
+    /// A consistent copy of the ledger at `to` (SQLite's `VACUUM INTO`), taken while it is in use:
+    /// what `wicket self update` keeps before a new build migrates anything.
+    pub fn snapshot(&self, to: &Path) -> Result<()> {
+        self.conn.execute("VACUUM INTO ?1", [to.to_string_lossy()])?;
+        Ok(())
+    }
+
     pub fn open_in_memory() -> Result<Ledger> {
         let conn = Connection::open_in_memory()?;
+        check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
@@ -736,6 +811,28 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(Some(gid))
+    }
+
+    /// An operator's approval of an agent's `request_update` for the artifact with this sha256
+    /// (#162): a live grant made for such a request. It is used up here (revoked, whatever uses it
+    /// had left), so one approval accepts one update. Returns (request id, grant id).
+    pub fn use_update_approval(&mut self, sha256: &str) -> Result<Option<(String, String)>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found: Option<(String, String)> = tx
+            .query_row(
+                "SELECT r.id, g.id FROM grants g JOIN requests r ON r.id = g.request_id
+                 WHERE r.method = 'UPDATE' AND r.host = 'wicket.internal' AND r.path = ?1 AND g.path = ?1 AND g.prefix = 0
+                   AND g.revoked = 0 AND g.expires_at > ?2 AND (g.uses_left IS NULL OR g.uses_left > 0)
+                 ORDER BY g.created_at ASC LIMIT 1",
+                params![format!("/self/{sha256}"), now()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((_, gid)) = &found {
+            tx.execute("UPDATE grants SET revoked = 1 WHERE id = ?1", params![gid])?;
+        }
+        tx.commit()?;
+        Ok(found)
     }
 
     pub fn denied_recently(&self, op: &Op) -> Result<Option<String>> {
@@ -1583,6 +1680,49 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn an_approved_update_request_accepts_its_hash_once() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let sha = "ab".repeat(32);
+        let mut op = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "UPDATE", "wicket.internal", &format!("/self/{sha}"));
+        op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
+        let (rid, _) = l.pending_for(&op, "an agent's build", None).unwrap();
+        assert_eq!(l.use_update_approval(&sha).unwrap(), None, "asked, not approved");
+        let a = Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "op".into() };
+        let gid = l.approve(&rid, &a).unwrap();
+        assert_eq!(l.use_update_approval(&"cd".repeat(32)).unwrap(), None, "another hash");
+        assert_eq!(l.use_update_approval(&sha).unwrap(), Some((rid, gid)));
+        assert_eq!(l.use_update_approval(&sha).unwrap(), None, "used up, even with uses left");
+    }
+
+    #[test]
+    fn a_ledger_records_its_schema_and_refuses_a_build_below_its_floor() {
+        let dir = std::env::temp_dir().join(format!("wicket-store-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        // A ledger from before #162: no schema recorded.
+        Connection::open(&path).unwrap().execute_batch(SCHEMA).unwrap();
+        assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: 0, floor: 0 });
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(Ledger::schema_of(&path).unwrap(), Schema { version: SCHEMA_VERSION, floor: SCHEMA_FLOOR });
+        // A snapshot is a whole ledger, with the same schema and records.
+        l.audit(&TenantId::single(), None, "x", &serde_json::json!({})).unwrap();
+        l.snapshot(&dir.join("snap.db")).unwrap();
+        drop(l);
+        assert_eq!(Ledger::open(&dir.join("snap.db")).unwrap().verify_audit().unwrap(), 1);
+        // A newer build's expand step: this build still opens it, and never lowers the version.
+        let c = Connection::open(&path).unwrap();
+        c.execute("UPDATE schema_meta SET value = ?1 WHERE key = 'version'", [SCHEMA_VERSION + 1]).unwrap();
+        Ledger::open(&path).unwrap();
+        assert_eq!(Ledger::schema_of(&path).unwrap().version, SCHEMA_VERSION + 1);
+        // Its contract step: this build is below the floor, and refuses.
+        c.execute("UPDATE schema_meta SET value = ?1 WHERE key = 'floor'", [SCHEMA_VERSION + 1]).unwrap();
+        assert!(matches!(Ledger::open(&path), Err(StoreError::TooNew { .. })));
+        drop(c);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

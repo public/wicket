@@ -11,7 +11,7 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd};
+use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd, SelfCmd};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -105,11 +105,26 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         // Spends money after a terminal prompt.
         Cmd::Place { .. } => Forward(Privileged),
+        Cmd::Itself { cmd } => match cmd {
+            SelfCmd::Status => Forward(Read),
+            // Changes the code that holds every key: root's alone, and never the daemon's own uid
+            // (`root_only`).
+            SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::TrustKey { .. } | SelfCmd::Health { .. } => Forward(Privileged),
+            // Touch no wicket data.
+            SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe => Local,
+        },
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
             DevCmd::NodeFeedProbe { .. } => Local,
         },
     }
+}
+
+/// Commands only root may run through the daemon: not even the daemon's own uid, which runs runs'
+/// supervisors, gateways and proxies (#162). Updating wicket, or changing which keys may sign an
+/// update, is a human's act on the host; an agent can only ask (`request_update`).
+pub fn root_only(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::TrustKey { .. } })
 }
 
 /// Arguments only wicket itself passes (a parent starting a child, the console starting a run): a
@@ -295,6 +310,13 @@ mod tests {
             (&["node", "serve"], Route::Local),
             (&["node", "attach"], Route::Local),
             (&["place", "plans"], Route::Forward(Privileged)),
+            (&["self", "status"], Route::Forward(Read)),
+            (&["self", "update", "/tmp/w.tar.gz"], Route::Forward(Privileged)),
+            (&["self", "update", "/tmp/w", "--nodes", "all"], Route::Forward(Privileged)),
+            (&["self", "rollback"], Route::Forward(Privileged)),
+            (&["self", "trust-key", "/tmp/k.pub"], Route::Forward(Privileged)),
+            (&["self", "keygen", "/tmp/k"], Route::Local),
+            (&["self", "sign", "--key", "/tmp/k", "/tmp/w"], Route::Local),
             (&["dev", "mock-llm", "--command", "true"], Route::Local),
         ];
         for (args, want) in cases {

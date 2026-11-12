@@ -252,7 +252,10 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     let has_passkeys = !l.operator_credentials(&tenant)?.is_empty();
     let _ = l.prune_console_sessions(wicket_store::now() - 30 * 86400);
     drop(l);
-    let exe = std::env::current_exe()?;
+    // `wicket self update` moves the console to the new build with SIGHUP (runs it started are
+    // their own processes, and stay).
+    crate::update::reexec_on_hangup(crate::update::pidfile("console"), crate::update::Versions::control().root, || {});
+    let exe = crate::update::self_exe()?;
     let mut state = State::new(
         RelyingParty { rp_id: plan.rp_id.clone(), origin: plan.origin.clone() },
         ledger_path(),

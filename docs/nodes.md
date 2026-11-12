@@ -16,8 +16,9 @@ Every box runs on a node through `wicket node serve` (#146). `wicket run` withou
 the control host's own built-in node, `local`, which is served by the same runtime and reached over its unix
 socket instead of ssh. The control host makes and enrols it the first time a run needs it
 (`<data dir>/local-node/`: its own node key, an identity certificate, and a node CA, each renewed by the
-control host itself), and starts its `serve` on demand: one per wicket build, detached, exiting after 10
-minutes with no boxes and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`). `wicket node list` shows it;
+control host itself), and starts its `serve` on demand: one, detached, exiting after 10 minutes with no boxes
+and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`); `wicket self update` has it re-execute itself as the new
+build, which adopts its boxes. `wicket node list` shows it;
 `enrol` refuses the name.
 
 **No code path distinguishes the control host's boxes but how their node is reached.** The local node
@@ -86,11 +87,12 @@ wicket node revoke n1
 
 ## `wicket node serve`: boxes that outlive the control channel
 
-- **Install.** `wicket node install <name>` copies the control host's own binary to `~/.local/bin/wicket` on the
-  node over the pinned ssh connection, checks its sha256 there, and installs a `systemd --user` unit,
-  `wicket-node`, that runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the
-  unit runs without a login. `serve` refuses a control host running any other build (sha256 of the binary): run
-  `install` again after upgrading.
+- **Install.** `wicket node install <name>` copies the control host's current binary to the node over the pinned
+  ssh connection as a version (`~/.local/share/wicket-node/versions/<build id>/wicket`, with `~/.local/bin/wicket`
+  a link to its `current`), checks its sha256 there, and installs a `systemd --user` unit, `wicket-node`, that
+  runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the unit runs without a
+  login. `serve` talks to a control host whose protocol version is at most one away from its own (#162), so the
+  control host and its nodes are updated one at a time: `wicket self update --nodes` ([operations.md](operations.md)).
 - **The node owns the box.** It starts the box detached (`docker run -d`) and relays its stdin, stdout and
   stderr over one multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which
   joins the ssh session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700).

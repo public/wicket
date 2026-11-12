@@ -555,7 +555,7 @@ async fn manage(
         }
         match r {
             Err(e) if !p.ever => {
-                // Never connected, or refused (another build): give up. The run sees the box end.
+                // Never connected, or refused (protocols too far apart): give up. The run sees the box end.
                 match ready.take() {
                     Some(t) => {
                         let _ = t.send(Err(e));
@@ -606,6 +606,7 @@ async fn session(
         node: sh.node.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
         build,
+        proto: crate::chan::PROTOCOL,
         observer: false,
         nonce,
         scope: sh.run.0.clone(),
@@ -625,7 +626,7 @@ async fn session(
         }
         Err(e @ HsError::Timeout(_)) => return Err(e.into()),
         Err(HsError::Refused(why)) => {
-            // Refused either way (identity, revocation, another build): not worth retrying.
+            // Refused either way (identity, revocation, protocol): not worth retrying.
             p.ever = false;
             bail!("{why}")
         }

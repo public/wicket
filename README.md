@@ -257,6 +257,19 @@ wicket audit --verify --against /var/log/wicket/audit.jsonl
 
 See [docs/audit-export.md](docs/audit-export.md).
 
+### Updates
+
+`wicket self update` moves the installation to another build, blue/green: the control host, then its
+nodes (a canary first), each watched by a health gate and switched back if it fails; boxes keep running
+throughout. Only artifacts signed by a release key the installation trusts are accepted, or a build an
+agent made in a box once a human approves its hash (`request_update`). See
+[docs/operations.md](docs/operations.md).
+
+```sh
+sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all
+sudo wicket self rollback --nodes all
+```
+
 ### Also
 
 - **Programs:** deterministic workloads with no model, pinned by source digest (`wicket program digest

@@ -386,7 +386,7 @@ fn launch(c: &SpawnCtx, yaml: &str, image: &str, placed: Option<&Placed>) -> Res
     let log = std::fs::File::create(cdir.join(format!("{}.log", child.0))).map_err(|e| e.to_string())?;
     let exe = match &c.exe {
         Some(e) => e.clone(),
-        None => std::env::current_exe().map_err(|e| e.to_string())?,
+        None => crate::update::self_exe().map_err(|e| e.to_string())?,
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["run", "--run-id", &child.0, "--parent-run", &c.run.0, "--image", image]);

@@ -1,8 +1,11 @@
 //! `wicket image`: the agent image's build context is the image directory plus the in-box
 //! forwarder's source, which the Dockerfile compiles in a builder stage.
 //!
-//! The forwarder's source is embedded in this binary, so `wicket image` builds the forwarder that
-//! matches the wicket that runs the box, from any working directory that has the image directory.
+//! The forwarder's source and the image directory are embedded in this binary, so `wicket image`
+//! builds the image that matches the wicket that runs the box, from anywhere (#162). Each build's
+//! image is tagged with its build id ([`tag_for`]): `wicket self update` builds the new version's
+//! before switching to it, new boxes of a staged version use it ([`effective`]), and a rollback finds
+//! the old one still there. Running boxes keep the image they started with.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -20,6 +23,33 @@ const FWD_SOURCES: &[(&str, &str)] = &[
     ("src/udp.rs", include_str!("../../wicket-fwd/src/udp.rs")),
     ("src/stdin.rs", include_str!("../../wicket-fwd/src/stdin.rs")),
 ];
+
+/// The image directory (`images/claude-code`), path relative to it and contents. A test checks the
+/// list is complete.
+const IMAGE_SOURCES: &[(&str, &str)] = &[
+    ("Dockerfile", include_str!("../../../images/claude-code/Dockerfile")),
+    ("wicket-entry", include_str!("../../../images/claude-code/wicket-entry")),
+];
+
+/// The agent image's repository, and the tag a box gets when nothing names another.
+pub const REPO: &str = "wicket/claude-code";
+pub const DEFAULT: &str = "wicket/claude-code:poc";
+
+/// A build's own image: `wicket/claude-code:<build id>`.
+pub fn tag_for(build_id: &str) -> String {
+    format!("{REPO}:{}", &build_id[..12.min(build_id.len())])
+}
+
+/// The image a new box gets for `image`: the default, from a staged version (`wicket self`), is
+/// that version's own image; anything else is what it says.
+pub fn effective(image: &str) -> String {
+    if image == DEFAULT && crate::update::is_staged() {
+        if let Ok(b) = crate::nodesrv::build_id() {
+            return tag_for(&b);
+        }
+    }
+    image.to_string()
+}
 
 /// A temporary build context, removed on drop.
 pub struct BuildContext {
@@ -49,6 +79,18 @@ pub fn context(image_dir: &Path) -> Result<BuildContext> {
         std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))?;
     }
     Ok(ctx)
+}
+
+/// The build context from this binary alone: the embedded image directory and forwarder.
+pub fn embedded_context() -> Result<BuildContext> {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let src = std::env::temp_dir().join(format!("wicket-image-src-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&src).with_context(|| format!("creating {}", src.display()))?;
+    let _clean = BuildContext { dir: src.clone() };
+    for (rel, text) in IMAGE_SOURCES {
+        std::fs::write(src.join(rel), text)?;
+    }
+    context(&src)
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -96,6 +138,20 @@ mod tests {
         assert!(!manifest.contains(".workspace"), "wicket-fwd must not inherit from the workspace");
         let deps = manifest.split("[dependencies]").nth(1).unwrap_or("");
         assert!(deps.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')), "wicket-fwd must have no dependencies");
+    }
+
+    #[test]
+    fn the_embedded_image_dir_is_the_whole_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/claude-code");
+        let mut on_disk = vec![];
+        files(&root, &root, &mut on_disk);
+        on_disk.sort();
+        let mut embedded: Vec<String> = IMAGE_SOURCES.iter().map(|(p, _)| p.to_string()).collect();
+        embedded.sort();
+        assert_eq!(embedded, on_disk, "add new images/claude-code files to IMAGE_SOURCES");
+        let ctx = embedded_context().unwrap();
+        assert!(ctx.dir.join("Dockerfile").is_file() && ctx.dir.join("wicket-fwd/src/main.rs").is_file());
+        assert_eq!(tag_for(&"ab".repeat(32)), "wicket/claude-code:abababababab");
     }
 
     #[test]
