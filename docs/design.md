@@ -1408,6 +1408,8 @@ Detail: [04 §7].
   2. **Canonicalize-or-reject:** dot segments (Codex `authorization_path.rs`), encoded slashes, duplicate
      query/JSON keys, method-override headers, `@` in the authority, Host ≠ SNI ≠ CONNECT target, unknown
      protocols after CONNECT, TRACE/TRACK, bodies on GET/HEAD. A truncated body gets the strict outcome.
+     One encoded slash is accepted: npm's scoped-package first segment `@scope%2fname` (npm's
+     characters only), decided as `/@scope/name` and forwarded as written (#143).
   3. Adapter match → `Op` → decision.
   4. Rebuild the request from the `Op` and inject the credential, or SigV4 re-sign.
   5. Upstream; redirects are not followed.
