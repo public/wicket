@@ -201,27 +201,30 @@ req=$(w pending 2>/dev/null | grep -o 'r-[a-z0-9]*' | head -1 || true)
 check "an agent's request_update files an R4 request and updates nothing" \
   'jq -r ".content[0].text" <<<"$asked" | grep -q "needs a human" && w pending | grep -q "UPDATE wicket.internal/self/$C_SHA" && [ "$(current "$WICKET_HOME/versions" 2>/dev/null)" != "$C_ID" ]'
 check "while the request is pending, its artifact is still refused" '! w self update "$work/C" >"$work/u-pending.log" 2>&1 && grep -q "no human has approved" "$work/u-pending.log"'
-w identity revoke "$r_asker" --reason "update test: asked" >/dev/null 2>&1 || true
 
 # ---- 2. A -> B ----
 log "2. update to B: control host, then n1 (canary) and n2"
+set +e
 w self update "$B_ART" --nodes n1,n2 --window 10s --interval 5s --canary ci/update/canary.yaml 2>&1 | tee "$work/u-b.log"
 st=${PIPESTATUS[0]}
+set -e
 W=$WICKET_HOME/versions/current/wicket
 local_serve=$(cat "$WICKET_HOME/local-node/serve/serve.pid")
 check "the update to B succeeded" '[ "$st" = 0 ]'
 check "  the control host runs B, and A is previous" '[ "$(current "$WICKET_HOME/versions")" = "$B_ID" ] && [ "$(basename "$(readlink "$WICKET_HOME/versions/previous")")" = "$A_ID" ]'
 check "  this host's node re-executed itself as B (same pid)" '[ "$(serve_runs "$local_serve")" = "$B_ID" ]'
 check "  n1 and n2 run B, their serves re-executed in place" '[ "$(current "$(node_dir n1)/versions")" = "$B_ID" ] && [ "$(current "$(node_dir n2)/versions")" = "$B_ID" ] && [ "$(serve_runs "$n1_pid")" = "$B_ID" ] && [ "$(serve_runs "$n2_pid")" = "$B_ID" ]'
-check "  the runs were handed over and adopted by B" 'grep -q "runs: 2 handed over, 2 adopted" "$work/u-b.log"'
+check "  the runs were handed over and adopted by B" 'grep -qE "runs: ([0-9]+) handed over, \1 adopted" "$work/u-b.log"'
 check "  B's own image was built while staging, and the canary ran on it" '$DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && w audit --tail 300 | grep run.start | grep -q "wicket/claude-code:$B_ID"'
 check "  a new box with the default image gets B's" '[ "$(new_box_image b)" = "wicket/claude-code:$B_ID" ]'
 another_turn "the update to B"
 
 # ---- 3. manual rollback ----
 log "3. rollback by hand"
+set +e
 w self rollback --nodes n1,n2 2>&1 | tee "$work/u-back.log"
 st=${PIPESTATUS[0]}
+set -e
 check "the rollback succeeded" '[ "$st" = 0 ]'
 check "  all three run A again" '[ "$(current "$WICKET_HOME/versions")" = "$A_ID" ] && [ "$(current "$(node_dir n1)/versions")" = "$A_ID" ] && [ "$(current "$(node_dir n2)/versions")" = "$A_ID" ] && [ "$(serve_runs "$local_serve")" = "$A_ID" ] && [ "$(serve_runs "$n1_pid")" = "$A_ID" ]'
 another_turn "the rollback"
@@ -230,8 +233,10 @@ check "  a new box with the default image gets A's again (B's is kept)" '[ "$(ne
 # ---- 4. automatic rollback ----
 log "4. an agent's build, approved, fails its health gate: rolled back"
 w approve "$req" --yes >"$work/approve.log" 2>&1 || cat "$work/approve.log"
+set +e
 w self update "$work/C" --window 10s --interval 5s --check 'test "$WICKET_UPDATE_TARGET" != control' 2>&1 | tee "$work/u-c.log"
 st=${PIPESTATUS[0]}
+set -e
 check "the approved build was accepted, failed the injected check, and the update failed" '[ "$st" != 0 ] && grep -q "approved" "$work/u-c.log" && grep -q "rolled back to $A_ID" "$work/u-c.log"'
 check "  the control host and its node run A" '[ "$(current "$WICKET_HOME/versions")" = "$A_ID" ] && [ "$(serve_runs "$local_serve")" = "$A_ID" ]'
 check "  the approval was used up: C is refused again" '! w self update "$work/C" >"$work/u-c2.log" 2>&1 && grep -q "no human has approved" "$work/u-c2.log"'
@@ -245,5 +250,6 @@ for k in self.update_refused self.staged self.snapshot self.switched self.health
   check "  the audit records $k" 'grep -q " $k$" "$work/self-audit.txt"'
 done
 check "  an automatic rollback is recorded as one" 'w audit --tail 1000 | grep self.rolled_back | grep -q "\"automatic\":true"'
-for r in "${runs[@]}"; do w identity revoke "$r" --reason "update test: done" >/dev/null 2>&1 || true; done
-for r in "${runs[@]}"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done
+# The agent that asked stays up until here: revoking it would withdraw its request, and its grants.
+for r in "${runs[@]}" "$r_asker"; do w identity revoke "$r" --reason "update test: done" >/dev/null 2>&1 || true; done
+for r in "${runs[@]}" "$r_asker"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done

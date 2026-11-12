@@ -185,7 +185,8 @@ With #154's state store configured, the snapshot belongs there too; until that l
    (`<data dir>/runs/<run>/workspace/out/`, or the node's run directory for a box on a node), checks its
    sha256 against the request, and approves it: `sudo wicket approve <request>`.
 5. The operator updates: `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`. The approval is used
-   up; a second update to the same artifact needs a second approval.
+   up; a second update to the same artifact needs a second approval. Like every grant made for an agent's
+   request, it lapses if the agent's identity is revoked first, so update before ending the agent.
 
 ## Not yet
 
