@@ -346,24 +346,28 @@ check "no box of ours is left" '[ -z "$(our_boxes)" ]'
 # ---- 3b. a box flooding its output (#151, #160) ----
 # A box's output is kept on its node's host only up to its zone's limits.output (Docker's log, rotated),
 # and the box's audit records what the host dropped. The control host's transcript is bounded the same
-# way (the newest kept, run.output in the audit), and so is what the run shows of a program's output. A burst faster than the node reads loses what Docker
-# rotates away unread (keep_newest); output at a pace the node keeps up with arrives whole across
-# rotations, each line once. With on_output_full: stop, the box is stopped instead.
+# way (the newest kept, run.output in the audit), and so is what the run shows of a program's output.
+# A burst faster than the node reads loses what Docker rotates away unread (keep_newest); output at a
+# pace the node keeps up with arrives whole across rotations, each line once. With on_output_full:
+# stop, the box is stopped instead.
 log "a box flooding its output"
 HOME=$HOMEW "$W" run "$(manifest flood)" --image "$IMAGE_TAG" >"$work/flood.log" 2>&1 &
 flood_pid=$!
 pids+=("$flood_pid")
-wait_for 120 'grep -q acc-flood-done "$work/flood.log" 2>/dev/null' || true
+wait_for 30 '[ -n "$(run_id_of "$work/flood.log")" ]' || true
 flood=$(run_id_of "$work/flood.log")
 our_runs+=("$flood")
+# The control host's transcript: the previous file, then the current one. (What the run shows of a
+# program's output stops at limits.output, so the end is looked for here.)
+flood_transcript() { data "runs/$flood/transcript.1.jsonl" 2>/dev/null; data "runs/$flood/transcript.jsonl" 2>/dev/null; }
+wait_for 120 'flood_transcript | grep -q acc-flood-done' || true
 flood_box=$(box_of "$flood" | head -1)
 flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
-flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
+flood_kept=
+[ -z "$flood_logpath" ] || flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
 echo "   20 MB burst, then 3 MB paced; ${flood_kept:-?} bytes kept in the host's log"
 check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
 wait "$flood_pid" 2>/dev/null || true
-# The control host's transcript: the previous file, then the current one.
-flood_transcript() { data "runs/$flood/transcript.1.jsonl" 2>/dev/null; data "runs/$flood/transcript.jsonl" 2>/dev/null; }
 # What it keeps of the paced lines (the newest, at least 5,000 of them): consecutive, each once, in
 # order, through the last.
 seq_ok() { flood_transcript | grep -oE 'acc-seq-[0-9]{8}' | awk 'NR == 1 { first = substr($0, 9) + 0 } { if (substr($0, 9) + 0 != first + NR - 1) bad = 1 } END { exit !(NR >= 5000 && first + NR - 1 == 30000 && !bad) }'; }

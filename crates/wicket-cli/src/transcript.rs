@@ -96,7 +96,9 @@ fn resumed(dir: &Path) -> State {
             // Rotated, not saved: the previous file is the one that was current, and the current one
             // was never started.
             s = State { cur: s.cur + m.len(), prev: s.cur, prev_ino: m.ino() };
-            let _ = std::fs::remove_file(dir.join(FILE));
+            // Saved, so lines written after this aren't taken for the rotation's again.
+            let _ = std::fs::create_dir_all(dir.join("ctl"));
+            let _ = crate::run::write_json(&dir.join(STATE), &s);
         }
     }
     s
@@ -204,6 +206,15 @@ mod tests {
         // The state now says the rotation before last; the rotated file is newer: still exact.
         assert!(after > at);
         assert_eq!(resume_offset(&d), after);
+        // A supervisor that took over from that, wrote and died before rotating: still exact.
+        let mut t = Transcript::open(&d, 1000, true).unwrap();
+        assert_eq!(t.offset(), after);
+        t.line("one more").unwrap();
+        let more = t.offset();
+        drop(t);
+        assert_eq!(more, after + 9);
+        assert_eq!(resume_offset(&d), more);
+        assert_eq!(Transcript::open(&d, 1000, true).unwrap().offset(), more);
         let _ = std::fs::remove_dir_all(&d);
     }
 
