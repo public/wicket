@@ -60,7 +60,9 @@ pub fn route(cmd: &Cmd) -> Route {
     use Class::*;
     use Route::*;
     match cmd {
-        Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Say { .. } => Forward(Run),
+        // Hibernating and waking steer an agent the way `say` does; waking reruns its stored manifest.
+        Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Say { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
+        Cmd::Agents { .. } => Forward(Read),
         Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } => Forward(Read),
         Cmd::Approve { .. } | Cmd::Deny { .. } => Forward(Privileged),
         Cmd::Unlink { .. } | Cmd::Grant { cmd: GrantCmd::Revoke { .. } } => Forward(Revoke),
@@ -68,7 +70,8 @@ pub fn route(cmd: &Cmd) -> Route {
             SecretCmd::List => Forward(Read),
             // Setting a secret changes what the proxies present upstream; linking one makes the
             // wicket user read a file the caller names.
-            SecretCmd::Set { .. } | SecretCmd::Link { .. } => Forward(Privileged),
+            // and binding one to hosts decides where it may go.
+            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } => Forward(Privileged),
         },
         // Reads a directory the caller names, as the wicket user.
         Cmd::Image { .. } => Forward(Privileged),
@@ -116,6 +119,8 @@ pub fn internal_args(cmd: &Cmd) -> Option<&'static str> {
         Cmd::Run { lease: Some(_), .. } => Some("--lease"),
         // ssh keys for nodes belong to the wicket user, not to the caller.
         Cmd::Run { ssh_key: Some(_), .. } => Some("--ssh-key"),
+        // What woke an agent is recorded as fact: a message's arrival, set by wicket.
+        Cmd::Wake { by: Some(_), .. } => Some("--by"),
         _ => None,
     }
 }
@@ -249,6 +254,9 @@ mod tests {
             (&["run", "m.yaml"], Route::Forward(Run)),
             (&["wrap", "--manifest", "m.yaml", "--", "claude"], Route::Forward(Run)),
             (&["say", "r1", "hello"], Route::Forward(Run)),
+            (&["hibernate", "r1"], Route::Forward(Run)),
+            (&["wake", "a1", "hello"], Route::Forward(Run)),
+            (&["agents"], Route::Forward(Read)),
             (&["pending"], Route::Forward(Read)),
             (&["links"], Route::Forward(Read)),
             (&["audit", "--verify"], Route::Forward(Read)),
@@ -260,6 +268,8 @@ mod tests {
             (&["grant", "revoke", "G1"], Route::Forward(Revoke)),
             (&["secret", "list"], Route::Forward(Read)),
             (&["secret", "set", "claude-oauth"], Route::Forward(Privileged)),
+            (&["secret", "set", "gh", "--hosts", "api.github.com"], Route::Forward(Privileged)),
+            (&["secret", "hosts", "gh", "--hosts", "*.attacker.example"], Route::Forward(Privileged)),
             (&["secret", "link", "x", "--file", "/etc/shadow"], Route::Forward(Privileged)),
             (&["image"], Route::Forward(Privileged)),
             (&["program", "digest", "."], Route::Local),
@@ -300,6 +310,8 @@ mod tests {
         assert_eq!(internal_args(&cmd(&["run", "--lease", "l1", "m.yaml"])), Some("--lease"));
         assert_eq!(internal_args(&cmd(&["run", "--node", "n1", "--ssh-key", "/k", "m.yaml"])), Some("--ssh-key"));
         assert_eq!(internal_args(&cmd(&["run", "--node", "n1", "m.yaml"])), None);
+        assert_eq!(internal_args(&cmd(&["wake", "--by", "message", "a1"])), Some("--by"));
+        assert_eq!(internal_args(&cmd(&["wake", "a1"])), None);
     }
 
     #[test]

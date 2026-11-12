@@ -69,6 +69,16 @@ pub async fn doctor(image: &str) -> Result<()> {
     let v = Vault::new(Vault::default_dir());
     let names = v.list();
     r.good(format!("vault: {} secret(s){}", names.len(), if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) }));
+    for n in &names {
+        let base = n.strip_suffix(" (reference)").unwrap_or(n);
+        match v.hosts(base) {
+            h if h.is_empty() => r.good(format!(
+                "  {base}: bound to no hosts, so sent nowhere ({}wicket secret hosts {base} --hosts HOST)",
+                if system { "sudo " } else { "" }
+            )),
+            h => r.good(format!("  {base}: sent only to {}", h.join(", "))),
+        }
+    }
     if !v.has("claude-oauth") {
         r.good("  no 'claude-oauth' secret: real runs need your Claude subscription token");
         r.good(format!("  (run `claude setup-token`, then: {}wicket secret set claude-oauth)", if system { "sudo " } else { "" }));

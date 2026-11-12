@@ -25,7 +25,7 @@ git -C ../wicket-self config user.name "…"; git -C ../wicket-self config user.
 
 # Optional, for pushes and pull requests: a fine-grained GitHub token limited to this repository
 # (Contents: read and write; Pull requests: read and write), typed into the terminal, never a chat.
-wicket secret set github-wicket
+wicket secret set github-wicket --hosts github.com,api.github.com
 ```
 
 Each session:

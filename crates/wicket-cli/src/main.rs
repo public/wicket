@@ -493,9 +493,22 @@ enum OperatorCmd {
 #[derive(Subcommand)]
 enum SecretCmd {
     /// Store a secret. Prompts without echo, or reads stdin when it isn't a terminal.
-    Set { name: String },
-    /// List secret names (never values).
+    Set {
+        name: String,
+        /// The only hosts it may be sent to (comma-separated; `*.example.com` for every host under
+        /// it). Without it, the secret keeps the hosts it had; a secret with none is sent nowhere
+        /// (claude-oauth defaults to api.anthropic.com).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+    },
+    /// List secret names and the hosts each may be sent to (never values).
     List,
+    /// Bind a secret to the only hosts it may be sent to, replacing its list.
+    Hosts {
+        name: String,
+        #[arg(long, value_delimiter = ',', required = true)]
+        hosts: Vec<String>,
+    },
     /// Make a secret a reference to a JSON field in another file, re-read on every use (never copied).
     /// E.g. the Claude login on this host:
     /// wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt
@@ -509,6 +522,9 @@ enum SecretCmd {
         pointer: Option<String>,
         #[arg(long)]
         expires_pointer: Option<String>,
+        /// The only hosts it may be sent to (as for `secret set`).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
     },
 }
 
@@ -1055,7 +1071,7 @@ async fn main() -> Result<()> {
         Cmd::Secret { cmd } => {
             let v = Vault::new(Vault::default_dir());
             match cmd {
-                SecretCmd::Set { name } => {
+                SecretCmd::Set { name, hosts } => {
                     let value = if std::io::stdin().is_terminal() {
                         rpassword::prompt_password(format!("value for {name} (not echoed): "))?
                     } else {
@@ -1067,18 +1083,33 @@ async fn main() -> Result<()> {
                         bail!("empty value");
                     }
                     v.set(&name, &value)?;
-                    println!("stored secret {name}");
+                    if !hosts.is_empty() {
+                        v.set_hosts(&name, &hosts)?;
+                    }
+                    println!("stored secret {name}; {}", secret_hosts_line(&v, &name));
                 }
-                SecretCmd::Link { name, file, pointer, expires_pointer } => {
+                SecretCmd::Link { name, file, pointer, expires_pointer, hosts } => {
                     v.link(&name, &file, pointer.as_deref(), expires_pointer.as_deref())?;
+                    if !hosts.is_empty() {
+                        v.set_hosts(&name, &hosts)?;
+                    }
                     println!(
-                        "secret {name} now refers to {file}{} (read at each use; never copied)",
-                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default()
+                        "secret {name} now refers to {file}{} (read at each use; never copied); {}",
+                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default(),
+                        secret_hosts_line(&v, &name)
                     );
+                }
+                SecretCmd::Hosts { name, hosts } => {
+                    if !v.has(&name) {
+                        bail!("no secret {name}");
+                    }
+                    v.set_hosts(&name, &hosts)?;
+                    println!("secret {name}: {}", secret_hosts_line(&v, &name));
                 }
                 SecretCmd::List => {
                     for n in v.list() {
-                        println!("{n}");
+                        let base = n.strip_suffix(" (reference)").unwrap_or(&n);
+                        println!("{n}  {}", secret_hosts_line(&v, base));
                     }
                 }
             }
@@ -1393,4 +1424,14 @@ fn serve_opts(c: Cmd) -> Option<(serve::ServeOpts, bool)> {
         },
         no_bootstrap_link,
     ))
+}
+
+/// Where a secret may be sent, for terminals.
+fn secret_hosts_line(v: &Vault, name: &str) -> String {
+    let h = v.hosts(name);
+    if h.is_empty() {
+        format!("sent to no host (bind it: wicket secret hosts {name} --hosts HOST[,HOST])")
+    } else {
+        format!("sent only to {}", h.join(", "))
+    }
 }

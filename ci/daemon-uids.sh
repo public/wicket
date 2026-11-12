@@ -57,15 +57,16 @@ echo "ok: the operator's uid can't approve, deny, enrol a passkey or set a secre
 out=$(as_root approve R1 2>&1) && fail "root: approve of a missing request succeeded"
 case "$out" in *"needs root"*) fail "root was refused: $out" ;; esac
 case "$out" in *R1*) ;; *) fail "root: approve: $out" ;; esac
-echo "value-from-root" | as_root secret set ci-test >/dev/null || fail "root: secret set"
-[ "$(as_root secret list)" = "ci-test" ] || fail "root: secret list"
+echo "value-from-root" | as_root secret set ci-test --hosts api.example.com >/dev/null || fail "root: secret set"
+[ "$(as_root secret list)" = "ci-test  sent only to api.example.com" ] || fail "root: secret list: $(as_root secret list)"
+if out=$(as_nobody secret hosts ci-test --hosts attacker.example 2>&1); then fail "nobody rebound a secret: $out"; fi
 [ "$(cat "$d/data/.config/wicket/secrets/ci-test")" = "value-from-root" ] || fail "the secret didn't land in the daemon's vault"
 [ "$(stat -c %U "$d/data/.config/wicket/secrets/ci-test")" = "$(id -un)" ] || fail "the secret is not the daemon user's"
-echo "ok: root (the host break-glass) approves and sets secrets, as the daemon's user"
+echo "ok: root (the host break-glass) approves and sets secrets (bound to hosts), as the daemon's user; the operator can't rebind them"
 
 # Refusals are audited, and the chain verifies.
 n=$(as_root audit --tail 100 | grep -c daemon.refused) || true
-[ "$n" -ge 6 ] || fail "only $n refusals audited"
+[ "$n" -ge 7 ] || fail "only $n refusals audited"
 as_root audit --verify >/dev/null || fail "audit chain"
 echo "ok: $n refusals in the audit log; the chain verifies"
 echo "daemon-uids: all checks passed"

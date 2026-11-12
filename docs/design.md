@@ -420,7 +420,12 @@ is the only member of the `docker` group. Other users reach wicket only through 
   Files the caller names (manifest, program source, `--workdir`) arrive as content, so the `wicket` user never
   reads a path a caller merely names. Mounting a directory in place (`--workspace-dir`, `wrap`) is root's only
   through the daemon, since Docker mounts by path and the directory's owner could swap the path for a link into
-  the data after any check; mounting the checked inode itself would lift this. Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
+  the data after any check; mounting the checked inode itself would lift this. A caller writes its own manifest, so it could
+  name any vault secret in `inject` or `llm`: every secret is therefore bound to the hosts it may be sent to
+  (`<name>.hosts` in the vault, set by root with `secret set/link/hosts --hosts`; `claude-oauth` defaults to
+  `api.anthropic.com`, any other unbound secret goes nowhere). Runs whose manifest sends a secret elsewhere are
+  refused, and the egress proxy, credential swaps and the model proxy check the binding again on every send.
+  Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
   refused, and refusals are audited.
 
 Without the daemon, the CLI keeps the single-user behaviour (development mode, labelled insecure by `wicket

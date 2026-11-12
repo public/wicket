@@ -44,6 +44,8 @@ pub struct Daemon {
     pub user: String,
     /// The binary each command runs as.
     pub exe: PathBuf,
+    /// The vault its commands use (`$HOME/.config/wicket/secrets`).
+    pub vault_dir: PathBuf,
 }
 
 /// `wicket daemon`: serve the socket until killed.
@@ -63,6 +65,7 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         uid,
         user: proto::user_name(uid).unwrap_or_else(|| uid.to_string()),
         exe: std::env::current_exe().context("finding this binary")?,
+        vault_dir: wicket_proxy::vault::Vault::default_dir(),
     });
     let listener = listen(socket)?;
     eprintln!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
@@ -185,8 +188,11 @@ impl Daemon {
             }
         }
         if let Some(s) = plan.stage.as_mut() {
-            if let Err(e) = s.finish().and_then(|_| check_staged(&cmd, &hello, s)) {
-                return refuse(&mut w, &format!("{e:#}"));
+            if let Err(e) = s.finish().and_then(|_| check_staged(&cmd, &hello, s, &self.vault_dir)) {
+                let why = format!("{e:#}");
+                eprintln!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
+                self.audit_refusal(&peer, &hello, &why);
+                return refuse(&mut w, &why);
             }
         }
         eprintln!(
@@ -401,7 +407,7 @@ impl Daemon {
 
 /// After uploads: the staged manifest's program source is the one the layout was made for, so it
 /// resolves inside the staging directory.
-fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage) -> Result<()> {
+fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) -> Result<()> {
     if !matches!(cmd, Cmd::Run { .. } | Cmd::Wrap { .. }) {
         return Ok(());
     }
@@ -412,6 +418,8 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage) -> Result<()> {
     if source != hello.program_source {
         bail!("the manifest's program source differs from the one announced");
     }
+    // A caller writes its own manifest: it may not send a secret anywhere root didn't bind it to.
+    crate::run::check_secret_hosts(&m, &wicket_proxy::vault::Vault::new(vault_dir.to_path_buf()), matches!(cmd, Cmd::Wrap { .. }))?;
     if let Some(p) = st.root("program") {
         if !p.is_dir() {
             bail!("the program's source did not arrive");

@@ -274,6 +274,12 @@ issuer, the vault, the console's origin and whether it is up, and the placement 
 
 - Enrol a passkey for the console: `sudo wicket operator enrol-link --origin http://localhost:8787` (the console
   doesn't print one in its log, which operators may be able to read).
+- **Secrets are bound to hosts.** Whoever stores a secret (root, here) names the only hosts it may go to:
+  `sudo wicket secret set github-token --hosts api.github.com,github.com` (also on `secret link`; change it with
+  `secret hosts NAME --hosts ...`). A manifest that injects a secret elsewhere, or points `llm.upstream` at another
+  host, is refused (and audited), and the proxies check again before sending, so an operator's manifest can use
+  the vault but never redirect it. A secret bound to no hosts is sent nowhere; `claude-oauth` defaults to
+  `api.anthropic.com`.
 - Manifests, `--workdir` and programs' sources are sent to the daemon as content. Mounting a directory in place
   (`--workspace-dir`, and `wrap`, which mounts its launcher's directory) is root's only through the daemon: Docker
   mounts it by its path, which its owner could swap for a link into wicket's data after any check. Operators copy
@@ -404,7 +410,7 @@ sandbox with the same egress control. Pin the approved source with `digest:` (fr
 any change is refused until re-approved. Out-of-reach requests fail instead of escalating (`on_pending: fail`).
 
 For testing without a model, `examples/mock-github.yaml` plus `wicket dev mock-llm --command '...'` drives the whole path
-with a scripted model.
+with a scripted model (store its stand-in secret with `wicket secret set mock --hosts 127.0.0.1`).
 
 ### Longer sessions, volumes and in-place workspaces
 

@@ -63,7 +63,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
 
     // stdin: a secret is read here, where the terminal is, and handed over through a pipe.
     let mut stdin_pipe: Option<OwnedFd> = None;
-    if let Cmd::Secret { cmd: SecretCmd::Set { name } } = cmd {
+    if let Cmd::Secret { cmd: SecretCmd::Set { name, .. } } = cmd {
         let value = if std::io::stdin().is_terminal() {
             rpassword::prompt_password(format!("value for {name} (not echoed): "))?
         } else {

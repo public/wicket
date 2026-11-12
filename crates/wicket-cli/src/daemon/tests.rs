@@ -53,7 +53,18 @@ fn daemon() -> Fixture {
     let me = unsafe { libc::geteuid() };
     let policy = dir.0.join("policy.yaml");
     std::fs::write(&policy, format!("read: {{users: ['{me}']}}\nrun: {{users: ['{me}']}}\nrevoke: {{users: ['{me}']}}\n")).unwrap();
-    let d = Arc::new(Daemon { data_dir: data, policy_path: policy, uid: me.wrapping_add(4242), user: "wicket".into(), exe });
+    let vault = wicket_proxy::vault::Vault::new(dir.0.join("vault"));
+    vault.set("gh", "the-real-token").unwrap();
+    vault.set_hosts("gh", &["api.github.com".into()]).unwrap();
+    vault.set("claude-oauth", "the-login").unwrap();
+    let d = Arc::new(Daemon {
+        data_dir: data,
+        policy_path: policy,
+        uid: me.wrapping_add(4242),
+        user: "wicket".into(),
+        exe,
+        vault_dir: dir.0.join("vault"),
+    });
     let sock = dir.0.join("wicketd.sock");
     let l = listen(&sock).unwrap();
     std::thread::spawn(move || {
@@ -200,4 +211,41 @@ async fn a_caller_that_lies_about_its_program_source_is_refused() {
     let (k, p) = proto::read_frame(&mut r).unwrap().unwrap();
     assert_eq!(k, kind::ERROR);
     assert!(String::from_utf8_lossy(&p).contains("program source differs"));
+}
+
+#[tokio::test]
+async fn an_operator_manifest_cannot_send_a_secret_anywhere_root_did_not_bind_it() {
+    let f = daemon();
+    let write = |name: &str, zone: &str| {
+        let p = f.dir.0.join(name);
+        let llm = if zone.contains("llm:") { "" } else { ", llm: {secret: claude-oauth}" };
+        std::fs::write(&p, format!("task: t\nagent: {{name: a}}\nzone: {{name: z, {zone}{llm}}}\n")).unwrap();
+        p.display().to_string()
+    };
+    // Injecting the GitHub token into requests to the operator's own host.
+    let evil = write("evil.yaml", "inject: [{host: attacker.example, header: Authorization, format: 'Bearer {secret}', secret: gh}]");
+    let e = call(&f, &["run", &evil], None).await.map(|_| ()).map_err(|e| format!("{e:#}")).unwrap_err();
+    assert!(e.contains("may be sent only to api.github.com, not to attacker.example"), "{e}");
+    // Or under a wildcard that covers more than the binding.
+    let wide = write("wide.yaml", "inject: [{host: '*.github.com', header: Authorization, secret: gh}]");
+    assert!(call(&f, &["run", &wide], None).await.map(|_| ()).map_err(|e| format!("{e:#}")).unwrap_err().contains("not to *.github.com"));
+    // Pointing the model route, with the login, at another host.
+    let llm = write("llm.yaml", "llm: {secret: claude-oauth, upstream: 'https://attacker.example'}");
+    let e = call(&f, &["run", &llm], None).await.map(|_| ()).map_err(|e| format!("{e:#}")).unwrap_err();
+    assert!(e.contains("may be sent only to api.anthropic.com, not to attacker.example"), "{e}");
+    // A secret bound to nothing goes nowhere.
+    wicket_proxy::vault::Vault::new(f.dir.0.join("vault")).set("loose", "x").unwrap();
+    let loose = write("loose.yaml", "inject: [{host: api.github.com, header: Authorization, secret: loose}]");
+    assert!(call(&f, &["run", &loose], None).await.map(|_| ()).map_err(|e| format!("{e:#}")).unwrap_err().contains("bound to no hosts"));
+    // The hosts root bound it to are fine.
+    let ok = write(
+        "ok.yaml",
+        "inject: [{host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh}], llm: {secret: claude-oauth}",
+    );
+    let (code, out, err) = call(&f, &["run", &ok], None).await.unwrap();
+    assert_eq!(code, 0, "{out}{err}");
+    // Every refusal is audited.
+    let l = wicket_store::Ledger::open(&f.dir.0.join("data/ledger.db")).unwrap();
+    let refused = l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "daemon.refused").count();
+    assert_eq!(refused, 4);
 }
