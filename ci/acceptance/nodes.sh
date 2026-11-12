@@ -240,10 +240,10 @@ offline_flow() {
     '[ "$(span "$t_cut" "$t_rs" model=200:)" -ge 12 ] && [ "$(span "$t_cut" "$t_rs" " write=[0-9]+:- ")" -ge 12 ]'
   check "  after the restart, still cut off: model calls fail clearly, plain egress goes on past 155 s" \
     '[ "$(span $((t_rs + 5000)) "$t_restore" model=503:credential)" -ge 5 ] && [ "$(span $((t_cut + 155000)) "$t_restore" " write=[0-9]+:- ")" -ge 1 ]'
-  check "  and the miss is in the node's audit" 'sleep 1; w audit --tail 2000 | grep node.secret_unavailable | grep -q "$r"'
   check "  an out-of-reach request was queued on the node while it was cut off" '[ "$(span "$t_cut" "$t_restore" ":queued")" -ge 1 ]'
   wait_for 40 '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]' || true
   check "  reconnected, the credential is fetched again and model calls work" '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]'
+  check "  and the miss while cut off is in the node's audit, shipped on reconnect" 'w audit --tail 3000 | grep node.secret_unavailable | grep -q "$r"'
   wait_for 20 '! grep -q "q-" "$nd/asks.json" 2>/dev/null' || true
   check "  and the queued ask was delivered to the control host" '! grep -q "q-" "$nd/asks.json" && w pending | grep -q "example.com/out-of-reach"'
   wroot secret rm mock-offline >/dev/null
@@ -252,11 +252,13 @@ offline_flow() {
   check "  a secret removed on the control host is dropped by the node within seconds" \
     '[ "$(span $((t_rm + 10000)) 99999999999999 model=200:)" -eq 0 ] && [ "$(span $((t_rm + 10000)) 99999999999999 model=)" -ge 1 ]'
   # Its authority ends 5 min after the run started: its node stops it then.
-  wait_for 240 '[ -z "$(box_of "$r")" ]' || true
-  local until; until=$(grep -o "$r: its authority expired at [0-9]* ms" "$work/node-serve.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1)
-  local last; last=$(tail -1 "$olog" | awk '{print $1}')
+  # The node removes the run's directory once the box has ended: keep a copy of its log as it goes.
+  local kept=$work/offline-box.log
+  wait_for 240 'cp "$olog" "$kept" 2>/dev/null; [ -z "$(box_of "$r")" ]' || true
+  local until; until=$(grep -o "$r: its authority expired at [0-9]* ms" "$work/node-serve.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
+  local last; last=$(tail -1 "$kept" 2>/dev/null | awk '{print $1}' || true)
   echo "   authority ended at ${until:-?} ms; the box's last line $(( (${last:-0} - ${until:-0}) / 1000 )) s from it"
-  check "  its node stopped the box when its authority expired" '[ -n "$until" ] && [ -z "$(box_of "$r")" ] && [ "$last" -le $((until + 7000)) ]'
+  check "  its node stopped the box when its authority expired" '[ -n "$until" ] && [ -n "$last" ] && [ -z "$(box_of "$r")" ] && [ "$last" -le $((until + 7000)) ]'
   check "  the node's audit records it" 'w audit --tail 2000 | grep -q "node.authority_expired"'
   wait_for 60 '! kill -0 "$run_pid" 2>/dev/null' || true
   check "  and its run ended" '! kill -0 "$run_pid" 2>/dev/null'

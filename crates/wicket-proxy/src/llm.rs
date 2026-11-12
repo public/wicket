@@ -297,7 +297,10 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
-        if let Err(why) = allowed_route(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/")) {
+        let Some(profile) = crate::provider::profile(&spec.provider) else {
+            return problem(404, "no-model", "No model", &format!("no provider profile for {:?}", spec.provider), None);
+        };
+        if let Err(why) = profile.allowed_route(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/")) {
             self.event(None, 404, Usage::default(), &format!("refused route: {why}"));
             return problem(404, "route", "Not a model route", &why, None);
         }
@@ -493,7 +496,9 @@ impl Llm {
         // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
         let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
         let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
-        rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
+        let profile =
+            crate::provider::profile(&spec.provider).ok_or_else(|| anyhow::anyhow!("no provider profile for {:?}", spec.provider))?;
+        rb = (profile.attach)(rb, &token).header("accept-encoding", "identity");
         Ok(rb.body(body).send().await?)
     }
 
@@ -682,7 +687,10 @@ impl Llm {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>(16);
         let me = self.clone();
         tokio::spawn(async move {
-            let mut scan = UsageScanner::default();
+            let mut scan = UsageScanner {
+                reader: me.ctx.zone.llm.as_ref().and_then(|l| crate::provider::profile(&l.provider)).map(|p| p.usage),
+                ..UsageScanner::default()
+            };
             let mut client = true;
             let mut deadline = None;
             let mut clean_end = false;
@@ -812,6 +820,8 @@ pub(crate) struct UsageScanner {
     pub saw_output: bool,
     /// The stream's `message_stop` event was seen: the final usage (in `message_delta`) came before it.
     pub stopped: bool,
+    /// The provider profile's usage reader (None: Anthropic's).
+    pub reader: Option<fn(&[u8]) -> Usage>,
 }
 
 /// Longer than any key plus its number, so nothing is split past the carried tail.
@@ -821,7 +831,7 @@ impl UsageScanner {
     pub(crate) fn feed(&mut self, chunk: &[u8]) {
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(chunk);
-        let u = usage(&buf);
+        let u = self.reader.unwrap_or(usage)(&buf);
         self.usage = Usage {
             input: self.usage.input.max(u.input),
             cache_read: self.usage.cache_read.max(u.cache_read),
@@ -853,25 +863,13 @@ pub struct Usage {
 /// The only requests the model route forwards, as (method, path): inference and token counting
 /// (and listing models). Everything else under the upstream would also carry the real token, so
 /// it is refused here, before any budget is spent.
-const ROUTES: &[(&str, &str)] = &[("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens"), ("GET", "/v1/models")];
-
-/// Query parameters a model route may carry (Claude Code sends `?beta=true`).
-const QUERY: &[&str] = &["beta=true"];
-
-/// Ok if `method` and `path_and_query` name an allowed model route, exactly and canonically.
+/// Ok if `method` and `path_and_query` name an allowed Anthropic model route (the [`crate::provider`]
+/// profile's), exactly and canonically.
 pub fn allowed_route(method: &str, path_and_query: &str) -> std::result::Result<(), String> {
-    let path = wicket_core::canon::canonical_path(path_and_query).map_err(|e| e.to_string())?;
-    if !ROUTES.iter().any(|(m, p)| *m == method && *p == path) {
-        return Err(format!("{method} {path} is not a model route"));
-    }
-    if let Some((_, q)) = path_and_query.split_once('?') {
-        if q.split('&').any(|kv| !QUERY.contains(&kv)) {
-            return Err(format!("query {q:?} is not allowed on a model route"));
-        }
-    }
-    Ok(())
+    crate::provider::ANTHROPIC.allowed_route(method, path_and_query)
 }
 
+/// Anthropic's usage fields in a response body (the Anthropic profile's [`crate::provider::Profile::usage`]).
 pub fn usage(body: &[u8]) -> Usage {
     let s = String::from_utf8_lossy(body);
     Usage {
