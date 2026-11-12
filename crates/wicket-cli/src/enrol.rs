@@ -550,8 +550,8 @@ RestartSec=2
 WantedBy=default.target
 ";
 
-/// `wicket node install <name>`: copies this control host's own wicket binary to the node over the
-/// pinned ssh connection (`~/.local/bin/wicket`), checks its sha256 there, and (unless `no_service`)
+/// `wicket node install <name>`: copies this control host's current wicket binary to the node over
+/// the pinned ssh connection (as a version: see `update.rs`), checks its sha256 there, and (unless `no_service`)
 /// installs and restarts the `wicket-node` systemd user service that runs `wicket node serve`. The
 /// node's `serve` refuses a control host more than one protocol version away (`chan.rs`); `wicket self
 /// update --nodes` keeps nodes current.
@@ -567,24 +567,24 @@ pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Re
     if arch != std::env::consts::ARCH {
         bail!("node {name} is {arch}, this control host's wicket is {}: install a {arch} build there yourself", std::env::consts::ARCH);
     }
-    let exe = std::env::current_exe().context("finding this binary")?;
+    // The control host's current version, staged on the node as a version of its own
+    // (`<node dir>/versions/<id>/wicket`, `~/.local/bin/wicket` a link to its `current`).
+    let exe = crate::update::self_exe()?;
     let bytes = std::fs::read(&exe)?;
     let sha = hex::encode(Sha256::digest(&bytes));
-    let home = node.sh("echo $HOME").await?;
-    let dest = format!("{home}/.local/bin/wicket");
-    node.sh(&format!("mkdir -p {}", wicket_sandbox::shell_quote(&format!("{home}/.local/bin")))).await?;
-    node.put(&format!("{dest}.new"), &bytes).await?;
-    let q = wicket_sandbox::shell_quote(&dest);
-    node.script(
-        "checking and installing the binary",
-        &format!("set -eu\necho '{sha}  '{q}.new | sha256sum -c --quiet\nchmod 755 {q}.new\nmv -f {q}.new {q}\n"),
-    )
-    .await?;
-    println!("installed wicket on node {name} ({} MB, sha256 {}…)", bytes.len() >> 20, &sha[..16]);
+    let prev = crate::update::push_version(&node, &bytes, &sha).await?;
+    println!(
+        "installed wicket on node {name} ({} MB, version {}{}, sha256 {}…)",
+        bytes.len() >> 20,
+        &sha[..12],
+        prev.filter(|p| p.as_str() != &sha[..12]).map(|p| format!(", was {p}")).unwrap_or_default(),
+        &sha[..16]
+    );
     if no_service {
-        println!("no service installed: run `{dest} node serve` on the node yourself");
+        println!("no service installed: run `~/.local/bin/wicket node serve` on the node yourself");
         return Ok(());
     }
+    let home = node.sh("echo $HOME").await?;
     let unit_dir = format!("{home}/.config/systemd/user");
     let script = format!(
         "set -eu\nexport XDG_RUNTIME_DIR=/run/user/$(id -u)\nmkdir -p {d}\ncat > {d}/wicket-node.service <<'WICKET_UNIT_EOF'\n{NODE_UNIT}WICKET_UNIT_EOF\n\

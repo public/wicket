@@ -42,7 +42,7 @@ pub struct Daemon {
     /// The uid the daemon runs as: trusted with everything.
     pub uid: u32,
     pub user: String,
-    /// The binary each command runs as.
+    /// The binary each command runs as (resolved at each command).
     pub exe: PathBuf,
     /// The vault its commands use (`$HOME/.config/wicket/secrets`).
     pub vault_dir: PathBuf,
@@ -64,10 +64,28 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         policy_path,
         uid,
         user: proto::user_name(uid).unwrap_or_else(|| uid.to_string()),
-        exe: std::env::current_exe().context("finding this binary")?,
+        // When installed as a version, the `current` link, so commands run as whichever build
+        // `wicket self update` last switched to.
+        exe: crate::update::self_exe()?,
         vault_dir: wicket_proxy::vault::Vault::default_dir(),
     });
     let listener = listen(socket)?;
+    // `wicket self update` moves the daemon to the new build last: on SIGHUP it re-executes itself
+    // once no command is running through it (each holds its caller's connection, which an exec
+    // would cut).
+    crate::update::reexec_on_hangup(crate::update::pidfile("daemon"), crate::update::Versions::control().root, || {
+        let mut waited = 0u64;
+        while IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if waited.is_multiple_of(60) {
+                eprintln!(
+                    "wicketd: waiting for {} running command(s) to end before moving to the new build",
+                    IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            waited += 1;
+        }
+    });
     eprintln!("wicketd: {} as {} (uid {uid}), data {}, policy {}", socket.display(), d.user, d.data_dir.display(), d.policy_path.display());
     for conn in listener.incoming() {
         let conn = match conn {
@@ -85,6 +103,22 @@ pub fn serve(socket: &Path, policy_path: PathBuf) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Commands running through the daemon.
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct InFlight;
+impl InFlight {
+    fn enter() -> InFlight {
+        IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlight
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The data directory exists, is ours, and is 0700.
@@ -127,6 +161,7 @@ struct Plan {
 
 impl Daemon {
     fn handle(&self, conn: UnixStream) -> Result<()> {
+        let _busy = InFlight::enter();
         let peer = proto::peer(&conn)?;
         let mut fds = proto::recv_fds(&conn)?;
         let mut w = conn.try_clone()?;
@@ -222,6 +257,9 @@ impl Daemon {
         };
         let policy = Policy::load(&self.policy_path).map_err(|e| format!("the daemon's policy is unreadable: {e}"))?;
         let basis = policy::authorize(peer, class, &policy, self.uid)?;
+        if policy::root_only(&cmd) && basis != Basis::Root {
+            return Err("updating wicket needs root on the host (sudo wicket self …): no other user, and nothing wicket runs, may".into());
+        }
         if basis != Basis::Daemon {
             if let Some(a) = policy::internal_args(&cmd) {
                 return Err(format!("{a} is for wicket's own use"));

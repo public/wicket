@@ -88,7 +88,6 @@ pub struct Authenticated {
     pub welcome: Msg,
     pub cert: NodeCertClaims,
     /// The protocol version the connection talks (#162).
-    #[allow(dead_code)]
     pub proto: u32,
 }
 

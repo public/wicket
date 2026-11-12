@@ -477,6 +477,26 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     }
     adopt_previous(&node).await;
     {
+        // `wicket self update` moves a node to a new build with SIGHUP: it saves where each box's
+        // output got to, commits its audit, and re-executes itself from the new version, which
+        // adopts the boxes as a restarted `serve` does (#151). Its boxes never stop.
+        let n = node.clone();
+        // This host's own node runs the control host's versions; another node its own.
+        let versions = match n.paths.shares_host() {
+            true => crate::update::Versions::control().root,
+            false => n.paths.root.join("versions"),
+        };
+        crate::update::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
+            for b in n.boxes.lock().expect("boxes").values_mut() {
+                save_output(b);
+            }
+            if let Ok(l) = n.audit.lock() {
+                let _ = l.flush_audit();
+            }
+            n.ship_audit();
+        });
+    }
+    {
         // A run whose lease has lapsed (its control host gone longer than the feed window): kept
         // running by default, as before run leases; `WICKET_NODE_LEASE_EXPIRY=stop` stops it instead.
         let n = node.clone();

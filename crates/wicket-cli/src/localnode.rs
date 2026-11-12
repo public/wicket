@@ -46,6 +46,11 @@ fn build_dir() -> Result<PathBuf> {
     Ok(root().join("serve"))
 }
 
+/// Its `serve`'s pid file.
+pub fn pidfile() -> Result<PathBuf> {
+    Ok(build_dir()?.join("serve.pid"))
+}
+
 /// Its control socket.
 pub fn socket() -> Result<PathBuf> {
     Ok(crate::nodesrv::NodePaths::new(Some(build_dir()?)).socket())
@@ -249,7 +254,7 @@ fn renew_cert(ledger: &std::sync::Mutex<Ledger>, dir: &std::path::Path) -> Resul
 /// Starts the `serve`, detached from this run (it outlives it, and serves the next).
 fn start_serve(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().context("finding this binary")?;
+    let exe = crate::update::self_exe()?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("serve.log"))?;
     let idle = std::env::var("WICKET_LOCAL_NODE_IDLE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(600);
     let mut c = std::process::Command::new(exe);
