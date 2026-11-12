@@ -44,7 +44,7 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   forbidden) is decided at `CONNECT` and its TLS relayed unmodified with splice(2), with the dial-time
   address check and one audit row per connection. That is 0.33 CPU-s per GB instead of 2.67, and
   HTTP/2 end to end. `wicket zone MANIFEST` and the console show which hosts are spliced. Benchmarks
-  are in `docs/performance.md` ([#PR](https://github.com/public/wicket/pull/PR)).
+  are in `docs/performance.md` ([#144](https://github.com/public/wicket/pull/144)).
 
 ### Model budgets
 
