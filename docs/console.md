@@ -13,6 +13,12 @@ or deny from a browser or phone. It uses **passkeys**:
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
   signed record, so `wicket audit --verify` re-verifies every decision offline;
+- **signing takes two steps.** A tap on Approve, Deny, Send, Revoke or Start asks the server for the exact
+  action. The page then shows that action in a confirmation pinned to the top of the screen, above where a
+  phone's passkey sheet opens, and only its own button starts the passkey ceremony. The authenticator's sheet
+  shows only the site's name, so this confirmation is what tells you what you're signing. While it is open,
+  nothing on the page is redrawn. Pending cards are kept by request id, and a tap within a moment of the cards
+  moving is ignored, so an agent can't slide another request under your finger;
 - `wicket operator reset` (host only) revokes passkeys but keeps their public keys for verification.
 
 Signed in, the console can also do what was CLI-only, each action signed with a fresh passkey assertion over
@@ -54,6 +60,17 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
     --trusted-proxy 10.0.0.2
 ```
 
+- **Behind a TLS terminator** (nginx, HAProxy, Caddy, a cloud load balancer), `--trusted-proxy` is required. It
+  takes the address or range the proxy connects from, and is repeatable. Without it, every client would
+  look like the proxy: one client's failed sign-ins would lock everyone out, and a few slow connections
+  would fill the per-client connection cap. `X-Forwarded-For` is read only on connections from a trusted
+  proxy. All of its header lines are read, in order, and the client is the right-most entry that isn't a
+  trusted proxy. Anything further left is whatever the client sent. Two rules for the proxy:
+  - **It must add the address it saw.** nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+    HAProxy: `option forwardfor`, which adds a header line of its own; wicket reads every line, so that
+    is fine. Caddy's `reverse_proxy` does it by default.
+  - **It must be the only way in.** Listen on an address that only the proxy can reach, or firewall the
+    port to the proxy. If there are several proxies in a chain, trust each of them.
 - **Transport.** A non-loopback listener refuses to start in plain HTTP unless `--behind-tls-terminator` is given
   with an `https://` `--origin`. TLS is rustls: TLS 1.3, and TLS 1.2 with ECDHE and AEAD suites only; HTTP/1.1
   only (no h2, so there is one HTTP implementation to bound). HTTPS responses carry
@@ -65,9 +82,12 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
   address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
-  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges are bounded
-  (1024 in all, 8 per client, 2-minute expiry). Every failure looks the same to the client, and every failure
-  and lockout is in the audit log.
+  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges expire after 2
+  minutes and come from two bounded pools. Sign-in challenges get 512 in all, 8 per client and 32 per
+  IPv4 /24 or IPv6 /48. Signed-in sessions' action and enrolment challenges get 512 in all and 8 per
+  session. A flood of sign-in attempts therefore never stops the operator from approving. Every failure looks the same to the client, and every failure
+  and lockout is in the audit log. The limiter remembers 4096 clients. When every entry is a live lockout, the
+  oldest one is dropped to make room, so new clients aren't all refused.
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
   host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately

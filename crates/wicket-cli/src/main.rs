@@ -1054,8 +1054,13 @@ async fn main() -> Result<()> {
             }
             let l = Ledger::open(&ledger_path())?;
             if verify {
-                let n = l.verify_audit()?;
-                println!("audit chain OK: {n} records");
+                let n = l.verify_audit_versions()?;
+                let v1 = if n.v1 > 0 {
+                    format!(" ({} written before v2 hash only their prev, kind and body; the exported copies check the rest)", n.v1)
+                } else {
+                    String::new()
+                };
+                println!("audit chain OK: {} records{v1}", n.total());
                 let (ok, bad) = verify_signed_decisions(&l)?;
                 println!("passkey-signed decisions and console actions: {ok} verified offline, {bad} failed");
                 let (iok, ibad) = verify_identities_and_messages(&l)?;

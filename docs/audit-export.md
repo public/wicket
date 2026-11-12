@@ -89,6 +89,12 @@ are `wicket.audit.type`, `wicket.audit.seq` (int), `wicket.audit.kind`, `wicket.
 
 ## Checkpoints and `--verify --against`
 
+Each record's hash covers every field it stores: `seq`, `ts`, `tenant`, `run`, `kind`, `body` and the
+previous record's hash. These are v2 hashes and start with `v2:`. Ledgers written by older versions
+hold v1 hashes (64 hex digits), which cover only `prev`, `kind` and `body`. They still verify, and
+new records continue the chain as v2. A v1 record after a v2 one fails, so a record can't be
+downgraded to hide an edit. `wicket audit --verify` reports how many v1 records a ledger holds.
+
 The hash chain proves that the ledger is internally consistent, not that it is complete: whoever
 controls the control host can rewrite a record and recompute every hash after it. Checkpoints close
 that gap. Every `checkpoint_every`, each sink also receives:
@@ -111,7 +117,9 @@ This runs the normal verification first, then checks the local ledger against th
 - the signature on every checkpoint;
 - that the local record at each checkpoint's `seq` has the checkpoint's head hash;
 - that the local chain reaches the newest checkpoint;
-- that each exported record's hash equals the local record's hash.
+- that every field of each exported record (`ts`, `tenant`, `run`, `kind`, `body`, `prev`, `hash`)
+  equals the local record's. This catches a v1 record that was moved to another run or tenant, or
+  given another time, which its hash doesn't cover.
 
 A rewritten chain fails this check even if it was consistently re-chained, and so does a truncated
 one. The files can be wicket's JSON lines, or a Collector `file` exporter's output (OTLP JSON, one

@@ -88,9 +88,15 @@ const TOUCH_EVERY: i64 = 15;
 /// (browsers treat http://localhost as secure for this).
 const COOKIE: &str = "__Host-wicket_sid";
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
-/// Pending passkey challenges, in all, and per client (sign-in) or session (actions, enrolment).
-const MAX_CHALLENGES: usize = 1024;
+/// Pending passkey challenges (#122). Sign-in challenges, which anyone can ask for, have a pool of
+/// their own, so a flood of them never crowds out a signed-in session's actions or enrolment; each
+/// pool is bounded in all, and per client address or session.
+const MAX_LOGIN_CHALLENGES: usize = 512;
+const MAX_SESSION_CHALLENGES: usize = 512;
 const MAX_CHALLENGES_PER_OWNER: usize = 8;
+/// Sign-in challenges per address block (an IPv4 /24, an IPv6 /48): one host with a routed block
+/// doesn't get a pool's worth of addresses.
+const MAX_LOGIN_CHALLENGES_PER_BLOCK: usize = 32;
 /// Longest follow-up or task override the console accepts (characters).
 const MAX_TEXT: usize = 16 * 1024;
 const MAX_REASON: usize = 500;
@@ -134,6 +140,8 @@ struct Pending {
     session: Option<String>,
     /// Whose quota it counts against: the client address (sign-in) or the session.
     owner: String,
+    /// The client's address block, for sign-in challenges.
+    block: Option<String>,
     created: Instant,
     expires: Instant,
 }
@@ -458,22 +466,45 @@ fn session(state: &State, sid: &Option<String>) -> Option<(String, SessionKind)>
     Some((id, kind))
 }
 
-/// Issues a challenge; None when the store is full (each owner keeps at most
-/// [`MAX_CHALLENGES_PER_OWNER`]: a new one replaces its oldest).
-fn new_challenge(state: &State, challenge: Vec<u8>, purpose: Purpose, session: Option<String>, owner: String) -> Option<String> {
+/// Who asks for a challenge: a client that hasn't signed in, or a signed-in session.
+enum Asker {
+    Client(IpAddr),
+    Session(String),
+}
+
+/// Issues a challenge; None when its pool is full. Each owner keeps at most
+/// [`MAX_CHALLENGES_PER_OWNER`] (a new one replaces its oldest); a sign-in challenge also counts
+/// against its client's address block, and comes from the sign-in pool, which never takes the room
+/// sessions need (#122).
+fn new_challenge(state: &State, challenge: Vec<u8>, purpose: Purpose, asker: Asker) -> Option<String> {
     let key = b64u(&challenge);
+    let (session, owner, block) = match asker {
+        Asker::Client(ip) => (None, limits::ip_key(ip), Some(limits::block_key(ip))),
+        Asker::Session(sid) => (Some(sid.clone()), sid, None),
+    };
+    let login = block.is_some();
     let mut c = state.challenges.lock().expect("lock");
     let now = Instant::now();
     c.retain(|_, v| v.expires > now);
-    let mut mine: Vec<(String, Instant)> = c.iter().filter(|(_, v)| v.owner == owner).map(|(k, v)| (k.clone(), v.created)).collect();
-    if mine.len() >= MAX_CHALLENGES_PER_OWNER {
-        mine.sort_by_key(|m| m.1);
-        c.remove(&mine[0].0);
+    let oldest = |c: &HashMap<String, Pending>, f: &dyn Fn(&Pending) -> bool| -> (usize, Option<String>) {
+        let mine: Vec<(&String, Instant)> = c.iter().filter(|(_, v)| f(v)).map(|(k, v)| (k, v.created)).collect();
+        (mine.len(), mine.iter().min_by_key(|m| m.1).map(|m| m.0.clone()))
+    };
+    if let (n, Some(k)) = oldest(&c, &|v| v.owner == owner) {
+        if n >= MAX_CHALLENGES_PER_OWNER {
+            c.remove(&k);
+        }
     }
-    if c.len() >= MAX_CHALLENGES {
+    if let Some(b) = &block {
+        if oldest(&c, &|v| v.block.as_ref() == Some(b)).0 >= MAX_LOGIN_CHALLENGES_PER_BLOCK {
+            return None;
+        }
+    }
+    let in_pool = c.values().filter(|v| v.block.is_some() == login).count();
+    if in_pool >= if login { MAX_LOGIN_CHALLENGES } else { MAX_SESSION_CHALLENGES } {
         return None;
     }
-    c.insert(key.clone(), Pending { purpose, session, owner, created: now, expires: now + CHALLENGE_TTL });
+    c.insert(key.clone(), Pending { purpose, session, owner, block, created: now, expires: now + CHALLENGE_TTL });
     Some(key)
 }
 
@@ -555,8 +586,8 @@ where
     if !host.is_some_and(|h| h.eq_ignore_ascii_case(&state.authority)) {
         return denied();
     }
-    let forwarded = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), forwarded, &state.trusted) };
+    let forwarded: Vec<Option<&str>> = req.headers().get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect();
+    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), &forwarded, &state.trusted) };
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -703,7 +734,7 @@ fn register_begin(state: &State, sess: &Option<(String, SessionKind)>) -> Reply 
     // session: a stolen cookie must not be able to add a passkey.
     let Some((sid, SessionKind::Bootstrap { .. })) = sess else { return err(StatusCode::FORBIDDEN, ENROL_ON_HOST) };
     let challenge = random_bytes(32);
-    let Some(key) = new_challenge(state, challenge, Purpose::Register, Some(sid.clone()), sid.clone()) else {
+    let Some(key) = new_challenge(state, challenge, Purpose::Register, Asker::Session(sid.clone())) else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };
     let exclude: Vec<Value> = creds(state).unwrap_or_default().iter().map(|c| json!({ "type": "public-key", "id": c.id })).collect();
@@ -791,7 +822,7 @@ fn login_begin(state: &State, ctx: &Ctx) -> Reply {
     if let Err(r) = state.limiter.attempt(ctx.client, Instant::now()) {
         return refused(r);
     }
-    let Some(key) = new_challenge(state, random_bytes(32), Purpose::Login, None, limits::ip_key(ctx.client)) else {
+    let Some(key) = new_challenge(state, random_bytes(32), Purpose::Login, Asker::Client(ctx.client)) else {
         return refused(Refusal::Throttled(Duration::from_secs(5)));
     };
     ok(
@@ -1047,7 +1078,7 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();
     let Some(key) =
-        new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Some(sid.clone()), sid)
+        new_challenge(state, challenge, Purpose::Action { action_json, nonce, action: Box::new(action) }, Asker::Session(sid.clone()))
     else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "too many passkey ceremonies in progress; try again shortly");
     };

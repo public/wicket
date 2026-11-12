@@ -109,6 +109,11 @@ pub fn plan(o: &ServeOpts, data: &Path) -> Result<Plan> {
     if !o.trusted_proxy.is_empty() && !o.behind_tls_terminator {
         bail!("--trusted-proxy applies only with --behind-tls-terminator");
     }
+    // Without it every client would be the proxy's address: one client's failed sign-ins would lock
+    // everyone out, and a few slow connections would fill the per-client cap (#123).
+    if o.behind_tls_terminator && o.trusted_proxy.is_empty() {
+        bail!("--behind-tls-terminator needs --trusted-proxy (the proxy's address or range), so each client is told apart by its X-Forwarded-For");
+    }
     let trusted =
         o.trusted_proxy.iter().map(|s| s.parse::<Cidr>().with_context(|| format!("--trusted-proxy {s:?}"))).collect::<Result<Vec<_>>>()?;
     if !addr.ip().is_loopback() && !tls && !o.behind_tls_terminator {
@@ -377,6 +382,9 @@ mod tests {
         assert!(plan(&ServeOpts { origin: None, ..o.clone() }, &data()).is_err());
         assert!(plan(&ServeOpts { origin: Some("http://console.example.com".into()), ..o.clone() }, &data()).is_err());
         assert!(plan(&ServeOpts { tls_cert: Some("c".into()), tls_key: Some("k".into()), ..o.clone() }, &data()).is_err());
+        // #123: a terminator without a trusted proxy would make every client the proxy's address.
+        let e = plan(&ServeOpts { trusted_proxy: vec![], ..o.clone() }, &data()).unwrap_err().to_string();
+        assert!(e.contains("--trusted-proxy"), "{e}");
         // Forwarded-for is never believed without a terminator.
         let o = ServeOpts { trusted_proxy: vec!["10.0.0.5".into()], ..opts("127.0.0.1:8787") };
         assert!(plan(&o, &data()).unwrap_err().to_string().contains("--behind-tls-terminator"));

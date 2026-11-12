@@ -268,6 +268,8 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     publisher.commit(changes, now).context("publishing the box's token")?;
     let token_root = (token_issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
     let target_epoch = publisher.epoch();
+    // Records the node ships are filed under this run only once the ledger says it runs there (#120).
+    s.ledger.lock().expect("ledger").set_run_node(&s.run.0, &name).context("recording the run's node")?;
     let ctl = Arc::new(NodeCtl {
         node: name.clone(),
         run: s.run.0.clone(),
@@ -663,7 +665,7 @@ async fn on_frame(
             Msg::Close { stream } => sh.tunnels.close(stream),
             Msg::Audit { records } => {
                 let n = records.len();
-                if let Err(e) = sh.ledger.lock().expect("ledger").append_node_audit(&sh.node, &records) {
+                if let Err(e) = sh.ledger.lock().expect("ledger").append_node_audit(&sh.node, &sh.tenant, &records) {
                     println!("[wicket] node {}'s audit records were refused ({e}); they stay on the node", sh.node);
                 } else {
                     tracing::debug!(node = %sh.node, n, "node audit records appended");

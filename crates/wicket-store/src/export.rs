@@ -106,6 +106,11 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
+    /// The record at `seq`, with its chain fields, if there is one.
+    pub fn audit_record_at(&self, seq: i64) -> Result<Option<crate::AuditRecord>> {
+        Ok(self.audit_records_after(seq - 1, 1)?.into_iter().next().filter(|r| r.seq == seq))
+    }
+
     /// The hash of the record at `seq`, if there is one.
     pub fn audit_hash_at(&self, seq: i64) -> Result<Option<String>> {
         Ok(self.conn.query_row("SELECT hash FROM audit WHERE seq = ?1", params![seq], |r| r.get(0)).optional()?)

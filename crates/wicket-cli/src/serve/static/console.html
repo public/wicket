@@ -38,6 +38,15 @@
   <div class="card" id="operator"></div>
   </div>
 </main>
+<!-- What the passkey is about to sign (#124): fixed at the top, and it blocks the page below. -->
+<div id="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title" hidden>
+  <div class="card">
+    <div id="confirm-title">Your passkey will sign exactly this:</div>
+    <div id="confirm-what" class="what"></div>
+    <div id="confirm-state" class="meta"></div>
+    <div class="buttons"><button type="button" id="confirm-go"></button><button type="button" id="confirm-cancel">Cancel</button></div>
+  </div>
+</div>
 <div id="msg" hidden></div>
 </body>
 </html>

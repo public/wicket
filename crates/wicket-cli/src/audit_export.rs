@@ -566,10 +566,22 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                 }
             }
             Some("wicket.audit.record") => {
-                let (Some(seq), Some(want)) = (o["seq"].as_i64(), o["hash"].as_str()) else { continue };
-                match l.audit_hash_at(seq)? {
-                    Some(h) if h == want => a.records += 1,
-                    Some(_) => a.problems.push(format!("record {seq}: the exported copy's hash differs from the local one")),
+                let Some(seq) = o["seq"].as_i64() else { continue };
+                // Every exported field, not only the hash: a v1 hash covers neither ts, tenant nor
+                // run, so a record moved to another run must be caught here (#120).
+                match l.audit_record_at(seq)? {
+                    Some(r) => {
+                        let local = record_json(&r);
+                        let differ: Vec<&str> = ["ts", "tenant", "run", "kind", "body", "prev", "hash"]
+                            .into_iter()
+                            .filter(|k| o.get(*k).unwrap_or(&Value::Null) != &local[*k])
+                            .collect();
+                        if differ.is_empty() {
+                            a.records += 1;
+                        } else {
+                            a.problems.push(format!("record {seq}: the exported copy's {} differs from the local one", differ.join(", ")));
+                        }
+                    }
                     None => a.problems.push(format!("record {seq}: exported, but missing locally")),
                 }
             }
@@ -639,14 +651,16 @@ mod tests {
     fn rewrite_and_rechain(path: &Path, seq: i64) {
         let c = rusqlite_conn(path);
         c.execute("UPDATE audit SET body = '{\"i\":\"forged\"}' WHERE seq = ?1", [seq]).unwrap();
-        let rows: Vec<(i64, String, String)> = {
-            let mut st = c.prepare("SELECT seq, kind, body FROM audit ORDER BY seq").unwrap();
-            let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        type Row = (i64, i64, String, Option<String>, String, String);
+        let rows: Vec<Row> = {
+            let mut st = c.prepare("SELECT seq, ts, tenant, run, kind, body FROM audit ORDER BY seq").unwrap();
+            let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
             r.map(|x| x.unwrap()).collect()
         };
-        let mut prev = "0".repeat(64);
-        for (s, kind, body) in rows {
-            let h = wicket_store::chain_hash(&prev, &kind, &body);
+        let mut prev = wicket_store::CHAIN_ZERO.to_string();
+        for (s, ts, tenant, run, kind, body) in rows {
+            let f = wicket_store::ChainFields { seq: s, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
+            let h = wicket_store::chain_hash_v2(&prev, &f);
             c.execute("UPDATE audit SET prev = ?2, hash = ?3 WHERE seq = ?1", rusqlite::params![s, prev, h]).unwrap();
             prev = h;
         }
@@ -715,6 +729,37 @@ mod tests {
             .collect();
         let a = verify_against(&l, &cps, &key).unwrap();
         assert!(a.problems.iter().any(|p| p.contains("ends at seq 6")), "{:?}", a.problems);
+    }
+
+    /// #120: on a v1 ledger, whose hashes cover neither ts, tenant nor run, a record moved to another
+    /// run passes the chain check; `--against` compares every exported field, so it is caught.
+    #[test]
+    fn against_catches_edits_a_v1_hash_does_not_cover() {
+        let d = TmpDir::new("against-fields");
+        let lp = d.0.join("ledger.db");
+        let out = d.0.join("audit.jsonl");
+        let l = Ledger::open(&lp).unwrap();
+        let c = rusqlite_conn(&lp);
+        let mut prev = wicket_store::CHAIN_ZERO.to_string();
+        for i in 0..4 {
+            let body = json!({ "i": i }).to_string();
+            let h = wicket_store::chain_hash(&prev, "op", &body);
+            c.execute(
+                "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (10, 'default', 'run_a', 'op', ?1, ?2, ?3)",
+                rusqlite::params![body, prev, h],
+            )
+            .unwrap();
+            prev = h;
+        }
+        let mut x = Exporter::new(&lp, jsonl_cfg(&out), None).unwrap();
+        x.pass(false);
+        let objs = exported_objects(&std::fs::read_to_string(&out).unwrap());
+        let key = wicket_identity::Issuer::generate("test.local").verifying_key();
+        assert!(verify_against(&l, &objs, &key).unwrap().problems.is_empty());
+        c.execute("UPDATE audit SET run = 'run_b', tenant = 'other', ts = 99 WHERE seq = 2", []).unwrap();
+        assert_eq!(l.verify_audit().unwrap(), 4, "a v1 chain doesn't cover them");
+        let a = verify_against(&l, &objs, &key).unwrap();
+        assert_eq!(a.problems, vec!["record 2: the exported copy's ts, tenant, run differs from the local one".to_string()]);
     }
 
     #[test]

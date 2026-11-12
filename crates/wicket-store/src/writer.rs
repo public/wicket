@@ -18,7 +18,7 @@
 //! Batching: the thread takes whatever is queued (at most `max_batch`). If nothing in the batch is
 //! waited on, it lingers up to `linger` for more, to save fsyncs; a waited-on record commits at once.
 
-use crate::{chain_hash, now, Result, StoreError};
+use crate::{chain_hash_v2, now, ChainFields, Result, StoreError, CHAIN_ZERO};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -263,16 +263,20 @@ fn commit_with_retry(conn: &mut Connection, recs: &[Pending], retries: u32) -> s
 /// One batch: read the head and chain every record under one write lock.
 fn commit(conn: &mut Connection, recs: &[Pending]) -> rusqlite::Result<Vec<i64>> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut prev: String =
-        tx.query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).optional()?.unwrap_or_else(|| "0".repeat(64));
+    let (mut seq, mut prev): (i64, String) = tx
+        .query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .unwrap_or_else(|| (0, CHAIN_ZERO.to_string()));
     let mut seqs = Vec::with_capacity(recs.len());
     {
         let mut st =
-            tx.prepare_cached("INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            tx.prepare_cached("INSERT INTO audit (seq, ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
         for r in recs {
-            let hash = chain_hash(&prev, &r.kind, &r.body);
-            st.execute(params![r.ts, r.tenant, r.run, r.kind, r.body, prev, hash])?;
-            seqs.push(tx.last_insert_rowid());
+            seq += 1;
+            let f = ChainFields { seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body: &r.body };
+            let hash = chain_hash_v2(&prev, &f);
+            st.execute(params![seq, r.ts, r.tenant, r.run, r.kind, r.body, prev, hash])?;
+            seqs.push(seq);
             prev = hash;
         }
     }
