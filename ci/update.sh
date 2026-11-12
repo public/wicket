@@ -21,7 +21,9 @@
 #      image;
 #   4. an automatic rollback: the agent's build C, approved by a human, fails an injected health
 #      check on the control host and is switched back to A; the approval is used up;
-#   5. the audit chain verifies and has every step.
+#   5. pruning (#166): a dry run removes nothing; then B, now neither current nor previous on the
+#      control host, goes with its image, while A and C stay (and the nodes, A and B, keep both);
+#   6. the audit chain verifies and has every step.
 #
 # Needs Docker with runsc and the agent image. Env: WICKET, IMAGE (an existing agent image: not
 # built, not removed; default: built as wicket/claude-code:upd-$$ and removed), WICKET_DOCKER (e.g.
@@ -242,11 +244,25 @@ check "  the control host and its node run A" '[ "$(current "$WICKET_HOME/versio
 check "  the approval was used up: C is refused again" '! w self update "$work/C" >"$work/u-c2.log" 2>&1 && grep -q "no human has approved" "$work/u-c2.log"'
 another_turn "the automatic rollback"
 
-# ---- 5. audit ----
-log "5. audit"
+# ---- 5. prune ----
+log "5. prune"
+w self prune --nodes n1,n2 --dry-run >"$work/prune-dry.log" 2>&1 || cat "$work/prune-dry.log"
+cat "$work/prune-dry.log"
+check "a dry run says B would go, keeps its image while a container uses it, and removes nothing" \
+  'grep -q "control: would remove 1 version(s) \[$B_ID\]" "$work/prune-dry.log" && grep -q "kept wicket/claude-code:$B_ID (a container uses it)" "$work/prune-dry.log" && [ -d "$WICKET_HOME/versions/$B_ID" ]'
+# That container is the stopped box which checked that new boxes get B's image: once it is gone,
+# B's image can go too.
+for c in $($DOCKER ps -aq --filter "ancestor=wicket/claude-code:$B_ID"); do $DOCKER rm -f "$c" >/dev/null; done
+w self prune --nodes n1,n2 >"$work/prune.log" 2>&1 || cat "$work/prune.log"
+cat "$work/prune.log"
+check "  prune removes B and its image; A (current) and C (previous) stay" '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ]'
+check "  the nodes keep their current and previous" '[ -d "$(node_dir n1)/versions/$A_ID" ] && [ -d "$(node_dir n1)/versions/$B_ID" ] && grep -q "node:n1: removed 0 version" "$work/prune.log"'
+
+# ---- 6. audit ----
+log "6. audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
 w audit --tail 1000 | grep -oE '"?self\.[a-z_]+' | tr -d '"' | uniq -c | tee "$work/self-audit.txt"
-for k in self.update_refused self.staged self.snapshot self.switched self.health self.committed self.rolled_back; do
+for k in self.update_refused self.staged self.snapshot self.switched self.health self.committed self.rolled_back self.pruned; do
   check "  the audit records $k" 'grep -q " $k$" "$work/self-audit.txt"'
 done
 check "  an automatic rollback is recorded as one" 'w audit --tail 1000 | grep self.rolled_back | grep -q "\"automatic\":true"'
