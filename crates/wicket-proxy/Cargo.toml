@@ -1,6 +1,6 @@
 [package]
 name = "wicket-proxy"
-description = "wicket enforcement points: the TLS-intercepting egress proxy and the LLM proxy, served on unix sockets; plus the vault and per-run CA."
+description = "wicket enforcement points: the TLS-intercepting egress proxy (and its DNS and HTTP/3 side) and the LLM proxy, served on unix sockets; plus the vault and per-run CA."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,7 +19,7 @@ serde_json.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-http-body-util.workspace = true
+http-body-util = { workspace = true, features = ["channel"] }
 http.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
@@ -32,6 +32,12 @@ tracing.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 x509-parser = "0.16"
+wicket-fwd.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+webpki-roots.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 wicket-authz.workspace = true

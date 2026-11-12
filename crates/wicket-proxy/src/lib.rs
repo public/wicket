@@ -4,8 +4,10 @@
 
 pub mod ca;
 pub mod decide;
+pub mod dns;
 pub mod egress;
 pub mod gateway;
+pub mod h3;
 pub mod link;
 pub mod llm;
 pub mod vault;
