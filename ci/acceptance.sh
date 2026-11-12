@@ -304,6 +304,12 @@ pids+=($orphan_pid)
 wait_for 90 'grep -q acc-orphan-up "$work/orphan.log" 2>/dev/null' || true
 orphan=$(run_id_of "$work/orphan.log")
 our_runs+=("$orphan")
+# The supervisor named in the box's owner label (<machine>:<pid>:<start>): this `wicket run` in
+# development mode, wicketd's child for it when installed (the client only relays).
+wait_for 30 '[ -n "$(box_of "$orphan")" ]' || true
+sup=$($DOCKER inspect -f '{{index .Config.Labels "wicket.owner"}}' "$(box_of "$orphan" | head -1)" 2>/dev/null | cut -d: -f2 || true)
+echo "   killing the supervisor, pid ${sup:-?}"
+if [ "$mode" = dev ]; then kill -9 "$sup" 2>/dev/null || true; else sudo -n kill -9 "$sup" 2>/dev/null || true; fi
 kill -9 "$orphan_pid" 2>/dev/null || true
 wait "$orphan_pid" 2>/dev/null || true
 sleep 2

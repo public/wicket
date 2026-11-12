@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ci/acceptance.sh --installed against a system that deploy/install.sh set up in a disposable
-# container (as ci/install-test.sh does): the operator `alex` drives wicketd, privileged steps go
+# container (as ci/install-test.sh does): the operator `you` drives wicketd, privileged steps go
 # through `sudo wicket` (the host break-glass), and the boxes are real gVisor boxes.
 #
 # The container has no Docker daemon or systemd of its own, and gVisor can't run inside it. So:
@@ -61,10 +61,10 @@ $docker run --rm --name "$name" --network host \
   -v "$repo:/src:ro" -v "$pkg:/pkg:ro" -v "$sock:/run/host-docker.sock" -v "$data:$data" \
   -e IMAGE="$image" "$base" bash -euo pipefail -c '
 apt-get update -q >/dev/null && apt-get install -y -q sudo jq curl socat python3 >/dev/null
-useradd --create-home alex
-echo "alex ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/alex
+useradd --create-home you
+echo "you ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/you
 mkdir /opt/pkg && tar -C /opt/pkg -xzf /pkg/wicket-*-x86_64-linux.tar.gz
-/opt/pkg/wicket-*/deploy/install.sh --operator alex --skip-image --trust-domain acc.wicket.test >/tmp/install.log 2>&1 \
+/opt/pkg/wicket-*/deploy/install.sh --operator you --skip-image --trust-domain acc.wicket.test >/tmp/install.log 2>&1 \
   || { tail -30 /tmp/install.log; exit 1; }
 echo "ok: install.sh ran (from the release archive)"
 # The host'"'"'s Docker, for the docker group only (where install.sh put the wicket user).
@@ -79,11 +79,11 @@ for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
 [ -S /run/wicket/wicketd.sock ] || { cat /tmp/wicketd.log; exit 1; }
 echo "ok: wicketd is up"
 # The operator, in a copy of the checkout it can write to.
-mkdir /home/alex/wicket && tar -C /src --exclude=./target --exclude=./ci/h3get/target -cf - . | tar -C /home/alex/wicket -xf - && chown -R alex /home/alex/wicket
-cp /pkg/h3get /home/alex/h3get && chown alex /home/alex/h3get
+mkdir /home/you/wicket && tar -C /src --exclude=./target --exclude=./ci/h3get/target -cf - . | tar -C /home/you/wicket -xf - && chown -R you /home/you/wicket
+cp /pkg/h3get /home/you/h3get && chown you /home/you/h3get
 status=0
-(cd /home/alex/wicket && runuser -u alex -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/alex USER=alex \
-  IMAGE="$IMAGE" H3GET=/home/alex/h3get WICKET_DOCKER="sudo -n docker" ACC_AUDIT_SINK=1 ci/acceptance.sh --installed) || status=$?
+(cd /home/you/wicket && runuser -u you -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/you USER=you \
+  IMAGE="$IMAGE" H3GET=/home/you/h3get WICKET_DOCKER="sudo -n docker" ACC_AUDIT_SINK=1 ci/acceptance.sh --installed) || status=$?
 [ "$status" = 0 ] || { echo "== wicketd log (tail)"; tail -30 /tmp/wicketd.log; }
 exit $status
 '
