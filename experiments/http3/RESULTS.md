@@ -15,14 +15,17 @@ The three changes:
 1. **Raise the QUIC MTU bound on the box leg.** gVisor's loopback costs about 110 µs of CPU per UDP
    datagram, against about 8 µs in runc, and `sendmmsg`/`recvmmsg` don't change that. At the usual 1452-byte MTU, a box
    downloads at 40–100 Mbit/s and burns about 190 CPU-s per GB. The box leg is `lo` plus a unix socket,
-   with no real link. With the terminator's PMTUD upper bound at 16000, gVisor reaches 430–460 Mbit/s
-   at about 43 CPU-s/GB, as cheap as runc at 1452. This needs the client to advertise a large
-   `max_udp_payload_size`.
+   with no real link. With the PMTUD upper bound at 16000 on both ends, gVisor reaches 430–460 Mbit/s
+   at about 43 CPU-s/GB, as cheap as runc at 1452. **That only applies to clients that advertise a
+   large `max_udp_payload_size`.** With the bound on the terminator alone and a stock quinn client
+   (advertising 1472), the MTU stayed at 1472 and throughput stayed at 27–86 Mbit/s. Real clients are
+   unverified, so plan for the stock-client number: 40–100 Mbit/s and about 190 CPU-s/GB.
 2. **The relay frame should be stateless, not flow-id based.** It carries the client's and the
    destination's address and port in both directions. The forwarder then keeps no flow table and no
    idle timer, so QUIC idle timeouts and migration are handled end to end. Add a segment-size field
    (GSO/GRO over the relay).
-3. **Use `SOCK_SEQPACKET` only. `SOCK_DGRAM` is not a usable fallback.** In gVisor the host can't
+3. **Use `SOCK_SEQPACKET` only. `SOCK_DGRAM` is not a usable fallback** (under the box's current runsc
+   flags, `--host-uds=open`). In gVisor the host can't
    answer a box's datagram socket: the socket is unnamed, abstract names stay in the sentry, and a
    bound path never reaches the host. Fall back to a length-framed stream.
 
@@ -60,7 +63,7 @@ takes 10.7–12.7 s.
 | UDP 1500 / 9000 / 65000-byte datagrams on lo (lo MTU 65522) | ok | ok |
 | unix `SOCK_STREAM`, `SOCK_SEQPACKET` to a host socket (1 B – 65000 B, boundaries kept) | ok | ok |
 | unix `SOCK_DGRAM`, connected | host receives, can't reply (peer unnamed) | same |
-| unix `SOCK_DGRAM`, autobound / bound to a path in the mounted dir | nothing reaches the host | host receives, reply refused |
+| unix `SOCK_DGRAM`, autobound / bound to a path in the mounted dir | nothing reaches the host | host receives; the reply failed on the probe's file permissions (not a runc limit) |
 | `UDP_SEGMENT` (GSO), 3600 bytes at segment 1200 | **accepted but ignored**: one 3600-byte datagram | three 1200-byte datagrams |
 | `UDP_GRO`, `IP_RECVTOS`, `IP_MTU_DISCOVER=PROBE`, `sendmmsg`/`recvmmsg` | accepted | accepted |
 
@@ -127,14 +130,15 @@ The noise came from the box's load.
 
 ### 100 MB downloads and CPU per GB
 
-All arms are 2 × 100 MB. Mbit/s is per download; CPU is from `/proc` and the box's cgroup `cpu.stat`
+The gVisor arms are 2 × 100 MB, runc 1 × 100 MB, and direct 3 × 100 MB (the CPU) or 2 × 100 MB (the Mbit/s). Mbit/s is per download; CPU is from `/proc` and the box's cgroup `cpu.stat`
 over the downloads, scaled to 1 GB.
 
 | arm | Mbit/s | box cgroup (sentry + client + fwd) | of which fwd | terminator | origin | total CPU-s/GB |
 |---|---|---|---|---|---|---|
 | direct HTTP/3 on the host | 1,400–1,650 | — (client 6.2) | — | — | 5.5 | **11.7** |
 | gVisor, MTU 1452 | 80–96 | 166 | 80 | 18.7 | 6.8 | **191** |
-| gVisor, `--mtu-upper 16000` | 433–458 | 26 | 12.7 | 10.5 | 6.1 | **43** |
+| gVisor, bound 16000/60000 on the terminator only (stock client, MTU stays 1472) | 27–86 | — | — | — | — | (as 1452) |
+| gVisor, `--mtu-upper 16000` on both ends | 433–458 | 26 | 12.7 | 10.5 | 6.1 | **43** |
 | gVisor, `--mtu-upper 32000` | 470–483 | 23 | 11.8 | 11.4 | 6.5 | 41 |
 | gVisor, `--mtu-upper 60000` | 545–573 | 17.7 | 7.2 | 10.9 | 6.2 | **35** |
 | runc, MTU 1452 | 364 | 16.3 | 6.6 | 13.7 | 6.4 | 36 |
@@ -149,7 +153,8 @@ over the downloads, scaled to 1 GB.
   - In gVisor, `sendmmsg`/`recvmmsg` save about a third at most. 9000-byte datagrams reach 95 MB/s in
     gVisor, so the cost is per datagram.
   - The terminator's own CPU (8–19 s/GB) and the host-side relay are minor.
-  - The box was not throttled at `--cpus 2` (0–23 throttled periods per run).
+  - At MTU 1452 the box runs near its `--cpus 2` cap: 1.4–1.7 CPUs busy, and up to 23 throttled
+    periods per run. With a large MTU it has room to spare.
 - **Batching over the relay** (GSO from quinn into one unix message, split with `sendmmsg` in the
   box; GRO the other way) helps a little at MTU 1452. In two interleaved pairs, fwd CPU fell by 20–22%
   (18.8 → 14.6 and 25.0 → 20.0 s per 200 MB), and throughput went 75 → 92 and 58 → 72 Mbit/s. It makes no difference with a large MTU. Keep it: it's cheap.
@@ -187,11 +192,16 @@ over the downloads, scaled to 1 GB.
 - **GSO in gVisor is broken for QUIC senders.**
   - gVisor accepts `UDP_SEGMENT` but sends the whole buffer as one datagram. A QUIC short-header packet
     runs to the end of the datagram, so the coalesced packets fail to decrypt.
-  - In-box quinn uploads (8 MB POST) lose packets with GSO on: 8 lost and 2 congestion events, against
-    0 with it off. They take 1.3–1.7 s instead of 0.9–1.4 s at MTU 1452. At MTU 16000: 0.52–0.54 s
-    against 0.39–0.41 s.
+  - In-box quinn uploads (8 MB POST) lose packets with GSO on. At MTU 1452: 8 lost and 2 congestion
+    events against 0 with GSO off, taking 1.3–1.7 s against 0.9–1.4 s. At MTU 16000 (forwarder
+    `--gro 1`, see below): 3–4 lost against 0, taking 258–347 ms against 218–245 ms.
+  - Spike bug found on the way: with the forwarder's GRO at 32 and MTU 16000, runs of four or more
+    16000-byte datagrams overflowed the terminator's receive slot (16000 × 3) and were truncated,
+    losing 34–49 packets per upload with or without GSO. Phase 2 must cap a batch at the receiver's
+    slot size.
   - It still completes (loss recovery). The forwarder can't re-split: the segment size is lost.
-  - Clients that use GSO on Linux (quinn, ngtcp2, quiche) are affected. This is a gVisor bug to report
+  - quinn is affected (measured). ngtcp2 and quiche also use GSO on Linux, so they probably are too;
+    that is to check. This is a gVisor bug to report
     upstream. Until it's fixed, a seccomp-style refusal of `UDP_SEGMENT` would be the fix inside the box,
     since clients fall back when the setsockopt fails. Check whether `wicket-entry` can do that under
     runsc.
@@ -214,7 +224,9 @@ over the downloads, scaled to 1 GB.
    - **Wildcard socket:** `IP_PKTINFO` in, `ipi_spec_dst` out, and drop anything outside the
      synthetic /16.
    - **Batching:** `recvmsg` then `recvmmsg(MSG_DONTWAIT)`, coalescing same-flow equal-size runs (GRO);
-     split `seg` batches with `sendmmsg`.
+     split `seg` batches with `sendmmsg`. Cap a coalesced batch at what the receiver's slot holds
+     (segments × max UDP payload, agreed in the frame's setup or fixed per version); the spike didn't
+     and truncated uploads at MTU 16000.
    - **Fallback:** a length-prefixed stream; drop the `SOCK_DGRAM` fallback.
    - **DNS:** a `--udp 198.18.0.1:53` listener over the same frame.
 2. **`wicket-entry`:**
