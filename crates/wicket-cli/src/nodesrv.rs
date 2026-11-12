@@ -294,7 +294,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         }
     };
     let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
-    let audit = Ledger::open(&paths.root.join("audit.db"))?;
+    let audit = crate::audit_export::open_batched(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
     let ctl = paths.socket();
     let ctl_dir = ctl.parent().expect("socket dir");
@@ -321,6 +321,13 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         shipped: AtomicI64::new(-1),
         shipping: Mutex::new(()),
     });
+    // Queued audit records are committed (and shipped, if the control host is connected) on a
+    // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
+    let _flush = crate::audit_export::FlushOnDrop(node.audit.clone());
+    {
+        let n = node.clone();
+        crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
+    }
     reap_previous(&node.docker, &node.paths.runs()).await;
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     eprintln!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);
@@ -701,6 +708,8 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
         swaps: vec![],
         boxes: None,
         capacity: None,
+        fence: None,
+        waker: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = match &ca {
@@ -714,8 +723,20 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
     });
     let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
+    // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
+    // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
+    // the proxy, which forwards them.
+    let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
     let mut tasks = vec![];
+    tasks.push(tokio::spawn({
+        let us = sock.join("udp.sock");
+        async move {
+            if let Err(e) = h3.serve(&us).await {
+                eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
+            }
+        }
+    }));
     let es = sock.join("egress.sock");
     tasks.push(tokio::spawn({
         let es = es.clone();

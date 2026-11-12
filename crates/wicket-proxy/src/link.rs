@@ -75,7 +75,11 @@ pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
     if let Err(e) = l.expose(&ctx.tenant, &ctx.run.0, port, name.as_deref(), &zone) {
         return (e.to_string(), true);
     }
-    let _ = l.audit(&ctx.tenant, Some(&ctx.run), "link.expose", &serde_json::json!({ "port": port, "name": name }));
+    // On the record before it takes effect (fail closed).
+    if let Err(e) = l.audit(&ctx.tenant, Some(&ctx.run), "link.expose", &serde_json::json!({ "port": port, "name": name })) {
+        let _ = l.unexpose(&ctx.run.0, port);
+        return (format!("not exposed: the audit record could not be written ({e})"), true);
+    }
     let who = if ctx.zone.accept_from.is_empty() {
         "your parent (always), and boxes a human approves".to_string()
     } else {
@@ -358,7 +362,7 @@ async fn open(
         return Err(format!("could not listen in box {}: {e}", from.run));
     }
     let address = format!("{name}.{}:{port}", policy::DOMAIN);
-    let _ = ledger(ctx).audit(
+    let audited = ledger(ctx).audit(
         &ctx.tenant,
         Some(&ctx.run),
         "link.open",
@@ -367,6 +371,13 @@ async fn open(
             "address": address, "addr": addr.to_string(), "basis": basis, "grant": grant, "labels": LABELS,
         }),
     );
+    // A link carries traffic only once it is on the record (fail closed).
+    if let Err(e) = audited {
+        let _ = std::fs::remove_file(&host_sock);
+        let _ = ledger(ctx).close_link(&id, "wicket", &format!("the audit record could not be written: {e}"));
+        write_hosts(ctx, &dir, &from.run);
+        return Err(format!("link not opened: the audit record could not be written ({e})"));
+    }
     ctx.emit(Event::Tool { name: "link".into(), detail: format!("opened {id}: {} → {address} ({}, port {port})", from.agent, to.agent) });
     tokio::spawn(relay(ctx.clone(), ops, row, listener, host_sock, dir));
     let who = if from.run == ctx.run.0 { "this box".to_string() } else { format!("box {} ({})", from.agent, from.run) };
@@ -593,6 +604,8 @@ mod tests {
                 swaps: vec![],
                 boxes: Some(Arc::new(boxes)),
                 capacity: None,
+                fence: None,
+                waker: None,
             }
         }
     }

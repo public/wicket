@@ -2,7 +2,7 @@
 resolver = "2"
 # Vendored third-party crates (the patched Biscuit fork) are path dependencies, not members: workspace
 # lint and test runs cover wicket's own code only.
-exclude = ["third_party"]
+exclude = ["third_party", "ci/h3get"]
 members = [
     "crates/wicket-core",
     "crates/wicket-store",
@@ -53,6 +53,12 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 humantime = "2"
 getrandom = "0.2"
 base64 = "0.22"
+# HTTP/3 (#92). ring everywhere, as rustls above; quinn's default provider would be aws-lc-rs.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+webpki-roots = "1"
+libc = "0.2"
 wicket-core = { path = "crates/wicket-core" }
 wicket-store = { path = "crates/wicket-store" }
 wicket-auth = { path = "crates/wicket-auth" }
@@ -63,6 +69,7 @@ wicket-agent = { path = "crates/wicket-agent" }
 wicket-feed = { path = "crates/wicket-feed" }
 wicket-authz = { path = "crates/wicket-authz" }
 wicket-placement = { path = "crates/wicket-placement" }
+wicket-fwd = { path = "crates/wicket-fwd" }
 
 [profile.release]
 debug = 1

@@ -12,7 +12,9 @@ pub mod op;
 pub mod subset;
 
 pub use canon::{canonical_path, CanonError};
-pub use manifest::{AgentSpec, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, ProgramSpec, ReachRule, ZoneSpec};
+pub use manifest::{
+    AgentSpec, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, Persist, ProgramSpec, ReachRule, VolumeSpec, ZoneSpec,
+};
 pub use op::{evaluate, host_verdict, never_reachable, CompiledZone, HostVerdict, Op, RiskClass, Surface, Verdict};
 
 use serde::{Deserialize, Serialize};

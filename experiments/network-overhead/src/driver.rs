@@ -18,7 +18,8 @@ const SNI: &str = "127.0.0.1:18129";
 enum Proxy {
     None,
     /// The egress proxy replica. `mem`: audit rows go to an in-memory ledger. `nopool`: no upstream keep-alive.
-    Mitm { mem: bool, nopool: bool },
+    /// `batched`: audit rows go through wicket's batched audit writer (#62's fix).
+    Mitm { mem: bool, nopool: bool, batched: bool },
     /// CONNECT, host decision, SNI check, then copy.
     Pass { splice: bool },
     /// SNI only (no CONNECT), then copy.
@@ -49,12 +50,14 @@ fn setups() -> Vec<Setup> {
     vec![
         s("direct", None, Direct, false),
         s("direct-h2", None, Direct, true),
-        s("mitm/unix", Mitm { mem: false, nopool: false }, Direct, false),
-        s("mitm/socat", Mitm { mem: false, nopool: false }, Socat { nodelay: false }, false),
-        s("mitm/socat-nodelay", Mitm { mem: false, nopool: false }, Socat { nodelay: true }, false),
-        s("mitm/fwd", Mitm { mem: false, nopool: false }, Fwd { splice: false }, false),
-        s("mitm-memaudit/unix", Mitm { mem: true, nopool: false }, Direct, false),
-        s("mitm-nopool/unix", Mitm { mem: false, nopool: true }, Direct, false),
+        s("mitm/unix", Mitm { mem: false, nopool: false, batched: false }, Direct, false),
+        s("mitm/socat", Mitm { mem: false, nopool: false, batched: false }, Socat { nodelay: false }, false),
+        s("mitm/socat-nodelay", Mitm { mem: false, nopool: false, batched: false }, Socat { nodelay: true }, false),
+        s("mitm/fwd", Mitm { mem: false, nopool: false, batched: false }, Fwd { splice: false }, false),
+        s("mitm-memaudit/unix", Mitm { mem: true, nopool: false, batched: false }, Direct, false),
+        s("mitm-batched/unix", Mitm { mem: false, nopool: false, batched: true }, Direct, false),
+        s("mitm-batched/fwd", Mitm { mem: false, nopool: false, batched: true }, Fwd { splice: false }, false),
+        s("mitm-nopool/unix", Mitm { mem: false, nopool: true, batched: false }, Direct, false),
         s("pass/unix", Pass { splice: false }, Direct, false),
         s("pass/socat", Pass { splice: false }, Socat { nodelay: false }, false),
         s("pass-splice/unix", Pass { splice: true }, Direct, false),
@@ -164,7 +167,7 @@ async fn start(s: &Setup, work: &Path, stamps: &Path) -> Result<(Procs, Target)>
             ep = Endpoint::Tcp(ORIGIN.parse()?);
             connect = false;
         }
-        Proxy::Mitm { mem, nopool } => {
+        Proxy::Mitm { mem, nopool, batched } => {
             let ledger = work.join("ledger.db");
             for ext in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{ext}", ledger.display()));
@@ -175,6 +178,9 @@ async fn start(s: &Setup, work: &Path, stamps: &Path) -> Result<(Procs, Target)>
             c.args(["--ledger", &if mem { ":memory:".into() } else { ledger.display().to_string() }, "--stamps", &stamps.display().to_string()]);
             if nopool {
                 c.arg("--no-pool");
+            }
+            if batched {
+                c.arg("--batched");
             }
             named.push(("proxy", c.spawn()?));
             wait_for(&Endpoint::Unix(sock.clone())).await?;
@@ -241,7 +247,8 @@ pub async fn run() -> Result<()> {
     let res = async {
         for round in 0..rounds {
             for s in setups() {
-                if only.as_deref().is_some_and(|o| !s.name.contains(o)) {
+                // `--only a,b`: setups whose name contains any of them.
+                if only.as_deref().is_some_and(|o| !o.split(',').any(|x| s.name.contains(x))) {
                     continue;
                 }
                 eprintln!("round {round}: {}", s.name);

@@ -56,6 +56,7 @@ getrandom.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 ciborium = "0.2"
 wicket-placement = { workspace = true, features = ["mock"] }
 p256 = { version = "0.13", features = ["ecdsa"] }

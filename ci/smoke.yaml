@@ -10,6 +10,9 @@ zone:
   isolation: gvisor
   reach:
     - { host: example.com, methods: [GET], paths: ["/"] }
+  # For the HTTP/3 check: a forbidden host doesn't even resolve.
+  forbid:
+    - { host: forbidden.example.com, paths: ["/**"] }
   llm:
     secret: mock
     upstream: http://127.0.0.1:9999

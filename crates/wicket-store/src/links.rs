@@ -87,6 +87,12 @@ impl Ledger {
         Ok(())
     }
 
+    /// Takes back an expose (one that could not be recorded in the audit log).
+    pub fn unexpose(&self, run: &str, port: u16) -> Result<()> {
+        self.conn.execute("DELETE FROM exposes WHERE run = ?1 AND port = ?2", params![run, port])?;
+        Ok(())
+    }
+
     pub fn exposed(&self, run: &str, port: u16) -> Result<Option<ExposeRow>> {
         Ok(self
             .conn

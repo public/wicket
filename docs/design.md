@@ -1842,7 +1842,31 @@ its label is the join of everything that shaped it.
   input. The session stays open for `agent.idle_timeout` after each turn and closes after that. Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
-Not built: snapshots, hibernate and wake, object storage, encryption of agent state.
+**Hibernate and wake (#70, 2026-11-12).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0), with `docker pause` for Idle.
+- The ledger has an agent row for each long-lived agent: its state, generation, session, manifest and head
+  bundle.
+  - A wake is a compare-and-set claim that bumps the generation.
+  - The LLM, egress and gateway proxies refuse a stale generation.
+  - A push commits only under the current generation, and from the head it started from.
+- The bundle is the box's whole writable state:
+  - the workspace (or the in-place directory);
+  - all of `/wicket/state`;
+  - `/tmp`, now a per-box host directory;
+  - `durable` volumes. `node` and `cache` volumes stay out of the bundle; on one node they behave the same.
+- Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory now). Each is verified by its
+  tree digest on restore.
+- The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
+  recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
+  messages can't buy it a fresh budget.
+- Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
+  box stays Idle.
+- Not built:
+  - encryption and signing (the agent data key, a signed `StateManifest`);
+  - S3-compatible backends;
+  - the Sleeping tier (a stopped box with its state cached on the node);
+  - the gVisor checkpoint (H2);
+  - garbage collection;
+  - hibernation for node and wrapped boxes.
 
 Volumes inherit the zone's taint like any store (§12): whatever one run leaves there, the next one reads.
 

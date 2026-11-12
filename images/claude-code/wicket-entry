@@ -8,6 +8,10 @@
 set -eu
 
 WICKET_ADDR=198.18.0.1
+# wicket's DNS answers every host the zone allows with an address of its own in this range, one per
+# host (#92); QUIC to it is relayed to wicket, which terminates it as that host. One address with the
+# /16 prefix makes the whole range local (gVisor refuses `ip route add local`).
+SYNTHETIC=198.19.0.1/16
 
 # gVisor's save/restore hook (`runsc checkpoint --save-restore-exec-argv="wicket-entry --restore-hook"`)
 # runs this as root inside the sandbox, with GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE=save, resume or restore. A
@@ -16,7 +20,7 @@ WICKET_ADDR=198.18.0.1
 # Not wired yet: wicket parks boxes by rebuild today; this is for memory restore (experiment #70, H2).
 if [ "${1:-}" = --restore-hook ]; then
   case "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE:-restore}" in
-    restore|resume) ip addr replace "$WICKET_ADDR/32" dev lo ;;
+    restore|resume) ip addr replace "$WICKET_ADDR/32" dev lo; ip addr replace "$SYNTHETIC" dev lo ;;
   esac
   exit 0
 fi
@@ -31,13 +35,18 @@ drop() { setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --boun
 # One `ip -batch` (~60 ms under gVisor; 32 separate `ip` calls took ~0.7 s).
 seq 1 32 | sed 's|.*|addr replace 198.18.1.&/32 dev lo|' | ip -batch -
 ip addr replace "$WICKET_ADDR/32" dev lo
+ip addr replace "$SYNTHETIC" dev lo
 
-# One forwarder for all three (crates/wicket-fwd): TCP_NODELAY, large buffers, splice, a thread per
-# direction. Its log lines (listeners, errors, the address going missing) go to the box's stderr.
+# One forwarder for all of them (crates/wicket-fwd): TCP_NODELAY, large buffers, splice, a thread per
+# direction; and datagrams, in frames over one unix connection each: QUIC (HTTP/3) to any synthetic
+# address, and DNS (the box's resolver is wicket.internal). Its log lines (listeners, errors, the
+# address going missing) go to the box's stderr.
 SOCK=/wicket/sock
 drop wicket-fwd --listen $WICKET_ADDR:3128=$SOCK/egress.sock \
                 --listen $WICKET_ADDR:8080=$SOCK/llm.sock \
-                --listen $WICKET_ADDR:8081=$SOCK/gateway.sock &
+                --listen $WICKET_ADDR:8081=$SOCK/gateway.sock \
+                --udp 0.0.0.0:443=$SOCK/udp.sock \
+                --udp $WICKET_ADDR:53=$SOCK/udp.sock &
 
 # Trust the run's CA (public certificate only) alongside the system roots.
 drop sh -c 'cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-bundle.pem'

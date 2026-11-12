@@ -23,6 +23,10 @@ What it does:
   uses Anthropic API keys) and the **egress proxy**
   (per-run CA, TLS interception, canonicalize-or-reject, reach rules, a GitHub dangerous-pattern list, credential
   injection into one declared header slot);
+- **HTTP/3** goes the same way: the box resolves names through **wicket's DNS** (reachable hosts get a
+  synthetic address in 198.19.0.0/16, hidden and forbidden hosts NXDOMAIN), its forwarder relays QUIC to
+  wicket, and wicket terminates it with the run's CA and decides each request exactly like an HTTP/1.1
+  one, re-originating it over HTTP/3 when the origin offers it (else HTTP/2); 0-RTT is refused;
 - a minimal **MCP gateway** is the agent's only MCP server; its `await_grant` tool lets a blocked agent wait for
   the human's decision instead of sleeping and retrying;
 - requests outside the zone's reach become **pending escalations** (HTTP 403 problem+json with a request id); a
@@ -411,6 +415,7 @@ These are general features for any workload:
   datasets, any state.
 - **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
   a follow-up, which becomes its next turn.
+- **Long-lived agents hibernate and wake** (see below).
 - **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
   allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
 - **`inject` rules can be `optional`,** and `{basic:USER}` renders an HTTP Basic credential (e.g. git over
@@ -418,12 +423,63 @@ These are general features for any workload:
 
 `examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
 
+### Hibernate and wake
+
+Every Claude Code agent wicket launches on this host is a long-lived agent with an id (`agt_…`), its own
+Claude Code session, and a generation number. Each run is one activation of it. `wicket agents` lists them with
+their state, generation and bundle size.
+
+- **Idle.** With `agent.hibernate_after` set, the box is paused (`docker pause`) once `idle_timeout` has passed
+  after a turn. Its processes and memory are kept, and a follow-up unpauses it.
+- **Hibernated.** At `hibernate_after`, or when you run `wicket hibernate <run>`, the agent is hibernated if
+  the box is at a quiet point: its turn has ended, and nothing but the agent runtime runs in it. Its box stops,
+  and its whole writable state is bundled into wicket's object store: the workspace, all of `/wicket/state`
+  (`$HOME` and the Claude Code config), `/tmp`, and the zone's `persist: durable` volumes. Each tree is tar +
+  zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
+  background build, a dev server) stays Idle instead, because a rebuild restores files, not processes.
+- **Wake.** `wicket wake <agent> ["…"]`, `wicket say <run or agent> "…"`, or a message from another agent
+  rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
+  `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,
+  and by what. A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly
+  one wins. The proxies refuse requests from a stale generation, and a push of state only commits under the
+  current one.
+- **Volumes by class** (`zone.volumes[].persist`):
+  - `durable`: the agent's own, bundled;
+  - `node` (the default): shared by the zone, kept on the node;
+  - `cache`: never bundled, and may be empty after a wake on another node. On one node it behaves like `node`.
+- **Budgets belong to the agent, over its whole life.** The zone's model budget (`max_requests`,
+  `max_output_tokens`, `max_input_tokens`) and `limits.timeout` (total time in a box, Idle included) are
+  recorded on the agent. A wake continues from what is left; it never resets them. Budget handed to children
+  counts as spent. An agent that has spent a budget isn't woken again, by any source.
+- At the timeout, an idle agent at a quiet point hibernates, and any other is stopped.
+- Only a hibernated agent can be woken. If its session ends any other way (stopped, timed out mid-turn, or
+  over its `/tmp` cap), the agent is `ended`.
+- A local box's `/tmp` is a host directory in the run's directory, so it is kept with the rest, and survives a
+  crash of the supervisor. wicket stops the box if `/tmp` goes over 512 MiB, checking every 5 s; the old tmpfs
+  enforced that cap exactly.
+- wicket sets Claude Code's `cleanupPeriodDays` itself, so a sleeping agent's sessions aren't swept, and a
+  manifest can't set it.
+- `ci/hibernate.sh` tests all of this end to end with the mock model.
+
+Not yet: encryption and signing of bundles, an S3 backend, the gVisor checkpoint fast path, and hibernating
+boxes on remote nodes or wrapped sessions.
+
 ### Inside the box
 
 wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
 script), so the agent has all of localhost for its own servers. Links to other boxes get addresses from
 198.18.1.1 onward and names in the box's hosts file, which wicket owns and the box can only read. The entry script adds that address as root
 with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+
+The box's resolver is wicket.internal:53: wicket answers every query itself, so a lookup can't carry data
+out. Every host the zone can reach resolves to its own address in 198.19.0.0/16 (on the box's loopback);
+QUIC sent there is relayed to wicket over a bind-mounted unix socket and served as that host. Under gVisor
+each UDP datagram is costly (about 110 µs of CPU in the box), so HTTP/3 downloads run at 40–100 Mbit/s with
+the usual 1452-byte packets. `WICKET_H3_BOX_MTU=16000` lets the box's leg (loopback and a unix socket, no
+real link) use 16000-byte packets for clients that accept them: 430–460 Mbit/s in #92's measurements.
+`WICKET_H3_HTTPS_RECORDS=0` stops wicket answering HTTPS (`alpn=h3`) DNS records.
+The forwarder holds UDP port 443 on every address in the box (it catches QUIC to any synthetic address),
+so a server in the box can't take UDP 443, even on 127.0.0.1; TCP 443 and every other port stay the agent's.
 
 ### Agents launched by something else, e.g. Remote Control
 

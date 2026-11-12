@@ -8,7 +8,8 @@
 //! ```text
 //! wicket-fwd --listen 198.18.0.1:3128=/wicket/sock/egress.sock \
 //!            --listen 198.18.0.1:8080=/wicket/sock/llm.sock \
-//!            --listen 198.18.0.1:8081=/wicket/sock/gateway.sock
+//!            --listen 198.18.0.1:8081=/wicket/sock/gateway.sock \
+//!            --udp 0.0.0.0:443=/wicket/sock/udp.sock --udp 198.18.0.1:53=/wicket/sock/udp.sock
 //! ```
 //!
 //! Each accepted TCP connection gets a new connection to its unix socket, and bytes are relayed both
@@ -64,41 +65,30 @@
 //! logs `address 198.18.0.1 is gone` and `... is back`, so a missing hook shows up in the box's log
 //! instead of as silent retries in the agent. `bench/addr-gone.sh` checks all of this in a gVisor box.
 //!
-//! # Datagrams, later (HTTP/3, DNS)
+//! # Datagrams (HTTP/3 and DNS, #92)
 //!
-//! Not built yet; the CLI and code are shaped for it. [`Kind`] gets a `Udp` variant and the CLI a
-//! `--udp ADDR:PORT=PATH` (and `--udp *:443=PATH` for a wildcard socket), parsed by the same
-//! [`spec::parse`]. Addresses on `lo` stay `wicket-entry`'s business (root only at start, the forwarder
-//! never has `NET_ADMIN`): it puts the synthetic range wicket's DNS answers from (198.19.0.0/16, one
-//! address per upstream host) on `lo` once, as a prefix, so every address in it is local without
-//! adding them one by one (whether gVisor honours a prefix on `lo` is #92's spike); the forwarder
-//! only listens.
+//! `--udp ADDR:PORT=PATH` listeners relay datagrams in [`frame`]s; see [`udp`] for the details.
+//! `wicket-entry` starts two, both to `/wicket/sock/udp.sock`:
 //!
-//! - **In the box.** One UDP socket per listener, or one wildcard `0.0.0.0:443` socket with
-//!   `IP_PKTINFO` (`IPV6_RECVPKTINFO`) so each datagram's original destination is known even across
-//!   many synthetic addresses; replies are sent with the same `IP_PKTINFO` so their source is the
-//!   address the client sent to. A flow is (client addr:port, destination addr:port); the forwarder
-//!   gives each a 32-bit id and forgets it after an idle timeout (QUIC's idle timeout, 30 s by default).
-//! - **To the host.** One `SOCK_SEQPACKET` unix connection per UDP listener, falling back to
-//!   `SOCK_DGRAM`: both keep datagram boundaries, so no length prefix is needed; seqpacket also tells
-//!   each side when the other goes away. Every message is a fixed header then the payload:
-//!   `version u8 (1) | kind u8 (0 data, 1 flow closed) | family u8 (4 or 6) | reserved u8 |
-//!   flow id u32 | destination port u16 | client port u16 | destination address (16 bytes, v4-mapped)`
-//!   (28 bytes, network byte order), then up to 65,507 payload bytes. Replies from the host carry the
-//!   same header, so the forwarder knows which flow and source address to answer from. The client
-//!   address stays in the box: the host only needs the flow id.
-//! - **On the host** (#92): the relay terminates QUIC with wicket's CA, as the host name the
-//!   synthetic destination address was minted for by wicket's DNS, and decides each HTTP/3 request
-//!   like an HTTP/1 or HTTP/2 one. The forwarder needs no policy: it never sees a host name.
-//! - **DNS** on 198.18.0.1:53: TCP DNS is an ordinary `--listen 198.18.0.1:53=/wicket/sock/dns.sock`
-//!   today; UDP DNS is a `--udp 198.18.0.1:53=...` listener over the same framing, its answers
-//!   (synthetic addresses in 198.19.0.0/16, NXDOMAIN for hidden hosts) decided on the host.
-//! - **Not built here yet** because its other ends (the host relay, wicket's DNS, the synthetic
-//!   addresses on `lo`) don't exist yet; it lands with them, for 0.0.1 (#92).
+//! ```text
+//! --udp 0.0.0.0:443=/wicket/sock/udp.sock      # QUIC to any synthetic address (198.19.0.0/16 on lo)
+//! --udp 198.18.0.1:53=/wicket/sock/udp.sock    # DNS: the box's resolver
+//! ```
+//!
+//! wicket's DNS answers every allowed host with a synthetic address in 198.19.0.0/16 (and hidden
+//! hosts with NXDOMAIN); `wicket-entry` puts that whole range on `lo` as one address with a /16
+//! prefix (gVisor makes the prefix local; it refuses `ip route add local`). The forwarder never sees
+//! a host name and decides nothing: the host terminates QUIC as the name the address was minted for.
+//!
+//! The frame is stateless (both addresses in every frame, both ways) rather than flow ids, so the
+//! forwarder has no flow table to expire and QUIC migration needs nothing from it. The host side is
+//! `wicket_proxy::h3`.
 
 pub mod copy;
+pub mod frame;
 pub mod spec;
 mod sys;
+pub mod udp;
 
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -168,7 +158,12 @@ impl Forwarder {
     pub fn start(cfg: Config) -> io::Result<Forwarder> {
         spec::check_distinct(&cfg.listens).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut bound = Vec::new();
-        for l in &cfg.listens {
+        let mut udp = Vec::new();
+        for l in cfg.listens.iter().filter(|l| l.kind == Kind::Udp) {
+            let s = udp::bind(l.addr, cfg.bind_timeout).map_err(|e| io::Error::new(e.kind(), format!("udp {}: {e}", l.addr)))?;
+            udp.push((l.clone(), s));
+        }
+        for l in cfg.listens.iter().filter(|l| l.kind == Kind::Tcp) {
             let listener = bind(l.addr, cfg.bind_timeout).map_err(|e| io::Error::new(e.kind(), format!("listen {}: {e}", l.addr)))?;
             bound.push((l.clone(), listener));
         }
@@ -182,6 +177,13 @@ impl Forwarder {
             addrs.push(addr);
             let (cfg, gate) = (cfg.clone(), gate.clone());
             threads.push(thread::Builder::new().name(format!("accept {addr}")).spawn(move || accept_loop(listener, l.path, cfg, gate))?);
+        }
+        for (l, sock) in udp {
+            let addr = sock.local_addr()?;
+            log!("listening {}", Listen { addr, ..l.clone() });
+            addrs.push(addr);
+            let verbose = cfg.verbose;
+            threads.push(thread::Builder::new().name(format!("udp {addr}")).spawn(move || udp::serve(sock, l.path, verbose))?);
         }
         if !cfg.watch_every.is_zero() {
             let mut ips: Vec<IpAddr> = addrs.iter().map(SocketAddr::ip).filter(|ip| !ip.is_unspecified()).collect();

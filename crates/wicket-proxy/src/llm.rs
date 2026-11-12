@@ -35,6 +35,11 @@ pub struct Llm {
     pub reserved_requests: AtomicU64,
     pub reserved_output_tokens: AtomicU64,
     pub reserved_input_tokens: AtomicU64,
+    /// What a long-lived agent's earlier activations already spent (#70): the zone's budget is the
+    /// agent's, over its whole life, so a wake starts from what is left, not from a fresh budget.
+    pub prior_requests: AtomicU64,
+    pub prior_input_tokens: AtomicU64,
+    pub prior_output_tokens: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
 }
 
@@ -42,8 +47,12 @@ impl Llm {
     /// Model requests and output tokens this run has left to spend or hand on.
     pub fn remaining(&self) -> Option<(u64, u64)> {
         let spec = self.ctx.zone.llm.as_ref()?;
-        let used_r = self.requests.load(Ordering::SeqCst) + self.reserved_requests.load(Ordering::SeqCst);
-        let used_t = self.output_tokens.load(Ordering::SeqCst) + self.reserved_output_tokens.load(Ordering::SeqCst);
+        let used_r = self.requests.load(Ordering::SeqCst)
+            + self.reserved_requests.load(Ordering::SeqCst)
+            + self.prior_requests.load(Ordering::SeqCst);
+        let used_t = self.output_tokens.load(Ordering::SeqCst)
+            + self.reserved_output_tokens.load(Ordering::SeqCst)
+            + self.prior_output_tokens.load(Ordering::SeqCst);
         Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(used_t)))
     }
 
@@ -57,7 +66,9 @@ impl Llm {
     /// Input tokens this run has left to spend or hand on, if its zone caps them.
     pub fn remaining_input(&self) -> Option<u64> {
         let max = self.ctx.zone.llm.as_ref()?.max_input_tokens?;
-        Some(max.saturating_sub(self.input_total() + self.reserved_input_tokens.load(Ordering::SeqCst)))
+        Some(max.saturating_sub(
+            self.input_total() + self.reserved_input_tokens.load(Ordering::SeqCst) + self.prior_input_tokens.load(Ordering::SeqCst),
+        ))
     }
 
     pub fn new(ctx: RunCtx) -> Result<Arc<Llm>> {
@@ -73,8 +84,41 @@ impl Llm {
             reserved_requests: AtomicU64::new(0),
             reserved_output_tokens: AtomicU64::new(0),
             reserved_input_tokens: AtomicU64::new(0),
+            prior_requests: AtomicU64::new(0),
+            prior_input_tokens: AtomicU64::new(0),
+            prior_output_tokens: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
+    }
+
+    /// Starts this activation from what the agent's earlier ones spent (#70).
+    pub fn spent_before(&self, requests: u64, input_tokens: u64, output_tokens: u64) {
+        self.prior_requests.store(requests, Ordering::SeqCst);
+        self.prior_input_tokens.store(input_tokens, Ordering::SeqCst);
+        self.prior_output_tokens.store(output_tokens, Ordering::SeqCst);
+    }
+
+    /// What counts against the zone's budget so far, over the agent's life: (requests, input tokens
+    /// with cached ones, output tokens). Budget handed to children counts as spent.
+    pub fn spent_total(&self) -> (u64, u64, u64) {
+        (
+            self.requests.load(Ordering::SeqCst)
+                + self.reserved_requests.load(Ordering::SeqCst)
+                + self.prior_requests.load(Ordering::SeqCst),
+            self.input_total() + self.reserved_input_tokens.load(Ordering::SeqCst) + self.prior_input_tokens.load(Ordering::SeqCst),
+            self.output_tokens.load(Ordering::SeqCst)
+                + self.reserved_output_tokens.load(Ordering::SeqCst)
+                + self.prior_output_tokens.load(Ordering::SeqCst),
+        )
+    }
+
+    /// How the budget is described: per run, or (for a woken agent) over its life.
+    fn whose(&self) -> &'static str {
+        if self.prior_requests.load(Ordering::SeqCst) + self.prior_output_tokens.load(Ordering::SeqCst) > 0 {
+            "this agent, over all its activations,"
+        } else {
+            "this run"
+        }
     }
 
     /// Seconds since the agent last called the model: the liveness signal.
@@ -105,24 +149,35 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
-        let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1 + self.reserved_requests.load(Ordering::SeqCst);
+        if let Some(why) = self.ctx.superseded() {
+            self.event(None, 409, Usage::default(), "stale generation");
+            return problem(409, "stale-generation", "This activation is stale", &why, None);
+        }
+        let n = self.requests.fetch_add(1, Ordering::SeqCst)
+            + 1
+            + self.reserved_requests.load(Ordering::SeqCst)
+            + self.prior_requests.load(Ordering::SeqCst);
         if n > spec.max_requests {
             self.event(None, 429, Usage::default(), "budget: request cap reached");
             return problem(
                 429,
                 "budget",
                 "Model request budget exhausted",
-                &format!("this run may make at most {} model requests", spec.max_requests),
+                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
                 None,
             );
         }
-        if self.output_tokens.load(Ordering::SeqCst) + self.reserved_output_tokens.load(Ordering::SeqCst) >= spec.max_output_tokens {
+        if self.output_tokens.load(Ordering::SeqCst)
+            + self.reserved_output_tokens.load(Ordering::SeqCst)
+            + self.prior_output_tokens.load(Ordering::SeqCst)
+            >= spec.max_output_tokens
+        {
             self.event(None, 429, Usage::default(), "budget: output token cap reached");
             return problem(
                 429,
                 "budget",
                 "Model token budget exhausted",
-                &format!("this run may generate at most {} output tokens", spec.max_output_tokens),
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
                 None,
             );
         }
@@ -132,7 +187,7 @@ impl Llm {
                 429,
                 "budget",
                 "Model token budget exhausted",
-                &format!("this run may use at most {max} input tokens, cached ones included"),
+                &format!("{} may use at most {max} input tokens, cached ones included", self.whose()),
                 None,
             );
         }
@@ -270,6 +325,122 @@ fn max_after(s: &str, key: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{usage, Usage};
+
+    /// A run context for zone `z` (with a model route), fenced as `fence` if given.
+    fn ctx(ledger: wicket_store::Ledger, fence: Option<crate::Fence>, llm: &str) -> crate::RunCtx {
+        use std::sync::{Arc, Mutex};
+        let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {llm}}}")).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::RunCtx {
+            tenant: wicket_core::TenantId::single(),
+            run: wicket_core::RunId("run_old".into()),
+            zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
+            ledger: Arc::new(Mutex::new(ledger)),
+            vault: crate::vault::Vault::new(std::env::temp_dir().join("wicket-llm-no-vault")),
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps: vec![],
+            boxes: None,
+            capacity: None,
+            fence,
+            waker: None,
+        }
+    }
+
+    fn hibernated_agent(ledger: &mut wicket_store::Ledger) -> String {
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "z",
+                name: "a",
+                run: "run_old",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        agent
+    }
+
+    /// Serves `llm` on a socket and sends it one model request: (status, body).
+    async fn post(llm: std::sync::Arc<super::Llm>, tag: &str) -> (u16, String) {
+        use http_body_util::BodyExt;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("llm.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { llm.serve(&sock).await }
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        (status, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// #70: once the agent has been woken again, an older activation's model calls are refused.
+    #[tokio::test]
+    async fn a_stale_generation_is_refused() {
+        let mut ledger = wicket_store::Ledger::open_in_memory().unwrap();
+        let agent = hibernated_agent(&mut ledger);
+        let ctx = ctx(ledger, Some(crate::Fence { agent: agent.clone(), generation: 1 }), "{}");
+        assert_eq!(ctx.superseded(), None, "generation 1 is current");
+        // A second activation claims the agent: generation 2.
+        assert_eq!(ctx.ledger.lock().unwrap().claim_wake(&agent, "run_new", 0).unwrap(), Some(2));
+        assert!(ctx.superseded().unwrap().contains("stale"));
+        let llm = super::Llm::new(ctx).unwrap();
+        let (status, body) = post(llm.clone(), "fence").await;
+        assert_eq!(status, 409);
+        assert!(body.contains("generation 2"), "{body}");
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "not counted, never forwarded");
+    }
+
+    /// #70: the zone's model budget is the agent's over its life. A woken activation starts from
+    /// what its earlier ones left, and an exhausted agent gets 429 without a model call.
+    #[tokio::test]
+    async fn a_woken_agent_continues_its_budget() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 5, max_output_tokens: 100}"))
+            .unwrap();
+        llm.spent_before(3, 40, 60);
+        assert_eq!(llm.remaining(), Some((2, 40)), "children are carved from what is left");
+        llm.reserved_requests.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(llm.spent_total(), (4, 40, 60));
+        // Every request is spent: refused, never forwarded (the default upstream is never contacted).
+        llm.spent_before(5, 40, 60);
+        llm.reserved_requests.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = post(llm.clone(), "budget").await;
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("over all its activations"), "{body}");
+        // Output tokens spent instead.
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 5, max_output_tokens: 100}"))
+            .unwrap();
+        llm.spent_before(1, 0, 100);
+        let (status, _) = post(llm, "tokens").await;
+        assert_eq!(status, 429);
+    }
 
     #[test]
     fn usage_from_sse_and_json() {

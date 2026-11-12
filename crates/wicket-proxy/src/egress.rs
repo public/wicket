@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
@@ -27,13 +27,49 @@ use wicket_core::{canonical_path, manifest::host_matches, Op};
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 pub struct Egress {
-    ctx: RunCtx,
-    ca: Arc<dyn Minter>,
-    decider: Arc<dyn Decider>,
-    relay: Option<Arc<dyn Relay>>,
+    pub(crate) ctx: RunCtx,
+    pub(crate) ca: Arc<dyn Minter>,
+    pub(crate) decider: Arc<dyn Decider>,
+    pub(crate) relay: Option<Arc<dyn Relay>>,
     client: reqwest::Client,
+    /// Where upstream connections go and what they trust, beyond DNS and the public roots (tests).
+    pub(crate) upstream: Upstream,
+    /// HTTP/3 upstream connections, made on first use (requests that arrived over HTTP/3).
+    h3_up: tokio::sync::OnceCell<Option<Arc<crate::h3::Up>>>,
     /// Blocked attempts this run: per request (or host), and in total.
     strikes: std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
+}
+
+/// How upstream connections are made. The default (public DNS and the public roots) is what runs
+/// use; tests point hosts at local origins with their own CA.
+#[derive(Clone, Default)]
+pub struct Upstream {
+    /// Host -> address, instead of DNS.
+    pub resolve: std::collections::HashMap<String, std::net::SocketAddr>,
+    /// Extra trusted roots (PEM), besides the public ones.
+    pub roots_pem: Option<String>,
+    /// Re-originate requests that arrived over HTTP/3 over HTTP/3 too, when the upstream offers it
+    /// (default on; HTTP/2 or HTTP/1.1 otherwise).
+    pub no_h3: bool,
+}
+
+/// How a request reached the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Via {
+    /// CONNECT (or plain HTTP) over the box's TCP forwarder.
+    Tcp,
+    /// HTTP/3 over the box's UDP forwarder.
+    H3,
+}
+
+/// A request ready to go upstream: decided, credentials stripped and injected.
+pub(crate) struct Outgoing {
+    pub method: http::Method,
+    pub url: String,
+    pub headers: http::HeaderMap,
+    pub body: Bytes,
+    /// What must never be reflected back into the box (injected secrets and their rendering).
+    pub injected: Vec<String>,
 }
 
 /// A byte stream to the control host (one tunnel over the node's control channel).
@@ -60,12 +96,31 @@ impl Egress {
 
     /// An egress proxy with its own decision source, CA and (on a node) relay to the control host.
     pub fn with(ctx: RunCtx, ca: Arc<dyn Minter>, decider: Arc<dyn Decider>, relay: Option<Arc<dyn Relay>>) -> Result<Arc<Egress>> {
-        let client = reqwest::Client::builder()
+        Egress::with_upstream(ctx, ca, decider, relay, Upstream::default())
+    }
+
+    /// As [`Egress::with`], with upstream connections made as `upstream` says.
+    pub fn with_upstream(
+        ctx: RunCtx,
+        ca: Arc<dyn Minter>,
+        decider: Arc<dyn Decider>,
+        relay: Option<Arc<dyn Relay>>,
+        upstream: Upstream,
+    ) -> Result<Arc<Egress>> {
+        let mut b = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()?;
-        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, strikes: Default::default() }))
+            .connect_timeout(std::time::Duration::from_secs(15));
+        for (host, addr) in &upstream.resolve {
+            b = b.resolve(host, *addr);
+        }
+        if let Some(pem) = &upstream.roots_pem {
+            for c in reqwest::Certificate::from_pem_bundle(pem.as_bytes())? {
+                b = b.add_root_certificate(c);
+            }
+        }
+        let client = b.build()?;
+        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, upstream, h3_up: Default::default(), strikes: Default::default() }))
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -94,6 +149,10 @@ impl Egress {
             }
             if host.parse::<std::net::IpAddr>().is_ok() {
                 return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
+            }
+            // A superseded activation (#70) gets no tunnel at all.
+            if let Some(why) = self.ctx.superseded() {
+                return Ok(self.refuse(&host, "CONNECT", "/", &why));
             }
             if let Some(r) = self.judge_host(&host, "CONNECT") {
                 return Ok(r);
@@ -128,7 +187,7 @@ impl Egress {
                     return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP to {h} isn't served on this node ({why}); use https")));
                 }
                 let me = self.clone();
-                Ok(me.handle(req, h, "http").await)
+                Ok(me.handle(req, h, "http", Via::Tcp).await)
             }
             _ => Ok(problem(400, "bad-request", "Not a proxy request", "use CONNECT or an absolute http:// URL", None)),
         }
@@ -141,7 +200,7 @@ impl Egress {
         let svc = service_fn(move |req: Request<Incoming>| {
             let me = me.clone();
             let host = host.clone();
-            async move { Ok::<_, hyper::Error>(me.handle(req, host, "https").await) }
+            async move { Ok::<_, hyper::Error>(me.handle(req, host, "https", Via::Tcp).await) }
         });
         hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await?;
         Ok(())
@@ -224,7 +283,7 @@ impl Egress {
 
     /// Decides about a host before any request to it (and before TLS): never-reachable hosts are
     /// refused, saying so; in zones that hide unlisted hosts, they behave as if they didn't exist.
-    fn judge_host(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
+    pub(crate) fn judge_host(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
         match self.decider.host_verdict(&self.ctx, host) {
             wicket_core::HostVerdict::Open => None,
             wicket_core::HostVerdict::Forbidden(why) => {
@@ -262,7 +321,7 @@ impl Egress {
 
     /// Counts a blocked attempt and returns a note for the agent once it starts repeating itself: the
     /// point is that an agent at the edge of its sandbox stops and asks, rather than spinning.
-    fn strike(&self, key: &str) -> String {
+    pub(crate) fn strike(&self, key: &str) -> String {
         let (same, total) = {
             let mut s = self.strikes.lock().expect("strikes");
             let same = {
@@ -287,7 +346,7 @@ impl Egress {
         note
     }
 
-    fn refuse(&self, host: &str, method: &str, path: &str, why: &str) -> Response<BoxBody> {
+    pub(crate) fn refuse(&self, host: &str, method: &str, path: &str, why: &str) -> Response<BoxBody> {
         self.ctx.emit(Event::Egress {
             method: method.into(),
             host: host.into(),
@@ -301,8 +360,15 @@ impl Egress {
 
     /// Decide and, if allowed, forward one request. `host` is the CONNECT target (or the absolute
     /// URL's host), never a client-supplied Host header.
-    async fn handle(self: Arc<Self>, req: Request<Incoming>, host: String, scheme: &str) -> Response<BoxBody> {
+    pub(crate) async fn handle<B>(self: Arc<Self>, req: Request<B>, host: String, scheme: &str, via: Via) -> Response<BoxBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let method = req.method().as_str().to_string();
+        if let Some(why) = self.ctx.superseded() {
+            return self.refuse(&host, &method, "/", &why);
+        }
         // Authority pinning: a Host header that disagrees with the tunnel target is an attack.
         if let Some(h) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()) {
             let h = h.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
@@ -332,7 +398,30 @@ impl Egress {
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
         match self.decider.decide(ctx, &op, who.as_ref()).await {
-            Outcome::Allow(detail) => emit("allow", detail),
+            Outcome::Allow(detail) => {
+                // A grant's use must be on the record before the request goes ahead (fail closed).
+                let ev = Event::Egress {
+                    method: method.clone(),
+                    host: host.clone(),
+                    path: path.clone(),
+                    risk: risk.clone(),
+                    outcome: "allow".into(),
+                    detail: detail.clone(),
+                };
+                if let Err(e) = ctx.record(ev) {
+                    emit("unavailable", format!("{detail}; refused: the audit record could not be written ({e})"));
+                    return problem(
+                        503,
+                        "audit-unavailable",
+                        "Blocked by wicket sandbox: the audit log is unavailable",
+                        &format!(
+                            "wicket could not record this request in its audit log, so it was not sent; retry later. {}",
+                            crate::SANDBOX_FACT
+                        ),
+                        None,
+                    );
+                }
+            }
             Outcome::Forbidden(why) => {
                 emit("forbidden", why.clone());
                 let note = self.strike(&op.digest());
@@ -380,23 +469,89 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
-        match self.forward(req, &host, scheme, &pq).await {
+        match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
             Err(e) => problem(502, "upstream", "Upstream error", &e.to_string(), None),
         }
     }
 
-    async fn forward(&self, req: Request<Incoming>, host: &str, scheme: &str, pq: &str) -> Result<Response<BoxBody>> {
+    async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let out = self.prepare(req, host, scheme, pq).await?;
+        if via == Via::H3 && scheme == "https" && !self.upstream.no_h3 {
+            if let Some(up) = self.h3_up().await {
+                if let Some(r) = up.try_send(host, &out).await {
+                    return r.map(|r| self.clean(r, &out.injected));
+                }
+            }
+        }
+        let mut rb = self.client.request(out.method.clone(), &out.url).headers(out.headers.clone());
+        rb = rb.body(out.body.clone());
+        let resp = rb.send().await?;
+        let mut head = Response::builder().status(StatusCode::from_u16(resp.status().as_u16())?);
+        for (name, value) in resp.headers().iter() {
+            head = head.header(name, value);
+        }
+        let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        Ok(self.clean(head.body(BodyExt::boxed(StreamBody::new(stream)))?, &out.injected))
+    }
+
+    /// The HTTP/3 upstream (made on first use); None if its UDP socket can't be had.
+    async fn h3_up(&self) -> Option<Arc<crate::h3::Up>> {
+        self.h3_up
+            .get_or_init(|| async {
+                match crate::h3::Up::new(&self.upstream) {
+                    Ok(u) => Some(Arc::new(u)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no HTTP/3 upstream; using HTTP/2");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// Drops hop-by-hop and stripped response headers, and any that would reflect an injected
+    /// credential back into the box.
+    fn clean(&self, resp: Response<BoxBody>, injected: &[String]) -> Response<BoxBody> {
+        let (mut parts, body) = resp.into_parts();
+        let names: Vec<http::HeaderName> = parts.headers.keys().cloned().collect();
+        for name in names {
+            if STRIP_RESPONSE.contains(&name.as_str()) {
+                parts.headers.remove(&name);
+                continue;
+            }
+            let leaks = parts
+                .headers
+                .get_all(&name)
+                .iter()
+                .any(|v| injected.iter().any(|s| v.as_bytes().windows(s.len()).any(|w| w == s.as_bytes())));
+            if leaks {
+                parts.headers.remove(&name);
+            }
+        }
+        Response::from_parts(parts, body)
+    }
+
+    /// Reads the body (bounded), strips the box's credentials and headers, and injects the zone's.
+    async fn prepare<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str) -> Result<Outgoing>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let (parts, body) = req.into_parts();
         // What the box put in Authorization: only ever a placeholder, to be swapped (below) or dropped.
         let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let url = format!("{scheme}://{host}{pq}");
-        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
-        let mut rb = self.client.request(method, &url);
+        let mut headers = http::HeaderMap::new();
         for (name, value) in parts.headers.iter() {
             if !STRIP_REQUEST.contains(&name.as_str()) {
-                rb = rb.header(name.as_str(), value.as_bytes());
+                headers.append(name.clone(), value.clone());
             }
         }
         // Inject the zone's credential for this host into its one declared slot. An optional rule
@@ -410,7 +565,7 @@ impl Egress {
                     Err(e) => return Err(e),
                 };
                 let value = render_credential(&rule.format, &secret);
-                rb = rb.header(rule.header.as_str(), value.as_str());
+                headers.insert(http::HeaderName::from_bytes(rule.header.as_bytes())?, http::HeaderValue::from_str(&value)?);
                 injected.push(secret);
                 injected.push(value);
                 break;
@@ -425,7 +580,7 @@ impl Egress {
                             crate::SwapSource::Vault(name) => self.ctx.vault.get(name)?,
                             crate::SwapSource::Value(v) => v.clone(),
                         };
-                        rb = rb.header("authorization", format!("Bearer {real}"));
+                        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {real}"))?);
                         injected.push(real);
                         tracing::debug!(host, swap = %sw.name, "credential swapped");
                     }
@@ -433,21 +588,7 @@ impl Egress {
                 }
             }
         }
-        let resp = rb.body(body).send().await?;
-        let status = StatusCode::from_u16(resp.status().as_u16())?;
-        let mut out = Response::builder().status(status);
-        for (name, value) in resp.headers().iter() {
-            if STRIP_RESPONSE.contains(&name.as_str()) {
-                continue;
-            }
-            // Never reflect an injected credential back into the box.
-            if injected.iter().any(|s| value.as_bytes().windows(s.len()).any(|w| w == s.as_bytes())) {
-                continue;
-            }
-            out = out.header(name.as_str(), value.as_bytes());
-        }
-        let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-        Ok(out.body(BodyExt::boxed(StreamBody::new(stream)))?)
+        Ok(Outgoing { method: parts.method, url, headers, body, injected })
     }
 }
 

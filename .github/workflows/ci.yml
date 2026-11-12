@@ -86,10 +86,16 @@ jobs:
           runsc --version | head -1
           docker info --format 'runtimes: {{range $k, $v := .Runtimes}}{{$k}} {{end}}'
       - run: cargo build -p wicket-cli --locked
+      - name: Rust's musl target, for the smoke test's static HTTP/3 client
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q musl-tools
       - name: Build the agent image
         run: target/debug/wicket image
       - name: Smoke test
         run: WICKET=target/debug/wicket ci/smoke.sh
+      - name: Hibernate and wake
+        run: WICKET=target/debug/wicket ci/hibernate.sh
       # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
       - name: wicketd with second uids
         run: ci/daemon-uids.sh target/debug/wicket
