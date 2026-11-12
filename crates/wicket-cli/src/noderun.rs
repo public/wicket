@@ -830,6 +830,9 @@ async fn on_frame(
         Frame::Feed(_) => bail!("the node sent a feed frame"),
         Frame::Msg(m) => match m {
             Msg::FeedStatus { mode, epoch, refused, catch_up } => {
+                if let Some(e) = epoch {
+                    let _ = sh.ledger.lock().expect("ledger").node_feed_at(&sh.node, e as i64);
+                }
                 if let Some(r) = refused {
                     println!("[wicket] node {} refused a feed frame: {r}", sh.node);
                 }
@@ -1044,6 +1047,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let before = p.live.len();
     p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
     let mut rebuild = p.live.len() != before;
+    let mut handed: Vec<String> = vec![];
     for g in grants {
         let mine = g.node.as_deref() == Some(sh.node.as_str());
         if g.revoked && mine && p.published.contains(&g.id) && p.revoked.insert(g.id.clone()) {
@@ -1104,6 +1108,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             println!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
         }
         p.live.push(live);
+        handed.push(g.id.clone());
         p.published.insert(g.id);
         rebuild = true;
     }
@@ -1133,6 +1138,9 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         }
         r.map(|f| (f, p.epoch()))
     };
+    if let Ok((_, epoch)) = &committed {
+        let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+    }
     match committed {
         Ok((f, epoch)) => {
             println!(

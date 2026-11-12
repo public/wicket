@@ -188,7 +188,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -278,6 +278,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN max_risk INTEGER", []);
         // The run a grant is bound to (#127); NULL is zone-wide, as every grant was before.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN run TEXT", []);
+        // The feed epoch that carries a grant handed to a node, until the node reports it applied.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN node_epoch INTEGER", []);
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
