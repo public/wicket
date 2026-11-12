@@ -727,28 +727,24 @@ pub fn human(b: u64) -> String {
     }
 }
 
-/// Whether `dir` holds more than `cap` bytes (stops counting once over). Symlinks aren't followed.
-pub fn over(dir: &Path, cap: u64) -> bool {
-    fn walk(d: &Path, total: &mut u64, cap: u64) -> bool {
-        let Ok(rd) = std::fs::read_dir(d) else { return false };
+/// The bytes `dir` takes on disk (allocated blocks, so a sparse file counts as what it uses).
+/// Symlinks aren't followed. What a node measures a box's /tmp with, against its cap.
+pub fn used_bytes(dir: &Path) -> u64 {
+    fn walk(d: &Path, total: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {
-                if walk(&e.path(), total, cap) {
-                    return true;
-                }
+                walk(&e.path(), total);
             } else {
                 use std::os::unix::fs::MetadataExt;
                 *total += m.blocks() * 512;
-                if *total > cap {
-                    return true;
-                }
             }
         }
-        false
     }
     let mut total = 0;
-    walk(dir, &mut total, cap)
+    walk(dir, &mut total);
+    total
 }
 
 #[cfg(test)]
@@ -928,8 +924,8 @@ mod tests {
         let d = std::env::temp_dir().join(format!("wicket-cap-{}", std::process::id()));
         std::fs::create_dir_all(d.join("a")).unwrap();
         std::fs::write(d.join("a/f"), vec![7u8; 64 * 1024]).unwrap();
-        assert!(!over(&d, 1 << 20));
-        assert!(over(&d, 16 * 1024));
+        assert!(used_bytes(&d) <= 1 << 20);
+        assert!(used_bytes(&d) > 16 * 1024);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

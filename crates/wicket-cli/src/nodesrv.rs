@@ -47,6 +47,9 @@ pub const OUTPUT_CAP: usize = 4 << 20;
 /// The node's files: what enrolment installed, and what `serve` keeps.
 pub struct NodePaths {
     pub root: PathBuf,
+    /// For the control host's own node (#146): the control host's data directory, which this node
+    /// shares (`node.json`'s `shares_host`). Its boxes live in the runs' own directories there.
+    shared: Option<PathBuf>,
 }
 
 impl NodePaths {
@@ -59,7 +62,11 @@ impl NodePaths {
         home.join(crate::enrol::NODE_DIR)
     }
     pub fn new(root: Option<PathBuf>) -> NodePaths {
-        NodePaths { root: root.unwrap_or_else(NodePaths::default_root) }
+        let root = root.unwrap_or_else(NodePaths::default_root);
+        let info = std::fs::read(root.join("node.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let shared =
+            info.filter(|v| v["shares_host"] == serde_json::Value::Bool(true)).and_then(|v| v["data_dir"].as_str().map(PathBuf::from));
+        NodePaths { root, shared }
     }
     pub fn socket(&self) -> PathBuf {
         self.root.join("ctl/ctl.sock")
@@ -67,16 +74,25 @@ impl NodePaths {
     /// Whether this node shares the control host's filesystem (the built-in local node, #146):
     /// `node.json` says `"shares_host": true`, which only the control host writes, for its own node.
     pub fn shares_host(&self) -> bool {
-        std::fs::read(self.root.join("node.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|v| v["shares_host"] == serde_json::Value::Bool(true))
+        self.shared.is_some()
+    }
+    /// Where zone volumes are kept: the control host's own for its own node, so they outlive a build.
+    fn volumes(&self) -> PathBuf {
+        match &self.shared {
+            Some(d) => d.join("volumes"),
+            None => self.root.join("volumes"),
+        }
     }
     fn feed(&self) -> PathBuf {
         self.root.join("feed")
     }
+    /// Where boxes are laid out: for the control host's own node, the runs' own directories (the
+    /// control host's), so their files needn't move between the two.
     fn runs(&self) -> PathBuf {
-        self.root.join("runs")
+        match &self.shared {
+            Some(d) => d.join("runs"),
+            None => self.root.join("runs"),
+        }
     }
     pub fn name(&self) -> Result<String> {
         let info: serde_json::Value = serde_json::from_slice(
@@ -235,7 +251,8 @@ impl Node {
     fn ca(&self) -> Option<Arc<NodeCa>> {
         let cert = std::fs::read_to_string(self.paths.root.join("ca.pem")).ok()?;
         let key = std::fs::read_to_string(self.paths.root.join("ca.key")).ok()?;
-        match NodeCa::load(&cert, &key) {
+        let loaded = if self.paths.shares_host() { NodeCa::load_any(&cert, &key) } else { NodeCa::load(&cert, &key) };
+        match loaded {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 eprintln!("[node] the node CA is unusable ({e:#}); every host is forwarded to the control host");
@@ -244,8 +261,14 @@ impl Node {
         }
     }
 
-    /// Opens a tunnel to the run's `target` socket on the control host.
-    async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<tokio::io::DuplexStream> {
+    /// Opens a tunnel to the run's `target` socket on the control host: over the control channel, or
+    /// for the control host's own node, the socket itself (the run's `ctl/` directory, on this host).
+    async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<Box<dyn RelayStream>> {
+        if self.paths.shares_host() && ["egress", "llm", "gateway"].contains(&target) {
+            crate::run::check_run_id(run).map_err(std::io::Error::other)?;
+            let s = UnixStream::connect(self.paths.runs().join(run).join("ctl").join(format!("{target}.sock"))).await?;
+            return Ok(Box::new(s));
+        }
         let unreachable = || std::io::Error::new(std::io::ErrorKind::NotConnected, "the control host is unreachable");
         let (out, tunnels) = {
             let gen = self.owner(run).ok_or_else(unreachable)?;
@@ -269,7 +292,7 @@ impl Node {
         }
         let (ours, theirs) = tokio::io::duplex(256 * 1024);
         tunnels.attach(id, theirs, out);
-        Ok(ours)
+        Ok(Box::new(ours))
     }
 
     fn feed_status(&self, refused: Option<&wicket_feed::Refusal>) -> Frame {
@@ -358,7 +381,7 @@ impl Relay for NodeRelay {
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {
-        Box::pin(async move { self.node.open_tunnel(&self.run, "egress").await.map(|s| Box::new(s) as Box<dyn RelayStream>) })
+        Box::pin(async move { self.node.open_tunnel(&self.run, "egress").await })
     }
 }
 
@@ -743,8 +766,8 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 let b = node.boxes.lock().expect("boxes").remove(&run);
                 if let Some(b) = b {
                     b.tasks.iter().for_each(|t| t.abort());
-                    // Only what the node laid out itself: a shared-filesystem box's directory is the run's.
-                    if b.dir.starts_with(node.paths.runs()) {
+                    // The control host's own node shares the run's directory with the run: that stays.
+                    if !node.paths.shares_host() && b.dir.starts_with(node.paths.runs()) {
                         let _ = std::fs::remove_dir_all(&b.dir);
                     }
                 }
@@ -872,7 +895,7 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
         "status" => Ok(None),
         "usage" => {
             let d = tree_dir(&node.paths, run, arg)?;
-            Ok(Some(tokio::task::spawn_blocking(move || du(&d)).await?.to_string()))
+            Ok(Some(tokio::task::spawn_blocking(move || crate::hibernate::used_bytes(&d)).await?.to_string()))
         }
         "pause" => node.docker.pause(&name).await.map(|()| None),
         "unpause" => node.docker.unpause(&name).await.map(|()| None),
@@ -946,23 +969,6 @@ fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
     }
 }
 
-/// Bytes of the files under `d` (symlinks not followed).
-fn du(d: &std::path::Path) -> u64 {
-    let mut n = 0;
-    let mut stack = vec![d.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&p) else { continue };
-        for e in rd.flatten() {
-            match e.file_type() {
-                Ok(t) if t.is_dir() => stack.push(e.path()),
-                Ok(t) if t.is_file() => n += e.metadata().map(|m| m.len()).unwrap_or(0),
-                _ => {}
-            }
-        }
-    }
-    n
-}
-
 /// `Msg::Listen`: a link's relay socket in a run's socket directory; each connection to it is offered
 /// to connection `gen` as a tunnel.
 fn listen(node: &Arc<Node>, gen: u64, run: &str, sock: &str) -> Result<()> {
@@ -1028,180 +1034,208 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
     if !node.docker.image_exists(&bs.image).await? {
         bail!("image {} not found on node {} (run: wicket image there)", bs.image, node.name);
     }
-    let (dir, spec, mut tasks) = match &bs.host {
-        Some(h) => host_layout(node, &bs, h)?,
-        None => {
-            let dir = node.paths.runs().join(&bs.run);
-            if bs.long_lived {
-                std::fs::create_dir_all(dir.join("tmp"))?;
-                std::fs::set_permissions(dir.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
-            }
-            for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
-                std::fs::create_dir_all(dir.join(sub))?;
-            }
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-            std::fs::write(dir.join("ca/ca.pem"), format!("{}{}", node.root_pem, bs.ca_pem))?;
-            std::fs::write(dir.join("hosts"), wicket_core::link::hosts_file(&[]))?;
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let tar = b64.decode(&bs.workspace_tar).context("workspace archive")?;
-            if !tar.is_empty() {
-                let mut c = tokio::process::Command::new("tar")
-                    .arg("-C")
-                    .arg(dir.join("workspace"))
-                    .args(["--no-same-owner", "-xf", "-"])
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()?;
-                c.stdin.take().expect("stdin").write_all(&tar).await?;
-                if !c.wait().await?.success() {
-                    bail!("unpacking the workspace failed");
-                }
-            }
-            for (rel, body) in &bs.state_files {
-                if rel.split('/').any(|p| p.is_empty() || p == "..") {
-                    bail!("bad state file name {rel:?}");
-                }
-                let p = dir.join("state").join(rel);
-                if let Some(d) = p.parent() {
-                    std::fs::create_dir_all(d)?;
-                }
-                std::fs::write(&p, b64.decode(body)?)?;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-            }
-            let mut volume_mounts = vec![];
-            for (name, target) in &bs.volumes {
-                let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && s != "..";
-                if !ok(name) || !ok(&bs.tenant) || !ok(&bs.zone) {
-                    bail!("bad volume name {name:?}");
-                }
-                // A long-lived agent's durable volume is its own, kept with its state in the run's
-                // directory (and moved when it hibernates); any other is the zone's.
-                let d = match bs.long_lived && bs.durable.iter().any(|(n, _)| n == name) {
-                    true => dir.join("volumes").join(name),
-                    false => node.paths.root.join("volumes").join(&bs.tenant).join(&bs.zone).join(name),
-                };
-                std::fs::create_dir_all(&d)?;
-                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
-                volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
-            }
-
-            // The box's enforcement points: egress decided here; LLM and MCP gateway tunnelled to the control host.
-            let compiled = Arc::new(wicket_core::CompiledZone::new(zone)?);
-            let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
-            let ctx = wicket_proxy::RunCtx {
-                tenant: wicket_core::TenantId(bs.tenant.clone()),
-                run: wicket_core::RunId(bs.run.clone()),
-                zone: compiled.clone(),
-                ledger: node.audit.clone(),
-                // Secrets never reach a node: hosts that need one are forwarded, so this vault stays empty.
-                vault: wicket_proxy::vault::Vault::new(node.paths.root.join("no-secrets")),
-                events: ev_tx,
-                escalate: bs.escalate,
-                attribute: None,
-                identity: None,
-                spawner: None,
-                swaps: vec![],
-                boxes: None,
-                capacity: None,
-                fence: None,
-                waker: None,
-            };
-            let ca = node.ca();
-            let minter: Arc<dyn Minter> = match &ca {
-                Some(c) => c.clone(),
-                None => Arc::new(NoCa),
-            };
-            let decider = Arc::new(NodeDecider {
-                replica: node.replica.clone(),
-                clock: node.clock.clone(),
-                control: Arc::new(Control(node.clone(), bs.run.clone())),
-            });
-            let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
-            let egress = Egress::with(ctx, minter, decider, Some(relay))?;
-            // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
-            // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
-            // the proxy, which forwards them.
-            let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
-            let sock = dir.join("sock");
-            let mut tasks = vec![];
-            tasks.push(tokio::spawn({
-                let us = sock.join("udp.sock");
-                async move {
-                    if let Err(e) = h3.serve(&us).await {
-                        eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
-                    }
-                }
-            }));
-            let es = sock.join("egress.sock");
-            tasks.push(tokio::spawn({
-                let es = es.clone();
-                async move {
-                    if let Err(e) = egress.serve(&es).await {
-                        eprintln!("[node] egress proxy ended: {e:#}");
-                    }
-                }
-            }));
-            for target in ["llm", "gateway"] {
-                let _ = std::fs::remove_file(sock.join(format!("{target}.sock")));
-                let l = UnixListener::bind(sock.join(format!("{target}.sock")))?;
-                let (n, run) = (node.clone(), bs.run.clone());
-                tasks.push(tokio::spawn(async move {
-                    while let Ok((mut c, _)) = l.accept().await {
-                        let (n, run) = (n.clone(), run.clone());
-                        tokio::spawn(async move {
-                            if let Ok(mut t) = n.open_tunnel(&run, target).await {
-                                let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
-                            }
-                        });
-                    }
-                }));
-            }
-            {
-                let (n, run) = (node.clone(), bs.run.clone());
-                tasks.push(tokio::spawn(async move {
-                    while let Some(ev) = ev_rx.recv().await {
-                        if let Ok(event) = serde_json::to_value(&ev) {
-                            n.send_run(&run, Frame::Msg(Msg::Event { run: run.clone(), event }));
-                        }
-                    }
-                }));
-            }
-            for _ in 0..50 {
-                if es.exists() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-
-            let spec = SandboxSpec {
-                // The name the control host gives it (its box prefix), else wicket's own.
-                name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
-                image: bs.image.clone(),
-                isolation: bs.isolation,
-                mounts: vec![
-                    Mount { host: sock, target: wicket_agent::SOCK_DIR.into(), read_only: false },
-                    Mount { host: dir.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
-                    Mount { host: dir.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
-                    Mount { host: dir.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false },
-                    // wicket's own hosts file, which links add names to (`BoxCtl` "hosts").
-                    Mount { host: dir.join("hosts"), target: "/etc/hosts".into(), read_only: true },
-                ]
-                .into_iter()
-                .chain(volume_mounts)
-                // A long-lived agent's /tmp is a directory here, kept with the rest of its state.
-                .chain(bs.long_lived.then(|| Mount { host: dir.join("tmp"), target: "/tmp".into(), read_only: false }))
-                .collect(),
-                env: bs.env.clone(),
-                argv: bs.argv.clone(),
-                memory: bs.memory.clone(),
-                cpus: bs.cpus,
-                pids: bs.pids,
-                user: ids(),
-                workdir: wicket_agent::WORKSPACE.into(),
-                interactive: bs.interactive,
-                labels: vec![("wicket.run".into(), bs.run.clone()), ("wicket.owner".into(), crate::reap::owner_label())],
-            };
-            (dir, spec, tasks)
+    if !bs.binds.is_empty() && !node.paths.shares_host() {
+        bail!("this node doesn't share the control host's filesystem: it can't mount the control host's directories");
+    }
+    for (host, target, _) in &bs.binds {
+        let reserved = [wicket_agent::SOCK_DIR, wicket_agent::CA_DIR, wicket_agent::STATE_DIR, "/etc/hosts", "/tmp"];
+        if !host.starts_with('/')
+            || !target.starts_with('/')
+            || reserved.iter().any(|r| target == r || target.starts_with(&format!("{r}/")))
+        {
+            bail!("bad bind {host:?} on {target:?}");
         }
+    }
+    let dir = node.paths.runs().join(&bs.run);
+    if bs.long_lived {
+        std::fs::create_dir_all(dir.join("tmp"))?;
+        std::fs::set_permissions(dir.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
+    }
+    for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(dir.join("ca/ca.pem"), format!("{}{}", node.root_pem, bs.ca_pem))?;
+    std::fs::write(dir.join("hosts"), wicket_core::link::hosts_file(&[]))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tar = b64.decode(&bs.workspace_tar).context("workspace archive")?;
+    if !tar.is_empty() {
+        let mut c = tokio::process::Command::new("tar")
+            .arg("-C")
+            .arg(dir.join("workspace"))
+            .args(["--no-same-owner", "-xf", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        c.stdin.take().expect("stdin").write_all(&tar).await?;
+        if !c.wait().await?.success() {
+            bail!("unpacking the workspace failed");
+        }
+    }
+    for (rel, body) in &bs.state_files {
+        if rel.split('/').any(|p| p.is_empty() || p == "..") {
+            bail!("bad state file name {rel:?}");
+        }
+        let p = dir.join("state").join(rel);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(&p, b64.decode(body)?)?;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut volume_mounts = vec![];
+    for (name, target) in &bs.volumes {
+        let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && s != "..";
+        if !ok(name) || !ok(&bs.tenant) || !ok(&bs.zone) {
+            bail!("bad volume name {name:?}");
+        }
+        // A long-lived agent's durable volume is its own, kept with its state in the run's
+        // directory (and moved when it hibernates); any other is the zone's.
+        let d = match bs.long_lived && bs.durable.iter().any(|(n, _)| n == name) {
+            true => dir.join("volumes").join(name),
+            false => node.paths.volumes().join(&bs.tenant).join(&bs.zone).join(name),
+        };
+        std::fs::create_dir_all(&d)?;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+        volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
+    }
+
+    // The box's enforcement points: egress decided here; LLM and MCP gateway tunnelled to the control host.
+    let compiled = Arc::new(wicket_core::CompiledZone::new(zone)?);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
+    let ctx = wicket_proxy::RunCtx {
+        tenant: wicket_core::TenantId(bs.tenant.clone()),
+        run: wicket_core::RunId(bs.run.clone()),
+        zone: compiled.clone(),
+        ledger: node.audit.clone(),
+        // Secrets never reach a node: hosts that need one are forwarded, so this vault stays empty.
+        vault: wicket_proxy::vault::Vault::new(node.paths.root.join("no-secrets")),
+        events: ev_tx,
+        escalate: bs.escalate,
+        attribute: None,
+        identity: None,
+        spawner: None,
+        swaps: vec![],
+        boxes: None,
+        capacity: None,
+        fence: None,
+        waker: None,
+    };
+    let ca = node.ca();
+    let minter: Arc<dyn Minter> = match &ca {
+        Some(c) => c.clone(),
+        None => Arc::new(NoCa),
+    };
+    let decider = Arc::new(NodeDecider {
+        replica: node.replica.clone(),
+        clock: node.clock.clone(),
+        control: Arc::new(Control(node.clone(), bs.run.clone())),
+    });
+    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
+    let egress = Egress::with(ctx, minter, decider, Some(relay))?;
+    // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
+    // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
+    // the proxy, which forwards them.
+    let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
+    let sock = dir.join("sock");
+    let mut tasks = vec![];
+    tasks.push(tokio::spawn({
+        let us = sock.join("udp.sock");
+        async move {
+            if let Err(e) = h3.serve(&us).await {
+                eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
+            }
+        }
+    }));
+    let es = sock.join("egress.sock");
+    tasks.push(tokio::spawn({
+        let es = es.clone();
+        async move {
+            if let Err(e) = egress.serve(&es).await {
+                eprintln!("[node] egress proxy ended: {e:#}");
+            }
+        }
+    }));
+    for target in ["llm", "gateway"] {
+        let _ = std::fs::remove_file(sock.join(format!("{target}.sock")));
+        let l = UnixListener::bind(sock.join(format!("{target}.sock")))?;
+        let (n, run) = (node.clone(), bs.run.clone());
+        tasks.push(tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let (n, run) = (n.clone(), run.clone());
+                tokio::spawn(async move {
+                    if let Ok(mut t) = n.open_tunnel(&run, target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
+                    }
+                });
+            }
+        }));
+    }
+    {
+        let (n, run) = (node.clone(), bs.run.clone());
+        tasks.push(tokio::spawn(async move {
+            while let Some(ev) = ev_rx.recv().await {
+                if let Ok(event) = serde_json::to_value(&ev) {
+                    n.send_run(&run, Frame::Msg(Msg::Event { run: run.clone(), event }));
+                }
+            }
+        }));
+    }
+    for _ in 0..50 {
+        if es.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let spec = SandboxSpec {
+        // The name the control host gives it (its box prefix), else wicket's own.
+        name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
+        image: bs.image.clone(),
+        isolation: bs.isolation,
+        mounts: vec![
+            Mount { host: sock, target: wicket_agent::SOCK_DIR.into(), read_only: false },
+            Mount { host: dir.join("ca"), target: wicket_agent::CA_DIR.into(), read_only: true },
+            Mount { host: dir.join("state"), target: wicket_agent::STATE_DIR.into(), read_only: false },
+            // wicket's own hosts file, which links add names to (`BoxCtl` "hosts").
+            Mount { host: dir.join("hosts"), target: "/etc/hosts".into(), read_only: true },
+        ]
+        .into_iter()
+        // The workspace: the run's, or (on the control host's own node) a directory of the control
+        // host's own, mounted in place, as the binds say.
+        .chain((!bs.binds.iter().any(|(_, t, _)| t == wicket_agent::WORKSPACE)).then(|| Mount {
+            host: dir.join("workspace"),
+            target: wicket_agent::WORKSPACE.into(),
+            read_only: false,
+        }))
+        .chain(bs.binds.iter().map(|(h, t, ro)| Mount { host: PathBuf::from(h), target: t.clone(), read_only: *ro }))
+        .chain(volume_mounts)
+        // A long-lived agent's /tmp is a directory here, kept with the rest of its state.
+        .chain(bs.long_lived.then(|| Mount { host: dir.join("tmp"), target: "/tmp".into(), read_only: false }))
+        .collect(),
+        env: bs.env.clone(),
+        argv: bs.argv.clone(),
+        memory: bs.memory.clone(),
+        cpus: bs.cpus,
+        pids: bs.pids,
+        user: ids(),
+        workdir: bs
+            .workdir
+            .clone()
+            .filter(|w| w.starts_with('/') && node.paths.shares_host())
+            .unwrap_or_else(|| wicket_agent::WORKSPACE.into()),
+        interactive: bs.interactive,
+        // Its owner: on the control host's own node, the run's process (what the reconciler there
+        // judges); elsewhere this `serve` (what the next `serve` judges, `reap_previous`).
+        labels: vec![
+            ("wicket.run".into(), bs.run.clone()),
+            (
+                "wicket.owner".into(),
+                bs.owner
+                    .clone()
+                    .filter(|o| node.paths.shares_host() && o.len() <= 200 && !o.contains(['\n', '=']))
+                    .unwrap_or_else(crate::reap::owner_label),
+            ),
+        ],
     };
     let name = spec.name.clone();
     let mut child = node.docker.spawn(&spec)?;
@@ -1287,39 +1321,6 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
     });
     eprintln!("[node] {}: box {name} started", bs.run);
     Ok(())
-}
-
-/// A box the control host laid out (a node sharing its filesystem, #146): its mounts as given, in
-/// the run's own directory, and its sockets the run's own proxies. Only a node made for that (the
-/// built-in local node) takes one.
-type Layout = (PathBuf, SandboxSpec, Vec<tokio::task::JoinHandle<()>>);
-
-fn host_layout(node: &Node, bs: &BoxStart, h: &crate::chan::HostBox) -> Result<Layout> {
-    if !node.paths.shares_host() {
-        bail!("this node doesn't share the control host's filesystem: it lays out its boxes itself");
-    }
-    let ok_name = box_name_ok(&h.name, &bs.run);
-    if !ok_name {
-        bail!("bad box name {:?}", h.name);
-    }
-    let sock = h.mounts.iter().find(|(_, t, _)| t == wicket_agent::SOCK_DIR).map(|(p, _, _)| PathBuf::from(p));
-    let dir = sock.and_then(|s| s.parent().map(PathBuf::from)).context("the box has no socket directory")?;
-    let spec = SandboxSpec {
-        name: h.name.clone(),
-        image: bs.image.clone(),
-        isolation: bs.isolation,
-        mounts: h.mounts.iter().map(|(p, t, ro)| Mount { host: PathBuf::from(p), target: t.clone(), read_only: *ro }).collect(),
-        env: bs.env.clone(),
-        argv: bs.argv.clone(),
-        memory: bs.memory.clone(),
-        cpus: bs.cpus,
-        pids: bs.pids,
-        user: h.user.clone(),
-        workdir: h.workdir.clone(),
-        interactive: bs.interactive,
-        labels: h.labels.clone(),
-    };
-    Ok((dir, spec, vec![]))
 }
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).

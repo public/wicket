@@ -112,6 +112,16 @@ pub struct NodeCa {
 
 impl NodeCa {
     pub fn load(cert_pem: &str, key_pem: &str) -> Result<NodeCa> {
+        Self::load_with(cert_pem, key_pem, false)
+    }
+
+    /// As [`NodeCa::load`], also taking a CA without DNS name constraints (IP addresses still
+    /// excluded): the control host's own node's, which may mint for any name (`*`).
+    pub fn load_any(cert_pem: &str, key_pem: &str) -> Result<NodeCa> {
+        Self::load_with(cert_pem, key_pem, true)
+    }
+
+    fn load_with(cert_pem: &str, key_pem: &str, any: bool) -> Result<NodeCa> {
         use x509_parser::extensions::{GeneralName, ParsedExtension};
         let key = KeyPair::from_pem(key_pem).context("node CA key")?;
         if key.public_key_der() != spki_of(cert_pem)? {
@@ -129,6 +139,9 @@ impl NodeCa {
                     }
                 }
             }
+        }
+        if permitted.is_empty() && any {
+            permitted.push("*".into());
         }
         if permitted.is_empty() {
             bail!("the node CA has no DNS name constraints: refusing to use it");
@@ -267,7 +280,9 @@ impl InstallationCa {
         if csr.public_key.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256 {
             bail!("the node CA key must be ECDSA P-256");
         }
-        let permitted = permitted_dns_subtrees(hosts)?;
+        // `*`: any DNS name (the control host's own node, #146, which decides every host its boxes
+        // reach); IP addresses stay excluded either way.
+        let permitted = if hosts == ["*"] { vec!["*".to_string()] } else { permitted_dns_subtrees(hosts)? };
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, format!("wicket node CA {node}"));
@@ -276,7 +291,7 @@ impl InstallationCa {
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
         params.name_constraints = Some(NameConstraints {
-            permitted_subtrees: permitted.iter().map(|d| GeneralSubtree::DnsName(d.clone())).collect(),
+            permitted_subtrees: permitted.iter().filter(|d| *d != "*").map(|d| GeneralSubtree::DnsName(d.clone())).collect(),
             excluded_subtrees: vec![
                 GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])),
                 GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])),
@@ -499,6 +514,22 @@ mod tests {
         // A key that isn't the certificate's is refused.
         let other = KeyPair::generate().unwrap();
         assert!(NodeCa::load(&cert.pem, &other.serialize_pem()).is_err());
+    }
+
+    /// #146: the control host's own node's CA may mint for any name (it serves whatever its boxes
+    /// reach) but never an IP literal; only `load_any` takes it, so a remote node never would.
+    #[tokio::test]
+    async fn the_local_node_ca_mints_any_name_and_no_ip() {
+        let root = InstallationCa::generate().unwrap();
+        let (key, cert) = node_ca(&root, &["*"]);
+        assert_eq!(cert.permitted, vec!["*"]);
+        assert!(NodeCa::load(&cert.pem, &key.serialize_pem()).is_err(), "a remote node refuses an unconstrained CA");
+        let ca = NodeCa::load_any(&cert.pem, &key.serialize_pem()).unwrap();
+        for host in ["api.example.com", "evil.example.net", "example.org"] {
+            handshake(&root, Minter::server_config(&ca, host).unwrap(), host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        assert!(Minter::server_config(&ca, "203.0.113.7").is_err());
+        assert!(crate::decide::subtree_permits("*", "anything.example"));
     }
 
     #[test]

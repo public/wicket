@@ -5,8 +5,11 @@
 //! host makes and enrols it itself, the first time a run needs it:
 //!
 //! - **Its directory** is `<data dir>/local-node/`: a node key (made here with `openssl`, as on a
-//!   remote node), the installation's public keys, and `node.json` with `"shares_host": true`. It
-//!   gets no node CA: every host it would decide is forwarded to the run's own proxies.
+//!   remote node), the installation's public keys, `node.json` with `"shares_host": true` and the
+//!   data directory it shares, and a node CA: a P-256 key made here and a 24-hour intermediate from
+//!   the installation CA with no DNS name constraint (`*`; IP addresses still excluded), since it
+//!   decides every host its boxes reach. The control host renews it when a run finds it within 12
+//!   hours of expiry, as it renews the identity certificate.
 //! - **Enrolment** records it in the ledger like any node (target `unix:<socket>`, no ssh host key)
 //!   and issues its identity certificate; the control host renews the certificate itself when a run
 //!   finds it past half its life, so an installation idle for days still starts boxes.
@@ -15,10 +18,12 @@
 //!   its log in `serve.log` there) and exiting once it has had no boxes and no connections for a while
 //!   (10 minutes; `WICKET_LOCAL_NODE_IDLE_SECS`). A `serve` from before an upgrade keeps the boxes
 //!   it runs until they end.
-//! - **What sharing the filesystem means.** The control host lays out the box itself, in the run's own
-//!   directory ([`crate::chan::HostBox`]): its sockets are the run's proxies, its workspace, state,
-//!   `/tmp` and volumes are where they always were. That is how hibernation, wrapped sessions and
-//!   in-place workspaces keep working; a node that doesn't share the filesystem refuses such a box.
+//! - **What sharing the filesystem means** is only transport. The node lays out its boxes and runs
+//!   their proxies (egress decided from the feed, with its own CA) as any node does, but in the runs'
+//!   own directories (`<data dir>/runs/<run>`), so a run's trees needn't be copied to it and back;
+//!   its tunnels to a run's proxies (hosts it forwards, the model and the MCP gateway) are the run's
+//!   own sockets (`ctl/`); and it can mount a directory of the control host's in a box (an in-place
+//!   workspace, a wrapped session's directory).
 
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -46,7 +51,8 @@ pub fn socket() -> Result<PathBuf> {
 }
 
 /// The files every build's directory gets (copied from the node's own).
-const SHARED: &[&str] = &["node.key", "node.pub", "root.pem", "feed-root.pub", "authz-root.pub", "issuer.pub.json", "node.json"];
+const SHARED: &[&str] =
+    &["node.key", "node.pub", "root.pem", "feed-root.pub", "authz-root.pub", "issuer.pub.json", "node.json", "ca.key", "ca.pem"];
 
 /// Makes, enrols and starts the local node as needed; returns once its `serve` answers.
 pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
@@ -54,6 +60,7 @@ pub async fn ensure(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
     {
         let _lock = lock(&root().join("enrol.lock"))?;
         enrol(ledger)?;
+        renew_ca(ledger)?;
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         for f in SHARED {
@@ -104,7 +111,14 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         Some(r) if r.status != "active" => {
             bail!("the local node was revoked: boxes can't run on this host until its directory {} is removed", dir.display())
         }
-        Some(_) if dir.join("node.key").exists() => return Ok(()),
+        Some(r) if dir.join("node.key").exists() => {
+            // node.json says which data directory it shares (written again: earlier ones didn't).
+            let want = node_json(&r.node_key, r.enrolled_at)?;
+            if std::fs::read_to_string(dir.join("node.json")).ok().as_deref() != Some(want.as_str()) {
+                std::fs::write(dir.join("node.json"), want)?;
+            }
+            return Ok(());
+        }
         _ => {}
     }
     // The node's own key, made as a remote node makes it.
@@ -132,12 +146,7 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         ("feed-root.pub", hex::encode(feed_root.to_bytes())),
         ("authz-root.pub", authz_root.to_hex()),
         ("issuer.pub.json", serde_json::to_string_pretty(&issuer.public_jwk())?),
-        (
-            "node.json",
-            serde_json::to_string_pretty(
-                &serde_json::json!({ "name": NAME, "node_key": node_key, "shares_host": true, "enrolled_at": now }),
-            )?,
-        ),
+        ("node.json", node_json(&node_key, now)?),
     ];
     for (f, body) in files {
         std::fs::write(dir.join(f), body)?;
@@ -165,6 +174,54 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         &serde_json::json!({ "name": NAME, "target": row.target, "node_key": node_key, "builtin": true }),
     )?;
     println!("[wicket] made this host's built-in node {NAME:?} ({})", dir.display());
+    Ok(())
+}
+
+fn node_json(node_key: &str, enrolled_at: i64) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "name": NAME, "node_key": node_key, "shares_host": true, "enrolled_at": enrolled_at,
+        "data_dir": crate::data_dir().canonicalize()?.display().to_string(),
+    }))?)
+}
+
+/// The node's CA: made, or renewed when within 12 hours of expiry. Recorded like any node's.
+fn renew_ca(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
+    let dir = root();
+    let now = wicket_store::now();
+    let current = ledger.lock().expect("ledger").node_cas(NAME)?.into_iter().find(|c| c.status == "active");
+    if current.is_some_and(|c| c.not_after > now + 12 * 3600) && dir.join("ca.pem").exists() && dir.join("ca.key").exists() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("set -eu; umask 077; rm -f ca.key.new; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key.new && openssl req -new -key ca.key.new -subj '/O=wicket/CN=wicket node CA local'")
+        .current_dir(&dir)
+        .output()
+        .context("running openssl")?;
+    if !out.status.success() {
+        bail!("making the local node's CA key: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let ca = wicket_proxy::ca::InstallationCa::load_or_create(&crate::enrol::Paths::installation().ca_key)?;
+    let cert = ca.issue_node_ca(&String::from_utf8_lossy(&out.stdout), NAME, &["*".to_string()], time::Duration::hours(24))?;
+    std::fs::write(dir.join("ca.pem.new"), &cert.pem)?;
+    std::fs::rename(dir.join("ca.pem.new"), dir.join("ca.pem"))?;
+    std::fs::rename(dir.join("ca.key.new"), dir.join("ca.key"))?;
+    let row = wicket_store::NodeCaRow {
+        serial: cert.serial.clone(),
+        node: NAME.into(),
+        issued_at: now,
+        not_after: cert.not_after,
+        hosts: cert.permitted.clone(),
+        status: "active".into(),
+    };
+    let mut l = ledger.lock().expect("ledger");
+    l.renew_node_ca(&row)?;
+    l.audit(
+        &wicket_core::TenantId::single(),
+        None,
+        "node.ca_renewed",
+        &serde_json::json!({ "name": NAME, "ca_serial": cert.serial, "ca_not_after": cert.not_after, "hosts": cert.permitted }),
+    )?;
     Ok(())
 }
 

@@ -325,6 +325,8 @@ pub struct Start {
     pub calls: Arc<Calls>,
     /// Trees sent to the node before the box starts: (tree, local directory, top-level names left out).
     pub trees: Vec<(String, PathBuf, Vec<String>)>,
+    /// Who in the box made a request (the run's own reading of the agent's events).
+    pub attribute: Option<wicket_proxy::Attributor>,
     /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
     /// fetched first).
     pub keep: bool,
@@ -346,6 +348,9 @@ struct Shared {
     /// The box's base token (block 0), and the key that signs its grant blocks.
     token_issuer: wicket_feed::Issuer,
     approver: wicket_authz::SigningKey,
+    /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
+    /// didn't attribute).
+    attribute: Option<wicket_proxy::Attributor>,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
@@ -422,6 +427,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         issuer,
         token_issuer,
         approver,
+        attribute: s.attribute.clone(),
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -782,7 +788,7 @@ async fn on_frame(
                 let ok_target = ["egress", "llm", "gateway"].contains(&target.as_str());
                 let conn = match (run == sh.run.0, ok_target) {
                     (true, true) => {
-                        tokio::net::UnixStream::connect(sh.dir.join("sock").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
+                        tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
                     }
                     _ => Err(format!("no tunnel to {target} for run {run}")),
                 };
@@ -866,6 +872,13 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_
         Err(e) => return reply(None, None, Some(e)),
     };
     let op = &op;
+    // The node reports who asked if it knows; else the run's own attribution, read from the agent's
+    // event stream outside the box (reported, not proven, either way).
+    let ours = match who {
+        Some(_) => None,
+        None => sh.attribute.as_ref().and_then(|a| a(&op.host, &op.path)).map(|(v, _)| v),
+    };
+    let who = who.or(ours.as_ref());
     let l = sh.ledger.lock().expect("ledger");
     if let Ok(Some(rid)) = l.denied_recently(op) {
         return reply(None, Some(rid), None);
@@ -945,6 +958,11 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         if g.revoked || g.node.is_some() || g.expires_at <= now_s || p.published.contains(&g.id) {
+            continue;
+        }
+        // Grants in wicket's own namespace (spawn, capacity, links) are the control host's to use:
+        // it is wicket that asks for them, never a box's egress.
+        if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
         let route = wicket_proxy::decide::route(&g.host, &sh.zone, &[], ca.as_ref().map(|c| (&c.hosts[..], c.not_after)), now_s);
