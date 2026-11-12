@@ -20,7 +20,7 @@
 #     under /usr/local/share/wicket, and /etc/wicket (the daemon's policy, the console's options);
 #   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
-#   - the identity issuer, and the agent image.
+#   - the identity issuer, and the agent image (wicket/claude-code:<build id>, and :poc as an alias).
 # Then the one secret: sudo wicket secret set claude-oauth (from `claude setup-token`).
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -251,8 +251,14 @@ else
 fi
 
 if [ "$skip_image" = 0 ]; then
+    # The installed version's own image, wicket/claude-code:<build id>, built by that binary from the
+    # image sources embedded in it, as `wicket self update` does for each version it stages (#162):
+    # its boxes and a rollback to it use that tag. wicket/claude-code:poc stays an alias of it, for
+    # anything that names the default image without running a staged version.
     say "agent image"
-    as_wicket image --dir /usr/local/share/wicket/images/claude-code
+    tag=wicket/claude-code:$id
+    docker image inspect "$tag" >/dev/null 2>&1 || as_wicket image --tag "$tag"
+    docker tag "$tag" wicket/claude-code:poc
 fi
 
 cat <<EOF

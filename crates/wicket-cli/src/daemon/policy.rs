@@ -109,7 +109,11 @@ pub fn route(cmd: &Cmd) -> Route {
             SelfCmd::Status => Forward(Read),
             // Changes the code that holds every key: root's alone, and never the daemon's own uid
             // (`root_only`).
-            SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::TrustKey { .. } | SelfCmd::Health { .. } => Forward(Privileged),
+            SelfCmd::Update { .. }
+            | SelfCmd::Rollback { .. }
+            | SelfCmd::Prune { .. }
+            | SelfCmd::TrustKey { .. }
+            | SelfCmd::Health { .. } => Forward(Privileged),
             // Touch no wicket data.
             SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe => Local,
         },
@@ -124,7 +128,7 @@ pub fn route(cmd: &Cmd) -> Route {
 /// supervisors, gateways and proxies (#162). Updating wicket, or changing which keys may sign an
 /// update, is a human's act on the host; an agent can only ask (`request_update`).
 pub fn root_only(cmd: &Cmd) -> bool {
-    matches!(cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::TrustKey { .. } })
+    matches!(cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::Prune { .. } | SelfCmd::TrustKey { .. } })
 }
 
 /// Arguments only wicket itself passes (a parent starting a child, the console starting a run): a
@@ -314,6 +318,7 @@ mod tests {
             (&["self", "update", "/tmp/w.tar.gz"], Route::Forward(Privileged)),
             (&["self", "update", "/tmp/w", "--nodes", "all"], Route::Forward(Privileged)),
             (&["self", "rollback"], Route::Forward(Privileged)),
+            (&["self", "prune", "--dry-run"], Route::Forward(Privileged)),
             (&["self", "trust-key", "/tmp/k.pub"], Route::Forward(Privileged)),
             (&["self", "keygen", "/tmp/k"], Route::Local),
             (&["self", "sign", "--key", "/tmp/k", "/tmp/w"], Route::Local),
