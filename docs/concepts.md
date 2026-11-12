@@ -46,8 +46,8 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
   reach hosts the zone never allowed (`llm.allow_server_tools` lets them through). A wrapped Claude Code session's model calls, which reach the model host through the
   egress proxy, get the same budget, checks and accounting there;
 - **limits, isolation, images, volumes:** memory, CPUs and time; how much of the box's output its
-  node's host keeps (`limits.output`, default `64m`, the newest kept; `on_output_full: stop` stops the
-  box instead); the isolation tier; the images a child may use; named directories that persist between
+  node's host and the control host's transcript keep (`limits.output`, default `64m` of each, the newest
+  kept; `on_output_full: stop` stops the box instead); the isolation tier; the images a child may use; named directories that persist between
   runs;
 - **accept_from:** the zones whose agents may message this one.
 

@@ -134,7 +134,11 @@ not a permanent decision.
   the control host, and isn't counted. `box.output` in the node's audit has the bytes read and a lower
   bound on what the host dropped; offsets count bytes read. Output that repeats itself exactly can be
   lined up on the wrong copy when an adopted box's replay is resumed (`box.output.gap` notes one that
-  can't be lined up at all). The control host's run transcript isn't capped.
+  can't be lined up at all). The control host keeps the same amount (#160): the run's transcript
+  (`transcript.jsonl`, then `transcript.1.jsonl` before it) and `agent.stderr.log` keep the newest
+  `limits.output` of each stream, a program's output shown by its run stops there, and `run.output` in
+  the audit records how many bytes of each were dropped. A single line longer than half the cap is kept
+  whole, and a re-attached run's `agent.stderr.log` and stderr count are its own supervisor's only.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's

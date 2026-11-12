@@ -28,6 +28,7 @@ mod reconcile;
 mod run;
 mod serve;
 mod spawn;
+mod transcript;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

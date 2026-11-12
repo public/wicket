@@ -1,5 +1,6 @@
 # Acceptance (ci/acceptance.sh): a box that writes 20 MB to stdout at once, then 3 MB of numbered lines
-# at a pace, kept on its node's host only up to its zone's limits.output (#151).
+# at a pace, kept on its node's host and in the control host's transcript only up to its
+# zone's limits.output (#151, #160).
 task: Write a lot.
 program:
   name: flood
