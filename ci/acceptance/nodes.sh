@@ -56,7 +56,11 @@ node_local_teardown() {
 
 node_vultr_setup() {
   : "${ACC_VULTR_SSH_KEY_ID:?the id of an ssh key in the Vultr account}" "${ACC_VULTR_SSH_KEY:?its private half on this host}"
-  wroot secret list | grep -q '^vultr-api-key ' || { echo "no vault secret vultr-api-key (wicket secret set vultr-api-key)"; exit 1; }
+  # ACC_VULTR_API_KEY_FILE: link the key into this run's vault by reference (never copied).
+  if [ -n "${ACC_VULTR_API_KEY_FILE:-}" ] && ! wroot secret list | grep -q '^vultr-api-key '; then
+    wroot secret link vultr-api-key --file "$ACC_VULTR_API_KEY_FILE" --hosts api.vultr.com >/dev/null
+  fi
+  wroot secret list | grep -q '^vultr-api-key ' || { echo "no vault secret vultr-api-key (wicket secret set vultr-api-key, or ACC_VULTR_API_KEY_FILE)"; exit 1; }
   local f=$WICKET_HOME/placement.yaml
   [ "$mode" = dev ] || f=$work/placement.yaml
   cat >"$f" <<EOF
@@ -161,9 +165,10 @@ multihost() {
   wait_for 90 'child_log "$cap_run" | grep -qE "run $remote_run: [a-z]+ in"' || true
   if [ "${ACC_NODE_E2E:-1}" = 1 ] && [ -n "${node_name:-}" ]; then
     log "node e2e flow on $node_name"
-    if TMPDIR=$work HOME=$HOMEW WICKET="$W" IMAGE="$IMAGE_TAG" ${ACC_VULTR_SSH_KEY:+WICKET_E2E_SSH_KEY=$ACC_VULTR_SSH_KEY} \
+    if TMPDIR=$work HOME=$HOMEW WICKET="$W" IMAGE="$IMAGE_TAG" WICKET_E2E_SSH_KEY="${ACC_VULTR_SSH_KEY:-}" \
       timeout 600 ci/node-e2e.sh "$node_name" >"$work/node-e2e.log" 2>&1; then e2e=0; else e2e=$?; fi
-    grep -E '^(ok|FAIL) ' "$work/node-e2e.log" | sed 's/^/   node-e2e: /'
+    grep -E '^(ok|FAIL) ' "$work/node-e2e.log" | sed 's/^/   node-e2e: /' || true
+    if [ "$e2e" != 0 ]; then tail -n 25 "$work/node-e2e.log" | sed 's/^/   node-e2e log: /'; fi
     check "the node e2e flow passed (ci/node-e2e.sh $node_name)" '[ "$e2e" = 0 ]'
   fi
 

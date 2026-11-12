@@ -15,7 +15,8 @@
 #                    backend; only the ssh hop is replaced, as in ci/node-e2e.sh --local).
 #   --nodes vultr    the multi-host flow on a fresh Vultr node, through placement (`backend: vultr`,
 #                    the cheapest plan, `max_total_usd: 0.05`). It SPENDS MONEY: needs ACC_VULTR=yes,
-#                    the vault secret vultr-api-key, ACC_VULTR_SSH_KEY_ID and ACC_VULTR_SSH_KEY.
+#                    the vault secret vultr-api-key (or ACC_VULTR_API_KEY_FILE, linked by reference),
+#                    ACC_VULTR_SSH_KEY_ID and ACC_VULTR_SSH_KEY.
 #                    Never run in CI.
 #
 # Local flows (each a check, or several):
