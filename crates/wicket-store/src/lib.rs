@@ -1312,6 +1312,28 @@ impl Ledger {
         Ok(())
     }
 
+    /// Records the control host's own built-in node (#146): enrolled by the control host itself, so
+    /// no join token, and no node CA (it decides nothing itself). A no-op if it is already recorded.
+    pub fn enrol_builtin_node(&self, node: &NodeRow) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL) ON CONFLICT(name) DO NOTHING"
+            ),
+            params![
+                node.name,
+                node.tenant,
+                node.target,
+                node.host_key,
+                node.host_key_fp,
+                node.node_key,
+                node.ssh_key,
+                serde_json::Value::from(node.hosts.clone()).to_string(),
+                node.enrolled_at
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Records a renewed CA certificate for an active node; its earlier active ones become "superseded".
     pub fn renew_node_ca(&mut self, ca: &NodeCaRow) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

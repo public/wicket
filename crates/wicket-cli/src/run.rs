@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
 use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
-use wicket_sandbox::{Docker, Mount, SandboxSpec};
+use wicket_sandbox::{Mount, SandboxSpec};
 use wicket_store::Ledger;
 
 /// How long an agent identity is valid (seconds). Re-issued at half-life. WICKET_IDENTITY_TTL
@@ -28,58 +28,58 @@ pub fn check_run_id(id: &str) -> Result<()> {
     }
 }
 
-/// Stops a run's box: Docker here (or over ssh), or the box's node.
+/// The run's box, on whichever node it runs: stop it, revoke it, pause it, look inside it.
 #[derive(Clone)]
-enum Stopper {
-    Docker(Docker, String),
-    Node(Arc<crate::noderun::NodeCtl>),
-}
+struct Stopper(Arc<crate::noderun::NodeCtl>);
 
 impl Stopper {
     async fn kill(&self) -> Result<()> {
-        match self {
-            Stopper::Docker(d, name) => {
-                // A paused (Idle) box must be unpaused before it can be killed.
-                let _ = d.unpause(name).await;
-                d.kill(name).await
-            }
-            Stopper::Node(c) => {
-                c.kill();
-                Ok(())
-            }
-        }
+        // A paused (Idle) box is unpaused first, so it can be killed.
+        let _ = self.unpause().await;
+        self.0.kill();
+        Ok(())
     }
 
-    /// The run's identity was revoked: on a node, publish the revocation first (the node refuses its
-    /// ops as soon as the delta applies), then stop the box.
+    /// The run's identity was revoked: the revocation is published first (the node refuses its
+    /// ops as soon as the delta applies), then the box is stopped.
     async fn revoke(&self) {
-        match self {
-            Stopper::Docker(d, name) => {
-                let _ = d.unpause(name).await;
-                let _ = d.kill(name).await;
-            }
-            Stopper::Node(c) => c.revoke(),
-        }
+        let _ = self.unpause().await;
+        self.0.revoke();
+    }
+
+    async fn pause(&self) -> Result<()> {
+        self.0.calls.ctl(&self.0.run, "pause", "", "").await.map(|_| ())
+    }
+
+    async fn unpause(&self) -> Result<()> {
+        self.0.calls.ctl(&self.0.run, "unpause", "", "").await.map(|_| ())
+    }
+
+    /// Whether the box is at a quiet point (only the agent's runtime running), as `user`.
+    async fn check_quiet(&self, user: &str) -> std::result::Result<(), String> {
+        let out = self.0.calls.ctl(&self.0.run, "processes", user, "").await.map_err(|e| format!("{e:#}"))?;
+        let procs: Vec<(u32, u32, String)> = serde_json::from_str(out.as_deref().unwrap_or("[]")).map_err(|e| e.to_string())?;
+        crate::hibernate::quiet(&procs).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
     }
 }
 
-/// The box's process: `docker run` here, or the exit a node reports.
-enum BoxProc {
-    Local(tokio::process::Child),
-    Node(tokio::sync::oneshot::Receiver<i32>),
-}
+/// The box's exit, as its node reports it.
+struct BoxProc(tokio::sync::oneshot::Receiver<i32>);
 
 impl BoxProc {
+    /// Until the box exits (a wrapped agent's whole session).
+    async fn exited(&mut self) -> Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        let code = (&mut self.0).await.unwrap_or(255);
+        Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8))
+    }
+
+    /// After its output ended: the exit, if the node reports it within 2 s.
     async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         use std::os::unix::process::ExitStatusExt;
-        match self {
-            BoxProc::Local(c) => Ok(c.wait().await?),
-            // A node that never reported an exit (the channel gave up, or the run stopped waiting): a failure.
-            BoxProc::Node(rx) => {
-                let code = tokio::time::timeout(std::time::Duration::from_secs(2), &mut *rx).await.ok().and_then(|r| r.ok()).unwrap_or(255);
-                Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8))
-            }
-        }
+        // A node that never reported an exit (the channel gave up, or the run stopped waiting): a failure.
+        let code = tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.0).await.ok().and_then(|r| r.ok()).unwrap_or(255);
+        Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8))
     }
 }
 
@@ -136,6 +136,8 @@ pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap, wake } = o;
+    // `--node local` is this host's own node: the same as no --node.
+    let node = node.filter(|n| *n != crate::localnode::NAME);
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
     // everything wicket prints to a log file instead.
     let mut agent_stdout: Option<std::os::fd::OwnedFd> = None;
@@ -153,7 +155,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         eprintln!("[wicket] wrapping an agent; wicket's log: {}", logs.join(format!("{}.log", std::process::id())).display());
     }
     if wrap.is_some() && node.is_some() {
-        bail!("wrapping an agent runs it on this host; --node isn't supported with it");
+        bail!("wrapping an agent runs it on this host's own node; --node isn't supported with it");
     }
     // A wrapped agent works in its launcher's directory, mounted at the same path in the box.
     let wrap_cwd = match &wrap {
@@ -237,17 +239,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
         }
     }
-    // An enrolled node is reached with its host key pinned; a revoked one is refused. It runs the box
-    // through its own `wicket node serve`; an unenrolled target gets docker over ssh, as before.
+    // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
+    // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
-    let served = node.as_ref().is_some_and(|n| n.name.is_some());
-    let docker = match &node {
-        Some(n) => Docker::over_ssh(n.ssh_prefix()),
-        None => Docker::from_env(),
-    };
-    if !served && !docker.image_exists(image).await? {
-        bail!("image {image} not found{} (run: wicket image)", node.as_ref().map(|n| format!(" on {}", n.target)).unwrap_or_default());
+    if let Some(n) = node.as_ref().filter(|n| n.name.is_none()) {
+        bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
+    let node_name = node.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| crate::localnode::NAME.to_string());
+    // This host's own node shares its filesystem: the box is laid out here, in the run's directory, and
+    // keeps what that allows (in-place workspaces, wrapped sessions, hibernation, a host /tmp).
+    let shares_host = node.is_none();
 
     let run = match run_id {
         Some(id) => {
@@ -259,7 +260,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
     // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
-    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none() && node.is_none();
+    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none() && shares_host;
     if wake.is_some() && !long_lived {
         bail!("only a local claude-code agent can be woken");
     }
@@ -281,7 +282,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     crate::hibernate::real_dirs(&["sock", "ca", "state", "state/home", "state/claude", "workspace", "workspace/out"].map(|s| dir.join(s)))?;
     // A local agent's /tmp is a host directory (kept with the rest of its state, and through a
     // crash), capped at the size the tmpfs had. Programs keep the tmpfs.
-    let tmp_dir = (node.is_none() && m.program.is_none()).then(|| dir.join("tmp"));
+    let tmp_dir = (shares_host && m.program.is_none()).then(|| dir.join("tmp"));
     if let Some(t) = &tmp_dir {
         crate::hibernate::real_dirs(std::slice::from_ref(t))?;
         std::fs::set_permissions(t, std::fs::Permissions::from_mode(0o1777))?;
@@ -290,8 +291,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         std::fs::create_dir_all(t)?;
         std::fs::set_permissions(t, std::fs::Permissions::from_mode(0o1777))?;
     }
-    // A local box gets wicket's own hosts file, which links add names to (crate::links).
-    if node.is_none() {
+    // The box's own hosts file, which links add names to (crate::links); a node that lays out its
+    // boxes itself makes its own.
+    if shares_host {
         std::fs::write(crate::links::hosts_path(&dir), wicket_core::link::hosts_file(&[]))?;
     }
     for w in workdir.into_iter().chain(program_src.as_ref().map(|(s, _)| s.as_path())) {
@@ -379,7 +381,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let now = wicket_store::now();
             let ttl = identity_ttl;
             let manifest_sha256 = hex::encode(sha2::Sha256::digest(text.as_bytes()));
-            let node_name = node.as_ref().map(Node::label).unwrap_or_else(|| "local".into());
+            let node_name = node_name.clone();
             // Who this agent acts for. A root run: the human who started it, and how wicket knows
             // (the PoC CLI knows only the local unix user). A child: its parent's principal, with the
             // parent prepended to the delegation chain, read from the parent's verified identity
@@ -530,6 +532,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         _ => None,
     };
+    // Calls on boxes over this run's node connection (pause, exec, link sockets), made before the
+    // connection itself: the link tools use them.
+    let node_calls = Arc::new(crate::nodecall::Calls::default());
     let ctx = RunCtx {
         tenant: m.tenant.clone(),
         run: run.clone(),
@@ -542,10 +547,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         identity: identity.clone(),
         spawner,
         swaps,
-        boxes: node.is_none().then(|| {
-            Arc::new(crate::links::LocalBoxes::new(docker.clone(), data_dir().join("runs"), dir.clone()))
-                as Arc<dyn wicket_proxy::link::BoxOps>
-        }),
+        boxes: Some(Arc::new(crate::links::NodeBoxes::new(ledger.clone(), &run.0, &node_name, node_calls.clone(), dir.clone()))
+            as Arc<dyn wicket_proxy::link::BoxOps>),
         capacity,
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
@@ -568,16 +571,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let gateway = Gateway::new(ctx.clone());
     let (es, ls, gs) = (dir.join("sock/egress.sock"), dir.join("sock/llm.sock"), dir.join("sock/gateway.sock"));
-    // HTTP/3 and DNS (#92): the box's UDP forwarder connects here. A box on a remote node reaches
-    // the run over SSH-forwarded sockets, which carry streams only: it gets the stream variant.
-    let (us, us_stream) = (dir.join("sock/udp.sock"), dir.join("sock/udp-stream.sock"));
+    // HTTP/3 and DNS (#92): the box's UDP forwarder connects here (on a node that lays out its own
+    // boxes, the node's own HTTP/3 proxy serves it instead).
+    let us = dir.join("sock/udp.sock");
     let u_task = tokio::spawn({
         let (h3, us) = (h3.clone(), us.clone());
         async move { h3.serve(&us).await }
-    });
-    let us_task = (node.is_some() && !served).then(|| {
-        let (h3, p) = (h3.clone(), us_stream.clone());
-        tokio::spawn(async move { h3.serve_stream(&p).await })
     });
     let g_task = tokio::spawn({
         let gs = gs.clone();
@@ -611,39 +610,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             (p, vec![])
         }
     };
-    // Where the box's directories live: here, or on the remote node (which gets no secrets: only
-    // the CA's public certificate, the workspace, and the two forwarded sockets). A served node makes
-    // them itself, from what the run sends it.
-    let (box_root, user, _forward) = match &node {
-        Some(_) if served => (dir.clone(), String::new(), None),
-        None => {
-            let uid = std::process::Command::new("id").arg("-u").output()?;
-            let gid = std::process::Command::new("id").arg("-g").output()?;
-            (dir.clone(), format!("{}:{}", String::from_utf8_lossy(&uid.stdout).trim(), String::from_utf8_lossy(&gid.stdout).trim()), None)
-        }
-        Some(n) => {
-            let home = n.sh("echo $HOME").await?;
-            let rd = format!("{home}/wicket-runs/{}", run.0);
-            n.sh(&format!("umask 077; mkdir -p {rd}/sock {rd}/ca {rd}/state/home {rd}/state/claude {rd}/workspace/out")).await?;
-            n.put(&format!("{rd}/ca/ca.pem"), ca.cert_pem().as_bytes()).await?;
-            if let Some(w) = workdir {
-                n.put_dir(w, &format!("{rd}/workspace")).await?;
-            }
-            let fwd = n
-                .forward(&[
-                    (format!("{rd}/sock/egress.sock"), es.as_path()),
-                    (format!("{rd}/sock/llm.sock"), ls.as_path()),
-                    (format!("{rd}/sock/gateway.sock"), gs.as_path()),
-                    (format!("{rd}/sock/udp.sock"), us_stream.as_path()),
-                ])
-                .await?;
-            let user = n.sh("echo $(id -u):$(id -g)").await?;
-            (std::path::PathBuf::from(rd), user, Some(fwd))
-        }
-    };
-    // Volumes persist per tenant and zone, on whichever host runs the box.
+    // Where the box's directories live: here, in the run's directory, for this host's own node; a
+    // node that lays out its boxes itself makes them from what the run sends it (it gets no secrets:
+    // only the CA's public certificate, the workspace, and the run's settings).
+    let box_root = dir.clone();
+    // SAFETY: getuid and getgid can't fail.
+    let user = if shares_host { unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) } } else { String::new() };
+    // Volumes persist per tenant and zone, on whichever node runs the box (a node that lays out its
+    // boxes keeps them itself).
     let mut volume_mounts = Vec::new();
-    for v in m.zone.volumes.iter().filter(|_| !served) {
+    for v in m.zone.volumes.iter().filter(|_| shares_host) {
         let host = match &node {
             // A long-lived agent's durable volume is its own, bundled with its state (#70).
             None if v.persist == wicket_core::Persist::Durable && fence.is_some() => {
@@ -658,12 +634,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
                 d
             }
-            Some(n) => {
-                let home = n.sh("echo $HOME").await?;
-                let d = format!("{home}/wicket-volumes/{}/{}/{}", m.tenant.0, m.zone.name, v.name);
-                n.sh(&format!("umask 077; mkdir -p {}", wicket_sandbox::shell_quote(&d))).await?;
-                std::path::PathBuf::from(d)
-            }
+            Some(_) => unreachable!("only this host's node shares its filesystem"),
         };
         volume_mounts.push(Mount { host, target: v.path.clone(), read_only: false });
     }
@@ -693,13 +664,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut state_files: Vec<(String, String)> = vec![];
     if m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") {
         let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(&m))?;
-        match &node {
-            Some(_) if served => {
-                use base64::Engine;
-                state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
-            }
-            None => crate::hibernate::write_new(&box_root.join("state/claude/settings.json"), &json)?,
-            Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
+        if shares_host {
+            crate::hibernate::write_new(&box_root.join("state/claude/settings.json"), &json)?;
+        } else {
+            use base64::Engine;
+            state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
         }
     }
     let box_user = user.clone();
@@ -718,7 +687,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         .into_iter()
         .chain(workspace_mounts)
         .chain(volume_mounts)
-        .chain(node.is_none().then(|| Mount { host: crate::links::hosts_path(&dir), target: "/etc/hosts".into(), read_only: true }))
+        .chain(shares_host.then(|| Mount { host: crate::links::hosts_path(&dir), target: "/etc/hosts".into(), read_only: true }))
         .chain(tmp_dir.as_ref().map(|t| Mount { host: t.clone(), target: "/tmp".into(), read_only: false }))
         .collect(),
         env: plan.env,
@@ -748,73 +717,106 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         println!("  identity {}  (valid {}s, re-issued every {}s)", c.sub, identity_ttl, identity_ttl / 2);
         println!("  acting for {}", c.chain().join(" → "));
     }
-    if let Some(n) = &node {
-        if served {
-            println!("  node {} via wicket node serve (egress decided there from the signed feed; secrets stay here)", n.label());
-        } else {
-            println!("  node {} (holds no secrets; sockets forwarded over ssh)", n.target);
-        }
+    if node.is_some() {
+        println!("  node {node_name} via wicket node serve (egress decided there from the signed feed; secrets stay here)");
     }
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
-    let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = match &node {
-        Some(n) if served => {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let start = crate::chan::BoxStart {
-                run: run.0.clone(),
-                tenant: m.tenant.0.clone(),
-                zone: m.zone.name.clone(),
-                image: spec.image.clone(),
-                isolation: spec.isolation,
-                env: spec.env.clone(),
-                argv: spec.argv.clone(),
-                memory: spec.memory.clone(),
-                cpus: spec.cpus,
-                pids: spec.pids,
-                interactive: spec.interactive,
-                timeout_secs: m.zone.limits.timeout()?.as_secs(),
-                escalate,
-                ca_pem: ca.cert_pem(),
-                workspace_tar: b64.encode(crate::noderun::tar_dir(&dir.join("workspace"))?),
-                state_files: state_files.clone(),
-                volumes: m.zone.volumes.iter().map(|v| (v.name.clone(), v.path.clone())).collect(),
-                streams: [1, 2, 3],
-            };
-            let nb = crate::noderun::start(crate::noderun::Start {
-                node: n,
-                tenant: m.tenant.clone(),
-                run: run.clone(),
-                zone: m.zone.clone(),
-                dir: dir.clone(),
-                ledger: ledger.clone(),
-                events: ctx.events.clone(),
-                start,
-            })
-            .await?;
-            (
-                BoxProc::Node(nb.exit),
-                Stopper::Node(nb.ctl),
-                nb.stdin.map(|s| Box::new(s) as Writer),
-                Some(Box::new(nb.stdout) as Reader),
-                Box::new(nb.stderr) as Reader,
-            )
+    // A wrapped agent's stdout, copied to its launcher until the box's ends.
+    let mut wrapped_out: Option<tokio::task::JoinHandle<()>> = None;
+    let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // This host's own node mounts the box as laid out here; another node is sent the workspace.
+        let host = shares_host.then(|| crate::chan::HostBox {
+            name: spec.name.clone(),
+            mounts: spec.mounts.iter().map(|m| (m.host.display().to_string(), m.target.clone(), m.read_only)).collect(),
+            user: spec.user.clone(),
+            workdir: spec.workdir.clone(),
+            labels: spec.labels.clone(),
+        });
+        let workspace_tar = if shares_host { String::new() } else { b64.encode(crate::noderun::tar_dir(&dir.join("workspace"))?) };
+        let start = crate::chan::BoxStart {
+            run: run.0.clone(),
+            tenant: m.tenant.0.clone(),
+            zone: m.zone.name.clone(),
+            image: spec.image.clone(),
+            isolation: spec.isolation,
+            env: spec.env.clone(),
+            argv: spec.argv.clone(),
+            memory: spec.memory.clone(),
+            cpus: spec.cpus,
+            pids: spec.pids,
+            interactive: spec.interactive,
+            // The node's own backstop, for when it can't reach the run. A long-lived agent's run
+            // decides at its deadline (it may hibernate instead), so the node waits a little longer.
+            timeout_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
+                + if long_lived { 120 } else { 0 },
+            escalate,
+            ca_pem: ca.cert_pem(),
+            workspace_tar,
+            state_files: state_files.clone(),
+            volumes: m.zone.volumes.iter().map(|v| (v.name.clone(), v.path.clone())).collect(),
+            streams: [1, 2, 3],
+            host,
+        };
+        let via = match &node {
+            Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
+            None => {
+                crate::localnode::ensure(&ledger).await?;
+                crate::nodecall::Via::Unix(crate::localnode::socket()?)
+            }
+        };
+        let nb = crate::noderun::start(crate::noderun::Start {
+            node: node_name.clone(),
+            via,
+            tenant: m.tenant.clone(),
+            run: run.clone(),
+            zone: m.zone.clone(),
+            dir: dir.clone(),
+            ledger: ledger.clone(),
+            events: ctx.events.clone(),
+            start,
+            calls: node_calls.clone(),
+        })
+        .await?;
+        let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
+        // A wrapped agent's stdin and stdout are its launcher's: joined to the box's, not read here.
+        if let Some(fd) = agent_stdout.take() {
+            let (box_in, mut box_out) = (si.take(), so.take().expect("stdout"));
+            if let Some(mut w) = box_in {
+                // Read on a thread of its own: a blocking read of the launcher's stdin must not hold
+                // up the runtime's shutdown.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; 32 * 1024];
+                    let mut input = std::io::stdin().lock();
+                    while let Ok(n) = input.read(&mut buf) {
+                        if n == 0 || tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Some(b) = rx.recv().await {
+                        if w.write_all(&b).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = w.shutdown().await;
+                });
+            }
+            wrapped_out = Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut out = tokio::fs::File::from_std(std::fs::File::from(fd));
+                let _ = tokio::io::copy(&mut box_out, &mut out).await;
+                let _ = out.flush().await;
+            }));
         }
-        _ => {
-            let mut c = match agent_stdout.take() {
-                Some(fd) => docker.spawn_with(&spec, std::process::Stdio::inherit(), std::process::Stdio::from(fd))?,
-                None => docker.spawn(&spec)?,
-            };
-            let (i, o, e) = (c.stdin.take(), c.stdout.take(), c.stderr.take().expect("stderr"));
-            (
-                BoxProc::Local(c),
-                Stopper::Docker(docker.clone(), name.clone()),
-                i.map(|s| Box::new(s) as Writer),
-                o.map(|s| Box::new(s) as Reader),
-                Box::new(e) as Reader,
-            )
-        }
+        (BoxProc(nb.exit), Stopper(nb.ctl), si, so, Box::new(nb.stderr) as Reader)
     };
     if let Some(f) = &fence {
         let l = ledger.lock().expect("ledger");
@@ -945,7 +947,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     loop {
         tokio::select! {
-            ex = child.wait(), if lines.is_none() => {
+            ex = child.exited(), if lines.is_none() => {
                 wrapped_exit = Some(ex?);
                 break;
             }
@@ -1032,9 +1034,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             _ = tick.tick(), if stdin.is_some() => {
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
                 if !msgs.is_empty() && paused {
-                    if let Stopper::Docker(d, n) = &stopper {
-                        let _ = d.unpause(n).await;
-                    }
+                    let _ = stopper.unpause().await;
                     paused = false;
                     set_state("active", None);
                 }
@@ -1066,9 +1066,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if !turn_running && waiting > notified_msgs && hib_after.is_some() {
                         use tokio::io::AsyncWriteExt;
                         if paused {
-                            if let Stopper::Docker(d, n) = &stopper {
-                                let _ = d.unpause(n).await;
-                            }
+                            let _ = stopper.unpause().await;
                             paused = false;
                             set_state("active", None);
                         }
@@ -1085,12 +1083,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         let since = last_result.elapsed();
                         if hib_asked || (hib_after.is_some_and(|h| since >= h) && !hib_tried) {
                             hib_asked = false;
-                            if let Stopper::Docker(d, n) = &stopper {
+                            {
                                 if paused {
-                                    let _ = d.unpause(n).await;
+                                    let _ = stopper.unpause().await;
                                     paused = false;
                                 }
-                                match crate::hibernate::check_quiet(d, n, &box_user).await {
+                                match stopper.check_quiet(&box_user).await {
                                     Ok(()) => {
                                         println!("[wicket] quiet point: hibernating agent {}", f.agent);
                                         set_state("hibernating", None);
@@ -1100,7 +1098,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     Err(why) => {
                                         let note = format!("not hibernated: {why}");
                                         println!("[wicket] {note}; staying idle (paused)");
-                                        let _ = d.pause(n).await;
+                                        let _ = stopper.pause().await;
                                         paused = true;
                                         hib_tried = true;
                                         set_state("idle", Some(&note));
@@ -1108,15 +1106,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 }
                             }
                         } else if hib_after.is_some() && !paused && since >= idle {
-                            if let Stopper::Docker(d, n) = &stopper {
-                                match d.pause(n).await {
-                                    Ok(()) => {
-                                        paused = true;
-                                        set_state("idle", None);
-                                        println!("[wicket] idle: box paused (follow-ups still reach it: wicket say {run} \"…\")");
-                                    }
-                                    Err(e) => println!("[wicket] could not pause the box: {e:#}"),
+                            match stopper.pause().await {
+                                Ok(()) => {
+                                    paused = true;
+                                    set_state("idle", None);
+                                    println!("[wicket] idle: box paused (follow-ups still reach it: wicket say {run} \"…\")");
                                 }
+                                Err(e) => println!("[wicket] could not pause the box: {e:#}"),
                             }
                         }
                     }
@@ -1133,10 +1129,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
-                if let (Some(_), false, false, Some(_), Stopper::Docker(d, n)) = (&fence, turn_running, hibernating, &stdin, &stopper) {
-                    let _ = d.unpause(n).await;
+                if let (Some(_), false, false, Some(_)) = (&fence, turn_running, hibernating, &stdin) {
+                    let _ = stopper.unpause().await;
                     paused = false;
-                    if crate::hibernate::check_quiet(d, n, &box_user).await.is_ok() {
+                    if stopper.check_quiet(&box_user).await.is_ok() {
                         println!("[wicket] timeout after {} while idle: hibernating instead", humantime::format_duration(timeout));
                         set_state("hibernating", None);
                         hibernating = true;
@@ -1153,7 +1149,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
                 }
             }
-            _ = &mut give_up, if stopping && served => {
+            _ = &mut give_up, if stopping => {
                 println!("[wicket] node unreachable; not waiting for the box any longer (the node stops it at the run's timeout)");
                 break;
             }
@@ -1172,11 +1168,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(e) => e,
         None => child.wait().await?,
     };
+    if let Some(t) = wrapped_out.take() {
+        // Everything the box wrote reaches the launcher before the run ends.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
+    }
     while let Ok(ev) = rx.try_recv() {
         print_event(&ev);
     }
     // (A node box that couldn't be reached has no end of stderr: don't wait for one.)
-    let stderr_text = match tokio::time::timeout(std::time::Duration::from_secs(if served { 5 } else { 3600 }), err_task).await {
+    let stderr_text = match tokio::time::timeout(std::time::Duration::from_secs(5), err_task).await {
         Ok(r) => r.unwrap_or_default(),
         Err(_) => String::new(),
     };
@@ -1279,21 +1279,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     l_task.abort();
     g_task.abort();
     u_task.abort();
-    if let Some(t) = &us_task {
-        t.abort();
-    }
 
-    // Typed output: the outbox, parsed and size-limited outside the box. (A served node sent it with
-    // the exit.)
-    if let Some(n) = node.as_ref().filter(|_| !served) {
-        let rd = box_root.display().to_string();
-        if let Ok(s) = n.sh(&format!(
-            "o={rd}/workspace/out; f=$o/result.json; if [ ! -L {rd}/workspace ] && [ ! -L $o ] && [ ! -L $f ] && [ -f $f ]; then head -c 65537 $f; fi 2>/dev/null || true"
-        )).await {
-            let _ = std::fs::write(dir.join("workspace/out/result.json"), s);
-        }
-        let _ = n.sh(&format!("rm -rf {rd}")).await;
-    }
+    // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its
+    // boxes sent it with the exit.)
     let result = crate::hibernate::read_outbox(&dir, 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     // A child reports back to its parent with a signed message, before its run is marked ended.
     if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {

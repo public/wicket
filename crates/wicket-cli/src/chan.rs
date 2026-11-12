@@ -1,5 +1,6 @@
-//! The node control channel (#57): one multiplexed, length-prefixed byte stream between the control
-//! host's `wicket run --node <name>` and the node's `wicket node serve`, carried over ssh.
+//! The node control channel (#57): one multiplexed, length-prefixed byte stream between a control host
+//! process (a `wicket run`, or a link relay) and a node's `wicket node serve`, carried over ssh, or
+//! over the node's unix socket for this host's own node (#146).
 //!
 //! **Framing.** Each frame is a 4-byte big-endian length `N` (1 ≤ N ≤ [`MAX_FRAME`]) followed by `N`
 //! bytes: one kind byte, then the body.
@@ -33,8 +34,11 @@ const KIND_MSG: u8 = 1;
 const KIND_DATA: u8 = 2;
 const KIND_FEED: u8 = 3;
 
-/// Tunnel stream ids (allocated by the node) have this bit set; stdio stream ids don't.
+/// Tunnel stream ids have this bit set; stdio stream ids don't.
 pub const TUNNEL_BIT: u64 = 1 << 63;
+/// Tunnels the control host numbers (an [`Msg::Exec`]'s) also have this bit, so they never collide
+/// with the node's.
+pub const CONTROL_TUNNEL_BIT: u64 = 1 << 62;
 
 /// One frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +79,25 @@ pub struct BoxStart {
     pub volumes: Vec<(String, String)>,
     /// Stream ids for stdin, stdout and stderr.
     pub streams: [u64; 3],
+    /// Set only for a node that shares the control host's filesystem (the built-in local node,
+    /// #146): the box is laid out by the control host, in the run's own directory, and its sockets
+    /// are the run's own proxies (as for any host a node forwards, without the hop).
+    #[serde(default)]
+    pub host: Option<HostBox>,
+}
+
+/// A box laid out by the control host on a node that shares its filesystem: what `docker run`
+/// mounts, by path, and how the box is named and labelled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostBox {
+    /// The box's Docker name.
+    pub name: String,
+    /// (host path, path in the box, read-only).
+    pub mounts: Vec<(String, String, bool)>,
+    /// uid:gid the box runs as.
+    pub user: String,
+    pub workdir: String,
+    pub labels: Vec<(String, String)>,
 }
 
 /// How far a box's stdio has got, as the node reports it on reconnect.
@@ -108,6 +131,10 @@ pub enum Msg {
         /// The control host's handshake nonce (base64url, 32 bytes); unused by observers.
         #[serde(default)]
         nonce: String,
+        /// What this connection is for (a run's id, or a link relay's): the node keeps one
+        /// connection per scope, so a reconnect replaces its own older connection and no other.
+        #[serde(default)]
+        scope: String,
     },
     /// The control host's handshake proof, signed with the issuer key (answers [`Msg::Challenge`]).
     Prove {
@@ -159,8 +186,54 @@ pub enum Msg {
     Close {
         stream: u64,
     },
+    /// Acts on a run's box: `status` (an error unless it is running), `pause`, `unpause`, `processes` (as `user`; the answer's `out` is a JSON
+    /// list of (pid, ppid, command line)) or `hosts` (`arg` becomes the box's /etc/hosts).
+    BoxCtl {
+        id: u64,
+        run: String,
+        what: String,
+        #[serde(default)]
+        user: String,
+        #[serde(default)]
+        arg: String,
+    },
+    /// Runs `argv` in a run's box as `user` (`docker exec`), its stdout (and stdin, if `stdin`) joined
+    /// to tunnel `stream`, which the control host numbers ([`CONTROL_TUNNEL_BIT`]). Answered with
+    /// [`Msg::TunnelOpened`], then [`Msg::ExecDone`].
+    Exec {
+        stream: u64,
+        run: String,
+        user: String,
+        argv: Vec<String>,
+        stdin: bool,
+    },
+    /// Listens on unix socket `sock` in a run's socket directory (a link's relay socket, #6): each
+    /// connection is offered to this connection as a tunnel to target `link:<sock>`.
+    Listen {
+        id: u64,
+        run: String,
+        sock: String,
+    },
+    Unlisten {
+        run: String,
+        sock: String,
+    },
 
     // ---- node → control host ----
+    /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
+    BoxCtlDone {
+        id: u64,
+        out: Option<String>,
+        error: Option<String>,
+    },
+    /// An [`Msg::Exec`]'s process ended.
+    ExecDone {
+        stream: u64,
+        code: i32,
+    },
+    /// The connection that shipped audit records went away: send [`Msg::AuditFrom`] with this
+    /// control host's watermark to take over.
+    AuditAsk {},
     /// The node's handshake answer: its nonce, certificate and proof (answers [`Msg::Hello`]).
     Challenge {
         proof: wicket_identity::node::NodeProof,
@@ -450,6 +523,7 @@ mod tests {
                 build: "ab".repeat(32),
                 observer: false,
                 nonce: "A".repeat(43),
+                scope: "run_a".into(),
             }),
             Frame::Msg(Msg::Challenge {
                 proof: wicket_identity::node::NodeProof { nonce: "B".repeat(43), cert: "a.b.c".into(), proof: "d.e.f".into() },

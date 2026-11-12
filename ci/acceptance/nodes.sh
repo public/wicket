@@ -3,7 +3,9 @@
 #
 # An agent asks for a machine of its own (request_capacity), a human approves the lease, the
 # reconciler acquires the node through placement, and the agent starts a box there (spawn with
-# placement {lease}). Then the node e2e flow (ci/node-e2e.sh) runs against the same node. Revoking the
+# placement {lease}), and links to it: the agent's box, on the control host's own node, fetches a page
+# from the box on the other node across the link, relayed by the control host over both nodes'
+# channels (#146). Then the node e2e flow (ci/node-e2e.sh) runs against the same node. Revoking the
 # agent ends the lease; one reconcile pass gives the node back (on Vultr: destroys it), no tagged
 # machine remains, and the lease records what the node billed.
 #
@@ -12,9 +14,6 @@
 #          does). Nothing costs money.
 #   vultr: `backend: vultr`, the cheapest plan that fits 1 vCPU and 1 GiB, at most $0.02 an hour,
 #          in an envelope of $0.05 an hour and $0.05 in total (owner tag wicket-owner-acc.wicket.test). The agent image is loaded onto the node over its pinned ssh.
-#
-# Links reach only boxes on the control host (a remote box has no host directory here), so a link
-# to the box on the node is refused: cross-node links are a known gap, recorded as such.
 
 NODE=acc-n1
 node_ssh_target=wicket@acc-n1.example.com
@@ -151,16 +150,12 @@ multihost() {
   wait_for 120 'child_log "$cap_run" | grep -q "acc-remote-done"' || true
   check "  its egress was decided on the node: in reach 200" 'child_log "$cap_run" | grep -q "acc-remote in=200"'
   check "  and out of reach 403" 'child_log "$cap_run" | grep -q "acc-remote .*out=403"'
-  # Cross-node links: not supported yet.
+  # A link across nodes: the agent's box (on the control host's own node) reaches the box on this node.
   echo "   connect to the box on the node: $(cf connect)"
-  if cf connect | grep -q "wicket.internal:8000"; then
-    check "a box on the node, linked to the control host's agent, serves it across nodes" '[ "$(cf connect_fetch)" = acc-remote ]'
-  else
-    check "a link to the box on the node is refused cleanly (cross-node links: known gap)" 'cf connect | grep -q "is not one wicket can link here"'
-    skip "a box on the node linked to a box on the control host" "cross-node links are a known gap; the node e2e flow runs instead"
-  fi
+  check "the agent linked to the box on the other node" 'cf connect | grep -q "remote.wicket.internal:8000"'
+  check "  and fetched its page across nodes, relayed by the control host" '[ "$(cf connect_fetch)" = acc-remote ]'
 
-  # The node e2e flow, against the same node, once the remote box has ended (one run per node).
+  # The node e2e flow, against the same node, once the remote box has ended.
   remote_run=$(cf remote | grep -o 'run_[a-z0-9]*' | head -1 || true)
   wait_for 90 'child_log "$cap_run" | grep -qE "run $remote_run: [a-z]+ in"' || true
   if [ "${ACC_NODE_E2E:-1}" = 1 ] && [ -n "${node_name:-}" ]; then

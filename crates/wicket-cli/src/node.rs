@@ -1,14 +1,10 @@
-//! A remote sandbox node reached over SSH (PoC of design §8: a node that holds no secrets).
-//!
-//! The node runs only Docker + gVisor. wicket's proxies, the model key, the CA key and the ledger
-//! stay on the control host; the node gets the run's two unix sockets forwarded with `ssh -R`
-//! (unix socket to unix socket), plus the CA's public certificate.
+//! A remote node reached over SSH (design §8: a node that holds no secrets).
 //!
 //! An **enrolled** node (`wicket node enrol`, see `enrol.rs`) is reached with its host key pinned:
 //! every ssh call checks it against a known_hosts file wicket manages, with `StrictHostKeyChecking=yes`,
-//! so a node presenting any other key is refused. A target that isn't enrolled is still reached the old
-//! way (trust on first use), with a warning. Runs on an enrolled node go through its `wicket node
-//! serve` (`noderun.rs`); runs on an unenrolled target still run docker over ssh, as described above.
+//! so a node presenting any other key is refused. Its boxes run through its `wicket node serve`
+//! (`noderun.rs`), as this host's own boxes do through the built-in local node (`localnode.rs`, #146);
+//! a target that isn't enrolled is reached only to enrol it (trust on first use, with a warning).
 //!
 //! **Test hook.** `WICKET_NODE_SSH` replaces `ssh <options> <target>` for every command sent to a node
 //! with the command it names (split on spaces; it gets the remote command as one argument, as ssh
@@ -19,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use wicket_sandbox::shell_quote;
 
 pub struct Node {
@@ -74,11 +70,6 @@ impl Node {
         Node { target: target.to_string(), name: name.map(String::from), base, hook }
     }
 
-    /// The name runs and identities record: the enrolled name, else the ssh target.
-    pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.target.clone())
-    }
-
     /// The ssh command up to and including the target (for Docker::over_ssh).
     pub fn ssh_prefix(&self) -> Vec<String> {
         if let Some(h) = &self.hook {
@@ -122,41 +113,6 @@ impl Node {
             bail!("writing {remote} on {} failed", self.target);
         }
         Ok(())
-    }
-
-    /// Copies a local directory's contents into a node directory (tar over ssh).
-    pub async fn put_dir(&self, local: &Path, remote: &str) -> Result<()> {
-        let tar = std::process::Command::new("tar").arg("-C").arg(local).args(["-cf", "-", "."]).stdout(Stdio::piped()).spawn()?;
-        let p = self.ssh_prefix();
-        let st = std::process::Command::new(&p[0])
-            .args(&p[1..])
-            .arg(format!("tar -C {} -xf -", shell_quote(remote)))
-            .stdin(tar.stdout.expect("tar stdout"))
-            .status()?;
-        if !st.success() {
-            bail!("copying {} to {}:{} failed", local.display(), self.target, remote);
-        }
-        Ok(())
-    }
-
-    /// Forwards local unix sockets to paths on the node for the life of the returned process.
-    pub async fn forward(&self, pairs: &[(String, &Path)]) -> Result<Child> {
-        let mut c = Command::new(&self.base[0]);
-        c.args(&self.base[1..]).args(["-N", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes"]);
-        for (remote, local) in pairs {
-            c.arg("-R").arg(format!("{}:{}", remote, local.display()));
-        }
-        c.arg(&self.target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
-        let child = c.spawn().context("starting ssh socket forwarding")?;
-        // Wait until the forwarded sockets exist on the node.
-        let test = pairs.iter().map(|(r, _)| format!("test -S {}", shell_quote(r))).collect::<Vec<_>>().join(" && ");
-        for _ in 0..50 {
-            if self.sh(&test).await.is_ok() {
-                return Ok(child);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        bail!("forwarded sockets did not appear on {}", self.target)
     }
 }
 

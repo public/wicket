@@ -8,7 +8,24 @@ Reference for running boxes on other machines. The README has the short version;
 On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress locally from
 a signed policy feed, so the box keeps working, failing narrow, while the control host is unreachable (#57;
 below). The ledger, the keys that matter, the LLM proxy and the MCP gateway stay on the control host. A
-`--node` ssh target that isn't enrolled still works the old way: docker over ssh, the run's sockets forwarded.
+`--node` target must be enrolled: there is no other way to run a box.
+
+## The control host is a node too
+
+Every box runs on a node through `wicket node serve` (#146). `wicket run` without `--node` places the box on
+the control host's own built-in node, `local`, which is served by the same runtime and reached over its unix
+socket instead of ssh. The control host makes and enrols it the first time a run needs it
+(`<data dir>/local-node/`: its own node key, an identity certificate the control host renews itself, no node
+CA), and starts its `serve` on demand: one per wicket build, detached, exiting after 10 minutes with no boxes
+and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`). `wicket node list` shows it; `enrol` refuses the name.
+
+The local node differs from a remote one only in how it is reached, and in that it shares the control
+host's filesystem. So the control host lays the box out itself, in the run's directory (as `chan::HostBox`):
+its workspace, state, `/tmp` and volumes stay where they always were, and its sockets are the run's own
+proxies, as for any host a node forwards to the control host, without the hop. Its lifecycle is the node's:
+`docker run`, stdio, the timeout, kill, pause and unpause, process lists for hibernation, execs for links.
+What needs the shared filesystem (in-place `--workspace-dir`, wrapped sessions, hibernation, a host `/tmp`)
+needs the local node; a remote node refuses a box laid out that way.
 
 ```sh
 wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)
@@ -25,7 +42,7 @@ wicket node revoke n1
   `enrol` refuses unless you pass `--trust-first-use`, and then prints the fingerprint it pinned. After that, every
   ssh call uses a wicket-managed known_hosts (`<data dir>/nodes/<name>/known_hosts`) with
   `StrictHostKeyChecking=yes`, so a node with any other key is refused. A `--node` target that isn't enrolled
-  still works the old way (trust on first use), with a warning. A revoked node is refused.
+  is refused: boxes run only through an enrolled node's `serve`. A revoked node is refused.
 - **Join token.** It's single-use, expires, and names the node. The operator redeems it on the control host
   with `enrol`. It shows that whoever minted it meant that name to join, and it never goes to the node. Passed as `--token`,
   it shows up in `ps` and shell history, which is acceptable only because it's single-use and short-lived.
@@ -99,8 +116,18 @@ wicket node revoke n1
   `node.audit.restart` record. Feed decisions use the wall clock read once at start and advanced by a monotonic
   clock, so a clock step on the node can't stretch a freshness statement (after a deliberate clock step, restart
   `wicket-node` so it reads the wall clock again).
-- **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), so a
-  child can't share its parent's served node (on a leased node it runs alone), plain `http://` to a forwarded host is refused, and the MCP gateway still
+- **Many runs per node.** Each run has its own control connection, named by its run (a newer connection for
+  the same run replaces the older one, and no other); the node sends each box's output, events, asks and
+  tunnels to the connection that owns it, and audit records over one of them, handing that over when it
+  goes. Runs share the node's feed: each commit takes `<data dir>/nodes/<name>/feed.lock` and first reloads
+  the delta log if another process appended to it. A run drops its own token from the feed when its box
+  exits; the next run to start drops those of runs that ended without doing so.
+- **Links across nodes.** A link's ends may be on any nodes. Its relay socket is the node's (each connection
+  is tunnelled over the control channel to the process that opened the link); the in-box listener and each
+  connection into the target box are execs on that box's node; its hosts file is rewritten there. A box on
+  another node than the relaying run's is reached over a connection of the relay's own (scope
+  `links:<run>`), so the bytes pass through the control host. Reach, approval and audit are those of any link.
+- **For now.** Plain `http://` to a forwarded host is refused, and the MCP gateway still
   decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
