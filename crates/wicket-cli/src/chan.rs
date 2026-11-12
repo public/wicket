@@ -106,6 +106,16 @@ pub struct BoxStart {
     /// input and output tokens. The node's model proxy starts from it (#151).
     #[serde(default)]
     pub llm_prior: (u64, u64, u64),
+    /// What the box's output may take on the node's disk (#151; the zone's `limits.output`), and
+    /// whether the box is stopped when its output passes it (else the oldest output goes).
+    #[serde(default = "default_output_cap")]
+    pub output_cap: u64,
+    #[serde(default)]
+    pub output_stop: bool,
+}
+
+fn default_output_cap() -> u64 {
+    64 << 20
 }
 
 /// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).

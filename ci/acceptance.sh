@@ -343,6 +343,35 @@ wroot reconcile --dry-run >"$work/rec-dry2.log" 2>&1 || true
 check "then a dry run has nothing to change" 'grep -q "^reconcile: 0 change(s)" "$work/rec-dry2.log"'
 check "no box of ours is left" '[ -z "$(our_boxes)" ]'
 
+# ---- 3b. a box flooding its output (#151) ----
+# A box's output is kept on its node's host only up to its zone's limits.output (Docker's log, rotated),
+# and the box's audit records what the host dropped. A burst faster than the node reads loses what Docker
+# rotates away unread (keep_newest); output at a pace the node keeps up with arrives whole across
+# rotations, each line once. With on_output_full: stop, the box is stopped instead.
+log "a box flooding its output"
+HOME=$HOMEW "$W" run "$(manifest flood)" --image "$IMAGE_TAG" >"$work/flood.log" 2>&1 &
+flood_pid=$!
+pids+=("$flood_pid")
+wait_for 120 'grep -q acc-flood-done "$work/flood.log" 2>/dev/null' || true
+flood=$(run_id_of "$work/flood.log")
+our_runs+=("$flood")
+flood_box=$(box_of "$flood" | head -1)
+flood_logpath=$($DOCKER inspect -f '{{.LogPath}}' "$flood_box" 2>/dev/null || true)
+flood_kept=$(sudo -n sh -c 'du -cb "$1"* | tail -1' _ "$flood_logpath" 2>/dev/null | cut -f1 || true)
+echo "   20 MB burst, then 3 MB paced; ${flood_kept:-?} bytes kept in the host's log"
+check "a flooding box's output kept on the host stays within limits.output (1m)" '[ -n "$flood_kept" ] && [ "$flood_kept" -le $((1100 * 1024)) ]'
+seq_ok() { grep -oE 'acc-seq-[0-9]{8}' "$work/flood.log" | awk '{ if (substr($0, 9) + 0 != NR) bad = 1 } END { exit !(NR == 30000 && !bad) }'; }
+check "  and its paced output arrived whole across rotations, each line once, in order" seq_ok
+wait "$flood_pid" 2>/dev/null || true
+flood_drop() { w audit --tail 400 | grep "$flood" | grep box.output | grep -oE 'dropped_from_host_at_least[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | tail -1; }
+wait_for 30 '[ -n "$(flood_drop)" ]' || true
+echo "   box.output: dropped_from_host_at_least $(flood_drop)"
+check "  and its audit records the bytes dropped from the host (at least)" '[ "$(flood_drop)" -ge 1000000 ]'
+HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood-stop.log" 2>&1 || true
+flood_stop=$(run_id_of "$work/flood-stop.log")
+our_runs+=("$flood_stop")
+check "with on_output_full: stop, the box is stopped, saying why, and its run ends" 'grep -q "on_output_full: stop" "$work/flood-stop.log" && [ -z "$(box_of "$flood_stop")" ] && w audit --tail 300 | grep -E "run\.end" | grep -q "$flood_stop"'
+
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
   multihost

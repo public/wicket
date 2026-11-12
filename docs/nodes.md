@@ -103,7 +103,8 @@ wicket node revoke n1
   the box by `wicket-fwd --stdin-from`, which reconnects when the node comes back and closes the agent's
   stdin only when the control host closes it. The node keeps a record of each box (`node-box.json` in its
   run directory), and a restarted `serve` **adopts** every running box it has a record for: its proxies
-  start again, its output is replayed from the start (the control host drops what it already has), its
+  start again, its output is replayed from a little before the last offset it recorded (lined up on the
+  last bytes it read; the control host drops what it already has), its
   timeout is still counted from when it started. A box whose run has no authority in the feed any more is
   stopped. Exited boxes are kept until their exit is read, then removed.
 - **Run leases** (#151). The control host leases each run it supervises to its node with every freshness

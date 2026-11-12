@@ -347,12 +347,40 @@ pub struct Limits {
     pub timeout: String,
     #[serde(default = "default_pids")]
     pub pids: u32,
+    /// What a box's output may take on its node's disk (its stdout and stderr together), outside
+    /// the box's own limits (#151). Default 64 MiB.
+    #[serde(default = "default_output")]
+    pub output: String,
+    /// When a box's output passes `output`: keep its newest output (the oldest goes, and the bytes
+    /// dropped are recorded), or stop the box.
+    #[serde(default)]
+    pub on_output_full: OnOutputFull,
+}
+
+/// What happens when a box's output passes its zone's `limits.output`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnOutputFull {
+    #[default]
+    KeepNewest,
+    Stop,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { memory: default_memory(), cpus: default_cpus(), timeout: default_timeout(), pids: default_pids() }
+        Limits {
+            memory: default_memory(),
+            cpus: default_cpus(),
+            timeout: default_timeout(),
+            pids: default_pids(),
+            output: default_output(),
+            on_output_full: OnOutputFull::default(),
+        }
     }
+}
+
+fn default_output() -> String {
+    "64m".into()
 }
 
 fn default_memory() -> String {
@@ -378,6 +406,11 @@ impl Limits {
         crate::subset::parse_bytes(&self.memory)
     }
 
+    /// The output cap in bytes, if readable.
+    pub fn output_bytes(&self) -> Option<u64> {
+        crate::subset::parse_bytes(&self.output)
+    }
+
     /// Every limit is a real bound: Docker reads `--memory 0`, `--cpus 0` and `--pids-limit 0` as
     /// "no limit" (#126), so each has a floor of 1 (byte, CPU share, process; `MIN_CPUS` for cpus).
     pub fn check(&self) -> Result<(), ManifestError> {
@@ -390,6 +423,10 @@ impl Limits {
         }
         if self.pids < 1 {
             return bad(format!("pids {}", self.pids));
+        }
+        // At least 64 KiB: Docker's log rotation needs room for two files.
+        if !self.output_bytes().is_some_and(|o| o >= 64 << 10) {
+            return Err(ManifestError::Invalid(format!("limits.output {:?}: at least 64k", self.output)));
         }
         if self.timeout()?.is_zero() {
             return bad(format!("timeout {:?}", self.timeout));

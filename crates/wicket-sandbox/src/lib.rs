@@ -260,15 +260,24 @@ impl Docker {
     /// Starts the box detached (`docker run -d`, kept after it exits so its exit code can be read):
     /// its stdin, if interactive, stays open between attaches, so a supervisor that restarts can
     /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
-    pub async fn start_detached(&self, spec: &SandboxSpec) -> Result<()> {
-        // Its output is replayed from `docker logs` by offset, so it must be whole from byte 0: a
-        // log driver of our own choosing, `json-file` with no options, which never rotates (whatever
-        // the daemon's default; the box's logs go with it when it is removed).
+    pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<()> {
+        // Its output on the host is bounded (#151): `json-file` (whatever the daemon's default), two
+        // files of half the cap each, so at most `log_cap` bytes are kept; the box's logs go with it
+        // when it is removed. Whoever replays them lines their offsets up again after a rotation.
+        let half = format!("{}k", (log_cap / 2 / 1024).max(32));
         let args: Vec<String> = self
             .build_args(spec)
             .into_iter()
             .flat_map(|a| match a.as_str() {
-                "--rm" => vec!["-d".to_string(), "--log-driver".into(), "json-file".into()],
+                "--rm" => vec![
+                    "-d".to_string(),
+                    "--log-driver".into(),
+                    "json-file".into(),
+                    "--log-opt".into(),
+                    format!("max-size={half}"),
+                    "--log-opt".into(),
+                    "max-file=2".into(),
+                ],
                 _ => vec![a],
             })
             .collect();
@@ -287,9 +296,16 @@ impl Docker {
         c
     }
 
-    /// A box's stdout and stderr from its start, followed until it exits (piped).
-    pub fn logs(&self, name: &str) -> Command {
-        let mut c = self.command_with(["logs".to_string(), "--follow".into(), name.into()]);
+    /// A box's stdout and stderr as Docker still has them (from its start, unless rotated; or since
+    /// `since`, RFC 3339), followed until it exits (piped).
+    pub fn logs(&self, name: &str, since: Option<&str>) -> Command {
+        let mut a = vec!["logs".to_string(), "--follow".into()];
+        if let Some(s) = since {
+            a.push("--since".into());
+            a.push(s.into());
+        }
+        a.push(name.into());
+        let mut c = self.command_with(a);
         c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         c
     }

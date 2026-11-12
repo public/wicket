@@ -615,7 +615,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(crate::spawn::spawner(crate::spawn::SpawnCtx {
             parent: m.clone(),
-            slots: Default::default(),
+            // A re-attached run (#151) starts from the slots its children already hold.
+            slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, a.max_children))),
             exe: None,
             run: run.clone(),
             dir: dir.clone(),
@@ -938,6 +939,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
             llm_prior: llm.spent_total(),
+            output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
+            output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             durable: match long_lived {
                 true => m
                     .zone

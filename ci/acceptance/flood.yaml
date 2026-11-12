@@ -1,0 +1,10 @@
+# Acceptance (ci/acceptance.sh): a box that writes 20 MB to stdout at once, then 3 MB of numbered lines
+# at a pace, kept on its node's host only up to its zone's limits.output (#151).
+task: Write a lot.
+program:
+  name: flood
+  command: [sh, -c, "yes 0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz | head -c 20000000; echo; sleep 3; for c in $(seq 0 29); do seq -f 'acc-seq-%08.0f 0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123' $((c * 1000 + 1)) $((c * 1000 + 1000)); sleep 0.2; done; echo acc-flood-done; sleep 20"]
+zone:
+  name: acc-flood
+  isolation: gvisor
+  limits: { memory: 256m, cpus: 1, timeout: 3m, output: 1m }

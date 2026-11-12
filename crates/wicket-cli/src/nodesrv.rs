@@ -1333,8 +1333,9 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         ],
     };
     let name = spec.name.clone();
+    let cap = bs.output_cap.max(64 << 10);
     // Detached, so the box outlives this `serve` (a restarted one adopts it, `adopt_previous`).
-    node.docker.start_detached(&spec).await?;
+    node.docker.start_detached(&spec, cap).await?;
     let rec = BoxRecord {
         start: bs,
         name: name.clone(),
@@ -1342,6 +1343,9 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         stdin_received: 0,
         stdin_closed: false,
         lease_until: 0,
+        out_end: [0, 0],
+        out_tail: [String::new(), String::new()],
+        out_saved_ms: 0,
     };
     rec.save(&dir)?;
     wire(node, Some(gen), rec, dir, tasks, spec.user.clone());
@@ -1362,7 +1366,18 @@ struct BoxRecord {
     stdin_closed: bool,
     /// The control host's lease of the run (Unix ms; 0: none yet).
     lease_until: i64,
+    /// How far into its stdout and stderr this node has read (bytes read, whatever Docker has rotated
+    /// away since), the last bytes read of each (base64; to line a replay up again), and when.
+    #[serde(default)]
+    out_end: [u64; 2],
+    #[serde(default)]
+    out_tail: [String; 2],
+    #[serde(default)]
+    out_saved_ms: i64,
 }
+
+/// How many of a stream's last bytes a box's record keeps, to find its place in a replay.
+const TAIL: usize = 1024;
 
 impl BoxRecord {
     const FILE: &'static str = "node-box.json";
@@ -1510,7 +1525,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             dir: dir.clone(),
             stdin: feed,
             stdin_next: rec.stdin_received,
-            out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+            out: [OutBuf::starting_at(OUTPUT_CAP, rec.out_end[0]), OutBuf::starting_at(OUTPUT_CAP, rec.out_end[1])],
             exited: None,
             tasks,
             user,
@@ -1522,7 +1537,13 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             record: rec.clone(),
         },
     );
-    let logs = node.docker.logs(&name).spawn();
+    // A box read before (adopted): Docker's logs since a little before the last save, lined up on
+    // the last bytes read (rotation may have dropped their start).
+    let since = (rec.out_saved_ms > 0).then(|| {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis((rec.out_saved_ms - 10_000).max(0) as u64);
+        humantime::format_rfc3339_millis(t).to_string()
+    });
+    let logs = node.docker.logs(&name, since.as_deref()).spawn();
     let readers: Vec<_> = match logs {
         Err(e) => {
             eprintln!("[node] {}: reading the box's output failed: {e}", bs.run);
@@ -1536,23 +1557,10 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             .into_iter()
             .enumerate()
             .filter_map(|(i, r)| r.map(|r| (i, r)))
-            .map(|(i, mut r)| {
-                let (n, run) = (node.clone(), bs.run.clone());
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 32 * 1024];
-                    while let Ok(k) = r.read(&mut buf).await {
-                        if k == 0 {
-                            break;
-                        }
-                        let frame = {
-                            let mut boxes = n.boxes.lock().expect("boxes");
-                            let Some(b) = boxes.get_mut(&run) else { break };
-                            let at = b.out[i].write(&buf[..k]);
-                            Frame::Data { stream: b.streams[i + 1], offset: at, bytes: buf[..k].to_vec() }
-                        };
-                        n.send_run(&run, frame);
-                    }
-                })
+            .map(|(i, r)| {
+                use base64::Engine;
+                let tail = base64::engine::general_purpose::STANDARD.decode(&rec.out_tail[i]).unwrap_or_default();
+                tokio::spawn(read_output(node.clone(), bs.run.clone(), name.clone(), i, r, tail, bs.output_cap, bs.output_stop))
             })
             .collect();
             // The log reader lives as long as its readers.
@@ -1585,15 +1593,181 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
     });
 }
 
+/// Lines an adopted box's replayed output up on the last bytes its node read of it before (#151).
+struct Aligner {
+    tail: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+impl Aligner {
+    /// Takes replayed bytes: once the whole tail has been seen, what follows it.
+    fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        self.pending.extend_from_slice(data);
+        let t = self.tail.as_slice();
+        let p = self.pending.windows(t.len()).position(|w| w == t)?;
+        Some(self.pending.split_off(p + t.len()))
+    }
+
+    /// No whole tail in the replay: if it starts inside the tail (at least 64 bytes of its end, or
+    /// all of a shorter one), what follows; otherwise all of it (the replay starts after the tail, or
+    /// Docker rotated part of it away). The flag says whether it was lined up.
+    fn give_up(&mut self) -> (Vec<u8>, bool) {
+        let p = std::mem::take(&mut self.pending);
+        let t = &self.tail;
+        for k in (t.len().min(64)..t.len()).rev() {
+            if p.starts_with(&t[t.len() - k..]) {
+                return (p[k..].to_vec(), true);
+            }
+        }
+        (p, false)
+    }
+}
+
+/// Reads one of a box's streams from Docker's logs into the node's buffer. Offsets count the bytes
+/// this node has read: what Docker rotated away before it was read is never seen, nor counted.
+///
+/// - **Lining a replay up** (an adopted box): until the stream's last recorded bytes (`tail`) are
+///   found in what Docker replays, nothing is passed on; what follows them continues at the recorded
+///   offset. If they aren't found within 3 s (`Aligner::give_up`), the replay continues at the
+///   recorded offset, and a gap that can't be lined up is put in the node's audit (`box.output.gap`).
+///   Output that repeats itself exactly can line up on an earlier copy of the tail.
+/// - **The cap**: Docker keeps at most `cap` bytes on the host, so the oldest are rotated away
+///   (`box.output` records at exit how many at least), or with `stop` the box is stopped once it has
+///   written more, saying why on its stderr.
+#[allow(clippy::too_many_arguments)]
+async fn read_output<R: tokio::io::AsyncRead + Unpin>(
+    n: Arc<Node>,
+    run: String,
+    name: String,
+    i: usize,
+    mut r: R,
+    tail: Vec<u8>,
+    cap: u64,
+    stop: bool,
+) {
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut aligner = (!tail.is_empty()).then(|| Aligner { tail, pending: Vec::new() });
+    let t0 = std::time::Instant::now();
+    let mut last_save = std::time::Instant::now();
+    let mut stopped = false;
+    loop {
+        // While lining up, a quiet box's replay mustn't be held back: reads time out at 3 s.
+        let read = match aligner {
+            Some(_) => tokio::time::timeout(std::time::Duration::from_secs(3).saturating_sub(t0.elapsed()), r.read(&mut buf)).await.ok(),
+            None => Some(r.read(&mut buf).await),
+        };
+        let timed_out = read.is_none();
+        let (k, eof) = match read {
+            Some(Ok(0)) | Some(Err(_)) => (0, true),
+            Some(Ok(k)) => (k, false),
+            None => (0, false),
+        };
+        let data = match aligner.as_mut() {
+            None => buf[..k].to_vec(),
+            Some(a) => match a.feed(&buf[..k]) {
+                Some(d) => {
+                    aligner = None;
+                    d
+                }
+                None if eof || timed_out || a.pending.len() > (8 << 20) => {
+                    let (d, lined) = a.give_up();
+                    aligner = None;
+                    if !lined {
+                        let at = n.boxes.lock().expect("boxes").get(&run).map(|b| b.out[i].end()).unwrap_or(0);
+                        eprintln!("[node] {run}: its output's replay couldn't be lined up: resuming at offset {at}");
+                        let _ = n.audit.lock().expect("audit").audit(
+                            &wicket_core::TenantId::single(),
+                            Some(&wicket_core::RunId(run.clone())),
+                            "box.output.gap",
+                            &serde_json::json!({ "stream": if i == 0 { "stdout" } else { "stderr" }, "offset": at }),
+                        );
+                    }
+                    d
+                }
+                None => continue,
+            },
+        };
+        if data.is_empty() {
+            if eof {
+                break;
+            }
+            continue;
+        }
+        let (frame, over) = {
+            let mut boxes = n.boxes.lock().expect("boxes");
+            let Some(b) = boxes.get_mut(&run) else { break };
+            let at = b.out[i].write(&data);
+            b.record.out_end[i] = b.out[i].end();
+            if last_save.elapsed() > std::time::Duration::from_secs(2) {
+                save_output(b);
+                last_save = std::time::Instant::now();
+            }
+            let over = stop && !stopped && b.record.out_end[0] + b.record.out_end[1] > cap;
+            (Frame::Data { stream: b.streams[i + 1], offset: at, bytes: data }, over)
+        };
+        n.send_run(&run, frame);
+        if over {
+            stopped = true;
+            let why =
+                format!("[wicket] the box's output passed its zone's limits.output ({cap} bytes): stopping it (on_output_full: stop)\n");
+            eprintln!("[node] {run}: {}", why.trim());
+            let frame = {
+                let mut boxes = n.boxes.lock().expect("boxes");
+                boxes.get_mut(&run).map(|b| {
+                    let at = b.out[1].write(why.as_bytes());
+                    Frame::Data { stream: b.streams[2], offset: at, bytes: why.as_bytes().to_vec() }
+                })
+            };
+            if let Some(f) = frame {
+                n.send_run(&run, f);
+            }
+            let _ = n.docker.kill(&name).await;
+        }
+        if eof {
+            break;
+        }
+    }
+    // The tail as of the end of this read, for a `serve` that comes after.
+    if let Some(b) = n.boxes.lock().expect("boxes").get_mut(&run) {
+        save_output(b);
+    }
+}
+
+/// Saves how far into each of a box's streams this node has read, with the bytes that end there.
+fn save_output(b: &mut BoxState) {
+    use base64::Engine;
+    for i in 0..2 {
+        let end = b.out[i].end();
+        let (_, s) = b.out[i].since(end.saturating_sub(TAIL as u64));
+        b.record.out_end[i] = end;
+        b.record.out_tail[i] = base64::engine::general_purpose::STANDARD.encode(&s[s.len().saturating_sub(TAIL)..]);
+    }
+    b.record.out_saved_ms = wicket_feed::now_ms();
+    let _ = b.record.save(&b.dir);
+}
+
 /// A box exited: its exit and result are kept for the control host, and its container removed.
 async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     let dir = n.boxes.lock().expect("boxes").get(run).map(|b| b.dir.clone());
     let result = dir.as_ref().and_then(|d| crate::hibernate::read_outbox(d, 64 * 1024)).and_then(|b| String::from_utf8(b).ok());
-    if let Some(b) = n.boxes.lock().expect("boxes").get_mut(run) {
+    let output = n.boxes.lock().expect("boxes").get_mut(run).map(|b| {
         b.exited = Some((code, result.clone()));
         if let Some(f) = b.stdin.take() {
             f.close();
         }
+        (b.record.out_end, b.record.start.output_cap, b.record.start.tenant.clone())
+    });
+    // What the box wrote, against what its node keeps of it (#151): counted from what this node read,
+    // so what Docker rotated away unread isn't in it, and the drop is a lower bound.
+    if let Some(([o, e], cap, tenant)) = output {
+        let dropped = (o + e).saturating_sub(cap);
+        let _ = n.audit.lock().expect("audit").audit(
+            &wicket_core::TenantId(tenant),
+            Some(&wicket_core::RunId(run.to_string())),
+            "box.output",
+            &serde_json::json!({ "stdout_read": o, "stderr_read": e, "cap": cap, "dropped_from_host_at_least": dropped }),
+        );
+        n.ship_audit();
     }
     let _ = n.docker.remove(box_name).await;
     if let Some(d) = &dir {
@@ -1844,6 +2018,32 @@ mod tests {
         panic!("the feed never got {n} bytes");
     }
 
+    /// #151: an adopted box's replay is lined up on the last bytes read before, wherever it starts.
+    #[test]
+    fn a_replay_lines_up_on_the_last_bytes_read() {
+        let tail: Vec<u8> = (0..100).map(|k| b"abcdefghij"[k % 10] ^ (k as u8)).collect();
+        // The whole tail in the replay, after older bytes: only what follows it, in pieces.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        let mut replay = b"older output\n".to_vec();
+        replay.extend_from_slice(&tail);
+        assert_eq!(a.feed(&replay[..50]), None);
+        assert_eq!(a.feed(&[&replay[50..], b"fresh"].concat()), Some(b"fresh".to_vec()));
+        // The replay starts inside the tail (Docker's entries since the save start mid-way).
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.feed(&[&tail[30..], b"fresh"].concat()), None);
+        assert_eq!(a.give_up(), (b"fresh".to_vec(), true));
+        // Nothing of the tail (the replay starts after it): all of it, not lined up.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.feed(b"after"), None);
+        assert_eq!(a.give_up(), (b"after".to_vec(), false));
+        // A quiet stream: nothing replayed, nothing passed on.
+        let mut a = Aligner { tail: tail.clone(), pending: vec![] };
+        assert_eq!(a.give_up(), (vec![], false));
+        // Output that repeats itself: lined up on the first copy of the tail.
+        let mut a = Aligner { tail: b"yy\n".to_vec(), pending: vec![] };
+        assert_eq!(a.feed(b"yy\nyy\nz"), Some(b"yy\nz".to_vec()));
+    }
+
     fn fake_record(run: &str) -> BoxRecord {
         BoxRecord {
             start: BoxStart {
@@ -1872,12 +2072,17 @@ mod tests {
                 durable: vec![],
                 name: None,
                 llm_prior: (0, 0, 0),
+                output_cap: 64 << 20,
+                output_stop: false,
             },
             name: format!("wicket-{run}"),
             started_ms: 0,
             stdin_received: 0,
             stdin_closed: false,
             lease_until: 0,
+            out_end: [0, 0],
+            out_tail: [String::new(), String::new()],
+            out_saved_ms: 0,
         }
     }
 
