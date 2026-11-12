@@ -1,5 +1,5 @@
 # Acceptance (ci/acceptance.sh): a box whose `wicket run` is killed hard, so `wicket reconcile` has
-# an orphan to stop. A program, not an agent: an agent's session reads its stdin and ends with the
+# a run to take over (#151). A program, not an agent: an agent's session reads its stdin and ends with the
 # supervisor, while this box keeps running with nothing behind it.
 task: Stay up until stopped.
 program:
