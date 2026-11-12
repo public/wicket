@@ -788,7 +788,7 @@ mod tests {
             let n = resolve(&l, &dir, arg, None).unwrap();
             assert_eq!(n.name.as_deref(), Some("n1"));
             assert!(n.ssh_prefix().iter().any(|o| o == "StrictHostKeyChecking=yes"));
-            assert_eq!(n.label(), "n1");
+            assert_eq!(n.target, "wicket@n1.example.com");
         }
         let n = resolve(&l, &dir, "wicket@203.0.113.9", None).unwrap();
         assert!(n.name.is_none() && n.ssh_prefix().iter().any(|o| o == "StrictHostKeyChecking=accept-new"), "unenrolled: as before");

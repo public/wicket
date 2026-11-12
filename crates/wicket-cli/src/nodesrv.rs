@@ -1347,8 +1347,11 @@ mod tests {
     /// The node's id state for a connection that never finished the handshake.
     async fn wait_link(node: &Node, gen: Option<u64>) {
         for _ in 0..100 {
-            let links = node.links.lock().unwrap();
-            if links.keys().copied().max() == gen && links.len() <= 1 {
+            let ok = {
+                let links = node.links.lock().unwrap();
+                links.keys().copied().max() == gen && links.len() <= 1
+            };
+            if ok {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
