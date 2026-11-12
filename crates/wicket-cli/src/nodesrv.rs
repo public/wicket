@@ -587,6 +587,9 @@ async fn adopt_previous(node: &Arc<Node>) {
                     }
                 }
             }
+            // This host's own node shares the run directories with every other node on this Docker:
+            // a box without its record isn't its to judge (it is another node's, or the reconciler's).
+            None if node.paths.shares_host() => {}
             None => {
                 if let crate::reap::Verdict::Orphan(why) = crate::reap::judge(&b, None) {
                     eprintln!("[node] stopping {} ({why})", b.name);
