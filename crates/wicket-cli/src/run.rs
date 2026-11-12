@@ -148,11 +148,11 @@ struct RunProgress {
     stderr: u64,
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(p).ok()?).ok()
 }
 
-fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
+pub(crate) fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = p.with_extension("json.new");
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
@@ -875,11 +875,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             },
         )?;
     }
-    // Where the last supervisor got to: its transcript is the box's stdout, line by line, so its
-    // length is exactly what it processed (stderr only as of its last save).
+    // Where the last supervisor got to: its transcript is the box's stdout, line by line, so where it
+    // ends is exactly what it processed (stderr only as of its last save).
     let resume_from: [u64; 2] = match &record {
         Some(_) => [
-            std::fs::metadata(dir.join("transcript.jsonl")).map(|m| m.len()).unwrap_or(0),
+            crate::transcript::resume_offset(&dir),
             read_json::<RunProgress>(&dir.join("ctl/progress.json")).map(|p| p.stderr).unwrap_or(0),
         ],
         None => [0, 0],
@@ -1081,9 +1081,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let idle = m.agent.as_ref().map(|a| a.idle()).transpose()?.unwrap_or_default();
     // Re-attached: between turns if the box's last output line was a turn's result.
     let mut turn_running = match &record {
-        Some(_) => !std::fs::read_to_string(dir.join("transcript.jsonl"))
-            .ok()
-            .and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()).map(String::from))
+        Some(_) => !crate::transcript::last_line(&dir)
             .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
             .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")),
         None => true,
@@ -1096,22 +1094,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // From here the loop handles SIGTERM and ^C, and the run ends through `_flush`.
     early_signals.abort();
+    // What the control host keeps of the box's output is bounded like its node's (#160): the zone's
+    // limits.output of each stream, the newest kept, and of a program's output shown, the first.
+    let output_cap = m.zone.limits.output_bytes().unwrap_or(64 << 20);
     let log_path = dir.join("agent.stderr.log");
     let err_task = tokio::spawn(async move {
-        let mut out = String::new();
+        let mut out = crate::transcript::Newest::new(output_cap);
         let mut l = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = l.next_line().await {
-            out.push_str(&line);
-            out.push('\n');
+            out.line(&line);
         }
-        let _ = std::fs::write(log_path, &out);
+        let _ = std::fs::write(log_path, &out.text);
         out
     });
-    let transcript = dir.join("transcript.jsonl");
-    let mut transcript_f = std::fs::OpenOptions::new().create(true).append(true).open(&transcript)?;
-    if record.is_none() {
-        transcript_f.set_len(0)?;
-    }
+    let transcript = dir.join(crate::transcript::FILE);
+    let mut transcript_f = crate::transcript::Transcript::open(&dir, output_cap, record.is_some())?;
+    let mut shown: u64 = 0;
     let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(3));
     // limits.timeout is a long-lived agent's total time in a box: a wake gets what is left.
     let timeout = m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs));
@@ -1170,10 +1168,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             line = async { lines.as_mut().expect("guarded").next_line().await }, if lines.is_some() => match line? {
                 Some(l) => {
-                    use std::io::Write;
-                    let _ = writeln!(transcript_f, "{l}");
+                    if let Err(e) = transcript_f.line(&l) {
+                        tracing::warn!("writing the transcript: {e:#}");
+                    }
                     if is_program {
-                        println!("[program] {}", wicket_agent::clip(&l, 300));
+                        shown += l.len() as u64 + 1;
+                        if shown <= output_cap {
+                            println!("[program] {}", wicket_agent::clip(&l, 300));
+                        } else if shown - (l.len() as u64 + 1) <= output_cap {
+                            println!("[wicket] the program's output passed limits.output; the rest is only in its transcript, the newest kept");
+                        }
                         program_tail.push(l.clone());
                         if program_tail.len() > 40 {
                             program_tail.remove(0);
@@ -1410,10 +1414,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         print_event(&ev);
     }
     // (A node box that couldn't be reached has no end of stderr: don't wait for one.)
-    let stderr_text = match tokio::time::timeout(std::time::Duration::from_secs(5), err_task).await {
+    let stderr_kept = match tokio::time::timeout(std::time::Duration::from_secs(5), err_task).await {
         Ok(r) => r.unwrap_or_default(),
-        Err(_) => String::new(),
+        Err(_) => Default::default(),
     };
+    let stderr_text = stderr_kept.text.clone();
     if let Some(t) = &rotate_task {
         t.abort();
     }
@@ -1594,6 +1599,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     {
         let l = ledger.lock().expect("ledger");
         let _ = l.run_ended(&run, &status, &summary.to_string())?;
+        // What the control host kept of the box's output, and dropped (#160).
+        l.audit(
+            &m.tenant,
+            Some(&run),
+            "run.output",
+            &serde_json::json!({
+                "cap": output_cap,
+                "stdout_bytes": transcript_f.offset(), "stdout_dropped": transcript_f.dropped(),
+                "stderr_bytes": stderr_kept.total, "stderr_dropped": stderr_kept.dropped(),
+            }),
+        )?;
         l.audit(&m.tenant, Some(&run), "run.end", &summary)?;
     }
     println!(
