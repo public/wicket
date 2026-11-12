@@ -67,7 +67,8 @@ set -eu
 ip addr add 198.18.0.1/32 dev lo
 ip addr add 198.19.0.1/16 dev lo
 drop() { setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all --bounding-set=-all -- "$@"; }
-drop /opt/h3spike fwd $FWD_ARGS 2>/tmp/fwd.log &
+setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all --bounding-set=-all -- /opt/h3spike fwd $FWD_ARGS 2>/tmp/fwd.log &
+echo $! > /tmp/fwd.pid
 sleep 0.3
 export HOME=/tmp
 exec setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all --bounding-set=-all -- bash -c "$0"
