@@ -47,13 +47,22 @@ grant is bound to the exact request, single-use and expiring by default, and kep
 That zone must be within the agent's own (`wicket_core::subset`):
 
 - reach covered rule by rule (host, method and path), and every parent `forbid` kept;
-- only the parent's own credentials;
+- only the parent's own credentials and model route;
 - a model budget carved out of what the parent has left;
-- memory, CPUs, PIDs and time no larger, isolation no weaker, and images from the parent's list.
+- memory, CPUs, PIDs and time at least 1 and no larger than the parent's, isolation no weaker, and images
+  from the parent's list;
+- `max_children` within the parent's: a child's own `max_children` counts against the parent's.
 
 A zone that isn't within it is refused, with every violation listed. With `ask_human`, it goes to a
-human as exactly that zone. Globs whose containment can't be proven are refused, so the check errs on the
-side of refusing.
+human as exactly that zone, on an R4 card that lists what the child gets (its model route, credential
+injections, reach and limits). A different model route or credential is refused outright, with no
+approval path. Globs whose containment can't be proven (a character class under `*`, for example) are
+refused, so the check errs on the side of refusing. A spawned zone is named `<parent zone>.<name>.<parent
+run>`, so no other run can create the same zone.
+
+A grant belongs to the run that asked for it, and ends with it; `wicket approve --zone-wide` lets any run in
+the zone use it until it expires. `wicket approve` prints the request as wicket recorded it, and at a
+terminal asks before approving (`--yes` skips the question).
 
 ## Identities: agents and nodes
 
