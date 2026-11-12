@@ -129,6 +129,7 @@ impl Gateway {
             "unlink" => crate::link::unlink(&self.ctx, args.get("link").and_then(|v| v.as_str()).unwrap_or("")),
             "links" => crate::link::list(&self.ctx),
             "request_capacity" => self.request_capacity(&args).await,
+            "request_update" => self.request_update(&args),
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
@@ -395,6 +396,43 @@ impl Gateway {
         }
     }
 
+    /// `request_update` (#162): ask the operator to accept a wicket build this agent made (by the
+    /// sha256 of its artifact). It only files an R4 request: nothing here, or anywhere an agent can
+    /// reach, updates wicket. A human approves it, then runs `wicket self update` with the artifact
+    /// on the control host, which accepts that hash once.
+    fn request_update(&self, args: &Value) -> (String, bool) {
+        let sha = args.get("sha256").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return ("`sha256` is required: the artifact's sha256, 64 lowercase hex digits (sha256sum)".into(), true);
+        }
+        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if reason.is_empty() || reason.len() > 1000 {
+            return ("`reason` is required (at most 1000 characters): what the build is, and where its artifact is".into(), true);
+        }
+        let mut op = wicket_core::Op::egress(
+            &self.ctx.tenant,
+            &self.ctx.run,
+            &self.ctx.zone.name,
+            "UPDATE",
+            "wicket.internal",
+            &format!("/self/{sha}"),
+        );
+        op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
+        let l = self.ctx.ledger.lock().expect("ledger");
+        if let Ok(Some(rid)) = l.denied_recently(&op) {
+            return (format!("a human denied exactly this update ({rid}) a few minutes ago; don't ask again"), true);
+        }
+        match l.pending_for(&op, &format!("update wicket to the build with sha256 {sha}: {reason}"), None) {
+            Ok((rid, _)) => (
+                format!(
+                    "needs a human: request {rid}. This does not update wicket, and nothing you can call does. If a human approves it, the operator runs `wicket self update <artifact>` on the control host, which accepts the artifact with sha256 {sha} once. Call await_grant with {rid} to wait for the decision."
+                ),
+                false,
+            ),
+            Err(e) => (format!("not requested: {e}"), true),
+        }
+    }
+
     fn pending_requests(&self) -> (String, bool) {
         let l = self.ctx.ledger.lock().expect("ledger");
         match l.pending(&self.ctx.tenant) {
@@ -513,6 +551,22 @@ fn capacity_tool() -> Value {
     })
 }
 
+fn update_tool() -> Value {
+    json!({
+        "name": "request_update",
+        "description": "Ask the operator to update this wicket installation to a build you made (wicket building wicket). Give the sha256 of the artifact (the release archive from ci/package.sh, or the binary) and say where it is. A human always decides; this never updates anything by itself: once approved, the operator runs `wicket self update` with the artifact, which accepts that hash once.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sha256": { "type": "string", "description": "the artifact's sha256 (64 hex digits)" },
+                "reason": { "type": "string", "description": "what the build changes, and the artifact's path" }
+            },
+            "required": ["sha256", "reason"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn tools() -> Value {
     json!([
         {
@@ -616,6 +670,7 @@ fn tools() -> Value {
             }
         },
         capacity_tool(),
+        update_tool(),
         {
             "name": "expose",
             "description": "Offer a TCP port of this box (a server you run on 127.0.0.1 or 0.0.0.0) to other boxes. Your parent may connect without it; other boxes may if your zone's accept_from lists theirs, or a human approves.",
@@ -936,5 +991,31 @@ mod tests {
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(capacity_ask(&json!({ "duration_minutes": 100000, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "request_capacity"));
+    }
+
+    /// #162: an agent can ask for an update to its own build, and that is all: an R4 request a human
+    /// decides, which updates nothing.
+    #[test]
+    fn request_update_only_files_a_request_for_a_human() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "builder", "run_b", None, &[]) };
+        let sha = "0f".repeat(32);
+        let (text, err) = gw.request_update(&json!({ "sha256": sha, "reason": "a build of main, at /workspace/out/wicket.tar.gz" }));
+        assert!(!err && text.contains("needs a human") && text.contains("does not update wicket"), "{text}");
+        let pending = w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap();
+        assert_eq!(pending.len(), 1);
+        let r = &pending[0];
+        assert_eq!((r.method.as_str(), r.host.as_str(), r.path.as_str()), ("UPDATE", "wicket.internal", format!("/self/{sha}").as_str()));
+        assert_eq!(r.risk, "R4ExecOrPrivilege");
+        assert!(text.contains(&r.id));
+        // Asking again is the same request; nothing is approved by asking.
+        let (again, _) = gw.request_update(&json!({ "sha256": sha, "reason": "a build of main, at /workspace/out/wicket.tar.gz" }));
+        assert!(again.contains(&r.id));
+        assert_eq!(w.ledger.lock().unwrap().use_update_approval(&sha).unwrap(), None);
+        // A hash is a hash; a reason is required.
+        assert!(gw.request_update(&json!({ "sha256": "../../etc", "reason": "x" })).1);
+        assert!(gw.request_update(&json!({ "sha256": sha.to_uppercase(), "reason": "x" })).1);
+        assert!(gw.request_update(&json!({ "sha256": sha })).1);
+        assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "request_update"));
     }
 }
