@@ -19,9 +19,11 @@ use wicket_core::{Manifest, ZoneSpec};
 use wicket_proxy::link::{BoxOps, Stream};
 use wicket_sandbox::Docker;
 
-/// The Docker name of a run's box (as `wicket run` names it).
+/// The Docker name of a run's box (as `wicket run` names it): `wicket-<run>`, or another prefix from
+/// WICKET_BOX_PREFIX (tests name theirs, so they can be told apart and cleaned up).
 pub fn box_name(run: &str) -> String {
-    format!("wicket-{}", run.replace('_', "-"))
+    let prefix = std::env::var("WICKET_BOX_PREFIX").ok().filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    format!("{}-{}", prefix.as_deref().unwrap_or("wicket"), run.replace('_', "-"))
 }
 
 /// A box's hosts file, mounted read-only at /etc/hosts: wicket rewrites it in place as links open

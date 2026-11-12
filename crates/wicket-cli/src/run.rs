@@ -38,7 +38,11 @@ enum Stopper {
 impl Stopper {
     async fn kill(&self) -> Result<()> {
         match self {
-            Stopper::Docker(d, name) => d.kill(name).await,
+            Stopper::Docker(d, name) => {
+                // A paused (Idle) box must be unpaused before it can be killed.
+                let _ = d.unpause(name).await;
+                d.kill(name).await
+            }
             Stopper::Node(c) => {
                 c.kill();
                 Ok(())
@@ -51,6 +55,7 @@ impl Stopper {
     async fn revoke(&self) {
         match self {
             Stopper::Docker(d, name) => {
+                let _ = d.unpause(name).await;
                 let _ = d.kill(name).await;
             }
             Stopper::Node(c) => c.revoke(),
@@ -101,10 +106,13 @@ pub struct RunOpts<'a> {
     /// through CLAUDE_CODE_PROCESS_WRAPPER) instead of launching the agent ourselves. Its stdin and
     /// stdout stay connected to the launcher; wicket's own output goes to a log file.
     pub wrap: Option<Vec<String>>,
+    /// Wake a hibernated agent (#70): its claim, bundle and first turn. The manifest, image and
+    /// workspace come from the agent, not from the options above.
+    pub wake: Option<crate::hibernate::Wake>,
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
-    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap } = o;
+    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap, wake } = o;
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
     // everything wicket prints to a log file instead.
     let mut agent_stdout: Option<std::os::fd::OwnedFd> = None;
@@ -130,7 +138,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         None => None,
     };
     let workspace_dir = workspace_dir.or(wrap_cwd.as_deref());
-    let raw = std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+    // A woken agent's in-place workspace is where it was: Claude Code keys sessions by directory. If
+    // it's gone (another node, a lost disk), it is restored from the bundle first.
+    let wake_ws: Option<std::path::PathBuf> = wake.as_ref().and_then(|w| w.agent.workspace.as_ref().map(std::path::PathBuf::from));
+    if let (Some(w), Some(ws)) = (&wake, &wake_ws) {
+        if !ws.exists() {
+            println!("[wicket] the agent's workspace {} is gone; restoring it from the bundle", ws.display());
+            crate::hibernate::restore(&w.state, "workspace", ws)?;
+        }
+    }
+    let workspace_dir = workspace_dir.or(wake_ws.as_deref());
+    let raw = match &wake {
+        Some(w) => w.agent.manifest.clone(),
+        None => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
+    };
     let mut m = Manifest::from_yaml(&raw)?;
     if let Some(t) = task {
         if m.agent.is_none() {
@@ -211,11 +232,37 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         None => RunId::new(),
     };
+    // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
+    // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
+    // state there: both stay one-shot.
+    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none() && node.is_none();
+    if wake.is_some() && !long_lived {
+        bail!("only a local claude-code agent can be woken");
+    }
     let dir = data_dir().join("runs").join(&run.0);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    if let Some(w) = &wake {
+        // The agent's writable state, verified against its manifest as it is unpacked.
+        let t0 = std::time::Instant::now();
+        for (name, sub) in [("state", "state"), ("tmp", "tmp")].into_iter().chain(wake_ws.is_none().then_some(("workspace", "workspace"))) {
+            crate::hibernate::restore(&w.state, name, &dir.join(sub))?;
+        }
+        for v in m.zone.volumes.iter().filter(|v| v.persist == wicket_core::Persist::Durable) {
+            crate::hibernate::restore(&w.state, &format!("volume.{}", v.name), &crate::hibernate::durable_volume(&w.agent.id, &v.name))?;
+        }
+        println!("[wicket] restored and verified the agent's state in {} ms", t0.elapsed().as_millis());
+    }
     for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    // A local box's /tmp is a host directory (kept with the rest of its state, and through a crash),
+    // capped at the size the tmpfs had.
+    let tmp_dir = node.is_none().then(|| dir.join("tmp"));
+    if let Some(t) = &tmp_dir {
+        std::fs::create_dir_all(t)?;
+        std::fs::set_permissions(t, std::fs::Permissions::from_mode(0o1777))?;
+    }
     // A local box gets wicket's own hosts file, which links add names to (crate::links).
     if node.is_none() {
         std::fs::write(crate::links::hosts_path(&dir), wicket_core::link::hosts_file(&[]))?;
@@ -228,6 +275,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
 
     let ledger = Arc::new(Mutex::new(Ledger::open(&ledger_path())?));
+    // The agent's session, and this activation's fencing token: new for a first run, the claimed
+    // generation and the agent's own session for a wake.
+    let session = match &wake {
+        Some(w) => wicket_agent::AgentSession { id: w.agent.session_id.clone(), resume: true },
+        None => wicket_agent::AgentSession::new(),
+    };
+    let mut fence: Option<wicket_proxy::Fence> = wake.as_ref().map(|w| wicket_proxy::Fence { agent: w.agent.id.clone(), generation: w.generation });
     {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
@@ -236,6 +290,25 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         if let Some(lease) = &lease {
             l.set_run_lease(&run.0, lease)?;
         }
+        drop(l);
+        if long_lived && wake.is_none() {
+            let mut l = ledger.lock().expect("ledger");
+            let id = wicket_store::new_agent_id();
+            l.create_agent(&wicket_store::NewAgent {
+                id: &id,
+                tenant: &m.tenant.0,
+                zone: &m.zone.name,
+                name: &workload,
+                run: &run.0,
+                session_id: &session.id,
+                manifest: &text,
+                image,
+                workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
+                lease_until: wicket_store::now() + crate::hibernate::LEASE_SECS,
+            })?;
+            fence = Some(wicket_proxy::Fence { agent: id, generation: 1 });
+        }
+        let l = ledger.lock().expect("ledger");
         l.audit(
             &m.tenant,
             Some(&run),
@@ -245,6 +318,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 "reach": m.zone.reach.len(), "task": m.task,
                 "program_digest": program_src.as_ref().map(|(_, d)| d.clone()),
                 "program_pinned": m.program.as_ref().map(|p| p.digest.is_some()),
+                "agent_id": fence.as_ref().map(|f| f.agent.clone()), "generation": fence.as_ref().map(|f| f.generation),
+                "session_id": long_lived.then(|| session.id.clone()), "resumed": session.resume,
             }),
         )?;
     }
@@ -436,6 +511,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 as Arc<dyn wicket_proxy::link::BoxOps>
         }),
         capacity,
+        fence: fence.clone(),
+        waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
     };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
@@ -466,7 +543,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped) {
         (Some(p), _) => (p, vec![]),
         (None, Some(w)) => (w.plan, w.files),
-        (None, None) => (wicket_agent::claude_code_plan(&m, &run), vec![]),
+        (None, None) => {
+            let mut p = wicket_agent::claude_code_plan(&m, &run, &session);
+            if let Some(w) = &wake {
+                p.stdin_task = Some(wicket_agent::user_message(&w.first));
+            }
+            (p, vec![])
+        }
     };
     // Where the box's directories live: here, or on the remote node (which gets no secrets: only
     // the CA's public certificate, the workspace, and the two forwarded sockets). A served node makes
@@ -501,6 +584,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut volume_mounts = Vec::new();
     for v in m.zone.volumes.iter().filter(|_| !served) {
         let host = match &node {
+            // A long-lived agent's durable volume is its own, bundled with its state (#70).
+            None if v.persist == wicket_core::Persist::Durable && fence.is_some() => {
+                let d = crate::hibernate::durable_volume(&fence.as_ref().expect("checked").agent, &v.name);
+                std::fs::create_dir_all(&d)?;
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+                d
+            }
             None => {
                 let d = data_dir().join("volumes").join(&m.tenant.0).join(&m.zone.name).join(&v.name);
                 std::fs::create_dir_all(&d)?;
@@ -541,10 +631,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         ],
         None => vec![Mount { host: box_root.join("workspace"), target: wicket_agent::WORKSPACE.into(), read_only: false }],
     };
-    // The agent's adapter settings (allowlisted keys only), in its own config dir.
+    // The agent's adapter settings (allowlisted keys only, plus what wicket owns, such as
+    // cleanupPeriodDays), in its own config dir. Written after any restore, so wicket's values win.
     let mut state_files: Vec<(String, String)> = vec![];
-    if let Some(a) = m.agent.as_ref().filter(|a| !a.adapter_settings.is_empty()) {
-        let json = serde_json::to_vec_pretty(&serde_json::Value::Object(a.adapter_settings.clone()))?;
+    if m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") {
+        let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(&m))?;
         match &node {
             Some(_) if served => {
                 use base64::Engine;
@@ -554,9 +645,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
         }
     }
+    let box_user = user.clone();
     let interactive = plan.stdin_task.is_some() || wrap_cwd.is_some();
     let stdin_task = plan.stdin_task.clone();
-    let name = format!("wicket-{}", run.0.replace('_', "-"));
+    let name = crate::links::box_name(&run.0);
     let spec = SandboxSpec {
         name: name.clone(),
         image: image.to_string(),
@@ -570,6 +662,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         .chain(workspace_mounts)
         .chain(volume_mounts)
         .chain(node.is_none().then(|| Mount { host: crate::links::hosts_path(&dir), target: "/etc/hosts".into(), read_only: true }))
+        .chain(tmp_dir.as_ref().map(|t| Mount { host: t.clone(), target: "/tmp".into(), read_only: false }))
         .collect(),
         env: plan.env,
         argv: plan.argv,
@@ -665,6 +758,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             )
         }
     };
+    if let Some(f) = &fence {
+        let l = ledger.lock().expect("ledger");
+        l.set_agent_state(&f.agent, f.generation, "active", None)?;
+        if wake.is_some() {
+            println!("  agent {} woken: generation {}, session {} resumed", f.agent, f.generation, session.id);
+        } else {
+            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket wake {}", f.agent, session.id, run, f.agent);
+        }
+    }
     // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rotate_task = match (&identity, id_spec) {
@@ -754,6 +856,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut status = "unknown".to_string();
     // A program's last lines of output: its result, when it reports to a parent.
     let mut program_tail: Vec<String> = Vec::new();
+    // Long-lived agents (#70): Idle is a paused box; at a quiet point the agent hibernates.
+    let hib_after = if fence.is_some() { m.agent.as_ref().and_then(|a| a.hibernate().ok().flatten()) } else { None };
+    let mut paused = false;
+    let mut hibernating = false;
+    let mut hib_asked = false;
+    let mut hib_tried = false;
+    let mut notified_msgs = 0i64;
+    let mut superseded = false;
+    let mut saw_assistant = false;
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    let tmp_cap = wicket_sandbox::TMP_CAP_MB << 20;
+    let set_state = |state: &str, note: Option<&str>| {
+        if let (Some(f), Ok(l)) = (&fence, ledger.lock()) {
+            let _ = l.set_agent_state(&f.agent, f.generation, state, note);
+        }
+    };
     loop {
         tokio::select! {
             ex = child.wait(), if lines.is_none() => {
@@ -782,6 +900,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     } else {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                                saw_assistant = true;
+                            }
                             if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
                                 turn_running = false;
                                 last_result = std::time::Instant::now();
@@ -805,10 +926,44 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None => break,
             },
             Some(ev) = rx.recv() => print_event(&ev),
+            _ = heartbeat.tick(), if !stopping && !is_program => {
+                // The holder's claim on its agent: renewed while the box lives. If it can't be, a
+                // newer activation has the agent, and this box must not go on.
+                if let Some(f) = &fence {
+                    let ok = ledger.lock().ok().and_then(|l| l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::LEASE_SECS).ok());
+                    if ok == Some(false) {
+                        println!("[wicket] agent {} was woken elsewhere (this is generation {}); stopping this box", f.agent, f.generation);
+                        superseded = true;
+                        hibernating = false;
+                        stopper.kill().await?;
+                        status = "superseded".into();
+                        stopping = true;
+                        give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                    }
+                }
+                if let Some(t) = tmp_dir.clone() {
+                    if tokio::task::spawn_blocking(move || crate::hibernate::over(&t, tmp_cap)).await.unwrap_or(false) {
+                        println!("[wicket] the box's /tmp is over its {} MiB cap; stopping the box", wicket_sandbox::TMP_CAP_MB);
+                        hibernating = false;
+                        stopper.kill().await?;
+                        status = "failed (/tmp over its cap)".into();
+                        stopping = true;
+                        give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                    }
+                }
+            }
             _ = tick.tick(), if stdin.is_some() => {
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
+                if !msgs.is_empty() && paused {
+                    if let Stopper::Docker(d, n) = &stopper {
+                        let _ = d.unpause(n).await;
+                    }
+                    paused = false;
+                    set_state("active", None);
+                }
                 for (text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
+                    hib_tried = false;
                     println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
                         if si.write_all(format!("{}\n", wicket_agent::user_message(&text)).as_bytes()).await.is_err() {
@@ -817,6 +972,80 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         }
                     }
                     turn_running = true;
+                }
+                if let Some(f) = &fence {
+                    if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
+                        hib_asked = true;
+                        if turn_running {
+                            println!("[wicket] hibernate asked: at the end of this turn");
+                        }
+                    }
+                    // A peer's message waiting while the agent is between turns: tell it (wicket's
+                    // own words; the message itself is read with await_message).
+                    let waiting = ledger.lock().ok().and_then(|l| l.waiting_messages(&run.0).ok()).unwrap_or(0);
+                    if waiting < notified_msgs {
+                        notified_msgs = waiting;
+                    }
+                    if !turn_running && waiting > notified_msgs && hib_after.is_some() {
+                        use tokio::io::AsyncWriteExt;
+                        if paused {
+                            if let Stopper::Docker(d, n) = &stopper {
+                                let _ = d.unpause(n).await;
+                            }
+                            paused = false;
+                            set_state("active", None);
+                        }
+                        let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
+                        println!("{t}");
+                        if let Some(si) = stdin.as_mut() {
+                            let _ = si.write_all(format!("{}\n", wicket_agent::user_message(&t)).as_bytes()).await;
+                        }
+                        notified_msgs = waiting;
+                        turn_running = true;
+                        hib_tried = false;
+                    }
+                    if !turn_running && !hibernating {
+                        let since = last_result.elapsed();
+                        if hib_asked || (hib_after.is_some_and(|h| since >= h) && !hib_tried) {
+                            hib_asked = false;
+                            if let Stopper::Docker(d, n) = &stopper {
+                                if paused {
+                                    let _ = d.unpause(n).await;
+                                    paused = false;
+                                }
+                                match crate::hibernate::check_quiet(d, n, &box_user).await {
+                                    Ok(()) => {
+                                        println!("[wicket] quiet point: hibernating agent {}", f.agent);
+                                        set_state("hibernating", None);
+                                        hibernating = true;
+                                        stdin = None; // EOF: the agent exits, then its state is pushed
+                                    }
+                                    Err(why) => {
+                                        let note = format!("not hibernated: {why}");
+                                        println!("[wicket] {note}; staying idle (paused)");
+                                        let _ = d.pause(n).await;
+                                        paused = true;
+                                        hib_tried = true;
+                                        set_state("idle", Some(&note));
+                                    }
+                                }
+                            }
+                        } else if hib_after.is_some() && !paused && since >= idle {
+                            if let Stopper::Docker(d, n) = &stopper {
+                                match d.pause(n).await {
+                                    Ok(()) => {
+                                        paused = true;
+                                        set_state("idle", None);
+                                        println!("[wicket] idle: box paused (follow-ups still reach it: wicket say {run} \"…\")");
+                                    }
+                                    Err(e) => println!("[wicket] could not pause the box: {e:#}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                if hibernating || hib_after.is_some() {
+                    continue;
                 }
                 if !turn_running && last_result.elapsed() >= idle {
                     if !idle.is_zero() {
@@ -827,6 +1056,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
+                if let (Some(_), false, false, Some(_), Stopper::Docker(d, n)) = (&fence, turn_running, hibernating, &stdin, &stopper) {
+                    let _ = d.unpause(n).await;
+                    paused = false;
+                    if crate::hibernate::check_quiet(d, n, &box_user).await.is_ok() {
+                        println!("[wicket] timeout after {} while idle: hibernating instead", humantime::format_duration(timeout));
+                        set_state("hibernating", None);
+                        hibernating = true;
+                        stdin = None;
+                        continue;
+                    }
+                }
+                hibernating = false;
                 println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
                 stopper.kill().await?;
                 status = "timeout".into();
@@ -870,6 +1111,59 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
     if status == "unknown" {
         status = if exit.success() { "succeeded".into() } else { format!("failed ({exit})") };
+    }
+    // A long-lived agent's activation ends: hibernated (its state pushed), a wake that never got its
+    // session going (back to hibernated, to be retried), or ended.
+    if let (Some(f), false) = (&fence, superseded) {
+        if hibernating {
+            let t0 = std::time::Instant::now();
+            let row = ledger.lock().expect("ledger").agent(&f.agent)?.context("the agent row")?;
+            let trees = crate::hibernate::trees(&m, &f.agent, &dir, workspace_dir.as_deref());
+            match crate::hibernate::push(&ledger, &row, f.generation, &trees) {
+                Ok(Some(st)) => {
+                    // The node is released: what was bundled goes (an in-place workspace is the
+                    // operator's own directory, and stays).
+                    for (name, p, _) in &trees {
+                        if name != "workspace" || workspace_dir.is_none() {
+                            crate::hibernate::drop_tree(p);
+                        }
+                    }
+                    let ms = t0.elapsed().as_millis();
+                    println!(
+                        "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket wake {}",
+                        f.agent,
+                        st.trees.len(),
+                        crate::hibernate::human(st.raw_bytes()),
+                        crate::hibernate::human(st.stored_bytes()),
+                        st.seq,
+                        f.agent
+                    );
+                    let l = ledger.lock().expect("ledger");
+                    l.audit(&m.tenant, Some(&run), "agent.hibernate", &serde_json::json!({
+                        "agent": f.agent, "generation": f.generation, "seq": st.seq, "push_ms": ms,
+                        "raw_bytes": st.raw_bytes(), "stored_bytes": st.stored_bytes(),
+                        "trees": st.trees.iter().map(|t| serde_json::json!({ "name": t.name, "digest": t.digest, "files": t.files, "stored_bytes": t.stored_bytes })).collect::<Vec<_>>(),
+                    }))?;
+                    status = "hibernated".into();
+                }
+                Ok(None) => {
+                    println!("[wicket] agent {} was woken elsewhere while this one hibernated; its push was refused", f.agent);
+                    status = "superseded".into();
+                }
+                Err(e) => {
+                    println!("[wicket] hibernating agent {} failed: {e:#} (its state stays on this node, in {})", f.agent, dir.display());
+                    set_state("failed", Some(&format!("hibernate failed: {e:#}")));
+                    status = format!("failed (hibernate: {e})");
+                }
+            }
+        } else if wake.is_some() && !saw_assistant {
+            let why = stderr_text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output").to_string();
+            println!("[wicket] the woken session never started ({}); agent {} stays hibernated", wicket_agent::clip(&why, 200), f.agent);
+            let _ = ledger.lock().expect("ledger").release_failed_wake(&f.agent, f.generation, &format!("wake failed: {}", wicket_agent::clip(&why, 200)));
+            status = "failed (wake)".into();
+        } else {
+            set_state("ended", Some(&format!("its session closed ({status}) without hibernating")));
+        }
     }
     if !exit.success() && !stderr_text.trim().is_empty() {
         println!("[wicket] agent stderr (last lines):");

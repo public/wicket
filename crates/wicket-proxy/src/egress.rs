@@ -303,6 +303,9 @@ impl Egress {
     /// URL's host), never a client-supplied Host header.
     async fn handle(self: Arc<Self>, req: Request<Incoming>, host: String, scheme: &str) -> Response<BoxBody> {
         let method = req.method().as_str().to_string();
+        if let Some(why) = self.ctx.superseded() {
+            return self.refuse(&host, &method, "/", &why);
+        }
         // Authority pinning: a Host header that disagrees with the tunnel target is an attack.
         if let Some(h) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()) {
             let h = h.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();

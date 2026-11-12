@@ -58,6 +58,9 @@ impl Gateway {
             // No server-initiated stream in the PoC.
             return body(StatusCode::METHOD_NOT_ALLOWED, None);
         }
+        if let Some(why) = self.ctx.superseded() {
+            return body(StatusCode::CONFLICT, Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32000, "message": why } })));
+        }
         let raw = match Limited::new(req.into_body(), 1024 * 1024).collect().await {
             Ok(b) => b.to_bytes(),
             Err(_) => return body(StatusCode::PAYLOAD_TOO_LARGE, None),
@@ -221,12 +224,17 @@ impl Gateway {
                 l.take_message(&self.ctx.run.0).map(|m| {
                     m.map(|m| {
                         let revoked = l.revoked_in_chain(&m.from_run).ok().flatten().is_some();
-                        (m, revoked)
+                        // A long-lived agent's earlier activations: messages sent to them are its own (#70).
+                        let earlier: Vec<String> = match &self.ctx.fence {
+                            Some(f) => l.agent_runs(&f.agent).unwrap_or_default().into_iter().map(|(r, _)| r).collect(),
+                            None => vec![],
+                        };
+                        (m, revoked, earlier)
                     })
                 })
             };
             match m {
-                Ok(Some((m, sender_revoked))) => return deliver(&cell.current(), &self.ctx.run.0, &m, sender_revoked),
+                Ok(Some((m, sender_revoked, earlier))) => return deliver(&cell.current(), &self.ctx.run.0, &earlier, &m, sender_revoked),
                 Ok(None) => {}
                 Err(e) => return (e.to_string(), true),
             }
@@ -406,7 +414,7 @@ impl Gateway {
 ///   exfiltrated key can't produce a message wicket records now), and a matching send time;
 /// - from a sender whose identity has not been revoked;
 /// - addressed to this run, and sent by the run the ledger says sent it.
-fn deliver(me: &crate::RunIdentity, my_run: &str, m: &wicket_store::StoredMessage, sender_revoked: bool) -> (String, bool) {
+fn deliver(me: &crate::RunIdentity, my_run: &str, earlier: &[String], m: &wicket_store::StoredMessage, sender_revoked: bool) -> (String, bool) {
     let id = &m.id;
     let (sender, payload) = match wicket_identity::verify_envelope(&m.envelope, &me.issuer, m.created_at) {
         Ok(v) => v,
@@ -419,7 +427,8 @@ fn deliver(me: &crate::RunIdentity, my_run: &str, m: &wicket_store::StoredMessag
     if sender_revoked {
         return (format!("message {id} was dropped: the sender's identity has been revoked"), true);
     }
-    if payload.get("to_run").and_then(|v| v.as_str()) != Some(my_run)
+    let to_run = payload.get("to_run").and_then(|v| v.as_str()).unwrap_or("");
+    if (to_run != my_run && !earlier.iter().any(|r| r == to_run))
         || sender.run != m.from_run
         || payload.get("jti").and_then(|v| v.as_str()) != Some(id.as_str())
     {
@@ -726,6 +735,8 @@ mod tests {
                 swaps: vec![],
                 boxes: None,
                 capacity: None,
+                fence: None,
+                waker: None,
             }
         }
     }
@@ -735,7 +746,7 @@ mod tests {
         let m = l.take_message(&ctx.run.0).unwrap().expect("a message");
         let revoked = l.revoked(&m.from_run).unwrap().is_some();
         drop(l);
-        deliver(&ctx.identity.as_ref().unwrap().current(), &ctx.run.0, &m, revoked)
+        deliver(&ctx.identity.as_ref().unwrap().current(), &ctx.run.0, &[], &m, revoked)
     }
 
     #[test]
@@ -805,7 +816,7 @@ mod tests {
         // A genuine envelope replayed to a different recipient is refused too.
         child.send_message("run_lead", "message", serde_json::json!(1)).unwrap();
         let m = lead.ledger.lock().unwrap().take_message("run_lead").unwrap().unwrap();
-        let (text, err) = deliver(&child.identity.as_ref().unwrap().current(), "run_child", &m, false);
+        let (text, err) = deliver(&child.identity.as_ref().unwrap().current(), "run_child", &[], &m, false);
         assert!(err && text.contains("does not match"), "{text}");
     }
 

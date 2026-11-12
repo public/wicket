@@ -306,6 +306,8 @@ mod tests {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            fence: None,
+            waker: None,
         }
     }
 

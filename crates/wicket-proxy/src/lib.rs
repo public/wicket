@@ -42,7 +42,22 @@ pub struct RunCtx {
     pub boxes: Option<Arc<dyn link::BoxOps>>,
     /// Asks for capacity leases (`request_capacity`, #7); None when this run may not.
     pub capacity: Option<CapacityHook>,
+    /// The long-lived agent this run is an activation of, and its generation (#70). Requests are
+    /// refused once the agent's generation has moved past this one: a newer activation woke it.
+    pub fence: Option<Fence>,
+    /// Wakes a hibernated agent (a message just arrived for it). Set by the supervisor.
+    pub waker: Option<Waker>,
 }
+
+/// An activation's fencing token: the agent's generation when it was woken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    pub agent: String,
+    pub generation: i64,
+}
+
+/// Asks for an agent to be woken, with what woke it.
+pub type Waker = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -208,6 +223,19 @@ pub enum Event {
 }
 
 impl RunCtx {
+    /// Why this activation may no longer act, if a newer one has superseded it (or its agent is
+    /// gone). Checked by every proxy on every request.
+    pub fn superseded(&self) -> Option<String> {
+        let f = self.fence.as_ref()?;
+        let current = self.ledger.lock().ok().map(|l| l.agent_generation(&f.agent));
+        match current {
+            Some(Ok(Some(g))) if g == f.generation => None,
+            Some(Ok(Some(g))) => Some(format!("agent {} was woken again (generation {g}); this activation (generation {}) is stale", f.agent, f.generation)),
+            Some(Ok(None)) => Some(format!("agent {} no longer exists", f.agent)),
+            _ => Some("the ledger can't be read to check this activation's generation".into()),
+        }
+    }
+
     /// Sends a signed message from this agent to the agent running as `to_run`. The sender is this
     /// run's identity, set by wicket; the agent can't choose it. Allowed between parent and child,
     /// or when the recipient's zone lists this zone in `accept_from`, within one tenant.
@@ -229,9 +257,22 @@ impl RunCtx {
             Some(r) if r.tenant == self.tenant.0 => r,
             _ => return Err(format!("no agent {to_run}")),
         };
-        if l.run_status(to_run).map_err(|e| e.to_string())?.as_deref() != Some("running") {
-            return Err(format!("agent {} ({to_run}) is not running", rec.agent));
+        // A long-lived agent (#70) is reached through any of its runs: its current activation if it
+        // has one, or (hibernated) the message waits and the agent is woken to read it.
+        let mut to_run = to_run.to_string();
+        let mut wake: Option<String> = None;
+        if l.run_status(&to_run).map_err(|e| e.to_string())?.as_deref() != Some("running") {
+            let agent = match l.agent_of_run(&to_run).map_err(|e| e.to_string())? {
+                Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
+                None => None,
+            };
+            match agent {
+                Some(a) if a.restorable && a.state == "hibernated" && self.waker.is_some() => wake = Some(a.id),
+                Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) && a.run != to_run => to_run = a.run,
+                _ => return Err(format!("agent {} ({to_run}) is not running", rec.agent)),
+            }
         }
+        let to_run = to_run.as_str();
         let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
             "child"
         } else if me.claims.parent_run.as_deref() == Some(to_run) {
@@ -257,8 +298,13 @@ impl RunCtx {
             "message",
             &serde_json::json!({
                 "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
+                "wakes": wake,
             }),
         );
+        drop(l);
+        if let (Some(agent), Some(w)) = (&wake, &self.waker) {
+            w(agent, &format!("a message from {} ({})", me.claims.agent, self.run.0));
+        }
         Ok(id)
     }
 

@@ -105,6 +105,10 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
+        if let Some(why) = self.ctx.superseded() {
+            self.event(None, 409, Usage::default(), "stale generation");
+            return problem(409, "stale-generation", "This activation is stale", &why, None);
+        }
         let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1 + self.reserved_requests.load(Ordering::SeqCst);
         if n > spec.max_requests {
             self.event(None, 429, Usage::default(), "budget: request cap reached");
@@ -270,6 +274,81 @@ fn max_after(s: &str, key: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{usage, Usage};
+
+    /// #70: once the agent has been woken again, an older activation's model calls are refused.
+    #[tokio::test]
+    async fn a_stale_generation_is_refused() {
+        use http_body_util::BodyExt;
+        use std::sync::{Arc, Mutex};
+        let m = wicket_core::Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        let mut ledger = wicket_store::Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "z",
+                name: "a",
+                run: "run_old",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = crate::RunCtx {
+            tenant: wicket_core::TenantId::single(),
+            run: wicket_core::RunId("run_old".into()),
+            zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
+            ledger: Arc::new(Mutex::new(ledger)),
+            vault: crate::vault::Vault::new(std::env::temp_dir().join("wicket-llm-no-vault")),
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps: vec![],
+            boxes: None,
+            capacity: None,
+            fence: Some(crate::Fence { agent: agent.clone(), generation: 1 }),
+            waker: None,
+        };
+        assert_eq!(ctx.superseded(), None, "generation 1 is current");
+        // A second activation claims the agent: generation 2.
+        assert_eq!(ctx.ledger.lock().unwrap().claim_wake(&agent, "run_new", 0).unwrap(), Some(2));
+        assert!(ctx.superseded().unwrap().contains("stale"));
+        let llm = super::Llm::new(ctx).unwrap();
+        let dir = std::env::temp_dir().join(format!("wicket-llm-fence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("llm.sock");
+        let server = tokio::spawn({
+            let (llm, sock) = (llm.clone(), sock.clone());
+            async move { llm.serve(&sock).await }
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 409);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&b).contains("generation 2"), "{}", String::from_utf8_lossy(&b));
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "not counted, never forwarded");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn usage_from_sse_and_json() {

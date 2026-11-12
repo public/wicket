@@ -1,5 +1,9 @@
 //! A scripted stand-in for the Anthropic Messages API, for testing the whole path without a key.
-//! Turn 1: ask the agent to run one Bash command. Turn 2 (once a tool result is present): finish.
+//! Every user turn: ask the agent to run one Bash command. Once its result is back: finish, saying how
+//! many messages the request carried (a resumed session carries its whole earlier conversation).
+//!
+//! Every reply has its own message id: Claude Code merges entries that share one when it loads a
+//! session, so with a fixed id a resumed session folds its turns together and loops (#70).
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -9,8 +13,22 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
+static REPLIES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the conversation's last message carries a tool result (the command ran): then the turn
+/// ends. Otherwise the last message is the user's: run the command.
+fn tool_result_last(v: &Value) -> bool {
+    v.get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.last())
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|c| c.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")))
+}
 
 pub async fn serve(listen: &str, command: &str) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
@@ -63,19 +81,23 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
         .and_then(|t| t.as_array())
         .map(|t| t.iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some("Bash")))
         .unwrap_or(false);
-    let done = body.windows(b"tool_result".len()).any(|w| w == b"tool_result");
+    let done = tool_result_last(&v);
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let n = REPLIES.fetch_add(1, Ordering::SeqCst) + 1;
+    let msg_id = format!("msg_mock_{}_{n}", std::process::id());
+    let messages = v.get("messages").and_then(|m| m.as_array()).map(|m| m.len()).unwrap_or(0);
     let (block, stop) = if has_tools && !done {
         (
-            json!({ "type": "tool_use", "id": "toolu_mock_1", "name": "Bash", "input": { "command": command, "description": "wicket mock step" } }),
+            json!({ "type": "tool_use", "id": format!("toolu_mock_{n}"), "name": "Bash", "input": { "command": command, "description": "wicket mock step" } }),
             "tool_use",
         )
     } else {
-        (json!({ "type": "text", "text": "Done: the mock model finished." }), "end_turn")
+        (json!({ "type": "text", "text": format!("Done: the mock model finished. The request carried {messages} messages.") }), "end_turn")
     };
+    eprintln!("mock: reply {msg_id}: {} ({messages} messages in the request)", if stop == "tool_use" { "run the command" } else { "finish" });
     if !stream {
         return json_resp(json!({
-            "id": "msg_mock", "type": "message", "role": "assistant", "model": model,
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
             "content": [block], "stop_reason": stop, "stop_sequence": null,
             "usage": { "input_tokens": 10, "output_tokens": 20 }
         }));
@@ -84,7 +106,7 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
     let mut ev = |name: &str, data: Value| sse.push_str(&format!("event: {name}\ndata: {data}\n\n"));
     ev(
         "message_start",
-        json!({ "type": "message_start", "message": { "id": "msg_mock", "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
+        json!({ "type": "message_start", "message": { "id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
     );
     if block["type"] == "tool_use" {
         let mut start = block.clone();
