@@ -671,7 +671,7 @@ pub fn show_request(l: &Ledger, r: &wicket_store::Request) -> String {
         clip(&r.method, 16),
         clip(&r.host, 255),
         clip(&r.path, 400),
-        if r.scope_prefix { "*  (every path under it)" } else { "" },
+        if r.scope_prefix { "…  (every path under it)" } else { "" },
         r.risk,
         clip(&r.run, 64),
         age,

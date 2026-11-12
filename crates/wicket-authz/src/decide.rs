@@ -34,13 +34,14 @@ use std::time::Duration;
 /// Measured on every legitimate token the tests build (the 46 zones of oracle 1: example manifests
 /// and the subset tests' zones, as single blocks; the depth-0..5 chains of #59 with globs, with and
 /// without grants, under oracle 3's random requests of every kind), the most any request took was
-/// 308 steps in the compiled evaluator and 5,597 in the fork's generic engine. They differ because
+/// 308 steps in the compiled evaluator and 6,605 in the fork's generic engine (5,597 before forbid
+/// globs ignored case, #115: a folded letter is a four-byte class, so forbid patterns got longer). They differ because
 /// the compiled evaluator compiles each `.matches()` pattern once, while the generic engine charges
 /// 16 steps per pattern byte for compiling it on every evaluation. Legitimate tokens always run
 /// compiled (the tests assert it; the generic engine is the fallback for constructs the compiler
 /// doesn't handle and for run-time expression errors, neither of which wicket's blocks produce).
 ///
-/// 25,000 is about 80x the compiled maximum and 4.5x the generic one, so legitimate requests decide
+/// 25,000 is about 80x the compiled maximum and 3.8x the generic one, so legitimate requests decide
 /// the same in both engines with room for larger zones, while no token that passes the structural
 /// check can make a request cost more (a hostile block at every cap is cut off with a run-limit
 /// error, which decides `Forbidden`). Asserted by the oracle tests ([`MEASURED_MAX_STEPS`]) and the
@@ -48,7 +49,7 @@ use std::time::Duration;
 pub const STEP_BUDGET: u64 = 25_000;
 
 /// The bound the tests assert on legitimate requests (generic engine; see [`STEP_BUDGET`]).
-pub const MEASURED_MAX_STEPS: u64 = 6_000;
+pub const MEASURED_MAX_STEPS: u64 = 7_000;
 
 /// The per-request limits.
 pub fn limits() -> PreparedLimits {

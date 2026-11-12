@@ -3,7 +3,7 @@
 //! enforces request and token budgets, strips server-side tools the zone doesn't allow (they would
 //! bypass the egress proxy), and is the run's liveness sensor.
 
-use crate::{problem, BoxBody, Event, RunCtx, STRIP_REQUEST, STRIP_RESPONSE};
+use crate::{problem, BoxBody, Event, RunCtx, FORWARD_REQUEST, STRIP_RESPONSE};
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -19,7 +19,9 @@ use std::time::Instant;
 use tokio::net::UnixListener;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
-const MAX_ACCOUNTED_RESPONSE: usize = 8 * 1024 * 1024;
+/// How long a response is still read to its end after the agent stopped reading it, so its final
+/// usage is seen (#113). Past this, the call is charged its whole reservation.
+const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct Llm {
     ctx: RunCtx,
@@ -40,6 +42,9 @@ pub struct Llm {
     pub prior_requests: AtomicU64,
     pub prior_input_tokens: AtomicU64,
     pub prior_output_tokens: AtomicU64,
+    /// Output tokens reserved by model calls in flight (#113): each call reserves its `max_tokens`
+    /// up front, and settles to what it actually generated when its final usage arrives.
+    pub inflight_output_tokens: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
 }
 
@@ -50,10 +55,46 @@ impl Llm {
         let used_r = self.requests.load(Ordering::SeqCst)
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        let used_t = self.output_tokens.load(Ordering::SeqCst)
+        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(self.output_committed())))
+    }
+
+    /// Output tokens spent, handed to children, spent by earlier activations, or reserved by calls
+    /// in flight: what is no longer available to a new call.
+    fn output_committed(&self) -> u64 {
+        self.output_tokens.load(Ordering::SeqCst)
             + self.reserved_output_tokens.load(Ordering::SeqCst)
-            + self.prior_output_tokens.load(Ordering::SeqCst);
-        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(used_t)))
+            + self.prior_output_tokens.load(Ordering::SeqCst)
+            + self.inflight_output_tokens.load(Ordering::SeqCst)
+    }
+
+    /// Reserves up to `want` output tokens for one call, atomically (parallel calls can't each
+    /// claim the same tokens): what is left, if less. None when nothing is left.
+    fn reserve_output(&self, max: u64, want: u64) -> Option<u64> {
+        loop {
+            let inflight = self.inflight_output_tokens.load(Ordering::SeqCst);
+            let used = self.output_tokens.load(Ordering::SeqCst)
+                + self.reserved_output_tokens.load(Ordering::SeqCst)
+                + self.prior_output_tokens.load(Ordering::SeqCst)
+                + inflight;
+            let left = max.saturating_sub(used);
+            if left == 0 {
+                return None;
+            }
+            let take = want.min(left);
+            if self.inflight_output_tokens.compare_exchange(inflight, inflight + take, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some(take);
+            }
+        }
+    }
+
+    /// Settles a call's reservation: releases it and charges what the call used. A call whose final
+    /// usage wasn't seen is charged its whole reservation (or what was seen, if more).
+    fn settle(&self, reserved: u64, u: Usage, settled: bool) {
+        self.inflight_output_tokens.fetch_sub(reserved, Ordering::SeqCst);
+        self.input_tokens.fetch_add(u.input, Ordering::SeqCst);
+        self.cache_read_tokens.fetch_add(u.cache_read, Ordering::SeqCst);
+        self.cache_creation_tokens.fetch_add(u.cache_creation, Ordering::SeqCst);
+        self.output_tokens.fetch_add(if settled { u.output } else { u.output.max(reserved) }, Ordering::SeqCst);
     }
 
     /// Every input token this run's model calls used: uncached, cache reads and cache writes.
@@ -87,6 +128,7 @@ impl Llm {
             prior_requests: AtomicU64::new(0),
             prior_input_tokens: AtomicU64::new(0),
             prior_output_tokens: AtomicU64::new(0),
+            inflight_output_tokens: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
     }
@@ -149,47 +191,16 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
+        if let Err(why) = allowed_route(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/")) {
+            self.event(None, 404, Usage::default(), &format!("refused route: {why}"));
+            return problem(404, "route", "Not a model route", &why, None);
+        }
         if let Some(why) = self.ctx.superseded() {
             self.event(None, 409, Usage::default(), "stale generation");
             return problem(409, "stale-generation", "This activation is stale", &why, None);
         }
-        let n = self.requests.fetch_add(1, Ordering::SeqCst)
-            + 1
-            + self.reserved_requests.load(Ordering::SeqCst)
-            + self.prior_requests.load(Ordering::SeqCst);
-        if n > spec.max_requests {
-            self.event(None, 429, Usage::default(), "budget: request cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model request budget exhausted",
-                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
-                None,
-            );
-        }
-        if self.output_tokens.load(Ordering::SeqCst)
-            + self.reserved_output_tokens.load(Ordering::SeqCst)
-            + self.prior_output_tokens.load(Ordering::SeqCst)
-            >= spec.max_output_tokens
-        {
-            self.event(None, 429, Usage::default(), "budget: output token cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model token budget exhausted",
-                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
-                None,
-            );
-        }
-        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
-            self.event(None, 429, Usage::default(), "budget: input token cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model token budget exhausted",
-                &format!("{} may use at most {max} input tokens, cached ones included", self.whose()),
-                None,
-            );
+        if let Some(r) = self.admit(Some(spec)) {
+            return r;
         }
         match self.forward(req).await {
             Ok(r) => r,
@@ -198,6 +209,47 @@ impl Llm {
                 problem(502, "upstream", "Model upstream error", &e.to_string(), None)
             }
         }
+    }
+
+    /// Counts a model request and checks the budgets before it is sent: None if it may go, else the
+    /// refusal. Without a model route (a wrapped session's zone may have none), only counts.
+    fn admit(&self, spec: Option<&wicket_core::manifest::LlmSpec>) -> Option<Response<BoxBody>> {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst)
+            + 1
+            + self.reserved_requests.load(Ordering::SeqCst)
+            + self.prior_requests.load(Ordering::SeqCst);
+        let spec = spec?;
+        if n > spec.max_requests {
+            self.event(None, 429, Usage::default(), "budget: request cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model request budget exhausted",
+                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
+                None,
+            ));
+        }
+        if self.output_committed() >= spec.max_output_tokens {
+            self.event(None, 429, Usage::default(), "budget: output token cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                None,
+            ));
+        }
+        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
+            self.event(None, 429, Usage::default(), "budget: input token cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("{} may use at most {max} input tokens, cached ones included", self.whose()),
+                None,
+            ));
+        }
+        None
     }
 
     fn event(&self, model: Option<String>, status: u16, u: Usage, outcome: &str) {
@@ -215,40 +267,19 @@ impl Llm {
     async fn forward(self: &Arc<Self>, req: Request<Incoming>) -> Result<Response<BoxBody>> {
         let spec = self.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
         let (parts, body) = req.into_parts();
-        let mut body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
-        let mut model = None;
-        let mut note = String::from("ok");
-        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            model = json.get("model").and_then(|m| m.as_str()).map(String::from);
-            if !spec.allow_server_tools {
-                if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                    let before = tools.len();
-                    tools.retain(|t| {
-                        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        !(ty.starts_with("web_search") || ty.starts_with("web_fetch") || ty.starts_with("code_execution"))
-                    });
-                    if tools.len() != before {
-                        note = format!("stripped {} server-side tool(s)", before - tools.len());
-                        body = Bytes::from(serde_json::to_vec(&json)?);
-                    }
-                }
+        let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
+        let Filtered { body, model, note, reserved } = match self.filter(Some(spec), &parts, body) {
+            Ok(f) => f,
+            Err(r) => return Ok(*r),
+        };
+        let up = self.send_upstream(spec, &parts, body).await;
+        let resp = match up {
+            Ok(r) => r,
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                return Err(e);
             }
-        }
-        let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
-        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
-        let mut rb = self.client.request(method, &url);
-        for (name, value) in parts.headers.iter() {
-            if !STRIP_REQUEST.contains(&name.as_str()) && name.as_str() != "accept-encoding" {
-                rb = rb.header(name.as_str(), value.as_bytes());
-            }
-        }
-        // The real subscription token, injected into the one slot Claude Code uses for it.
-        // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
-        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
-        let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
-        rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
-        let resp = rb.body(body).send().await?;
+        };
         let status = resp.status().as_u16();
         let mut out = Response::builder().status(StatusCode::from_u16(status)?);
         for (name, value) in resp.headers().iter() {
@@ -256,37 +287,368 @@ impl Llm {
                 out = out.header(name.as_str(), value.as_bytes());
             }
         }
-        // Stream through to the agent while keeping a bounded copy for token accounting.
+        let sse = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        let body = self.account(model, status, sse, resp.bytes_stream(), reserved, note);
+        Ok(out.body(body)?)
+    }
+
+    async fn send_upstream(
+        &self,
+        spec: &wicket_core::manifest::LlmSpec,
+        parts: &http::request::Parts,
+        body: Bytes,
+    ) -> Result<reqwest::Response> {
+        let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
+        let mut rb = self.client.request(method, &url);
+        // Allow-listed headers only (#112, as on the egress proxy): never a client credential.
+        for (name, value) in parts.headers.iter() {
+            let n = name.as_str();
+            if n != "accept-encoding" && (FORWARD_REQUEST.contains(&n) || crate::provider_request_header(MODEL_HOST, n)) {
+                rb = rb.header(n, value.as_bytes());
+            }
+        }
+        // The real subscription token, injected into the one slot Claude Code uses for it.
+        // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
+        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
+        let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
+        rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
+        Ok(rb.body(body).send().await?)
+    }
+
+    /// Vets a model request's body (#112) and reserves its output (#113). Only `POST /v1/messages` and
+    /// `/v1/messages/count_tokens` carry bodies; reads (GET, HEAD) pass without one. The body must be
+    /// a plain (not `Content-Encoding`-ed) JSON object; it is re-encoded from what was parsed, keeping
+    /// only known top-level fields, and only client tools (executed by the agent, in its box) unless
+    /// the zone has `allow_server_tools`: server tools, the MCP connector, containers and URL
+    /// sources make the provider fetch from or send to hosts the zone never allowed. A messages call
+    /// must say its `max_tokens`, which is reserved, lowered to what is left of the output budget if
+    /// it asks for more (#113). The caller settles `reserved`.
+    pub(crate) fn filter(
+        &self,
+        spec: Option<&wicket_core::manifest::LlmSpec>,
+        parts: &http::request::Parts,
+        body: Bytes,
+    ) -> std::result::Result<Filtered, Box<Response<BoxBody>>> {
+        let refuse = |status: u16, why: String| {
+            self.event(None, status, Usage::default(), &format!("refused: {why}"));
+            Box::new(problem(
+                status,
+                "forbidden",
+                "Blocked by wicket: model request refused",
+                &format!("{why}. {}", crate::SANDBOX_FACT),
+                None,
+            ))
+        };
+        let path = parts.uri.path();
+        if matches!(parts.method, http::Method::GET | http::Method::HEAD) {
+            if !body.is_empty() {
+                return Err(refuse(400, format!("a {} request with a body", parts.method)));
+            }
+            return Ok(Filtered { body, model: None, note: "ok".into(), reserved: 0 });
+        }
+        if parts.method != http::Method::POST || !MODEL_ENDPOINTS.contains(&path) {
+            return Err(refuse(
+                403,
+                format!("{} {path} is not a model call wicket proxies (only POST {})", parts.method, MODEL_ENDPOINTS.join(" and ")),
+            ));
+        }
+        if let Some(enc) = parts.headers.get(http::header::CONTENT_ENCODING) {
+            if !enc.as_bytes().eq_ignore_ascii_case(b"identity") {
+                return Err(refuse(415, "a Content-Encoding-ed model request body (send it uncompressed)".into()));
+            }
+        }
+        let Ok(serde_json::Value::Object(mut json)) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return Err(refuse(400, "a model request body that isn't a JSON object".into()));
+        };
+        let server_ok = spec.is_some_and(|s| s.allow_server_tools);
+        let model = json.get("model").and_then(|m| m.as_str()).map(String::from);
+        let mut notes = Vec::new();
+        let before = json.len();
+        json.retain(|k, _| REQUEST_FIELDS.contains(&k.as_str()) || (server_ok && SERVER_FIELDS.contains(&k.as_str())));
+        if json.len() != before {
+            notes.push(format!("stripped {} request field(s)", before - json.len()));
+        }
+        if !server_ok {
+            if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                let before = tools.len();
+                tools.retain(|t| client_tool(t.get("type").and_then(|v| v.as_str())));
+                if tools.len() != before {
+                    notes.push(format!("stripped {} server-side tool(s)", before - tools.len()));
+                }
+            }
+        }
+        // URL sources (images, documents) are fetched by the provider: a way around the egress proxy.
+        if !server_ok && has_url_source(&serde_json::Value::Object(json.clone())) {
+            return Err(refuse(403, "a content block with a URL source, which the provider would fetch (send the content itself)".into()));
+        }
+        // The call's output is reserved up front (#113), here, so the amount reserved is the amount
+        // the body asks for: one asking for more than is left is lowered to what is left, and
+        // parallel calls can't each claim the same tokens.
+        let mut reserved = 0;
+        if path == "/v1/messages" {
+            let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) else {
+                return Err(refuse(400, "a messages request without an integer max_tokens".into()));
+            };
+            if let Some(spec) = spec {
+                let Some(r) = self.reserve_output(spec.max_output_tokens, asked) else {
+                    self.event(model.clone(), 429, Usage::default(), "budget: output token cap reached");
+                    return Err(Box::new(problem(
+                        429,
+                        "budget",
+                        "Model token budget exhausted",
+                        &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                        None,
+                    )));
+                };
+                if r < asked {
+                    json.insert("max_tokens".into(), r.into());
+                    notes.push(format!("max_tokens {asked} lowered to the {r} output tokens left"));
+                }
+                reserved = r;
+            }
+        }
+        let body = match serde_json::to_vec(&json) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                return Err(refuse(400, format!("the model request body can't be re-encoded ({e})")));
+            }
+        };
+        Ok(Filtered { body, model, note: if notes.is_empty() { "ok".into() } else { notes.join("; ") }, reserved })
+    }
+
+    /// A wrapped session's model call, which reaches the model host through the egress proxy (its
+    /// credential swapped there) rather than through this proxy (#112): the same budget, body
+    /// filter and accounting as a call to this proxy, then the egress proxy's own forwarding.
+    pub(crate) async fn through_egress<B>(
+        self: &Arc<Self>,
+        egress: &crate::egress::Egress,
+        req: Request<B>,
+        host: &str,
+        pq: &str,
+        via: crate::egress::Via,
+    ) -> Response<BoxBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Ok(mut t) = self.last_activity.lock() {
+            *t = Instant::now();
+        }
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return r;
+        }
+        let (parts, body) = req.into_parts();
+        let body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => return problem(400, "bad-request", "Bad model request", &format!("request body: {e}"), None),
+        };
+        let f = match self.filter(spec, &parts, body) {
+            Ok(f) => f,
+            Err(r) => return *r,
+        };
+        let reserved = f.reserved;
+        let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
+        match egress.forward(req, host, "https", pq, via).await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let sse = resp
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("text/event-stream"));
+                let (head, body) = resp.into_parts();
+                Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, f.note))
+            }
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                self.event(f.model, 502, Usage::default(), &format!("upstream error: {e:#}"));
+                problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
+            }
+        }
+    }
+
+    /// Streams an upstream response to the agent while reading its usage as it goes (in constant
+    /// memory, #113), and settles the call's reservation when the response ends. If the agent stops
+    /// reading, the response is still read to its end (for up to [`DRAIN_AFTER_DISCONNECT`]), so a
+    /// call can't escape its charge by disconnecting before the final usage. A successful response
+    /// that ends without its final usage (`message_stop` for a stream) is charged its whole
+    /// reservation; an error response, only what it reports.
+    pub(crate) fn account<S, E>(
+        self: &Arc<Self>,
+        model: Option<String>,
+        status: u16,
+        sse: bool,
+        mut upstream: S,
+        reserved: u64,
+        note: String,
+    ) -> BoxBody
+    where
+        S: futures_util::Stream<Item = std::result::Result<Bytes, E>> + Send + Unpin + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>(16);
         let me = self.clone();
-        let mut upstream = resp.bytes_stream();
         tokio::spawn(async move {
-            let mut seen: Vec<u8> = Vec::new();
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(b) => {
-                        if seen.len() < MAX_ACCOUNTED_RESPONSE {
-                            seen.extend_from_slice(&b);
-                        }
-                        if tx.send(Ok(Frame::data(b))).await.is_err() {
-                            break;
+            let mut scan = UsageScanner::default();
+            let mut client = true;
+            let mut deadline = None;
+            let mut clean_end = false;
+            loop {
+                let next = match deadline {
+                    None => upstream.next().await,
+                    Some(d) => match tokio::time::timeout_at(d, upstream.next()).await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    },
+                };
+                match next {
+                    Some(Ok(b)) => {
+                        scan.feed(&b);
+                        if client && tx.send(Ok(Frame::data(b))).await.is_err() {
+                            client = false;
+                            deadline = Some(tokio::time::Instant::now() + DRAIN_AFTER_DISCONNECT);
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(Box::new(e))).await;
+                    Some(Err(e)) => {
+                        if client {
+                            let _ = tx.send(Err(e.into())).await;
+                        }
+                        break;
+                    }
+                    None => {
+                        clean_end = true;
                         break;
                     }
                 }
             }
-            let u = usage(&seen);
-            me.input_tokens.fetch_add(u.input, Ordering::SeqCst);
-            me.cache_read_tokens.fetch_add(u.cache_read, Ordering::SeqCst);
-            me.cache_creation_tokens.fetch_add(u.cache_creation, Ordering::SeqCst);
-            me.output_tokens.fetch_add(u.output, Ordering::SeqCst);
-            me.event(model, status, u, &note);
+            let u = scan.usage;
+            let ok = (200..300).contains(&status);
+            let settled = !ok || (clean_end && if sse { scan.stopped } else { scan.saw_output });
+            me.settle(reserved, u, settled);
+            let note = if settled { note } else { format!("{note}; no final usage seen: charged the {reserved} reserved output tokens") };
+            let charged = Usage { output: if settled { u.output } else { u.output.max(reserved) }, ..u };
+            me.event(model, status, charged, &note);
         });
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        Ok(out.body(BodyExt::boxed(StreamBody::new(stream)))?)
+        BodyExt::boxed(StreamBody::new(stream))
+    }
+}
+
+/// The host Claude Code's model calls go to.
+pub(crate) const MODEL_HOST: &str = "api.anthropic.com";
+
+/// The only model endpoints that take a request body (#112). Batches, files and anything else are
+/// refused: a batch carries requests (and tools) of its own.
+const MODEL_ENDPOINTS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
+
+/// Whether a request to the model host is a model call, vetted and accounted as one, when it
+/// arrives at the egress proxy (a wrapped session's).
+pub(crate) fn is_model_call(host: &str, path: &str) -> bool {
+    host == MODEL_HOST && (path == "/v1/messages" || path.starts_with("/v1/messages/") || path == "/v1/complete")
+}
+
+/// Top-level Messages request fields that are forwarded (#112): none of them makes the provider
+/// reach another host.
+const REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "max_tokens",
+    "metadata",
+    "stop_sequences",
+    "stream",
+    "temperature",
+    "top_k",
+    "top_p",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "output_config",
+    "output_format",
+    "service_tier",
+    "context_management",
+    "inference_geo",
+    "speed",
+    "cache_control",
+    "thread",
+];
+
+/// Fields that run things on the provider's side (the MCP connector, code-execution containers and
+/// skills): forwarded only with `allow_server_tools`.
+const SERVER_FIELDS: &[&str] = &["mcp_servers", "container"];
+
+/// Whether a tool `type` is one the agent itself executes: a custom tool (no type, or `custom`), or
+/// one of the schema-less client tools (bash, text editor, memory, computer use). Everything else
+/// (web search and fetch, code execution, tool search, MCP toolsets, the advisor, and any type
+/// added later) runs on the provider's side.
+fn client_tool(ty: Option<&str>) -> bool {
+    match ty {
+        None | Some("custom") => true,
+        Some(t) => ["bash_", "text_editor_", "memory_", "computer_2"].iter().any(|p| t.starts_with(p)),
+    }
+}
+
+/// A vetted model request body, and what it reserves.
+pub(crate) struct Filtered {
+    pub body: Bytes,
+    pub model: Option<String>,
+    pub note: String,
+    /// Output tokens reserved for it (its `max_tokens`, or what was left): to be settled.
+    pub reserved: u64,
+}
+
+/// Whether any content block (at any depth: messages, system, tool results) has a URL source.
+fn has_url_source(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(o) => {
+            o.get("source").and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("url") || o.values().any(has_url_source)
+        }
+        serde_json::Value::Array(a) => a.iter().any(has_url_source),
+        _ => false,
+    }
+}
+
+/// Reads token usage from a response as it streams past, in constant memory: each chunk is scanned
+/// with the end of the previous one, so a key or number split across chunks is still read (the
+/// largest value per field wins, so reading one twice changes nothing).
+#[derive(Default)]
+pub(crate) struct UsageScanner {
+    carry: Vec<u8>,
+    pub usage: Usage,
+    /// An `output_tokens` count was seen (a non-streamed response's usage).
+    pub saw_output: bool,
+    /// The stream's `message_stop` event was seen: the final usage (in `message_delta`) came before it.
+    pub stopped: bool,
+}
+
+/// Longer than any key plus its number, so nothing is split past the carried tail.
+const SCAN_CARRY: usize = 96;
+
+impl UsageScanner {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(chunk);
+        let u = usage(&buf);
+        self.usage = Usage {
+            input: self.usage.input.max(u.input),
+            cache_read: self.usage.cache_read.max(u.cache_read),
+            cache_creation: self.usage.cache_creation.max(u.cache_creation),
+            output: self.usage.output.max(u.output),
+        };
+        let text = String::from_utf8_lossy(&buf);
+        self.saw_output |= text.contains("\"output_tokens\"");
+        // As the event's own type, never as text inside a JSON string (where quotes are escaped).
+        self.stopped |= text.contains("event: message_stop") || text.contains("\"type\":\"message_stop\"");
+        let keep = buf.len().saturating_sub(SCAN_CARRY);
+        self.carry = buf.split_off(keep);
     }
 }
 
@@ -303,6 +665,28 @@ pub struct Usage {
 /// Best-effort usage from a Messages response, streamed (SSE) or not: the largest value seen for
 /// each field (streamed counts are cumulative). The keys include their opening quote, so
 /// `"input_tokens":` doesn't also match `"cache_read_input_tokens":`.
+/// The only requests the model route forwards, as (method, path): inference and token counting
+/// (and listing models). Everything else under the upstream would also carry the real token, so
+/// it is refused here, before any budget is spent.
+const ROUTES: &[(&str, &str)] = &[("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens"), ("GET", "/v1/models")];
+
+/// Query parameters a model route may carry (Claude Code sends `?beta=true`).
+const QUERY: &[&str] = &["beta=true"];
+
+/// Ok if `method` and `path_and_query` name an allowed model route, exactly and canonically.
+pub fn allowed_route(method: &str, path_and_query: &str) -> std::result::Result<(), String> {
+    let path = wicket_core::canon::canonical_path(path_and_query).map_err(|e| e.to_string())?;
+    if !ROUTES.iter().any(|(m, p)| *m == method && *p == path) {
+        return Err(format!("{method} {path} is not a model route"));
+    }
+    if let Some((_, q)) = path_and_query.split_once('?') {
+        if q.split('&').any(|kv| !QUERY.contains(&kv)) {
+            return Err(format!("query {q:?} is not allowed on a model route"));
+        }
+    }
+    Ok(())
+}
+
 pub fn usage(body: &[u8]) -> Usage {
     let s = String::from_utf8_lossy(body);
     Usage {
@@ -374,6 +758,11 @@ mod tests {
 
     /// Serves `llm` on a socket and sends it one model request: (status, body).
     async fn post(llm: std::sync::Arc<super::Llm>, tag: &str) -> (u16, String) {
+        send(llm, tag, "POST", "/v1/messages").await
+    }
+
+    /// Serves `llm` on a socket and sends it one request: (status, body).
+    async fn send(llm: std::sync::Arc<super::Llm>, tag: &str, method: &str, path: &str) -> (u16, String) {
         use http_body_util::BodyExt;
         let dir = std::env::temp_dir().join(format!("wicket-llm-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -391,9 +780,11 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
         let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
         tokio::spawn(conn);
-        let req = http::Request::post("/v1/messages")
+        let req = http::Request::builder()
+            .method(method)
+            .uri(path)
             .header("host", "wicket.internal")
-            .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"max_tokens":1,"messages":[]}"#)))
             .unwrap();
         let resp = send.send_request(req).await.unwrap();
         let status = resp.status().as_u16();
@@ -442,6 +833,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn only_model_routes_are_allowed() {
+        use super::allowed_route as a;
+        assert!(a("POST", "/v1/messages").is_ok());
+        assert!(a("POST", "/v1/messages?beta=true").is_ok());
+        assert!(a("POST", "/v1/messages/count_tokens?beta=true").is_ok());
+        assert!(a("GET", "/v1/models").is_ok());
+        for (m, p) in [
+            ("GET", "/v1/messages"),
+            ("DELETE", "/v1/messages"),
+            ("POST", "/v1/messages/../../api/x"),
+            ("POST", "/v1/messages/%2e%2e/x"),
+            ("POST", "//v1/messages"),
+            ("POST", "/v1/messages/"),
+            ("POST", "/v1/messages?beta=true&x=1"),
+            ("GET", "/api/oauth/profile"),
+            ("POST", "/v1/other"),
+            ("GET", "/"),
+        ] {
+            assert!(a(m, p).is_err(), "{m} {p}");
+        }
+    }
+
+    /// Any other path is refused before it reaches the upstream with the token.
+    #[tokio::test]
+    async fn other_routes_never_reach_the_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = c.read(&mut buf).await;
+                seen2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}").await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wicket-llm-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}");
+        for (i, (m, p)) in [("GET", "/v1/code/sessions"), ("POST", "/api/oauth/x"), ("POST", "/v1/messages/../x")].into_iter().enumerate() {
+            let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+            c.vault = vault.clone();
+            let (status, _) = send(super::Llm::new(c).unwrap(), &format!("r{i}"), m, p).await;
+            assert_eq!(status, 404, "{m} {p}");
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault;
+        let (status, _) = send(super::Llm::new(c).unwrap(), "ok", "POST", "/v1/messages?beta=true").await;
+        assert_eq!(status, 200);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #70: once the agent has been woken again, an older activation's model calls are refused.
     #[tokio::test]
     async fn a_stale_generation_is_refused() {
@@ -481,6 +932,295 @@ mod tests {
         llm.spent_before(1, 0, 100);
         let (status, _) = post(llm, "tokens").await;
         assert_eq!(status, 429);
+    }
+
+    /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing
+    /// `pause` before each of the last two, then ends cleanly. It records each request it got.
+    async fn sse_upstream(chunks: Vec<Vec<u8>>, pause: std::time::Duration) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let (chunks, seen) = (chunks.clone(), seen2.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = vec![0u8; 65536];
+                    while !String::from_utf8_lossy(&req).contains("\r\n\r\n") {
+                        let n = c.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    // The body follows the head (small in these tests): give it a moment to arrive.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(50), c.read(&mut buf)).await {
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    seen.lock().await.push(String::from_utf8_lossy(&req).into_owned());
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await;
+                    let last = chunks.len().saturating_sub(1);
+                    for (i, ch) in chunks.iter().enumerate() {
+                        if i > 0 && i + 1 >= last {
+                            tokio::time::sleep(pause).await;
+                        }
+                        if c.write_all(format!("{:x}\r\n", ch.len()).as_bytes()).await.is_err()
+                            || c.write_all(ch).await.is_err()
+                            || c.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = c.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    fn sse(event: &str, data: &str) -> Vec<u8> {
+        format!("event: {event}\ndata: {data}\n\n").into_bytes()
+    }
+
+    /// An Llm with a model route to the mock on `port` and an output budget of `max_output`.
+    fn llm_to(port: u16, max_output: u64, tag: &str) -> (std::sync::Arc<super::Llm>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wicket-llm-v-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}', max_output_tokens: {max_output}, max_requests: 100}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault;
+        (super::Llm::new(c).unwrap(), dir)
+    }
+
+    /// Sends one model request; reads the whole response, or (`whole` false) its first frame only,
+    /// then hangs up.
+    async fn call(llm: std::sync::Arc<super::Llm>, tag: &str, body: &str, whole: bool) -> u16 {
+        use http_body_util::BodyExt;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-c-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("llm.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { llm.serve(&sock).await }
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        let conn = tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let mut b = resp.into_body();
+        if whole {
+            let _ = b.collect().await;
+        } else {
+            let _ = b.frame().await;
+            drop(b);
+            drop(send);
+            conn.abort();
+        }
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        status
+    }
+
+    async fn output_settles(llm: &super::Llm, want: u64) -> u64 {
+        for _ in 0..300 {
+            if llm.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    const ASK: &str = r#"{"model":"m","max_tokens":300,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    /// #113: an agent that hangs up after the first event is still charged what the call generated.
+    #[tokio::test]
+    async fn a_client_that_disconnects_early_is_charged_the_final_usage() {
+        let chunks = vec![
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
+            sse("content_block_delta", r#"{"type":"content_block_delta","delta":{"text":"lots"}}"#),
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        ];
+        let (port, _) = sse_upstream(chunks, std::time::Duration::from_millis(300)).await;
+        let (llm, dir) = llm_to(port, 1000, "early");
+        assert_eq!(call(llm.clone(), "early", ASK, false).await, 200);
+        assert_eq!(output_settles(&llm, 250).await, 250);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: usage at the end of a stream larger than any bounded copy is still read.
+    #[tokio::test]
+    async fn the_final_usage_of_a_large_stream_is_counted() {
+        let delta =
+            sse("content_block_delta", &format!(r#"{{"type":"content_block_delta","delta":{{"text":"{}"}}}}"#, "x".repeat(64 * 1024)));
+        let mut chunks = vec![sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#)];
+        chunks.extend(std::iter::repeat_n(delta, 150)); // ~9.6 MiB
+        chunks.push(
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":77}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        );
+        let (port, _) = sse_upstream(chunks, std::time::Duration::ZERO).await;
+        let (llm, dir) = llm_to(port, 1000, "large");
+        assert_eq!(call(llm.clone(), "large", ASK, true).await, 200);
+        assert_eq!(output_settles(&llm, 77).await, 77);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: a stream that ends without its final usage is charged the whole reservation, and a
+    /// call asking for more than is left is lowered to what is left.
+    #[tokio::test]
+    async fn an_unsettled_call_is_charged_its_reservation_and_asks_are_capped() {
+        let chunks = vec![
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#),
+            b": keep-alive\n\n".to_vec(),
+        ];
+        let (port, seen) = sse_upstream(chunks, std::time::Duration::ZERO).await;
+        let (llm, dir) = llm_to(port, 1000, "unsettled");
+        assert_eq!(call(llm.clone(), "unsettled", ASK, true).await, 200);
+        assert_eq!(output_settles(&llm, 300).await, 300, "charged max_tokens");
+        // 700 left: an ask for 5000 goes upstream as 700.
+        let big = ASK.replace("\"max_tokens\":300", "\"max_tokens\":5000");
+        assert_eq!(call(llm.clone(), "unsettled2", &big, true).await, 200);
+        assert!(seen.lock().await.iter().any(|r| r.contains("\"max_tokens\":700")), "{:?}", seen.lock().await);
+        assert_eq!(output_settles(&llm, 1000).await, 1000);
+        // Nothing left: refused without a model call.
+        let n = seen.lock().await.len();
+        assert_eq!(call(llm.clone(), "unsettled3", ASK, true).await, 429);
+        assert_eq!(seen.lock().await.len(), n);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: the amount a call reserves is the amount its body asks for, so a call made while
+    /// another holds part of the budget goes upstream lowered to what is left; a messages call that
+    /// doesn't say how much it may generate isn't sent.
+    #[test]
+    fn a_call_asks_upstream_for_no_more_than_it_reserved() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        let parts = || http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let ask = |n: &str| bytes::Bytes::from(format!(r#"{{"model":"m","max_tokens":{n},"messages":[]}}"#));
+        let first = llm.filter(Some(&spec), &parts(), ask("60")).ok().unwrap();
+        assert_eq!(first.reserved, 60);
+        let second = llm.filter(Some(&spec), &parts(), ask("60")).ok().unwrap();
+        assert_eq!(second.reserved, 40);
+        let out: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(out["max_tokens"], 40);
+        assert_eq!(llm.filter(Some(&spec), &parts(), ask("1")).err().map(|r| r.status().as_u16()), Some(429));
+        llm.settle(60, Usage::default(), true);
+        for bad in
+            [r#"{"messages":[]}"#, r#"{"max_tokens":64000.0,"messages":[]}"#, r#"{"max_tokens":"9","messages":[]}"#, r#"{"max_tokens":-1}"#]
+        {
+            let r = llm.filter(Some(&spec), &parts(), bytes::Bytes::from(bad));
+            assert_eq!(r.err().map(|r| r.status().as_u16()), Some(400), "{bad}");
+        }
+        // A URL source is a fetch by the provider.
+        let url = r#"{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"url","url":"https://evil.example/x.png"}}]}]}]}"#;
+        assert_eq!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(url)).err().map(|r| r.status().as_u16()), Some(403));
+        let b64 = r#"{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}]}"#;
+        assert!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(b64)).is_ok());
+    }
+
+    /// #113: parallel calls reserve from what is left, so together they can't overshoot.
+    #[test]
+    fn reservations_are_carved_from_what_is_left() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();
+        assert_eq!(llm.reserve_output(100, 60), Some(60));
+        assert_eq!(llm.reserve_output(100, 60), Some(40));
+        assert_eq!(llm.reserve_output(100, 1), None);
+        assert_eq!(llm.remaining().map(|r| r.1), Some(0), "spawn carve-outs see the reservations");
+        llm.settle(60, Usage { output: 10, ..Usage::default() }, true);
+        assert_eq!(llm.remaining().map(|r| r.1), Some(50));
+        llm.settle(40, Usage { output: 3, ..Usage::default() }, false);
+        assert_eq!(llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst), 50, "10 settled, 40 charged in full");
+    }
+
+    #[test]
+    fn usage_split_across_chunks_is_read() {
+        let mut s = super::UsageScanner::default();
+        s.feed(b"event: message_delta\ndata: {\"usage\":{\"output_tok");
+        s.feed(b"ens\":12");
+        s.feed(b"34}}\n\nevent: message_st");
+        assert!(!s.stopped);
+        s.feed(b"op\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(s.usage.output, 1234);
+        assert!(s.saw_output && s.stopped);
+        // Text that merely mentions the event doesn't end the stream.
+        let mut t = super::UsageScanner::default();
+        t.feed(br#"data: {"delta":{"text":"say \"type\":\"message_stop\" now"}}"#);
+        assert!(!t.stopped);
+    }
+
+    /// #112: only known fields and client tools reach the provider, unless the zone allows server
+    /// tools; bodies that can't be vetted, and endpoints other than messages, are refused.
+    #[test]
+    fn model_requests_are_filtered_by_allowlist() {
+        let parts = |m: &str, path: &str, enc: Option<&str>| {
+            let mut b = http::Request::builder().method(m).uri(path);
+            if let Some(e) = enc {
+                b = b.header("content-encoding", e);
+            }
+            b.body(()).unwrap().into_parts().0
+        };
+        let body = br#"{"model":"m","max_tokens":10,"messages":[],"mcp_servers":[{"type":"url","url":"https://evil.example/mcp","name":"x"}],"container":{"skills":[]},"some_future_field":1,
+            "tools":[{"name":"a","input_schema":{}},{"type":"custom","name":"b","input_schema":{}},{"type":"bash_20250124","name":"bash"},
+                     {"type":"web_search_20260209","name":"web_search"},{"type":"web_fetch_20250910","name":"web_fetch"},{"type":"code_execution_20260521","name":"code_execution"},
+                     {"type":"mcp_toolset","mcp_server_name":"x"},{"type":"tool_search_tool_regex_20251119","name":"t"},{"type":"advisor_20260301","name":"adv"},{"type":"some_new_server_tool","name":"n"}]}"#;
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        let f = llm.filter(Some(&spec), &parts("POST", "/v1/messages?beta=true", None), bytes::Bytes::from_static(body)).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["max_tokens", "messages", "model", "tools"], "{out}");
+        let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["a", "b", "bash"]);
+        assert!(f.note.contains("stripped 3 request field(s)") && f.note.contains("stripped 7 server-side tool(s)"), "{}", f.note);
+        // With server tools allowed, they and their fields go through.
+        let mut open = spec.clone();
+        open.allow_server_tools = true;
+        let f = llm.filter(Some(&open), &parts("POST", "/v1/messages", None), bytes::Bytes::from_static(body)).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert!(out.get("mcp_servers").is_some() && out["tools"].as_array().unwrap().len() == 10);
+        // Refused: unparseable, encoded, a batch, another method.
+        for (m, path, enc, b, status) in [
+            ("POST", "/v1/messages", None, &b"\x1f\x8b gzip"[..], 400),
+            ("POST", "/v1/messages", None, &b"[1]"[..], 400),
+            ("POST", "/v1/messages", Some("gzip"), &body[..], 415),
+            ("POST", "/v1/messages/batches", None, &body[..], 403),
+            ("POST", "/v1/files", None, &b"{}"[..], 403),
+            ("PUT", "/v1/messages", None, &body[..], 403),
+            ("GET", "/v1/models", None, &b"{}"[..], 400),
+        ] {
+            let r = llm.filter(Some(&spec), &parts(m, path, enc), bytes::Bytes::copy_from_slice(b));
+            assert_eq!(r.err().map(|r| r.status().as_u16()), Some(status), "{m} {path}");
+        }
+        assert!(llm.filter(Some(&spec), &parts("GET", "/v1/models", None), bytes::Bytes::new()).is_ok());
     }
 
     #[test]

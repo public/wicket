@@ -869,10 +869,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
             let _ = r.await;
         }
         let code = status.and_then(|s| s.code()).unwrap_or(-1);
-        let result = std::fs::read(dir.join("workspace/out/result.json"))
-            .ok()
-            .filter(|b| b.len() <= 64 * 1024)
-            .and_then(|b| String::from_utf8(b).ok());
+        let result = crate::hibernate::read_outbox(&dir, 64 * 1024).and_then(|b| String::from_utf8(b).ok());
         if let Some(b) = n.boxes.lock().expect("boxes").get_mut(&run) {
             b.exited = Some((code, result.clone()));
             b.stdin = None;

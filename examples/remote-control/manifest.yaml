@@ -21,4 +21,7 @@ zone:
     - { host: api.anthropic.com, paths: ["/v1/mcp_servers", "/v1/mcp_servers/**", "/mcp-registry/**"] }
   llm:
     secret: claude-oauth   # the host's Claude login, by reference (wicket secret link)
+    # The session's model calls are metered at the egress proxy: a budget sized for a 2-hour session.
+    max_requests: 3000
+    max_output_tokens: 3000000
   limits: { memory: 2g, cpus: 1, timeout: 2h }

@@ -208,7 +208,10 @@ pub enum UnlistedHosts {
 #[serde(deny_unknown_fields)]
 pub struct ForbidRule {
     pub host: String,
-    /// Path globs, as in reach rules. Default: everything on the host.
+    /// Path globs, as in reach rules, but matched ignoring ASCII case (#115): many upstreams
+    /// (GitHub's owner and repository names, for one) fold case, so `/repos/ACME/prod` must not dodge
+    /// a forbid on `/repos/acme/prod/**`. Reach globs stay case-sensitive (narrower is safer there).
+    /// Default: everything on the host.
     #[serde(default = "default_paths")]
     pub paths: Vec<String>,
 }
@@ -221,7 +224,8 @@ impl ForbidRule {
 
     pub fn matches(&self, host: &str, path: &str) -> bool {
         // A glob that doesn't compile counts as matching: a broken forbid rule forbids, never allows.
-        host_matches(&self.host, host) && self.paths.iter().any(|p| compile_glob(p).map(|g| g.is_match(path)).unwrap_or(true))
+        host_matches(&self.host, host)
+            && self.paths.iter().any(|p| compile_glob(&fold_case_glob(p)).map(|g| g.is_match(path)).unwrap_or(true))
     }
 }
 
@@ -492,6 +496,77 @@ pub(crate) fn compile_glob(p: &str) -> Result<GlobMatcher, ManifestError> {
         .build()
         .map(|g| g.compile_matcher())
         .map_err(|e| ManifestError::Glob { glob: p.to_string(), err: e.to_string() })
+}
+
+/// A glob that matches what `glob` matches, ignoring ASCII case: every ASCII letter `x` becomes the
+/// class `[xX]`, and every class gets its letters' other case added. Forbid globs are compiled from
+/// this, here and in the Biscuit ceiling (wicket-authz), so both match byte for byte the same paths
+/// (a regex case flag would fold non-ASCII characters differently in the two).
+pub fn fold_case_glob(glob: &str) -> String {
+    let swap = |c: char| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+    let mut out = String::with_capacity(glob.len() * 2);
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(n) if n.is_ascii_alphabetic() => out.push_str(&format!("[{n}{}]", swap(n))),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push('\\'),
+            },
+            '[' => {
+                // A class: `[` then an optional `!`/`^`, then up to the first `]` after one char.
+                let mut body = String::new();
+                if let Some(&neg @ ('!' | '^')) = chars.peek() {
+                    out.push('[');
+                    out.push(neg);
+                    chars.next();
+                } else {
+                    out.push('[');
+                }
+                let mut closed = false;
+                for n in chars.by_ref() {
+                    if n == ']' && !body.is_empty() {
+                        closed = true;
+                        break;
+                    }
+                    body.push(n);
+                }
+                if !closed {
+                    out.push_str(&body);
+                } else {
+                    // The other case of each letter and letter range (`a-z` gains `A-Z`), put right
+                    // after a leading `]` or `-` (literals there), so it never joins another range.
+                    let b: Vec<char> = body.chars().collect();
+                    let mut extra = String::new();
+                    let mut i = 0;
+                    while i < b.len() {
+                        if i + 2 < b.len() && b[i + 1] == '-' {
+                            if b[i].is_ascii_alphabetic() && b[i + 2].is_ascii_alphabetic() {
+                                extra.extend([swap(b[i]), '-', swap(b[i + 2])]);
+                            }
+                            i += 3;
+                        } else {
+                            if b[i].is_ascii_alphabetic() {
+                                extra.push(swap(b[i]));
+                            }
+                            i += 1;
+                        }
+                    }
+                    let lead = usize::from(matches!(b.first(), Some(']' | '-')));
+                    out.extend(&b[..lead]);
+                    out.push_str(&extra);
+                    out.extend(&b[lead..]);
+                    out.push(']');
+                }
+            }
+            c if c.is_ascii_alphabetic() => out.push_str(&format!("[{c}{}]", swap(c))),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl ReachRule {

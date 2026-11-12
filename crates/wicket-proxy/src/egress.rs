@@ -10,7 +10,7 @@
 
 use crate::ca::{Minter, RunCa};
 use crate::decide::{Central, Decider, Outcome, Route};
-use crate::{full, problem, BoxBody, Event, RunCtx, STRIP_REQUEST, STRIP_RESPONSE};
+use crate::{full, problem, BoxBody, Event, RunCtx, FORWARD_METHODS, FORWARD_REQUEST, REFUSE_REQUEST, STRIP_RESPONSE};
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -38,19 +38,32 @@ pub struct Egress {
     h3_up: tokio::sync::OnceCell<Option<Arc<crate::h3::Up>>>,
     /// Blocked attempts this run: per request (or host), and in total.
     strikes: std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
+    /// The run's model proxy, which vets and accounts model calls that reach the model host through
+    /// here (a wrapped session's, #112).
+    model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
 }
 
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
 /// use; tests point hosts at local origins with their own CA.
 #[derive(Clone, Default)]
 pub struct Upstream {
-    /// Host -> address, instead of DNS.
+    /// Host -> address, instead of DNS. Pinned by whoever configures the proxy, so not subject to the
+    /// dial-time address check (tests point hosts at local origins this way).
     pub resolve: std::collections::HashMap<String, std::net::SocketAddr>,
+    /// Host -> the addresses DNS would answer (tests). Unlike `resolve`, these are checked like real
+    /// answers: a name with a non-public address is refused (#116).
+    pub dns: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
     /// Extra trusted roots (PEM), besides the public ones.
     pub roots_pem: Option<String>,
     /// Re-originate requests that arrived over HTTP/3 over HTTP/3 too, when the upstream offers it
     /// (default on; HTTP/2 or HTTP/1.1 otherwise).
     pub no_h3: bool,
+}
+
+impl Upstream {
+    pub(crate) fn lookup(&self) -> crate::dial::Lookup {
+        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()) }
+    }
 }
 
 /// How a request reached the proxy.
@@ -110,7 +123,9 @@ impl Egress {
         let mut b = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(15));
+            .connect_timeout(std::time::Duration::from_secs(15))
+            // Every name is resolved by wicket and dialled only at checked, public addresses (#116).
+            .dns_resolver(Arc::new(crate::dial::PublicResolver(upstream.lookup())));
         for (host, addr) in &upstream.resolve {
             b = b.resolve(host, *addr);
         }
@@ -120,7 +135,23 @@ impl Egress {
             }
         }
         let client = b.build()?;
-        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, upstream, h3_up: Default::default(), strikes: Default::default() }))
+        Ok(Arc::new(Egress {
+            ctx,
+            ca,
+            decider,
+            relay,
+            client,
+            upstream,
+            h3_up: Default::default(),
+            strikes: Default::default(),
+            model_gate: Default::default(),
+        }))
+    }
+
+    /// Model calls to the model host that come through this proxy (a wrapped Claude Code session's)
+    /// go through `llm`'s budget, body filter and accounting (#112).
+    pub fn set_model_gate(&self, llm: Arc<crate::llm::Llm>) {
+        let _ = self.model_gate.set(llm);
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -142,13 +173,14 @@ impl Egress {
             let Some(auth) = req.uri().authority().cloned() else {
                 return Ok(problem(400, "bad-request", "Bad CONNECT", "CONNECT needs host:port", None));
             };
-            let host = auth.host().trim_end_matches('.').to_ascii_lowercase();
             let port = auth.port_u16().unwrap_or(443);
+            // One spelling per host, and no IP addresses in any spelling (#116).
+            let host = match wicket_core::canonical_host(auth.host()) {
+                Ok(h) => h,
+                Err(e) => return Ok(self.refuse(&auth.host().to_ascii_lowercase(), "CONNECT", "/", &e.to_string())),
+            };
             if port != 443 {
                 return Ok(self.refuse(&host, "CONNECT", "/", &format!("only port 443 is proxied (asked for {port})")));
-            }
-            if host.parse::<std::net::IpAddr>().is_ok() {
-                return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
             }
             // A superseded activation (#70) gets no tunnel at all.
             if let Some(why) = self.ctx.superseded() {
@@ -176,9 +208,18 @@ impl Egress {
             return Ok(Response::new(full(Bytes::new())));
         }
         // Absolute-form plain HTTP request.
-        let host = req.uri().host().map(|h| h.to_ascii_lowercase());
+        let host = req.uri().host().map(|h| (h.to_ascii_lowercase(), wicket_core::canonical_host(h)));
         match host {
-            Some(h) if req.uri().scheme_str() == Some("http") => {
+            Some((raw, Err(e))) if req.uri().scheme_str() == Some("http") => {
+                let method = req.method().to_string();
+                Ok(self.refuse(&raw, &method, "/", &e.to_string()))
+            }
+            Some((_, Ok(h))) if req.uri().scheme_str() == Some("http") => {
+                // The URL sent upstream has no port: say so rather than quietly using port 80.
+                if let Some(port) = req.uri().port_u16().filter(|p| *p != 80) {
+                    let method = req.method().to_string();
+                    return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP is proxied to port 80 only (asked for {port})")));
+                }
                 if let Some(r) = self.judge_host(&h, req.method().as_str()) {
                     return Ok(r);
                 }
@@ -376,6 +417,20 @@ impl Egress {
                 return self.refuse(&host, &method, "/", &format!("Host header {h:?} does not match the tunnel target"));
             }
         }
+        if let Some(why) = refused_shape(&req) {
+            return self.refuse(&host, &method, "/", &why);
+        }
+        // A credential never goes out in cleartext (#129): plain HTTP to a host the zone injects a
+        // credential into, or swaps a placeholder for, is refused before anything is decided or read
+        // from the vault, whether or not this request would have carried one.
+        if scheme != "https" && self.credentials_for(&host) {
+            return self.refuse(
+                &host,
+                &method,
+                "/",
+                &format!("plain HTTP to {host} is refused: wicket attaches a credential to requests for this host and never sends one unencrypted; use https://{host}/"),
+            );
+        }
         let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
         let path = match canonical_path(&pq) {
             Ok(p) => p.to_string(),
@@ -469,13 +524,22 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
+        if let Some(llm) = self.model_gate.get().filter(|_| crate::llm::is_model_call(&host, &path)) {
+            return llm.clone().through_egress(&self, req, &host, &pq, via).await;
+        }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
-            Err(e) => problem(502, "upstream", "Upstream error", &e.to_string(), None),
+            // The whole chain: a refused dial (#116) says why at its end.
+            Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
         }
     }
 
-    async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
+    /// Whether the zone injects a credential into requests for `host`, or swaps one in.
+    fn credentials_for(&self, host: &str) -> bool {
+        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host)) || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
+    }
+
+    pub(crate) async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -548,9 +612,13 @@ impl Egress {
         let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let url = format!("{scheme}://{host}{pq}");
+        if matches!(parts.method, Method::GET | Method::HEAD) && !body.is_empty() {
+            anyhow::bail!("refused: a {} request with a body", parts.method);
+        }
+        // Only allow-listed headers go upstream (#130); credentials are added below, by wicket.
         let mut headers = http::HeaderMap::new();
         for (name, value) in parts.headers.iter() {
-            if !STRIP_REQUEST.contains(&name.as_str()) {
+            if FORWARD_REQUEST.contains(&name.as_str()) || crate::provider_request_header(host, name.as_str()) {
                 headers.append(name.clone(), value.clone());
             }
         }
@@ -592,6 +660,27 @@ impl Egress {
         }
         Ok(Outgoing { method: parts.method, url, headers, body, injected })
     }
+}
+
+/// Why a request is refused before any decision, by its method, headers or body framing (#130,
+/// design §9.1): methods other than the usual ones (TRACE, and CONNECT inside a tunnel, among them),
+/// method-override and URL-rewrite headers, and a body on GET or HEAD.
+fn refused_shape<B>(req: &Request<B>) -> Option<String> {
+    let method = req.method().as_str();
+    if !FORWARD_METHODS.contains(&method) {
+        return Some(format!("the {method} method is not proxied"));
+    }
+    if let Some(h) = REFUSE_REQUEST.iter().find(|h| req.headers().contains_key(**h)) {
+        return Some(format!("the {h} header is refused: the request must be decided as it will run"));
+    }
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        let h = req.headers();
+        let length = h.get(http::header::CONTENT_LENGTH).map(|v| v.as_bytes() != b"0").unwrap_or(false);
+        if length || h.contains_key(http::header::TRANSFER_ENCODING) {
+            return Some(format!("a {method} request with a body is not proxied"));
+        }
+    }
+    None
 }
 
 /// A response head: status, reason phrase, and headers with lowercase names.
@@ -703,6 +792,154 @@ mod tests {
         for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
         }
+    }
+
+    /// #130: only allow-listed headers go upstream, and requests that could run as something other
+    /// than what was decided are refused before the decision.
+    #[tokio::test]
+    async fn headers_are_forwarded_by_allowlist_and_override_shapes_are_refused() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "shape");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c, ca).unwrap();
+        let empty = || http_body_util::Full::new(bytes::Bytes::new());
+        let refused = [
+            http::Request::builder().method("TRACE").uri("/x").body(empty()).unwrap(),
+            http::Request::builder().method("TRACK").uri("/x").body(empty()).unwrap(),
+            http::Request::builder().method("CONNECT").uri("/x").body(empty()).unwrap(),
+            http::Request::post("/repos/a/b/issues").header("x-http-method-override", "DELETE").body(empty()).unwrap(),
+            http::Request::get("/safe").header("X-Original-URL", "/admin").body(empty()).unwrap(),
+            http::Request::get("/safe").header("x-rewrite-url", "/admin").body(empty()).unwrap(),
+            http::Request::get("/safe")
+                .header("content-length", "5")
+                .body(http_body_util::Full::new(bytes::Bytes::from_static(b"hello")))
+                .unwrap(),
+            http::Request::head("/safe").header("transfer-encoding", "chunked").body(empty()).unwrap(),
+        ];
+        for req in refused {
+            let what = format!("{} {:?}", req.method(), req.headers());
+            let resp = e.clone().handle(req, "api.github.com".into(), "https", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 403, "{what}: {body}");
+            assert!(body.contains("malformed request") || body.contains("not proxied") || body.contains("refused"), "{what}: {body}");
+        }
+        // What does go upstream: the allow-list, plus the provider's own headers on its hosts only.
+        let req = || {
+            http::Request::post("/x")
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("git-protocol", "version=2")
+                .header("x-github-api-version", "2022-11-28")
+                .header("anthropic-beta", "b")
+                .header("x-forwarded-for", "10.0.0.1")
+                .header("x-forwarded-host", "internal")
+                .header("forwarded", "for=10.0.0.1")
+                .header("cookie", "a=b")
+                .header("x-api-key", "k")
+                .header("x-anything", "y")
+                .body(empty())
+                .unwrap()
+        };
+        let gh = e.prepare(req(), "api.github.com", "https", "/x").await.unwrap();
+        let names: Vec<&str> = gh.headers.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["accept", "content-type", "git-protocol", "x-github-api-version"], "{names:?}");
+        let other = e.prepare(req(), "example.com", "https", "/x").await.unwrap();
+        assert!(!other.headers.contains_key("x-github-api-version") && !other.headers.contains_key("anthropic-beta"));
+        let ant = e.prepare(req(), "api.anthropic.com", "https", "/x").await.unwrap();
+        assert!(ant.headers.contains_key("anthropic-beta") && !ant.headers.contains_key("x-github-api-version"));
+        // A GET body that arrives without framing headers (HTTP/3) is caught when it is read.
+        let get = http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::from_static(b"x"))).unwrap();
+        assert!(e.prepare(get, "api.github.com", "https", "/x").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
+    /// proxy's budget and body checks there: never forwarded once the budget is spent, nor as a
+    /// batch or an encoded body.
+    #[tokio::test]
+    async fn model_calls_through_egress_are_vetted_and_counted() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [GET, POST]}]", vec![], "model-gate");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c.clone(), ca).unwrap();
+        let llm = crate::llm::Llm::new(c).unwrap();
+        e.set_model_gate(llm.clone());
+        let send = |path: &str, enc: Option<&str>| {
+            let mut b = http::Request::post(path).header("content-type", "application/json");
+            if let Some(x) = enc {
+                b = b.header("content-encoding", x);
+            }
+            let req =
+                b.body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[]}"#))).unwrap();
+            let e = e.clone();
+            async move {
+                let r = e.handle(req, "api.anthropic.com".into(), "https", super::Via::Tcp).await;
+                let st = r.status().as_u16();
+                (st, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned())
+            }
+        };
+        assert_eq!(send("/v1/messages/batches", None).await.0, 403);
+        assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
+        llm.spent_before(u64::MAX / 4, 0, 0);
+        let (st, body) = send("/v1/messages", None).await;
+        assert_eq!(st, 429, "{body}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #129: no credential is ever sent over plain HTTP: requests to a host with an inject rule or a
+    /// swap are refused with a 403 that says to use https, before the vault is read.
+    #[tokio::test]
+    async fn plain_http_to_a_credentialed_host_is_refused() {
+        use http_body_util::BodyExt;
+        let swap = crate::CredentialSwap {
+            name: "t".into(),
+            host: "api.github.com".into(),
+            placeholder: "ph-123".into(),
+            real: crate::SwapSource::Vault("gh".into()),
+        };
+        let inject = "reach: [{host: api.github.com, methods: [GET]}], inject: [{host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh}]";
+        for (zone, swaps, tag) in
+            [(inject, vec![], "http-inject"), ("reach: [{host: api.github.com, methods: [GET]}]", vec![swap], "http-swap")]
+        {
+            let (c, dir) = ctx(zone, swaps, tag);
+            let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+            let e = super::Egress::new(c, ca).unwrap();
+            let req = http::Request::get("/user")
+                .header("host", "api.github.com")
+                .header("authorization", "Bearer ph-123")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            let resp = e.clone().handle(req, "api.github.com".into(), "http", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 403, "{tag}: {body}");
+            assert!(body.contains("never sends one unencrypted") && !body.contains("the-real-token"), "{tag}: {body}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// #116: a name in reach whose DNS answer is a non-public address is never dialled.
+    #[tokio::test]
+    async fn a_name_resolving_to_a_private_address_is_not_dialled() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: rebind.example, methods: [GET]}, {host: meta.example, methods: [GET]}]", vec![], "rebind");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let mut up = super::Upstream::default();
+        up.dns.insert("rebind.example".into(), vec!["127.0.0.1".parse().unwrap()]);
+        up.dns.insert("meta.example".into(), vec!["8.8.8.8".parse().unwrap(), "169.254.169.254".parse().unwrap()]);
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        for host in ["rebind.example", "meta.example"] {
+            let req =
+                http::Request::get("/latest/user-data").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            let resp = e.clone().handle(req, host.into(), "http", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 502, "{body}");
+            assert!(body.contains("non-public address"), "{body}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

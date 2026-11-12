@@ -554,6 +554,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
+    // A wrapped session's model calls reach the model host through the egress proxy: they get the
+    // model proxy's budget, filter and accounting there (#112).
+    egress.set_model_gate(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70).
     let prior_secs = match &wake {
         Some(w) => {
@@ -665,12 +668,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         volume_mounts.push(Mount { host, target: v.path.clone(), read_only: false });
     }
     for (rel, body) in &wrap_files {
-        let p = box_root.join("state").join(rel);
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&p, body)?;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+        // `state/` may hold restored, agent-written entries: never write through them.
+        crate::hibernate::write_owned(&box_root.join("state"), rel, body.as_ref())?;
     }
     if let (Some(w), None) = (&workspace_dir, &wrap_cwd) {
         // Create the outbox mount point ourselves, so it isn't left behind owned by root.
@@ -1288,14 +1287,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // the exit.)
     if let Some(n) = node.as_ref().filter(|_| !served) {
         let rd = box_root.display().to_string();
-        if let Ok(s) = n.sh(&format!("head -c 65537 {rd}/workspace/out/result.json 2>/dev/null || true")).await {
+        if let Ok(s) = n.sh(&format!(
+            "o={rd}/workspace/out; f=$o/result.json; if [ ! -L {rd}/workspace ] && [ ! -L $o ] && [ ! -L $f ] && [ -f $f ]; then head -c 65537 $f; fi 2>/dev/null || true"
+        )).await {
             let _ = std::fs::write(dir.join("workspace/out/result.json"), s);
         }
         let _ = n.sh(&format!("rm -rf {rd}")).await;
     }
-    let outbox = dir.join("workspace/out/result.json");
-    let result =
-        std::fs::read(&outbox).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let result = crate::hibernate::read_outbox(&dir, 64 * 1024).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     // A child reports back to its parent with a signed message, before its run is marked ended.
     if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {
         let output: String = program_tail.join("\n").chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();

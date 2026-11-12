@@ -193,7 +193,8 @@ pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'
     for f in &ceiling.forbid {
         for glob in &f.paths {
             let host = host_q(&mut c, &f.host);
-            let re = c.s(&path_regex(glob)?);
+            // Forbids ignore ASCII case, as in wicket-core (`ForbidRule::paths`, #115).
+            let re = c.s(&path_regex(&wicket_core::manifest::fold_case_glob(glob))?);
             c.push(&format!("reject if {host}, path($p), $p.matches({re});\n"));
         }
     }
