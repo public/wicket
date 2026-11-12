@@ -374,6 +374,7 @@ impl Link {
             node: node.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             build,
+            proto: crate::chan::PROTOCOL,
             observer: false,
             nonce,
             scope: scope.into(),

@@ -553,7 +553,8 @@ WantedBy=default.target
 /// `wicket node install <name>`: copies this control host's own wicket binary to the node over the
 /// pinned ssh connection (`~/.local/bin/wicket`), checks its sha256 there, and (unless `no_service`)
 /// installs and restarts the `wicket-node` systemd user service that runs `wicket node serve`. The
-/// node's `serve` refuses a control host running any other build, so run this again after upgrading.
+/// node's `serve` refuses a control host more than one protocol version away (`chan.rs`); `wicket self
+/// update --nodes` keeps nodes current.
 pub async fn install(name: &str, ssh_key: Option<&Path>, no_service: bool) -> Result<()> {
     use sha2::Digest;
     let ledger = Ledger::open(&crate::ledger_path())?;

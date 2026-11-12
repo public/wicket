@@ -24,8 +24,38 @@
 //! by the node with the top bit set, and die with the connection.
 //!
 //! [`read_frame`] never panics on any input: a bad frame is an error and the connection is dropped.
+//!
+//! **Versions** (#162). Both ends say which protocol version they speak ([`PROTOCOL`], in
+//! [`Msg::Hello`] and [`Msg::Welcome`]); they talk if the two are at most [`PROTOCOL_SKEW`] apart,
+//! at the lower of the two ([`negotiate`]). That is what lets a rollout update the control host and
+//! its nodes one at a time: a control host at N talks to nodes at N−1 and N, and a node at N to a
+//! control host at N−1 (rolled back) and N+1. The build (sha256 of the binary) is still sent, for
+//! the logs only. The rules for changing the protocol:
+//! - A change either side of an older peer could misread (a new [`Msg`] variant, a new required
+//!   field, a changed meaning) bumps [`PROTOCOL`]. A new field with `#[serde(default)]` that an older
+//!   peer may ignore does not.
+//! - A message added in version N is sent only on a connection that negotiated N or later, since an
+//!   older peer drops the connection on a message it can't parse.
+//! - Support for version N−1 is removed only after a release that spoke N everywhere.
 
 use serde::{Deserialize, Serialize};
+
+/// The control/node protocol version this build speaks.
+pub const PROTOCOL: u32 = 1;
+/// How far apart two peers' versions may be.
+pub const PROTOCOL_SKEW: u32 = 1;
+
+/// The version two peers talk at: the lower of the two, if they are at most [`PROTOCOL_SKEW`]
+/// apart. `theirs` is 0 for a peer from before protocol versions (it required the same build).
+pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
+    if theirs == 0 {
+        return Err(format!("it runs a wicket from before protocol versions (this one speaks protocol {ours})"));
+    }
+    if ours.abs_diff(theirs) > PROTOCOL_SKEW {
+        return Err(format!("it speaks protocol {theirs}, this one {ours} (at most {PROTOCOL_SKEW} apart)"));
+    }
+    Ok(ours.min(theirs))
+}
 
 /// The largest frame body: a feed snapshot (`wicket_feed::MAX_FRAME_BYTES`) plus framing.
 pub const MAX_FRAME: usize = wicket_feed::MAX_FRAME_BYTES + 4096;
@@ -155,13 +185,16 @@ pub struct RunState {
 #[serde(tag = "m", rename_all = "snake_case")]
 pub enum Msg {
     // ---- control host → node ----
-    /// First message: who is connecting, and with which build (the node refuses any other build).
-    /// `observer`: a check (`wicket dev node-feed-probe`) that only sends feed frames and reads the
+    /// First message: who is connecting, and with which protocol version (`proto`; the build is
+    /// informational). `observer`: a check (`wicket dev node-feed-probe`) that only sends feed frames and reads the
     /// node's feed status; it doesn't take over the control connection.
     Hello {
         node: String,
         version: String,
         build: String,
+        /// The protocol version the control host speaks (0: from before versions).
+        #[serde(default)]
+        proto: u32,
         #[serde(default)]
         observer: bool,
         /// The control host's handshake nonce (base64url, 32 bytes); unused by observers.
@@ -304,13 +337,16 @@ pub enum Msg {
     Welcome {
         node: String,
         build: String,
+        /// The protocol version this connection talks ([`negotiate`]d; 0: a node from before versions).
+        #[serde(default)]
+        proto: u32,
         feed: wicket_feed::Hello,
         runs: Vec<RunState>,
         /// What the node has, and what its running boxes are given (for placement).
         #[serde(default)]
         capacity: Option<NodeCapacity>,
     },
-    /// The node won't talk to this control host (wrong build, wrong node name).
+    /// The node won't talk to this control host (protocols too far apart, wrong node name).
     Refused {
         why: String,
     },
@@ -586,6 +622,7 @@ mod tests {
                 node: "n1".into(),
                 version: "0.0.1".into(),
                 build: "ab".repeat(32),
+                proto: PROTOCOL,
                 observer: false,
                 nonce: "A".repeat(43),
                 scope: "run_a".into(),
@@ -597,6 +634,7 @@ mod tests {
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),
                 build: "x".into(),
+                proto: PROTOCOL,
                 feed: wicket_feed::Hello::default(),
                 runs: vec![RunState {
                     run: "run_a".into(),
@@ -729,5 +767,26 @@ mod tests {
         assert_eq!(accept_at(&mut next, 2, b"cde"), (b"de".to_vec(), false), "an overlap");
         assert_eq!(accept_at(&mut next, 9, b"x"), (b"x".to_vec(), true), "a gap");
         assert_eq!(next, 10);
+    }
+
+    #[test]
+    fn peers_talk_within_the_skew_at_the_lower_version() {
+        assert_eq!(negotiate(5, 5), Ok(5));
+        assert_eq!(negotiate(5, 4), Ok(4), "a control host at N, a node at N-1");
+        assert_eq!(negotiate(4, 5), Ok(4), "a node at N, a control host rolled back to N-1");
+        assert!(negotiate(5, 3).unwrap_err().contains("at most 1 apart"));
+        assert!(negotiate(3, 5).is_err());
+        assert!(negotiate(PROTOCOL, 0).unwrap_err().contains("before protocol versions"));
+    }
+
+    #[test]
+    fn a_hello_or_welcome_without_a_version_parses_as_version_0() {
+        let h: Msg = serde_json::from_str(r#"{"m":"hello","node":"n1","version":"0.0.1","build":"x"}"#).unwrap();
+        assert!(matches!(h, Msg::Hello { proto: 0, .. }));
+        let w: Msg = serde_json::from_value(
+            serde_json::json!({"m":"welcome","node":"n1","build":"x","feed":wicket_feed::Hello::default(),"runs":[]}),
+        )
+        .unwrap();
+        assert!(matches!(w, Msg::Welcome { proto: 0, .. }));
     }
 }

@@ -13,11 +13,12 @@
 //! - **Enrolment** records it in the ledger like any node (target `unix:<socket>`, no ssh host key)
 //!   and issues its identity certificate; the control host renews the certificate itself when a run
 //!   finds it past half its life, so an installation idle for days still starts boxes.
-//! - **One `serve` per build.** The node refuses a control host with another build, so each build
-//!   has its own subdirectory (`<build id prefix>/`) and its own `serve`, started on demand (detached,
-//!   its log in `serve.log` there) and exiting once it has had no boxes and no connections for a while
-//!   (10 minutes; `WICKET_LOCAL_NODE_IDLE_SECS`). A `serve` from before an upgrade keeps the boxes
-//!   it runs until they end.
+//! - **One `serve`**, in `serve/` (#162), started on demand (detached, its log in `serve.log` there)
+//!   and exiting once it has had no boxes and no connections for a while (10 minutes;
+//!   `WICKET_LOCAL_NODE_IDLE_SECS`). Any build within the protocol skew talks to it (`chan.rs`), so
+//!   there is one at a time: `wicket self update` has it re-execute itself from the new build, which
+//!   adopts its boxes. (Builds before #162 kept one per build, in `<build id prefix>/`; such a `serve`
+//!   keeps the boxes it runs until they end.)
 //! - **What sharing the filesystem means** is only transport. The node lays out its boxes and runs
 //!   their proxies (egress decided from the feed, with its own CA) as any node does, but in the runs'
 //!   own directories (`<data dir>/runs/<run>`), so a run's trees needn't be copied to it and back;
@@ -40,12 +41,12 @@ fn root() -> PathBuf {
     crate::data_dir().join("local-node")
 }
 
-/// This build's serving directory.
+/// The serving directory.
 fn build_dir() -> Result<PathBuf> {
-    Ok(root().join(&crate::nodesrv::build_id()?[..12]))
+    Ok(root().join("serve"))
 }
 
-/// This build's control socket.
+/// Its control socket.
 pub fn socket() -> Result<PathBuf> {
     Ok(crate::nodesrv::NodePaths::new(Some(build_dir()?)).socket())
 }
@@ -245,7 +246,7 @@ fn renew_cert(ledger: &std::sync::Mutex<Ledger>, dir: &std::path::Path) -> Resul
     Ok(())
 }
 
-/// Starts this build's `serve`, detached from this run (it outlives it, and serves the next).
+/// Starts the `serve`, detached from this run (it outlives it, and serves the next).
 fn start_serve(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().context("finding this binary")?;
