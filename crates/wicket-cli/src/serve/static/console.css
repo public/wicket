@@ -1,43 +1,77 @@
-:root { --bg:#fafaf8; --ink:#1d1d1b; --quiet:#6b6b66; --line:#e2e1dc; --card:#fff; --accent:#2f6fde; --warn:#b4540a; --bad:#b42318; --good:#1e7a46; }
-@media (prefers-color-scheme: dark) { :root { --bg:#161615; --ink:#ecebe6; --quiet:#a3a29c; --line:#33332f; --card:#1f1f1d; } }
+/* System fonts only: the CSP allows no font files, and each platform's UI face (SF Pro, Segoe UI Variable,
+   Roboto) reads better than anything we'd ship. */
+:root {
+  color-scheme: light dark;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", Roboto, Inter,
+    "Noto Sans", Cantarell, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "JetBrains Mono", "Roboto Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  --bg:#f6f7f9; --ink:#14161a; --soft:#3d424b; --quiet:#6b7280; --line:#e4e7ec; --card:#fff; --tint:#f1f3f6;
+  --accent:#2557d6; --accent-ink:#fff; --warn:#b45309; --bad:#c0262d; --good:#15803d;
+  --radius:12px; --shadow:0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0f1115; --ink:#eceef2; --soft:#c4c9d2; --quiet:#8b93a1; --line:#262a33; --card:#171a20; --tint:#1e222a;
+    --accent:#6d9bff; --accent-ink:#0b1020; --warn:#f0a35b; --bad:#ff6b6b; --good:#4ade80; --shadow:none; }
+}
 * { box-sizing: border-box; }
-body { margin:0; font:15px/1.45 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--ink); }
-header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:baseline; }
-header h1 { font-size:17px; margin:0; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; font:15px/1.5 var(--sans); background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; font-feature-settings:"tnum" 0; }
+header { position:sticky; top:0; z-index:5; padding:14px 20px; background:color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter:saturate(1.4) blur(10px); -webkit-backdrop-filter:saturate(1.4) blur(10px); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+header h1 { font-size:17px; font-weight:650; letter-spacing:-.01em; margin:0; }
 header span { color:var(--quiet); font-size:13px; }
-main { max-width:760px; margin:0 auto; padding:12px 16px 40px; }
-h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--quiet); margin:22px 0 8px; }
-.agent { margin:6px 0 2px; font-size:15px; } .agent .ok { color:var(--good); font-weight:700; } .agent .bad { color:var(--bad); font-weight:600; }
-.agent .chain { font-size:13px; margin-top:2px; }
-.agent .idline { color:var(--quiet); font-family:ui-monospace,Menlo,monospace; font-size:11px; word-break:break-all; }
-button:disabled { opacity:.4; cursor:not-allowed; }
-.who { margin:6px 0; font-size:14px; } .who .cand { margin-left:10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
-.who .note { color:var(--quiet); font-size:12px; margin-top:2px; } .who .warn { color:var(--warn); font-size:13px; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:8px 0; }
-.req .what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; word-break:break-all; }
-.meta { color:var(--quiet); font-size:13px; margin-top:4px; }
-.why { font-size:13px; margin-top:6px; }
-.risk { display:inline-block; font-size:12px; font-weight:600; padding:1px 7px; border-radius:20px; border:1px solid currentColor; margin-right:6px; }
-.r0, .r1 { color:var(--good); } .r2 { color:var(--accent); } .r3 { color:var(--warn); } .r4 { color:var(--bad); }
-.buttons { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
-button { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-button.approve { border-color:var(--accent); color:var(--accent); font-weight:600; }
-button.deny { border-color:var(--bad); color:var(--bad); }
+main { max-width:720px; margin:0 auto; padding:8px 16px 56px; }
+h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--quiet); margin:28px 4px 10px; }
+
+.card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; margin:10px 0; box-shadow:var(--shadow); }
+.req .what { font:500 14px/1.45 var(--mono); margin-top:8px; word-break:break-all; }
+.why { color:var(--soft); font-size:14px; margin-top:6px; }
+.meta { color:var(--quiet); font-size:12.5px; margin-top:8px; font-variant-numeric:tabular-nums; }
+.note { color:var(--quiet); font-size:13px; margin-top:10px; }
 .empty { color:var(--quiet); font-size:14px; }
-.row { display:flex; justify-content:space-between; gap:10px; font-size:14px; padding:6px 0; border-bottom:1px solid var(--line); }
-.row:last-child { border-bottom:0; }
-.mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; word-break:break-all; }
-.log { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+
+.risk { display:inline-flex; align-items:center; font-size:11.5px; font-weight:650; letter-spacing:.02em; padding:2px 9px; border-radius:999px; background:color-mix(in srgb, currentColor 12%, transparent); }
+.r0, .r1 { color:var(--good); } .r2 { color:var(--accent); } .r3 { color:var(--warn); } .r4 { color:var(--bad); }
+
+.agent { margin:12px 0 0; padding-top:12px; border-top:1px solid var(--line); font-size:14px; }
+.agent .ok { color:var(--good); font-weight:700; } .agent .bad { color:var(--bad); font-weight:600; }
+.agent .chain { color:var(--soft); font-size:13px; margin-top:2px; }
+.agent .idline { color:var(--quiet); font:11.5px/1.4 var(--mono); margin-top:2px; word-break:break-all; }
+.who { margin:8px 0 0; font-size:13.5px; color:var(--soft); }
+.who .cand { margin-left:10px; font:12px/1.45 var(--mono); }
+.who .note { font-size:12px; margin-top:4px; } .who .warn { color:var(--warn); font-size:13px; }
+
+.buttons { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+button { font:600 14px/1 var(--sans); padding:11px 16px; min-height:42px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; transition:background .12s, border-color .12s, box-shadow .12s; }
+button:hover { background:var(--tint); }
+button:focus-visible { outline:none; box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent); }
+button.approve { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+button.approve:hover { background:color-mix(in srgb, var(--accent) 88%, #000); }
+button.deny { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); }
+button.deny:hover { background:color-mix(in srgb, var(--bad) 8%, var(--card)); }
+button:disabled, button:disabled:hover { opacity:.45; cursor:not-allowed; background:var(--card); }
+button.approve:disabled { background:var(--accent); }
+
+.row { display:flex; justify-content:space-between; align-items:center; gap:12px; font-size:14px; padding:9px 0; border-bottom:1px solid var(--line); }
+.row:first-child { padding-top:0; } .row:last-child { border-bottom:0; padding-bottom:0; }
+.row .acts { display:flex; gap:6px; flex-shrink:0; } .row .acts button { min-height:32px; padding:7px 11px; font-size:13px; }
+.mono { font:13px/1.45 var(--mono); word-break:break-all; }
+.log { font:12px/1.6 var(--mono); white-space:pre-wrap; word-break:break-all; color:var(--soft); }
 .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
-select, textarea, input.text { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); width:100%; margin-top:6px; }
-textarea { min-height:70px; }
-.row .acts { display:flex; gap:6px; } .row .acts button { padding:3px 9px; font-size:13px; }
-#msg { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:14px; }
+
+select, textarea, input.text { font:15px/1.4 var(--sans); padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); width:100%; margin-top:8px; }
+select:focus, textarea:focus, input.text:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+textarea { min-height:76px; resize:vertical; }
+#runform textarea { min-height:96px; }
+#runform.revoke textarea { min-height:48px; }
+
+#msg { position:fixed; bottom:max(16px, env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); max-width:calc(100% - 32px); background:var(--ink); color:var(--bg); padding:10px 16px; border-radius:10px; font-size:14px; box-shadow:0 8px 24px rgba(0,0,0,.2); }
 [hidden] { display:none !important; }
-#runform textarea { min-height:90px; }
-#runform.revoke textarea { min-height:44px; }
-.note { color:var(--quiet); font-size:13px; margin-top:8px; }
-#confirm { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.45); display:flex; align-items:flex-start; justify-content:center; padding:12px; }
-#confirm .card { width:100%; max-width:760px; margin:0; box-shadow:0 6px 24px rgba(0,0,0,.3); }
-#confirm-title { font-weight:600; }
-#confirm-what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; word-break:break-word; margin-top:6px; }
+
+/* What the passkey is about to sign (#124): pinned to the top, above a phone's passkey sheet. */
+#confirm { position:fixed; inset:0; z-index:10; background:rgba(10,12,16,.5); display:flex; align-items:flex-start; justify-content:center; padding:max(12px, env(safe-area-inset-top)) 12px 12px; }
+#confirm .card { width:100%; max-width:720px; margin:0; padding:18px 20px; border-color:transparent; box-shadow:0 12px 40px rgba(0,0,0,.28); }
+#confirm-title { font-size:13px; font-weight:600; color:var(--quiet); letter-spacing:.01em; }
+#confirm-what { font:600 16px/1.45 var(--sans); margin-top:8px; word-break:break-word; }
+#confirm .buttons { margin-top:16px; }
+#confirm-go { flex:1 1 auto; }
