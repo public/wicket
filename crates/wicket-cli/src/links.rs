@@ -15,14 +15,14 @@
 //! a connection this process opens to it (scope `links:<run>`), so a link between nodes is relayed
 //! by the control host. Both boxes need `wicket-fwd` (every image built on wicket's agent image has it).
 
+use crate::nodecall::Calls;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use wicket_core::{Manifest, ZoneSpec};
 use wicket_proxy::link::{BoxOps, Stream};
-use crate::nodecall::Calls;
-use std::sync::Arc;
 
 /// The Docker name of a run's box (as `wicket run` names it): `wicket-<run>`, or another prefix from
 /// WICKET_BOX_PREFIX (tests name theirs, so they can be told apart and cleaned up).
@@ -54,15 +54,7 @@ pub struct NodeBoxes {
 
 impl NodeBoxes {
     pub fn new(ledger: Arc<Mutex<wicket_store::Ledger>>, run: &str, node: &str, own: Arc<Calls>, dir: PathBuf) -> NodeBoxes {
-        NodeBoxes {
-            ledger,
-            run: run.into(),
-            node: node.into(),
-            own,
-            dir,
-            others: Default::default(),
-            listeners: Mutex::default(),
-        }
+        NodeBoxes { ledger, run: run.into(), node: node.into(), own, dir, others: Default::default(), listeners: Mutex::default() }
     }
 
     /// The node `run`'s box was placed on.
@@ -103,8 +95,9 @@ fn stream(s: crate::nodecall::BoxStream, guard: Box<dyn std::any::Any + Send>) -
 }
 
 impl BoxOps for NodeBoxes {
-    fn reachable(&self, run: &str) -> Result<(), String> {
-        self.node_of(run).map(|_| ())
+    fn reachable<'a>(&'a self, run: &'a str) -> Fut<'a, Result<(), String>> {
+        // Its node must answer for it: the box is running there (not still starting, or gone).
+        Box::pin(async move { self.calls(run).await?.ctl(run, "status", "", "").await.map(|_| ()).map_err(|e| format!("{e:#}")) })
     }
 
     fn child_zone(&self, child_run: &str) -> Option<ZoneSpec> {

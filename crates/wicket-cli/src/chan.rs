@@ -185,7 +185,7 @@ pub enum Msg {
     Close {
         stream: u64,
     },
-    /// Acts on a run's box: `pause`, `unpause`, `processes` (as `user`; the answer's `out` is a JSON
+    /// Acts on a run's box: `status` (an error unless it is running), `pause`, `unpause`, `processes` (as `user`; the answer's `out` is a JSON
     /// list of (pid, ppid, command line)) or `hosts` (`arg` becomes the box's /etc/hosts).
     BoxCtl {
         id: u64,

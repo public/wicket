@@ -25,5 +25,12 @@ for _ in $(seq 20); do
   case "$c" in *"No such container"* | *"not running"* | *"no running box"*) sleep 2 ;; *) break ;; esac
 done
 put connect "$c"
-put connect_fetch "$(curl -s -m 5 --noproxy '*' http://remote.wicket.internal:8000/ 2>/dev/null || true)"
+# Its server starts after its probes: retried until it answers.
+f=
+for _ in $(seq 15); do
+  f=$(curl -s -m 5 --noproxy '*' http://remote.wicket.internal:8000/ 2>/dev/null || true)
+  [ -n "$f" ] && break
+  sleep 2
+done
+put connect_fetch "$f"
 put done 1

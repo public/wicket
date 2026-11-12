@@ -101,7 +101,9 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         Some(r) if !r.target.starts_with("unix:") => {
             bail!("an enrolled node is named {NAME:?}, which is now the built-in local node's name: revoke it (wicket node revoke {NAME}) and enrol it under another name")
         }
-        Some(r) if r.status != "active" => bail!("the local node was revoked: boxes can't run on this host until its directory {} is removed", dir.display()),
+        Some(r) if r.status != "active" => {
+            bail!("the local node was revoked: boxes can't run on this host until its directory {} is removed", dir.display())
+        }
         Some(_) if dir.join("node.key").exists() => return Ok(()),
         _ => {}
     }
@@ -130,7 +132,12 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         ("feed-root.pub", hex::encode(feed_root.to_bytes())),
         ("authz-root.pub", authz_root.to_hex()),
         ("issuer.pub.json", serde_json::to_string_pretty(&issuer.public_jwk())?),
-        ("node.json", serde_json::to_string_pretty(&serde_json::json!({ "name": NAME, "node_key": node_key, "shares_host": true, "enrolled_at": now }))?),
+        (
+            "node.json",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "name": NAME, "node_key": node_key, "shares_host": true, "enrolled_at": now }),
+            )?,
+        ),
     ];
     for (f, body) in files {
         std::fs::write(dir.join(f), body)?;

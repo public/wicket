@@ -27,8 +27,8 @@
 //! feed's timings (within the certificate's caps, which follow them).
 
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf};
-use crate::nodecall::{Calls, Via};
 use crate::nodeauth::HsError;
+use crate::nodecall::{Calls, Via};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -259,7 +259,11 @@ impl NodeCtl {
             p.commit(
                 vec![
                     Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 },
-                    Change::Revoke { kind: RevokeKind::Token, id: self.token_root.0.clone(), until: self.token_root.1.max(now + 86_400_000) },
+                    Change::Revoke {
+                        kind: RevokeKind::Token,
+                        id: self.token_root.0.clone(),
+                        until: self.token_root.1.max(now + 86_400_000),
+                    },
                 ],
                 now,
             )
@@ -506,8 +510,14 @@ async fn session(
     let d = sh.via.dial().await?;
     let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
     let build = crate::nodesrv::build_id()?;
-    let hello =
-        |nonce| Msg::Hello { node: sh.node.clone(), version: env!("CARGO_PKG_VERSION").into(), build, observer: false, nonce, scope: sh.run.0.clone() };
+    let hello = |nonce| Msg::Hello {
+        node: sh.node.clone(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        build,
+        observer: false,
+        nonce,
+        scope: sh.run.0.clone(),
+    };
     let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
         Ok(a) => a,
         Err(HsError::NoAnswer) => {

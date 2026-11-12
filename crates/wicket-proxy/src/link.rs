@@ -45,8 +45,8 @@ type Fut<'a, T> = futures_util::future::BoxFuture<'a, T>;
 /// What links need from the boxes themselves, supplied by whoever runs them (`wicket run`): each box
 /// is reached on its own node.
 pub trait BoxOps: Send + Sync {
-    /// Whether wicket can link `run`'s box (on a node it reaches), and if not, why.
-    fn reachable(&self, run: &str) -> Result<(), String>;
+    /// Whether wicket can link `run`'s box (running, on a node it reaches), and if not, why.
+    fn reachable<'a>(&'a self, run: &'a str) -> Fut<'a, Result<(), String>>;
     /// The zone of one of this run's own children, from the record of its spawn.
     fn child_zone(&self, child_run: &str) -> Option<ZoneSpec>;
     /// Rewrites `run`'s box's /etc/hosts.
@@ -291,8 +291,8 @@ async fn open(
     d: Decision,
     wanted: &str,
 ) -> Result<String, String> {
-    ops.reachable(&from.run)?;
-    ops.reachable(&to.run)?;
+    ops.reachable(&from.run).await?;
+    ops.reachable(&to.run).await?;
     let existing = ledger(ctx).open_link(&from.run, &to.run, port).map_err(|e| e.to_string())?;
     if let Some(r) = existing {
         return Ok(format!("already linked ({}): {}.{}:{port}", r.id, r.name, policy::DOMAIN));
@@ -484,8 +484,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use tokio::net::{UnixListener, UnixStream};
     use tokio::io::AsyncReadExt;
+    use tokio::net::{UnixListener, UnixStream};
     use wicket_core::{Manifest, RunId, TenantId};
     use wicket_identity::{AgentKey, Issuer};
     use wicket_store::{IdentityRow, Ledger};
@@ -500,11 +500,12 @@ mod tests {
     }
 
     impl BoxOps for FakeBoxes {
-        fn reachable(&self, run: &str) -> Result<(), String> {
-            match self.root.join(run).join("hosts").exists() {
+        fn reachable<'a>(&'a self, run: &'a str) -> Fut<'a, Result<(), String>> {
+            let r = match self.root.join(run).join("hosts").exists() {
                 true => Ok(()),
                 false => Err(format!("box {run} is not on a node wicket reaches")),
-            }
+            };
+            Box::pin(async move { r })
         }
         fn child_zone(&self, run: &str) -> Option<ZoneSpec> {
             self.zones.get(run).cloned()
