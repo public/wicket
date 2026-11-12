@@ -330,6 +330,17 @@ impl<P: Policy> Publisher<P> {
         Ok(frames)
     }
 
+    /// The latest `issued_at` this publisher has signed a statement with.
+    pub fn last_issued(&self) -> i64 {
+        self.last_issued
+    }
+
+    /// Notes a statement time signed elsewhere for this feed (another process publishing to the
+    /// same node), so the next statement is issued after it and no node sees two with one time.
+    pub fn note_issued(&mut self, at: i64) {
+        self.last_issued = self.last_issued.max(at);
+    }
+
     /// The delta log's path (for operators and tests).
     pub fn log_path(&self) -> &Path {
         &self.path

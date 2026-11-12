@@ -137,19 +137,86 @@ impl WriteSync for std::fs::File {
     }
 }
 
-/// An exclusive hold on a node's feed for the life of a run.
-struct FeedLock(#[allow(dead_code)] std::fs::File);
+/// A node's feed, shared by every process that publishes to it (each run on the node, and each
+/// link relay). Every use holds `<data dir>/nodes/<name>/feed.lock` for its duration, and first reloads
+/// the delta log if another process appended to it since, so each delta extends the one true head.
+pub struct SharedFeed {
+    name: String,
+    cfg: PublisherConfig,
+    dir: PathBuf,
+    /// The publisher, and the delta log's length when it was last loaded or written.
+    inner: Mutex<(Publisher<BoxAuthority>, u64)>,
+}
 
-fn lock_feed(name: &str) -> Result<FeedLock> {
-    use std::os::fd::AsRawFd;
-    let dir = crate::data_dir().join("nodes").join(name);
-    std::fs::create_dir_all(&dir)?;
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("feed.lock"))?;
-    // SAFETY: flock on a file descriptor this process owns.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another run is using node {name}: one run per node for now (#38)");
+/// A held feed: the publisher, current, with the feed's lock taken.
+pub struct FeedGuard<'a> {
+    g: std::sync::MutexGuard<'a, (Publisher<BoxAuthority>, u64)>,
+    dir: &'a Path,
+    /// The last statement time when the lock was taken.
+    issued: i64,
+    _lock: std::fs::File,
+}
+
+impl std::ops::Deref for FeedGuard<'_> {
+    type Target = Publisher<BoxAuthority>;
+    fn deref(&self) -> &Publisher<BoxAuthority> {
+        &self.g.0
     }
-    Ok(FeedLock(f))
+}
+
+impl std::ops::DerefMut for FeedGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Publisher<BoxAuthority> {
+        &mut self.g.0
+    }
+}
+
+impl Drop for FeedGuard<'_> {
+    fn drop(&mut self) {
+        self.g.1 = std::fs::metadata(self.g.0.log_path()).map(|m| m.len()).unwrap_or(0);
+        if self.g.0.last_issued() != self.issued {
+            let _ = std::fs::write(self.dir.join("feed/issued"), self.g.0.last_issued().to_string());
+        }
+    }
+}
+
+fn feed_lock(dir: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("feed.lock"))?;
+    // SAFETY: flock on a file descriptor this function owns.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("locking the node's feed");
+    }
+    Ok(f)
+}
+
+fn last_issued(feed_dir: &Path) -> i64 {
+    std::fs::read_to_string(feed_dir.join("issued")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(i64::MIN)
+}
+
+impl SharedFeed {
+    pub fn open(name: &str, cfg: PublisherConfig) -> Result<SharedFeed> {
+        let dir = crate::data_dir().join("nodes").join(name);
+        let _lock = feed_lock(&dir)?;
+        let mut p = open_feed(name, cfg.clone())?;
+        p.note_issued(last_issued(&dir.join("feed")));
+        let len = std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0);
+        Ok(SharedFeed { name: name.into(), cfg, dir, inner: Mutex::new((p, len)) })
+    }
+
+    /// The feed, locked and current.
+    pub fn lock(&self) -> Result<FeedGuard<'_>> {
+        let lock = feed_lock(&self.dir)?;
+        let mut g = self.inner.lock().expect("feed");
+        let len = std::fs::metadata(g.0.log_path()).map(|m| m.len()).unwrap_or(0);
+        if len != g.1 {
+            g.0 = open_feed(&self.name, self.cfg.clone())?;
+            g.1 = len;
+        }
+        g.0.note_issued(last_issued(&self.dir.join("feed")));
+        let issued = g.0.last_issued();
+        Ok(FeedGuard { g, dir: &self.dir, issued, _lock: lock })
+    }
 }
 
 /// What the run loop gets: the box's stdio as streams, its exit, and a handle to stop it.
@@ -166,11 +233,10 @@ pub struct NodeCtl {
     node: String,
     run: String,
     link: Mutex<Option<chan::Out>>,
-    publisher: Arc<Mutex<Publisher<BoxAuthority>>>,
+    publisher: Arc<SharedFeed>,
     /// The box's token's block 0 revocation id (hex), and until when it matters (Unix ms).
     token_root: (String, i64),
     killed: AtomicBool,
-    _lock: FeedLock,
 }
 
 impl NodeCtl {
@@ -187,13 +253,16 @@ impl NodeCtl {
     /// Revokes the run on the node (every op refused from the moment the delta applies), then stops it.
     pub fn revoke(&self) {
         let now = wicket_feed::now_ms();
-        let frame = self.publisher.lock().expect("publisher").commit(
-            vec![
-                Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 },
-                Change::Revoke { kind: RevokeKind::Token, id: self.token_root.0.clone(), until: self.token_root.1.max(now + 86_400_000) },
-            ],
-            now,
-        );
+        let frame = self.publisher.lock().and_then(|mut p| {
+            p.commit(
+                vec![
+                    Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 },
+                    Change::Revoke { kind: RevokeKind::Token, id: self.token_root.0.clone(), until: self.token_root.1.max(now + 86_400_000) },
+                ],
+                now,
+            )
+            .map_err(Into::into)
+        });
         match frame {
             Ok(f) => {
                 self.send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
@@ -239,9 +308,8 @@ struct Shared {
 pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     let name = s.node.name.clone().context("only enrolled nodes run `wicket node serve`")?;
     let issuer = Arc::new(crate::issuer()?);
-    let lock = lock_feed(&name)?;
     let cfg = feed_config();
-    let mut publisher = open_feed(&name, cfg.clone())?;
+    let feed = Arc::new(SharedFeed::open(&name, cfg.clone())?);
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
     let (authz_root, approver) = (crate::enrol::token_key(&paths.authz_root_key)?, crate::enrol::token_key(&paths.approver_key)?);
@@ -260,24 +328,36 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
     )
     .context("minting the box's token")?;
     let authority = token_issuer.publish(&approver, &[]).context("the box's token")?;
-    // One run per node holds the feed (the lock above): earlier runs' tokens go in the same delta, so
-    // the feed and the node's snapshot don't grow with every run.
-    let mut changes: Vec<Change<BoxAuthority>> =
-        publisher.state().zones.keys().filter(|k| **k != s.run.0).map(|k| Change::DropZone { name: k.clone() }).collect();
-    changes.push(Change::PutZone { zone: authority });
-    publisher.commit(changes, now).context("publishing the box's token")?;
+    // Several runs share the node's feed. Tokens of runs that have ended (whose own exit didn't
+    // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
+    // grow with every run.
+    let target_epoch = {
+        let mut publisher = feed.lock()?;
+        let ended: Vec<String> = {
+            let l = s.ledger.lock().expect("ledger");
+            publisher
+                .state()
+                .zones
+                .keys()
+                .filter(|k| **k != s.run.0 && l.run_status(k).ok().flatten().as_deref() != Some("running"))
+                .cloned()
+                .collect()
+        };
+        let mut changes: Vec<Change<BoxAuthority>> = ended.into_iter().map(|name| Change::DropZone { name }).collect();
+        changes.push(Change::PutZone { zone: authority });
+        publisher.commit(changes, now).context("publishing the box's token")?;
+        publisher.epoch()
+    };
     let token_root = (token_issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
-    let target_epoch = publisher.epoch();
     // Records the node ships are filed under this run only once the ledger says it runs there (#120).
     s.ledger.lock().expect("ledger").set_run_node(&s.run.0, &name).context("recording the run's node")?;
     let ctl = Arc::new(NodeCtl {
         node: name.clone(),
         run: s.run.0.clone(),
         link: Mutex::new(None),
-        publisher: Arc::new(Mutex::new(publisher)),
+        publisher: feed,
         token_root,
         killed: AtomicBool::new(false),
-        _lock: lock,
     });
     let mut argv = s.node.ssh_prefix();
     if argv[0] == "ssh" {
@@ -444,7 +524,8 @@ async fn session(
         })
     };
     let build = crate::nodesrv::build_id()?;
-    let hello = |nonce| Msg::Hello { node: sh.node.clone(), version: env!("CARGO_PKG_VERSION").into(), build, observer: false, nonce };
+    let hello =
+        |nonce| Msg::Hello { node: sh.node.clone(), version: env!("CARGO_PKG_VERSION").into(), build, observer: false, nonce, scope: sh.run.0.clone() };
     let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
         Ok(a) => a,
         Err(HsError::NoAnswer) => {
@@ -488,7 +569,7 @@ async fn session(
     };
     let feed_frame = |f: wicket_feed::Frame| Frame::Feed(f.to_line().trim_end().as_bytes().to_vec());
     let now = wicket_feed::now_ms();
-    for f in sh.ctl.publisher.lock().expect("publisher").catch_up(&feed, now)? {
+    for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
     }
     if let Some(r) = runs.iter().find(|r| r.run == sh.run.0) {
@@ -538,7 +619,7 @@ async fn session(
                 }
             },
             _ = tick.tick() => {
-                let f = sh.ctl.publisher.lock().expect("publisher").tick(wicket_feed::now_ms());
+                let f = sh.ctl.publisher.lock().ok().and_then(|mut p| p.tick(wicket_feed::now_ms()));
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
@@ -610,7 +691,7 @@ async fn on_frame(
                     println!("[wicket] node {} refused a feed frame: {r}", sh.node);
                 }
                 if let Some(h) = catch_up {
-                    for f in sh.ctl.publisher.lock().expect("publisher").catch_up(&h, wicket_feed::now_ms())? {
+                    for f in sh.ctl.publisher.lock()?.catch_up(&h, wicket_feed::now_ms())? {
                         send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
                     }
                 }
@@ -638,6 +719,13 @@ async fn on_frame(
                     let _ = t.send(code);
                 }
                 send(Frame::Msg(Msg::Forget { run }));
+                // The box is gone: its token leaves the feed (the node no longer needs it).
+                let dropped = sh.ctl.publisher.lock().and_then(|mut f| {
+                    f.commit(vec![Change::DropZone { name: sh.run.0.clone() }], wicket_feed::now_ms()).map_err(Into::into)
+                });
+                if let Ok(f) = dropped {
+                    send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
+                }
                 p.exited = true;
             }
             Msg::Event { run, event } if run == sh.run.0 => {
@@ -672,6 +760,10 @@ async fn on_frame(
                 }
             }
             Msg::Refused { why } => bail!("node {} refused: {why}", sh.node),
+            Msg::AuditAsk {} => {
+                let head = sh.ledger.lock().expect("ledger").node_audit_head(&sh.node)?.map(|h| h.0).unwrap_or(0);
+                send(Frame::Msg(Msg::AuditFrom { seq: head }));
+            }
             Msg::NodeCertInstalled { serial, error } => match (p.renewing.take(), error) {
                 (Some(c), None) if c.jti == serial => {
                     println!("[wicket] node {}'s identity certificate renewed until {}", sh.node, c.exp);
@@ -792,7 +884,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     };
     let now_s = wicket_store::now();
     let mut changes = vec![];
-    let ctx = sh.ctl.publisher.lock().expect("publisher").state().ctx;
+    let Ok(ctx) = sh.ctl.publisher.lock().map(|p| p.state().ctx) else { return vec![] };
     // Whether the token with these grants would load on a node (the publisher refuses it otherwise).
     let loads = |live: &[LiveGrant]| -> Result<(), String> {
         let a = sh.token_issuer.publish(&sh.approver, live).map_err(|e| e.to_string())?;
@@ -886,7 +978,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
     let committed = {
-        let mut p = sh.ctl.publisher.lock().expect("publisher");
+        let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
         let mut r = p.commit(changes, wicket_feed::now_ms());
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.

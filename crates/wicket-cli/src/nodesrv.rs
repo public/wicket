@@ -100,13 +100,20 @@ struct BoxState {
     out: [OutBuf; 2],
     exited: Option<(i32, Option<String>)>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The control connection that started or last resumed it: its stdio, events, asks and
+    /// tunnels go there.
+    owner: Option<u64>,
 }
 
 struct Link {
     out: chan::Out,
-    gen: u64,
+    /// What the connection is for (a run's id, or a link relay's): a newer connection with the same
+    /// scope replaces it, others stay.
+    scope: String,
     /// Ends the connection's reader (a newer connection took over).
     kill: Option<oneshot::Sender<()>>,
+    /// Tunnels opened for the boxes this connection owns; they die with it.
+    tunnels: Arc<Tunnels>,
 }
 
 struct Node {
@@ -119,24 +126,39 @@ struct Node {
     audit: Arc<Mutex<Ledger>>,
     root_pem: String,
     docker: Docker,
-    link: Mutex<Option<Link>>,
+    /// Authenticated control connections, by generation.
+    links: Mutex<HashMap<u64, Link>>,
     boxes: Mutex<HashMap<String, BoxState>>,
     asks: Mutex<HashMap<u64, oneshot::Sender<Msg>>>,
     opens: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
-    tunnels: Tunnels,
     next: AtomicU64,
+    /// The connection audit records are shipped on (the last to send `AuditFrom`), and how far.
+    audit_link: Mutex<Option<u64>>,
     shipped: AtomicI64,
     /// One audit shipment at a time (the timer and a reconnect's watermark would send the same batch).
     shipping: Mutex<()>,
 }
 
 impl Node {
-    fn send(&self, f: Frame) -> bool {
-        self.link.lock().expect("link").as_ref().is_some_and(|l| l.out.send(f).is_ok())
+    /// Sends on connection `gen`.
+    fn send_to(&self, gen: u64, f: Frame) -> bool {
+        self.links.lock().expect("links").get(&gen).is_some_and(|l| l.out.send(f).is_ok())
     }
 
+    /// The connection that owns `run`'s box, if it is up.
+    fn owner(&self, run: &str) -> Option<u64> {
+        let owner = self.boxes.lock().expect("boxes").get(run).and_then(|b| b.owner)?;
+        self.links.lock().expect("links").contains_key(&owner).then_some(owner)
+    }
+
+    /// Sends to the connection that owns `run`'s box.
+    fn send_run(&self, run: &str, f: Frame) -> bool {
+        self.owner(run).is_some_and(|g| self.send_to(g, f))
+    }
+
+    #[cfg(test)]
     fn connected(&self) -> bool {
-        self.link.lock().expect("link").is_some()
+        !self.links.lock().expect("links").is_empty()
     }
 
     fn id(&self) -> u64 {
@@ -158,7 +180,12 @@ impl Node {
     /// Opens a tunnel to the run's `target` socket on the control host.
     async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<tokio::io::DuplexStream> {
         let unreachable = || std::io::Error::new(std::io::ErrorKind::NotConnected, "the control host is unreachable");
-        let out = self.link.lock().expect("link").as_ref().map(|l| l.out.clone()).ok_or_else(unreachable)?;
+        let (out, tunnels) = {
+            let gen = self.owner(run).ok_or_else(unreachable)?;
+            let links = self.links.lock().expect("links");
+            let l = links.get(&gen).ok_or_else(unreachable)?;
+            (l.out.clone(), l.tunnels.clone())
+        };
         let id = TUNNEL_BIT | self.id();
         let (tx, rx) = oneshot::channel();
         self.opens.lock().expect("opens").insert(id, tx);
@@ -174,7 +201,7 @@ impl Node {
             }
         }
         let (ours, theirs) = tokio::io::duplex(256 * 1024);
-        self.tunnels.attach(id, theirs, out);
+        tunnels.attach(id, theirs, out);
         Ok(ours)
     }
 
@@ -193,12 +220,13 @@ impl Node {
     fn ship_audit(&self) {
         let _one = self.shipping.lock().expect("shipping");
         let from = self.shipped.load(Ordering::SeqCst);
-        if from < 0 || !self.connected() {
+        let Some(gen) = *self.audit_link.lock().expect("audit link") else { return };
+        if from < 0 {
             return;
         }
         let recs = self.audit.lock().expect("audit").audit_records_after(from, 500).unwrap_or_default();
         if let Some(last) = recs.last().map(|r| r.seq) {
-            if self.send(Frame::Msg(Msg::Audit { records: recs })) {
+            if self.send_to(gen, Frame::Msg(Msg::Audit { records: recs })) {
                 self.shipped.store(last, Ordering::SeqCst);
             }
         }
@@ -210,7 +238,7 @@ struct Control(Arc<Node>, String);
 
 impl ControlLink for Control {
     fn connected(&self) -> bool {
-        self.0.connected()
+        self.0.owner(&self.1).is_some()
     }
 
     fn ask<'a>(
@@ -224,7 +252,7 @@ impl ControlLink for Control {
             let (tx, rx) = oneshot::channel();
             self.0.asks.lock().expect("asks").insert(id, tx);
             let sent =
-                self.0.send(Frame::Msg(Msg::Ask { id, run: self.1.clone(), op: Box::new(op.clone()), why: why.into(), who: who.cloned() }));
+                self.0.send_run(&self.1, Frame::Msg(Msg::Ask { id, run: self.1.clone(), op: Box::new(op.clone()), why: why.into(), who: who.cloned() }));
             let reply = match sent {
                 true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
                 false => None,
@@ -312,12 +340,12 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         audit: Arc::new(Mutex::new(audit)),
         root_pem,
         docker: Docker::from_env(),
-        link: Mutex::new(None),
+        links: Mutex::new(HashMap::new()),
         boxes: Mutex::new(HashMap::new()),
         asks: Mutex::new(HashMap::new()),
         opens: Mutex::new(HashMap::new()),
-        tunnels: Tunnels::default(),
         next: AtomicU64::new(0),
+        audit_link: Mutex::new(None),
         shipped: AtomicI64::new(-1),
         shipping: Mutex::new(()),
     });
@@ -375,8 +403,8 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
     let (mut rd, mut wr) = stream.into_split();
     let hello = tokio::time::timeout(std::time::Duration::from_secs(15), chan::read_frame(&mut rd)).await.context("no hello")??;
     let refuse = |why: String| Frame::Msg(Msg::Refused { why }).encode();
-    let observer = match hello {
-        Some(Frame::Msg(Msg::Hello { node: n, build, version, observer, nonce })) => {
+    let (observer, scope) = match hello {
+        Some(Frame::Msg(Msg::Hello { node: n, build, version, observer, nonce, scope })) => {
             let why = if n != node.name {
                 Some(format!("this is node {}, not {n}", node.name))
             } else if build != node.build {
@@ -402,7 +430,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
                     bail!("refused a control host: {why}");
                 }
             }
-            observer
+            (observer, scope)
         }
         _ => {
             wr.write_all(&refuse("expected a hello".into())).await?;
@@ -424,16 +452,22 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
     let (kill_tx, mut kill_rx) = oneshot::channel();
+    let tunnels = Arc::new(Tunnels::default());
     {
-        let mut l = node.link.lock().expect("link");
-        if let Some(mut old) = l.take() {
-            if let Some(k) = old.kill.take() {
-                let _ = k.send(());
+        // A newer connection with the same scope (the same run reconnecting) replaces the older one;
+        // connections for other runs stay.
+        let mut links = node.links.lock().expect("links");
+        let older: Vec<u64> = links.iter().filter(|(_, l)| l.scope == scope).map(|(g, _)| *g).collect();
+        for g in older {
+            if let Some(mut old) = links.remove(&g) {
+                old.tunnels.clear();
+                if let Some(k) = old.kill.take() {
+                    let _ = k.send(());
+                }
             }
         }
-        *l = Some(Link { out: tx.clone(), gen, kill: Some(kill_tx) });
+        links.insert(gen, Link { out: tx.clone(), scope: scope.clone(), kill: Some(kill_tx), tunnels: tunnels.clone() });
     }
-    node.tunnels.clear();
     let writer = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
             if wr.write_all(&f.encode()).await.is_err() {
@@ -457,13 +491,13 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
     let _ = tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), feed, runs }));
-    eprintln!("[node] control host connected");
+    eprintln!("[node] control host connected{}", if scope.is_empty() { String::new() } else { format!(" ({scope})") });
     let result = loop {
         tokio::select! {
             _ = &mut kill_rx => break Ok(()),
             f = chan::read_frame(&mut rd) => match f {
                 Ok(Some(f)) => {
-                    if let Err(e) = handle(&node, f).await {
+                    if let Err(e) = handle(&node, gen, &tunnels, f).await {
                         break Err(e);
                     }
                 }
@@ -472,22 +506,26 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
             }
         }
     };
-    {
-        let mut l = node.link.lock().expect("link");
-        if l.as_ref().is_some_and(|l| l.gen == gen) {
-            *l = None;
-            node.tunnels.clear();
-            node.asks.lock().expect("asks").clear();
-            node.opens.lock().expect("opens").clear();
+    let gone = node.links.lock().expect("links").remove(&gen);
+    if let Some(l) = gone {
+        l.tunnels.clear();
+        let mut a = node.audit_link.lock().expect("audit link");
+        if *a == Some(gen) {
+            *a = None;
             node.shipped.store(-1, Ordering::SeqCst);
-            eprintln!("[node] control host disconnected; boxes keep running on the feed held");
+            // Another connection, if any, takes over the audit shipping from its own watermark.
+            let next = node.links.lock().expect("links").keys().copied().max();
+            if let Some(g) = next {
+                node.send_to(g, Frame::Msg(Msg::AuditAsk {}));
+            }
         }
+        eprintln!("[node] control host disconnected{}; its boxes keep running on the feed held", if scope.is_empty() { String::new() } else { format!(" ({scope})") });
     }
     writer.abort();
     result
 }
 
-async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
+async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Result<()> {
     match f {
         Frame::Feed(bytes) => {
             let now = (node.clock)();
@@ -514,15 +552,15 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                     }
                 }
             }
-            node.send(node.feed_status(r.as_ref().err()));
+            node.send_to(gen, node.feed_status(r.as_ref().err()));
         }
         Frame::Data { stream, offset, bytes } if stream & TUNNEL_BIT != 0 => {
-            node.tunnels.data(stream, bytes);
+            tunnels.data(stream, bytes);
             let _ = offset;
         }
         Frame::Data { stream, offset, bytes } => {
             let mut boxes = node.boxes.lock().expect("boxes");
-            if let Some(b) = boxes.values_mut().find(|b| b.streams[0] == stream) {
+            if let Some(b) = boxes.values_mut().find(|b| b.owner == Some(gen) && b.streams[0] == stream) {
                 let (fresh, _) = accept_at(&mut b.stdin_next, offset, &bytes);
                 if let (Some(s), false) = (&b.stdin, fresh.is_empty()) {
                     let _ = s.send(fresh);
@@ -534,17 +572,19 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                 let n = node.clone();
                 tokio::spawn(async move {
                     let run = bs.run.clone();
-                    let error = start_box(&n, *bs).await.err().map(|e| format!("{e:#}"));
+                    let error = start_box(&n, gen, *bs).await.err().map(|e| format!("{e:#}"));
                     if let Some(e) = &error {
                         eprintln!("[node] starting {run} failed: {e}");
                     }
-                    n.send(Frame::Msg(Msg::Started { run, error }));
+                    n.send_to(gen, Frame::Msg(Msg::Started { run, error }));
                 });
             }
             Msg::Resume { run, stdout_from, stderr_from } => {
                 let (frames, exited) = {
-                    let boxes = node.boxes.lock().expect("boxes");
-                    let Some(b) = boxes.get(&run) else { return Ok(()) };
+                    let mut boxes = node.boxes.lock().expect("boxes");
+                    let Some(b) = boxes.get_mut(&run) else { return Ok(()) };
+                    // The resuming connection owns the box from now on.
+                    b.owner = Some(gen);
                     let mut v = vec![];
                     for (i, from) in [(0usize, stdout_from), (1, stderr_from)] {
                         let (at, bytes) = b.out[i].since(from);
@@ -555,15 +595,15 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                     (v, b.exited.clone())
                 };
                 for f in frames {
-                    node.send(f);
+                    node.send_to(gen, f);
                 }
                 if let Some((code, result)) = exited {
-                    node.send(Frame::Msg(Msg::Exited { run, code, result }));
+                    node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result }));
                 }
             }
             Msg::Ack { stream, upto } => {
                 let mut boxes = node.boxes.lock().expect("boxes");
-                for b in boxes.values_mut() {
+                for b in boxes.values_mut().filter(|b| b.owner == Some(gen)) {
                     for i in 0..2 {
                         if b.streams[i + 1] == stream {
                             b.out[i].ack(upto);
@@ -596,7 +636,11 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                 }
             }
             Msg::AuditFrom { seq } => {
-                node.shipped.store(seq, Ordering::SeqCst);
+                {
+                    let _one = node.shipping.lock().expect("shipping");
+                    *node.audit_link.lock().expect("audit link") = Some(gen);
+                    node.shipped.store(seq, Ordering::SeqCst);
+                }
                 node.ship_audit();
             }
             Msg::TunnelOpened { stream, error } => {
@@ -604,7 +648,7 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                     let _ = tx.send(error);
                 }
             }
-            Msg::Close { stream } => node.tunnels.close(stream),
+            Msg::Close { stream } => tunnels.close(stream),
             Msg::NodeCert { cert } => {
                 let now = (node.clock)() / 1000;
                 let (serial, error) = match node.ident.install_cert(&node.paths.root, cert.trim(), &node.name, now) {
@@ -617,7 +661,7 @@ async fn handle(node: &Arc<Node>, f: Frame) -> Result<()> {
                         (String::new(), Some(format!("{e:#}")))
                     }
                 };
-                node.send(Frame::Msg(Msg::NodeCertInstalled { serial, error }));
+                node.send_to(gen, Frame::Msg(Msg::NodeCertInstalled { serial, error }));
             }
             other => bail!("unexpected message from the control host: {other:?}"),
         },
@@ -630,7 +674,7 @@ fn ids() -> String {
     unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
 }
 
-async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
+async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
     crate::run::check_run_id(&bs.run)?;
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
@@ -766,7 +810,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
         tasks.push(tokio::spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
                 if let Ok(event) = serde_json::to_value(&ev) {
-                    n.send(Frame::Msg(Msg::Event { run: run.clone(), event }));
+                    n.send_run(&run, Frame::Msg(Msg::Event { run: run.clone(), event }));
                 }
             }
         }));
@@ -824,6 +868,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
             out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
             exited: None,
             tasks,
+            owner: Some(gen),
         },
     );
     let readers: Vec<_> = [
@@ -847,7 +892,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
                     let at = b.out[i].write(&buf[..k]);
                     Frame::Data { stream: b.streams[i + 1], offset: at, bytes: buf[..k].to_vec() }
                 };
-                n.send(frame);
+                n.send_run(&run, frame);
             }
         })
     })
@@ -875,7 +920,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
             b.stdin = None;
         }
         eprintln!("[node] {run}: box exited ({code})");
-        n.send(Frame::Msg(Msg::Exited { run, code, result }));
+        n.send_run(&run.clone(), Frame::Msg(Msg::Exited { run, code, result }));
     });
     eprintln!("[node] {}: box {name} started", bs.run);
     Ok(())
@@ -921,6 +966,7 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
             build: build_id()?,
             observer: true,
             nonce: String::new(),
+            scope: String::new(),
         })
         .encode(),
     )
@@ -963,12 +1009,12 @@ mod tests {
             audit: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())),
             root_pem: String::new(),
             docker: Docker::from_env(),
-            link: Mutex::new(None),
+            links: Mutex::new(HashMap::new()),
             boxes: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
-            tunnels: Tunnels::default(),
             next: AtomicU64::new(0),
+            audit_link: Mutex::new(None),
             shipped: AtomicI64::new(-1),
             shipping: Mutex::new(()),
         })
@@ -979,7 +1025,7 @@ mod tests {
     }
 
     fn hello(build: &str) -> impl FnOnce(String) -> Msg + '_ {
-        move |nonce| Msg::Hello { node: "n1".into(), version: "t".into(), build: build.into(), observer: false, nonce }
+        move |nonce| Msg::Hello { node: "n1".into(), version: "t".into(), build: build.into(), observer: false, nonce, scope: String::new() }
     }
 
     /// A control host's connection, authenticated both ways: the stream, and the result of the
@@ -998,6 +1044,18 @@ mod tests {
         (a, r)
     }
 
+    /// A control connection for one run (its scope), as `wicket run` makes.
+    async fn connect_run(node: &Arc<Node>, gen: u64, i: &Install, run: &str) -> UnixStream {
+        let (mut a, b) = UnixStream::pair().unwrap();
+        tokio::spawn(connection(node.clone(), b, gen));
+        let (mut rd, mut wr) = a.split();
+        let build = node.build.clone();
+        let hello = move |nonce| Msg::Hello { node: "n1".into(), version: "t".into(), build, observer: false, nonce, scope: run.into() };
+        let r = crate::nodeauth::control(&mut rd, &mut wr, "n1", &i.ledger, &i.issuer, hello).await.map(|a| a.welcome);
+        assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
+        a
+    }
+
     async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
         let (a, r) = handshake(node, gen, &node.build, i, &i.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
@@ -1007,7 +1065,8 @@ mod tests {
     /// The node's id state for a connection that never finished the handshake.
     async fn wait_link(node: &Node, gen: Option<u64>) {
         for _ in 0..100 {
-            if node.link.lock().unwrap().as_ref().map(|l| l.gen) == gen {
+            let links = node.links.lock().unwrap();
+            if links.keys().copied().max() == gen && links.len() <= 1 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1023,7 +1082,7 @@ mod tests {
             let at = b.out[0].write(bytes);
             Frame::Data { stream: b.streams[1], offset: at, bytes: bytes.to_vec() }
         };
-        node.send(f);
+        node.send_run("run_a", f);
     }
 
     #[tokio::test]
@@ -1043,6 +1102,7 @@ mod tests {
                 out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                 exited: None,
                 tasks: vec![],
+                owner: Some(2),
             },
         );
         // Another build is refused.
@@ -1192,5 +1252,59 @@ mod tests {
         inst.ledger.lock().unwrap().revoke_node("n1").unwrap();
         let why = refused(handshake(&node, 12, &node.build, &inst, &inst.issuer).await.1);
         assert!(why.contains("revoked"), "{why}");
+    }
+
+    /// #146: one node serves many runs at once, each over its own control connection. A box's
+    /// output goes to the connection that owns it, stdin from another run's connection doesn't reach
+    /// it, and a run reconnecting replaces only its own older connection.
+    #[tokio::test]
+    async fn runs_on_one_node_each_keep_their_own_connection() {
+        let inst = Install::new("nodesrv-many");
+        let node = test_node(&inst);
+        let mut stdins = HashMap::new();
+        for (run, gen) in [("run_a", 1), ("run_b", 2)] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            stdins.insert(run, rx);
+            node.boxes.lock().unwrap().insert(
+                run.into(),
+                BoxState {
+                    streams: [1, 2, 3],
+                    name: format!("wicket-{run}"),
+                    dir: inst.dir.join("runs").join(run),
+                    stdin: Some(tx),
+                    stdin_next: 0,
+                    out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+                    exited: None,
+                    tasks: vec![],
+                    owner: Some(gen),
+                },
+            );
+        }
+        let mut a = connect_run(&node, 1, &inst, "run_a").await;
+        let mut b = connect_run(&node, 2, &inst, "run_b").await;
+        let out = |run: &str, bytes: &[u8]| {
+            let f = {
+                let mut boxes = node.boxes.lock().unwrap();
+                let bx = boxes.get_mut(run).unwrap();
+                let at = bx.out[0].write(bytes);
+                Frame::Data { stream: bx.streams[1], offset: at, bytes: bytes.to_vec() }
+            };
+            node.send_run(run, f)
+        };
+        assert!(out("run_a", b"for a\n"));
+        assert!(out("run_b", b"for b\n"));
+        assert_eq!(next_msg(&mut a).await, Frame::Data { stream: 2, offset: 0, bytes: b"for a\n".to_vec() });
+        assert_eq!(next_msg(&mut b).await, Frame::Data { stream: 2, offset: 0, bytes: b"for b\n".to_vec() });
+        // The same stream ids on two connections: each reaches its own box only.
+        a.write_all(&Frame::Data { stream: 1, offset: 0, bytes: b"x".to_vec() }.encode()).await.unwrap();
+        assert_eq!(stdins.get_mut("run_a").unwrap().recv().await.unwrap(), b"x");
+        assert!(stdins.get_mut("run_b").unwrap().try_recv().is_err());
+        // run_b reconnects: its old connection ends, run_a's stays.
+        let _b2 = connect_run(&node, 3, &inst, "run_b").await;
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(&mut b)).await.unwrap().unwrap().is_none());
+        assert!(out("run_a", b"still a\n"));
+        assert_eq!(next_msg(&mut a).await, Frame::Data { stream: 2, offset: 6, bytes: b"still a\n".to_vec() });
+        // Until it resumes, run_b's output waits on the node.
+        assert!(!out("run_b", b"later\n"));
     }
 }

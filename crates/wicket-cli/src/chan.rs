@@ -108,6 +108,10 @@ pub enum Msg {
         /// The control host's handshake nonce (base64url, 32 bytes); unused by observers.
         #[serde(default)]
         nonce: String,
+        /// What this connection is for (a run's id, or a link relay's): the node keeps one
+        /// connection per scope, so a reconnect replaces its own older connection and no other.
+        #[serde(default)]
+        scope: String,
     },
     /// The control host's handshake proof, signed with the issuer key (answers [`Msg::Challenge`]).
     Prove {
@@ -161,6 +165,9 @@ pub enum Msg {
     },
 
     // ---- node → control host ----
+    /// The connection that shipped audit records went away: send [`Msg::AuditFrom`] with this
+    /// control host's watermark to take over.
+    AuditAsk {},
     /// The node's handshake answer: its nonce, certificate and proof (answers [`Msg::Hello`]).
     Challenge {
         proof: wicket_identity::node::NodeProof,
@@ -450,6 +457,7 @@ mod tests {
                 build: "ab".repeat(32),
                 observer: false,
                 nonce: "A".repeat(43),
+                scope: "run_a".into(),
             }),
             Frame::Msg(Msg::Challenge {
                 proof: wicket_identity::node::NodeProof { nonce: "B".repeat(43), cert: "a.b.c".into(), proof: "d.e.f".into() },
