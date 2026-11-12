@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use wicket_core::{Manifest, Persist, RunId, TenantId};
 use wicket_store::bundle::{self, StateManifest, TreeSrc};
 use wicket_store::objects::DirStore;
+use wicket_store::sealed::SealedStore;
 use wicket_store::{AgentRow, Ledger};
 
 /// How long a holder's claim on an agent lasts without renewal (seconds). The supervisor renews it
@@ -36,8 +37,28 @@ pub const BUSY_LEASE_SECS: i64 = 900;
 
 /// The object store agent state goes to: a directory under wicket's data dir (S3-compatible
 /// backends later).
-pub fn store() -> DirStore {
-    DirStore::new(data_dir().join("objects"))
+pub fn store() -> Result<SealedStore<DirStore>> {
+    Ok(SealedStore::new(DirStore::new(data_dir().join("objects")), &state_key()?))
+}
+
+/// The key agent state is sealed with at rest (`<data dir>/state.key`, 0600, made on first use): it
+/// stays on the control host, which bundles and restores agents; nodes never see it.
+fn state_key() -> Result<[u8; 32]> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = data_dir().join("state.key");
+    let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|s| hex::decode(s.trim()).ok()).and_then(|b| b.try_into().ok());
+    if let Some(k) = read(&p) {
+        return Ok(k);
+    }
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    std::fs::create_dir_all(data_dir())?;
+    // Made once: a run racing this one keeps whichever key was written first.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p) {
+        let _ = std::io::Write::write_all(&mut f, hex::encode(k).as_bytes());
+        let _ = f.sync_all();
+    }
+    read(&p).with_context(|| format!("{} could not be read or written", p.display()))
 }
 
 /// Per-agent files on this node: durable volumes, wake logs.
@@ -100,7 +121,7 @@ pub fn push(
     generation: i64,
     trees: &[(String, PathBuf, &[&str])],
 ) -> Result<Option<StateManifest>> {
-    let store = store();
+    let store = store()?;
     let prev = match &agent.head {
         Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
         None => None,
@@ -309,7 +330,7 @@ pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    bundle::pull_tree(&store(), t, dest).with_context(|| format!("restoring {name}"))?;
+    bundle::pull_tree(&store()?, t, dest).with_context(|| format!("restoring {name}"))?;
     Ok(())
 }
 
@@ -492,7 +513,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     println!("[wicket] waking agent {} ({}): generation {generation}, run {run}", agent.id, agent.name);
     let res = async {
         let t0 = std::time::Instant::now();
-        let state = bundle::read_manifest(&store(), agent.head.as_deref().expect("checked"), &agent.id)?;
+        let state = bundle::read_manifest(&store()?, agent.head.as_deref().expect("checked"), &agent.id)?;
         if state.session_id != agent.session_id {
             bail!("the bundle's session {} isn't the agent's {}", state.session_id, agent.session_id);
         }
@@ -583,7 +604,11 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
     let probes = names.into_iter().filter(|n| !leased.contains(n)).map(|n| {
         let ledger = ledger.clone();
         async move {
-            let r = tokio::time::timeout(std::time::Duration::from_secs(10), crate::nodecall::Link::connect(&n, "place", &ledger)).await;
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
+            )
+            .await;
             match r {
                 Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
                 Ok(Err(e)) => {

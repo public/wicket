@@ -781,6 +781,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             streams: [1, 2, 3],
             host,
             long_lived: long_lived && !shares_host,
+            name: Some(spec.name.clone()),
             durable: match long_lived && !shares_host {
                 true => m
                     .zone

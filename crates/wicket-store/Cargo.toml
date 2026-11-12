@@ -16,6 +16,8 @@ hex.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 ulid.workspace = true
+# Agent state sealed at rest (#146): AES-256-GCM, the same ring the TLS stack uses.
+ring = "0.17"
 # Agent state bundles (#70): tar + zstd.
 tar = "0.4"
 zstd = "0.13"

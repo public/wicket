@@ -1173,7 +1173,8 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             }
 
             let spec = SandboxSpec {
-                name: format!("wicket-{}", bs.run.replace('_', "-")),
+                // The name the control host gives it (its box prefix), else wicket's own.
+                name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
                 image: bs.image.clone(),
                 isolation: bs.isolation,
                 mounts: vec![
@@ -1297,8 +1298,7 @@ fn host_layout(node: &Node, bs: &BoxStart, h: &crate::chan::HostBox) -> Result<L
     if !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it lays out its boxes itself");
     }
-    let ok_name =
-        h.name.len() <= 100 && h.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && h.name.ends_with(&bs.run.replace('_', "-"));
+    let ok_name = box_name_ok(&h.name, &bs.run);
     if !ok_name {
         bail!("bad box name {:?}", h.name);
     }
@@ -1320,6 +1320,13 @@ fn host_layout(node: &Node, bs: &BoxStart, h: &crate::chan::HostBox) -> Result<L
         labels: h.labels.clone(),
     };
     Ok((dir, spec, vec![]))
+}
+
+/// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
+fn box_name_ok(name: &str, run: &str) -> bool {
+    name.len() <= 100
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && name.ends_with(&format!("-{}", run.replace('_', "-")))
 }
 
 /// `wicket node attach`: what the control host runs over ssh. It joins its stdin and stdout to the

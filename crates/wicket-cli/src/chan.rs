@@ -92,6 +92,9 @@ pub struct BoxStart {
     /// directory on the node and moved with its state (unlike `volumes`, kept per tenant and zone).
     #[serde(default)]
     pub durable: Vec<(String, String)>,
+    /// The box's Docker name (`<prefix>-<run>`), if the control host names it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A box laid out by the control host on a node that shares its filesystem: what `docker run`

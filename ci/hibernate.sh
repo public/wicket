@@ -3,6 +3,10 @@
 # `wicket dev mock-llm`. Needs Docker with runsc and the agent image. No model credential.
 #
 #   WICKET=target/debug/wicket ci/hibernate.sh      (IMAGE=tag for another image)
+#   ci/hibernate.sh --node                           the agents' first runs on an enrolled node (#146):
+#                                                    localhost, with its own data directory and
+#                                                    `wicket node serve`, the ssh hop replaced by
+#                                                    WICKET_NODE_SSH, as ci/node-e2e.sh --local does
 #
 # Checks:
 #   - a quiet agent hibernates after its turn: its box is gone and its state is one bundle;
@@ -13,12 +17,18 @@
 #   - two concurrent wakes: exactly one wins, and the generation goes up by one;
 #   - `wicket say` to a hibernated agent wakes it, with the message as its turn;
 #   - the zone's model budget is the agent's over all its activations: a wake continues it, and an
-#     agent that has spent it isn't woken (and makes no model call).
+#     agent that has spent it isn't woken (and makes no model call);
+#   - the agents' state is sealed at rest: every object in the store is encrypted (#146).
+# With --node, the state moves between the node and the control host: it is fetched back to be
+# bundled, the node keeps nothing of it, and a wake is bin-packed onto the nodes available (here
+# the enrolled node wins the tie with this host's own, as where it last ran).
 # Boxes are named hib-*; everything is removed at the end.
 set -euo pipefail
 
 WICKET=${WICKET:-target/debug/wicket}
 WICKET=$(realpath "$WICKET")
+on_node=
+[ "${1:-}" = --node ] && on_node=1
 cd "$(dirname "$0")/.."
 DOCKER=${WICKET_DOCKER:-docker}
 
@@ -26,7 +36,7 @@ export WICKET_HOME=${WICKET_HOME:-$(mktemp -d)}
 export WICKET_BOX_PREFIX=hib
 work=$(mktemp -d)
 cleanup() {
-  kill "${mock_pid:-}" "${busy_pid:-}" 2>/dev/null || true
+  kill "${mock_pid:-}" "${busy_pid:-}" "${serve_pid:-}" 2>/dev/null || true
   wait 2>/dev/null || true
   for c in $($DOCKER ps -aq --filter name=^hib-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
   chmod -R u+w "$work" "$WICKET_HOME" 2>/dev/null || true
@@ -35,6 +45,22 @@ cleanup() {
 trap cleanup EXIT
 
 "$WICKET" identity init --trust-domain ci.wicket.test >/dev/null
+node_args=()
+if [ -n "$on_node" ]; then
+  nodehome=$work/n   # short: the node's run sockets live under it
+  mkdir -p "$nodehome"
+  export WICKET_NODE_SSH="env HOME=$nodehome sh -c"
+  token=$("$WICKET" node token --name hn1 2>/dev/null)
+  # A placeholder host key: with WICKET_NODE_SSH nothing checks it.
+  "$WICKET" node enrol wicket@hn1.example.com --token "$token" --hosts example.com \
+    --host-key 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEggj6FyU//JJDZKykzPImKRPFveTcOK9nWc/L0oCx+k' >"$work/enrol.log" 2>&1
+  "$WICKET" node install hn1 --no-service >>"$work/enrol.log" 2>&1
+  HOME=$nodehome WICKET_BOX_PREFIX=hib "$nodehome/.local/bin/wicket" node serve >"$work/node.log" 2>&1 &
+  serve_pid=$!
+  for _ in $(seq 50); do [ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ] && break; sleep 0.2; done
+  node_args=(--node hn1)
+  noderuns=$nodehome/.local/share/wicket-node/runs
+fi
 printf 'mock-model-credential' | "$WICKET" secret set mock --hosts 127.0.0.1 >/dev/null
 "$WICKET" dev mock-llm --listen 127.0.0.1:9998 --command 'sh /workspace/step.sh' 2>"$work/mock.log" &
 mock_pid=$!
@@ -61,7 +87,7 @@ fi
 STEP
 
 echo "== agent A: first run (hibernates after its turn)"
-timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/a" ${IMAGE:+--image "$IMAGE"} >"$work/a1.log" 2>&1 || true
+timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/a" "${node_args[@]}" ${IMAGE:+--image "$IMAGE"} >"$work/a1.log" 2>&1 || true
 cat "$work/a1.log"
 A=$(grep -o "agent agt_[a-z0-9]*" "$work/a1.log" | head -1 | cut -d" " -f2 || true)
 check "agent A was registered" '[ -n "$A" ]'
@@ -71,6 +97,10 @@ check "A's box is gone" '[ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'
 r1=$(grep -o "run_[a-z0-9]\{26\}" "$work/a1.log" | head -1 || true)
 check "A's run dir no longer holds its state" '[ ! -e "$WICKET_HOME/runs/$r1/state" ] && [ ! -e "$WICKET_HOME/runs/$r1/tmp" ] && [ ! -e "$WICKET_HOME/runs/$r1/workspace/hib-ws" ]'
 check "A's first result is kept" 'result_of "$work/a1.log" | grep -q first'
+if [ -n "$on_node" ]; then
+  check "A ran on the node, and its state came back from it" 'grep -q "node hn1 via wicket node serve" "$work/a1.log" && grep -q "fetched the box.s files from its node" "$work/a1.log"'
+  check "  and the node kept nothing of it" '[ ! -e "$noderuns/$r1" ]'
+fi
 gen1=$(agent_field "$A" generation)
 check "A's first run spent 2 requests" '[ "$(agent_field "$A" used.requests)" = 2 ]'
 
@@ -81,6 +111,9 @@ res=$(result_of "$work/a2.log")
 echo "   result: $res"
 field() { jq -r ".$1 // empty" <<<"$res" 2>/dev/null; }
 check "the woken session resumed (--resume)" 'grep -q "session .* resumed" "$work/a2.log"'
+if [ -n "$on_node" ]; then
+  check "the wake was bin-packed onto the node it last ran on (a tie with this host's)" 'grep -q "placing agent .* on node hn1" "$work/a2.log"'
+fi
 check "a file under /tmp survived" '[ "$(field tmp)" = tmp-kept ]'
 check "a file under \$HOME survived" '[ "$(field home)" = home-kept ]'
 check "a file in the workspace survived" '[ "$(field ws)" = ws-kept ]'
@@ -121,7 +154,7 @@ check "it made no model call" '[ "$(grep -c "^mock: /v1/messages" "$work/mock.lo
 mkdir -p "$work/b"
 echo 'nohup sleep 300 >/dev/null 2>&1 & echo "{\"status\":\"busy\"}" > /workspace/out/result.json' > "$work/b/step.sh"
 echo "== agent B: a background process keeps it idle"
-timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/b" ${IMAGE:+--image "$IMAGE"} >"$work/b.log" 2>&1 & busy_pid=$!
+timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/b" "${node_args[@]}" ${IMAGE:+--image "$IMAGE"} >"$work/b.log" 2>&1 & busy_pid=$!
 B=""
 for _ in $(seq 90); do
   B=$(grep -o 'agent agt_[a-z0-9]*' "$work/b.log" 2>/dev/null | head -1 | cut -d' ' -f2 || true)
@@ -140,6 +173,16 @@ wait "$busy_pid" 2>/dev/null || true
 check "B's box was stopped with its run" '[ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'
 
 check "the model never saw the placeholder" '! grep -q "PLACEHOLDER" "$work/mock.log"'
+sealed_only() {
+  local f n=0
+  while IFS= read -r f; do
+    case "$f" in "$WICKET_HOME/objects/sealed/"*) ;; *) return 1 ;; esac
+    [ "$(head -c 4 "$f")" = WKS1 ] || return 1
+    n=$((n + 1))
+  done < <(find "$WICKET_HOME/objects" -type f ! -name '.tmp-*')
+  [ "$n" -gt 0 ]
+}
+check "the agents' state is sealed at rest (every object encrypted)" sealed_only
 check "the audit chain verifies" '"$WICKET" audit --verify >/dev/null'
 "$WICKET" agents
 
