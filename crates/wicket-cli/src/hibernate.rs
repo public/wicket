@@ -270,6 +270,34 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
     }
 }
 
+/// Why an agent may not be woken again because its zone's budget is spent, over all its
+/// activations: model requests, output or input tokens, or `limits.timeout` (its total time in a
+/// box). A wake never resets a budget.
+pub fn exhausted(a: &AgentRow) -> Option<String> {
+    let m = match Manifest::from_yaml(&a.manifest) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("its manifest no longer parses: {e}")),
+    };
+    if let Some(l) = &m.zone.llm {
+        if a.used_requests as u64 >= l.max_requests {
+            return Some(format!("its model request budget is spent ({} of {})", a.used_requests, l.max_requests));
+        }
+        if a.used_output_tokens as u64 >= l.max_output_tokens {
+            return Some(format!("its output token budget is spent ({} of {})", a.used_output_tokens, l.max_output_tokens));
+        }
+        if let Some(max) = l.max_input_tokens.filter(|max| a.used_input_tokens as u64 >= *max) {
+            return Some(format!("its input token budget is spent ({} of {max})", a.used_input_tokens));
+        }
+    }
+    match m.zone.limits.timeout() {
+        Ok(t) if a.used_secs as u64 >= t.as_secs() => {
+            Some(format!("its time budget (limits.timeout, {}) is spent over its activations", humantime::format_duration(t)))
+        }
+        Ok(_) => None,
+        Err(e) => Some(format!("its limits.timeout doesn't parse: {e}")),
+    }
+}
+
 /// A claimed wake, handed to `wicket run`'s supervisor.
 pub struct Wake {
     pub agent: AgentRow,
@@ -310,6 +338,12 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         }
         if a.head.is_none() {
             bail!("agent {} has never hibernated (it is {}); there is nothing to wake", a.id, a.state);
+        }
+        if let Some(why) = exhausted(&a) {
+            let note = format!("not woken: {why}");
+            l.set_agent_state(&a.id, a.generation, &a.state, Some(&note))?;
+            l.audit(&TenantId(a.tenant.clone()), None, "agent.wake_refused", &serde_json::json!({ "agent": a.id, "by": by, "why": why }))?;
+            bail!("agent {} can't be woken: {why}", a.id);
         }
         let run = RunId::new();
         let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_LEASE_SECS)? else {
@@ -439,6 +473,7 @@ pub fn list(json: bool) -> Result<()> {
             "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
             "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
             "workspace": a.workspace, "updated_at": a.updated_at,
+            "used": { "requests": a.used_requests, "input_tokens": a.used_input_tokens, "output_tokens": a.used_output_tokens, "secs": a.used_secs },
         })).collect::<Vec<_>>())?);
         return Ok(());
     }
@@ -515,6 +550,42 @@ mod tests {
         let e = quiet(&busy).unwrap_err();
         assert_eq!(e.len(), 3, "{e:?}");
         assert!(e[0].contains("sleep 600"));
+    }
+
+    #[test]
+    fn a_spent_budget_is_never_reset_by_a_wake() {
+        let manifest =
+            "task: t\nagent: {name: a}\nzone: {name: z, llm: {max_requests: 4, max_output_tokens: 100}, limits: {timeout: 1m}}\n";
+        let a = AgentRow {
+            id: "agt_x".into(),
+            tenant: "t0".into(),
+            zone: "z".into(),
+            name: "a".into(),
+            state: "hibernated".into(),
+            generation: 2,
+            run: "run_x".into(),
+            session_id: "s".into(),
+            manifest: manifest.into(),
+            image: "i".into(),
+            workspace: None,
+            head: Some("h".into()),
+            head_seq: 1,
+            bundle_bytes: 1,
+            lease_until: None,
+            restorable: true,
+            want: None,
+            note: None,
+            created_at: 0,
+            updated_at: 0,
+            used_requests: 3,
+            used_input_tokens: 0,
+            used_output_tokens: 10,
+            used_secs: 20,
+        };
+        assert_eq!(exhausted(&a), None);
+        assert!(exhausted(&AgentRow { used_requests: 4, ..a.clone() }).unwrap().contains("request budget"));
+        assert!(exhausted(&AgentRow { used_output_tokens: 100, ..a.clone() }).unwrap().contains("output token"));
+        assert!(exhausted(&AgentRow { used_secs: 60, ..a.clone() }).unwrap().contains("limits.timeout"));
     }
 
     #[test]

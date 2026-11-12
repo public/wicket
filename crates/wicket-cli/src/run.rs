@@ -521,6 +521,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
+    // A woken agent's budget continues from what its earlier activations spent (#70).
+    let prior_secs = match &wake {
+        Some(w) => {
+            let a = &w.agent;
+            llm.spent_before(a.used_requests.max(0) as u64, a.used_input_tokens.max(0) as u64, a.used_output_tokens.max(0) as u64);
+            a.used_secs.max(0) as u64
+        }
+        None => 0,
+    };
     let gateway = Gateway::new(ctx.clone());
     let (es, ls, gs) = (dir.join("sock/egress.sock"), dir.join("sock/llm.sock"), dir.join("sock/gateway.sock"));
     let g_task = tokio::spawn({
@@ -847,7 +856,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     });
     let transcript = dir.join("transcript.jsonl");
     let mut transcript_f = std::fs::File::create(&transcript)?;
-    let timeout = m.zone.limits.timeout()?;
+    // limits.timeout is a long-lived agent's total time in a box: a wake gets what is left.
+    let timeout = m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs));
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     let mut timed_out = false;
@@ -871,6 +881,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut saw_assistant = false;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
     let tmp_cap = wicket_sandbox::TMP_CAP_MB << 20;
+    // The agent's spend over its life: what earlier activations spent, plus this one's.
+    let usage = || {
+        let (r, i, o) = llm.spent_total();
+        wicket_store::AgentUsage {
+            requests: r as i64,
+            input_tokens: i as i64,
+            output_tokens: o as i64,
+            secs: (prior_secs + started.elapsed().as_secs()) as i64,
+        }
+    };
     let set_state = |state: &str, note: Option<&str>| {
         if let (Some(f), Ok(l)) = (&fence, ledger.lock()) {
             let _ = l.set_agent_state(&f.agent, f.generation, state, note);
@@ -937,6 +957,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 // The holder's claim on its agent: renewed while the box lives. If it can't be, a
                 // newer activation has the agent, and this box must not go on.
                 if let Some(f) = &fence {
+                    if let Ok(l) = ledger.lock() {
+                        let _ = l.record_agent_usage(&f.agent, f.generation, &usage());
+                    }
                     let ok = ledger.lock().ok().and_then(|l| l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::LEASE_SECS).ok());
                     if ok == Some(false) {
                         println!("[wicket] agent {} was woken elsewhere (this is generation {}); stopping this box", f.agent, f.generation);
@@ -1118,6 +1141,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
     if status == "unknown" {
         status = if exit.success() { "succeeded".into() } else { format!("failed ({exit})") };
+    }
+    if let Some(f) = &fence {
+        ledger.lock().expect("ledger").record_agent_usage(&f.agent, f.generation, &usage())?;
     }
     // A long-lived agent's activation ends: hibernated (its state pushed), a wake that never got its
     // session going (back to hibernated, to be retried), or ended.

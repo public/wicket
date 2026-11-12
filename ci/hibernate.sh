@@ -11,7 +11,9 @@
 #     survive hibernate and wake;
 #   - a box with a background process isn't hibernated: it stays idle, paused;
 #   - two concurrent wakes: exactly one wins, and the generation goes up by one;
-#   - `wicket say` to a hibernated agent wakes it, with the message as its turn.
+#   - `wicket say` to a hibernated agent wakes it, with the message as its turn;
+#   - the zone's model budget is the agent's over all its activations: a wake continues it, and an
+#     agent that has spent it isn't woken (and makes no model call).
 # Boxes are named hib-*; everything is removed at the end.
 set -euo pipefail
 
@@ -70,6 +72,7 @@ r1=$(grep -o "run_[a-z0-9]\{26\}" "$work/a1.log" | head -1 || true)
 check "A's run dir no longer holds its state" '[ ! -e "$WICKET_HOME/runs/$r1/state" ] && [ ! -e "$WICKET_HOME/runs/$r1/tmp" ] && [ ! -e "$WICKET_HOME/runs/$r1/workspace/hib-ws" ]'
 check "A's first result is kept" 'result_of "$work/a1.log" | grep -q first'
 gen1=$(agent_field "$A" generation)
+check "A's first run spent 2 requests" '[ "$(agent_field "$A" used.requests)" = 2 ]'
 
 echo "== agent A: wicket wake"
 timeout 240 "$WICKET" wake "$A" "Run it again, please." ${IMAGE:+} >"$work/a2.log" 2>&1 || true
@@ -89,6 +92,7 @@ check "the operator's text reached the model, after wicket's wake notice" 'grep 
 check "A hibernated again" '[ "$(agent_field "$A" state)" = hibernated ]'
 gen2=$(agent_field "$A" generation)
 check "the wake bumped the generation by one" '[ "$gen2" = $((gen1 + 1)) ]'
+check "the woken activation's spend continued from 2" '[ "$(agent_field "$A" used.requests)" = 4 ] && [ "$(agent_field "$A" used.output_tokens)" = 80 ]'
 
 echo "== agent A: two wakes at once"
 timeout 240 "$WICKET" wake "$A" >"$work/w1.log" 2>&1 & p1=$!
@@ -105,6 +109,13 @@ echo "== agent A: wicket say wakes it"
 for _ in $(seq 120); do [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ] && break; sleep 1; done
 check "say woke it, and it went back to sleep" '[ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ]'
 check "the message was its turn" 'grep "the user said:" "$work/mock.log" | grep "woken (wicket say" | grep -q "A message for a sleeping agent."'
+check "four activations spent the whole budget" '[ "$(agent_field "$A" used.requests)" = 8 ]'
+calls=$(grep -c "^mock: /v1/messages" "$work/mock.log" || true)
+out=$("$WICKET" say "$A" "One more?" 2>&1 || true); echo "   $out"
+check "a spent agent isn't woken" 'grep -q "request budget is spent" <<<"$out"'
+"$WICKET" wake "$A" >"$work/w3.log" 2>&1 || true
+check "nor by wicket wake, and its generation stays" 'grep -q "request budget is spent" "$work/w3.log" && [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ]'
+check "it made no model call" '[ "$(grep -c "^mock: /v1/messages" "$work/mock.log" || true)" = "$calls" ]'
 
 # Agent B: leaves a background process running, so it can't be rebuilt without losing it.
 mkdir -p "$work/b"

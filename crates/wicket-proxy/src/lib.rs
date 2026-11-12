@@ -382,3 +382,116 @@ pub(crate) const STRIP_REQUEST: &[&str] = &[
 ];
 
 pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length"];
+
+#[cfg(test)]
+mod fence_tests {
+    //! #70: an activation superseded by a newer wake is refused at every enforcement point (the LLM
+    //! proxy's test is in llm.rs).
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stale activation's context: its agent has been woken again (generation 2).
+    fn stale_ctx() -> RunCtx {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "z",
+                name: "a",
+                run: "run_old",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        assert_eq!(ledger.claim_wake(&agent, "run_new", 0).unwrap(), Some(2));
+        let m = wicket_core::Manifest::from_yaml(
+            "task: t\nagent: {name: a}\nzone: {name: z, llm: {}, reach: [{host: example.com, methods: [GET]}]}",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        RunCtx {
+            tenant: TenantId::single(),
+            run: RunId("run_old".into()),
+            zone: Arc::new(CompiledZone::new(m.zone.clone()).unwrap()),
+            ledger: Arc::new(Mutex::new(ledger)),
+            vault: vault::Vault::new(std::env::temp_dir().join("wicket-fence-no-vault")),
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps: vec![],
+            boxes: None,
+            capacity: None,
+            fence: Some(Fence { agent, generation: 1 }),
+            waker: None,
+        }
+    }
+
+    /// Sends one raw HTTP/1.1 request to a unix socket once it exists; returns the response head and body.
+    async fn raw(sock: &std::path::Path, req: &str) -> String {
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut s = tokio::net::UnixStream::connect(sock).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut out)).await.unwrap().unwrap();
+        String::from_utf8_lossy(&out[..n]).into_owned()
+    }
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-fence-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn the_egress_proxy_refuses_a_stale_generation() {
+        let ctx = stale_ctx();
+        let ca = Arc::new(ca::RunCa::generate("run_old").unwrap());
+        let egress = egress::Egress::new(ctx, ca).unwrap();
+        let d = dir("egress");
+        let sock = d.join("egress.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { egress.serve(&sock).await }
+        });
+        // In reach, so only the fence can refuse it: a CONNECT and a plain request.
+        let r = raw(&sock, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("stale"), "{r}");
+        let r = raw(&sock, "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("stale"), "{r}");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn the_gateway_refuses_a_stale_generation() {
+        let gw = gateway::Gateway::new(stale_ctx());
+        let d = dir("gateway");
+        let sock = d.join("gateway.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { gw.serve(&sock).await }
+        });
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: wicket.internal\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw(&sock, &req).await;
+        assert!(r.starts_with("HTTP/1.1 409") && r.contains("stale"), "{r}");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

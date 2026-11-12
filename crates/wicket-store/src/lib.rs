@@ -13,7 +13,7 @@ pub mod bundle;
 mod links;
 mod node;
 pub mod objects;
-pub use agents::{new_agent_id, valid_agent_id, AgentRow, NewAgent, HELD as AGENT_HELD};
+pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
 mod lease;
 pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};

@@ -394,8 +394,11 @@ their state, generation and bundle size.
   - `durable`: the agent's own, bundled;
   - `node` (the default): shared by the zone, kept on the node;
   - `cache`: never bundled, and may be empty after a wake on another node. On one node it behaves like `node`.
-- `limits.timeout` applies to each activation, Idle time included. At the timeout, an idle agent at a quiet
-  point hibernates, and any other is stopped.
+- **Budgets belong to the agent, over its whole life.** The zone's model budget (`max_requests`,
+  `max_output_tokens`, `max_input_tokens`) and `limits.timeout` (total time in a box, Idle included) are
+  recorded on the agent. A wake continues from what is left; it never resets them. Budget handed to children
+  counts as spent. An agent that has spent a budget isn't woken again, by any source.
+- At the timeout, an idle agent at a quiet point hibernates, and any other is stopped.
 - Only a hibernated agent can be woken. If its session ends any other way (stopped, timed out mid-turn, or
   over its `/tmp` cap), the agent is `ended`.
 - A local box's `/tmp` is a host directory in the run's directory, so it is kept with the rest, and survives a

@@ -95,6 +95,10 @@ impl Egress {
             if host.parse::<std::net::IpAddr>().is_ok() {
                 return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
             }
+            // A superseded activation (#70) gets no tunnel at all.
+            if let Some(why) = self.ctx.superseded() {
+                return Ok(self.refuse(&host, "CONNECT", "/", &why));
+            }
             if let Some(r) = self.judge_host(&host, "CONNECT") {
                 return Ok(r);
             }

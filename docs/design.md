@@ -1834,6 +1834,9 @@ its label is the join of everything that shaped it.
   - `durable` volumes. `node` and `cache` volumes stay out of the bundle; on one node they behave the same.
 - Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory now). Each is verified by its
   tree digest on restore.
+- The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
+  recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
+  messages can't buy it a fresh budget.
 - Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
   box stays Idle.
 - Not built:

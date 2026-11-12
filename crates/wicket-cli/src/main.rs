@@ -654,6 +654,9 @@ async fn main() -> Result<()> {
                 if let Ok(a) = hibernate::resolve(&l, &run) {
                     match a.state.as_str() {
                         "hibernated" if a.restorable => {
+                            if let Some(why) = hibernate::exhausted(&a) {
+                                bail!("agent {} is hibernated and can't be woken: {why}", a.id);
+                            }
                             l.add_operator_message(&a.id, &text, &operator())?;
                             l.audit(
                                 &TenantId::single(),

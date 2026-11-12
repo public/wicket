@@ -12,6 +12,9 @@ zone:
   llm:
     secret: mock
     upstream: http://127.0.0.1:9998
+    # The agent's budget over its whole life: 2 requests a turn, 4 activations (first run, wake,
+    # the winning double wake, say). A fifth wake is refused.
+    max_requests: 8
   volumes:
     - { name: data, path: /volumes/data, persist: durable }
   limits: { memory: 1500m, cpus: 1, timeout: 5m }

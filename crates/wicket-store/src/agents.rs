@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS agents (
   generation INTEGER NOT NULL, run TEXT NOT NULL, session_id TEXT NOT NULL, manifest TEXT NOT NULL,
   image TEXT NOT NULL, workspace TEXT, head TEXT, head_seq INTEGER NOT NULL DEFAULT 0,
   bundle_bytes INTEGER NOT NULL DEFAULT 0, lease_until INTEGER, restorable INTEGER NOT NULL DEFAULT 1,
-  want TEXT, note TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  want TEXT, note TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  used_requests INTEGER NOT NULL DEFAULT 0, used_input_tokens INTEGER NOT NULL DEFAULT 0,
+  used_output_tokens INTEGER NOT NULL DEFAULT 0, used_secs INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS agent_runs (
   run TEXT PRIMARY KEY, agent TEXT NOT NULL, generation INTEGER NOT NULL, started_at INTEGER NOT NULL
@@ -75,10 +77,27 @@ pub struct AgentRow {
     pub note: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// What the agent has spent of its zone's budget, over all its activations: model requests,
+    /// input tokens (cached ones included), output tokens, and seconds in a box. A wake starts from
+    /// what is left.
+    pub used_requests: i64,
+    pub used_input_tokens: i64,
+    pub used_output_tokens: i64,
+    pub used_secs: i64,
+}
+
+/// What an activation has spent, counted from the agent's start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentUsage {
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub secs: i64,
 }
 
 const COLS: &str = "id, tenant, zone, name, state, generation, run, session_id, manifest, image, workspace, head, head_seq, \
-                    bundle_bytes, lease_until, restorable, want, note, created_at, updated_at";
+                    bundle_bytes, lease_until, restorable, want, note, created_at, updated_at, used_requests, used_input_tokens, \
+                    used_output_tokens, used_secs";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
     Ok(AgentRow {
@@ -102,6 +121,10 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         note: r.get(17)?,
         created_at: r.get(18)?,
         updated_at: r.get(19)?,
+        used_requests: r.get(20)?,
+        used_input_tokens: r.get(21)?,
+        used_output_tokens: r.get(22)?,
+        used_secs: r.get(23)?,
     })
 }
 
@@ -125,7 +148,7 @@ impl Ledger {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         tx.execute(
-            &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11)"),
+            &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
             params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.lease_until, t],
         )?;
         tx.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
@@ -162,6 +185,17 @@ impl Ledger {
         let n = self.conn.execute(
             "UPDATE agents SET state = ?3, note = COALESCE(?4, note), updated_at = ?5 WHERE id = ?1 AND generation = ?2",
             params![id, generation, state, note, now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Records the agent's spend so far (totals over its life, never lower than what is recorded),
+    /// if `generation` is still current.
+    pub fn record_agent_usage(&self, id: &str, generation: i64, u: &AgentUsage) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agents SET used_requests = MAX(used_requests, ?3), used_input_tokens = MAX(used_input_tokens, ?4), \
+             used_output_tokens = MAX(used_output_tokens, ?5), used_secs = MAX(used_secs, ?6) WHERE id = ?1 AND generation = ?2",
+            params![id, generation, u.requests, u.input_tokens, u.output_tokens, u.secs],
         )?;
         Ok(n == 1)
     }
@@ -319,6 +353,13 @@ mod tests {
         // A push that started from an older head is refused too.
         assert!(!l.commit_agent_push(&id, 2, 0, 2, "a/x/m/2.2", 10).unwrap());
         assert!(l.commit_agent_push(&id, 2, 1, 2, "a/x/m/2.2", 10).unwrap());
+        // Spend is recorded by the current generation only, and never goes down.
+        let u = AgentUsage { requests: 4, input_tokens: 40, output_tokens: 80, secs: 9 };
+        assert!(l.record_agent_usage(&id, 2, &u).unwrap());
+        assert!(!l.record_agent_usage(&id, 1, &AgentUsage { requests: 99, ..u }).unwrap());
+        assert!(l.record_agent_usage(&id, 2, &AgentUsage { requests: 1, ..u }).unwrap());
+        let a = l.agent(&id).unwrap().unwrap();
+        assert_eq!((a.used_requests, a.used_input_tokens, a.used_output_tokens, a.used_secs), (4, 40, 80, 9));
         // Revoked: never woken again.
         l.agent_not_restorable(&id, "revoked").unwrap();
         assert_eq!(l.claim_wake(&id, "run_4", now() + 30).unwrap(), None);
