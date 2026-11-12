@@ -45,6 +45,8 @@ impl Default for WriterConfig {
 type Reply = SyncSender<std::result::Result<i64, String>>;
 
 struct Pending {
+    /// When it was queued (a retried batch commits later; the record keeps its own time).
+    ts: i64,
     tenant: String,
     run: Option<String>,
     kind: String,
@@ -122,7 +124,7 @@ impl AuditWriter {
     }
 
     fn queue(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: String, reply: Option<Reply>) -> Result<()> {
-        self.send(Msg::Rec(Pending { tenant: tenant.0.clone(), run: run.map(|r| r.0.clone()), kind: kind.into(), body, reply }))
+        self.send(Msg::Rec(Pending { ts: now(), tenant: tenant.0.clone(), run: run.map(|r| r.0.clone()), kind: kind.into(), body, reply }))
     }
 
     /// Queues a record without waiting: durable within a batch interval, or at the next
@@ -257,7 +259,7 @@ fn commit_with_retry(conn: &mut Connection, recs: &[Pending]) -> std::result::Re
 }
 
 /// One batch: read the head and chain every record under one write lock.
-pub(crate) fn commit(conn: &mut Connection, recs: &[Pending]) -> rusqlite::Result<Vec<i64>> {
+fn commit(conn: &mut Connection, recs: &[Pending]) -> rusqlite::Result<Vec<i64>> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut prev: String = tx
         .query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
@@ -266,10 +268,9 @@ pub(crate) fn commit(conn: &mut Connection, recs: &[Pending]) -> rusqlite::Resul
     let mut seqs = Vec::with_capacity(recs.len());
     {
         let mut st = tx.prepare_cached("INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
-        let ts = now();
         for r in recs {
             let hash = chain_hash(&prev, &r.kind, &r.body);
-            st.execute(params![ts, r.tenant, r.run, r.kind, r.body, prev, hash])?;
+            st.execute(params![r.ts, r.tenant, r.run, r.kind, r.body, prev, hash])?;
             seqs.push(tx.last_insert_rowid());
             prev = hash;
         }
@@ -283,11 +284,24 @@ mod tests {
     use super::*;
     use crate::Ledger;
 
-    fn tmp(name: &str) -> PathBuf {
+    /// A temp dir, removed when the test ends (passed or failed).
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for Tmp {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    fn tmp(name: &str) -> Tmp {
         let d = std::env::temp_dir().join(format!("wicket-writer-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Tmp(d)
     }
 
     #[test]
@@ -308,7 +322,6 @@ mod tests {
             assert_eq!(row.4, format!("{{\"i\":{k}}}"), "records commit in the order they were queued");
         }
         drop(w);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -321,7 +334,6 @@ mod tests {
         }
         drop(w);
         assert_eq!(Ledger::open(&p).unwrap().verify_audit().unwrap(), 50);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -357,7 +369,6 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(Ledger::open(&p).unwrap().verify_audit().unwrap(), 900);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// The child half of `a_crash_loses_nothing_acknowledged`: appends until killed.
@@ -408,6 +419,5 @@ mod tests {
             assert_eq!(tail[(*seq - 1) as usize].2, "decision");
         }
         drop(l);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 }

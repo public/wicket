@@ -5,6 +5,7 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod audit_export;
 mod capacity;
 mod chan;
 mod enrol;
@@ -144,12 +145,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GrantCmd,
     },
-    /// Show or verify the hash-chained audit log.
+    /// Show or verify the hash-chained audit log, or export it to the configured sinks.
     Audit {
         #[arg(long, default_value_t = 40)]
         tail: usize,
         #[arg(long)]
         verify: bool,
+        /// With --verify: also check the local chain against exported records and signed
+        /// checkpoints (JSON lines, or a Collector's OTLP JSON file output). Catches a rewritten
+        /// or truncated chain.
+        #[arg(long, requires = "verify")]
+        against: Vec<PathBuf>,
+        /// The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be
+        /// signed with. Default: this installation's issuer key.
+        #[arg(long, requires = "against")]
+        issuer_jwk: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: Option<AuditCmd>,
     },
     /// Manage vault secrets (values are read from the terminal, never from arguments).
     Secret {
@@ -286,6 +298,25 @@ enum LeaseCmd {
     List,
     /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
     Release { id: String },
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
+    /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
+    /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
+    /// to a `path: "-"` (stdout) sink.
+    Export {
+        /// One pass, then exit (non-zero if a sink failed).
+        #[arg(long)]
+        once: bool,
+        /// Send every sink a checkpoint now.
+        #[arg(long)]
+        checkpoint: bool,
+        /// Show each sink's position and last error.
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -464,6 +495,52 @@ pub fn data_dir() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join(".local/share/wicket")
+}
+
+fn audit_export_cmd(once: bool, checkpoint: bool, status: bool) -> Result<()> {
+    let cfg = audit_export::SinksConfig::load()?
+        .with_context(|| format!("no audit sinks configured ({} does not exist)", audit_export::sinks_path().display()))?;
+    if status {
+        let l = Ledger::open(&ledger_path())?;
+        let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
+        for s in &cfg.sinks {
+            let c = l.export_cursor(&s.name)?;
+            let holder = if c.lease_until >= wicket_store::now() { c.holder.unwrap_or_default() } else { "-".into() };
+            println!(
+                "{:<16} at {} of {head}  last checkpoint {}  fed by {holder}{}",
+                s.name,
+                c.seq,
+                c.checkpoint_at,
+                c.error.map(|e| format!("  error: {e}")).unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+    let issuer = match issuer() {
+        Ok(i) => Some(i),
+        Err(e) => {
+            eprintln!("wicket: no issuer key ({e}): exporting records without checkpoints");
+            None
+        }
+    };
+    let mut x = audit_export::Exporter::new(&ledger_path(), cfg, issuer)?;
+    x.stdout = true;
+    let mut force = checkpoint;
+    loop {
+        let p = x.pass(force);
+        force = false;
+        for (sink, e) in &p.failures {
+            eprintln!("wicket: audit sink {sink}: {e}");
+        }
+        if once {
+            if !p.failures.is_empty() {
+                bail!("{} sink(s) failed", p.failures.len());
+            }
+            eprintln!("exported {} record(s) and {} checkpoint(s)", p.records, p.checkpoints);
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 pub fn ledger_path() -> PathBuf {
@@ -809,7 +886,10 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Audit { tail, verify } => {
+        Cmd::Audit { tail, verify, against, issuer_jwk, cmd } => {
+            if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
+                return audit_export_cmd(once, checkpoint, status);
+            }
             let l = Ledger::open(&ledger_path())?;
             if verify {
                 let n = l.verify_audit()?;
@@ -823,8 +903,31 @@ async fn main() -> Result<()> {
                         if n.restarts > 0 { format!(" ({} restart(s): the node's data was wiped)", n.restarts) } else { String::new() };
                     println!("node {} audit chain OK: {} records shipped{restarts}", n.node, n.records);
                 }
+                let mut against_bad = 0;
+                if !against.is_empty() {
+                    let key = match &issuer_jwk {
+                        Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
+                        None => issuer()?.verifying_key(),
+                    };
+                    let mut objs = Vec::new();
+                    for p in &against {
+                        objs.extend(audit_export::exported_objects(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?));
+                    }
+                    let a = audit_export::verify_against(&l, &objs, &key)?;
+                    println!("against the exported copies: {} signed checkpoint(s) and {} record(s) match", a.checkpoints, a.records);
+                    for p in a.problems.iter().take(20) {
+                        println!("  MISMATCH: {p}");
+                    }
+                    if a.checkpoints == 0 && a.problems.is_empty() {
+                        println!("  (no signed checkpoints found: only exported records were compared)");
+                    }
+                    against_bad = a.problems.len();
+                }
                 if bad + ibad > 0 {
                     bail!("{} record(s) failed verification", bad + ibad);
+                }
+                if against_bad > 0 {
+                    bail!("the local audit chain does not match its exported copies ({against_bad} problem(s)): it was rewritten or truncated here");
                 }
                 return Ok(());
             }

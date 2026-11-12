@@ -1,0 +1,773 @@
+//! Audit export (#91): the ledger's audit records, and signed checkpoints of its chain head, streamed
+//! to the sinks an installation configures (`audit-sinks.yaml`, see `docs/audit-export.md`).
+//!
+//! - The ledger is the source of truth and the buffer. Each sink has a cursor in the ledger (the
+//!   last sequence number it acknowledged); delivery reads past it. A sink that is down holds its
+//!   cursor and catches up when it's back: nothing is dropped, and delivery is at least once.
+//! - Delivery runs on its own thread with its own ledger connection, never on a request's path.
+//!   Each sink is fed by one process at a time (a lease in the ledger), so the processes sharing a
+//!   ledger don't send everything several times.
+//! - Every `checkpoint_every`, each sink also gets a checkpoint: the sequence number and hash of the
+//!   last record it has, and the time, signed by the installation's issuer key. A copy held outside
+//!   the control host lets `wicket audit --verify --against <file>` catch a rewritten local chain,
+//!   which the chain alone can't (whoever controls the host can recompute every hash).
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use wicket_store::{AuditRecord, Ledger, EXPORT_LEASE_SECS};
+
+/// Opens the ledger with this process's batched audit writer started (#62).
+pub fn open_batched(path: &Path) -> Result<Ledger> {
+    let mut l = Ledger::open(path)?;
+    l.start_audit_writer(None)?;
+    Ok(l)
+}
+
+/// Commits the audit records still queued when it is dropped (the end of a run, on any path).
+pub struct FlushOnDrop(pub Arc<Mutex<Ledger>>);
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        if let Ok(l) = self.0.lock() {
+            if let Err(e) = l.flush_audit() {
+                eprintln!("wicket: committing the last audit records failed: {e}");
+            }
+        }
+    }
+}
+
+// ---- configuration ----
+
+/// The installation's sinks file: `$WICKET_AUDIT_SINKS`, else `audit-sinks.yaml` in the data dir.
+pub fn sinks_path() -> PathBuf {
+    match std::env::var_os("WICKET_AUDIT_SINKS") {
+        Some(p) => PathBuf::from(p),
+        None => crate::data_dir().join("audit-sinks.yaml"),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinksConfig {
+    /// How often each sink gets a signed checkpoint (humantime, e.g. `5m`).
+    #[serde(default = "default_every", with = "humantime_serde_compat")]
+    pub checkpoint_every: Duration,
+    /// The most records per delivery.
+    #[serde(default = "default_batch")]
+    pub batch: usize,
+    pub sinks: Vec<SinkSpec>,
+}
+
+fn default_every() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_batch() -> usize {
+    500
+}
+
+mod humantime_serde_compat {
+    use serde::{Deserialize, Deserializer};
+    use std::time::Duration;
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let s = String::deserialize(d)?;
+        humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SinkSpec {
+    /// The sink's name: its cursor in the ledger. Renaming a sink starts it from the beginning.
+    pub name: String,
+    #[serde(flatten)]
+    pub kind: SinkKind,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SinkKind {
+    /// JSON lines appended to `path` (`-`: standard output, only from `wicket audit export`).
+    Jsonl { path: String },
+    /// OTLP/HTTP logs (JSON encoding) to an OpenTelemetry Collector: `endpoint` is its base URL;
+    /// records are POSTed to `<endpoint>/v1/logs`.
+    Otlp {
+        endpoint: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        /// Extra resource attributes (`service.name` is `wicket`).
+        #[serde(default)]
+        resource: BTreeMap<String, String>,
+    },
+}
+
+impl SinksConfig {
+    pub fn parse(text: &str) -> Result<SinksConfig> {
+        let c: SinksConfig = serde_yaml::from_str(text)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &c.sinks {
+            if s.name.is_empty() || !seen.insert(s.name.clone()) {
+                bail!("audit sink names must be present and distinct ({:?})", s.name);
+            }
+        }
+        if c.batch == 0 {
+            bail!("batch must be at least 1");
+        }
+        Ok(c)
+    }
+
+    /// The installation's sinks, if it has a sinks file.
+    pub fn load() -> Result<Option<SinksConfig>> {
+        let p = sinks_path();
+        match std::fs::read_to_string(&p) {
+            Ok(t) => Ok(Some(SinksConfig::parse(&t).with_context(|| format!("{}", p.display()))?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("{}", p.display())),
+        }
+    }
+}
+
+// ---- what is sent ----
+
+/// One audit record as exported: a JSON object, one line.
+pub fn record_json(r: &AuditRecord) -> Value {
+    json!({
+        "type": "wicket.audit.record",
+        "seq": r.seq, "ts": r.ts, "tenant": r.tenant, "run": r.run, "kind": r.kind,
+        "body": serde_json::from_str::<Value>(&r.body).unwrap_or_else(|_| Value::String(r.body.clone())),
+        "prev": r.prev, "hash": r.hash,
+    })
+}
+
+/// A signed checkpoint of the chain at `seq` (whose record's hash is `head`).
+pub fn checkpoint_json(issuer: &wicket_identity::Issuer, seq: i64, head: &str, ts: i64) -> Value {
+    let payload = json!({ "seq": seq, "head": head, "ts": ts, "iss": issuer.issuer_id() });
+    json!({
+        "type": "wicket.audit.checkpoint",
+        "seq": seq, "head": head, "ts": ts, "iss": issuer.issuer_id(),
+        "kid": wicket_identity::key_id(&issuer.verifying_key()),
+        "jws": issuer.sign_checkpoint(&payload),
+    })
+}
+
+/// OTLP/HTTP JSON for a batch of exported objects (records or checkpoints): one log record each,
+/// whose body is the object's JSON line.
+pub fn otlp_body(items: &[Value], resource: &BTreeMap<String, String>) -> Value {
+    let s = |v: &str| json!({ "stringValue": v });
+    let observed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0).to_string();
+    let mut res = vec![json!({ "key": "service.name", "value": s("wicket") })];
+    res.extend(resource.iter().map(|(k, v)| json!({ "key": k, "value": s(v) })));
+    let logs: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            let ty = it["type"].as_str().unwrap_or("");
+            let mut attrs = vec![
+                json!({ "key": "wicket.audit.type", "value": s(ty) }),
+                json!({ "key": "wicket.audit.seq", "value": { "intValue": it["seq"].as_i64().unwrap_or(0).to_string() } }),
+            ];
+            for (k, f) in [("wicket.audit.kind", "kind"), ("wicket.audit.hash", "hash"), ("wicket.audit.head", "head"), ("wicket.run", "run"), ("wicket.tenant", "tenant")] {
+                if let Some(v) = it[f].as_str() {
+                    attrs.push(json!({ "key": k, "value": s(v) }));
+                }
+            }
+            json!({
+                "timeUnixNano": (it["ts"].as_i64().unwrap_or(0) as i128 * 1_000_000_000).to_string(),
+                "observedTimeUnixNano": observed,
+                "severityNumber": 9,
+                "severityText": "INFO",
+                "body": s(&it.to_string()),
+                "attributes": attrs,
+            })
+        })
+        .collect();
+    json!({
+        "resourceLogs": [{
+            "resource": { "attributes": res },
+            "scopeLogs": [{ "scope": { "name": "wicket.audit" }, "logRecords": logs }],
+        }]
+    })
+}
+
+// ---- sinks ----
+
+struct Sink {
+    spec: SinkSpec,
+    /// Not before this instant (backoff after a failure).
+    next_try: Instant,
+    backoff: Duration,
+    held: bool,
+    renewed: Option<Instant>,
+}
+
+/// Feeds the configured sinks from the ledger.
+pub struct Exporter {
+    ledger: Ledger,
+    cfg: SinksConfig,
+    sinks: Vec<Sink>,
+    holder: String,
+    issuer: Option<wicket_identity::Issuer>,
+    http: reqwest::Client,
+    rt: tokio::runtime::Runtime,
+    /// Whether this process may write to standard output (only `wicket audit export`).
+    pub stdout: bool,
+}
+
+/// What one pass delivered.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pass {
+    pub records: usize,
+    pub checkpoints: usize,
+    pub failures: Vec<(String, String)>,
+}
+
+impl Exporter {
+    /// `issuer`: the key checkpoints are signed with (none: records only, and a warning).
+    pub fn new(ledger_path: &Path, cfg: SinksConfig, issuer: Option<wicket_identity::Issuer>) -> Result<Exporter> {
+        let mut nonce = [0u8; 6];
+        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+        let sinks = cfg.sinks.iter().map(|s| Sink { spec: s.clone(), next_try: Instant::now(), backoff: Duration::from_secs(1), held: false, renewed: None }).collect();
+        Ok(Exporter {
+            ledger: Ledger::open(ledger_path)?,
+            cfg,
+            sinks,
+            holder: format!("{}-{}", std::process::id(), hex::encode(nonce)),
+            issuer,
+            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
+            rt: tokio::runtime::Builder::new_current_thread().enable_all().build()?,
+            stdout: false,
+        })
+    }
+
+    /// One pass over every sink: deliver what each is missing, and a checkpoint if one is due
+    /// (`force_checkpoint`: due now).
+    pub fn pass(&mut self, force_checkpoint: bool) -> Pass {
+        let mut out = Pass::default();
+        let now = Instant::now();
+        let at = wicket_store::now();
+        for i in 0..self.sinks.len() {
+            let name = self.sinks[i].spec.name.clone();
+            if matches!(&self.sinks[i].spec.kind, SinkKind::Jsonl { path } if path == "-") && !self.stdout {
+                continue;
+            }
+            // Renew the lease about three times per lease period; take it when it lapses.
+            let s = &self.sinks[i];
+            if !s.held || s.renewed.is_none_or(|r| now.duration_since(r) >= Duration::from_secs((EXPORT_LEASE_SECS / 3) as u64)) {
+                let held = self.ledger.lease_export(&name, &self.holder, at).unwrap_or(false);
+                let s = &mut self.sinks[i];
+                s.held = held;
+                s.renewed = held.then_some(now);
+            }
+            if !self.sinks[i].held || now < self.sinks[i].next_try {
+                continue;
+            }
+            match self.feed(i, force_checkpoint) {
+                Ok((r, c)) => {
+                    out.records += r;
+                    out.checkpoints += c;
+                    let s = &mut self.sinks[i];
+                    s.backoff = Duration::from_secs(1);
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let _ = self.ledger.export_failed(&name, &msg);
+                    let s = &mut self.sinks[i];
+                    s.next_try = now + s.backoff;
+                    s.backoff = (s.backoff * 2).min(Duration::from_secs(60));
+                    out.failures.push((name, msg));
+                }
+            }
+        }
+        out
+    }
+
+    /// Clears backoff, so the next pass retries every sink at once.
+    #[cfg(test)]
+    pub fn retry_now(&mut self) {
+        for s in &mut self.sinks {
+            s.next_try = Instant::now();
+        }
+    }
+
+    fn feed(&mut self, i: usize, force_checkpoint: bool) -> Result<(usize, usize)> {
+        let name = self.sinks[i].spec.name.clone();
+        let mut cur = self.ledger.export_cursor(&name)?;
+        let mut sent = 0;
+        loop {
+            let recs = self.ledger.audit_records_after(cur.seq, self.cfg.batch)?;
+            let Some(last) = recs.last().map(|r| r.seq) else { break };
+            let items: Vec<Value> = recs.iter().map(record_json).collect();
+            self.deliver(i, &items)?;
+            // One cursor write per delivered batch.
+            self.ledger.advance_export(&name, last)?;
+            cur.seq = last;
+            sent += recs.len();
+            if recs.len() < self.cfg.batch {
+                break;
+            }
+        }
+        let at = wicket_store::now();
+        let due = force_checkpoint || at - cur.checkpoint_at >= self.cfg.checkpoint_every.as_secs() as i64;
+        let mut cps = 0;
+        if due && cur.seq > 0 {
+            if let Some(issuer) = &self.issuer {
+                let head = self.ledger.audit_hash_at(cur.seq)?.context("the sink's cursor is past the local chain")?;
+                let cp = checkpoint_json(issuer, cur.seq, &head, at);
+                self.deliver(i, &[cp])?;
+                self.ledger.export_checkpointed(&name, at)?;
+                cps = 1;
+            }
+        }
+        Ok((sent, cps))
+    }
+
+    fn deliver(&self, i: usize, items: &[Value]) -> Result<()> {
+        match &self.sinks[i].spec.kind {
+            SinkKind::Jsonl { path } => {
+                let mut buf = String::new();
+                for it in items {
+                    buf.push_str(&it.to_string());
+                    buf.push('\n');
+                }
+                if path == "-" {
+                    let mut o = std::io::stdout().lock();
+                    o.write_all(buf.as_bytes())?;
+                    o.flush()?;
+                } else {
+                    let p = Path::new(path);
+                    if let Some(d) = p.parent() {
+                        std::fs::create_dir_all(d)?;
+                    }
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).with_context(|| path.clone())?;
+                    f.write_all(buf.as_bytes())?;
+                    f.sync_data()?;
+                }
+                Ok(())
+            }
+            SinkKind::Otlp { endpoint, headers, resource } => {
+                let url = format!("{}/v1/logs", endpoint.trim_end_matches('/'));
+                let mut req = self.http.post(&url).json(&otlp_body(items, resource));
+                for (k, v) in headers {
+                    req = req.header(k, v);
+                }
+                self.rt.block_on(async {
+                    let resp = req.send().await.with_context(|| url.clone())?;
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        bail!("{url}: {status}: {}", text.chars().take(200).collect::<String>());
+                    }
+                    // A 2xx can still reject some records (OTLP partial success): hold the cursor.
+                    let rejected = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v["partialSuccess"]["rejectedLogRecords"].as_str().map(String::from).or_else(|| v["partialSuccess"]["rejectedLogRecords"].as_i64().map(|n| n.to_string())))
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if rejected > 0 {
+                        bail!("{url}: the collector rejected {rejected} record(s): {}", text.chars().take(200).collect::<String>());
+                    }
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    /// Gives up this process's leases (so another process takes over at once).
+    pub fn release(&mut self) {
+        for s in &mut self.sinks {
+            if s.held {
+                let _ = self.ledger.release_export(&s.spec.name, &self.holder);
+                s.held = false;
+            }
+        }
+    }
+}
+
+impl Drop for Exporter {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Starts this process's background exporter if the installation has sinks configured: a thread
+/// that feeds them every second until the process exits. Once per process.
+pub fn spawn_background() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cfg = match SinksConfig::load() {
+        Ok(Some(c)) if !c.sinks.is_empty() => c,
+        Ok(_) => return,
+        Err(e) => {
+            eprintln!("wicket: audit export is off: {e:#}");
+            return;
+        }
+    };
+    let issuer = crate::issuer().map_err(|e| eprintln!("wicket: audit checkpoints are off (no issuer key: {e})")).ok();
+    let path = crate::ledger_path();
+    let _ = std::thread::Builder::new().name("wicket-audit-export".into()).spawn(move || {
+        let mut x = match Exporter::new(&path, cfg, issuer) {
+            Ok(x) => x,
+            Err(e) => return eprintln!("wicket: audit export is off: {e:#}"),
+        };
+        loop {
+            x.pass(false);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+// ---- verification against exported copies ----
+
+/// What `--against` found.
+#[derive(Debug, Default)]
+pub struct Against {
+    pub checkpoints: usize,
+    pub records: usize,
+    pub problems: Vec<String>,
+}
+
+/// The exported objects in a file: JSON lines of records and checkpoints as wicket writes them, or
+/// OTLP/HTTP JSON lines (as a Collector's file exporter writes them) whose log bodies are those.
+pub fn exported_objects(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if let Some(rls) = v["resourceLogs"].as_array() {
+            for rl in rls {
+                for sl in rl["scopeLogs"].as_array().into_iter().flatten() {
+                    for lr in sl["logRecords"].as_array().into_iter().flatten() {
+                        if let Some(b) = lr["body"]["stringValue"].as_str().and_then(|b| serde_json::from_str::<Value>(b).ok()) {
+                            out.push(b);
+                        }
+                    }
+                }
+            }
+        } else {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Checks the local ledger against exported records and checkpoints: every signed checkpoint's
+/// head and every exported record's hash must be the local chain's at that sequence number, and the
+/// local chain must reach the newest checkpoint. A rewritten (even consistently re-chained) or
+/// truncated local chain fails.
+pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::VerifyingKey) -> Result<Against> {
+    let mut a = Against::default();
+    let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
+    let mut newest = 0;
+    for o in objects {
+        match o["type"].as_str() {
+            Some("wicket.audit.checkpoint") => {
+                let Some(jws) = o["jws"].as_str() else {
+                    a.problems.push("a checkpoint without a signature".into());
+                    continue;
+                };
+                let p = match wicket_identity::verify_checkpoint(jws, issuer) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        a.problems.push(format!("a checkpoint (seq {}) does not verify: {e}", o["seq"]));
+                        continue;
+                    }
+                };
+                let (Some(seq), Some(want)) = (p["seq"].as_i64(), p["head"].as_str()) else {
+                    a.problems.push("a signed checkpoint without seq and head".into());
+                    continue;
+                };
+                newest = newest.max(seq);
+                match l.audit_hash_at(seq)? {
+                    Some(h) if h == want => a.checkpoints += 1,
+                    Some(h) => a.problems.push(format!("checkpoint at seq {seq} (signed at {}): exported head {want}, local {h}", p["ts"])),
+                    None => a.problems.push(format!("checkpoint at seq {seq}: the local chain ends at {head}")),
+                }
+            }
+            Some("wicket.audit.record") => {
+                let (Some(seq), Some(want)) = (o["seq"].as_i64(), o["hash"].as_str()) else { continue };
+                match l.audit_hash_at(seq)? {
+                    Some(h) if h == want => a.records += 1,
+                    Some(_) => a.problems.push(format!("record {seq}: the exported copy's hash differs from the local one")),
+                    None => a.problems.push(format!("record {seq}: exported, but missing locally")),
+                }
+            }
+            _ => {}
+        }
+    }
+    if newest > head {
+        a.problems.push(format!("the local chain ends at seq {head}, before the newest checkpoint ({newest})"));
+    }
+    a.problems.dedup();
+    Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wicket_core::{RunId, TenantId};
+
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(name: &str) -> TmpDir {
+            let mut n = [0u8; 4];
+            getrandom::getrandom(&mut n).unwrap();
+            let d = std::env::temp_dir().join(format!("wicket-export-{name}-{}-{}", std::process::id(), hex::encode(n)));
+            std::fs::create_dir_all(&d).unwrap();
+            TmpDir(d)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_records(l: &Ledger, from: usize, n: usize) {
+        for i in from..from + n {
+            l.audit(&TenantId::single(), Some(&RunId("run_a".into())), "op", &json!({ "i": i })).unwrap();
+        }
+    }
+
+    fn jsonl_cfg(path: &Path) -> SinksConfig {
+        SinksConfig::parse(&format!("checkpoint_every: 1h\nbatch: 7\nsinks:\n  - name: file\n    type: jsonl\n    path: {}\n", path.display())).unwrap()
+    }
+
+    #[test]
+    fn the_sinks_file_parses_and_rejects_duplicates() {
+        let c = SinksConfig::parse(
+            "checkpoint_every: 2m\nsinks:\n  - {name: a, type: jsonl, path: '-'}\n  - {name: b, type: otlp, endpoint: 'http://127.0.0.1:4318', headers: {x-tenant: t}}\n",
+        )
+        .unwrap();
+        assert_eq!(c.checkpoint_every, Duration::from_secs(120));
+        assert_eq!(c.batch, 500);
+        assert!(matches!(&c.sinks[1].kind, SinkKind::Otlp { headers, .. } if headers["x-tenant"] == "t"));
+        assert!(SinksConfig::parse("sinks:\n  - {name: a, type: jsonl, path: x}\n  - {name: a, type: jsonl, path: y}\n").is_err());
+        assert!(SinksConfig::parse("sinks:\n  - {name: a, type: kafka}\n").is_err());
+    }
+
+    /// Rewrites record `seq`'s body and re-chains every record after it: a consistent forgery that
+    /// the chain alone can't catch.
+    fn rewrite_and_rechain(path: &Path, seq: i64) {
+        let c = rusqlite_conn(path);
+        c.execute("UPDATE audit SET body = '{\"i\":\"forged\"}' WHERE seq = ?1", [seq]).unwrap();
+        let rows: Vec<(i64, String, String)> = {
+            let mut st = c.prepare("SELECT seq, kind, body FROM audit ORDER BY seq").unwrap();
+            let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            r.map(|x| x.unwrap()).collect()
+        };
+        let mut prev = "0".repeat(64);
+        for (s, kind, body) in rows {
+            let h = wicket_store::chain_hash(&prev, &kind, &body);
+            c.execute("UPDATE audit SET prev = ?2, hash = ?3 WHERE seq = ?1", rusqlite::params![s, prev, h]).unwrap();
+            prev = h;
+        }
+    }
+
+    fn rusqlite_conn(path: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(path).unwrap()
+    }
+
+    #[test]
+    fn a_rewritten_or_truncated_chain_fails_against_exported_checkpoints() {
+        let d = TmpDir::new("against");
+        let lp = d.0.join("ledger.db");
+        let out = d.0.join("out/audit.jsonl");
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let l = open_batched(&lp).unwrap();
+        write_records(&l, 0, 20);
+        let mut x = Exporter::new(&lp, jsonl_cfg(&out), Some(issuer)).unwrap();
+        let p = x.pass(true);
+        assert_eq!((p.records, p.checkpoints), (20, 1), "{p:?}");
+        write_records(&l, 20, 5);
+        let p = x.pass(true);
+        assert_eq!((p.records, p.checkpoints), (5, 1));
+        let objs = exported_objects(&std::fs::read_to_string(&out).unwrap());
+        assert_eq!(objs.len(), 27);
+        let a = verify_against(&l, &objs, &key).unwrap();
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert_eq!((a.checkpoints, a.records), (2, 25));
+
+        // Only checkpoints exported (e.g. to a write-once bucket): still caught.
+        let cps: Vec<Value> = objs.iter().filter(|o| o["type"] == "wicket.audit.checkpoint").cloned().collect();
+        rewrite_and_rechain(&lp, 3);
+        assert_eq!(l.verify_audit().unwrap(), 25, "the forgery is internally consistent");
+        let a = verify_against(&l, &cps, &key).unwrap();
+        assert_eq!(a.problems.len(), 2, "both checkpoints disagree: {:?}", a.problems);
+        let a = verify_against(&l, &objs, &key).unwrap();
+        assert!(a.problems.iter().any(|p| p.starts_with("record 3:")), "{:?}", a.problems);
+
+        // A checkpoint signed by another key proves nothing.
+        let other = wicket_identity::Issuer::generate("test.local").verifying_key();
+        let a = verify_against(&l, &cps, &other).unwrap();
+        assert_eq!(a.checkpoints, 0);
+        assert!(a.problems.iter().all(|p| p.contains("does not verify")));
+        drop(x);
+        drop(l);
+
+        // Truncation: the local chain no longer reaches the newest checkpoint.
+        let d2 = TmpDir::new("truncate");
+        let lp2 = d2.0.join("ledger.db");
+        let out2 = d2.0.join("audit.jsonl");
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let l = Ledger::open(&lp2).unwrap();
+        write_records(&l, 0, 10);
+        let mut x = Exporter::new(&lp2, jsonl_cfg(&out2), Some(issuer)).unwrap();
+        x.pass(true);
+        rusqlite_conn(&lp2).execute("DELETE FROM audit WHERE seq > 6", []).unwrap();
+        assert_eq!(l.verify_audit().unwrap(), 6);
+        let cps: Vec<Value> =
+            exported_objects(&std::fs::read_to_string(&out2).unwrap()).into_iter().filter(|o| o["type"] == "wicket.audit.checkpoint").collect();
+        let a = verify_against(&l, &cps, &key).unwrap();
+        assert!(a.problems.iter().any(|p| p.contains("ends at seq 6")), "{:?}", a.problems);
+    }
+
+    #[test]
+    fn one_process_feeds_a_sink_at_a_time() {
+        let d = TmpDir::new("lease");
+        let lp = d.0.join("ledger.db");
+        let out = d.0.join("audit.jsonl");
+        let l = Ledger::open(&lp).unwrap();
+        write_records(&l, 0, 10);
+        let mut a = Exporter::new(&lp, jsonl_cfg(&out), None).unwrap();
+        let mut b = Exporter::new(&lp, jsonl_cfg(&out), None).unwrap();
+        assert_eq!(a.pass(false).records, 10);
+        write_records(&l, 10, 3);
+        assert_eq!(b.pass(false).records, 0, "a holds the lease");
+        a.release();
+        assert_eq!(b.pass(false).records, 3, "b takes over where a left off");
+        assert_eq!(exported_objects(&std::fs::read_to_string(&out).unwrap()).len(), 13);
+    }
+
+    // ---- a local OTLP/HTTP receiver ----
+
+    #[derive(Default)]
+    struct Stub {
+        up: AtomicBool,
+        bodies: Mutex<Vec<Value>>,
+    }
+
+    fn start_stub(rt: &tokio::runtime::Runtime) -> (Arc<Stub>, String) {
+        use http_body_util::BodyExt;
+        let stub = Arc::new(Stub::default());
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s2 = stub.clone();
+        rt.spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let s3 = s2.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let s4 = s3.clone();
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let ct = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                            let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                            let (status, text) = if !s4.up.load(Ordering::SeqCst) {
+                                (503, "{}".to_string())
+                            } else if path != "/v1/logs" || !ct.starts_with("application/json") {
+                                (404, "{}".to_string())
+                            } else {
+                                s4.bodies.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                                (200, "{}".to_string())
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder().status(status).header("content-type", "application/json").body(http_body_util::Full::new(bytes::Bytes::from(text))).unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+                });
+            }
+        });
+        (stub, format!("http://{addr}"))
+    }
+
+    #[test]
+    fn an_otlp_receiver_gets_every_record_after_being_down() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (stub, endpoint) = start_stub(&rt);
+        let d = TmpDir::new("otlp");
+        let lp = d.0.join("ledger.db");
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let cfg = SinksConfig::parse(&format!("checkpoint_every: 1h\nbatch: 16\nsinks:\n  - {{name: otel, type: otlp, endpoint: '{endpoint}'}}\n")).unwrap();
+        let l = open_batched(&lp).unwrap();
+        write_records(&l, 0, 40);
+
+        // Down: nothing advances, the failure is recorded, and more records arrive meanwhile.
+        let mut x = Exporter::new(&lp, cfg, Some(issuer)).unwrap();
+        let p = x.pass(true);
+        assert_eq!(p.records, 0);
+        assert_eq!(p.failures.len(), 1, "{p:?}");
+        assert!(l.export_cursor("otel").unwrap().error.unwrap().contains("503"));
+        write_records(&l, 40, 60);
+        x.retry_now();
+        assert_eq!(x.pass(false).records, 0);
+
+        // Back: everything arrives, then a checkpoint.
+        stub.up.store(true, Ordering::SeqCst);
+        x.retry_now();
+        let p = x.pass(true);
+        assert_eq!((p.records, p.checkpoints), (100, 1), "{p:?}");
+        assert_eq!(l.export_cursor("otel").unwrap().seq, 100);
+
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let lines: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+        let objs = exported_objects(&lines.join("\n"));
+        let mut seqs: Vec<i64> = objs.iter().filter(|o| o["type"] == "wicket.audit.record").map(|o| o["seq"].as_i64().unwrap()).collect();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs, (1..=100).collect::<Vec<_>>(), "every record, by sequence number");
+        let first = &bodies[0]["resourceLogs"][0];
+        assert_eq!(first["resource"]["attributes"][0]["value"]["stringValue"], "wicket");
+        let lr = &first["scopeLogs"][0]["logRecords"][0];
+        assert_eq!(lr["attributes"][1]["key"], "wicket.audit.seq");
+        assert!(lr["attributes"][1]["value"]["intValue"].is_string(), "OTLP JSON carries int64 as a string");
+        assert!(lr["timeUnixNano"].is_string());
+        let a = verify_against(&l, &objs, &key).unwrap();
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert_eq!((a.records, a.checkpoints), (100, 1));
+        drop(x);
+        drop(l);
+    }
+
+    #[test]
+    fn a_partial_success_holds_the_cursor() {
+        // The collector answers 200 but rejects records: nothing is skipped.
+        use http_body_util::BodyExt;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        rt.spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(r#"{"partialSuccess":{"rejectedLogRecords":"2","errorMessage":"bad"}}"#))),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+                });
+            }
+        });
+        let d = TmpDir::new("partial");
+        let lp = d.0.join("ledger.db");
+        let l = Ledger::open(&lp).unwrap();
+        write_records(&l, 0, 5);
+        let cfg = SinksConfig::parse(&format!("sinks:\n  - {{name: otel, type: otlp, endpoint: 'http://{addr}'}}\n")).unwrap();
+        let mut x = Exporter::new(&lp, cfg, None).unwrap();
+        let p = x.pass(false);
+        assert_eq!(p.records, 0);
+        assert!(p.failures[0].1.contains("rejected 2"), "{p:?}");
+        assert_eq!(l.export_cursor("otel").unwrap().seq, 0);
+    }
+}

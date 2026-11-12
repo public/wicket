@@ -226,6 +226,8 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     let plan = net::plan(&opts, &data_dir())?;
     let tenant = TenantId::single();
     let l = Ledger::open(&ledger_path())?;
+    // The console is the control host's long-lived process: it feeds the audit sinks (#91).
+    crate::audit_export::spawn_background();
     let has_passkeys = !l.operator_credentials(&tenant)?.is_empty();
     let _ = l.prune_console_sessions(wicket_store::now() - 30 * 86400);
     drop(l);

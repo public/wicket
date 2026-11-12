@@ -227,7 +227,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
 
-    let ledger = Arc::new(Mutex::new(Ledger::open(&ledger_path())?));
+    let ledger: Arc<Mutex<Ledger>> = Arc::new(Mutex::new(crate::audit_export::open_batched(&ledger_path())?));
+    // Commits the audit records still queued however the run ends (#62).
+    let _flush = crate::audit_export::FlushOnDrop(ledger.clone());
+    // Feeds the installation's audit sinks while this run lasts, if it has any (#91).
+    crate::audit_export::spawn_background();
     {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;

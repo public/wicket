@@ -294,7 +294,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         }
     };
     let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
-    let audit = Ledger::open(&paths.root.join("audit.db"))?;
+    let audit = crate::audit_export::open_batched(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
     let ctl = paths.socket();
     let ctl_dir = ctl.parent().expect("socket dir");

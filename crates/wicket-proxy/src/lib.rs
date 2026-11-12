@@ -262,14 +262,53 @@ impl RunCtx {
         Ok(id)
     }
 
+    /// Records an event in the audit log and sends it to the console.
+    ///
+    /// With the batched audit writer (#62), most records are queued and committed within
+    /// milliseconds, off the request path. A request allowed by a human's grant waits for its
+    /// record's commit before it is forwarded ([`must_be_durable`]): the use of an approval is on
+    /// disk before it takes effect. The ledger lock is held only to look up the writer, never across
+    /// a commit.
     pub(crate) fn emit(&self, ev: Event) {
         if let Ok(v) = serde_json::to_value(&ev) {
-            // Queued, not waited on: the batched writer commits it within milliseconds (#62).
-            if let Ok(l) = self.ledger.lock() {
-                let _ = l.audit_deferred(&self.tenant, Some(&self.run), "op", &v);
+            let writer = match self.ledger.lock() {
+                Ok(l) => match l.audit_writer() {
+                    Some(w) => Some(w),
+                    None => {
+                        let _ = l.audit(&self.tenant, Some(&self.run), "op", &v);
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            if let Some(w) = writer {
+                if must_be_durable(&ev) {
+                    if let Ok(t) = w.enqueue(&self.tenant, Some(&self.run), "op", &v) {
+                        wait_blocking(move || {
+                            let _ = t.wait();
+                        });
+                    }
+                } else {
+                    let _ = w.submit(&self.tenant, Some(&self.run), "op", &v);
+                }
             }
         }
         let _ = self.events.send(ev);
+    }
+}
+
+/// Whether an event's audit record must be committed before the request it describes goes ahead:
+/// a request allowed by a grant (a human's approval, consumed here or counted on a node). Requests
+/// allowed by the zone's reach and refusals are recorded without waiting.
+pub fn must_be_durable(ev: &Event) -> bool {
+    matches!(ev, Event::Egress { outcome, detail, .. } if outcome == "allow" && detail.starts_with("grant "))
+}
+
+/// Runs a blocking wait without stalling other tasks on a multi-threaded tokio runtime.
+fn wait_blocking(f: impl FnOnce()) {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 
