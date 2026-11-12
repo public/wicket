@@ -65,8 +65,10 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
   address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
-  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges are bounded
-  (1024 in all, 8 per client, 2-minute expiry). Every failure looks the same to the client, and every failure
+  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges expire after 2
+  minutes and come from two bounded pools. Sign-in challenges get 512 in all, 8 per client and 32 per
+  IPv4 /24 or IPv6 /48. Signed-in sessions' action and enrolment challenges get 512 in all and 8 per
+  session. A flood of sign-in attempts therefore never stops the operator from approving. Every failure looks the same to the client, and every failure
   and lockout is in the audit log.
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the

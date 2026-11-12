@@ -393,14 +393,56 @@ async fn the_challenge_store_is_bounded() {
         assert_eq!(c.values().filter(|p| p.owner == "192.0.2.10").count(), MAX_CHALLENGES_PER_OWNER);
         assert!(!c.contains_key(first.as_deref().unwrap()), "the oldest went");
     }
-    // In all: when the store is full, sign-in is refused rather than growing it.
-    for i in 0..MAX_CHALLENGES {
-        let ip: IpAddr = std::net::Ipv4Addr::from(0x0a00_0000 + i as u32).into();
-        new_challenge(&t.state, random_bytes(32), Purpose::Login, None, limits::ip_key(ip));
+    // In all: when the sign-in pool is full, sign-in is refused rather than growing it.
+    for i in 0..MAX_LOGIN_CHALLENGES {
+        let ip: IpAddr = std::net::Ipv4Addr::from(0x0a00_0000 + (i as u32) * 256).into();
+        new_challenge(&t.state, random_bytes(32), Purpose::Login, Asker::Client(ip));
     }
-    assert!(t.state.challenges.lock().unwrap().len() <= MAX_CHALLENGES);
+    assert!(t.state.challenges.lock().unwrap().len() <= MAX_LOGIN_CHALLENGES);
     let (status, _, _) = post_json_from(&t.state, "192.0.2.99:1", "/api/login/begin", None, &json!({})).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// #122: a pre-auth flood (many addresses, each at its per-client cap) fills only the sign-in pool:
+/// the signed-in operator can still begin and sign actions.
+#[tokio::test]
+async fn a_sign_in_flood_never_blocks_signed_actions() {
+    let mut t = setup("challenge-flood");
+    t.running("run_a", "lead");
+    // 128 IPv6 /64s from one /56, and 128 IPv4 addresses from different /24s, 8 challenges each:
+    // well past the old shared store's 1024.
+    for i in 0..128u16 {
+        let v6 = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0x7, i, 0, 0, 0, 1);
+        let v4 = std::net::Ipv4Addr::from(0x0a00_0001 + (u32::from(i) << 8));
+        for ip in [IpAddr::V6(v6), IpAddr::V4(v4)] {
+            for _ in 0..MAX_CHALLENGES_PER_OWNER {
+                new_challenge(&t.state, random_bytes(32), Purpose::Login, Asker::Client(ip));
+            }
+        }
+    }
+    let b = t.begin(json!({ "action": "say", "run": "run_a", "text": "still here" }));
+    assert_eq!(b.status, StatusCode::OK, "the flood blocked a signed action: {:?}", b.body);
+    let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+    assert_eq!(t.post("/api/action/finish", a).status, StatusCode::OK);
+    {
+        let c = t.state.challenges.lock().unwrap();
+        assert!(c.len() <= MAX_LOGIN_CHALLENGES, "{}", c.len());
+        // The /56 is one /48 block: it got that block's cap, not 128 clients' worth.
+        assert_eq!(c.values().filter(|p| p.block.as_deref() == Some("2001:db8:7::/48")).count(), MAX_LOGIN_CHALLENGES_PER_BLOCK);
+    }
+    // And repeatedly: a session's own ceremonies replace its oldest rather than running out.
+    for _ in 0..(MAX_CHALLENGES_PER_OWNER * 3) {
+        assert_eq!(t.begin(json!({ "action": "say", "run": "run_a", "text": "x" })).status, StatusCode::OK);
+    }
+    let r = t.act(json!({ "action": "say", "run": "run_a", "text": "and again" }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    // Expired challenges free their room.
+    for p in t.state.challenges.lock().unwrap().values_mut() {
+        p.expires = Instant::now() - Duration::from_secs(1);
+    }
+    let (status, _, _) = post_json_from(&t.state, "192.0.2.99:1", "/api/login/begin", None, &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(t.state.challenges.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

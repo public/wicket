@@ -176,6 +176,24 @@ pub fn ip_key(ip: IpAddr) -> String {
     }
 }
 
+/// The address block a client is in: its IPv4 /24 or IPv6 /48 (a site's usual allocation).
+pub fn block_key(ip: IpAddr) -> String {
+    let v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+    };
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(a) => v4(a),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+            }
+        },
+    }
+}
+
 /// An address range: `192.0.2.10`, `192.0.2.0/24`, `2001:db8::/32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cidr {
