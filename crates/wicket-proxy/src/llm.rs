@@ -191,6 +191,10 @@ impl Llm {
         let Some(spec) = self.ctx.zone.llm.as_ref() else {
             return problem(404, "no-model", "No model", "this zone has no model route", None);
         };
+        if let Err(why) = allowed_route(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/")) {
+            self.event(None, 404, Usage::default(), &format!("refused route: {why}"));
+            return problem(404, "route", "Not a model route", &why, None);
+        }
         if let Some(why) = self.ctx.superseded() {
             self.event(None, 409, Usage::default(), "stale generation");
             return problem(409, "stale-generation", "This activation is stale", &why, None);
@@ -661,6 +665,28 @@ pub struct Usage {
 /// Best-effort usage from a Messages response, streamed (SSE) or not: the largest value seen for
 /// each field (streamed counts are cumulative). The keys include their opening quote, so
 /// `"input_tokens":` doesn't also match `"cache_read_input_tokens":`.
+/// The only requests the model route forwards, as (method, path): inference and token counting
+/// (and listing models). Everything else under the upstream would also carry the real token, so
+/// it is refused here, before any budget is spent.
+const ROUTES: &[(&str, &str)] = &[("POST", "/v1/messages"), ("POST", "/v1/messages/count_tokens"), ("GET", "/v1/models")];
+
+/// Query parameters a model route may carry (Claude Code sends `?beta=true`).
+const QUERY: &[&str] = &["beta=true"];
+
+/// Ok if `method` and `path_and_query` name an allowed model route, exactly and canonically.
+pub fn allowed_route(method: &str, path_and_query: &str) -> std::result::Result<(), String> {
+    let path = wicket_core::canon::canonical_path(path_and_query).map_err(|e| e.to_string())?;
+    if !ROUTES.iter().any(|(m, p)| *m == method && *p == path) {
+        return Err(format!("{method} {path} is not a model route"));
+    }
+    if let Some((_, q)) = path_and_query.split_once('?') {
+        if q.split('&').any(|kv| !QUERY.contains(&kv)) {
+            return Err(format!("query {q:?} is not allowed on a model route"));
+        }
+    }
+    Ok(())
+}
+
 pub fn usage(body: &[u8]) -> Usage {
     let s = String::from_utf8_lossy(body);
     Usage {
@@ -732,6 +758,11 @@ mod tests {
 
     /// Serves `llm` on a socket and sends it one model request: (status, body).
     async fn post(llm: std::sync::Arc<super::Llm>, tag: &str) -> (u16, String) {
+        send(llm, tag, "POST", "/v1/messages").await
+    }
+
+    /// Serves `llm` on a socket and sends it one request: (status, body).
+    async fn send(llm: std::sync::Arc<super::Llm>, tag: &str, method: &str, path: &str) -> (u16, String) {
         use http_body_util::BodyExt;
         let dir = std::env::temp_dir().join(format!("wicket-llm-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -749,7 +780,9 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
         let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
         tokio::spawn(conn);
-        let req = http::Request::post("/v1/messages")
+        let req = http::Request::builder()
+            .method(method)
+            .uri(path)
             .header("host", "wicket.internal")
             .body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"max_tokens":1,"messages":[]}"#)))
             .unwrap();
@@ -797,6 +830,66 @@ mod tests {
         let (status, _) = post(super::Llm::new(c).unwrap(), "bound").await;
         assert_eq!(status, 200);
         assert!(seen.lock().await.iter().any(|r| r.to_ascii_lowercase().contains("authorization: bearer the-model-token")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_model_routes_are_allowed() {
+        use super::allowed_route as a;
+        assert!(a("POST", "/v1/messages").is_ok());
+        assert!(a("POST", "/v1/messages?beta=true").is_ok());
+        assert!(a("POST", "/v1/messages/count_tokens?beta=true").is_ok());
+        assert!(a("GET", "/v1/models").is_ok());
+        for (m, p) in [
+            ("GET", "/v1/messages"),
+            ("DELETE", "/v1/messages"),
+            ("POST", "/v1/messages/../../api/x"),
+            ("POST", "/v1/messages/%2e%2e/x"),
+            ("POST", "//v1/messages"),
+            ("POST", "/v1/messages/"),
+            ("POST", "/v1/messages?beta=true&x=1"),
+            ("GET", "/api/oauth/profile"),
+            ("POST", "/v1/other"),
+            ("GET", "/"),
+        ] {
+            assert!(a(m, p).is_err(), "{m} {p}");
+        }
+    }
+
+    /// Any other path is refused before it reaches the upstream with the token.
+    #[tokio::test]
+    async fn other_routes_never_reach_the_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = c.read(&mut buf).await;
+                seen2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}").await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wicket-llm-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}");
+        for (i, (m, p)) in [("GET", "/v1/code/sessions"), ("POST", "/api/oauth/x"), ("POST", "/v1/messages/../x")].into_iter().enumerate() {
+            let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+            c.vault = vault.clone();
+            let (status, _) = send(super::Llm::new(c).unwrap(), &format!("r{i}"), m, p).await;
+            assert_eq!(status, 404, "{m} {p}");
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault;
+        let (status, _) = send(super::Llm::new(c).unwrap(), "ok", "POST", "/v1/messages?beta=true").await;
+        assert_eq!(status, 200);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
