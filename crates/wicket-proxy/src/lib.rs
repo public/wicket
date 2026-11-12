@@ -471,6 +471,10 @@ pub(crate) const REFUSE_REQUEST: &[&str] =
 /// unknown are refused.
 pub(crate) const FORWARD_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
+/// Hop-by-hop response headers, never passed on.
+pub(crate) const HOP_BY_HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"];
+
+/// Response headers the LLM proxy drops: hop-by-hop, and the length (it may rewrite the body).
 pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length"];
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::Central;
+use wicket_proxy::decide::{Central, NodeDecider};
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{Event, RunCtx};
 
@@ -86,6 +86,12 @@ struct World {
 
 impl World {
     async fn new() -> World {
+        World::with(None).await
+    }
+
+    /// The proxy as the control host runs it, or (with a node decider) as a node does: the node's
+    /// feed decides, there is no activation fence, and interception uses the node's own CA.
+    async fn with(node: Option<Arc<NodeDecider>>) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test", "registry.test"]).await;
@@ -123,13 +129,17 @@ impl World {
             swaps: vec![],
             boxes: None,
             capacity: None,
-            fence: Some(wicket_proxy::Fence { agent: agent.clone(), generation: 1 }),
+            fence: node.is_none().then(|| wicket_proxy::Fence { agent: agent.clone(), generation: 1 }),
             waker: None,
         };
         let mut up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
         // Not pinned: checked like a real DNS answer (#116), and refused.
         up.dns.insert("private.test".into(), vec!["127.0.0.1".parse().unwrap()]);
-        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_splice").unwrap()), Arc::new(Central), None, up).unwrap();
+        let egress = match node {
+            None => Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_splice").unwrap()), Arc::new(Central), None, up),
+            Some(d) => Egress::with_upstream(ctx, Arc::new(RunCa::generate("node").unwrap()), d, None, up),
+        }
+        .unwrap();
         let sock = dir.join("egress.sock");
         let s2 = sock.clone();
         tokio::spawn(async move { egress.serve(&s2).await });
@@ -390,4 +400,170 @@ async fn npm_scoped_packages_pass_an_inspected_registry() {
     settle().await;
     let ev = w.events();
     assert_eq!(ev.iter().filter(|e| e.1 == "forbidden").count(), 5, "{ev:?}");
+}
+
+/// A node's link to the control host that is never up (nothing in these tests escalates).
+struct Offline;
+
+impl wicket_proxy::decide::ControlLink for Offline {
+    fn connected(&self) -> bool {
+        false
+    }
+    fn ask<'a>(
+        &'a self,
+        _: &'a wicket_core::Op,
+        _: &'a str,
+        _: Option<&'a serde_json::Value>,
+    ) -> futures_util::future::BoxFuture<'a, Result<wicket_proxy::decide::Asked, String>> {
+        Box::pin(async { Err("offline".to_string()) })
+    }
+}
+
+/// A node's feed for run_splice: its token minted from [`zone`], fresh for 1 s of the test's clock,
+/// then narrow for 2 s, then closed. Returns the decider, the clock and the feed's directory.
+fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync::atomic::AtomicI64>, PathBuf) {
+    use ed25519_dalek::SigningKey;
+    use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig, Replica, ReplicaConfig};
+    let dir = tmpdir();
+    let root = SigningKey::from_bytes(&[7; 32]);
+    let key = SigningKey::from_bytes(&[8; 32]);
+    let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+    let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+    let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000, 120_000);
+    let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+    let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, narrow_ms: 2_000, retain: 100 };
+    let mut p = Publisher::open_with(&dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+    let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+    let t0 = 1_000_000;
+    let tenant = TenantId::single().0;
+    let mut issuer =
+        Issuer::root(&authz_root, &tenant, "run:run_splice", "run_splice", 0, zone, &[], 3_600, vec![approver.public()]).unwrap();
+    if box_run != "run_splice" {
+        // A child of run_splice, in the same zone.
+        let c = wicket_authz::Ceiling::from_zone(zone, &format!("run_splice/{box_run}"), 3_600, vec![approver.public()]).unwrap();
+        issuer = issuer.child(box_run, 0, zone, &c).unwrap();
+    }
+    p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], t0).unwrap();
+    let hello = r.hello();
+    for f in p.catch_up(&hello, t0).unwrap() {
+        r.accept(&f, t0).unwrap();
+    }
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(t0));
+    let clock: wicket_proxy::decide::Clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::SeqCst))
+    };
+    let d = Arc::new(NodeDecider { replica: Arc::new(Mutex::new(r)), clock, control: Arc::new(Offline) });
+    (d, now, dir)
+}
+
+/// #141: a node splices a host its box's token allows wholesale while its feed is fresh. When the
+/// feed narrows, the spliced connection is cut at the next check, and new connections are
+/// intercepted with the node's CA and decided per request (plain reads only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_splices_while_its_feed_is_fresh_and_stops_when_it_narrows() {
+    let (d, now, feed_dir) = node_feed(&zone(), "run_splice");
+    let w = World::with(Some(d)).await;
+    // Fresh: spliced, the origin's own certificate; inspected hosts still get the node's leaf.
+    let (status, s) = w.connect("checked.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let (issuer, body) = get(s, "checked.test", "/hello").await;
+    assert_eq!(issuer, "wicket run CA node", "checked.test is intercepted on the node");
+    assert!(String::from_utf8_lossy(&body).contains("origin /hello"));
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("open.test").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
+    let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+    assert_eq!(cert.issuer().iter_common_name().next().unwrap().as_str().unwrap(), "wicket run CA origin", "spliced on the node");
+    tls.write_all(b"POST /a HTTP/1.1\r\nHost: open.test\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+    tls.flush().await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tls.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("origin /a"));
+    // The feed narrows (the control host has been unreachable past the lease): the spliced
+    // connection is cut within a check or two.
+    now.fetch_add(1_500, Ordering::SeqCst);
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the spliced connection outlived the node's fresh policy");
+    settle().await;
+    let ev = w.events();
+    let row = ev.iter().find(|e| e.0 == "open.test" && e.1 == "spliced").expect("a row for the spliced connection");
+    assert!(row.2.contains("on the node") && row.2.contains("cut:") && row.2.contains("no longer fresh"), "{}", row.2);
+    // Narrow: a new connection is intercepted with the node's CA; reads go, writes are refused.
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let (issuer, body) = get(s, "open.test", "/read").await;
+    assert_eq!(issuer, "wicket run CA node", "inspected once narrow");
+    assert!(String::from_utf8_lossy(&body).contains("origin /read"));
+    let (_, s) = w.connect("open.test").await;
+    let body = request(s, "open.test", "POST /write HTTP/1.1\r\nHost: open.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    assert!(body.contains("plain reads") && !body.contains("origin"), "{body}");
+    settle().await;
+    let ev = w.events();
+    assert!(!ev.iter().any(|e| e.1 == "spliced"), "{ev:?}");
+    // Closed: refused outright.
+    now.fetch_add(2_000, Ordering::SeqCst);
+    let (_, s) = w.connect("open.test").await;
+    let (_, body) = get(s, "open.test", "/read").await;
+    assert!(String::from_utf8_lossy(&body).contains("allows nothing"), "{}", String::from_utf8_lossy(&body));
+    let _ = std::fs::remove_dir_all(feed_dir);
+}
+
+/// #141: a child box is never spliced on a node, even in a zone that allows the host wholesale: its
+/// token is narrowed by its ancestors' ceilings, which the node can't read back from the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_splices_only_top_level_boxes_and_only_wholesale_hosts() {
+    let (d, _, child_dir) = node_feed(&zone(), "run_child");
+    {
+        let r = d.replica.lock().unwrap();
+        assert_eq!(r.splice(&TenantId::single(), "run_child", "open.test", 1_000_000), None, "a child box");
+        assert_eq!(r.splice(&TenantId::single(), "run_child", "checked.test", 1_000_000), None);
+    }
+    let (d, _, top_dir) = node_feed(&zone(), "run_splice");
+    {
+        let r = d.replica.lock().unwrap();
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_000_000), Some(0), "fresh, top-level");
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "fenced.test", 1_000_000), None, "a forbid rule");
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "checked.test", 1_000_000), None, "GET only");
+        assert_eq!(r.splice(&TenantId::single(), "run_other", "open.test", 1_000_000), None, "no authority for the box");
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_001_000), None, "narrow");
+    }
+    for d in [child_dir, top_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// TLS over `s` (any certificate), one raw request, and the response as text.
+async fn request(s: UnixStream, sni: &str, raw: &str) -> String {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
+    tls.write_all(raw.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    String::from_utf8_lossy(&resp).into_owned()
 }

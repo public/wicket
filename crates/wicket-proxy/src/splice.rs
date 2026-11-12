@@ -28,7 +28,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest ClientHello wicket reads (a TLS record is at most 16 KiB; post-quantum key shares
 /// make hellos a few KiB, and a hello may span records).
 const MAX_HELLO: usize = 64 * 1024;
-/// How often a spliced connection checks that its activation is still current (#70).
+/// How often a spliced connection checks that its activation is still current (#70), and that its
+/// host is still spliced (a node's policy still fresh, #141).
 const FENCE_CHECK: Duration = Duration::from_secs(2);
 /// Pipe (splice) or buffer (copy) size per direction.
 const CHUNK: usize = 256 * 1024;
@@ -215,6 +216,8 @@ struct Record {
     end: std::sync::Mutex<Option<String>>,
     /// The connection fell back to interception: no row here (its requests have their own).
     skip: std::sync::atomic::AtomicBool,
+    /// Where it was decided, if not on the control host (the decider's note).
+    note: &'static str,
 }
 
 impl Drop for Record {
@@ -230,8 +233,9 @@ impl Drop for Record {
             risk: "-".into(),
             outcome: "spliced".into(),
             detail: format!(
-                "reach rule {} allows the host wholesale: not inspected; {} bytes up, {} down, {:.1}s{end}",
+                "reach rule {} allows the host wholesale{}: not inspected; {} bytes up, {} down, {:.1}s{end}",
                 self.rule,
+                self.note,
                 self.up.load(Ordering::Relaxed),
                 self.down.load(Ordering::Relaxed),
                 self.started.elapsed().as_secs_f64()
@@ -252,6 +256,7 @@ pub(crate) async fn serve(egress: Arc<Egress>, upgraded: hyper::upgrade::Upgrade
         started: Instant::now(),
         end: Default::default(),
         skip: Default::default(),
+        note: egress.decider.splice_note(),
     });
     // The box's raw socket, for splice(2), with whatever hyper had already read from it.
     let (pre, side) = match upgraded.downcast::<hyper_util::rt::TokioIo<tokio::net::UnixStream>>() {
@@ -287,15 +292,16 @@ pub(crate) async fn serve(egress: Arc<Egress>, upgraded: hyper::upgrade::Upgrade
         return;
     }
     let relay = relay(side, upstream, Bytes::from(all), rec.up.clone(), rec.down.clone());
-    let ctx = egress.ctx.clone();
-    let fenced = async move {
-        if ctx.fence.is_none() {
-            return std::future::pending::<String>().await;
-        }
+    // Every check: the activation is still current (#70), and the host is still spliced (on a node,
+    // only while its policy is fresh, #141).
+    let fenced = async {
         loop {
             tokio::time::sleep(FENCE_CHECK).await;
-            if let Some(why) = ctx.superseded() {
+            if let Some(why) = egress.ctx.superseded() {
                 return why;
+            }
+            if egress.splice_rule(&host) != Some(rule) {
+                return egress.decider.splice_lost(&egress.ctx, &host);
             }
         }
     };

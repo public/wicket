@@ -811,6 +811,8 @@ impl Up {
 
     /// Sends `out` over HTTP/3 if that's available now (see the type's docs). None: use HTTP/2.
     pub(crate) async fn try_send(&self, host: &str, out: &Outgoing) -> Option<Result<Response<BoxBody>>> {
+        // Only a body read whole can be sent here (and again over HTTP/2 if this connection is gone).
+        let body = out.body.buffered()?.clone();
         let mut send = self.ready(host).await?;
         let mut req = Request::builder().method(out.method.clone()).uri(&out.url);
         for (k, v) in out.headers.iter() {
@@ -829,7 +831,7 @@ impl Up {
                 return None;
             }
         };
-        Some(Self::exchange(&mut s, out.body.clone()).await.map(|head| {
+        Some(Self::exchange(&mut s, body).await.map(|head| {
             // The body streams through a channel (a body must be Sync; the stream isn't).
             let (mut tx, body) = http_body_util::channel::Channel::<Bytes, Box<dyn std::error::Error + Send + Sync>>::new(8);
             tokio::spawn(async move {

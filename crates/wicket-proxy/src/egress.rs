@@ -10,7 +10,7 @@
 
 use crate::ca::{Minter, RunCa};
 use crate::decide::{Central, Decider, Outcome, Route};
-use crate::{full, problem, BoxBody, Event, RunCtx, FORWARD_METHODS, FORWARD_REQUEST, REFUSE_REQUEST, STRIP_RESPONSE};
+use crate::{full, problem, BoxBody, Event, RunCtx, FORWARD_METHODS, FORWARD_REQUEST, HOP_BY_HOP, REFUSE_REQUEST};
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -24,7 +24,17 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use wicket_core::{canonical_path, manifest::host_matches, Op};
 
+/// The largest request body read whole: GET and HEAD (which must have none), and requests that
+/// arrived over HTTP/3, which are re-sent upstream from memory.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+/// HTTP/2 upstream flow control (#142): what one response may have in flight, per stream and per
+/// connection, and the largest frame the upstream may send.
+const H2_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+const H2_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+const H2_MAX_FRAME: u32 = 1024 * 1024;
+/// The largest request body streamed upstream (#142): enforced as the bytes pass, and up front when
+/// the request says its length. Large enough for a release upload or a big `git push`.
+pub(crate) const MAX_STREAMED_BODY: u64 = 4 * 1024 * 1024 * 1024;
 
 pub struct Egress {
     pub(crate) ctx: RunCtx,
@@ -58,6 +68,9 @@ pub struct Upstream {
     /// Re-originate requests that arrived over HTTP/3 over HTTP/3 too, when the upstream offers it
     /// (default on; HTTP/2 or HTTP/1.1 otherwise).
     pub no_h3: bool,
+    /// HTTP/1.1 to every upstream, even one that offers HTTP/2 (benchmarks; an upstream whose
+    /// HTTP/2 misbehaves). Default off: HTTP/2 where offered (#142).
+    pub http1_only: bool,
 }
 
 impl Upstream {
@@ -80,9 +93,27 @@ pub(crate) struct Outgoing {
     pub method: http::Method,
     pub url: String,
     pub headers: http::HeaderMap,
-    pub body: Bytes,
+    pub body: OutBody,
     /// What must never be reflected back into the box (injected secrets and their rendering).
     pub injected: Vec<String>,
+}
+
+/// A request body on its way upstream.
+pub(crate) enum OutBody {
+    /// Read whole (GET and HEAD, which must be empty; requests that arrived over HTTP/3).
+    Buffered(Bytes),
+    /// Streamed from the box as it arrives, never held whole (#142), within [`MAX_STREAMED_BODY`].
+    Streamed(reqwest::Body),
+}
+
+impl OutBody {
+    /// The whole body, if it was read whole.
+    pub(crate) fn buffered(&self) -> Option<&Bytes> {
+        match self {
+            OutBody::Buffered(b) => Some(b),
+            OutBody::Streamed(_) => None,
+        }
+    }
 }
 
 /// A byte stream to the control host (one tunnel over the node's control channel).
@@ -124,8 +155,19 @@ impl Egress {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(15))
+            // HTTP/2 where the upstream offers it (ALPN), else HTTP/1.1; one pooled HTTP/2 connection
+            // per host carries many box connections' requests (#142). Fixed windows large enough for
+            // a far upstream (8 MiB at 100 ms is 80 MB/s per stream) and 1 MiB frames: hyper's
+            // adaptive window measured at less than half the download rate, and 16 KiB frames cost
+            // CPU on both ends (docs/performance.md).
+            .http2_initial_stream_window_size(H2_STREAM_WINDOW)
+            .http2_initial_connection_window_size(H2_CONN_WINDOW)
+            .http2_max_frame_size(H2_MAX_FRAME)
             // Every name is resolved by wicket and dialled only at checked, public addresses (#116).
             .dns_resolver(Arc::new(crate::dial::PublicResolver(upstream.lookup())));
+        if upstream.http1_only {
+            b = b.http1_only();
+        }
         for (host, addr) in &upstream.resolve {
             b = b.resolve(host, *addr);
         }
@@ -238,8 +280,9 @@ impl Egress {
     }
 
     /// The reach rule that allows `host` wholesale, if this connection may be spliced through (#62):
-    /// the decider says so, and nothing is swapped in for the host.
-    fn splice_rule(&self, host: &str) -> Option<usize> {
+    /// the decider says so (on a node, only while its policy is fresh, #141), and nothing is swapped
+    /// in for the host. Asked at CONNECT and again every few seconds while a spliced connection lasts.
+    pub(crate) fn splice_rule(&self, host: &str) -> Option<usize> {
         if self.ctx.swaps.iter().any(|s| host_matches(&s.host, host)) {
             return None;
         }
@@ -595,7 +638,9 @@ impl Egress {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let out = self.prepare(req, host, scheme, pq).await?;
+        // Over HTTP/3 the request may be re-sent over HTTP/2 if the HTTP/3 connection is gone, so its
+        // body is read whole; otherwise it streams.
+        let out = self.prepare(req, host, scheme, pq, via != Via::H3).await?;
         if via == Via::H3 && scheme == "https" && !self.upstream.no_h3 {
             if let Some(up) = self.h3_up().await {
                 if let Some(r) = up.try_send(host, &out).await {
@@ -603,15 +648,18 @@ impl Egress {
                 }
             }
         }
-        let mut rb = self.client.request(out.method.clone(), &out.url).headers(out.headers.clone());
-        rb = rb.body(out.body.clone());
-        let resp = rb.send().await?;
+        let Outgoing { method, url, headers, body, injected } = out;
+        let body = match body {
+            OutBody::Buffered(b) => reqwest::Body::from(b),
+            OutBody::Streamed(b) => b,
+        };
+        let resp = self.client.request(method, &url).headers(headers).body(body).send().await?;
         let mut head = Response::builder().status(StatusCode::from_u16(resp.status().as_u16())?);
         for (name, value) in resp.headers().iter() {
             head = head.header(name, value);
         }
         let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-        Ok(self.clean(head.body(BodyExt::boxed(StreamBody::new(stream)))?, &out.injected))
+        Ok(self.clean(head.body(BodyExt::boxed(StreamBody::new(stream)))?, &injected))
     }
 
     /// The HTTP/3 upstream (made on first use); None if its UDP socket can't be had.
@@ -630,13 +678,14 @@ impl Egress {
             .clone()
     }
 
-    /// Drops hop-by-hop and stripped response headers, and any that would reflect an injected
-    /// credential back into the box.
+    /// Drops hop-by-hop response headers, and any that would reflect an injected credential back into
+    /// the box. `content-length` stays: the body passes through unchanged (#142), so clients keep
+    /// download sizes and progress.
     fn clean(&self, resp: Response<BoxBody>, injected: &[String]) -> Response<BoxBody> {
         let (mut parts, body) = resp.into_parts();
         let names: Vec<http::HeaderName> = parts.headers.keys().cloned().collect();
         for name in names {
-            if STRIP_RESPONSE.contains(&name.as_str()) {
+            if HOP_BY_HOP.contains(&name.as_str()) {
                 parts.headers.remove(&name);
                 continue;
             }
@@ -652,8 +701,10 @@ impl Egress {
         Response::from_parts(parts, body)
     }
 
-    /// Reads the body (bounded), strips the box's credentials and headers, and injects the zone's.
-    async fn prepare<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str) -> Result<Outgoing>
+    /// Strips the box's credentials and headers, injects the zone's, and readies the body: streamed
+    /// if `stream` (keeping the request's `content-length`), else read whole (bounded). GET and HEAD
+    /// are always read, and refused if they carry a body.
+    async fn prepare<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, stream: bool) -> Result<Outgoing>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -661,11 +712,7 @@ impl Egress {
         let (parts, body) = req.into_parts();
         // What the box put in Authorization: only ever a placeholder, to be swapped (below) or dropped.
         let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
-        let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let url = format!("{scheme}://{host}{pq}");
-        if matches!(parts.method, Method::GET | Method::HEAD) && !body.is_empty() {
-            anyhow::bail!("refused: a {} request with a body", parts.method);
-        }
         // Only allow-listed headers go upstream (#130); credentials are added below, by wicket.
         let mut headers = http::HeaderMap::new();
         for (name, value) in parts.headers.iter() {
@@ -673,6 +720,33 @@ impl Egress {
                 headers.append(name.clone(), value.clone());
             }
         }
+        let body = if stream && !matches!(parts.method, Method::GET | Method::HEAD) {
+            // The length the box declared goes upstream as declared (hyper has already checked it
+            // is one well-formed number, and holds the body to it); without one, chunked.
+            let length = match parts.headers.get(http::header::CONTENT_LENGTH) {
+                None => None,
+                Some(v) => Some(
+                    v.to_str()
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .ok_or_else(|| anyhow::anyhow!("refused: a malformed content-length"))?,
+                ),
+            };
+            if let Some(n) = length.filter(|n| *n > MAX_STREAMED_BODY) {
+                anyhow::bail!("refused: a {n}-byte request body (the limit is {MAX_STREAMED_BODY})");
+            }
+            if let Some(n) = length {
+                headers.insert(http::header::CONTENT_LENGTH, n.into());
+            }
+            let limited = Limited::new(body, usize::try_from(MAX_STREAMED_BODY).unwrap_or(usize::MAX));
+            OutBody::Streamed(reqwest::Body::wrap_stream(limited.into_data_stream()))
+        } else {
+            let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
+            if matches!(parts.method, Method::GET | Method::HEAD) && !body.is_empty() {
+                anyhow::bail!("refused: a {} request with a body", parts.method);
+            }
+            OutBody::Buffered(body)
+        };
         // Inject the zone's credential for this host into its one declared slot. An optional rule
         // whose secret isn't set sends the request without it (e.g. anonymous reads).
         let mut injected: Vec<String> = Vec::new();
@@ -813,7 +887,7 @@ mod tests {
         if let Some(a) = auth {
             b = b.header("authorization", a);
         }
-        e.prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), host, "https", "/x").await
+        e.prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), host, "https", "/x", true).await
     }
 
     /// Whatever a zone says, the proxy never attaches a secret to a host it isn't bound to.
@@ -892,16 +966,16 @@ mod tests {
                 .body(empty())
                 .unwrap()
         };
-        let gh = e.prepare(req(), "api.github.com", "https", "/x").await.unwrap();
+        let gh = e.prepare(req(), "api.github.com", "https", "/x", true).await.unwrap();
         let names: Vec<&str> = gh.headers.keys().map(|k| k.as_str()).collect();
         assert_eq!(names, ["accept", "content-type", "git-protocol", "x-github-api-version"], "{names:?}");
-        let other = e.prepare(req(), "example.com", "https", "/x").await.unwrap();
+        let other = e.prepare(req(), "example.com", "https", "/x", true).await.unwrap();
         assert!(!other.headers.contains_key("x-github-api-version") && !other.headers.contains_key("anthropic-beta"));
-        let ant = e.prepare(req(), "api.anthropic.com", "https", "/x").await.unwrap();
+        let ant = e.prepare(req(), "api.anthropic.com", "https", "/x", true).await.unwrap();
         assert!(ant.headers.contains_key("anthropic-beta") && !ant.headers.contains_key("x-github-api-version"));
         // A GET body that arrives without framing headers (HTTP/3) is caught when it is read.
         let get = http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::from_static(b"x"))).unwrap();
-        assert!(e.prepare(get, "api.github.com", "https", "/x").await.is_err());
+        assert!(e.prepare(get, "api.github.com", "https", "/x", true).await.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
