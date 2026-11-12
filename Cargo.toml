@@ -61,6 +61,7 @@ wicket-proxy = { path = "crates/wicket-proxy" }
 wicket-sandbox = { path = "crates/wicket-sandbox" }
 wicket-agent = { path = "crates/wicket-agent" }
 wicket-feed = { path = "crates/wicket-feed" }
+wicket-authz = { path = "crates/wicket-authz" }
 wicket-placement = { path = "crates/wicket-placement" }
 
 [profile.release]

@@ -50,7 +50,9 @@ that, `Loaded::decide(&Request)` returns `Allow`, `NeedsGrant` or `Forbidden` fo
   took 308 steps compiled and 5,597 in the generic engine. A token at every cap is cut off at the
   budget, in about 0.1 ms.
 - **Grant blocks travel in-process only.** `SignedGrant` has no `from_bytes`: Biscuit has no parser
-  for a lone third-party block, so an out-of-process approver needs one first.
+  for a lone third-party block. The feed doesn't need one. The control host signs grants and appends
+  them, then publishes the whole token (`wicket-feed`'s `token.rs`). An out-of-process approver will
+  need the parser.
 
 ## Tests
 

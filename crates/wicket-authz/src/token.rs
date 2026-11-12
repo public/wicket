@@ -132,7 +132,8 @@ impl GrantRequest {
 
 /// A grant block signed by an approver, as sent back to the node. (Biscuit has no parser for a
 /// lone third-party block, so an out-of-process approver's reply needs one before this can cross a
-/// process boundary; today approver and node share the process.)
+/// process boundary. The feed doesn't: the control host, which holds the approver key, appends
+/// grants itself and publishes the whole token, `wicket_feed::token`.)
 pub struct SignedGrant(ThirdPartyBlock);
 
 impl SignedGrant {

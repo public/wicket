@@ -1,0 +1,347 @@
+//! Boxes' authority as Biscuit token chains in the feed (#57 step 4; #76, design A).
+//!
+//! The feed's entries are [`BoxAuthority`] records, one per box (keyed by run id), each carrying the
+//! box's whole token: block 0 (the zone's ceiling, minted with the authority root key on the control
+//! plane), a spawn block per ancestor link below it, and a third-party grant block per live grant. A
+//! node loads each token once, when the delta carrying it applies ([`Policy::compile`]):
+//! signatures against the pinned authority root, every block's revocation id against the feed's
+//! revocation list, the strict structural check, then the fork's prepared and compiled evaluator
+//! with its step budget (`wicket_authz::load`). Requests are decided by `wicket_authz`'s decision
+//! (Allow / NeedsGrant / Forbidden), mapped onto the feed's fail-narrow modes
+//! ([`Replica::<BoxAuthority>::decide`]).
+//!
+//! - **What the token decides, and what it doesn't.** Every allow comes from the token. The record's
+//!   [`BoxAuthority::zone`] (the zone block 0 was minted from) is used only for things that can't
+//!   widen authority: the pre-TLS host verdict (an early refusal), which hosts the node forwards to
+//!   the control host (injected credentials), and the run's limits. A zone that disagrees with the
+//!   token can only refuse more.
+//! - **Grants** are the token's own third-party blocks. The record's [`BoxAuthority::grants`] carries
+//!   what the token can't: each grant's use cap (counted on the node, `uses.log`), and the request it
+//!   names, used only to pick which grant to try. The token's grant rule needs a `uses_left` fact,
+//!   which the node supplies for one candidate at a time, so a grant the record doesn't list never
+//!   fires, and the node knows exactly which grant an allow consumed.
+//! - **Revocation.** A `Revoke { kind: Token, id }` names a block's revocation id (hex). It refuses
+//!   every token containing that block: revoking a spawn block revokes the box it started and every
+//!   box below it. Held revocations are checked when a token loads; a revocation that arrives later
+//!   invalidates already-loaded tokens as its delta applies ([`Policy::revoked_by`]). Revoking a
+//!   grant by its id (`kind: Grant`) stops that grant only.
+//! - **Shipping grants.** `wicket_authz::SignedGrant` has no parser (the fork can't read a lone
+//!   third-party block), so grant blocks never travel alone: the control host, which holds the
+//!   approver key, appends them and publishes the whole token ([`Issuer::publish`]). It rebuilds the
+//!   token from its unchanged base (block 0 and spawn blocks) with the live grants each time they
+//!   change, so dead grants drop out, the chain stays under the block cap, and the base's revocation
+//!   ids (what subtree revocation names) never change.
+
+use crate::format::RevokeKind;
+use crate::replica::{Allowed, Decision, Mode, Replica};
+use crate::state::Policy;
+use crate::NARROW_MAX_RISK;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use wicket_authz as authz;
+use wicket_core::{CompiledZone, HostVerdict, Op, ZoneSpec};
+
+/// The most grants one box's token carries: the structural block cap less block 0 and room for five
+/// spawn links (the design's depth).
+pub const MAX_GRANTS: usize = 10;
+
+/// One box's authority, as the feed carries it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoxAuthority {
+    /// The box's run id: the entry's key.
+    pub run: String,
+    /// The box's path in its spawn tree (`run_a`, `run_a/run_b`): the `box` fact the token checks.
+    pub box_path: String,
+    /// The box's epoch, the `epoch` fact grants are bound to.
+    pub epoch: i64,
+    /// The zone block 0 was minted from (see the module docs: never used to allow).
+    pub zone: ZoneSpec,
+    /// The serialized token, base64url.
+    pub token: String,
+    /// The grants the token carries.
+    #[serde(default)]
+    pub grants: Vec<TokenGrant>,
+}
+
+/// What the node needs to know about one of a token's grants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenGrant {
+    /// The grant id (the block's `approved` gid).
+    pub id: String,
+    pub host: String,
+    pub method: String,
+    pub path: String,
+    /// At most this many uses, counted on this node. `None`: until the grant expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<u32>,
+}
+
+/// A loaded token, and the zone's compiled form for host verdicts.
+pub struct CompiledAuthority {
+    pub loaded: authz::Loaded,
+    pub zone: CompiledZone,
+    /// Every block's revocation id, hex, in block order.
+    pub ids: Vec<String>,
+}
+
+/// A block revocation id as the feed names it.
+pub fn revocation_id(id: &[u8]) -> String {
+    hex::encode(id)
+}
+
+impl BoxAuthority {
+    pub fn token_bytes(&self) -> Result<Vec<u8>, String> {
+        B64.decode(&self.token).map_err(|e| format!("token encoding: {e}"))
+    }
+}
+
+impl Policy for BoxAuthority {
+    type Compiled = CompiledAuthority;
+    /// The authority root's public key, pinned on the node.
+    type Ctx = authz::PublicKey;
+
+    fn zone_name(&self) -> &str {
+        &self.run
+    }
+
+    fn compile(&self, root: &authz::PublicKey, revoked: &dyn Fn(RevokeKind, &str) -> bool) -> Result<CompiledAuthority, String> {
+        if self.run.is_empty() || self.run.contains('/') {
+            return Err(format!("bad run id {:?}", self.run));
+        }
+        // The node knows the run from the transport; the box path must end in it, so a record can't
+        // file one box's token under another box's run.
+        if self.box_path != self.run && !self.box_path.ends_with(&format!("/{}", self.run)) {
+            return Err(format!("box path {} is not run {}'s", self.box_path, self.run));
+        }
+        if self.grants.len() > MAX_GRANTS {
+            return Err(format!("{} grants (cap {MAX_GRANTS})", self.grants.len()));
+        }
+        let mut ids: Vec<&str> = self.grants.iter().map(|g| g.id.as_str()).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|w| w[0] == w[1]) {
+            return Err("a grant id is listed twice".into());
+        }
+        let bytes = self.token_bytes()?;
+        let loaded = authz::load(&bytes, root, &|id| revoked(RevokeKind::Token, &revocation_id(id))).map_err(|e| e.to_string())?;
+        let ids = loaded.revocation_ids().iter().map(|i| revocation_id(i)).collect();
+        let zone = CompiledZone::new(self.zone.clone()).map_err(|e| format!("zone {}: {e}", self.zone.name))?;
+        Ok(CompiledAuthority { loaded, zone, ids })
+    }
+
+    fn revoked_by(c: &CompiledAuthority, kind: RevokeKind, id: &str) -> bool {
+        kind == RevokeKind::Token && c.ids.iter().any(|i| i == id)
+    }
+}
+
+/// The request the token decides for `op`: every field from the node (its clock, the box's record,
+/// the transport's attribution of the op), never from the box. No credential is injected on a node,
+/// so `inject` is always empty.
+fn request(spec: &BoxAuthority, op: &Op, now_ms: i64) -> authz::Request {
+    authz::Request {
+        time: u64::try_from(now_ms.div_euclid(1000)).unwrap_or(0),
+        tenant: op.tenant.0.clone(),
+        box_id: spec.box_path.clone(),
+        epoch: spec.epoch,
+        action: authz::Action::from_op(op, None),
+        uses_left: vec![],
+    }
+}
+
+/// The reason shown to people (`wicket pending`, the agent's 403): the zone's own wording when the
+/// zone agrees with the token's decision, else the token's failed checks.
+fn reason(c: &CompiledAuthority, op: &Op, forbidden: bool, token: String) -> String {
+    match c.zone.evaluate(op) {
+        wicket_core::Verdict::Forbidden(why) if forbidden => why,
+        wicket_core::Verdict::NeedsGrant(why) if !forbidden => why,
+        _ => token,
+    }
+}
+
+/// What a token decision found, before the replica records a use (which needs it mutably).
+enum Found {
+    Done(Decision),
+    Grant { id: String, counted: bool },
+}
+
+impl Replica<BoxAuthority> {
+    /// The decision for one op at `now`, from the box's token:
+    ///
+    /// | token says | fresh | narrow |
+    /// |---|---|---|
+    /// | Allow (by its ceilings) | allow | allow at risk ≤ R1, else refused |
+    /// | NeedsGrant | try each live listed grant for this request; allow on the first the token accepts (one use consumed), else NeedsGrant | refused (grants aren't honoured while stale) |
+    /// | Forbidden | forbidden | forbidden |
+    ///
+    /// Closed refuses everything; a revoked run, a box with no record, a token that didn't load or
+    /// was revoked, and an op for another zone are forbidden.
+    pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
+        let found = match self.gate(op, now) {
+            Err(d) => Found::Done(d),
+            Ok((mode, st)) => {
+                let refused = |why: String| Decision::Refused { mode, why };
+                match st.zones.get(&op.run.0) {
+                    None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
+                    Some(entry) => match &entry.compiled {
+                        Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
+                        Ok(_) if entry.spec.zone.name != op.zone => Found::Done(Decision::Forbidden(format!(
+                            "op for zone {}, but box {} holds authority for zone {}",
+                            op.zone, op.run, entry.spec.zone.name
+                        ))),
+                        Ok(c) => {
+                            let mut req = request(&entry.spec, op, now);
+                            match c.loaded.decide(&req) {
+                                authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
+                                authz::Decision::Allow if mode == Mode::Fresh || op.risk <= NARROW_MAX_RISK => {
+                                    Found::Done(Decision::Allow(Allowed::Ceiling))
+                                }
+                                authz::Decision::Allow => Found::Done(refused(format!("narrow: {:?} needs fresh policy", op.risk))),
+                                authz::Decision::NeedsGrant(r) if mode != Mode::Fresh => {
+                                    let r = reason(c, op, false, r);
+                                    Found::Done(refused(format!("narrow: grants are not honoured while stale ({r})")))
+                                }
+                                authz::Decision::NeedsGrant(r) => {
+                                    let r = reason(c, op, false, r);
+                                    let candidates = entry.spec.grants.iter().filter(|g| {
+                                        g.host.eq_ignore_ascii_case(&op.host)
+                                            && g.method.eq_ignore_ascii_case(&op.method)
+                                            && g.path == op.path
+                                            && !st.is_revoked(RevokeKind::Grant, &g.id)
+                                            && g.uses.is_none_or(|max| self.uses(&g.id) < max)
+                                    });
+                                    let mut hit = None;
+                                    for g in candidates {
+                                        let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
+                                        req.uses_left = vec![(g.id.clone(), left)];
+                                        if c.loaded.decide(&req) == authz::Decision::Allow {
+                                            hit = Some(Found::Grant { id: g.id.clone(), counted: g.uses.is_some() });
+                                            break;
+                                        }
+                                    }
+                                    hit.unwrap_or(Found::Done(Decision::NeedsGrant(r)))
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        };
+        match found {
+            Found::Done(d) => d,
+            Found::Grant { id, counted } => {
+                if counted {
+                    if let Err(e) = self.record_use(&id) {
+                        return Decision::Refused { mode: Mode::Fresh, why: e };
+                    }
+                }
+                Decision::Allow(Allowed::Grant(id))
+            }
+        }
+    }
+
+    /// The verdict on a host before any request to it (and before TLS), from the zone the box's
+    /// token was minted from: an early refusal only (see the module docs). A box with no record, or
+    /// whose token didn't load, gets `Open`: its requests are then refused one by one by
+    /// [`Self::decide`].
+    pub fn host_verdict(&self, run: &str, host: &str) -> HostVerdict {
+        match self.state().and_then(|s| s.zones.get(run)).map(|z| &z.compiled) {
+            Some(Ok(c)) => c.zone.host_verdict(host),
+            _ => HostVerdict::Open,
+        }
+    }
+
+    /// The zone a box's authority was minted from, if the node holds it.
+    pub fn zone_of(&self, run: &str) -> Option<&ZoneSpec> {
+        self.state().and_then(|s| s.zones.get(run)).map(|z| &z.spec.zone)
+    }
+}
+
+/// The control plane's side of one box's authority: the base token (block 0 and spawn blocks),
+/// which never changes, and how to publish it with the box's live grants.
+#[derive(Clone)]
+pub struct Issuer {
+    pub base: authz::Token,
+    pub run: String,
+    pub box_path: String,
+    pub epoch: i64,
+    pub zone: ZoneSpec,
+}
+
+/// One grant to publish: what the token says, and its use cap.
+#[derive(Clone, Debug)]
+pub struct LiveGrant {
+    pub grant: authz::Grant,
+    pub uses: Option<u32>,
+}
+
+impl Issuer {
+    /// A top-level box: block 0 minted by `root` with the zone's ceiling, until `not_after` (Unix
+    /// seconds), accepting grants signed by `grant_keys`. `images` are added to the images the box
+    /// may start children from (its own image, which the zone doesn't name).
+    #[allow(clippy::too_many_arguments)]
+    pub fn root(
+        root: &authz::SigningKey,
+        tenant: &str,
+        principal: &str,
+        run: &str,
+        epoch: i64,
+        zone: &ZoneSpec,
+        images: &[String],
+        not_after: u64,
+        grant_keys: Vec<authz::PublicKey>,
+    ) -> Result<Issuer, authz::AuthzError> {
+        let mut c = authz::Ceiling::from_zone(zone, run, not_after, grant_keys)?;
+        c.spawn.images.extend(images.iter().cloned());
+        let base = authz::mint(root, tenant, principal, &c)?;
+        Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone() })
+    }
+
+    /// A child box started by this one, in `zone`: this box's base token plus a spawn block with the
+    /// child's ceiling. Whatever the ceiling says, the child holds at most what this box holds.
+    pub fn child(&self, run: &str, epoch: i64, zone: &ZoneSpec, ceiling: &authz::Ceiling) -> Result<Issuer, authz::AuthzError> {
+        let box_path = format!("{}/{run}", self.box_path);
+        if ceiling.box_prefix != box_path {
+            return Err(authz::AuthzError::Ceiling(format!("a child of {} must be bounded to {box_path}", self.box_path)));
+        }
+        Ok(Issuer { base: self.base.attenuate(ceiling)?, run: run.into(), box_path, epoch, zone: zone.clone() })
+    }
+
+    /// The base token's revocation ids (hex), in block order. The last one is this box's own link:
+    /// revoking it revokes this box and every box below it.
+    pub fn block_ids(&self) -> Vec<String> {
+        self.base.revocation_ids().iter().map(|i| revocation_id(i)).collect()
+    }
+
+    /// The record to publish: the base token with one grant block per live grant, signed by
+    /// `approver`. Each grant is bound to this box and epoch whatever it says.
+    pub fn publish(&self, approver: &authz::SigningKey, grants: &[LiveGrant]) -> Result<BoxAuthority, authz::AuthzError> {
+        if grants.len() > MAX_GRANTS {
+            return Err(authz::AuthzError::Structure(format!("{} grants (cap {MAX_GRANTS})", grants.len())));
+        }
+        let mut token = self.base.clone();
+        let mut listed = Vec::with_capacity(grants.len());
+        for g in grants {
+            let mut grant = g.grant.clone();
+            grant.box_id = self.box_path.clone();
+            grant.epoch = self.epoch;
+            token = authz::grant(&token, approver, &grant)?;
+            listed.push(TokenGrant {
+                id: grant.gid.clone(),
+                host: grant.host.to_ascii_lowercase(),
+                method: grant.method.to_ascii_uppercase(),
+                path: grant.path.clone(),
+                uses: g.uses,
+            });
+        }
+        Ok(BoxAuthority {
+            run: self.run.clone(),
+            box_path: self.box_path.clone(),
+            epoch: self.epoch,
+            zone: self.zone.clone(),
+            token: B64.encode(token.to_bytes()?),
+            grants: listed,
+        })
+    }
+}

@@ -88,9 +88,11 @@ fn check_cert(root: &VerifyingKey, key: &SigningKey, cert_jws: &str, cfg: &Publi
     Ok(cert)
 }
 
-impl<P: Policy> Publisher<P> {
-    /// Opens (or creates) the feed for node `feed` in `dir`, replaying its delta log. `cert_jws` is the
-    /// root-signed certificate for `key`; a higher version than the log's is a re-genesis.
+impl<P: Policy> Publisher<P>
+where
+    P::Ctx: Default,
+{
+    /// [`Publisher::open_with`] for payloads that compile without context ([`wicket_core::ZoneSpec`]).
     pub fn open(
         dir: &Path,
         feed: &str,
@@ -99,10 +101,29 @@ impl<P: Policy> Publisher<P> {
         cert_jws: &str,
         cfg: PublisherConfig,
     ) -> Result<Publisher<P>, PublishError> {
+        Self::open_with(dir, feed, root, key, cert_jws, cfg, P::Ctx::default())
+    }
+}
+
+impl<P: Policy> Publisher<P> {
+    /// Opens (or creates) the feed for node `feed` in `dir`, replaying its delta log. `cert_jws` is the
+    /// root-signed certificate for `key`; a higher version than the log's is a re-genesis. `ctx` is
+    /// what compiling an entry needs (for tokens, their root key): every entry committed is compiled
+    /// first, as a node will, and refused if it doesn't.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with(
+        dir: &Path,
+        feed: &str,
+        root: &VerifyingKey,
+        key: SigningKey,
+        cert_jws: &str,
+        cfg: PublisherConfig,
+        ctx: P::Ctx,
+    ) -> Result<Publisher<P>, PublishError> {
         let cert = check_cert(root, &key, cert_jws, &cfg)?;
         std::fs::create_dir_all(dir)?;
         let path = dir.join(DELTAS);
-        let mut state = State::genesis(cert.version);
+        let mut state = State::genesis(cert.version, ctx);
         let mut heads = vec![GENESIS.to_string()];
         let mut log = vec![];
         let mut gen_start = 0;
@@ -198,7 +219,8 @@ impl<P: Policy> Publisher<P> {
                 }
             }
             if let Change::PutZone { zone } = c {
-                zone.compile().map_err(|e| PublishError::Invalid(format!("zone {}: {e}", zone.zone_name())))?;
+                let revoked = |k, id: &str| self.state.is_revoked(k, id);
+                zone.compile(&self.state.ctx, &revoked).map_err(|e| PublishError::Invalid(format!("zone {}: {e}", zone.zone_name())))?;
             }
         }
         let d = Delta {

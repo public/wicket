@@ -55,6 +55,10 @@ pub struct Paths {
     pub ca_key: PathBuf,
     /// The feed root key (its public half is beside it, `.pub`).
     pub feed_root_key: PathBuf,
+    /// The authority root key (#76): signs block 0 of every box's token. Nodes pin its public half.
+    pub authz_root_key: PathBuf,
+    /// The approval service's key: signs grant blocks. Tokens name it; nodes needn't know it.
+    pub approver_key: PathBuf,
 }
 
 impl Paths {
@@ -64,8 +68,18 @@ impl Paths {
             nodes_dir: crate::data_dir().join("nodes"),
             ca_key: id.with_file_name("ca.key"),
             feed_root_key: id.with_file_name("feed-root.key"),
+            authz_root_key: id.with_file_name("authz-root.key"),
+            approver_key: id.with_file_name("approver.key"),
         }
     }
+}
+
+/// A token signing key (the authority root or the approver), created on first use like the feed
+/// root (hex seed, mode 0600, public half in `<path>.pub`). Separate from the feed root, so feed
+/// signing and authority can be rotated apart.
+pub fn token_key(path: &std::path::Path) -> Result<wicket_authz::SigningKey> {
+    let k = wicket_identity::load_or_create_feed_root_signing(path)?;
+    Ok(wicket_authz::SigningKey::from_bytes(&k.to_bytes())?)
 }
 
 /// Node names: what ledgers, aliases, certificate subjects and directories are keyed by.
@@ -280,6 +294,7 @@ fn node_files(
     ca: &InstallationCa,
     cert: &NodeCaCert,
     feed_root: &wicket_identity::VerifyingKey,
+    authz_root: &wicket_authz::PublicKey,
     info: serde_json::Value,
     node_pub: Option<&str>,
     node_cert: &str,
@@ -291,6 +306,7 @@ fn node_files(
         ("ca-chain.pem", format!("{}{}", cert.pem, ca.cert_pem())),
         ("root.pem", ca.cert_pem().to_string()),
         ("feed-root.pub", hex::encode(feed_root.to_bytes())),
+        ("authz-root.pub", authz_root.to_hex()),
         ("issuer.pub.json", serde_json::to_string_pretty(&issuer.public_jwk())?),
         ("node.json", serde_json::to_string_pretty(&info)?),
     ];
@@ -374,6 +390,7 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     // Everything the control host needs, before touching the node.
     let ca = InstallationCa::load_or_create(&paths.ca_key)?;
     let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
+    let authz_root = token_key(&paths.authz_root_key)?.public();
     let issuer = crate::issuer()?;
 
     let scanned = match &spec {
@@ -443,7 +460,7 @@ pub async fn enrol(o: EnrolOpts) -> Result<()> {
     )?;
     let info = serde_json::json!({ "name": name, "node_key": row.node_key, "hosts": cert.permitted, "ca_serial": cert.serial,
                                    "ca_not_after": cert.not_after, "enrolled_at": now });
-    let script = install_script(&node_files(&ca, &cert, &feed_root, info, Some(&node_pub_pem), &node_cert)?, true)?;
+    let script = install_script(&node_files(&ca, &cert, &feed_root, &authz_root, info, Some(&node_pub_pem), &node_cert)?, true)?;
     node.script("installing the node files", &script).await.with_context(|| {
         format!("node {name} is recorded and its CA (serial {}) issued, but installing it on the node failed: fix that and run `wicket node renew-ca {name}`, or `wicket node revoke {name}`", cert.serial)
     })?;
@@ -478,6 +495,7 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
     };
     let ca = InstallationCa::load_or_create(&paths.ca_key)?;
     let feed_root = wicket_identity::load_or_create_feed_root(&paths.feed_root_key)?;
+    let authz_root = token_key(&paths.authz_root_key)?.public();
     let node = pinned_node(&paths.nodes_dir, &row, None)?;
     let generated = parse_generated(&node.script("generating a new CA key", &keygen_script(name, false)).await?, false)?;
     let cert = ca.issue_node_ca(&generated.csr_pem, name, &hosts, ttl)?;
@@ -493,9 +511,12 @@ pub async fn renew_ca(name: &str, hosts: Vec<String>, ca_ttl: Duration, cert_ttl
     )?;
     let info = serde_json::json!({ "name": name, "node_key": row.node_key, "hosts": cert.permitted, "ca_serial": cert.serial,
                                    "ca_not_after": cert.not_after, "enrolled_at": row.enrolled_at });
-    node.script("installing the node files", &install_script(&node_files(&ca, &cert, &feed_root, info, None, &node_cert)?, false)?)
-        .await
-        .with_context(|| {
+    node.script(
+        "installing the node files",
+        &install_script(&node_files(&ca, &cert, &feed_root, &authz_root, info, None, &node_cert)?, false)?,
+    )
+    .await
+    .with_context(|| {
         format!(
             "CA serial {} is recorded for node {name}, but installing it failed (the node keeps its old CA): run renew-ca again",
             cert.serial

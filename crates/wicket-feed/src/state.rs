@@ -8,33 +8,37 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use wicket_core::{CompiledZone, Op, Verdict, ZoneSpec};
 
-/// A zone's policy as the feed carries it. Today it is a [`ZoneSpec`]; #76's capability tokens
-/// replace it behind this trait without changing the feed, the replica or the publisher.
+/// A policy entry as the feed carries it: a zone's [`ZoneSpec`] (the original payload, kept as the
+/// differential oracle), or a box's capability token ([`crate::token::BoxAuthority`], what nodes
+/// decide with). The feed, the replica and the publisher don't depend on which.
 pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     /// The policy in the form decisions use, built once when an update is applied.
     type Compiled;
-    /// The zone it is for: the key in [`State::zones`].
+    /// What compiling needs besides the entry itself (a token's root key), held by the [`State`].
+    type Ctx: Clone;
+    /// The entry's key in [`State::zones`]: the zone's name, or the box's run id.
     fn zone_name(&self) -> &str;
-    /// Prepares the policy for decisions. An error is kept, not refused (refusing a signed delta
-    /// would desynchronise the chain): such a zone forbids everything.
-    fn compile(&self) -> Result<Self::Compiled, String>;
-    /// The verdict for one op.
-    fn evaluate(compiled: &Self::Compiled, op: &Op) -> Verdict;
+    /// Prepares the policy for decisions. `revoked` answers for revocations already held. An error
+    /// is kept, not refused (refusing a signed delta would desynchronise the chain): such an entry
+    /// forbids everything.
+    fn compile(&self, ctx: &Self::Ctx, revoked: &dyn Fn(RevokeKind, &str) -> bool) -> Result<Self::Compiled, String>;
+    /// Whether a revocation applied after compiling invalidates the compiled entry (a token
+    /// containing a revoked block). It then forbids everything, as if it had failed to compile.
+    fn revoked_by(_compiled: &Self::Compiled, _kind: RevokeKind, _id: &str) -> bool {
+        false
+    }
 }
 
 impl Policy for ZoneSpec {
     type Compiled = CompiledZone;
+    type Ctx = ();
 
     fn zone_name(&self) -> &str {
         &self.name
     }
 
-    fn compile(&self) -> Result<CompiledZone, String> {
+    fn compile(&self, _: &(), _: &dyn Fn(RevokeKind, &str) -> bool) -> Result<CompiledZone, String> {
         CompiledZone::new(self.clone()).map_err(|e| e.to_string())
-    }
-
-    fn evaluate(compiled: &CompiledZone, op: &Op) -> Verdict {
-        compiled.evaluate(op)
     }
 }
 
@@ -44,16 +48,11 @@ pub struct Zone<P: Policy> {
     pub compiled: Result<P::Compiled, String>,
 }
 
-impl<P: Policy> Zone<P> {
-    fn new(spec: P) -> Zone<P> {
-        let compiled = spec.compile();
-        Zone { spec, compiled }
-    }
-
+impl Zone<ZoneSpec> {
     /// The verdict for one op; `Forbidden` if the policy didn't compile.
     pub fn evaluate(&self, op: &Op) -> Verdict {
         match &self.compiled {
-            Ok(c) => P::evaluate(c, op),
+            Ok(c) => c.evaluate(op),
             Err(e) => Verdict::Forbidden(format!("this zone's policy is invalid: {e}")),
         }
     }
@@ -61,6 +60,8 @@ impl<P: Policy> Zone<P> {
 
 /// Zone policies, grants, revocations and the epoch and head they are at.
 pub struct State<P: Policy> {
+    /// What compiling an entry needs.
+    pub ctx: P::Ctx,
     pub version: u64,
     pub epoch: u64,
     pub head: String,
@@ -73,8 +74,9 @@ pub struct State<P: Policy> {
 
 impl<P: Policy> State<P> {
     /// The empty state at epoch 0.
-    pub fn genesis(version: u64) -> State<P> {
+    pub fn genesis(version: u64, ctx: P::Ctx) -> State<P> {
         State {
+            ctx,
             version,
             epoch: 0,
             head: GENESIS.into(),
@@ -106,7 +108,9 @@ impl<P: Policy> State<P> {
     fn change(&mut self, c: &Change<P>) {
         match c {
             Change::PutZone { zone } => {
-                self.zones.insert(zone.zone_name().to_string(), Zone::new(zone.clone()));
+                let revoked = |k: RevokeKind, id: &str| self.revoked.contains_key(&(k, id.to_string()));
+                let compiled = zone.compile(&self.ctx, &revoked);
+                self.zones.insert(zone.zone_name().to_string(), Zone { spec: zone.clone(), compiled });
             }
             Change::DropZone { name } => {
                 self.zones.remove(name);
@@ -124,6 +128,11 @@ impl<P: Policy> State<P> {
                 self.revoked.insert((*kind, id.clone()), *until);
                 if *kind == RevokeKind::Grant {
                     self.drop_grant(id);
+                }
+                for z in self.zones.values_mut() {
+                    if z.compiled.as_ref().is_ok_and(|c| P::revoked_by(c, *kind, id)) {
+                        z.compiled = Err(format!("revoked ({kind:?} {id})").to_lowercase());
+                    }
                 }
             }
         }
@@ -170,8 +179,8 @@ impl<P: Policy> State<P> {
         }
     }
 
-    pub fn from_snapshot(s: &Snapshot<P>) -> State<P> {
-        let mut st = State::genesis(s.version);
+    pub fn from_snapshot(s: &Snapshot<P>, ctx: P::Ctx) -> State<P> {
+        let mut st = State::genesis(s.version, ctx);
         st.epoch = s.epoch;
         st.head = s.head.clone();
         for r in &s.revoked {
