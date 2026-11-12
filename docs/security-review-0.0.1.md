@@ -41,7 +41,7 @@ Severity:
 
 | Severity | Count | Where |
 |---|---|---|
-| critical | 2 | reported privately to the maintainers (below) |
+| critical | 2 | withheld until fixed |
 | high | 9 | #111–#119 |
 | medium | 11 | #120–#130 |
 | low | 30 | this document |
@@ -56,9 +56,7 @@ The themes:
 
 ## Critical (withheld)
 
-Two critical findings are not described here: one about how the host handles a box's output, and one about the model route. The
-token used for filing can't create GitHub security advisories, and private vulnerability reporting is off on the repository. So the
-details went to the maintainers directly instead of into a public issue. This document will be updated once both are fixed.
+Two critical findings are withheld until they are fixed; the maintainers have the details.
 
 ## High
 
