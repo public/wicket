@@ -262,12 +262,13 @@ impl Docker {
     /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
     pub async fn start_detached(&self, spec: &SandboxSpec) -> Result<()> {
         // Its output is replayed from `docker logs` by offset, so it must be whole from byte 0: a
-        // log driver of our own choosing, never rotated (the box's logs go with it when removed).
+        // log driver of our own choosing, `json-file` with no options, which never rotates (whatever
+        // the daemon's default; the box's logs go with it when it is removed).
         let args: Vec<String> = self
             .build_args(spec)
             .into_iter()
             .flat_map(|a| match a.as_str() {
-                "--rm" => vec!["-d".to_string(), "--log-driver".into(), "json-file".into(), "--log-opt".into(), "max-size=-1".into()],
+                "--rm" => vec!["-d".to_string(), "--log-driver".into(), "json-file".into()],
                 _ => vec![a],
             })
             .collect();
