@@ -49,15 +49,17 @@ wicket, a named page for prior art). **[M]** a secondary source, or a primary on
   credential, a slice of budget, a CA) is something an attacker who owns that node keeps until it expires.
   The autonomy window *is* the revocation latency for a compromised or partitioned node. wicket should let
   the operator set it per zone and show it, not hide it (§5).
-- **Decisions for the owner** (§6.6): how long a node may run alone (default proposal: 1 h for reads and
-  already-granted work, 15 min for model calls), and whether model calls continue offline at all (which
+- **Decisions for the owner** (§6.4): how long a node may run alone (default proposal: 1 h for plain reads,
+  15 min for writes and already-granted work, model calls relay-only unless a zone opts in to 15 min), and whether model calls continue offline at all (which
   needs the Claude access token on the node).
 
 ---
 
 ## 1. Inventory: what the control host does
 
-Everything below was checked against the code at the merge of #150 [H] unless tagged otherwise.
+Checked against the code at the merge of #150 for run supervision, the proxies, the vault, the feed, the
+reconciler, node serve and the keys; wicketd, placement and the hibernate store are from their module
+documentation and the docs pages [M] unless a cell says otherwise.
 
 ### 1.1 Who holds what
 
@@ -71,7 +73,7 @@ Everything below was checked against the code at the merge of #150 [H] unless ta
 | **Feed publishing** (`noderun.rs`, `wicket-feed`) | One publisher per node, its delta log under `<data dir>/nodes/<name>/feed`; statements are signed by whichever run is connected | The node's online feed key (Ed25519, on the control host), its certificate from the feed root (7 days, renewed when a run starts with less than a day left) | Every node's egress decisions |
 | **Authority** (`wicket-authz`, `wicket-feed/token.rs`) | The authority root key mints each box's block 0; the approver key signs grant blocks | Ed25519 keys, 0600 files | Every box's token; every grant |
 | **Identity issuer** (`wicket-identity`) | One Ed25519 key | Agent identities (10 min, re-issued at half-life by the run), node certificates (24 h, renewed at half-life by a connected run), the control host's proof in the node handshake | Agent messages and envelopes, the console's checks, node mutual authentication |
-| **Installation CA** (`ca.key`) | P-256 X.509 | Signs each node CA (24 h, path length 0, name-constrained), renewed with `wicket node renew-ca` over ssh | TLS termination on nodes |
+| **Installation CA** (`ca.key`) | X.509, ECDSA P-256 (rcgen's default `KeyPair::generate`, `wicket-proxy/src/ca.rs`) | Signs each node CA (24 h, path length 0, name-constrained), renewed with `wicket node renew-ca` over ssh | TLS termination on nodes |
 | **Ledger** (`wicket-store`) | One SQLite database in WAL mode | Runs, identities and their history, requests and grants, messages, leases, nodes and their certificates, agents (generation, head bundle, spend), console sessions, passkeys, enrol links, the audit chain | Everything |
 | **Audit chain** | The ledger, plus each node's own `audit.db`, shipped on connect | Hash chain (v2); signed checkpoints if exported (#91) | Verification, the console's activity |
 | **Placement and reconciler** (`wicket-placement`, `reconcile.rs`) | `wicket place`, `wicket reconcile --every` on the control host, one pass at a time by file lock | The Vultr key (vault), owner tags, leases and reservations | Capacity leases, cleanup of lost runs and orphaned machines |
@@ -189,13 +191,29 @@ control host) and its feed replica. It gains, per box:
 - **the model proxy** (`wicket-proxy/src/llm.rs`, unchanged in what it checks: model allowlist, server-side
   tool stripping, body pre-parse, token and request budgets, liveness, events);
 - **the MCP gateway** (`gateway.rs`), with each tool marked by what it needs (§3.4);
-- **the run's supervision**: identity renewal (from a node issuing key, §3.5), the timeout (already there),
+- **the run's supervision**: identity renewal (from the control host in phase 1, from a node issuing key in
+  phase 3, §3.5), the timeout (already there),
   output buffering (already there), and the audit of all of it in the node's chain.
 
 The control host keeps the ledger and the keys, and becomes a client of the node for the run: it attaches
 for stdio and events, pushes the feed, takes asks and audit, and *re-attaches* after its own restart. The
 run is ended by the node (timeout, exit), by an operator, or by the control host's reconciler only when the
-node says the box is gone, or the node's lease of the run (§5.1) has expired.
+node says the box is gone, or the node's lease of the run has expired. The **run lease** is a record the
+node holds for each run it supervises, renewed by the control host with every freshness statement, ending
+at the run's offline window (§5.1; until phase 3, the feed's 150 s). While it is live the node keeps the box
+and the control host doesn't end the run; when it expires the node stops the box (self-fencing, §5.2) and
+the control host may end the run.
+
+**The relay re-enforces.** While a credential is relayed (`control` residency), the control host's side
+of the relay applies the same model allowlist, server-side tool stripping and budget as the node's proxy,
+and the ledger-writing gateway tools (spawn's subset check and limits, capacity, links) are decided on the
+control host as today. The node's checks give the offline behaviour and early refusals; the control host's
+are the ones a rooted node can't skip.
+
+**Identities in phase 1.** Until phase 3 brings node issuing keys (§3.5), agent identities are still issued
+by the control host, so a run on a node that loses the control host keeps a valid identity for at most
+10 minutes; that only affects agent-to-agent messages and the console's checks, which need the control
+host anyway.
 
 ### 3.2 The model credential
 
@@ -238,7 +256,7 @@ child's share is carved out of its parent's at spawn [H]. On nodes:
   parent's node reserves the child's share before the spawn is sent, and gets nothing back (as today:
   limits.md, "a child's reservation counts as spent").
 - **Shared budgets (a tenant's monthly cap, a team's pool) use budget leases**, the escrow pattern from
-  the demarcation protocol [M]: the ledger holds the account; a node holds a lease of a slice (say 10% of
+  the demarcation protocol [L]: the ledger holds the account; a node holds a lease of a slice (say 10% of
   what is left, or a fixed number of tokens) with an expiry; it spends locally, asks for more at half
   spent, and returns the remainder when the lease ends. Spend reports go with the audit stream.
   - Overspend is bounded by the sum of outstanding slices, and only if a node is lost with its usage
@@ -289,13 +307,15 @@ Today (limits.md): the boxes' workspaces and decrypted traffic on that node, and
 its CA's name constraints until the CA expires (24 h). Never: injected credentials or the model token.
 
 With per-node proxies, additionally:
-- **with secrets in `control` residency: nothing more.** The proxies' checks were already on a machine the
-  attacker controls for traffic they could already see; budgets are advisory against them, but every call
-  still goes through the control host, which counts it again (the relay is a second meter).
+- **with secrets in `control` residency: nothing more**, provided the relay re-enforces (§3.1): the node's
+  checks become advisory, but the model allowlist, tool stripping, budgets and the ledger-writing gateway
+  tools are still decided on the control host, which every call passes through. Without that, a rooted node
+  could skip them; that is why the relay must re-check rather than only add the bearer.
 - **with `node` residency:** the model access token until its upstream expiry (they can use the owner's
   subscription for anything, at the owner's quota and reputational risk), each leased secret until its
-  lease or upstream expiry, the node's budget slices, and the node issuing key until its certificate
-  expires (identities for runs on that node only).
+  lease or upstream expiry, and the node's budget slices.
+- **from phase 3:** the node issuing key until its certificate expires (identities for runs on that node
+  only).
 
 So `node` residency for the model token should be opt-in per zone, offered only to nodes the operator
 trusts more (their own hardware, or later an attested runtime), and shown in `wicket node list` and on the
@@ -316,8 +336,8 @@ pages read; "not found" means the behaviour could not be confirmed from a primar
 | **Vault** | One active node holding a lock, standbys forward; integrated Raft storage, 5 servers recommended [H] | Vault Agent caches tokens and leased secrets and renews them; entries go at max TTL or failed renewal [H]. Explicit outage behaviour: not found | Each secret's lease TTL | Revocations made directly on the server can go unnoticed by the agent's cache [H] |
 | **Boundary** | Several controllers sharing Postgres [H] | **Workers cancel every proxied session** once they have gone `successful_status_grace_period` (15 s) without reaching a controller [H, source] | 15 s | Immediate: a cut-off worker fails closed |
 | **Teleport** | Auth instances behind a load balancer, over an HA backend (etcd, Postgres, DynamoDB, Firestore); SQLite isn't HA [H] | SSH sessions continue with async recording, uploaded later; agents cache roles and configuration [H]. New logins with Auth down: not found | User certificates 12 h by default [H] | Locks: `best_effort` (default) keeps the last known locks; `strict` ends interactions when locks can't be shown fresh [H] |
-| **SPIRE** | Several servers on a shared SQL datastore, each with its own CA [H] | Agents keep SVIDs and rotate them early so they outlast an outage [H] | `availability_target` (minimum 24 h) is the outage the agent is sized for; X.509 SVIDs 1 h by default, JWT 5 min, CA 24 h [H] | At SVID expiry |
-| **Tailscale** | One coordination service [H] | Existing devices keep talking with stored keys and cached ACLs; no new devices, ACL changes or revocations [H]. A client that restarts used to lose its network map; an on-disk cache is rolling out [H] | Node keys 180 days by default [H] | None while it's down [H] |
+| **SPIRE** | Several servers on a shared SQL datastore, each with its own CA [H] | Agents rotate SVIDs early so they are sized to outlast an outage [H]; explicit wording that agents serve cached SVIDs until expiry: not found | `availability_target` (minimum 24 h) is the outage the agent is sized for; X.509 SVIDs 1 h by default, JWT 5 min, CA 24 h [H] | At SVID expiry |
+| **Tailscale** | A coordination service separate from the data plane [H]; its own HA not covered | Existing devices keep talking with stored keys and cached ACLs; no new devices, ACL changes or revocations [H]. A client that restarts used to lose its network map; an on-disk cache is rolling out [H] | Node keys 180 days by default [H] | None while it's down [H] |
 | **Cloudflare Access** | A global edge with a separate control plane [H] | A 40 h control-plane outage (2023-11): security services kept working, configuration changes failed [H]. A 2025-06 storage outage: identity logins failed, by design closed; service tokens, mTLS and IP policies kept working [H]. 2025-11: existing sessions unaffected, new logins failed [H] | Sessions default to 24 h [H] | Per-application "revoke existing tokens" is immediate; logout takes 20–30 s [H] |
 
 What wicket takes from them:
@@ -343,8 +363,9 @@ Supporting tools:
 - **openraft** 0.10 (stable, active, breaking changes possible before 1.0), with a Jepsen suite and a
   deterministic simulation fuzzer in CI; used by Databend [H].
 - **rqlite**: Raft over SQLite, writes through its HTTP API, up to about 11 voters [H].
-- **Litestream** 0.5 moved to the LTX format with compaction, and uses S3 conditional writes as a
-  single-writer lease without a separate coordinator [H]. **LiteFS** is pre-1.0 and "outside [Fly's] scope of
+- **Litestream** 0.5 moved to the LTX format with compaction, and a post describes S3
+  conditional writes as a single-writer lease without a separate coordinator; which release ships that is
+  unclear [M]. **LiteFS** is pre-1.0 and "outside [Fly's] scope of
   support", and LiteFS Cloud was retired [H]/[M].
 - **FROST** (RFC 9591, June 2024, Informational) has Ed25519, ristretto255, Ed448, P-256 and secp256k1
   ciphersuites; the Zcash Foundation's `frost-ed25519` is at 3.0, described as stable, with an audit of an
@@ -352,8 +373,9 @@ Supporting tools:
 - **Anthropic's terms** for subscription OAuth: it is for "ordinary use of Claude Code and other native
   Anthropic applications", and allows an end user signing in to the unmodified Claude Code binary with their
   own subscription; third parties may not route requests through subscription credentials on behalf of
-  their users [H]. A per-node model proxy that relays the box's own Claude Code requests for the owner keeps
-  to that, as the control host's does; the token must never serve any other client.
+  their users [H]. Our reading, not the page's: a per-node model proxy relaying the box's own Claude Code
+  requests for the owner is the same use as the control host's proxy today, and the token must never serve
+  any other client [L]; §6.4 lists it for the owner to confirm.
 
 ---
 
@@ -505,7 +527,10 @@ plus a standby may be enough.
    never by default.
 4. **Whether a node stops its boxes when its window closes** (Nomad's choice) **or keeps them running
    without egress** (Kubernetes'). Proposal: stop, hibernating locally where it can.
-5. **Whether to build phase 5 at all**, or stop at a single control host with streamed state and a standby.
+5. **Whether running the Claude login's access token through per-node proxies** is within the
+   subscription terms as the owner reads them (§4, last item); the design assumes yes, for the box's own
+   Claude Code only.
+6. **Whether to build phase 5 at all**, or stop at a single control host with streamed state and a standby.
 
 ---
 
@@ -530,7 +555,8 @@ Prior art (read 2026-11-12):
   https://developer.hashicorp.com/vault/docs/internals/integrated-storage ·
   https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent/caching
 - Boundary: https://developer.hashicorp.com/boundary/docs/configuration/controller ; source
-  `internal/daemon/worker/session_info.go`, `internal/server/repository.go` (hashicorp/boundary main)
+  `internal/daemon/worker/session_info.go`, `internal/server/repository.go`, `internal/cmd/config/config.go`
+  (hashicorp/boundary main at `eeb38a1`)
 - Teleport: https://goteleport.com/docs/reference/deployment/backends/ ·
   https://goteleport.com/docs/reference/architecture/session-recording/ ·
   https://goteleport.com/docs/reference/deployment/scaling/ ·
@@ -549,5 +575,5 @@ Prior art (read 2026-11-12):
 - LiteFS: https://docs.fly.io/litefs · Litestream: https://github.com/benbjohnson/litestream/releases/tag/v0.5.0 ·
   https://fly.io/blog/litestream-revamped/
 - HPKE: RFC 9180. Demarcation protocol: Barbara and Garcia-Molina, "The Demarcation Protocol: A Technique for
-  Maintaining Constraints in Distributed Database Systems", VLDB Journal 1994 [M].
+  Maintaining Constraints in Distributed Database Systems" (cited from memory, not fetched) [L].
 - Anthropic: https://code.claude.com/docs/en/legal-and-compliance
