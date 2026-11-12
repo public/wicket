@@ -708,6 +708,8 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             Msg::Kill { run } => {
                 let name = node.boxes.lock().expect("boxes").get(&run).map(|b| b.name.clone());
                 if let Some(name) = name {
+                    // A paused (idle) box is unpaused first, so it can be killed.
+                    let _ = node.docker.unpause(&name).await;
                     let _ = node.docker.kill(&name).await;
                 }
             }
@@ -1147,6 +1149,7 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             s = child.wait() => s.ok(),
             _ = &mut deadline => {
                 eprintln!("[node] {run}: past its timeout; stopping the box");
+                let _ = n.docker.unpause(&box_name).await;
                 let _ = n.docker.kill(&box_name).await;
                 child.wait().await.ok()
             }

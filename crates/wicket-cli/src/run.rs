@@ -67,6 +67,14 @@ impl Stopper {
 struct BoxProc(tokio::sync::oneshot::Receiver<i32>);
 
 impl BoxProc {
+    /// Until the box exits (a wrapped agent's whole session).
+    async fn exited(&mut self) -> Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        let code = (&mut self.0).await.unwrap_or(255);
+        Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8))
+    }
+
+    /// After its output ended: the exit, if the node reports it within 2 s.
     async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         use std::os::unix::process::ExitStatusExt;
         // A node that never reported an exit (the channel gave up, or the run stopped waiting): a failure.
@@ -741,7 +749,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             cpus: spec.cpus,
             pids: spec.pids,
             interactive: spec.interactive,
-            timeout_secs: m.zone.limits.timeout()?.as_secs(),
+            // The node's own backstop, for when it can't reach the run. A long-lived agent's run
+            // decides at its deadline (it may hibernate instead), so the node waits a little longer.
+            timeout_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
+                + if long_lived { 120 } else { 0 },
             escalate,
             ca_pem: ca.cert_pem(),
             workspace_tar,
@@ -936,7 +947,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     loop {
         tokio::select! {
-            ex = child.wait(), if lines.is_none() => {
+            ex = child.exited(), if lines.is_none() => {
                 wrapped_exit = Some(ex?);
                 break;
             }

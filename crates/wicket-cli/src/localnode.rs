@@ -200,11 +200,20 @@ fn start_serve(dir: &std::path::Path) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // SAFETY: setsid in the child before exec: its own session, so a ^C or SIGHUP to this run's
-    // terminal doesn't reach it.
+    c.current_dir(dir);
+    // SAFETY: async-signal-safe calls only, in the child before exec. Its own session, so a ^C or
+    // SIGHUP to this run's terminal doesn't reach it; and no descriptor of this run's but stdio (a
+    // wrapped agent's launcher would otherwise never see its stdout close).
     unsafe {
         c.pre_exec(|| {
             libc::setsid();
+            let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
+                n if n > 0 => n.min(65_536) as libc::c_int,
+                _ => 1024,
+            };
+            for fd in 3..max {
+                libc::close(fd);
+            }
             Ok(())
         });
     }
