@@ -83,6 +83,8 @@ their state, generation and bundle size.
   restore, and the next hibernation writes them sealed. Object keys (content hashes, agent ids) and sizes
   aren't hidden. A store that encrypts at rest itself (S3 with server-side encryption) could do without
   this layer; it also keeps the state from whoever runs the store.
+  **Back up `state.key` with the data directory**: without it no hibernated agent can be woken, and
+  nothing can recover them. Keep the copy as private as the key (mode 0600, never in the object store).
 - **Volumes by class** (`zone.volumes[].persist`):
   - `durable`: the agent's own, bundled;
   - `node` (the default): shared by the zone, kept on the node;
