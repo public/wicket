@@ -142,10 +142,17 @@ if kill -0 "$run_pid" 2>/dev/null; then
   kill -INT "$run_pid" 2>/dev/null || true
   exit 1
 fi
-[ "$MODE" = --local ] || node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
+# The node's log: NODE_LOG if the caller has it (a node run by hand), else its journal.
+if [ -n "${NODE_LOG:-}" ]; then cp "$NODE_LOG" "$work/node.log"
+elif [ "$MODE" != --local ]; then node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
+fi
 t_expired=$(grep -o "$run: its authority expired at [0-9]* ms" "$work/node.log" 2>/dev/null | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
 # Else from the node's audit, shipped to the control host on reconnect.
-[ -n "$t_expired" ] || t_expired=$("$WICKET" audit --tail 5000 | grep node.authority_expired | grep "$run" | grep -o '"until_ms":[0-9]*' | grep -o '[0-9]*' | tail -1 || true)
+for _ in $(seq 20); do
+  [ -z "$t_expired" ] || break
+  t_expired=$("$WICKET" audit --tail 5000 | grep node.authority_expired | grep "$run" | grep -o '"until_ms":[0-9]*' | grep -o '[0-9]*' | tail -1 || true)
+  [ -n "$t_expired" ] || sleep 1
+done
 
 transcript="${WICKET_HOME:-$HOME/.local/share/wicket}/runs/$run/transcript.jsonl"
 python3 -I - "$transcript" "$t_cut" "$t_restore" "$t_reconnected" "$t_approve" "$t_revoke" "$t_cut2" "$t_restore2" "${t_expired:-0}" "$CUT" <<'PY' | tee "$work/summary.txt"
