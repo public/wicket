@@ -32,6 +32,8 @@ pub struct GrantRow {
     pub revoked: bool,
     /// The node it was handed to; the ledger no longer consumes it.
     pub node: Option<String>,
+    /// The riskiest op it covers (`RiskClass::rank`); None for grants from older ledgers (#119).
+    pub max_risk: Option<i64>,
 }
 
 /// One audit record with its chain fields, as a node ships it.
@@ -58,7 +60,7 @@ pub struct NodeAuditSummary {
 
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const GRANT_COLS: &str =
-    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node";
+    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node, g.max_risk";
 
 fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
@@ -74,6 +76,7 @@ fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
         request_id: r.get(9)?,
         revoked: r.get::<_, i64>(10)? != 0,
         node: r.get(11)?,
+        max_risk: r.get(12)?,
     })
 }
 

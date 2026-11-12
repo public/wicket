@@ -157,6 +157,13 @@ enum Cmd {
         /// Grant a path prefix of the requested path instead of the exact path.
         #[arg(long)]
         prefix: Option<String>,
+        /// Don't ask for confirmation at a terminal (the request is printed either way).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Let any run in the request's zone use the grant, until it expires. By default only the
+        /// run that asked may, and the grant ends with that run.
+        #[arg(long)]
+        zone_wide: bool,
     },
     /// Deny a pending request.
     Deny { id: String },
@@ -652,6 +659,42 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
     }
 }
 
+/// A request as `wicket pending` and `wicket approve` show it: wicket's own record, with every
+/// agent-written field (method, host, path, reason, attribution) stripped of terminal escapes,
+/// bidi and zero-width characters (#128).
+pub fn show_request(l: &Ledger, r: &wicket_store::Request) -> String {
+    let clip = wicket_agent::clip;
+    let age = wicket_store::now() - r.created_at;
+    let mut out = format!(
+        "{}  {} {}{}{}  [{}]  run {}  {}s ago{}\n    why: {}\n",
+        r.id,
+        clip(&r.method, 16),
+        clip(&r.host, 255),
+        clip(&r.path, 400),
+        if r.scope_prefix { "…  (every path under it)" } else { "" },
+        r.risk,
+        clip(&r.run, 64),
+        age,
+        if r.status == "pending" { String::new() } else { format!("  ({})", clip(&r.status, 16)) },
+        clip(&r.reason, 2000)
+    );
+    out.push_str(&format!("    agent: {}\n", clip(&identity_line(&verified_identity(l, &r.run, None)), 400)));
+    for a in &r.attribution {
+        out.push_str(&format!("    for: {}  (reported by the agent, unverified)\n", clip(&wicket_proxy::attribution_line(a), 240)));
+    }
+    out
+}
+
+/// Asks the operator at the terminal; anything but y or yes is no.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
 /// One line for terminals.
 pub fn identity_line(v: &serde_json::Value) -> String {
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
@@ -844,41 +887,26 @@ async fn main() -> Result<()> {
                 println!("no pending requests");
             }
             for r in p {
-                let age = wicket_store::now() - r.created_at;
-                println!(
-                    "{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}",
-                    r.id,
-                    r.method,
-                    r.host,
-                    r.path,
-                    if r.scope_prefix { "*  (every path under it)" } else { "" },
-                    r.risk,
-                    r.run,
-                    age,
-                    r.reason
-                );
-                println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
-                for a in &r.attribution {
-                    println!(
-                        "    for: {}  (reported by the agent, unverified)",
-                        wicket_agent::clip(&wicket_proxy::attribution_line(a), 240)
-                    );
-                }
+                print!("{}", show_request(&l, &r));
             }
             Ok(())
         }
-        Cmd::Approve { id, uses, unlimited, ttl, prefix } => {
+        Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
             if ttl > Duration::from_secs(24 * 3600) {
                 bail!("grants are capped at 24h in the PoC");
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
-            let lease = capacity::lease_of_request(&req).map(String::from);
-            let gid = l.approve(
-                &id,
-                &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
-            )?;
+            // What is approved is what wicket recorded, shown before the grant exists: a hint printed
+            // from a node's or an agent's text can name the wrong request (#121).
+            print!("{}", show_request(&l, &req));
+            if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
+                bail!("not approved");
+            }
+            let lease = capacity::lease_of_request(&l, &req)?;
+            let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
+            let gid = if zone_wide { l.approve_zone_wide(&id, &a)? } else { l.approve(&id, &a)? };
             // A grant exists only if its approval is on the record (fail closed).
             if let Err(e) = l.audit(
                 &TenantId::single(),
@@ -890,18 +918,20 @@ async fn main() -> Result<()> {
                     "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
                     "agent_identity": verified_identity(&l, &req.run, None),
                     "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
+                    "scope": if zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone,
                 }),
             ) {
                 let _ = l.revoke_grant(&gid);
                 return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
             }
             println!(
-                "approved {id} → grant {gid}: {} {}{} ({}, {})",
-                req.method,
-                req.host,
-                prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path),
+                "approved {id} → grant {gid}: {} {}{} ({}, {}, {})",
+                wicket_agent::clip(&req.method, 16),
+                wicket_agent::clip(&req.host, 255),
+                wicket_agent::clip(&prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), 400),
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
-                humantime::format_duration(ttl)
+                humantime::format_duration(ttl),
+                if zone_wide { format!("any run in zone {}", wicket_agent::clip(&req.zone, 64)) } else { format!("run {} only", req.run) }
             );
             if let Some(lease) = lease.as_deref() {
                 // A capacity ask: provision now rather than at the next pass of a running reconciler.
@@ -958,7 +988,7 @@ async fn main() -> Result<()> {
             l.deny(&id, &operator())?;
             l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": id, "decision": "deny", "by": operator() }))?;
             let req = l.request(&id)?;
-            if let Some(lease) = capacity::lease_of_request(&req) {
+            if let Some(lease) = capacity::lease_of_request(&l, &req)?.as_deref() {
                 l.lease_ended(lease, "denied", &format!("request {id} denied by {}", operator()), None)?;
                 println!("lease {lease} denied: its reservation is released");
             }

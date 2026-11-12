@@ -1,6 +1,7 @@
 //! The 28 parent/child zones from experiment #58 (experiments/symcc-zones), with the answers SymCC's
-//! segment model proved. `subset::check` must agree on every one: it missed the forbid cases (22 and
-//! 27) and wrongly refused one session's worker channel under any session's (19) before #73.
+//! segment model proved, and 4 more (29-32) for #111: classes that match `/`. `subset::check` must
+//! agree on every one: it missed the forbid cases (22 and 27) and wrongly refused one session's worker
+//! channel under any session's (19) before #73, and took a class under `*` as covered before #111.
 //!
 //! The zones are also used by wicket-authz's oracle tests (which include this file as a module),
 //! hence the `pub` items.
@@ -85,6 +86,14 @@ pub fn parents() -> Vec<Parent> {
         Parent {
             key: "forbid-parent",
             zone: zone("z", "  reach:\n    - { host: api.example.com, methods: [GET, POST], paths: [\"/**\"] }\n  forbid:\n    - { host: api.example.com, paths: [\"/private/**\"] }\n    - { host: mcp.example.com }\n  limits: { memory: 2g, cpus: 1, timeout: 1h }\n"),
+            images: vec!["img:a".into()],
+            llm_remaining: Some((100, 50_000)),
+            time_remaining: Duration::from_secs(1800),
+            child_slots: 3,
+        },
+        Parent {
+            key: "one-segment",
+            zone: zone("z", "  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/x/*\"] }\n  limits: { memory: 2g, cpus: 1, timeout: 1h }\n"),
             images: vec!["img:a".into()],
             llm_remaining: Some((100, 50_000)),
             time_remaining: Duration::from_secs(1800),
@@ -213,13 +222,28 @@ pub fn children() -> Vec<Child> {
             within: true,
             note: "GET only, forbids inherited as spawn.rs does",
         },
+        // #111: a class or range can match `/`, so a parent `*` segment doesn't cover it.
+        seg("g-class-star", "/x/*[!~]*[!~]*", false, "classes under a one-segment * (reach /x/admin/users/delete)"),
+        seg("g-class", "/x/a[!z]b", false, "a negated class under * (reach /x/a/b)"),
+        seg("g-range", "/x/a[.-0]b", false, "a range spanning / under * (reach /x/a/b)"),
+        seg("g-literal", "/x/admin", true, "one literal segment under *"),
     ];
     v.sort_by_key(|c| order(c.parent));
     v
 }
 
 fn order(p: &str) -> usize {
-    ["self-hosting", "research", "remote-control", "subset-rs", "subset-rs-hide", "forbid-parent"].iter().position(|x| *x == p).unwrap()
+    ["self-hosting", "research", "remote-control", "subset-rs", "subset-rs-hide", "forbid-parent", "one-segment"]
+        .iter()
+        .position(|x| *x == p)
+        .unwrap()
+}
+
+fn seg(name: &str, path: &str, within: bool, note: &'static str) -> Child {
+    let body = format!(
+        "  reach:\n    - {{ host: api.example.com, methods: [GET], paths: [\"{path}\"] }}\n  llm: {{ max_requests: 10, max_output_tokens: 1000 }}\n  limits: {{ memory: 1g, cpus: 1, timeout: 10m }}\n"
+    );
+    Child { parent: "one-segment", name: name.into(), zone: zone(name, &body), image: "img:a".into(), max_children: 0, within, note }
 }
 
 fn rs(name: &str, reach: &str, within: bool, note: &'static str) -> Child {
@@ -281,6 +305,6 @@ fn subset_check_agrees_with_symcc_on_every_case() {
             ));
         }
     }
-    assert_eq!(children().len(), 28);
+    assert_eq!(children().len(), 32);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

@@ -334,8 +334,15 @@ pub fn fmt_time(t: i64) -> String {
 }
 
 /// Whether a request is a capacity ask, and for which lease.
-pub fn lease_of_request(r: &wicket_store::Request) -> Option<&str> {
-    (r.method == METHOD && r.host == HOST).then(|| r.path.strip_prefix("/capacity/")).flatten()
+///
+/// Found by the request's id, as the lease recorded it, and only a lease of the run that asked: the
+/// path is only the op's text, and anyone who could file a request at it would end someone else's
+/// lease on a deny (#117).
+pub fn lease_of_request(l: &Ledger, r: &wicket_store::Request) -> Result<Option<String>> {
+    if r.method != METHOD || r.host != HOST {
+        return Ok(None);
+    }
+    Ok(l.lease_for_request(&r.id)?.filter(|x| x.run == r.run && x.tenant == r.tenant).map(|x| x.id))
 }
 
 /// `wicket lease list`.
@@ -360,4 +367,50 @@ pub fn list() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #117: a deny ends the lease that recorded the request, not whatever lease its path names.
+    #[test]
+    fn a_capacity_request_is_found_by_its_id() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let row = LeaseRow {
+            id: "l-a".into(),
+            tenant: t.0.clone(),
+            run: "run_a".into(),
+            request_id: None,
+            provider: "static".into(),
+            spec: serde_json::json!({}),
+            hourly_cap: 0,
+            reserved: 0,
+            duration_secs: 1800,
+            created_at: 0,
+            not_after: None,
+            status: "pending".into(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        };
+        l.create_lease(&row, LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+        let l = l;
+        let ask = |run: &str, zone: &str| {
+            let op = Op::egress(&t, &RunId(run.into()), zone, METHOD, HOST, "/capacity/l-a");
+            l.pending_for(&op, "capacity", None).unwrap().0
+        };
+        let mine = ask("run_a", "a");
+        l.set_lease_request("l-a", &mine).unwrap();
+        assert_eq!(lease_of_request(&l, &l.request(&mine).unwrap()).unwrap().as_deref(), Some("l-a"));
+        // The same path, filed by another run: not that lease's request.
+        let theirs = ask("run_b", "b");
+        assert_ne!(theirs, mine);
+        assert_eq!(lease_of_request(&l, &l.request(&theirs).unwrap()).unwrap(), None);
+    }
 }

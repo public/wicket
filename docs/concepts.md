@@ -29,11 +29,22 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
 A **zone** is the boundary a box runs in. It is declared in the manifest:
 
 - **reach:** the hosts, methods and paths requests may go to without asking;
-- **forbid:** hosts or paths refused outright, with no request and no grant;
+- **forbid:** hosts or paths refused outright, with no request and no grant (forbid paths match ignoring
+  ASCII case, since many upstreams fold it; request paths with another spelling of a path, such as
+  `%64` for `d`, a `;` parameter or a dot segment, are refused before any decision);
 - **`unlisted_hosts`:** what happens to a host the zone doesn't name (`escalate`, or `hide` to make it
   look like it doesn't exist);
-- **inject:** credentials added to requests for a host, from the vault;
-- **llm:** the model budget (requests, input and output tokens);
+- **inject:** credentials added to requests for a host, from the vault (only ever over HTTPS: plain HTTP
+  to a host with a credential is refused with a 403);
+- **llm:** the model budget (requests, input and output tokens). Each call reserves its `max_tokens` up
+  front (lowered to what is left if it asks for more), and is charged what its final usage reports. A
+  call is read to its end even if the agent hangs up, and one whose final usage never arrives is charged
+  its whole reservation. Model requests are vetted too: only `POST /v1/messages` and
+  `/v1/messages/count_tokens` take a body, which must be uncompressed JSON; only known request fields and
+  client tools (custom, bash, text editor, memory, computer use) are forwarded, and URL sources in content
+  blocks are refused, since server tools, URL sources, the MCP connector and containers make the provider
+  reach hosts the zone never allowed (`llm.allow_server_tools` lets them through). A wrapped Claude Code session's model calls, which reach the model host through the
+  egress proxy, get the same budget, checks and accounting there;
 - **limits, isolation, images, volumes:** memory, CPUs and time; the isolation tier; the images a child
   may use; named directories that persist between runs;
 - **accept_from:** the zones whose agents may message this one.
@@ -43,17 +54,40 @@ grant**. A request that needs a grant becomes a pending request. The agent gets 
 can wait with `await_grant`, and a human approves or denies it in the console or with `wicket approve`. A
 grant is bound to the exact request, single-use and expiring by default, and kept in the ledger.
 
+Whatever the zone says, some destinations are **never reachable**: cloud metadata endpoints, `localhost`
+and every non-public address (private, loopback, link-local, CGNAT, multicast, reserved, and IPv6 forms
+that carry an IPv4 address, such as NAT64 and 6to4). A host is parsed as a URL parser would, so
+`2852039166` or `0xa9fea9fe` is 169.254.169.254, and IP addresses aren't proxied at all. wicket resolves
+every upstream name itself and connects only to addresses it has checked; a name with any non-public
+address is refused, and the checked address is the one dialled, so DNS rebinding can't move a connection.
+
+A request goes upstream as it was decided. Only allow-listed request headers are forwarded (content
+negotiation, caching, conditional requests, the body's type and encoding, `git-protocol`, and a
+provider's own, such as `x-github-api-version` to GitHub's API), and wicket adds the credential itself.
+Requests that could run as something else are refused: methods other than GET, HEAD, POST, PUT, PATCH,
+DELETE and OPTIONS (so TRACE, and CONNECT inside a tunnel), method-override and URL-rewrite headers
+(`X-HTTP-Method-Override`, `X-Original-URL` and the like), and bodies on GET and HEAD.
+
 **The subset rule.** An agent with `max_children` can `spawn` an agent or a program in a zone it writes.
 That zone must be within the agent's own (`wicket_core::subset`):
 
 - reach covered rule by rule (host, method and path), and every parent `forbid` kept;
-- only the parent's own credentials;
+- only the parent's own credentials and model route;
 - a model budget carved out of what the parent has left;
-- memory, CPUs, PIDs and time no larger, isolation no weaker, and images from the parent's list.
+- memory, CPUs, PIDs and time at least 1 and no larger than the parent's, isolation no weaker, and images
+  from the parent's list;
+- `max_children` within the parent's: a child's own `max_children` counts against the parent's.
 
 A zone that isn't within it is refused, with every violation listed. With `ask_human`, it goes to a
-human as exactly that zone. Globs whose containment can't be proven are refused, so the check errs on the
-side of refusing.
+human as exactly that zone, on an R4 card that lists what the child gets (its model route, credential
+injections, reach and limits). A different model route or credential is refused outright, with no
+approval path. Globs whose containment can't be proven (a character class under `*`, for example) are
+refused, so the check errs on the side of refusing. A spawned zone is named `<parent zone>.<name>.<parent
+run>`, so no other run can create the same zone.
+
+A grant belongs to the run that asked for it, and ends with it; `wicket approve --zone-wide` lets any run in
+the zone use it until it expires. `wicket approve` prints the request as wicket recorded it, and at a
+terminal asks before approving (`--yes` skips the question).
 
 ## Identities: agents and nodes
 

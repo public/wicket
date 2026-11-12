@@ -2,7 +2,8 @@
 // The console's script, served as a static file under a strict CSP (no inline script or style, no
 // eval). Every string from the ledger is untrusted (agents influence paths and reasons): set as textContent only.
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = String(text); return e; };
-const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f​-‏‪-‮⁦-⁩]/g, " ");
+// The same set as wicket_core::text::is_unsafe: C0, DEL, C1, bidi, zero-width, line separators (#128).
+const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ");
 const ago = (now, t) => { const s = Math.max(0, now - t); return s < 90 ? s + "s ago" : s < 5400 ? Math.round(s / 60) + "m ago" : Math.round(s / 3600) + "h ago"; };
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 const riskLabel = r => ({ R0Read: "R0 read", R1ReadScoped: "R1 read", R2WriteReversible: "R2 write", R3ExternalOrIrreversible: "R3 external", R4ExecOrPrivilege: "R4 exec/privilege" })[r] || r;
@@ -102,7 +103,7 @@ function renderPending(s) {
   for (const p of s.pending) {
     const c = el("div", "card req");
     const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
-    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "*  (every path under it)" : "")));
+    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "…  (every path under it)" : "")));
     c.append(el("div", "why", strip(p.reason)));
     const idOk = renderAgent(c, p.identity || {});
     c.append(renderWho(p.attribution || []));

@@ -1,6 +1,6 @@
 //! `Op`: the normalised form of every boundary crossing, its risk class, and the pure decision.
 
-use crate::manifest::{compile_glob, host_matches, ManifestError, ZoneSpec};
+use crate::manifest::{compile_glob, fold_case_glob, host_matches, ManifestError, ZoneSpec};
 use crate::{RunId, TenantId};
 use globset::GlobMatcher;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,21 @@ pub enum RiskClass {
     R2WriteReversible,
     R3ExternalOrIrreversible,
     R4ExecOrPrivilege,
+}
+
+impl RiskClass {
+    /// 0 (R0) to 4 (R4), as the ledger stores a grant's risk bound.
+    pub fn rank(self) -> i64 {
+        self as i64
+    }
+
+    /// The class named as `{:?}` prints it (`R2WriteReversible`).
+    pub fn from_name(name: &str) -> Option<RiskClass> {
+        use RiskClass::*;
+        [R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege]
+            .into_iter()
+            .find(|r| format!("{r:?}") == name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +89,11 @@ impl Op {
 }
 
 /// A small, hand-maintained dangerous-pattern list (design §10). It can only raise risk.
+///
+/// GitHub endpoints are matched on the path's segments, lowercased (GitHub folds the case of owner
+/// and repository names, and lowercasing can only make more paths match, which only raises risk).
+/// Paths reach here canonical (`canonical_path`): no escapes of unreserved characters, no `;`, no
+/// dot segments, so a segment is spelled one way.
 fn classify(method: &str, host: &str, path: &str, query: &str) -> (RiskClass, Vec<String>) {
     let mut risk = match method {
         "GET" | "HEAD" | "OPTIONS" => RiskClass::R1ReadScoped,
@@ -86,21 +106,58 @@ fn classify(method: &str, host: &str, path: &str, query: &str) -> (RiskClass, Ve
         }
         effects.push(why.to_string());
     };
-    let push_discovery = path.ends_with("/info/refs") && query.split('&').any(|kv| kv == "service=git-receive-pack");
-    if host == "github.com" && (path.ends_with("/git-receive-pack") || push_discovery) {
-        raise(RiskClass::R4ExecOrPrivilege, "gh.git_push: pushes can trigger CI", &mut risk);
+    let lower = path.to_ascii_lowercase();
+    let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+    let has = |names: &[&str]| segs.iter().any(|s| names.contains(s));
+    if host == "github.com" {
+        // Ref discovery is a read only for exactly the upload-pack (fetch) service: any other query
+        // (receive-pack, or an escaped or repeated spelling of it) is treated as a push.
+        let discovery = lower.ends_with("/info/refs") && !(query.is_empty() || query == "service=git-upload-pack");
+        if lower.ends_with("/git-receive-pack") || discovery {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.git_push: pushes can trigger CI", &mut risk);
+        }
     }
     if host == "api.github.com" && risk >= RiskClass::R2WriteReversible {
-        if path.contains("/contents/.github/") {
+        // `/repos/{owner}/{repo}/...`: what follows the repository.
+        let rest: &[&str] = if segs.first() == Some(&"repos") && segs.len() >= 3 { &segs[3..] } else { &[] };
+        if segs.first() == Some(&"graphql") {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.graphql: a GraphQL mutation can do anything the token can", &mut risk);
+        }
+        if segs.first() == Some(&"repos") && segs.len() == 3 {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.repo_settings: changes or deletes the repository", &mut risk);
+        }
+        if rest.starts_with(&["contents", ".github"]) {
             raise(RiskClass::R4ExecOrPrivilege, "gh.workflow_path: edits CI with the repo's secrets", &mut risk);
         }
-        if path.contains("/merge") || path.ends_with("/dispatches") || path.contains("/actions/") {
-            raise(RiskClass::R4ExecOrPrivilege, "gh.exec: merges or dispatches workflows", &mut risk);
+        // Blobs, trees and commits made through the git data API do nothing until a ref points at
+        // them; moving the ref is what lands a change (a workflow edit included), as a push does.
+        if rest.starts_with(&["git", "refs"]) {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.git_ref: moves a branch or tag, as a push does", &mut risk);
         }
-        if path.contains("/collaborators") || path.contains("/keys") || path.contains("/hooks") || path.contains("/secrets") {
+        let update_branch = rest.first() == Some(&"pulls") && rest.get(2) == Some(&"update-branch");
+        if has(&["merge", "merges", "merge-upstream", "dispatches", "actions", "deployments"]) || update_branch {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.exec: merges, updates branches or runs workflows", &mut risk);
+        }
+        let perms = [
+            "collaborators",
+            "invitations",
+            "keys",
+            "gpg_keys",
+            "ssh_signing_keys",
+            "hooks",
+            "secrets",
+            "variables",
+            "environments",
+            "protection",
+            "rulesets",
+            "transfer",
+            "members",
+            "memberships",
+        ];
+        if has(&perms) {
             raise(RiskClass::R4ExecOrPrivilege, "gh.perm_manage: changes access or credentials", &mut risk);
         }
-        if path.contains("/comments") || path.ends_with("/issues") || path.ends_with("/pulls") {
+        if has(&["comments", "reviews", "releases"]) || lower.ends_with("/issues") || lower.ends_with("/pulls") {
             raise(RiskClass::R3ExternalOrIrreversible, "gh.notify: posts visible content", &mut risk);
         }
     }
@@ -136,13 +193,67 @@ pub enum HostVerdict {
 
 /// Why `host` is never reachable from a sandbox, whatever the zone says: metadata endpoints,
 /// localhost and non-public addresses. `None` for every other host.
+///
+/// The host is parsed as a URL parser would (WHATWG host parsing, as the `url` crate and browsers
+/// do), so every spelling of an address is judged as that address: `2852039166`, `0xa9fea9fe`,
+/// `0251.0376.0251.0376`, `169.254.169.254.` and `[::ffff:a9fe:a9fe]` are all 169.254.169.254. A
+/// host that doesn't parse is never reachable either. This is the name check; the address a name
+/// resolves to is checked again when wicket dials it (wicket-proxy).
 pub fn never_reachable(host: &str) -> Option<String> {
-    if FORBIDDEN_HOSTS.contains(&host) || host == "localhost" || host.ends_with(".localhost") {
-        return Some(format!("host {host} is never reachable from a sandbox"));
+    let parsed = match url::Host::parse(host) {
+        Ok(h) => h,
+        Err(e) => return Some(format!("{host:?} is not a valid host ({e})")),
+    };
+    let ip = match parsed {
+        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
+        url::Host::Ipv6(v6) => std::net::IpAddr::V6(v6),
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.');
+            if FORBIDDEN_HOSTS.contains(&d) || d == "localhost" || d.ends_with(".localhost") {
+                return Some(format!("host {d} is never reachable from a sandbox"));
+            }
+            // wicket's own name: the box reaches it directly (NO_PROXY), never as an egress target, and
+            // its approval namespace (SPAWN, LINK, CAPACITY) is wicket's alone (#117).
+            if is_wicket_host(d) {
+                return Some(format!("host {d} is wicket's own: it is never an egress target"));
+            }
+            return None;
+        }
+    };
+    (!is_public_ip(&ip)).then(|| format!("non-public address {ip}"))
+}
+
+/// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
+/// its parent's zone, a link beyond the default policy, and a capacity lease.
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY"];
+
+/// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
+pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+
+/// `wicket.internal` and every name under it (the in-box address of wicket's services and the link
+/// names of other boxes).
+pub fn is_wicket_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == crate::link::DOMAIN || h.ends_with(&format!(".{}", crate::link::DOMAIN))
+}
+
+impl Op {
+    /// Whether this op is in wicket's own approval namespace (#117): a reserved method, or a wicket
+    /// host. Only wicket raises such requests; an agent or a node never may.
+    pub fn is_reserved(&self) -> bool {
+        is_wicket_host(&self.host) || RESERVED_METHODS.contains(&self.method.to_ascii_uppercase().as_str())
     }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) if !is_public_ip(&ip) => Some(format!("non-public address {ip}")),
-        _ => None,
+
+    /// Why an agent or a node may not raise a request for this op, if it may not: a reserved op, or
+    /// a method that isn't one of [`HTTP_METHODS`].
+    pub fn refused_for_agents(&self) -> Option<String> {
+        if self.is_reserved() {
+            return Some(format!("{} {} is wicket's own approval namespace: only wicket asks for it", self.method, self.host));
+        }
+        if !HTTP_METHODS.contains(&self.method.as_str()) {
+            return Some(format!("method {:?} is not one of {}", self.method, HTTP_METHODS.join(", ")));
+        }
+        None
     }
 }
 
@@ -175,7 +286,13 @@ impl CompiledZone {
     /// forbid rule can't silently allow.
     pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
         let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
-        let forbid = spec.forbid.iter().map(|f| globs(&f.paths)).collect::<Result<_, _>>()?;
+        // Forbid globs ignore ASCII case (see `ForbidRule::paths`). A glob that doesn't compile is
+        // reported as written.
+        let forbid = spec
+            .forbid
+            .iter()
+            .map(|f| f.paths.iter().map(|p| compile_glob(p).and_then(|_| compile_glob(&fold_case_glob(p)))).collect::<Result<Vec<_>, _>>())
+            .collect::<Result<_, _>>()?;
         let reach = spec.reach.iter().map(|r| globs(&r.paths)).collect::<Result<_, _>>()?;
         Ok(Self { spec, forbid, reach })
     }
@@ -249,7 +366,11 @@ pub fn evaluate(zone: &ZoneSpec, op: &Op) -> Verdict {
     }
 }
 
-fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+/// Whether an address is on the public internet: not private, loopback, link-local, CGNAT,
+/// multicast, reserved, documentation or benchmarking space, and not an IPv6 form that carries or
+/// translates to an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo), which a gateway could
+/// turn into a private one.
+pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -258,17 +379,31 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
                 || o[0] == 0
+                || o[0] >= 240
                 || (o[0] == 100 && (64..128).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113))
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some())
+                || (s[0] & 0xffc0) == 0xfec0
+                || v6.to_ipv4_mapped().is_some()
+                || s[..6] == [0; 6]
+                || (s[0] == 0x64 && s[1] == 0xff9b)
+                || s[0] == 0x2002
+                || (s[0] == 0x2001 && s[1] < 0x0200)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x0100 && s[1..4] == [0; 3]))
         }
     }
 }
@@ -298,6 +433,23 @@ zone:
 
     fn op(m: &str, h: &str, p: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_test".into()), "z", m, h, p)
+    }
+
+    /// #117: wicket's own host is never an egress target, and its approval methods are reserved.
+    #[test]
+    fn wickets_own_namespace_is_reserved() {
+        for h in ["wicket.internal", "WICKET.internal.", "narrow.wicket.internal"] {
+            assert!(never_reachable(h.to_ascii_lowercase().trim_end_matches('.')).is_some(), "{h}");
+            assert!(is_wicket_host(h), "{h}");
+        }
+        assert!(never_reachable("wicket.internal.example.com").is_none());
+        let (t, r) = (TenantId::single(), RunId("r".into()));
+        let op = |m: &str, h: &str| Op::egress(&t, &r, "z", m, h, "/");
+        assert!(op("spawn", "api.example.com").is_reserved());
+        assert!(op("GET", "wicket.internal").is_reserved());
+        assert!(op("GET", "api.example.com").refused_for_agents().is_none());
+        assert!(op("PROPFIND", "api.example.com").refused_for_agents().is_some());
+        assert!(op("GET /x HTTP/1.1\r\n", "api.example.com").refused_for_agents().is_some());
     }
 
     #[test]
@@ -363,6 +515,43 @@ zone:
         assert!(matches!(evaluate(&zone(), &op("GET", "localhost", "/")), Verdict::Forbidden(_)));
     }
 
+    /// #116: every spelling of a non-public address is that address.
+    #[test]
+    fn every_spelling_of_a_non_public_address_is_refused() {
+        for h in [
+            "2852039166",
+            "0xa9fea9fe",
+            "0251.0376.0251.0376",
+            "169.254.169.254.",
+            "169.254.43518",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:a9fe:a9fe]",
+            "[::a9fe:a9fe]",
+            "[64:ff9b::a9fe:a9fe]",
+            "[2002:a9fe:a9fe::]",
+            "[2001:0:4136:e378:8000:63bf:3fff:fdd2]",
+            "[ff02::1]",
+            "[fec0::1]",
+            "0xe0000001",
+            "240.0.0.1",
+            "192.0.2.1",
+            "0x7f.1",
+            "metadata.",
+            "METADATA.GOOGLE.INTERNAL",
+            "LocalHost",
+            "foo.localhost.",
+            "a b",
+            "foo.123",
+        ] {
+            assert!(never_reachable(h).is_some(), "{h}");
+            assert!(matches!(evaluate(&zone(), &op("GET", h, "/")), Verdict::Forbidden(_)), "{h}");
+        }
+        for h in ["example.com", "api.github.com", "1.1.1.1", "[2606:4700::1111]"] {
+            assert_eq!(never_reachable(h), None, "{h}");
+        }
+    }
+
     #[test]
     fn digest_binds_method_host_path() {
         let a = op("GET", "api.github.com", "/x");
@@ -407,13 +596,8 @@ zone:
     /// changed are R3+ requests whose first matching rule lacks `allow_dangerous` while a later one
     /// has it (`a_later_dangerous_rule_allows_what_an_earlier_rule_matches`).
     fn evaluate_uncompiled(zone: &ZoneSpec, op: &Op) -> Verdict {
-        if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
-            return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
-        }
-        if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
-            if !is_public_ip(&ip) {
-                return Verdict::Forbidden(format!("non-public address {ip}"));
-            }
+        if let Some(why) = never_reachable(&op.host) {
+            return Verdict::Forbidden(why);
         }
         if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
             return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
@@ -498,6 +682,9 @@ zone:
                 .flat_map(|g| paths_for(g))
                 .collect();
             paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack"].map(String::from));
+            // Case-flipped spellings (#115: forbids ignore case, reach doesn't).
+            let flipped: Vec<String> = paths.iter().map(|p| p.to_ascii_uppercase()).collect();
+            paths.extend(flipped);
             for h in &hosts {
                 for p in &paths {
                     for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"] {
@@ -516,6 +703,95 @@ zone:
         }
         println!("{checked} decisions: {} allowed, {} forbidden, {} need a grant", kinds[0], kinds[1], kinds[2]);
         assert!(checked > 10_000 && kinds.iter().all(|&k| k > 500), "too few decisions of some kind: {kinds:?} of {checked}");
+    }
+
+    /// #114: the GitHub endpoints that do what the R4 patterns guard against, spelled any way.
+    #[test]
+    fn equivalent_github_endpoints_are_classified_alike() {
+        let risk = |m: &str, h: &str, p: &str| op(m, h, p).risk;
+        use RiskClass::*;
+        for (m, p) in [
+            ("PATCH", "/repos/acme/app/git/refs/heads/main"),
+            ("POST", "/repos/acme/app/git/refs"),
+            ("DELETE", "/repos/acme/app/git/refs/tags/v1"),
+            ("POST", "/graphql"),
+            ("PUT", "/repos/acme/app/pulls/7/update-branch"),
+            ("PUT", "/repos/acme/app/pulls/7/merge"),
+            ("POST", "/repos/acme/app/merges"),
+            ("POST", "/repos/acme/app/merge-upstream"),
+            ("PUT", "/repos/ACME/APP/contents/.GITHUB/workflows/ci.yml"),
+            ("PUT", "/repos/acme/app/Collaborators/mallory"),
+            ("POST", "/repos/acme/app/HOOKS"),
+            ("PUT", "/repos/acme/app/branches/main/protection"),
+            ("POST", "/repos/acme/app/environments/prod/secrets"),
+            ("POST", "/repos/acme/app/transfer"),
+            ("DELETE", "/repos/acme/app"),
+            ("PATCH", "/repos/acme/app"),
+            ("POST", "/user/keys"),
+        ] {
+            assert_eq!(risk(m, "api.github.com", p), R4ExecOrPrivilege, "{m} {p}");
+        }
+        // Objects alone change nothing a workflow runs from; reads stay reads.
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/git/blobs"), R2WriteReversible);
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/git/commits"), R2WriteReversible);
+        assert_eq!(risk("GET", "api.github.com", "/repos/acme/app/git/refs/heads/main"), R1ReadScoped);
+        assert_eq!(risk("PUT", "api.github.com", "/repos/acme/hooks-docs/contents/README.md"), R2WriteReversible);
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/pulls/7/Reviews"), R3ExternalOrIrreversible);
+        // git over HTTPS: push in any case, and ref discovery for anything but a plain fetch.
+        assert_eq!(risk("POST", "github.com", "/acme/app.git/GIT-RECEIVE-PACK"), R4ExecOrPrivilege);
+        let disc = |q: &str| {
+            Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/a/b.git/info/refs", q).risk
+        };
+        assert_eq!(disc("service=git-upload-pack"), R1ReadScoped);
+        assert_eq!(disc(""), R1ReadScoped);
+        for q in ["service=git-receive-p%61ck", "service=git-upload-pack&service=git-receive-pack", "service=GIT-RECEIVE-PACK"] {
+            assert_eq!(disc(q), R4ExecOrPrivilege, "{q}");
+        }
+    }
+
+    /// #115: a forbid narrower than reach can't be dodged by spelling the path in another case.
+    #[test]
+    fn forbids_ignore_case() {
+        let z = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: api.github.com, methods: [GET, PUT], paths: [\"/repos/**\"] }]\n  forbid: [{ host: api.github.com, paths: [\"/repos/acme/prod/**\", \"/repos/[a-c]x/Secret\"] }]\n").unwrap().zone;
+        let cz = CompiledZone::new(z.clone()).unwrap();
+        for p in [
+            "/repos/acme/prod/x",
+            "/repos/ACME/prod/x",
+            "/repos/acme/PROD/contents/a",
+            "/repos/Acme/Prod/x",
+            "/repos/BX/secret",
+            "/repos/ax/SECRET",
+        ] {
+            assert!(matches!(cz.evaluate(&op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
+            assert!(matches!(evaluate_uncompiled(&z, &op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
+        }
+        for p in ["/repos/acme/production/x", "/repos/dx/secret", "/repos/ACME/app/x"] {
+            assert!(matches!(cz.evaluate(&op("GET", "api.github.com", p)), Verdict::AllowByReach(0)), "{p}");
+        }
+        // Reach stays case-sensitive.
+        assert!(matches!(cz.evaluate(&op("GET", "api.github.com", "/REPOS/x")), Verdict::NeedsGrant(_)));
+    }
+
+    #[test]
+    fn folded_globs_match_ignoring_case() {
+        use crate::manifest::fold_case_glob;
+        assert_eq!(fold_case_glob("/a1/*"), "/[aA]1/*");
+        assert_eq!(fold_case_glob("/[a-c]/[!x]/\\q/\\*"), "/[A-Ca-c]/[!Xx]/[qQ]/\\*");
+        assert_eq!(fold_case_glob("/[a-z_-]"), "/[A-Za-z_-]");
+        assert_eq!(fold_case_glob("/[-a]"), "/[-Aa]");
+        // Every folded class still compiles, and matches either case.
+        for g in ["/[a-z_-]/x", "/[-a]", "/[]a]", "/[!a-c0-9-]", "/[0-9a]", "/[a-]"] {
+            assert!(compile_glob(&fold_case_glob(g)).is_ok(), "{g} -> {}", fold_case_glob(g));
+        }
+        assert!(compile_glob(&fold_case_glob("/[a-z_-]/x")).unwrap().is_match("/Q/X"));
+        for (g, yes, no) in [
+            ("/repos/{acme,octo}/**", "/REPOS/Octo/x", "/repos/other/x"),
+            ("/x/[]a]", "/X/A", "/x/b"),
+            ("/caf\u{e9}/**", "/CAF\u{e9}/y", "/CAF\u{c9}/y"),
+        ] {
+            let m = compile_glob(&fold_case_glob(g)).unwrap();
+            assert!(m.is_match(yes) && !m.is_match(no), "{g}");
+        }
     }
 
     #[test]

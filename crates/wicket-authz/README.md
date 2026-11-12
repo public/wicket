@@ -47,7 +47,7 @@ that, `Loaded::decide(&Request)` returns `Allow`, `NeedsGrant` or `Forbidden` fo
   over a cap fails where it is made rather than at every node. Grants aren't checked there: a node's
   `load` refuses a grant from a key that no block trusts.
 - **The step budget is 25,000 steps**, with no wall clock. The largest legitimate requests measured
-  took 308 steps compiled and 5,597 in the generic engine. A token at every cap is cut off at the
+  took 308 steps compiled and 6,605 in the generic engine. A token at every cap is cut off at the
   budget, in about 0.1 ms.
 - **Grant blocks travel in-process only.** `SignedGrant` has no `from_bytes`: Biscuit has no parser
   for a lone third-party block. The feed doesn't need one. The control host signs grants and appends
@@ -58,7 +58,7 @@ that, `Loaded::decide(&Request)` returns `Allow`, `NeedsGrant` or `Forbidden` fo
 
 | file | what it checks |
 |---|---|
-| `tests/oracles.rs` | Oracle 1: a single block decides as `CompiledZone`, on 41 zones (examples and subset cases) |
+| `tests/oracles.rs` | Oracle 1: a single block decides as `CompiledZone`, on 46 zones (examples and subset cases) |
 | | Oracle 2: a chain decides as the intersection of its zones |
 | | Oracle 3: compiled and generic engines agree, failed checks included. 25k requests by default (the generic engine takes about 0.4 ms a request, recompiling regexes); `-- --ignored` runs all 100k through `AuthorizerBuilder` too (about 3.5 min) |
 | `tests/properties.rs` | #59's checks, plus: block 0's forbids beat approvals, empty lists, Datalog traps, non-ASCII paths |

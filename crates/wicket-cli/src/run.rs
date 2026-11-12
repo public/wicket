@@ -455,6 +455,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(crate::spawn::spawner(crate::spawn::SpawnCtx {
             parent: m.clone(),
+            slots: Default::default(),
+            exe: None,
             run: run.clone(),
             dir: dir.clone(),
             image: image.to_string(),
@@ -552,6 +554,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
+    // A wrapped session's model calls reach the model host through the egress proxy: they get the
+    // model proxy's budget, filter and accounting there (#112).
+    egress.set_model_gate(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70).
     let prior_secs = match &wake {
         Some(w) => {
@@ -718,7 +723,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         .collect(),
         env: plan.env,
         argv: plan.argv,
-        memory: m.zone.limits.memory.clone(),
+        // In bytes, as the subset check read it, so Docker can't read the limit differently (#126).
+        memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
         cpus: m.zone.limits.cpus,
         pids: m.zone.limits.pids,
         user,
@@ -1367,9 +1373,19 @@ fn print_event(ev: &Event) {
                 "unavailable" => "STALE  ",
                 _ => "BLOCKED",
             };
-            println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));
+            // A node sends these events, and an agent chose the method, host and path: printed only
+            // stripped (#128), and the hint only for what is shaped like a request id (#121).
+            let clip = wicket_agent::clip;
+            println!(
+                "[egress] {tag} {} {}{}  ({}; {})",
+                clip(method, 16),
+                clip(host, 120),
+                clip(path, 120),
+                clip(risk, 24),
+                clip(detail, 240)
+            );
             if outcome == "pending" {
-                if let Some(id) = detail.split([' ', ':']).next() {
+                if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
@@ -1377,9 +1393,15 @@ fn print_event(ev: &Event) {
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
             println!(
-                "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({outcome})",
-                model.as_deref().unwrap_or("?")
+                "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
+                wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
+                wicket_agent::clip(outcome, 120)
             );
         }
     }
+}
+
+/// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).
+fn is_request_id(id: &str) -> bool {
+    id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
 }

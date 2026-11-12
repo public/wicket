@@ -260,7 +260,10 @@ impl Gateway {
             return ("`url` must start with https:// (or http://)".into(), true);
         };
         let (authority, pq) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-        let host = authority.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        let host = match wicket_core::canonical_host(authority.rsplit_once(':').map_or(authority, |(h, _)| h)) {
+            Ok(h) => h,
+            Err(e) => return (format!("not requested: {e}"), true),
+        };
         let pq = if pq.is_empty() { "/" } else { pq };
         let (raw_path, query) = pq.split_once('?').unwrap_or((pq, ""));
         let path = match wicket_core::canonical_path(raw_path) {
@@ -297,7 +300,11 @@ impl Gateway {
         };
         match res {
             Ok((rid, fresh)) => {
-                let scope = if prefix { format!("{method} {host}{path}* (every path under it)") } else { format!("{method} {host}{path}") };
+                let scope = if prefix {
+                    format!("{method} {host}{}… (every path under it)", wicket_core::prefix_dir(&path))
+                } else {
+                    format!("{method} {host}{path}")
+                };
                 (format!("{} {rid} for {scope}. Call await_grant with request_id {rid} to wait for the decision. Don't try other routes meanwhile.",
                     if fresh { "requested:" } else { "already requested:" }), false)
             }

@@ -716,18 +716,59 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 }
 
 /// Raises (or finds) the pending request for an op the node asks about, if it is this run's.
-fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_json::Value>) -> Msg {
+///
+/// The node is not trusted with what the human sees (#121): the op is rebuilt here from its method,
+/// host and canonical path, its risk is the control host's own classification (raised, never
+/// lowered, by the node's, which saw the query), only egress asks outside wicket's own approval
+/// namespace are taken (#117), and the reason on the card is this zone's own verdict, never the
+/// node's text. The node's attribution is kept, shown as reported by the agent.
+fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_json::Value>) -> Msg {
     let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
-    if run != sh.run.0 || op.run != sh.run || op.tenant != sh.tenant || op.zone != sh.zone.name {
-        return reply(None, None, Some(format!("not an op of run {}", sh.run)));
-    }
+    let (op, why) = match check_node_op(&sh.tenant, &sh.run, &sh.zone, run, op) {
+        Ok(x) => x,
+        Err(e) => return reply(None, None, Some(e)),
+    };
+    let op = &op;
     let l = sh.ledger.lock().expect("ledger");
     if let Ok(Some(rid)) = l.denied_recently(op) {
         return reply(None, Some(rid), None);
     }
-    match l.pending_for(op, why, who) {
+    match l.pending_for(op, &why, who) {
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
+    }
+}
+
+/// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
+/// zone decides it; refused if it isn't this run's, isn't egress, isn't canonical, is in wicket's
+/// own namespace, or doesn't need a grant (forbidden, or already allowed).
+pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &str, op: &Op) -> Result<(Op, String), String> {
+    let zone = zone_spec.name.as_str();
+    if run != own.0 || op.run != *own || op.tenant != *tenant || op.zone != zone {
+        return Err(format!("not an op of run {own}"));
+    }
+    if op.surface != wicket_core::Surface::Egress {
+        return Err("a node asks only about egress".into());
+    }
+    match wicket_core::canonical_path(&op.path) {
+        Ok(p) if p == op.path => {}
+        _ => return Err("not requested: the path is not canonical".into()),
+    }
+    let mut fresh = Op::egress(tenant, own, zone, &op.method, &op.host, &op.path);
+    if fresh.method != op.method || fresh.host != op.host {
+        return Err("not requested: the method or host is not canonical".into());
+    }
+    if let Some(why) = fresh.refused_for_agents() {
+        return Err(format!("not requested: {why}"));
+    }
+    if op.risk > fresh.risk {
+        fresh.risk = op.risk;
+        fresh.effects.extend(op.effects.iter().map(|e| wicket_core::text::clip(e, 120)));
+    }
+    match wicket_core::evaluate(zone_spec, &fresh) {
+        wicket_core::Verdict::NeedsGrant(why) => Ok((fresh, why)),
+        wicket_core::Verdict::Forbidden(why) => Err(format!("not requested: {why}")),
+        wicket_core::Verdict::AllowByReach(_) => Err("not requested: this zone already allows it".into()),
     }
 }
 
@@ -784,6 +825,19 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         let op = Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path);
+        // A node's grant covers its path whatever the query, and carries no risk bound: hand it over
+        // only if no query makes that path riskier than the human approved (#119; a fetch's ref
+        // discovery approved at R1 is a push's at R4). Otherwise the control host keeps deciding it.
+        let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
+        if worst.risk.rank() > g.max_risk.unwrap_or(0) {
+            if p.published.insert(g.id.clone()) {
+                println!(
+                    "[wicket] grant {} is bounded below what {} {}{} can be; it stays with the control host",
+                    g.id, g.method, g.host, g.path
+                );
+            }
+            continue;
+        }
         let live = LiveGrant {
             grant: wicket_authz::Grant {
                 gid: g.id.clone(),
@@ -870,4 +924,50 @@ pub fn tar_dir(dir: &Path) -> Result<Vec<u8>> {
         bail!("the workspace is too large to send to a node ({} bytes)", out.stdout.len());
     }
     Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wicket_core::RiskClass;
+
+    /// #121, #117: what a node asks about is rebuilt and classified on the control host.
+    #[test]
+    fn a_node_cannot_choose_what_its_ask_shows() {
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        let zone = wicket_core::Manifest::from_yaml(
+            "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/ok\"] }\n  forbid:\n    - { host: secret.example.com }\n",
+        )
+        .unwrap()
+        .zone;
+        let check = |op: &Op| check_node_op(&t, &run, &zone, "run_a", op).map(|(op, _)| op);
+        let egress = |m: &str, h: &str, p: &str| Op::egress(&t, &run, "z", m, h, p);
+
+        // An R4 push labelled R1 by the node is shown as R4.
+        let mut push = egress("POST", "github.com", "/acme/app.git/git-receive-pack");
+        assert_eq!(push.risk, RiskClass::R4ExecOrPrivilege);
+        push.risk = RiskClass::R1ReadScoped;
+        push.effects.clear();
+        assert_eq!(check(&push).unwrap().risk, RiskClass::R4ExecOrPrivilege);
+        // A node can raise the risk (it saw the query), never lower it.
+        let mut read = egress("GET", "api.example.com", "/x");
+        read.risk = RiskClass::R3ExternalOrIrreversible;
+        assert_eq!(check(&read).unwrap().risk, RiskClass::R3ExternalOrIrreversible);
+        // Not this run's, not egress, not canonical, or in wicket's own namespace: refused.
+        assert!(check(&Op { run: RunId("run_b".into()), ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&Op { surface: wicket_core::Surface::Llm, ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&egress("GET", "api.example.com", "/a/../admin")).is_err());
+        assert!(check(&Op { method: "get\u{1b}[2K".into(), ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&egress("SPAWN", "wicket.internal", "/zones/z.x/0123")).is_err());
+        assert!(check(&egress("CAPACITY", "api.example.com", "/capacity/l-1")).is_err());
+        assert!(check(&egress("PROPFIND", "api.example.com", "/x")).is_err());
+        assert!(check(&egress("GET", "x.wicket.internal", "/")).is_err());
+        // Forbidden or already allowed in this zone: nothing to ask.
+        assert!(check(&egress("GET", "secret.example.com", "/x")).is_err());
+        assert!(check(&egress("GET", "api.example.com", "/ok")).is_err());
+        // The reason on the card is this zone's own verdict (ask() never stores the node's text).
+        let o = egress("GET", "api.example.com", "/x");
+        let (_, why) = check_node_op(&t, &run, &zone, "run_a", &o).unwrap();
+        assert_eq!(wicket_core::evaluate(&zone, &o), wicket_core::Verdict::NeedsGrant(why));
+    }
 }
