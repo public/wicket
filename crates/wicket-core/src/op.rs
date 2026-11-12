@@ -212,10 +212,49 @@ pub fn never_reachable(host: &str) -> Option<String> {
             if FORBIDDEN_HOSTS.contains(&d) || d == "localhost" || d.ends_with(".localhost") {
                 return Some(format!("host {d} is never reachable from a sandbox"));
             }
+            // wicket's own name: the box reaches it directly (NO_PROXY), never as an egress target, and
+            // its approval namespace (SPAWN, LINK, CAPACITY) is wicket's alone (#117).
+            if is_wicket_host(d) {
+                return Some(format!("host {d} is wicket's own: it is never an egress target"));
+            }
             return None;
         }
     };
     (!is_public_ip(&ip)).then(|| format!("non-public address {ip}"))
+}
+
+/// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
+/// its parent's zone, a link beyond the default policy, and a capacity lease.
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY"];
+
+/// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
+pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+
+/// `wicket.internal` and every name under it (the in-box address of wicket's services and the link
+/// names of other boxes).
+pub fn is_wicket_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == crate::link::DOMAIN || h.ends_with(&format!(".{}", crate::link::DOMAIN))
+}
+
+impl Op {
+    /// Whether this op is in wicket's own approval namespace (#117): a reserved method, or a wicket
+    /// host. Only wicket raises such requests; an agent or a node never may.
+    pub fn is_reserved(&self) -> bool {
+        is_wicket_host(&self.host) || RESERVED_METHODS.contains(&self.method.to_ascii_uppercase().as_str())
+    }
+
+    /// Why an agent or a node may not raise a request for this op, if it may not: a reserved op, or
+    /// a method that isn't one of [`HTTP_METHODS`].
+    pub fn refused_for_agents(&self) -> Option<String> {
+        if self.is_reserved() {
+            return Some(format!("{} {} is wicket's own approval namespace: only wicket asks for it", self.method, self.host));
+        }
+        if !HTTP_METHODS.contains(&self.method.as_str()) {
+            return Some(format!("method {:?} is not one of {}", self.method, HTTP_METHODS.join(", ")));
+        }
+        None
+    }
 }
 
 pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
@@ -394,6 +433,23 @@ zone:
 
     fn op(m: &str, h: &str, p: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_test".into()), "z", m, h, p)
+    }
+
+    /// #117: wicket's own host is never an egress target, and its approval methods are reserved.
+    #[test]
+    fn wickets_own_namespace_is_reserved() {
+        for h in ["wicket.internal", "WICKET.internal.", "narrow.wicket.internal"] {
+            assert!(never_reachable(h.to_ascii_lowercase().trim_end_matches('.')).is_some(), "{h}");
+            assert!(is_wicket_host(h), "{h}");
+        }
+        assert!(never_reachable("wicket.internal.example.com").is_none());
+        let (t, r) = (TenantId::single(), RunId("r".into()));
+        let op = |m: &str, h: &str| Op::egress(&t, &r, "z", m, h, "/");
+        assert!(op("spawn", "api.example.com").is_reserved());
+        assert!(op("GET", "wicket.internal").is_reserved());
+        assert!(op("GET", "api.example.com").refused_for_agents().is_none());
+        assert!(op("PROPFIND", "api.example.com").refused_for_agents().is_some());
+        assert!(op("GET /x HTTP/1.1\r\n", "api.example.com").refused_for_agents().is_some());
     }
 
     #[test]

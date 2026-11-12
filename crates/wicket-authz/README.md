@@ -58,7 +58,7 @@ that, `Loaded::decide(&Request)` returns `Allow`, `NeedsGrant` or `Forbidden` fo
 
 | file | what it checks |
 |---|---|
-| `tests/oracles.rs` | Oracle 1: a single block decides as `CompiledZone`, on 41 zones (examples and subset cases) |
+| `tests/oracles.rs` | Oracle 1: a single block decides as `CompiledZone`, on 46 zones (examples and subset cases) |
 | | Oracle 2: a chain decides as the intersection of its zones |
 | | Oracle 3: compiled and generic engines agree, failed checks included. 25k requests by default (the generic engine takes about 0.4 ms a request, recompiling regexes); `-- --ignored` runs all 100k through `AuthorizerBuilder` too (about 3.5 min) |
 | `tests/properties.rs` | #59's checks, plus: block 0's forbids beat approvals, empty lists, Datalog traps, non-ASCII paths |

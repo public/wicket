@@ -394,15 +394,10 @@ pub(crate) fn summarise_input(v: &Value) -> String {
     v.to_string()
 }
 
-/// Clip and neutralise untrusted text for the operator's terminal: no control characters.
+/// Clip and neutralise untrusted text for the operator's terminal (`wicket_core::text::clip`): no
+/// control, bidi or zero-width characters.
 pub fn clip(s: &str, n: usize) -> String {
-    let clean: String = s.chars().map(|c| if c.is_control() && c != '\n' { ' ' } else { c }).collect();
-    let clean = clean.replace('\n', " ⏎ ");
-    if clean.chars().count() > n {
-        format!("{}…", clean.chars().take(n).collect::<String>())
-    } else {
-        clean
-    }
+    wicket_core::text::clip(s, n)
 }
 
 #[cfg(test)]

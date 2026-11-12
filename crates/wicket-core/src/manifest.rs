@@ -372,7 +372,34 @@ impl Limits {
     pub fn timeout(&self) -> Result<Duration, ManifestError> {
         humantime::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
     }
+
+    /// The memory limit in bytes, if readable.
+    pub fn memory_bytes(&self) -> Option<u64> {
+        crate::subset::parse_bytes(&self.memory)
+    }
+
+    /// Every limit is a real bound: Docker reads `--memory 0`, `--cpus 0` and `--pids-limit 0` as
+    /// "no limit" (#126), so each has a floor of 1 (byte, CPU share, process; `MIN_CPUS` for cpus).
+    pub fn check(&self) -> Result<(), ManifestError> {
+        let bad = |what: String| Err(ManifestError::Invalid(format!("limits.{what}: every limit must be a positive bound")));
+        if !self.memory_bytes().is_some_and(|m| m >= 1) {
+            return bad(format!("memory {:?}", self.memory));
+        }
+        if !(self.cpus.is_finite() && self.cpus >= MIN_CPUS) {
+            return bad(format!("cpus {}", self.cpus));
+        }
+        if self.pids < 1 {
+            return bad(format!("pids {}", self.pids));
+        }
+        if self.timeout()?.is_zero() {
+            return bad(format!("timeout {:?}", self.timeout));
+        }
+        Ok(())
+    }
 }
+
+/// The smallest CPU limit Docker takes (`--cpus 0.01`).
+pub const MIN_CPUS: f32 = 0.01;
 
 impl Manifest {
     pub fn from_yaml(s: &str) -> Result<Self, ManifestError> {
@@ -458,7 +485,7 @@ impl Manifest {
                 )));
             }
         }
-        self.zone.limits.timeout()?;
+        self.zone.limits.check()?;
         Ok(())
     }
 }
@@ -561,6 +588,17 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #126: a zero limit means no limit to Docker, so a manifest can't set one.
+    #[test]
+    fn every_limit_is_a_positive_bound() {
+        let with =
+            |l: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, limits: {{ {l} }} }}\n"));
+        assert!(with("memory: 1g, cpus: 0.5, pids: 64").is_ok());
+        for bad in ["memory: \"0\"", "memory: 0g", "memory: lots", "cpus: 0", "cpus: -1", "cpus: .nan", "pids: 0", "timeout: 0s"] {
+            assert!(with(bad).is_err(), "{bad} was accepted");
+        }
+    }
 
     const EXAMPLE: &str = r#"
 task: summarise the README

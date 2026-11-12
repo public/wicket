@@ -15,7 +15,7 @@ use wicket_core::{CompiledZone, RiskClass, ZoneSpec};
 fn oracle1_single_block_equals_compiled_zone() {
     let keys = Keys::new(0);
     let zones = all_zones();
-    assert_eq!(zones.len(), example_zones().len() + 6 + 28);
+    assert_eq!(zones.len(), example_zones().len() + 7 + 32);
     let (mut checked, mut kinds, mut max_steps, mut max_generic) = (0usize, [0usize; 3], 0u64, 0u64);
     let start = Instant::now();
     for z in &zones {
@@ -57,6 +57,58 @@ fn oracle1_single_block_equals_compiled_zone() {
     println!("oracle 1: {checked} decisions on {} zones in {:?}: {kinds:?} (allow, forbidden, needs grant); max steps: compiled {max_steps}, generic {max_generic}", zones.len(), start.elapsed());
     assert!(max_generic <= MEASURED_MAX_STEPS, "a legitimate request took {max_generic} steps (measured max {MEASURED_MAX_STEPS})");
     assert!(kinds.iter().all(|&k| k > 1000), "too few of some kind: {kinds:?}");
+}
+
+/// #111: a child `subset::check` proves within its parent adds no authority, as Biscuit decides it:
+/// the child's ceiling alone decides as the chain parent → child on every probe. The wider #111
+/// cases (classes that match `/` under a parent `*`) must show a probe where they differ, so the
+/// probes can see the bug the subset check had.
+#[test]
+fn proved_subsets_decide_as_their_chain() {
+    use wicket_core::subset;
+    let keys = Keys::new(1);
+    let parents = subset_cases::parents();
+    let (mut proved, mut checked) = (0, 0);
+    for c in subset_cases::children() {
+        let p = parents.iter().find(|p| p.key == c.parent).unwrap();
+        let bounds = subset::Bounds {
+            zone: &p.zone,
+            images: p.images.clone(),
+            llm_remaining: p.llm_remaining,
+            llm_input_remaining: None,
+            time_remaining: p.time_remaining,
+            child_slots: p.child_slots,
+        };
+        let within = subset::check(&subset::Ask { zone: &c.zone, image: &c.image, max_children: c.max_children }, &bounds).is_ok();
+        let ceiling = |z: &ZoneSpec, b: &str| Ceiling::from_zone(z, b, T0 + 3600, vec![keys.approver.public()]).unwrap();
+        let alone = load_ok(&mint(&keys.root, TENANT, "trigger:t", &ceiling(&c.zone, &box_id(1))).unwrap(), &keys);
+        let chain = load_ok(&mint_chain(&[ceiling(&p.zone, &box_id(0)), ceiling(&c.zone, &box_id(1))], &keys), &keys);
+        let (hosts, paths) = probes(&[&p.zone, &c.zone]);
+        let mut differs = None;
+        for h in &hosts {
+            for path in &paths {
+                for m in METHODS {
+                    let o = op(&c.zone.name, m, h, path);
+                    let (a, b) =
+                        (kind_of(&alone.decide(&http_request(&box_id(1), &o))), kind_of(&chain.decide(&http_request(&box_id(1), &o))));
+                    checked += 1;
+                    if a != b && differs.is_none() {
+                        differs = Some(format!("{m} {h}{path}: alone {a}, chain {b}"));
+                    }
+                }
+            }
+        }
+        if within {
+            proved += 1;
+            assert!(differs.is_none(), "{} is proved within {}, but {}", c.name, c.parent, differs.unwrap());
+        }
+        if c.name.starts_with("g-") && !c.within {
+            assert!(!within, "{} must not be proved within {}", c.name, c.parent);
+            assert!(differs.is_some(), "{}: no probe shows the extra reach", c.name);
+        }
+    }
+    println!("proved subsets: {proved} children, {checked} decisions");
+    assert!(proved >= 10, "only {proved} children proved within");
 }
 
 // --- oracle 2 ------------------------------------------------------------------------------------

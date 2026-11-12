@@ -31,7 +31,7 @@ use std::time::Duration;
 
 /// Steps (fuel) one request may take.
 ///
-/// Measured on every legitimate token the tests build (the 41 zones of oracle 1: example manifests
+/// Measured on every legitimate token the tests build (the 46 zones of oracle 1: example manifests
 /// and the subset tests' zones, as single blocks; the depth-0..5 chains of #59 with globs, with and
 /// without grants, under oracle 3's random requests of every kind), the most any request took was
 /// 308 steps in the compiled evaluator and 6,605 in the fork's generic engine (5,597 before forbid

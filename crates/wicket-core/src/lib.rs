@@ -10,6 +10,7 @@ pub mod link;
 pub mod manifest;
 pub mod op;
 pub mod subset;
+pub mod text;
 
 pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
