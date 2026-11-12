@@ -62,19 +62,24 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             }
         }
     }
+    // Every limit is between a floor of 1 and the parent's own (#126): Docker reads 0 as no limit,
+    // so 0 is never within a finite parent. Written so that NaN or an unreadable value fails.
     match (parse_bytes(&c.limits.memory), parse_bytes(&p.limits.memory)) {
-        (Some(cm), Some(pm)) if cm <= pm => {}
-        _ => v.push(format!("memory {}: more than this zone's {} (or unreadable)", c.limits.memory, p.limits.memory)),
+        (Some(cm), Some(pm)) if cm >= 1 && cm <= pm => {}
+        _ => v.push(format!("memory {}: more than this zone's {} (or zero, or unreadable)", c.limits.memory, p.limits.memory)),
     }
-    if c.limits.cpus > p.limits.cpus {
-        v.push(format!("cpus {}: more than this zone's {}", c.limits.cpus, p.limits.cpus));
+    let (cc, pc) = (c.limits.cpus, p.limits.cpus);
+    if !(cc.is_finite() && cc >= crate::manifest::MIN_CPUS && cc <= pc) {
+        v.push(format!("cpus {cc}: more than this zone's {pc} (or below {})", crate::manifest::MIN_CPUS));
     }
-    if c.limits.pids > p.limits.pids {
-        v.push(format!("pids {}: more than this zone's {}", c.limits.pids, p.limits.pids));
+    if !(c.limits.pids >= 1 && c.limits.pids <= p.limits.pids) {
+        v.push(format!("pids {}: more than this zone's {} (or zero)", c.limits.pids, p.limits.pids));
     }
     match c.limits.timeout() {
-        Ok(t) if t <= parent.time_remaining => {}
-        _ => v.push(format!("timeout {}: more than the {}s this zone has left", c.limits.timeout, parent.time_remaining.as_secs())),
+        Ok(t) if !t.is_zero() && t <= parent.time_remaining => {}
+        _ => {
+            v.push(format!("timeout {}: more than the {}s this zone has left (or zero)", c.limits.timeout, parent.time_remaining.as_secs()))
+        }
     }
     if !parent.images.iter().any(|i| i == ask.image) {
         v.push(format!("image {}: not one this zone may start (allowed: {})", ask.image, parent.images.join(", ")));
@@ -494,6 +499,40 @@ mod tests {
         // An uncapped parent doesn't constrain its children's input.
         assert_eq!(check(&ask(&uncapped), &bounds(&p)), Ok(()));
         assert_eq!(check(&ask(&capped(10)), &bounds(&p)), Ok(()));
+    }
+
+    /// #126: a zero limit is no limit to Docker, so never within a finite parent.
+    #[test]
+    fn zero_limits_are_never_within() {
+        let p = parent();
+        let limits = |l: &str| {
+            let mut z =
+                zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m, pids: 64 }\n");
+            match l {
+                "memory" => z.limits.memory = "0".into(),
+                "memory-half" => z.limits.memory = "0.4b".into(),
+                "cpus" => z.limits.cpus = 0.0,
+                "cpus-nan" => z.limits.cpus = f32::NAN,
+                "cpus-neg" => z.limits.cpus = -1.0,
+                "pids" => z.limits.pids = 0,
+                "timeout" => z.limits.timeout = "0s".into(),
+                _ => {}
+            }
+            z
+        };
+        assert_eq!(check(&ask(&limits("")), &bounds(&p)), Ok(()));
+        for (l, needle) in [
+            ("memory", "memory 0"),
+            ("memory-half", "memory 0.4b"),
+            ("cpus", "cpus 0"),
+            ("cpus-nan", "cpus NaN"),
+            ("cpus-neg", "cpus -1"),
+            ("pids", "pids 0"),
+            ("timeout", "timeout 0s"),
+        ] {
+            let errs = check(&ask(&limits(l)), &bounds(&p)).unwrap_err().join("\n");
+            assert!(errs.contains(needle), "{l}: {errs}");
+        }
     }
 
     #[test]

@@ -722,7 +722,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         .collect(),
         env: plan.env,
         argv: plan.argv,
-        memory: m.zone.limits.memory.clone(),
+        // In bytes, as the subset check read it, so Docker can't read the limit differently (#126).
+        memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
         cpus: m.zone.limits.cpus,
         pids: m.zone.limits.pids,
         user,
