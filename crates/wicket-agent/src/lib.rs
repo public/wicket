@@ -162,22 +162,7 @@ pub fn claude_code_wrapped_plan(
     // wicket's tools (await_grant, whoami, …) as the only MCP server: the account's connectors and any
     // project servers stay out of the box.
     out.extend(["--mcp-config".to_string(), WICKET_MCP.to_string(), "--strict-mcp-config".to_string()]);
-    let far =
-        (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) + 365 * 86_400_000) as u64;
-    let mut oauth = serde_json::json!({
-        "accessToken": login_placeholder,
-        "refreshToken": format!("sk-ant-ort01-wicket-placeholder-{tag}"),
-        "expiresAt": far,
-    });
-    for k in ["scopes", "subscriptionType", "rateLimitTier"] {
-        if let Some(v) = login_meta.get(k) {
-            oauth[k] = v.clone();
-        }
-    }
-    files.push((
-        "claude/.credentials.json".into(),
-        serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default(),
-    ));
+    files.push(placeholder_login(&login_placeholder, &tag, login_meta));
     let mut env: Vec<(String, String)> = launcher_env.iter().filter(|(k, _)| keep_launcher_var(k)).cloned().collect();
     if session_token.is_some() {
         env.push(("CLAUDE_CODE_SESSION_ACCESS_TOKEN".into(), session_placeholder.clone()));
@@ -204,6 +189,121 @@ pub fn claude_code_wrapped_plan(
     env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
     env.extend(m.agent.as_ref().map(|a| a.env.clone()).unwrap_or_default());
     Ok(WrappedPlan { plan: LaunchPlan { env, argv: out, stdin_task: None }, files, session_token, session_placeholder, login_placeholder })
+}
+
+/// The box's `.credentials.json`: the account login as placeholders (`login_placeholder`, which
+/// wicket's egress proxy swaps for the real access token toward `api.anthropic.com`, and a
+/// refresh token that refreshes nothing), expiring far ahead so Claude Code never tries to refresh
+/// it, with the real login's non-secret fields (`login_meta`: scopes, subscription type).
+fn placeholder_login(login_placeholder: &str, tag: &str, login_meta: &Value) -> (String, Vec<u8>) {
+    let far =
+        (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) + 365 * 86_400_000) as u64;
+    let mut oauth = serde_json::json!({
+        "accessToken": login_placeholder,
+        "refreshToken": format!("sk-ant-ort01-wicket-placeholder-{tag}"),
+        "expiresAt": far,
+    });
+    for k in ["scopes", "subscriptionType", "rateLimitTier"] {
+        if let Some(v) = login_meta.get(k) {
+            oauth[k] = v.clone();
+        }
+    }
+    ("claude/.credentials.json".into(), serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default())
+}
+
+/// The account login's placeholder for a run (what the box's credentials file holds).
+pub fn login_placeholder(run: &RunId) -> String {
+    format!("sk-ant-oat01-wicket-placeholder-{}", run.0.replace('_', "-"))
+}
+
+/// What a Remote Control agent is told, besides the sandbox notice: its messages come from the app.
+const RC_NOTICE: &str = "- You are a Remote Control session: the user talks to you from the Claude app. Work in /workspace.";
+
+/// The adapter's plan for a remote session (`agent.remote`, #169): which harnesses have one. Each
+/// harness adapter that adds the feature adds its arm; the others refuse, saying so.
+pub fn remote_plan(m: &Manifest, run: &RunId, login_meta: &Value) -> anyhow_free::Result<WrappedPlan> {
+    match m.agent.as_ref().map(|a| a.kind.as_str()) {
+        Some("claude-code") => claude_code_remote_control_plan(m, run, login_meta),
+        Some(k) => Err(anyhow_free::Error(format!("agent.remote: the {k} adapter has no remote sessions"))),
+        None => Err(anyhow_free::Error("agent.remote applies to agents only".into())),
+    }
+}
+
+/// The address of the remote session a harness's server printed on this line of its output, if
+/// any: where the owner opens it (for claude-code, a claude.ai/code link).
+pub fn remote_session_url(m: &Manifest, line: &str) -> Option<String> {
+    let prefix = match m.agent.as_ref()?.kind.as_str() {
+        "claude-code" => "https://claude.ai/code",
+        _ => return None,
+    };
+    let start = line.find(prefix)?;
+    let url: String = line[start..].chars().take_while(|c| !c.is_whitespace() && !"\"'<>)]".contains(*c)).collect();
+    Some(url)
+}
+
+/// A Remote Control agent (#169): Claude Code booted in the box as `claude remote-control`, so the
+/// box registers its own session in the owner's Claude apps. The account login is a placeholder
+/// (swapped by the egress proxy toward `api.anthropic.com`, refreshed only on the host); wicket's
+/// gateway is the only MCP server, the sandbox notice is the user memory, and `/workspace` is
+/// trusted, so nothing waits on a terminal that isn't there.
+pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &Value) -> anyhow_free::Result<WrappedPlan> {
+    let agent = m.agent.as_ref().ok_or_else(|| anyhow_free::Error("not an agent manifest".into()))?;
+    let rc = agent.remote.as_ref().ok_or_else(|| anyhow_free::Error("no agent.remote".into()))?;
+    let tag = run.0.replace('_', "-");
+    let login_placeholder = login_placeholder(run);
+    let mut files = vec![placeholder_login(&login_placeholder, &tag, login_meta)];
+    let mcp: Value = serde_json::from_str(WICKET_MCP).unwrap_or_default();
+    let config = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "projects": { WORKSPACE: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
+        "mcpServers": mcp["mcpServers"],
+    });
+    files.push(("claude/.claude.json".into(), serde_json::to_vec_pretty(&config).unwrap_or_default()));
+    files.push(("claude/CLAUDE.md".into(), format!("{SANDBOX_NOTICE}\n{RC_NOTICE}\n").into_bytes()));
+    let argv = [
+        "wicket-entry",
+        "claude",
+        "remote-control",
+        "--name",
+        rc.name.as_str(),
+        // One session per box: the box ends with it.
+        "--spawn",
+        "session",
+        // Claude Code asks in the app before it acts, as a session on the owner's own machine would;
+        // wicket's proxies decide what the box can reach either way.
+        "--permission-mode",
+        "default",
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut env: Vec<(String, String)> = [
+        ("HTTPS_PROXY", PROXY_URL),
+        ("HTTP_PROXY", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("http_proxy", PROXY_URL),
+        ("NO_PROXY", NO_PROXY),
+        ("no_proxy", NO_PROXY),
+        ("DISABLE_AUTOUPDATER", "1"),
+        ("MCP_TOOL_TIMEOUT", "660000"),
+        ("WICKET_CA_BUNDLE", CA_BUNDLE),
+        ("DISABLE_TELEMETRY", "1"),
+        ("DISABLE_ERROR_REPORTING", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    env.push(("CLAUDE_CONFIG_DIR".into(), format!("{STATE_DIR}/claude")));
+    env.push(("HOME".into(), format!("{STATE_DIR}/home")));
+    env.push(("WICKET_RUN".into(), run.0.clone()));
+    env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
+    env.extend(agent.env.clone());
+    Ok(WrappedPlan {
+        plan: LaunchPlan { env, argv, stdin_task: None },
+        files,
+        session_token: None,
+        session_placeholder: String::new(),
+        login_placeholder,
+    })
 }
 
 /// A tiny error type, so this crate stays free of anyhow.

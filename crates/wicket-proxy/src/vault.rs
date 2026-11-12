@@ -87,6 +87,19 @@ impl Vault {
         Ok(v.trim().to_string())
     }
 
+    /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
+    /// the Claude login's `claudeAiOauth`, for its non-secret fields: scopes, subscription type).
+    /// None for a stored secret or a whole-file link.
+    pub fn linked_object(&self, name: &str) -> Option<serde_json::Value> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        let file = spec.get("file")?.as_str()?;
+        let pointer = spec.get("pointer")?.as_str()?;
+        let parent = &pointer[..pointer.rfind('/')?];
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+        doc.pointer(parent).filter(|v| v.is_object()).cloned()
+    }
+
     /// Makes `name` a reference to another file (never copied into the vault): a JSON field in it,
     /// or with no `pointer`, the whole file, trimmed.
     pub fn link(&self, name: &str, file: &str, pointer: Option<&str>, expires_pointer: Option<&str>) -> Result<()> {

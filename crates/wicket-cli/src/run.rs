@@ -301,6 +301,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let vault = Vault::new(Vault::default_dir());
     check_secret_hosts(&m, &vault, wrap.is_some())?;
+    // A remote session (#169): its harness registers with its vendor using the account login.
+    let remote = m.agent.as_ref().is_some_and(|a| a.remote.is_some());
+    if remote {
+        if wrap.is_some() {
+            bail!("agent.remote boots its own session in the box: it isn't wrapped");
+        }
+        let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
+        if vault.hosts(secret).is_empty() {
+            bail!("agent.remote: the login secret {secret:?} is bound to no hosts, so it would be swapped in nowhere");
+        }
+    }
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
     }
@@ -645,7 +656,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // A wrapped Claude Code session: placeholders in the box, real credentials swapped at the proxy.
     let wrapped = match &wrap {
-        None => None,
+        None if !remote => None,
         Some(argv) => {
             if m.agent.as_ref().map(|a| a.kind.as_str()) != Some("claude-code") {
                 bail!("only claude-code agents can be wrapped");
@@ -661,9 +672,33 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let env: Vec<(String, String)> = std::env::vars().collect();
             Some(wicket_agent::claude_code_wrapped_plan(&m, &run, argv, &env, &login_meta).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
+        // A remote session (#169): the adapter's own (it refuses if its harness has none). Only the
+        // login's non-secret fields go in, from the file the zone's secret links to.
+        None => {
+            let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
+            let meta = vault
+                .linked_object(secret)
+                .map(|o| serde_json::json!({ "scopes": o.get("scopes"), "subscriptionType": o.get("subscriptionType"), "rateLimitTier": o.get("rateLimitTier") }))
+                .unwrap_or(serde_json::Value::Null);
+            Some(wicket_agent::remote_plan(&m, &run, &meta).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
     };
     let swaps = match &wrapped {
         None => vec![],
+        // A remote session's login: swapped wherever its secret is bound (the provider's hosts).
+        Some(w) if remote => {
+            let secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_default();
+            vault
+                .hosts(&secret)
+                .into_iter()
+                .map(|host| wicket_proxy::CredentialSwap {
+                    name: "account login".into(),
+                    host,
+                    placeholder: w.login_placeholder.clone(),
+                    real: wicket_proxy::SwapSource::Vault(secret.clone()),
+                })
+                .collect()
+        }
         Some(w) => {
             let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
             let mut v = vec![wicket_proxy::CredentialSwap {
@@ -1152,6 +1187,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let _ = l.set_agent_state(&f.agent, f.generation, state, note);
         }
     };
+    let mut remote_url: Option<String> = None;
     loop {
         tokio::select! {
             ex = child.exited(), if lines.is_none() => {
@@ -1172,7 +1208,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if let Err(e) = transcript_f.line(&l) {
                         tracing::warn!("writing the transcript: {e:#}");
                     }
-                    if is_program {
+                    if remote {
+                        // A remote session's server prints text, not events; its session's address is
+                        // what the owner needs (recorded once, and shown on the console's card).
+                        println!("[remote] {}", wicket_agent::clip(&l, 300));
+                        if remote_url.is_none() {
+                            if let Some(u) = wicket_agent::remote_session_url(&m, &l) {
+                                println!("[wicket] remote session: {u}");
+                                if let Ok(lg) = ledger.lock() {
+                                    let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                }
+                                remote_url = Some(u);
+                            }
+                        }
+                    } else if is_program {
                         shown += l.len() as u64 + 1;
                         if shown <= output_cap {
                             println!("[program] {}", wicket_agent::clip(&l, 300));
