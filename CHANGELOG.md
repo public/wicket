@@ -7,6 +7,19 @@ User-facing changes, grouped by area. Numbers link to the pull requests.
 The first release: one control host runs Claude Code agents in gVisor boxes with no network, brokers
 everything they reach, and can run boxes on remote nodes it enrols or provisions.
 
+### Install and privilege separation
+
+- `deploy/install.sh` sets up a control host on Ubuntu 24.04 or Debian 12: Docker, gVisor, the `wicket`
+  system user, the `wicket-operators` group and systemd units for `wicketd`, the console and the
+  reconciler. Releases are built on version tags as an archive with a SHA-256
+  ([#109](https://github.com/public/wicket/pull/109)).
+- `wicketd`: wicket runs as its own user, the only one in the `docker` group. Operators' commands go to
+  it over a socket that knows the caller from the kernel. Approving, secrets, nodes and spending need
+  root or a passkey in the console ([#109](https://github.com/public/wicket/pull/109)).
+- Every secret is bound to the hosts it may be sent to (`--hosts` on `secret set`/`link`, and
+  `secret hosts`); `claude-oauth` defaults to `api.anthropic.com`, and any other unbound secret goes
+  nowhere ([#109](https://github.com/public/wicket/pull/109)).
+
 ### Boxes and the egress path
 
 - Claude Code in a gVisor box with `--network none`, a read-only root and no capabilities. The model API,
@@ -118,6 +131,8 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 
 ### Upgrading from a development checkout
 
+- Bind each secret other than `claude-oauth` to its hosts (`wicket secret hosts NAME --hosts …`), or it is
+  sent nowhere ([#109](https://github.com/public/wicket/pull/109)).
 - Rebuild the agent image (`wicket image`) for the new entry script and forwarder
   ([#97](https://github.com/public/wicket/pull/97), [#108](https://github.com/public/wicket/pull/108)).
 - Nodes enrolled before [#100](https://github.com/public/wicket/pull/100) and

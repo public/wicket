@@ -38,7 +38,8 @@ not a permanent decision.
   your user. Anything else running as that user, including an agent session outside wicket, can reach
   run sockets, read the ledger and vault, approve requests, and set `WICKET_PRINCIPAL` to claim another
   principal ([#87](https://github.com/public/wicket/pull/87)). `wicket doctor` reports this mode as
-  insecure. The daemon install (#12, #40) closes this; see the README's Install section.
+  insecure. The daemon install ([#109](https://github.com/public/wicket/pull/109)) closes this; see the README's
+  Install section.
 - **Under the daemon:**
   - Mounting a directory in place (`--workspace-dir`, and `wicket wrap`, which mounts its launcher's
     directory) is root's only. So wrapping a Remote Control session needs root. Docker mounts by path,

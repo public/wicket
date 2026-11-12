@@ -6,7 +6,8 @@ The console (`wicket serve`) shows what's waiting for you, runs, recent decision
 or deny from a browser or phone. It uses **passkeys**:
 - passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
   passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
-  (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey). A
+  (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey).
+  An installed console runs with `--no-bootstrap-link`, so there you use `sudo wicket operator enrol-link`. A
   signed-in console session can't add a passkey, so a stolen cookie can't either;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision

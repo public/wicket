@@ -64,6 +64,11 @@ Who may do what:
 - **Approving, denying, secrets, passkey enrolment, nodes and spending need root** (`sudo wicket approve
   …`, the host break-glass) **or a passkey in the console**. So an agent session running as your own user
   can't approve anything.
+- **Secrets are bound to hosts.** Whoever stores a secret names the only hosts it may go to:
+  `sudo wicket secret set github-token --hosts api.github.com,github.com` (also on `secret link`; change it
+  with `secret hosts NAME --hosts …`). A manifest that injects a secret elsewhere, or points `llm.upstream`
+  at another host, is refused, and the proxies check again before sending. A secret bound to no hosts is
+  sent nowhere; `claude-oauth` defaults to `api.anthropic.com`.
 - Manifests and `--workdir` are sent to the daemon as content. Mounting a directory in place
   (`--workspace-dir`, `wicket wrap`) is root's only.
 - Restarting `wicketd` stops the runs started through it.
@@ -73,7 +78,7 @@ Who may do what:
 
 The commands in the rest of this README are written for development mode. On an installed host, prefix the
 privileged ones with `sudo`: `approve`, `deny`, `secret set|link`, `node …`, `place …`, `reconcile`, `reap`,
-`image`, `identity init` and `operator enrol-link|reset|revoke-session`. The release archive holds the
+`image`, `identity init`, `secret hosts` and `operator enrol-link|reset|revoke-session`. The release archive holds the
 binary, `deploy/` and `images/`, so the examples and the `docs/` pages are in the repository, not the
 archive.
 
@@ -110,7 +115,7 @@ wicket audit --tail 20
 ```
 
 For a run without a model, `examples/mock-github.yaml` with `wicket dev mock-llm --command '…'` drives the
-whole path with a scripted model.
+whole path with a scripted model (store its stand-in secret with `wicket secret set mock --hosts 127.0.0.1`).
 
 ## Features
 
@@ -129,6 +134,7 @@ zone:
     - { host: api.github.com, paths: ["/repos/octocat/Hello-World/actions/**"] }
   inject:                       # the credential goes in this one header, toward this one host
     - { host: api.github.com, header: Authorization, format: "Bearer {secret}", secret: github-ro }
+                                # stored with: wicket secret set github-ro --hosts api.github.com
   llm: { secret: claude-oauth, max_requests: 60, max_output_tokens: 60000 }
   limits: { memory: 2g, cpus: 1, timeout: 15m }
 ```
