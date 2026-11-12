@@ -4,8 +4,10 @@
 # systemd in a container) and real users check #12's acceptance: an operator reads state and starts
 # nothing it shouldn't, can't open the data or approve; root can. The script runs twice (idempotent).
 #
-# Not covered here (needs a real VM): gVisor (runsc can't run inside an unprivileged container),
-# Docker itself, systemd starting the units, and building the agent image.
+# It installs from the release archive (ci/package.sh), including gVisor's package and its
+# registration in daemon.json, and starts the console's command line as its unit would.
+# Not covered here (needs a real VM): running gVisor (runsc can't run inside an unprivileged
+# container), the Docker daemon, systemd starting the units, and building the agent image.
 #   ci/install-test.sh [path/to/wicket] [ubuntu:24.04|debian:12]
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -13,20 +15,32 @@ bin=$(realpath "${1:-$repo/target/release/wicket}")
 image=${2:-ubuntu:24.04}
 docker=${DOCKER:-docker}
 name=wicket-install-test-$$
-trap '$docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+pkg=$(mktemp -d)
+trap '$docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$pkg"' EXIT
+"$repo/ci/package.sh" "$bin" "$pkg" >/dev/null
 
 $docker run --rm --name "$name" --network host \
-    -v "$repo:/src:ro" -v "$bin:/opt/wicket-under-test:ro" \
+    -v "$repo:/src:ro" -v "$pkg:/pkg:ro" \
     "$image" bash -euo pipefail -c '
 fail() { echo "FAIL: $*"; exit 1; }
 useradd --create-home alex
 groupadd --system docker
 usermod -aG docker alex   # an operator who had Docker: the install takes it away
 
-/src/deploy/install.sh --binary /opt/wicket-under-test --operator alex --skip-gvisor --skip-image --trust-domain wicket.example.com >/tmp/install1.log
-echo "ok: install.sh ran"
-/src/deploy/install.sh --binary /opt/wicket-under-test --operator alex --skip-gvisor --skip-image >/tmp/install2.log
-echo "ok: install.sh ran again"
+mkdir -p /etc/docker && echo "{\"log-driver\": \"local\"}" >/etc/docker/daemon.json   # settings of its own
+mkdir /opt/pkg && tar -C /opt/pkg -xzf /pkg/wicket-*-x86_64-linux.tar.gz
+(cd /pkg && sha256sum -c --quiet wicket-*.tar.gz.sha256) || fail "archive checksum"
+inst=$(echo /opt/pkg/wicket-*/deploy/install.sh)
+$inst --operator alex --skip-image --trust-domain wicket.example.com >/tmp/install1.log
+echo "ok: install.sh ran, from the release archive"
+before=$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)
+$inst --operator alex --skip-image >/tmp/install2.log
+[ "$before" = "$(stat -c %i /usr/local/bin/wicket; sha256sum /etc/docker/daemon.json /etc/wicket/*)" ] || fail "the second run changed the binary or the configuration"
+echo "ok: install.sh ran again and changed nothing"
+python3 -c "import json; c = json.load(open(\"/etc/docker/daemon.json\")); assert c[\"log-driver\"] == \"local\", c; assert c[\"runtimes\"][\"runsc\"] == {\"path\": \"/usr/bin/runsc\", \"runtimeArgs\": [\"--host-uds=open\"]}, c" \
+    || fail "daemon.json: $(cat /etc/docker/daemon.json)"
+runsc --version >/dev/null || fail "runsc not installed"
+echo "ok: gVisor installed and registered as runsc with --host-uds=open, keeping daemon.json'"'"'s own settings"
 
 [ "$(stat -c "%U %G %a" /var/lib/wicket)" = "wicket wicket 700" ] || fail "data dir: $(stat -c "%U %G %a" /var/lib/wicket)"
 id -nG wicket | tr " " "\n" | grep -qx docker || fail "wicket is not in the docker group"
@@ -44,6 +58,17 @@ install -d -o wicket -g wicket -m 0755 /run/wicket
 (cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket daemon) 2>/tmp/wicketd.log &
 for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
 [ -S /run/wicket/wicketd.sock ] || { cat /tmp/wicketd.log; fail "wicketd did not start"; }
+
+# The console, as its unit starts it (on another port: this test may share the host'"'"'s network).
+sed -i "s/127.0.0.1:8787/127.0.0.1:18787/" /etc/wicket/console.env
+set -a; . /etc/wicket/console.env; set +a
+# shellcheck disable=SC2086
+(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket serve $WICKET_CONSOLE_ARGS) >/tmp/console.log 2>&1 &
+for _ in $(seq 50); do grep -q "wicket console on" /tmp/console.log && break; sleep 0.1; done
+grep -q "wicket console on http://localhost:18787" /tmp/console.log || { cat /tmp/console.log; fail "the console did not start"; }
+grep -q "/enrol?t=" /tmp/console.log && fail "the console printed an enrolment link in its log"
+grep -q "wicket operator enrol-link" /tmp/console.log || fail "the console did not say how to enrol"
+echo "ok: the console starts from its unit'"'"'s options and keeps enrolment links out of its log"
 
 as_alex() { (cd /home/alex && runuser -u alex -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/alex USER=alex /usr/local/bin/wicket "$@"); }
 out=$(as_alex pending) || fail "alex: pending: $out"
@@ -63,8 +88,8 @@ echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reap"
 out=$(as_alex run --run-id x /src/examples/demo.yaml 2>&1) && fail "alex passed --run-id"
 case "$out" in *"for wicket'"'"'s own use"*) ;; *) fail "alex: --run-id: $out" ;; esac
 out=$(as_alex run --workspace-dir /var/lib /src/examples/demo.yaml 2>&1) && fail "alex mounted /var/lib"
-case "$out" in *"owned by uid 0"*) ;; *) fail "alex: --workspace-dir /var/lib: $out" ;; esac
-echo "ok: alex can'"'"'t pass internal arguments or mount directories that aren'"'"'t its own"
+case "$out" in *"only root mounts in place"*) ;; *) fail "alex: --workspace-dir /var/lib: $out" ;; esac
+echo "ok: alex can'"'"'t pass internal arguments or mount a directory in place"
 useradd --create-home eve
 out=$(cd /home/eve && runuser -u eve -- /usr/local/bin/wicket pending 2>&1) && fail "eve (no operator) read state"
 case "$out" in *"may not read state"*) ;; *) fail "eve: $out" ;; esac
@@ -79,7 +104,8 @@ echo "ok: root approves and sets the secret, as the wicket user"
 out=$(as_alex doctor 2>&1) && fail "doctor passed without Docker"
 for want in "mode: system install, through wicketd" "not readable by you (good)" "docker: not reachable by you (good)" \
     "mode: system install, as wicket" "data /var/lib/wicket: ours, mode 0700" "docker group: only us" \
-    "policy /etc/wicket/wicketd.yaml: read [group wicket-operators]" "vault: 1 secret(s): claude-oauth" "docker: NOT OK"; do
+    "policy /etc/wicket/wicketd.yaml: read [group wicket-operators]" "vault: 1 secret(s): claude-oauth" "docker: NOT OK" \
+    "listening on 127.0.0.1:18787: up" "no passkey enrolled yet: sudo wicket operator enrol-link"; do
     case "$out" in *"$want"*) ;; *) printf "%s\n" "$out"; fail "doctor did not say: $want" ;; esac
 done
 echo "ok: doctor reports the install (and the missing Docker daemon)"

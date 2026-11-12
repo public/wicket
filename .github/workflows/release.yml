@@ -38,17 +38,7 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo build --release --locked -p wicket-cli
       - name: Package
-        env:
-          V: ${{ steps.version.outputs.version }}
-        run: |
-          [ "$(target/release/wicket --version)" = "wicket $V" ] || { target/release/wicket --version; exit 1; }
-          d=wicket-$V-x86_64-linux
-          mkdir -p "dist/$d/deploy"
-          cp target/release/wicket "dist/$d/"
-          cp -r deploy/install.sh deploy/systemd "dist/$d/deploy/"
-          cp -r images README.md LICENSE "dist/$d/"
-          tar -C dist -czf "dist/$d.tar.gz" "$d"
-          (cd dist && sha256sum "$d.tar.gz" > "$d.tar.gz.sha256" && cat "$d.tar.gz.sha256")
+        run: ci/package.sh target/release/wicket dist
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}

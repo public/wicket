@@ -158,8 +158,13 @@ if [ ! -e /etc/wicket/console.env ]; then
 fi
 
 say "wicket $("$binary" --version | awk '{print $2}')"
-install -m 0755 "$binary" /usr/local/bin/wicket.new
-mv -f /usr/local/bin/wicket.new /usr/local/bin/wicket
+# Replaced only when it differs: running `wicket run`s start children from their own binary.
+binary_changed=0
+if ! cmp -s "$binary" /usr/local/bin/wicket; then
+    install -m 0755 "$binary" /usr/local/bin/wicket.new
+    mv -f /usr/local/bin/wicket.new /usr/local/bin/wicket
+    binary_changed=1
+fi
 rm -rf /usr/local/share/wicket/images.new
 cp -r "$root/images" /usr/local/share/wicket/images.new
 chmod -R u=rwX,go=rX /usr/local/share/wicket/images.new
@@ -187,10 +192,14 @@ if [ "$systemd" = 1 ]; then
     if [ "$start" = 1 ]; then
         systemctl enable wicketd wicket-console wicket-reconcile >/dev/null 2>&1
         # Restarting wicketd stops the runs started through it: only when something changed.
-        if [ "$units_changed" = 1 ] || ! systemctl is-active -q wicketd; then
+        if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd
         fi
-        systemctl restart wicket-console wicket-reconcile
+        for u in wicket-console wicket-reconcile; do
+            if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q "$u"; then
+                systemctl restart "$u"
+            fi
+        done
     fi
 else
     say "no systemd here: units installed but not started"
