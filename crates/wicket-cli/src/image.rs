@@ -18,6 +18,7 @@ const FWD_SOURCES: &[(&str, &str)] = &[
     ("src/sys.rs", include_str!("../../wicket-fwd/src/sys.rs")),
     ("src/frame.rs", include_str!("../../wicket-fwd/src/frame.rs")),
     ("src/udp.rs", include_str!("../../wicket-fwd/src/udp.rs")),
+    ("src/stdin.rs", include_str!("../../wicket-fwd/src/stdin.rs")),
 ];
 
 /// A temporary build context, removed on drop.
