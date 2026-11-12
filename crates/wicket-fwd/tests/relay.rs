@@ -280,3 +280,39 @@ fn the_binary_refuses_bad_specs_and_serves_good_ones() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("listen 127.0.0.1:"));
 }
+
+#[test]
+fn dial_relays_stdin_and_stdout_with_half_close() {
+    let bin = env!("CARGO_BIN_EXE_wicket-fwd");
+    // A server that reads the whole request (to the client's half-close), then answers and closes.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    thread::spawn(move || {
+        for c in server.incoming().take(2) {
+            let mut c = c.unwrap();
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).unwrap();
+            c.write_all(format!("got {} bytes", got.len()).as_bytes()).unwrap();
+        }
+    });
+    for mode in ["splice", "rw"] {
+        let mut child = Command::new(bin)
+            .args(["--dial", &addr.to_string(), "--copy", mode])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&vec![7u8; 300_000]).unwrap();
+        drop(stdin);
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        assert_eq!(out, "got 300000 bytes", "{mode}");
+        assert!(child.wait().unwrap().success());
+    }
+    // Nothing listening: a failure, said on stderr.
+    let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let out = Command::new(bin).args(["--dial", &gone.to_string()]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("dial 127.0.0.1:"));
+}

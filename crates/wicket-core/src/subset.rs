@@ -34,43 +34,7 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     if strength(c.isolation) < strength(p.isolation) {
         v.push(format!("isolation {:?} is weaker than this zone's {:?}", c.isolation, p.isolation));
     }
-    if p.unlisted_hosts == UnlistedHosts::Hide && c.unlisted_hosts != UnlistedHosts::Hide {
-        v.push("unlisted_hosts must be hide, as in this zone".into());
-    }
-    for (i, r) in c.reach.iter().enumerate() {
-        for m in &r.methods {
-            for path in &r.paths {
-                let covered = p.reach.iter().any(|q| {
-                    host_covers(&q.host, &r.host)
-                        && q.methods.iter().any(|qm| qm.eq_ignore_ascii_case(m))
-                        && path_covered(&q.paths, path)
-                        && (!r.allow_dangerous || q.allow_dangerous)
-                });
-                if !covered {
-                    v.push(format!(
-                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
-                        r.host,
-                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
-                    ));
-                }
-            }
-        }
-    }
-    // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
-    // forbid rule with the same or a wider host (the paths of one parent rule may be split across
-    // several child rules).
-    for (i, f) in p.forbid.iter().enumerate() {
-        let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
-        if !kept {
-            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
-        }
-    }
-    for i in &c.inject {
-        let same = p.inject.iter().any(|q| q.host == i.host && q.header == i.header && q.format == i.format && q.secret == i.secret);
-        if !same {
-            v.push(format!("inject {} {}: only this zone's own credential injections can be passed on", i.host, i.header));
-        }
-    }
+    v.extend(reach_violations(p, c));
     match (&c.llm, &p.llm) {
         (None, _) => {}
         (Some(_), None) => v.push("a model route: this zone has none".into()),
@@ -136,6 +100,66 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     } else {
         Err(v)
     }
+}
+
+/// Whether `inner`'s reach is within `outer`'s: every reach rule covered, every forbid rule kept,
+/// no credential injection or model route `outer` lacks, and no unlisted hosts shown that `outer`
+/// hides. This is the authority a box lends whoever is linked to it (design §4.3): a connector may
+/// only reach a box whose zone could do nothing the connector's own zone couldn't. Conservative, as
+/// [`check`] is.
+pub fn reach_within(outer: &ZoneSpec, inner: &ZoneSpec) -> Result<(), Vec<String>> {
+    let mut v = reach_violations(outer, inner);
+    if inner.llm.is_some() && outer.llm.is_none() {
+        v.push("a model route: this zone has none".into());
+    }
+    if v.is_empty() {
+        Ok(())
+    } else {
+        Err(v)
+    }
+}
+
+/// The reach, forbid, credential and unlisted-host parts of [`check`].
+fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
+    let mut v = Vec::new();
+    if p.unlisted_hosts == UnlistedHosts::Hide && c.unlisted_hosts != UnlistedHosts::Hide {
+        v.push("unlisted_hosts must be hide, as in this zone".into());
+    }
+    for (i, r) in c.reach.iter().enumerate() {
+        for m in &r.methods {
+            for path in &r.paths {
+                let covered = p.reach.iter().any(|q| {
+                    host_covers(&q.host, &r.host)
+                        && q.methods.iter().any(|qm| qm.eq_ignore_ascii_case(m))
+                        && path_covered(&q.paths, path)
+                        && (!r.allow_dangerous || q.allow_dangerous)
+                });
+                if !covered {
+                    v.push(format!(
+                        "reach rule {i}: {m} {}{path} is not within this zone's reach{}",
+                        r.host,
+                        if r.allow_dangerous { " (with allow_dangerous)" } else { "" }
+                    ));
+                }
+            }
+        }
+    }
+    // The parent's forbid rules bind the child too: each forbidden path must stay forbidden, by a child
+    // forbid rule with the same or a wider host (the paths of one parent rule may be split across
+    // several child rules).
+    for (i, f) in p.forbid.iter().enumerate() {
+        let kept = f.paths.iter().all(|fp| c.forbid.iter().any(|g| host_covers(&g.host, &f.host) && path_covered(&g.paths, fp)));
+        if !kept {
+            v.push(format!("forbid rule {i} ({} {}) of this zone must be kept", f.host, f.paths.join(", ")));
+        }
+    }
+    for i in &c.inject {
+        let same = p.inject.iter().any(|q| q.host == i.host && q.header == i.header && q.format == i.format && q.secret == i.secret);
+        if !same {
+            v.push(format!("inject {} {}: only this zone's own credential injections can be passed on", i.host, i.header));
+        }
+    }
+    v
 }
 
 fn strength(i: Isolation) -> u8 {

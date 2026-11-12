@@ -699,6 +699,7 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
         identity: None,
         spawner: None,
         swaps: vec![],
+        boxes: None,
         capacity: None,
     };
     let ca = node.ca();

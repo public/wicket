@@ -1,0 +1,31 @@
+# An agent that starts headless Chromium in its own box and drives it over the DevTools protocol, through
+# a wicket link (examples/links/README.md). Needs a model (the claude-oauth secret) and the two images:
+#   docker build -t wicket/claude-code:links images/claude-code
+#   docker build -t wicket/chrome:links examples/links/chrome
+#   wicket run --image wicket/claude-code:links examples/links/chrome.yaml
+task: |
+  Start a headless Chromium in its own box with the wicket spawn tool:
+    name "chrome", kind "program", image "wicket/chrome:links", zone {"reach": [{"host": "example.com", "methods": ["GET"], "paths": ["/"]}]},
+    command ["chromium", "--headless=new", "--no-sandbox", "--disable-gpu", "--remote-debugging-address=127.0.0.1",
+             "--remote-debugging-port=9222", "--remote-allow-origins=*", "--proxy-server=http://wicket.internal:3128",
+             "--ignore-certificate-errors",
+             "--user-data-dir=/tmp/chrome", "about:blank"].
+  Then call connect with box "chrome" and port 9222, and use the address it returns.
+  Chromium only answers DevTools HTTP requests whose Host header is an IP address or localhost, so send
+  "Host: localhost:9222" (e.g. curl -H 'Host: localhost:9222' http://chrome.wicket.internal:9222/json/version).
+  Write a small Node.js script (Node 22 has a global WebSocket) that opens a page target, navigates it to
+  https://example.com/ and reads document.title over the DevTools protocol. Put the title in
+  /workspace/out/result.json as {"title": "..."}.
+agent:
+  name: driver
+  max_turns: 40
+  max_children: 1
+zone:
+  name: chrome-demo
+  isolation: gvisor
+  # The driver's reach must cover the browser's: a link lends the connector the target's authority.
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  images: [wicket/chrome:links]
+  llm: {}
+  limits: { memory: 2g, cpus: 2, timeout: 20m }

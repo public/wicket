@@ -8,8 +8,10 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
-mod lease;
+mod links;
 mod node;
+pub use links::{ExposeRow, LinkRow};
+mod lease;
 pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 
@@ -245,6 +247,7 @@ impl Ledger {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(links::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -261,6 +264,7 @@ impl Ledger {
     pub fn open_in_memory() -> Result<Ledger> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(links::SCHEMA)?;
         Ok(Ledger { conn })
     }
 
@@ -283,6 +287,7 @@ impl Ledger {
             "UPDATE requests SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE run = ?1 AND status = 'pending'",
             params![run.0, now()],
         )?;
+        self.close_links_of(&run.0)?;
         // A lease nobody has approved yet goes with the run that asked for it.
         self.conn.execute(
             "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
@@ -809,12 +814,26 @@ impl Ledger {
     /// Appends a hash-chained audit record: hash = sha256(prev || kind || body).
     pub fn audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &serde_json::Value) -> Result<i64> {
         let body = serde_json::to_string(body)?;
+        // Several processes append to one ledger (a run, its children, a link's relay): read the head
+        // and append under one write lock, or two appends can chain from the same record.
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let r = self.append_audit(tenant, run, kind, &body);
+        if own {
+            let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        }
+        r
+    }
+
+    fn append_audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &str) -> Result<i64> {
         let prev: String = self
             .conn
             .query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .optional()?
             .unwrap_or_else(|| "0".repeat(64));
-        let hash = chain_hash(&prev, kind, &body);
+        let hash = chain_hash(&prev, kind, body);
         self.conn.execute(
             "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![now(), tenant.0, run.map(|r| r.0.clone()), kind, body, prev, hash],
@@ -1515,5 +1534,31 @@ mod tests {
         assert_eq!(l.verify_audit().unwrap(), 5);
         l.conn.execute("UPDATE audit SET body = '{\"i\":99}' WHERE seq = 3", []).unwrap();
         assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(3))));
+    }
+
+    #[test]
+    fn concurrent_appenders_keep_one_chain() {
+        let dir = std::env::temp_dir().join(format!("wicket-audit-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        Ledger::open(&path).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let l = Ledger::open(&path).unwrap();
+                    for i in 0..50 {
+                        l.audit(&TenantId::single(), None, "test", &serde_json::json!({ "w": w, "i": i })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in writers {
+            t.join().unwrap();
+        }
+        let n = Ledger::open(&path).unwrap().verify_audit();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(n.unwrap(), 200);
     }
 }

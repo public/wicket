@@ -9,6 +9,7 @@ mod capacity;
 mod chan;
 mod enrol;
 mod image;
+mod links;
 mod mock;
 mod node;
 mod nodeauth;
@@ -131,6 +132,13 @@ enum Cmd {
     },
     /// Deny a pending request.
     Deny { id: String },
+    /// Links between boxes (expose/connect/link), newest first.
+    Links {
+        #[arg(long, default_value_t = 40)]
+        tail: usize,
+    },
+    /// Cut a link between boxes: its relay closes it and drops its connections within seconds.
+    Unlink { id: String },
     /// Grants made by approvals.
     Grant {
         #[command(subcommand)]
@@ -697,6 +705,45 @@ async fn main() -> Result<()> {
                 if let Some(x) = Ledger::open(&ledger_path())?.lease(lease)? {
                     println!("lease {lease}: {} {}", x.status, x.node_name.or(x.detail).unwrap_or_default());
                 }
+            }
+            Ok(())
+        }
+        Cmd::Links { tail } => {
+            let l = Ledger::open(&ledger_path())?;
+            let rows = l.links(&TenantId::single(), tail)?;
+            if rows.is_empty() {
+                println!("no links");
+            }
+            for r in rows {
+                println!(
+                    "{}  {:6}  {} → {}.{}:{} ({})  opened by {} ({}){}",
+                    r.id,
+                    r.status,
+                    r.from_run,
+                    r.name,
+                    wicket_core::link::DOMAIN,
+                    r.port,
+                    r.to_run,
+                    r.by_run,
+                    r.basis,
+                    r.close_reason.map(|c| format!("; closed: {c}")).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        Cmd::Unlink { id } => {
+            let l = Ledger::open(&ledger_path())?;
+            let r = l.link(&id)?.with_context(|| format!("no link {id}"))?;
+            if l.close_link(&id, &operator(), "cut by the operator")? {
+                l.audit(
+                    &TenantId::single(),
+                    None,
+                    "link.cut",
+                    &serde_json::json!({ "id": id, "by": operator(), "from": r.from_run, "to": r.to_run, "port": r.port }),
+                )?;
+                println!("cut {id}; its relay closes it within a few seconds");
+            } else {
+                println!("{id} was already closed");
             }
             Ok(())
         }

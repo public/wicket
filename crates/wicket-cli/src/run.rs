@@ -216,6 +216,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         std::fs::create_dir_all(dir.join(sub))?;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    // A local box gets wicket's own hosts file, which links add names to (crate::links).
+    if node.is_none() {
+        std::fs::write(crate::links::hosts_path(&dir), wicket_core::link::hosts_file(&[]))?;
+    }
     for w in workdir.into_iter().chain(program_src.as_ref().map(|(s, _)| s.as_path())) {
         let st = std::process::Command::new("cp").arg("-a").arg(format!("{}/.", w.display())).arg(dir.join("workspace")).status()?;
         if !st.success() {
@@ -427,6 +431,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         identity: identity.clone(),
         spawner,
         swaps,
+        boxes: node.is_none().then(|| {
+            Arc::new(crate::links::LocalBoxes::new(docker.clone(), data_dir().join("runs"), dir.clone()))
+                as Arc<dyn wicket_proxy::link::BoxOps>
+        }),
         capacity,
     };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
@@ -561,6 +569,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         .into_iter()
         .chain(workspace_mounts)
         .chain(volume_mounts)
+        .chain(node.is_none().then(|| Mount { host: crate::links::hosts_path(&dir), target: "/etc/hosts".into(), read_only: true }))
         .collect(),
         env: plan.env,
         argv: plan.argv,

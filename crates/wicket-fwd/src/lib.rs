@@ -127,6 +127,8 @@ pub struct Config {
     pub watch_every: Duration,
     /// One log line per connection.
     pub verbose: bool,
+    /// `--dial`: instead of listening, connect here and relay stdin/stdout ([`dial`]).
+    pub dial: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -139,6 +141,7 @@ impl Default for Config {
             bind_timeout: Duration::from_secs(5),
             watch_every: Duration::from_secs(1),
             verbose: false,
+            dial: None,
         }
     }
 }
@@ -364,6 +367,32 @@ fn end_down(r: &io::Result<u64>, from: &UnixStream, to: &TcpStream) {
             let _ = to.shutdown(Shutdown::Both);
         }
     }
+}
+
+/// `--dial ADDR`: one TCP connection to `addr`, relayed to stdin and stdout, for a caller outside
+/// the box that reaches in over `docker exec -i` (links between boxes, `wicket_proxy::link`: under
+/// gVisor the host can't connect to a socket a box creates, so wicket runs this in the target box).
+///
+/// End of file on stdin shuts down writing on the connection (half-close); the call returns when the
+/// connection's read side ends, without waiting for stdin. Returns (bytes in, bytes out).
+pub fn dial(addr: SocketAddr, mode: CopyMode, buf_size: usize) -> io::Result<(u64, u64)> {
+    use std::os::fd::AsFd;
+    let tcp = TcpStream::connect(addr)?;
+    let _ = tcp.set_nodelay(true);
+    // Unbuffered handles on fds 0 and 1 (std's Stdin/Stdout buffer, and splice wants the fd).
+    let mut stdin = std::fs::File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let mut stdout = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let mut tcp_w = tcp.try_clone()?;
+    let up = thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
+        let r = copy::copy(mode, &mut stdin, &mut tcp_w, buf_size);
+        let _ = tcp_w.shutdown(if r.is_ok() { Shutdown::Write } else { Shutdown::Both });
+        r
+    })?;
+    let mut tcp_r = tcp;
+    let down = copy::copy(mode, &mut tcp_r, &mut stdout, buf_size);
+    let _ = stdout.flush();
+    let up = if up.is_finished() { up.join().unwrap_or(Ok(0)).unwrap_or(0) } else { 0 };
+    Ok((up, down?))
 }
 
 /// Is `ip` an address of this machine (or box)? A UDP bind to it succeeds only then.

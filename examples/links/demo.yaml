@@ -1,0 +1,15 @@
+# Links demo (examples/links/demo.sh): an agent starts a service box, connects to it, and drives it
+# with its own code. Driven by `wicket dev mock-llm`, so no model credential is involved: the mock
+# asks the agent to run box/drive.sh, which calls wicket's MCP gateway directly.
+task: Run the command you are given and stop.
+agent:
+  name: lead
+  max_turns: 4
+  max_children: 2
+zone:
+  name: links-demo
+  isolation: gvisor
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:9999
+  limits: { memory: 1500m, cpus: 1, timeout: 5m }

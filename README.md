@@ -49,6 +49,12 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
   out), resources, time, isolation and images. Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
   exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
   `in_box_subagents: false` to make wicket children the only kind of subagent.
+- Boxes reach each other's ports only through links, which wicket relays (boxes still have no network):
+  `expose(port)` offers a port, `connect(box, port)` returns `<name>.wicket.internal:<port>` in the caller's box,
+  and `link(from, to, port)` wires two boxes the caller controls. A box's own children are connectable without
+  `expose`; others need its `expose` and its zone's `accept_from`, or a human. The target's reach must be within
+  the connector's, or a human approves. Every link is audited (`wicket links`, `wicket unlink <id>`), and closes
+  when cut, when either end is revoked or when either run ends. See `examples/links/`.
 - Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
   `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
   and approvals.
@@ -366,7 +372,8 @@ These are general features for any workload:
 ### Inside the box
 
 wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
-script), so the agent has all of localhost for its own servers. The entry script adds that address as root
+script), so the agent has all of localhost for its own servers. Links to other boxes get addresses from
+198.18.1.1 onward and names in the box's hosts file, which wicket owns and the box can only read. The entry script adds that address as root
 with only the network-admin capability, then runs everything as the agent's user with no capabilities.
 
 ### Agents launched by something else, e.g. Remote Control

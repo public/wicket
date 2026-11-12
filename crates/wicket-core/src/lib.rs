@@ -6,6 +6,7 @@
 //! a reach rule, forbidden outright, or needs a grant from the ledger.
 
 pub mod canon;
+pub mod link;
 pub mod manifest;
 pub mod op;
 pub mod subset;
@@ -73,4 +74,10 @@ pub fn new_request_id() -> String {
 pub fn new_grant_id() -> String {
     let u = ulid::Ulid::new().to_string().to_lowercase();
     format!("g-{}", &u[u.len() - 8..])
+}
+
+/// Short id for links between boxes, e.g. `l-01jc4x2k9q`.
+pub fn new_link_id() -> String {
+    let u = ulid::Ulid::new().to_string().to_lowercase();
+    format!("l-{}", &u[u.len() - 10..])
 }
