@@ -74,6 +74,11 @@ impl Op {
 }
 
 /// A small, hand-maintained dangerous-pattern list (design §10). It can only raise risk.
+///
+/// GitHub endpoints are matched on the path's segments, lowercased (GitHub folds the case of owner
+/// and repository names, and lowercasing can only make more paths match, which only raises risk).
+/// Paths reach here canonical (`canonical_path`): no escapes of unreserved characters, no `;`, no
+/// dot segments, so a segment is spelled one way.
 fn classify(method: &str, host: &str, path: &str, query: &str) -> (RiskClass, Vec<String>) {
     let mut risk = match method {
         "GET" | "HEAD" | "OPTIONS" => RiskClass::R1ReadScoped,
@@ -86,21 +91,58 @@ fn classify(method: &str, host: &str, path: &str, query: &str) -> (RiskClass, Ve
         }
         effects.push(why.to_string());
     };
-    let push_discovery = path.ends_with("/info/refs") && query.split('&').any(|kv| kv == "service=git-receive-pack");
-    if host == "github.com" && (path.ends_with("/git-receive-pack") || push_discovery) {
-        raise(RiskClass::R4ExecOrPrivilege, "gh.git_push: pushes can trigger CI", &mut risk);
+    let lower = path.to_ascii_lowercase();
+    let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+    let has = |names: &[&str]| segs.iter().any(|s| names.contains(s));
+    if host == "github.com" {
+        // Ref discovery is a read only for exactly the upload-pack (fetch) service: any other query
+        // (receive-pack, or an escaped or repeated spelling of it) is treated as a push.
+        let discovery = lower.ends_with("/info/refs") && !(query.is_empty() || query == "service=git-upload-pack");
+        if lower.ends_with("/git-receive-pack") || discovery {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.git_push: pushes can trigger CI", &mut risk);
+        }
     }
     if host == "api.github.com" && risk >= RiskClass::R2WriteReversible {
-        if path.contains("/contents/.github/") {
+        // `/repos/{owner}/{repo}/...`: what follows the repository.
+        let rest: &[&str] = if segs.first() == Some(&"repos") && segs.len() >= 3 { &segs[3..] } else { &[] };
+        if segs.first() == Some(&"graphql") {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.graphql: a GraphQL mutation can do anything the token can", &mut risk);
+        }
+        if segs.first() == Some(&"repos") && segs.len() == 3 {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.repo_settings: changes or deletes the repository", &mut risk);
+        }
+        if rest.starts_with(&["contents", ".github"]) {
             raise(RiskClass::R4ExecOrPrivilege, "gh.workflow_path: edits CI with the repo's secrets", &mut risk);
         }
-        if path.contains("/merge") || path.ends_with("/dispatches") || path.contains("/actions/") {
-            raise(RiskClass::R4ExecOrPrivilege, "gh.exec: merges or dispatches workflows", &mut risk);
+        // Blobs, trees and commits made through the git data API do nothing until a ref points at
+        // them; moving the ref is what lands a change (a workflow edit included), as a push does.
+        if rest.starts_with(&["git", "refs"]) {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.git_ref: moves a branch or tag, as a push does", &mut risk);
         }
-        if path.contains("/collaborators") || path.contains("/keys") || path.contains("/hooks") || path.contains("/secrets") {
+        let update_branch = rest.first() == Some(&"pulls") && rest.get(2) == Some(&"update-branch");
+        if has(&["merge", "merges", "merge-upstream", "dispatches", "actions", "deployments"]) || update_branch {
+            raise(RiskClass::R4ExecOrPrivilege, "gh.exec: merges, updates branches or runs workflows", &mut risk);
+        }
+        let perms = [
+            "collaborators",
+            "invitations",
+            "keys",
+            "gpg_keys",
+            "ssh_signing_keys",
+            "hooks",
+            "secrets",
+            "variables",
+            "environments",
+            "protection",
+            "rulesets",
+            "transfer",
+            "members",
+            "memberships",
+        ];
+        if has(&perms) {
             raise(RiskClass::R4ExecOrPrivilege, "gh.perm_manage: changes access or credentials", &mut risk);
         }
-        if path.contains("/comments") || path.ends_with("/issues") || path.ends_with("/pulls") {
+        if has(&["comments", "reviews", "releases"]) || lower.ends_with("/issues") || lower.ends_with("/pulls") {
             raise(RiskClass::R3ExternalOrIrreversible, "gh.notify: posts visible content", &mut risk);
         }
     }
@@ -532,6 +574,48 @@ zone:
         assert!(checked > 10_000 && kinds.iter().all(|&k| k > 500), "too few decisions of some kind: {kinds:?} of {checked}");
     }
 
+    /// #114: the GitHub endpoints that do what the R4 patterns guard against, spelled any way.
+    #[test]
+    fn equivalent_github_endpoints_are_classified_alike() {
+        let risk = |m: &str, h: &str, p: &str| op(m, h, p).risk;
+        use RiskClass::*;
+        for (m, p) in [
+            ("PATCH", "/repos/acme/app/git/refs/heads/main"),
+            ("POST", "/repos/acme/app/git/refs"),
+            ("DELETE", "/repos/acme/app/git/refs/tags/v1"),
+            ("POST", "/graphql"),
+            ("PUT", "/repos/acme/app/pulls/7/update-branch"),
+            ("PUT", "/repos/acme/app/pulls/7/merge"),
+            ("POST", "/repos/acme/app/merges"),
+            ("POST", "/repos/acme/app/merge-upstream"),
+            ("PUT", "/repos/ACME/APP/contents/.GITHUB/workflows/ci.yml"),
+            ("PUT", "/repos/acme/app/Collaborators/mallory"),
+            ("POST", "/repos/acme/app/HOOKS"),
+            ("PUT", "/repos/acme/app/branches/main/protection"),
+            ("POST", "/repos/acme/app/environments/prod/secrets"),
+            ("POST", "/repos/acme/app/transfer"),
+            ("DELETE", "/repos/acme/app"),
+            ("PATCH", "/repos/acme/app"),
+            ("POST", "/user/keys"),
+        ] {
+            assert_eq!(risk(m, "api.github.com", p), R4ExecOrPrivilege, "{m} {p}");
+        }
+        // Objects alone change nothing a workflow runs from; reads stay reads.
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/git/blobs"), R2WriteReversible);
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/git/commits"), R2WriteReversible);
+        assert_eq!(risk("GET", "api.github.com", "/repos/acme/app/git/refs/heads/main"), R1ReadScoped);
+        assert_eq!(risk("PUT", "api.github.com", "/repos/acme/hooks-docs/contents/README.md"), R2WriteReversible);
+        assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/pulls/7/Reviews"), R3ExternalOrIrreversible);
+        // git over HTTPS: push in any case, and ref discovery for anything but a plain fetch.
+        assert_eq!(risk("POST", "github.com", "/acme/app.git/GIT-RECEIVE-PACK"), R4ExecOrPrivilege);
+        let disc = |q: &str| Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/a/b.git/info/refs", q).risk;
+        assert_eq!(disc("service=git-upload-pack"), R1ReadScoped);
+        assert_eq!(disc(""), R1ReadScoped);
+        for q in ["service=git-receive-p%61ck", "service=git-upload-pack&service=git-receive-pack", "service=GIT-RECEIVE-PACK"] {
+            assert_eq!(disc(q), R4ExecOrPrivilege, "{q}");
+        }
+    }
+
     /// #115: a forbid narrower than reach can't be dodged by spelling the path in another case.
     #[test]
     fn forbids_ignore_case() {
@@ -542,7 +626,7 @@ zone:
             assert!(matches!(evaluate_uncompiled(&z, &op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
         }
         for p in ["/repos/acme/production/x", "/repos/dx/secret", "/repos/ACME/app/x"] {
-            assert!(matches!(cz.evaluate(&op("PUT", "api.github.com", p)), Verdict::AllowByReach(0)), "{p}");
+            assert!(matches!(cz.evaluate(&op("GET", "api.github.com", p)), Verdict::AllowByReach(0)), "{p}");
         }
         // Reach stays case-sensitive.
         assert!(matches!(cz.evaluate(&op("GET", "api.github.com", "/REPOS/x")), Verdict::NeedsGrant(_)));
