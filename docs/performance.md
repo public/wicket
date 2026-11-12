@@ -20,6 +20,8 @@ arms only within one table, where they were interleaved in the same run.
 | egress CPU per GB, host allowed wholesale (splice-through) | 2.67 CPU-s/GB | 0.33 CPU-s/GB |
 | egress CPU per 1,000 kept-alive requests, same host | 162 CPU-ms | 32 CPU-ms |
 | `cargo fetch` of a mid-size project in a gVisor box | 24.3 s, 1,012 audit rows | 15.8 s, 19 audit rows |
+| 10 MB upload through an inspected host (streamed bodies) | 44 ms, whole body buffered, 64 MiB cap | 25 ms, streamed, 4 GiB cap |
+| egress CPU per GB, spliced on a remote node | inspected: 2.47 CPU-s/GB | 0.37 CPU-s/GB, while its feed is fresh |
 
 ## Splice-through for hosts allowed wholesale
 
@@ -134,13 +136,72 @@ Measured 2026-11-12.
   long. The prototype measured 0.17 CPU-s/GB using two blocking threads per connection. The
   production version drives splice from the event loop: it pays for readiness wakeups, and doesn't
   use a thread per connection.
-- **Uploads stop being buffered.** The intercepting path reads a whole request body before sending
-  it upstream, and refuses bodies over 64 MiB ([#142](https://github.com/public/wicket/issues/142)).
-  Spliced, a 10 MB upload takes as long as direct.
-- **HTTP/2 goes end to end.** Intercepted, the box side is HTTP/1.1.
+- **Uploads aren't buffered.** Spliced, a 10 MB upload takes as long as direct. The intercepting path
+  streams bodies too since [#142](https://github.com/public/wicket/issues/142): see below.
+- **HTTP/2 goes end to end.** Intercepted, the box side is HTTP/1.1. The upstream side is HTTP/2 where
+  the upstream offers it.
 - **A new spliced connection is about 0.3 ms slower than an intercepted one.** The proxy dials the
   upstream before it answers the `CONNECT`, so that the address check can refuse it. Interception
   reuses a pooled upstream connection.
+
+## Intercepted hosts: streamed bodies and HTTP/2 upstreams
+
+Before [#142](https://github.com/public/wicket/issues/142), the intercepting path read a whole request
+body before it sent it upstream. A body over 64 MiB failed, and responses lost their
+`content-length`. Upstream connections were pooled over HTTP/1.1 only. Now:
+
+- **Request bodies stream upstream** as they arrive, with the box's backpressure: an upstream that
+  reads slowly slows the box's writes, so the proxy holds only what sits in its buffers. A declared
+  `content-length` goes upstream as declared, and a body without one goes chunked. A body over 4 GiB
+  is refused: up front when it declares its length, otherwise when it passes the limit.
+- **Some bodies are still read whole.** GET and HEAD are refused if they carry a body at all.
+  Requests that arrived over HTTP/3 are read whole (up to 64 MiB), so they can be sent again over
+  HTTP/2 if the HTTP/3 upstream connection is gone. Model calls through the model proxy keep its own
+  checks and limit, and the model proxy reads their bodies.
+- **Responses keep `content-length`**, so clients see download sizes and progress. The body passes
+  through unchanged (wicket doesn't decompress), including through the model proxy's accounting.
+- **Upstream connections use HTTP/2 where the upstream offers it (ALPN),** HTTP/1.1 otherwise. Requests
+  from many box connections to one host share one pooled HTTP/2 connection. Windows are fixed at
+  8 MiB per stream and 16 MiB per connection, with 1 MiB frames. hyper's adaptive window, which
+  follows the bandwidth-delay product with pings, cut 100 MB downloads to 150–160 MB/s on this
+  machine, against about 340–360 MB/s with fixed windows. The box side stays HTTP/1.1.
+
+### Measured: streamed bodies, HTTP/2 upstreams and node splicing
+
+The same bench as above (`netbench bench`), 3 interleaved rounds, measured 2026-11-12. The origin
+offers HTTP/2 and HTTP/1.1. The arms:
+
+- **inspected, 0.0.1 before #142**: the proxy built from the commit before this change (buffered bodies,
+  HTTP/1.1 upstream);
+- **inspected, HTTP/1.1 upstream**: streamed bodies, the upstream held to HTTP/1.1
+  (`Upstream::http1_only`);
+- **inspected**: streamed bodies, the HTTP/2 upstream pool, as wicket runs it;
+- **spliced**, and **spliced on a node**: the node's decider over a fresh feed replica, as
+  `wicket node serve` runs it.
+
+| setup | new conn p50 (ms) | kept-alive p50 / p99 (µs) | req/s, 16 kept | proxy CPU-ms per 1,000 kept requests | 100 MB, MB/s median (min–max) | proxy CPU-s per GB | 10 MB upload (ms) |
+|---|---|---|---|---|---|---|---|
+| direct | 1.23 | 118 / 208 | 38,968 | – | 765 (625–866) | – | 13 |
+| inspected, before #142 | 1.58 | 400 / 577 | 9,898 | 157 | 412 (298–465) | 2.47 | 44 |
+| inspected, HTTP/1.1 upstream | 1.64 | 370 / 806 | 11,632 | 149 | 391 (319–454) | 2.43 | 24 |
+| **inspected** | 1.75 | 442 / 879 | 9,554 | 154 | 418 (352–495) | 3.00 | **25** |
+| spliced | 1.78 | 193 / 415 | 23,311 | 35 | 671 (457–723) | 0.37 | 14 |
+| **spliced on a node** | 1.72 | 183 / 334 | 25,186 | 35 | 761 (614–838) | **0.37** | 13 |
+
+- **A 10 MB upload through an inspected host takes 25 ms instead of 44 ms.** The rest is the TLS work
+  on both sides. A body over 64 MiB, which used to fail, now streams. The regression test sends
+  80 MiB to an origin that stops reading, and checks that the box's writes stop too.
+- **HTTP/2 upstreams cost CPU on loopback, and save connections on the internet.** Per GB, the HTTP/2
+  upstream costs about 0.6 CPU-s more than HTTP/1.1 (3.00 against 2.43), and the origin pays more too.
+  Throughput and per-request cost are about the same. What it buys is one upstream connection, and
+  one TLS handshake, for many box connections to the same host. With a local origin that saves
+  nothing; with a real one it saves a TCP and TLS handshake of round trips per new upstream
+  connection. Set `Upstream::http1_only` to keep a deployment on HTTP/1.1.
+- **On a node, splicing costs what it costs on the control host:** 0.37 CPU-s per GB and 35 CPU-ms per
+  1,000 kept-alive requests, against 2.47 and 157 inspected. The node checks the box's token at each
+  `CONNECT`: 14 token decisions (7 methods, 2 paths). That adds about 0.08 ms to the `CONNECT`
+  (0.39 ms against 0.31 ms on the control host), and the same check runs every 2 s on each spliced
+  connection.
 
 ### Measured: real workloads in a gVisor box
 
@@ -173,6 +234,21 @@ What holds across both runs:
 - the audit rows: one per connection instead of one per request;
 - `cargo fetch` keeps HTTP/2 when spliced: its 366 crate downloads went over 2 connections to
   `static.crates.io`. Intercepted, they were 366 HTTP/1.1 requests.
+
+**Re-measured after [#142](https://github.com/public/wicket/issues/142)** (2026-11-12, release build,
+the same workloads, spliced first). The intercepting path now streams bodies, keeps
+`content-length` and uses HTTP/2 to registries that offer it.
+
+| workload | inspected | spliced |
+|---|---|---|
+| `cargo fetch` | 17.7 s | 18.8 s |
+| `npm install` | 16.8 s | 16.1 s |
+| 1 GiB download | 5.8 s (186 MB/s) | 6.6 s (167 MB/s) |
+| CPU of the `wicket run` process, whole run | 6.1 s | 2.8 s |
+
+The 1 GiB download through the intercepting path now runs as fast as spliced: both are set by the
+network, not the proxy. Before, it took 10.5 s inspected against 8.9 s spliced. The CPU figures
+include starting the run and the box, and spliced still costs less than half.
 
 **npm scoped packages through an inspected registry.** npm asks for a scoped package as
 `@scope%2fname`. The intercepting proxy refuses an encoded `/` in a path as ambiguous
@@ -227,7 +303,6 @@ faster in a gVisor box, and it is the path that splice-through applies to.
 
 - Read-through caches for package registries on each node ([#139](https://github.com/public/wicket/issues/139)).
 - Large inputs and outputs fetched and uploaded host-side ([#140](https://github.com/public/wicket/issues/140)).
-- Streaming request bodies and HTTP/2 upstream pooling on the intercepting path ([#142](https://github.com/public/wicket/issues/142)).
 - The `filtered` network mode, for protocols the proxy can't carry ([#63](https://github.com/public/wicket/issues/63)).
 
 ## Reproducing
@@ -237,9 +312,15 @@ cd experiments/network-overhead
 CARGO_BUILD_JOBS=1 cargo build --release
 # Proxy, per request and per GB: direct, inspected, spliced (about 4 minutes; ports 18128/18443).
 target/release/netbench bench --only direct,egress- --rounds 3 --secs 4 --out logs/splice-through
+# Streamed bodies, HTTP/2 upstreams and node splicing (#141, #142). The "before" arm needs this
+# harness built from the commit before #142, as NETBENCH_BASELINE; without it, that arm is skipped.
+NETBENCH_BASELINE=/path/to/old/netbench target/release/netbench bench \
+  --only direct,egress-inspect/unix,egress-inspect-h1up,egress-inspect-base,egress-splice/unix,egress-node-splice \
+  --rounds 3 --secs 4 --out logs/node-proxy
 # Real workloads in a gVisor box (needs Docker with runsc, the agent image, and the internet).
 workloads/prepare.sh /tmp/ws
 for arm in splice inspect; do wicket run workloads/$arm.yaml --workdir /tmp/ws; done
 ```
 
-The raw results are in `experiments/network-overhead/logs/splice-through/results.json`.
+The raw results are in `experiments/network-overhead/logs/splice-through/results.json` and
+`logs/node-proxy/results.json`.

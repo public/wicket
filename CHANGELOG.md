@@ -58,6 +58,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   for hosts the box's token itself allows for every method. When the replica narrows or closes, the
   node cuts its spliced connections within 2 s and inspects new ones
   ([#141](https://github.com/public/wicket/issues/141)).
+- Intercepted hosts: request bodies stream upstream instead of being buffered (a 10 MB upload went from
+  44 ms to 25 ms, and bodies over 64 MiB no longer fail; the limit is now 4 GiB). Responses keep their
+  `content-length`, and upstream connections use HTTP/2 where the upstream offers it, so many box
+  connections share one ([#142](https://github.com/public/wicket/issues/142)).
 
 ### Model budgets
 

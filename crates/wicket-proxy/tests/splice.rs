@@ -485,6 +485,7 @@ async fn a_node_splices_while_its_feed_is_fresh_and_stops_when_it_narrows() {
     let (_, cert) = x509_parser::parse_x509_certificate(&leaf).unwrap();
     assert_eq!(cert.issuer().iter_common_name().next().unwrap().as_str().unwrap(), "wicket run CA origin", "spliced on the node");
     tls.write_all(b"POST /a HTTP/1.1\r\nHost: open.test\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+    tls.flush().await.unwrap();
     let mut buf = vec![0u8; 4096];
     let n = tls.read(&mut buf).await.unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).contains("origin /a"));
@@ -561,6 +562,7 @@ async fn request(s: UnixStream, sni: &str, raw: &str) -> String {
     let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
     tls.write_all(raw.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
     let mut resp = Vec::new();
     let _ = tls.read_to_end(&mut resp).await;
     String::from_utf8_lossy(&resp).into_owned()

@@ -23,7 +23,8 @@ http-body-util = { workspace = true, features = ["channel"] }
 http.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
-reqwest.workspace = true
+# HTTP/2 to upstreams that offer it (ALPN), pooled: many box connections share one (#142).
+reqwest = { workspace = true, features = ["http2"] }
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
@@ -40,5 +41,7 @@ webpki-roots.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# HTTP/2 origins in the tests (#142).
+hyper = { workspace = true, features = ["http2"] }
 wicket-authz.workspace = true
 ed25519-dalek = "2"

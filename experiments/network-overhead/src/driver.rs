@@ -23,7 +23,9 @@ enum Proxy {
     /// CONNECT, host decision, SNI check, then copy.
     Pass { splice: bool },
     /// wicket's real egress proxy, splicing `origin.test` through (or, `splice: false`, inspecting it).
-    Egress { splice: bool },
+    /// `flag`: an extra flag for `netbench egress` (`--upstream-h1`, `--node`). `baseline`: the
+    /// proxy is `$NETBENCH_BASELINE` (this harness built against another wicket), skipped if unset.
+    Egress { splice: bool, flag: Option<&'static str>, baseline: bool },
     /// SNI only (no CONNECT), then copy.
     Sni { splice: bool },
 }
@@ -60,11 +62,14 @@ fn setups() -> Vec<Setup> {
         s("mitm-batched/unix", Mitm { mem: false, nopool: false, batched: true }, Direct, false),
         s("mitm-batched/fwd", Mitm { mem: false, nopool: false, batched: true }, Fwd { splice: false }, false),
         s("mitm-nopool/unix", Mitm { mem: false, nopool: true, batched: false }, Direct, false),
-        s("egress-inspect/unix", Egress { splice: false }, Direct, false),
-        s("egress-splice/unix", Egress { splice: true }, Direct, false),
-        s("egress-splice-h2/unix", Egress { splice: true }, Direct, true),
-        s("egress-inspect/fwd", Egress { splice: false }, Fwd { splice: true }, false),
-        s("egress-splice/fwd", Egress { splice: true }, Fwd { splice: true }, false),
+        s("egress-inspect/unix", Egress { splice: false, flag: Option::None, baseline: false }, Direct, false),
+        s("egress-inspect-h1up/unix", Egress { splice: false, flag: Some("--upstream-h1"), baseline: false }, Direct, false),
+        s("egress-inspect-base/unix", Egress { splice: false, flag: Option::None, baseline: true }, Direct, false),
+        s("egress-splice/unix", Egress { splice: true, flag: Option::None, baseline: false }, Direct, false),
+        s("egress-splice-h2/unix", Egress { splice: true, flag: Option::None, baseline: false }, Direct, true),
+        s("egress-node-splice/unix", Egress { splice: true, flag: Some("--node"), baseline: false }, Direct, false),
+        s("egress-inspect/fwd", Egress { splice: false, flag: Option::None, baseline: false }, Fwd { splice: true }, false),
+        s("egress-splice/fwd", Egress { splice: true, flag: Option::None, baseline: false }, Fwd { splice: true }, false),
         s("pass/unix", Pass { splice: false }, Direct, false),
         s("pass/socat", Pass { splice: false }, Socat { nodelay: false }, false),
         s("pass-splice/unix", Pass { splice: true }, Direct, false),
@@ -194,15 +199,16 @@ async fn start(s: &Setup, work: &Path, stamps: &Path) -> Result<(Procs, Target)>
             let pem = std::fs::read_to_string(work.join("run-ca.pem"))?;
             tls_ca = pem_to_der(&pem)?;
         }
-        Proxy::Egress { splice } => {
+        Proxy::Egress { splice, flag, baseline } => {
             let ledger = work.join("ledger.db");
             for ext in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{ext}", ledger.display()));
             }
             let _ = std::fs::remove_file(work.join("run-ca.pem"));
-            let mut c = Command::new(&exe);
+            let mut c = Command::new(if baseline { PathBuf::from(std::env::var("NETBENCH_BASELINE")?) } else { exe.clone() });
             c.args(["egress", "--listen", &format!("unix:{}", sock.display()), "--dir", &work.display().to_string(), "--upstream-port", port]);
             c.args(["--ledger", &ledger.display().to_string()]);
+            c.args(flag);
             if !splice {
                 c.arg("--inspect");
             }
@@ -273,7 +279,8 @@ pub async fn run() -> Result<()> {
         for round in 0..rounds {
             for s in setups() {
                 // `--only a,b`: setups whose name contains any of them.
-                if only.as_deref().is_some_and(|o| !o.split(',').any(|x| s.name.contains(x))) {
+                let no_baseline = matches!(s.proxy, Proxy::Egress { baseline: true, .. }) && std::env::var_os("NETBENCH_BASELINE").is_none();
+                if no_baseline || only.as_deref().is_some_and(|o| !o.split(',').any(|x| s.name.contains(x))) {
                     continue;
                 }
                 eprintln!("round {round}: {}", s.name);

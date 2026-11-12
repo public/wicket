@@ -35,8 +35,10 @@ not a permanent decision.
   connection, no per-request decisions, no header filtering and no Host pinning, so behind a shared
   CDN it can reach other sites on the same CDN. `wicket zone MANIFEST` lists spliced hosts. A forbid
   rule on the host keeps it inspected (`docs/performance.md`).
-- **Request bodies over 64 MiB fail,** and uploads are buffered rather than streamed
-  ([#93](https://github.com/public/wicket/pull/93)).
+- **Request bodies over 4 GiB fail.** Uploads stream upstream as they arrive, and a declared
+  `content-length` goes upstream as declared. Bodies are read whole in three cases: GET and HEAD,
+  which must have none; requests that arrive over HTTP/3, up to 64 MiB; and model calls through the
+  model proxy, up to its own limit ([#142](https://github.com/public/wicket/issues/142)).
 - **MCP is wicket's own gateway only.** Adapter-generated tools and isolated third-party MCP servers
   (design §8.2, M4/M4b) aren't built, so an agent has no third-party MCP servers.
 - **Agents inside one box are one principal.** With `in_box_subagents: true` (the default), Claude

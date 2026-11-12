@@ -12,6 +12,10 @@ description = "Experiment #62: what wicket's TLS-intercepting egress proxy costs
 wicket-core = { path = "../../crates/wicket-core" }
 wicket-store = { path = "../../crates/wicket-store" }
 wicket-proxy = { path = "../../crates/wicket-proxy" } # RunCa, as the proxy uses it
+# A node's decider and its feed, for `egress --node` (#141).
+wicket-feed = { path = "../../crates/wicket-feed" }
+wicket-authz = { path = "../../crates/wicket-authz" }
+ed25519-dalek = "2"
 anyhow = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -21,7 +25,7 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 futures-util = "0.3"
-# As the workspace has it (no http2 feature: the proxy's upstream side is HTTP/1.1 only).
+# The mitm replica's client. wicket-proxy enables reqwest's http2 since #142, so it applies here too.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
