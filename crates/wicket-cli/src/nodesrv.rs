@@ -1049,6 +1049,76 @@ fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u64, run: &st
     }
 }
 
+type GwBody = http_body_util::Full<bytes::Bytes>;
+
+/// One MCP gateway call from a box: relayed to the run's gateway on the control host, whole (the
+/// answers are small), so a call cut short by the control host going away gets a clear, retryable
+/// tool error instead of a broken response.
+async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<GwBody> {
+    use http_body_util::BodyExt;
+    let (parts, body) = req.into_parts();
+    let body = match http_body_util::Limited::new(body, 1 << 20).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return gw_reply(
+                413,
+                serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "request too large" } }),
+            )
+        }
+    };
+    let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let relayed = async {
+        let io = node.open_tunnel(run, "gateway").await?;
+        let (mut send, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.map_err(std::io::Error::other)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut rb = hyper::Request::builder().method(parts.method.clone()).uri(parts.uri.clone());
+        for (k, v) in parts.headers.iter() {
+            rb = rb.header(k, v);
+        }
+        let resp =
+            send.send_request(rb.body(GwBody::new(body.clone())).map_err(std::io::Error::other)?).await.map_err(std::io::Error::other)?;
+        let (rp, rb) = resp.into_parts();
+        let bytes = rb.collect().await.map_err(std::io::Error::other)?.to_bytes();
+        Ok::<_, std::io::Error>(hyper::Response::from_parts(rp, GwBody::new(bytes)))
+    }
+    .await;
+    match relayed {
+        Ok(r) => r,
+        Err(e) => gateway_offline(&rpc, &e.to_string()),
+    }
+}
+
+/// What the gateway answers while the control host can't be reached: MCP's own handshake, and a
+/// clear refusal for every tool (each needs the control plane).
+fn gateway_offline(rpc: &serde_json::Value, why: &str) -> hyper::Response<GwBody> {
+    let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let result = match method {
+        "initialize" => serde_json::json!({
+            "protocolVersion": rpc["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26"),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "wicket", "version": env!("CARGO_PKG_VERSION") },
+        }),
+        "ping" => serde_json::json!({}),
+        _ if id.is_null() => return gw_reply(202, serde_json::Value::Null),
+        _ => serde_json::json!({
+            "content": [{ "type": "text", "text": format!(
+                "the control plane is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
+            ) }],
+            "isError": true,
+        }),
+    };
+    gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn gw_reply(status: u16, v: serde_json::Value) -> hyper::Response<GwBody> {
+    let body = if v.is_null() { bytes::Bytes::new() } else { bytes::Bytes::from(v.to_string()) };
+    hyper::Response::builder().status(status).header("content-type", "application/json").body(GwBody::new(body)).expect("response")
+}
+
 /// A run's tree on this node: `workspace`, `state`, `tmp` or `volume.<name>`.
 fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
     crate::run::check_run_id(run)?;
@@ -1532,6 +1602,22 @@ async fn serve_box(
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
     let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
+    // The model proxy (#151): the run's checks here (allowed routes and models, server tools, the
+    // budget), then on to the run's own proxy on the control host, which adds the credential, checks
+    // again and is the one that counts the call. Its events stay here (the control host's are shown).
+    let llm = {
+        let (quiet, _) = mpsc::unbounded_channel::<wicket_proxy::Event>();
+        let mut c = ctx.clone();
+        c.events = quiet;
+        let (n, run) = (node.clone(), bs.run.clone());
+        let relay: wicket_proxy::llm::LlmRelay = Arc::new(move || {
+            let (n, run) = (n.clone(), run.clone());
+            Box::pin(async move { n.open_tunnel(&run, "llm").await })
+        });
+        let l = wicket_proxy::llm::Llm::relayed(c, relay)?;
+        l.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
+        l
+    };
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
     // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
     // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
@@ -1556,17 +1642,31 @@ async fn serve_box(
             }
         }
     }));
-    for target in ["llm", "gateway"] {
-        let _ = std::fs::remove_file(sock.join(format!("{target}.sock")));
-        let l = UnixListener::bind(sock.join(format!("{target}.sock")))?;
+    tasks.push(tokio::spawn({
+        let ls = sock.join("llm.sock");
+        async move {
+            if let Err(e) = llm.serve(&ls).await {
+                eprintln!("[node] model proxy ended: {e:#}");
+            }
+        }
+    }));
+    // The MCP gateway (#151): served here, each call relayed to the run's gateway on the control
+    // host, which decides every tool (they read or write the ledger). While it can't be reached, the
+    // node answers MCP's own handshake itself and refuses tool calls clearly.
+    {
+        let gs = sock.join("gateway.sock");
+        let _ = std::fs::remove_file(&gs);
+        let l = UnixListener::bind(&gs)?;
         let (n, run) = (node.clone(), bs.run.clone());
         tasks.push(tokio::spawn(async move {
-            while let Ok((mut c, _)) = l.accept().await {
+            while let Ok((c, _)) = l.accept().await {
                 let (n, run) = (n.clone(), run.clone());
                 tokio::spawn(async move {
-                    if let Ok(mut t) = n.open_tunnel(&run, target).await {
-                        let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
-                    }
+                    let svc = hyper::service::service_fn(move |req| {
+                        let (n, run) = (n.clone(), run.clone());
+                        async move { Ok::<_, hyper::Error>(gateway_call(&n, &run, req).await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(c), svc).await;
                 });
             }
         }));
@@ -1731,6 +1831,7 @@ mod tests {
                 long_lived: false,
                 durable: vec![],
                 name: None,
+                llm_prior: (0, 0, 0),
             },
             name: format!("wicket-{run}"),
             started_ms: 0,

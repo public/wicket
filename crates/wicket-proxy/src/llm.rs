@@ -23,9 +23,21 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// usage is seen (#113). Past this, the call is charged its whole reservation.
 const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// An upstream's answer: status, headers and body.
+type Upstream =
+    (u16, http::HeaderMap, futures_util::stream::BoxStream<'static, std::result::Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>);
+
+/// Opens a byte stream to the run's own model proxy on the control host (#151).
+pub type LlmRelay =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, std::io::Result<Box<dyn crate::egress::RelayStream>>> + Send + Sync>;
+
 pub struct Llm {
     ctx: RunCtx,
     client: reqwest::Client,
+    /// On a node (#151): the vetted request goes to the run's model proxy on the control host, which
+    /// holds the credential, checks the request again and is the one that counts it; this proxy's
+    /// checks give early refusals and nothing more. None: straight to the upstream, with the secret.
+    relay: Option<LlmRelay>,
     pub requests: AtomicU64,
     /// Uncached input tokens.
     pub input_tokens: AtomicU64,
@@ -117,6 +129,7 @@ impl Llm {
         Ok(Arc::new(Llm {
             ctx,
             client,
+            relay: None,
             requests: AtomicU64::new(0),
             input_tokens: AtomicU64::new(0),
             cache_read_tokens: AtomicU64::new(0),
@@ -131,6 +144,14 @@ impl Llm {
             inflight_output_tokens: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
+    }
+
+    /// A model proxy on a node (#151): requests it lets through go on to the run's own proxy on the
+    /// control host over `relay`, without a credential.
+    pub fn relayed(ctx: RunCtx, relay: LlmRelay) -> Result<Arc<Llm>> {
+        let mut l = Arc::into_inner(Llm::new(ctx)?).expect("fresh");
+        l.relay = Some(relay);
+        Ok(Arc::new(l))
     }
 
     /// Starts this activation from what the agent's earlier ones spent (#70).
@@ -272,28 +293,61 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
-        let up = self.send_upstream(spec, &parts, body).await;
-        let resp = match up {
+        let up = match &self.relay {
+            Some(r) => self.send_relayed(r, &parts, body).await,
+            None => self.send_upstream(spec, &parts, body).await.map(|r| {
+                let (status, headers) = (r.status().as_u16(), r.headers().clone());
+                let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
+                (status, headers, stream)
+            }),
+        };
+        let (status, headers, stream) = match up {
             Ok(r) => r,
             Err(e) => {
                 self.settle(reserved, Usage::default(), true);
                 return Err(e);
             }
         };
-        let status = resp.status().as_u16();
         let mut out = Response::builder().status(StatusCode::from_u16(status)?);
-        for (name, value) in resp.headers().iter() {
+        for (name, value) in headers.iter() {
             if !STRIP_RESPONSE.contains(&name.as_str()) {
                 out = out.header(name.as_str(), value.as_bytes());
             }
         }
-        let sse = resp
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
-        let body = self.account(model, status, sse, resp.bytes_stream(), reserved, note);
+        let sse = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+        let body = self.account(model, status, sse, stream, reserved, note);
         Ok(out.body(body)?)
+    }
+
+    /// Sends a vetted request to the run's own model proxy on the control host (#151).
+    async fn send_relayed(&self, relay: &LlmRelay, parts: &http::request::Parts, body: Bytes) -> Result<Upstream> {
+        let io = relay().await.map_err(|e| anyhow::anyhow!("the control host's model proxy is unreachable: {e}"))?;
+        let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut rb = Request::builder().method(parts.method.clone()).uri(parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        for (name, value) in parts.headers.iter() {
+            let n = name.as_str();
+            if n != "accept-encoding"
+                && n != "content-length"
+                && (FORWARD_REQUEST.contains(&n) || crate::provider_request_header(MODEL_HOST, n))
+            {
+                rb = rb.header(n, value);
+            }
+        }
+        let req = rb.header("host", "wicket.internal").header("accept-encoding", "identity").body(http_body_util::Full::new(body))?;
+        let resp = send.send_request(req).await?;
+        let (status, headers) = (resp.status().as_u16(), resp.headers().clone());
+        let stream = http_body_util::BodyStream::new(resp.into_body())
+            .filter_map(|f| async move {
+                match f {
+                    Ok(f) => f.into_data().ok().map(Ok),
+                    Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)),
+                }
+            })
+            .boxed();
+        Ok((status, headers, stream))
     }
 
     async fn send_upstream(

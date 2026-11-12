@@ -874,8 +874,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             },
         )?;
     }
+    // Where the last supervisor got to: its transcript is the box's stdout, line by line, so its
+    // length is exactly what it processed (stderr only as of its last save).
     let resume_from: [u64; 2] = match &record {
-        Some(_) => read_json::<RunProgress>(&dir.join("ctl/progress.json")).map(|p| [p.stdout, p.stderr]).unwrap_or_default(),
+        Some(_) => [
+            std::fs::metadata(dir.join("transcript.jsonl")).map(|m| m.len()).unwrap_or(0),
+            read_json::<RunProgress>(&dir.join("ctl/progress.json")).map(|p| p.stderr).unwrap_or(0),
+        ],
         None => [0, 0],
     };
     // A wrapped agent's stdout, copied to its launcher until the box's ends.
@@ -932,6 +937,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             owner: Some(crate::reap::owner_label()),
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
+            llm_prior: llm.spent_total(),
             durable: match long_lived {
                 true => m
                     .zone

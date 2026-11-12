@@ -102,6 +102,10 @@ pub struct BoxStart {
     /// The box's Docker name (`<prefix>-<run>`), if the control host names it.
     #[serde(default)]
     pub name: Option<String>,
+    /// What the run (or its long-lived agent) already spent of the zone's model budget: requests,
+    /// input and output tokens. The node's model proxy starts from it (#151).
+    #[serde(default)]
+    pub llm_prior: (u64, u64, u64),
 }
 
 /// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).
