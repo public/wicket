@@ -37,3 +37,7 @@ textarea { min-height:70px; }
 #runform textarea { min-height:90px; }
 #runform.revoke textarea { min-height:44px; }
 .note { color:var(--quiet); font-size:13px; margin-top:8px; }
+#confirm { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.45); display:flex; align-items:flex-start; justify-content:center; padding:12px; }
+#confirm .card { width:100%; max-width:760px; margin:0; box-shadow:0 6px 24px rgba(0,0,0,.3); }
+#confirm-title { font-weight:600; }
+#confirm-what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; word-break:break-word; margin-top:6px; }

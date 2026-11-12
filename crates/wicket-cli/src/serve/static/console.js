@@ -43,25 +43,69 @@ async function signIn() {
   catch (e) { toast("sign-in: " + e.message); }
 }
 // Every action is signed: the passkey challenge is the hash of exactly the action the server
-// returns from begin, and the toast spells out that action (not what the page asked for).
+// returns from begin. Signing takes two steps (#124): the click asks the server for that action, and
+// an in-page confirmation, built from what the server returned (not what the page asked for), states
+// it with its own sign button. The authenticator's own sheet shows only the site's name, so this is
+// what tells the operator what the passkey signs; it stays at the top of the screen, above where a
+// phone's passkey sheet opens, until the ceremony ends.
 function describe(a) {
   const s = x => strip(x);
-  if (a.action === "decide") return a.decision + " " + s(a.method + " " + a.host + a.path) + (a.prefix ? "* (every path under it)" : "") + (a.agent ? " for agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
-  if (a.action === "say") return "send to " + s(a.run) + ": \u201c" + s(a.text).slice(0, 80) + "\u201d";
-  if (a.action === "revoke") return "revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
-  if (a.action === "start_run") return "start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
+  if (a.action === "decide") {
+    const verb = a.decision === "deny" ? "Deny" : a.uses === 1 ? "Approve once" : "Allow" + (a.uses ? " " + a.uses + " uses" : "");
+    const how = a.decision === "deny" ? "" : " for " + Math.round((a.ttl_secs || 0) / 60) + " min";
+    return verb + how + ": " + s(a.method + " " + a.host + a.path) + (a.prefix ? "\u2026 (every path under it)" : "") +
+      " \u00b7 " + riskLabel(a.risk) + " \u00b7 request " + s(a.request) + " \u00b7 run " + s(a.run) +
+      (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
+  }
+  if (a.action === "say") return "Send to " + s(a.run) + ": \u201c" + s(a.text).slice(0, 80) + "\u201d";
+  if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
+  if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
+
+// While a confirmation or a passkey ceremony is open, nothing on the page is re-rendered, so what
+// the operator is looking at and tapping can't change under them.
+let ceremony = false;
+// When the pending cards last moved (added, removed, reordered or resized). A tap on a card's button
+// just after is ignored: it may have been aimed at whatever was there before.
+let layoutAt = 0;
+const SETTLE_MS = 800;
+const settled = () => performance.now() - layoutAt >= SETTLE_MS;
+
 async function signed(body) {
-  try {
-    const begin = await post("/api/action/begin", body);
-    toast("Confirm with your passkey: " + describe(begin.action));
-    const j = await post("/api/action/finish", await assertWith(begin.publicKey));
-    toast(j.ok);
-  } catch (e) { toast(e.message); }
+  if (ceremony) return;
+  ceremony = true;
+  let begin;
+  try { begin = await post("/api/action/begin", body); }
+  catch (e) { toast(e.message); closeConfirm(); return; }
+  const go = document.getElementById("confirm-go");
+  document.getElementById("confirm-what").textContent = describe(begin.action);
+  document.getElementById("confirm-state").textContent = "";
+  const deny = begin.action.decision === "deny" || begin.action.action === "revoke";
+  go.textContent = deny ? "Sign: " + (begin.action.action === "revoke" ? "revoke" : "deny") : "Sign with passkey";
+  go.className = deny ? "deny" : "approve";
+  // Not tappable at once: a second tap aimed at the card mustn't land on it.
+  go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
+  go.onclick = async () => {
+    go.disabled = true;
+    document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
+    try { const j = await post("/api/action/finish", await assertWith(begin.publicKey)); toast(j.ok); }
+    catch (e) { toast(e.message); }
+    closeConfirm();
+  };
+  document.getElementById("confirm").hidden = false;
+  go.focus();
+}
+function closeConfirm() {
+  document.getElementById("confirm").hidden = true;
+  document.getElementById("confirm-go").onclick = null;
+  ceremony = false;
   refresh();
 }
-const act = (kind, body) => signed({ ...body, action: "decide", decision: kind });
+const act = (kind, body) => {
+  if (!settled()) { toast("The list just changed: check the card and tap again."); return; }
+  signed({ ...body, action: "decide", decision: kind });
+};
 
 // The requesting agent's identity, verified by the console against wicket's issuer. Approve is
 // disabled when an agent's identity does not verify: you can't approve without knowing who for.
@@ -97,25 +141,44 @@ function renderWho(list) {
 }
 const r0 = rs => rs[0];
 
+// Pending cards are kept by request id: a card whose content hasn't changed is the same element
+// from one poll to the next, so its buttons don't move or get replaced under the cursor. When the
+// cards do move, `layoutAt` is set and taps are ignored for a moment.
+const cards = new Map();
+function pendingCard(s, p) {
+  const key = JSON.stringify([p.risk, p.method, p.host, p.path, p.scope_prefix, p.reason, p.identity, p.attribution, p.zone, p.run]);
+  const had = cards.get(p.id);
+  if (had && had.key === key) { had.meta.textContent = p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at); return had.node; }
+  const c = el("div", "card req"); c.dataset.id = p.id;
+  const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
+  c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "\u2026  (every path under it)" : "")));
+  c.append(el("div", "why", strip(p.reason)));
+  const idOk = renderAgent(c, p.identity || {});
+  c.append(renderWho(p.attribution || []));
+  const meta = el("div", "meta", p.id + " \u00b7 zone " + strip(p.zone) + " \u00b7 " + strip(p.run) + " \u00b7 " + ago(s.now, p.created_at));
+  c.append(meta);
+  const b = el("div", "buttons");
+  const once = el("button", "approve", p.scope_prefix ? "Approve prefix once (10 min)" : "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
+  const hour = el("button", "", p.scope_prefix ? "Allow prefix for 1 hour" : "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
+  const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
+  if (!idOk) { once.disabled = true; hour.disabled = true; }
+  if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") b.append(once, deny); else b.append(once, hour, deny);
+  c.append(b);
+  cards.set(p.id, { key, node: c, meta });
+  return c;
+}
+
 function renderPending(s) {
-  const box = document.getElementById("pending"); box.replaceChildren();
-  if (!s.pending.length) { box.append(el("div", "empty", "Nothing is waiting for a decision.")); return; }
-  for (const p of s.pending) {
-    const c = el("div", "card req");
-    const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
-    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "…  (every path under it)" : "")));
-    c.append(el("div", "why", strip(p.reason)));
-    const idOk = renderAgent(c, p.identity || {});
-    c.append(renderWho(p.attribution || []));
-    c.append(el("div", "meta", p.id + " · zone " + p.zone + " · " + p.run + " · " + ago(s.now, p.created_at)));
-    const b = el("div", "buttons");
-    const once = el("button", "approve", p.scope_prefix ? "Approve prefix once (10 min)" : "Approve once (10 min)"); once.onclick = () => act("approve", { id: p.id, uses: 1, ttl_secs: 600 });
-    const hour = el("button", "", p.scope_prefix ? "Allow prefix for 1 hour" : "Allow for 1 hour"); hour.onclick = () => act("approve", { id: p.id, unlimited: true, ttl_secs: 3600 });
-    const deny = el("button", "deny", "Deny"); deny.onclick = () => act("deny", { id: p.id });
-    if (!idOk) { once.disabled = true; hour.disabled = true; }
-    if (p.risk === "R4ExecOrPrivilege" || p.risk === "R3ExternalOrIrreversible") b.append(once, deny); else b.append(once, hour, deny);
-    c.append(b); box.append(c);
-  }
+  const box = document.getElementById("pending");
+  const live = new Set(s.pending.map(p => p.id));
+  for (const id of [...cards.keys()]) if (!live.has(id)) cards.delete(id);
+  const nodes = s.pending.length ? s.pending.map(p => pendingCard(s, p)) : [el("div", "empty", "Nothing is waiting for a decision.")];
+  const same = nodes.length === box.children.length && nodes.every((n, i) => n === box.children[i]);
+  if (same) return;
+  const empty = !s.pending.length && box.children.length === 1 && box.children[0].className === "empty";
+  if (empty) return;
+  box.replaceChildren(...nodes);
+  layoutAt = performance.now();
 }
 
 function renderRows(id, rows, f, emptyText) {
@@ -238,10 +301,12 @@ async function boot() {
 }
 
 async function refresh() {
+  if (ceremony) return;
   try {
     const r = await fetch("/api/state");
     if (!r.ok) { boot(); return; }
     const s = await r.json();
+    if (ceremony) return; // opened while this poll was in flight
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
@@ -254,6 +319,7 @@ async function refresh() {
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("runform").addEventListener("submit", submitRunForm);
   document.getElementById("runform-cancel").addEventListener("click", closeRunForm);
+  document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
   boot();
   setInterval(() => { if (!document.getElementById("console").hidden) refresh(); }, 2000);
 });

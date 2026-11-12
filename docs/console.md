@@ -13,6 +13,12 @@ or deny from a browser or phone. It uses **passkeys**:
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
   signed record, so `wicket audit --verify` re-verifies every decision offline;
+- **signing takes two steps.** A tap on Approve, Deny, Send, Revoke or Start asks the server for the exact
+  action. The page then shows that action in a confirmation pinned to the top of the screen, above where a
+  phone's passkey sheet opens, and only its own button starts the passkey ceremony. The authenticator's sheet
+  shows only the site's name, so this confirmation is what tells you what you're signing. While it is open,
+  nothing on the page is redrawn. Pending cards are kept by request id, and a tap within a moment of the cards
+  moving is ignored, so an agent can't slide another request under your finger;
 - `wicket operator reset` (host only) revokes passkeys but keeps their public keys for verification.
 
 Signed in, the console can also do what was CLI-only, each action signed with a fresh passkey assertion over

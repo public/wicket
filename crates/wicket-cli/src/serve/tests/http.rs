@@ -935,3 +935,23 @@ async fn random_bytes_on_the_wire_never_take_the_server_down() {
         .await
         .starts_with("HTTP/1.1 200"));
 }
+
+/// #124: the page's approval flow, run under node against a small fake DOM (`console_ui.js`):
+/// cards stay put across polls, taps just after a layout change are ignored, and the passkey signs
+/// only from an in-page confirmation that states the server's action. Without node it is skipped,
+/// except in CI, where it must run.
+#[test]
+fn the_console_page_confirms_what_it_signs_and_holds_still() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve");
+    let out = std::process::Command::new("node").arg(dir.join("tests/console_ui.js")).arg(dir.join("static/console.js")).output();
+    match out {
+        Ok(o) => assert!(
+            o.status.success(),
+            "console_ui.js failed:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) if std::env::var_os("CI").is_none() => eprintln!("skipped: no node ({e})"),
+        Err(e) => panic!("node is needed for the console page test in CI: {e}"),
+    }
+}
