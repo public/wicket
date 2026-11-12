@@ -15,6 +15,19 @@ pub enum RiskClass {
     R4ExecOrPrivilege,
 }
 
+impl RiskClass {
+    /// 0 (R0) to 4 (R4), as the ledger stores a grant's risk bound.
+    pub fn rank(self) -> i64 {
+        self as i64
+    }
+
+    /// The class named as `{:?}` prints it (`R2WriteReversible`).
+    pub fn from_name(name: &str) -> Option<RiskClass> {
+        use RiskClass::*;
+        [R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege].into_iter().find(|r| format!("{r:?}") == name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Surface {

@@ -851,7 +851,7 @@ async fn main() -> Result<()> {
                     r.method,
                     r.host,
                     r.path,
-                    if r.scope_prefix { "*  (every path under it)" } else { "" },
+                    if r.scope_prefix { "…  (every path under it)" } else { "" },
                     r.risk,
                     r.run,
                     age,

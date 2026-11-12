@@ -11,7 +11,7 @@ pub mod manifest;
 pub mod op;
 pub mod subset;
 
-pub use canon::{canonical_host, canonical_path, CanonError};
+pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
     AgentSpec, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, Persist, ProgramSpec, ReachRule, VolumeSpec, ZoneSpec,
 };

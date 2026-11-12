@@ -784,6 +784,16 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         let op = Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path);
+        // A node's grant covers its path whatever the query, and carries no risk bound: hand it over
+        // only if no query makes that path riskier than the human approved (#119; a fetch's ref
+        // discovery approved at R1 is a push's at R4). Otherwise the control host keeps deciding it.
+        let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
+        if worst.risk.rank() > g.max_risk.unwrap_or(0) {
+            if p.published.insert(g.id.clone()) {
+                println!("[wicket] grant {} is bounded below what {} {}{} can be; it stays with the control host", g.id, g.method, g.host, g.path);
+            }
+            continue;
+        }
         let live = LiveGrant {
             grant: wicket_authz::Grant {
                 gid: g.id.clone(),

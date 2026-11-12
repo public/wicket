@@ -102,7 +102,7 @@ function renderPending(s) {
   for (const p of s.pending) {
     const c = el("div", "card req");
     const head = el("div"); head.append(el("span", "risk " + riskClass(p.risk), riskLabel(p.risk)));
-    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "*  (every path under it)" : "")));
+    c.append(head, el("div", "what", strip(p.method + " " + p.host + p.path) + (p.scope_prefix ? "…  (every path under it)" : "")));
     c.append(el("div", "why", strip(p.reason)));
     const idOk = renderAgent(c, p.identity || {});
     c.append(renderWho(p.attribution || []));

@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT
+  node TEXT, max_risk INTEGER
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -270,6 +270,9 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before grants could be handed to a node.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN node TEXT", []);
+        // Ledgers created before grants carried a risk bound (#119). Their grants have none, which
+        // counts as the lowest: they cover no request (every request is at least R1).
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN max_risk INTEGER", []);
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
@@ -552,10 +555,12 @@ impl Ledger {
         }
         let id = new_request_id();
         let attr = serde_json::Value::from(who.cloned().into_iter().collect::<Vec<_>>()).to_string();
+        // A prefix covers whole segments: it is kept (and shown) ending in '/' (#119).
+        let path = if prefix { wicket_core::prefix_dir(&op.path) } else { op.path.clone() };
         self.conn.execute(
             "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution, scope_prefix)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
-            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr, prefix as i64],
+            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, path, format!("{:?}", op.risk), reason, now(), attr, prefix as i64],
         )?;
         Ok((id, true))
     }
@@ -618,17 +623,23 @@ impl Ledger {
         if req.status != "pending" {
             return Err(StoreError::NotPending(id.into(), req.status));
         }
+        // Prefixes cover whole segments (#119): a prefix given by the human must cover the asked path,
+        // or (for a prefix ask) lie within the asked prefix.
         let (path, prefix) = match &a.path_prefix {
-            Some(p) if req.path.starts_with(p.as_str()) => (p.clone(), 1),
+            Some(p) if wicket_core::prefix_covers(p, &req.path) => (wicket_core::prefix_dir(p), 1),
+            Some(p) if req.scope_prefix && wicket_core::prefix_covers(&req.path, p) => (wicket_core::prefix_dir(p), 1),
             // A prefix ask is granted as asked unless the human narrows it.
-            _ if req.scope_prefix => (req.path.clone(), 1),
+            _ if req.scope_prefix => (wicket_core::prefix_dir(&req.path), 1),
             _ => (req.path.clone(), 0),
         };
+        // The grant covers nothing riskier than what the human was shown (#119): a prefix approved
+        // for an R2 write doesn't also cover the R4 operations under it.
+        let max_risk = wicket_core::RiskClass::from_name(&req.risk).map(|r| r.rank()).unwrap_or(0);
         let gid = new_grant_id();
         let t = now();
         tx.execute(
-            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 gid,
                 req.tenant,
@@ -641,7 +652,8 @@ impl Ledger {
                 t + a.ttl.as_secs() as i64,
                 req.id,
                 a.decided_by,
-                t
+                t,
+                max_risk
             ],
         )?;
         tx.execute("UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1", params![id, t, a.decided_by])?;
@@ -667,13 +679,16 @@ impl Ledger {
         let t = now();
         let found: Option<(String, Option<i64>)> = tx
             .query_row(
-                "SELECT id, uses_left FROM grants
+                // `d`: the prefix ending in '/' (older ledgers stored it without), so it covers whole
+                // segments only (#119).
+                "SELECT id, uses_left FROM (SELECT *, CASE WHEN substr(path, -1) = '/' THEN path ELSE path || '/' END AS d FROM grants)
                  WHERE tenant = ?1 AND zone = ?2 AND method = ?3 AND host = ?4 AND revoked = 0 AND expires_at > ?5
                    AND node IS NULL
                    AND (uses_left IS NULL OR uses_left > 0)
-                   AND ((prefix = 0 AND path = ?6) OR (prefix = 1 AND substr(?6, 1, length(path)) = path))
+                   AND COALESCE(max_risk, 0) >= ?7
+                   AND ((prefix = 0 AND path = ?6) OR (prefix = 1 AND (?6 || '/' = d OR substr(?6, 1, length(d)) = d)))
                  ORDER BY prefix ASC, created_at ASC LIMIT 1",
-                params![op.tenant.0, op.zone, op.method, op.host, t, op.path],
+                params![op.tenant.0, op.zone, op.method, op.host, t, op.path, op.risk.rank()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -1578,6 +1593,47 @@ mod tests {
         assert!(l.consume_grant(&o).unwrap().is_some());
         assert_eq!(l.consume_grant(&o).unwrap(), None, "single use");
         assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
+    }
+
+    /// #119: a prefix grant covers whole segments, and nothing riskier than what was approved.
+    #[test]
+    fn prefix_grants_cover_segments_and_carry_a_risk_bound() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let o = |m: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", m, "api.github.com", p);
+        let ask = o("PUT", "/repos/acme/app");
+        assert_eq!(ask.risk, wicket_core::RiskClass::R4ExecOrPrivilege, "repo settings");
+        let ask = o("PUT", "/repos/acme/app/contents/README.md");
+        let (id, _) = l.ask(&ask, "edit docs", true, None).unwrap();
+        assert_eq!(l.request(&id).unwrap().path, "/repos/acme/app/contents/README.md/");
+        let (id, _) = l.ask(&o("PUT", "/repos/acme/app/contents"), "edit files", true, None).unwrap();
+        assert_eq!(l.request(&id).unwrap().path, "/repos/acme/app/contents/", "kept ending in '/'");
+        l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents/src/main.rs")).unwrap().is_some());
+        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents")).unwrap().is_some(), "the directory itself");
+        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents-x/a")).unwrap().is_none(), "a sibling");
+        // Approved at R2: the R4 workflow edit under the same prefix isn't covered.
+        let wf = o("PUT", "/repos/acme/app/contents/.github/workflows/ci.yml");
+        assert_eq!(wf.risk, wicket_core::RiskClass::R4ExecOrPrivilege);
+        assert!(l.consume_grant(&wf).unwrap().is_none());
+
+        // A raw-prefix grant from an older ledger: segment-bounded too, and without a risk bound it
+        // covers nothing.
+        let (id, _) = l.ask(&o("GET", "/repos/acme/api"), "read", true, None).unwrap();
+        let gid = l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        l.conn.execute("UPDATE grants SET path = '/repos/acme/api', max_risk = 1 WHERE id = ?1", params![gid]).unwrap();
+        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
+        assert!(l.consume_grant(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
+        l.conn.execute("UPDATE grants SET max_risk = NULL WHERE id = ?1", params![gid]).unwrap();
+        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
+
+        // An exact grant for a fetch's ref discovery doesn't cover the push's (same path, R4).
+        let fetch = Op::egress_with_query(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "github.com", "/a/b.git/info/refs", "service=git-upload-pack");
+        let (id, _) = l.pending_for(&fetch, "fetch", None).unwrap();
+        l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let push = Op::egress_with_query(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "github.com", "/a/b.git/info/refs", "service=git-receive-pack");
+        assert_eq!(push.digest(), fetch.digest());
+        assert!(l.consume_grant(&push).unwrap().is_none());
+        assert!(l.consume_grant(&fetch).unwrap().is_some());
     }
 
     #[test]

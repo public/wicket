@@ -28,6 +28,23 @@ pub enum CanonError {
     BadHost(String),
 }
 
+/// A path prefix as a grant holds it: ending in `/`, so it covers whole segments (#119). A prefix of
+/// `/repos/acme/app` is `/repos/acme/app/`, which covers `/repos/acme/app` itself and every path
+/// under it, but not `/repos/acme/app-secrets`.
+pub fn prefix_dir(prefix: &str) -> String {
+    if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+/// Whether a path-prefix grant for `prefix` covers `path` (see [`prefix_dir`]).
+pub fn prefix_covers(prefix: &str, path: &str) -> bool {
+    let dir = prefix_dir(prefix);
+    path.starts_with(&dir) || format!("{path}/") == dir
+}
+
 /// The host a request names, lowercased and without a trailing dot, if that is how a URL parser
 /// would spell it too (WHATWG host parsing). IP addresses in any spelling (`[::1]`, `2852039166`,
 /// `0x7f.1`) are refused, as are hosts with escapes or characters a parser would rewrite: the
@@ -132,6 +149,21 @@ mod tests {
         assert!(matches!(canonical_path("/a%2Fb"), Err(CanonError::EncodedSeparator(_))));
         assert_eq!(canonical_path("/a\\b"), Err(CanonError::BadCharacter));
         assert_eq!(canonical_path("a/b"), Err(CanonError::NotAbsolute));
+    }
+
+    /// #119: a prefix covers whole segments only.
+    #[test]
+    fn prefixes_cover_whole_segments() {
+        assert_eq!(prefix_dir("/repos/acme/app"), "/repos/acme/app/");
+        assert_eq!(prefix_dir("/"), "/");
+        for p in ["/repos/acme/app", "/repos/acme/app/"] {
+            assert!(prefix_covers(p, "/repos/acme/app"));
+            assert!(prefix_covers(p, "/repos/acme/app/"));
+            assert!(prefix_covers(p, "/repos/acme/app/contents/x"));
+            assert!(!prefix_covers(p, "/repos/acme/app-secrets/contents/x"));
+            assert!(!prefix_covers(p, "/repos/acme/ap"));
+        }
+        assert!(prefix_covers("/", "/anything/at/all"));
     }
 
     /// #116: hosts are decided in one spelling, and IP addresses in none.
