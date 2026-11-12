@@ -41,6 +41,10 @@ certificate.
 - the host is not the model host;
 - the box's TLS ClientHello names the `CONNECT` host in SNI and doesn't use Encrypted ClientHello.
 
+Browsers send a GREASE ECH extension even when they have no ECH configuration, so a browser's
+connections are always intercepted. curl, cargo, npm, git and other command-line clients don't send
+one.
+
 When any check fails, the proxy intercepts as before. That includes a ClientHello with no SNI or a
 different name: the bytes already read are replayed into the normal interception path. When in doubt,
 it intercepts.

@@ -435,10 +435,19 @@ mod sys {
         unsafe { libc::shutdown(fd, libc::SHUT_WR) };
     }
 
-    /// Moves everything `from` sends to `to`, then half-closes `to`.
+    /// Moves everything `from` sends to `to`, then half-closes `to`. On an error (a reset, a broken
+    /// pipe) both sockets are shut down completely, so the other direction isn't left waiting.
     pub(super) async fn pump<A: Sock, B: Sock>(from: &A, to: &B, n: &AtomicU64) -> io::Result<()> {
         let r = pump_inner(from, to, n).await;
-        shut_write(to.as_raw_fd());
+        match &r {
+            Ok(()) => shut_write(to.as_raw_fd()),
+            Err(_) => {
+                for fd in [from.as_raw_fd(), to.as_raw_fd()] {
+                    // SAFETY: shutdown on borrowed socket fds; errors (already closed) don't matter.
+                    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                }
+            }
+        }
         r
     }
 
