@@ -254,21 +254,21 @@ mod tests {
         // The unencoded spelling decides the same and is borrowed as written.
         assert!(matches!(canonical_path("/@types/node"), Ok(Cow::Borrowed("/@types/node"))));
         for p in [
-            "/x/@scope%2fname",          // not the first segment
+            "/x/@scope%2fname", // not the first segment
             "/-/package/@scope%2fname/dist-tags",
-            "/@scope%2fname%2fmore",     // double
-            "/@sc%2fope%2fname",         // in the scope
+            "/@scope%2fname%2fmore", // double
+            "/@sc%2fope%2fname",     // in the scope
             "/@scope%2f%2fname",
-            "/%40scope%2fname",          // `@` escaped
-            "/scope%2fname",             // no `@`
-            "/@%2fname",                 // empty scope
-            "/@scope%2f",                // empty name
-            "/@scope%2f..",              // dot segment once decoded
+            "/%40scope%2fname", // `@` escaped
+            "/scope%2fname",    // no `@`
+            "/@%2fname",        // empty scope
+            "/@scope%2f",       // empty name
+            "/@scope%2f..",     // dot segment once decoded
             "/@..%2fname",
             "/@scope%2f.name",
             "/@.scope%2fname",
-            "/@Scope%2fname",            // upper case
-            "/@scope%2fna%20me",         // another escape in the segment
+            "/@Scope%2fname",    // upper case
+            "/@scope%2fna%20me", // another escape in the segment
             "/@scope%5cname",
             "/@scope%2Ename",
         ] {
