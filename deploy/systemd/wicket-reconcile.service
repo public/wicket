@@ -1,0 +1,22 @@
+# The reconciler (#38): ends runs whose process is gone, stops their boxes, and keeps leases and
+# machines in line with the ledger. As the wicket user.
+[Unit]
+Description=wicket reconciler
+Documentation=https://github.com/public/wicket
+After=network-online.target docker.service wicketd.service
+Wants=network-online.target
+
+[Service]
+User=wicket
+Group=wicket
+SupplementaryGroups=docker
+Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
+ExecStart=/usr/local/bin/wicket reconcile --every 1m
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

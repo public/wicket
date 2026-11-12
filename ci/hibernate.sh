@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 "$WICKET" identity init --trust-domain ci.wicket.test >/dev/null
-printf 'mock-model-credential' | "$WICKET" secret set mock >/dev/null
+printf 'mock-model-credential' | "$WICKET" secret set mock --hosts 127.0.0.1 >/dev/null
 "$WICKET" dev mock-llm --listen 127.0.0.1:9998 --command 'sh /workspace/step.sh' 2>"$work/mock.log" &
 mock_pid=$!
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/9998) 2>/dev/null && break; sleep 0.2; done

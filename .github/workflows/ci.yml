@@ -96,3 +96,9 @@ jobs:
         run: WICKET=target/debug/wicket ci/smoke.sh
       - name: Hibernate and wake
         run: WICKET=target/debug/wicket ci/hibernate.sh
+      # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
+      - name: wicketd with second uids
+        run: ci/daemon-uids.sh target/debug/wicket
+      # #40: the host install script, twice, in a fresh container, then #12's checks with real users.
+      - name: Install script in a fresh container
+        run: ci/install-test.sh target/debug/wicket ubuntu:24.04

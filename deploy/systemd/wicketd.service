@@ -1,0 +1,27 @@
+# wicketd (#12): the only way other users reach wicket. Runs as the wicket system user, which owns
+# /var/lib/wicket (0700) and is the only member of the docker group. Installed by deploy/install.sh.
+[Unit]
+Description=wicket daemon: runs wicket commands for the host's operators
+Documentation=https://github.com/public/wicket
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+User=wicket
+Group=wicket
+SupplementaryGroups=docker
+Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
+ExecStart=/usr/local/bin/wicket daemon
+# /run/wicket/wicketd.sock. The socket is 0666: each caller is checked by its peer credentials.
+RuntimeDirectory=wicket
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+Restart=on-failure
+# Runs started through the daemon are its children: stopping it sends them SIGTERM, and each stops
+# its box before exiting (the reconciler ends any that don't as "lost").
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
