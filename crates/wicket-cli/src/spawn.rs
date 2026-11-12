@@ -285,12 +285,14 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     };
     let model = match &z.llm {
         Some(l) => format!(
-            "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens",
+            "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens, {} input tokens{}",
             clip(&l.provider, 40),
             clip(&l.upstream, 200),
             clip(&l.secret, 80),
             l.max_requests,
-            l.max_output_tokens
+            l.max_output_tokens,
+            l.max_input_tokens.map(|i| i.to_string()).unwrap_or_else(|| "uncapped".into()),
+            if l.allow_server_tools { ", server-side tools allowed" } else { "" }
         ),
         None => "no model route".into(),
     };
@@ -327,15 +329,24 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     );
     let l = &z.limits;
     let children = cm.agent.as_ref().map(|a| a.max_children).unwrap_or(0);
+    let forbid = list(z.forbid.iter().map(|f| format!("{} {}", clip(&f.host, 120), clip(&f.paths.join(", "), 200))).collect(), 12);
+    let accept = list(z.accept_from.iter().map(|a| clip(a, 120)).collect(), 8);
+    let images = list(z.images.iter().map(|i| clip(i, 120)).collect(), 8);
+    let volumes = list(z.volumes.iter().map(|v| format!("{} at {}", clip(&v.name, 60), clip(&v.path, 120))).collect(), 8);
+    let or_none = |s: String| if s.is_empty() { "none".to_string() } else { s };
     format!(
-        "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; unlisted hosts {:?}; isolation {:?}; image {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
+        "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; forbid {}; unlisted hosts {:?}; isolation {:?}; image {}; may start images {}; accepts messages from {}; volumes {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
         clip(name, 40),
         clip(&z.name, 200),
         list(violations.iter().map(|v| clip(v, 240)).collect(), 16),
-        if reach.is_empty() { "none".into() } else { reach },
+        or_none(reach),
+        or_none(forbid),
         z.unlisted_hosts,
         z.isolation,
         clip(image, 120),
+        or_none(images),
+        or_none(accept),
+        or_none(volumes),
         clip(&l.memory, 20),
         l.cpus,
         l.pids,
@@ -647,6 +658,9 @@ mod tests {
             "injects secret ex-token into api.example.com Authorization",
             "other.example.org",
             "It exceeds: reach rule 1",
+            "uncapped input tokens",
+            "accepts messages from none",
+            "volumes none",
         ] {
             assert!(r.reason.contains(needle), "missing {needle:?} in {}", r.reason);
         }
