@@ -2,7 +2,7 @@
 # inherits nothing from the workspace and has no dependencies (it builds offline, std only).
 [package]
 name = "wicket-fwd"
-description = "wicket's in-box forwarder: TCP listeners on wicket.internal relayed to the bind-mounted unix sockets of wicket's proxies."
+description = "wicket's in-box forwarder: TCP and UDP listeners in the box relayed to the bind-mounted unix sockets of wicket's proxies."
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"

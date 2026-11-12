@@ -8,7 +8,8 @@
 #                                 done, the agent image present there), with this shell's WICKET_HOME
 #
 # Needs Docker with runsc where the box runs and the agent image (`wicket image`). Env: WICKET (the
-# binary, default target/debug/wicket); for --local, WICKET_DOCKER (e.g. "sudo -n docker").
+# binary, default target/debug/wicket); IMAGE (the agent image, default wicket/claude-code:poc); for
+# --local, WICKET_DOCKER (e.g. "sudo -n docker").
 #
 # The program (ci/node-e2e/probe.sh) probes once a second: an allowed read and write on example.com,
 # an out-of-reach path there (decided on the node), and www.example.org (forwarded to the control
@@ -74,7 +75,7 @@ log "wicket run --node $NODE"
 probe_secs=$(( TTL + NARROW + 70 > 110 ? TTL + NARROW + 70 : 110 ))
 manifest=ci/node-e2e/.e2e-run.yaml
 sed "s/\"110\"/\"$probe_secs\"/" ci/node-e2e/e2e.yaml > "$manifest"
-"$WICKET" run "$manifest" --image wicket/claude-code:poc --node "$NODE" >"$work/run.log" 2>&1 &
+"$WICKET" run "$manifest" --image "${IMAGE:-wicket/claude-code:poc}" --node "$NODE" >"$work/run.log" 2>&1 &
 run_pid=$!
 pids+=($run_pid)
 for _ in $(seq 120); do grep -q ' read=' "$work/run.log" && break; sleep 1; done

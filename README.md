@@ -23,6 +23,10 @@ What it does:
   uses Anthropic API keys) and the **egress proxy**
   (per-run CA, TLS interception, canonicalize-or-reject, reach rules, a GitHub dangerous-pattern list, credential
   injection into one declared header slot);
+- **HTTP/3** goes the same way: the box resolves names through **wicket's DNS** (reachable hosts get a
+  synthetic address in 198.19.0.0/16, hidden and forbidden hosts NXDOMAIN), its forwarder relays QUIC to
+  wicket, and wicket terminates it with the run's CA and decides each request exactly like an HTTP/1.1
+  one, re-originating it over HTTP/3 when the origin offers it (else HTTP/2); 0-RTT is refused;
 - a minimal **MCP gateway** is the agent's only MCP server; its `await_grant` tool lets a blocked agent wait for
   the human's decision instead of sleeping and retrying;
 - requests outside the zone's reach become **pending escalations** (HTTP 403 problem+json with a request id); a
@@ -417,6 +421,16 @@ wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1
 script), so the agent has all of localhost for its own servers. Links to other boxes get addresses from
 198.18.1.1 onward and names in the box's hosts file, which wicket owns and the box can only read. The entry script adds that address as root
 with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+
+The box's resolver is wicket.internal:53: wicket answers every query itself, so a lookup can't carry data
+out. Every host the zone can reach resolves to its own address in 198.19.0.0/16 (on the box's loopback);
+QUIC sent there is relayed to wicket over a bind-mounted unix socket and served as that host. Under gVisor
+each UDP datagram is costly (about 110 µs of CPU in the box), so HTTP/3 downloads run at 40–100 Mbit/s with
+the usual 1452-byte packets. `WICKET_H3_BOX_MTU=16000` lets the box's leg (loopback and a unix socket, no
+real link) use 16000-byte packets for clients that accept them: 430–460 Mbit/s in #92's measurements.
+`WICKET_H3_HTTPS_RECORDS=0` stops wicket answering HTTPS (`alpn=h3`) DNS records.
+The forwarder holds UDP port 443 on every address in the box (it catches QUIC to any synthetic address),
+so a server in the box can't take UDP 443, even on 127.0.0.1; TCP 443 and every other port stay the agent's.
 
 ### Agents launched by something else, e.g. Remote Control
 

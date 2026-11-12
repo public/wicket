@@ -4,3 +4,5 @@ target/
 # Experiments: build output and downloaded solver binaries stay local.
 experiments/*/target/
 experiments/*/tools/
+# Written and removed by ci/node-e2e.sh (#95).
+ci/node-e2e/.e2e-run.yaml

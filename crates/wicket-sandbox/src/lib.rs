@@ -130,6 +130,10 @@ impl Docker {
             runtime.into(),
             "--network".into(),
             "none".into(),
+            // The box's resolver is wicket's DNS (#92), relayed by wicket-fwd: allowed hosts resolve
+            // to synthetic addresses for HTTP/3, the rest to NXDOMAIN.
+            "--dns".into(),
+            "198.18.0.1".into(),
             "--memory".into(),
             spec.memory.clone(),
             "--cpus".into(),
@@ -361,6 +365,7 @@ mod tests {
         assert!(a.contains("--cap-drop ALL"));
         assert!(a.contains("--user 0:0") && a.contains("WICKET_AS_USER=1000:1000"), "starts as root only to set up, then drops");
         assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
+        assert!(a.contains("--dns 198.18.0.1"));
         assert!(a.contains("--tmpfs /tmp:rw,nosuid,size=512m"));
         assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
