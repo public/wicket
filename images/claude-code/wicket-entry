@@ -28,7 +28,8 @@ drop() { setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --boun
 
 # Addresses for links to other boxes (198.18.1.1-32, one per linked name): added now, while this
 # script still can. wicket relays each link and names it in the box's hosts file, which it owns.
-for i in $(seq 1 32); do ip addr replace "198.18.1.$i/32" dev lo; done
+# One `ip -batch` (~60 ms under gVisor; 32 separate `ip` calls took ~0.7 s).
+seq 1 32 | sed 's|.*|addr replace 198.18.1.&/32 dev lo|' | ip -batch -
 ip addr replace "$WICKET_ADDR/32" dev lo
 
 # One forwarder for all three (crates/wicket-fwd): TCP_NODELAY, large buffers, splice, a thread per

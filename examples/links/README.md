@@ -38,7 +38,8 @@ of that run and of everything it started).
 - For each connection, wicket runs `wicket-fwd --dial 127.0.0.1:<port>` in the target box with `docker exec -i`,
   as the agent's user, and copies bytes both ways. Under gVisor a box can connect out to a host socket,
   but a socket the box creates can't be reached from the host, so wicket reaches in. That costs about
-  0.1 s per connection, which is fine for DevTools (one WebSocket) or keep-alive HTTP.
+  0.15 s per new connection (144 ms measured by the demo on a shared 4 vCPU VPS), which is fine for
+  DevTools (one WebSocket) or keep-alive HTTP.
 - Both images need `wicket-fwd` (any image built on wicket's agent image), and the boxes must run on this
   host: remote nodes can't link yet.
 
