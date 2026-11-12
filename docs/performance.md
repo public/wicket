@@ -87,9 +87,18 @@ zone wicket-src: egress over HTTPS (HTTP/3 is always terminated and inspected)
 - **HTTP/3.** wicket terminates QUIC for every host and decides each request, wholesale or not. A
   client that wants the fast path to a spliced host should use HTTP/2 or HTTP/1.1 over TCP.
 - **Plain HTTP.** It is always inspected.
-- **Remote nodes.** A node decides from its feed replica, which narrows to reads, then to nothing,
-  when the control host has been unreachable too long. A hostname can't carry that, so a node
-  inspects every host ([#141](https://github.com/public/wicket/issues/141)).
+- **Remote nodes whose policy isn't fresh.** A node decides from its feed replica, which narrows to
+  plain reads, then to nothing, when the control host has been unreachable past the freshness lease.
+  A hostname can't carry that, so a node splices only while its replica is fresh
+  ([#141](https://github.com/public/wicket/issues/141)). The checks above hold on the node too. In
+  addition, the box's own token must allow the host for every method the proxy forwards, at the
+  root and at a deep path, by its ceiling alone. The node checks the token, not just the zone it was
+  minted from. Only top-level boxes are spliced on a node. A child box's token is narrowed by its
+  ancestors' ceilings, which the node can't read back from the token, so the node always inspects
+  a child box's connections. When the replica leaves `fresh`, the node cuts the connections it
+  spliced at the next 2 s check, and inspects new ones, deciding each request as narrow or closed
+  mode says. Hosts the node forwards to the control host (credentials, the node CA's name
+  constraints) are still forwarded, and the control host decides there whether to splice them.
 
 ### Measured: the real proxy, with and without splice-through
 
@@ -218,7 +227,6 @@ faster in a gVisor box, and it is the path that splice-through applies to.
 
 - Read-through caches for package registries on each node ([#139](https://github.com/public/wicket/issues/139)).
 - Large inputs and outputs fetched and uploaded host-side ([#140](https://github.com/public/wicket/issues/140)).
-- Splice-through on remote nodes while the feed is fresh ([#141](https://github.com/public/wicket/issues/141)).
 - Streaming request bodies and HTTP/2 upstream pooling on the intercepting path ([#142](https://github.com/public/wicket/issues/142)).
 - The `filtered` network mode, for protocols the proxy can't carry ([#63](https://github.com/public/wicket/issues/63)).
 

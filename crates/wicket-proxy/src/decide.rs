@@ -10,7 +10,9 @@
 //!   carries each box's authority as a Biscuit token chain (`wicket_feed::token`), loaded once. A request that needs a
 //!   grant is put to the control host (which raises the pending request, so `wicket pending` and
 //!   `wicket approve` work as usual) when the node is connected; when it isn't, it fails with a clear
-//!   403 and no request id. Grant uses are counted on the node, for its boxes only.
+//!   403 and no request id. Grant uses are counted on the node, for its boxes only. Hosts the box's
+//!   token allows wholesale are spliced through while the replica is fresh, and inspected otherwise
+//!   (#141).
 
 use crate::RunCtx;
 use futures_util::future::BoxFuture;
@@ -50,6 +52,14 @@ pub trait Decider: Send + Sync {
     fn splice(&self, _ctx: &RunCtx, _host: &str) -> Option<usize> {
         None
     }
+    /// Why a spliced connection to `host` is cut, once [`Decider::splice`] no longer allows it.
+    fn splice_lost(&self, _ctx: &RunCtx, _host: &str) -> String {
+        "the host is no longer allowed wholesale".into()
+    }
+    /// What the audit row of a spliced connection adds about where it was decided.
+    fn splice_note(&self) -> &'static str {
+        ""
+    }
 }
 
 /// The control host's ledger: the decision every local run gets.
@@ -65,8 +75,6 @@ impl Decider for Central {
     }
 
     /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
-    /// A node's decider keeps the default: its decisions depend on the feed's freshness (narrow
-    /// and closed modes), which a hostname can't carry.
     fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
         match wicket_core::splice::inspection(ctx.zone.spec(), host) {
             wicket_core::splice::Inspection::Spliced { rule } => Some(rule),
@@ -188,6 +196,34 @@ impl Decider for NodeDecider {
                 },
             }
         })
+    }
+
+    fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
+        self.splice_now(ctx, host)
+    }
+
+    fn splice_lost(&self, _ctx: &RunCtx, _host: &str) -> String {
+        let mode = self.replica.lock().expect("replica").mode((self.clock)());
+        match mode {
+            Mode::Fresh => "the box's authority on this node no longer allows the host wholesale".into(),
+            Mode::Narrow => "this node's policy is no longer fresh (narrow: plain reads only, decided per request)".into(),
+            Mode::Closed => "this node's policy is closed (nothing is allowed until the control host returns)".into(),
+        }
+    }
+
+    fn splice_note(&self) -> &'static str {
+        " (on the node, while its policy is fresh)"
+    }
+}
+
+/// Splicing on a node (#141): only while the replica is fresh, and only if the box's token allows
+/// the host for every method and path ([`Replica::<BoxAuthority>::splice`]). Narrow and closed
+/// decide each request (plain reads, then nothing), which a hostname can't carry, so a node in
+/// those modes inspects, and cuts the connections it spliced at the next check.
+impl NodeDecider {
+    fn splice_now(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
+        let now = (self.clock)();
+        self.replica.lock().expect("replica").splice(&ctx.tenant, &ctx.run.0, host, now)
     }
 }
 

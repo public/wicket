@@ -54,6 +54,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   wake is bin-packed onto the nodes available; `--workspace-dir` works on remote nodes (copied up, synced
   back). Hibernated agents' state is encrypted at rest (AES-256-GCM, a key that stays on the control
   host) ([#146](https://github.com/public/wicket/issues/146)).
+- Remote nodes splice too, while their feed replica is fresh: only for top-level boxes, and only
+  for hosts the box's token itself allows for every method. When the replica narrows or closes, the
+  node cuts its spliced connections within 2 s and inspects new ones
+  ([#141](https://github.com/public/wicket/issues/141)).
 
 ### Model budgets
 

@@ -238,8 +238,9 @@ impl Egress {
     }
 
     /// The reach rule that allows `host` wholesale, if this connection may be spliced through (#62):
-    /// the decider says so, and nothing is swapped in for the host.
-    fn splice_rule(&self, host: &str) -> Option<usize> {
+    /// the decider says so (on a node, only while its policy is fresh, #141), and nothing is swapped
+    /// in for the host. Asked at CONNECT and again every few seconds while a spliced connection lasts.
+    pub(crate) fn splice_rule(&self, host: &str) -> Option<usize> {
         if self.ctx.swaps.iter().any(|s| host_matches(&s.host, host)) {
             return None;
         }

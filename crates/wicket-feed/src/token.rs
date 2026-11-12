@@ -160,6 +160,10 @@ fn reason(c: &CompiledAuthority, op: &Op, forbidden: bool, token: String) -> Str
     }
 }
 
+/// The paths a node probes a box's token at before it splices a host (#141): the root, and a deep
+/// path no rule names.
+const SPLICE_PROBES: [&str; 2] = ["/", "/.wicket-splice-probe/a/b.c"];
+
 /// What a token decision found, before the replica records a use (which needs it mutably).
 enum Found {
     Done(Decision),
@@ -250,6 +254,42 @@ impl Replica<BoxAuthority> {
             Some(Ok(c)) => c.zone.host_verdict(host),
             _ => HostVerdict::Open,
         }
+    }
+
+    /// The reach rule that lets this node splice connections from box `run` to `host` through
+    /// without terminating TLS (#141; which hosts: [`wicket_core::splice`]), at `now`. Read-only: no
+    /// grant is tried and no use is recorded. All of these must hold, else None (inspect):
+    ///
+    /// - the replica is fresh (narrow and closed decide per request, which a hostname can't carry);
+    /// - the box is a top-level box: a child's token is narrowed by its ancestors' ceilings, which
+    ///   the record's zone doesn't show;
+    /// - the zone the box's token was minted from allows the host wholesale;
+    /// - the token itself allows every method the proxy forwards, at the root and at a deep path,
+    ///   by its ceiling alone (the allow comes from the token, as for every request).
+    pub fn splice(&self, tenant: &wicket_core::TenantId, run: &str, host: &str, now: i64) -> Option<usize> {
+        let entry = self.state()?.zones.get(run)?;
+        let c = entry.compiled.as_ref().ok()?;
+        if entry.spec.box_path != entry.spec.run {
+            return None;
+        }
+        let rule = match wicket_core::splice::inspection(&entry.spec.zone, host) {
+            wicket_core::splice::Inspection::Spliced { rule } => rule,
+            wicket_core::splice::Inspection::Inspected(_) => return None,
+        };
+        let run_id = wicket_core::RunId(run.to_string());
+        for method in wicket_core::op::HTTP_METHODS {
+            for path in SPLICE_PROBES {
+                let op = Op::egress(tenant, &run_id, &entry.spec.zone.name, method, host, path);
+                match self.gate(&op, now) {
+                    Ok((Mode::Fresh, _)) => {}
+                    _ => return None,
+                }
+                if c.loaded.decide(&request(&entry.spec, &op, now)) != authz::Decision::Allow {
+                    return None;
+                }
+            }
+        }
+        Some(rule)
     }
 
     /// The zone a box's authority was minted from, if the node holds it.

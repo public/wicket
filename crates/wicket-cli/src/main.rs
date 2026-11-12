@@ -1519,6 +1519,7 @@ fn zone_view(zone: &wicket_core::ZoneSpec, json: bool) -> String {
         }
     }
     if rows.iter().any(|(_, i)| i.is_spliced()) {
+        out.push_str("  Spliced on the control host, and on a node while its policy is fresh (else inspected there).\n");
         out.push_str("  Spliced hosts get one audit row per connection, no per-request decisions or header filtering,\n");
         out.push_str("  and on a shared CDN may reach other sites behind it. Add a forbid rule to inspect one.\n");
     }
