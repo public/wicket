@@ -42,7 +42,22 @@ pub struct RunCtx {
     pub boxes: Option<Arc<dyn link::BoxOps>>,
     /// Asks for capacity leases (`request_capacity`, #7); None when this run may not.
     pub capacity: Option<CapacityHook>,
+    /// The long-lived agent this run is an activation of, and its generation (#70). Requests are
+    /// refused once the agent's generation has moved past this one: a newer activation woke it.
+    pub fence: Option<Fence>,
+    /// Wakes a hibernated agent (a message just arrived for it). Set by the supervisor.
+    pub waker: Option<Waker>,
 }
+
+/// An activation's fencing token: the agent's generation when it was woken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    pub agent: String,
+    pub generation: i64,
+}
+
+/// Asks for an agent to be woken, with what woke it.
+pub type Waker = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -208,6 +223,21 @@ pub enum Event {
 }
 
 impl RunCtx {
+    /// Why this activation may no longer act, if a newer one has superseded it (or its agent is
+    /// gone). Checked by every proxy on every request.
+    pub fn superseded(&self) -> Option<String> {
+        let f = self.fence.as_ref()?;
+        let current = self.ledger.lock().ok().map(|l| l.agent_generation(&f.agent));
+        match current {
+            Some(Ok(Some(g))) if g == f.generation => None,
+            Some(Ok(Some(g))) => {
+                Some(format!("agent {} was woken again (generation {g}); this activation (generation {}) is stale", f.agent, f.generation))
+            }
+            Some(Ok(None)) => Some(format!("agent {} no longer exists", f.agent)),
+            _ => Some("the ledger can't be read to check this activation's generation".into()),
+        }
+    }
+
     /// Sends a signed message from this agent to the agent running as `to_run`. The sender is this
     /// run's identity, set by wicket; the agent can't choose it. Allowed between parent and child,
     /// or when the recipient's zone lists this zone in `accept_from`, within one tenant.
@@ -229,9 +259,22 @@ impl RunCtx {
             Some(r) if r.tenant == self.tenant.0 => r,
             _ => return Err(format!("no agent {to_run}")),
         };
-        if l.run_status(to_run).map_err(|e| e.to_string())?.as_deref() != Some("running") {
-            return Err(format!("agent {} ({to_run}) is not running", rec.agent));
+        // A long-lived agent (#70) is reached through any of its runs: its current activation if it
+        // has one, or (hibernated) the message waits and the agent is woken to read it.
+        let mut to_run = to_run.to_string();
+        let mut wake: Option<String> = None;
+        if l.run_status(&to_run).map_err(|e| e.to_string())?.as_deref() != Some("running") {
+            let agent = match l.agent_of_run(&to_run).map_err(|e| e.to_string())? {
+                Some((id, _)) => l.agent(&id).map_err(|e| e.to_string())?,
+                None => None,
+            };
+            match agent {
+                Some(a) if a.restorable && a.state == "hibernated" && self.waker.is_some() => wake = Some(a.id),
+                Some(a) if a.restorable && wicket_store::AGENT_HELD.contains(&a.state.as_str()) && a.run != to_run => to_run = a.run,
+                _ => return Err(format!("agent {} ({to_run}) is not running", rec.agent)),
+            }
         }
+        let to_run = to_run.as_str();
         let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
             "child"
         } else if me.claims.parent_run.as_deref() == Some(to_run) {
@@ -257,8 +300,13 @@ impl RunCtx {
             "message",
             &serde_json::json!({
                 "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
+                "wakes": wake,
             }),
         );
+        drop(l);
+        if let (Some(agent), Some(w)) = (&wake, &self.waker) {
+            w(agent, &format!("a message from {} ({})", me.claims.agent, self.run.0));
+        }
         Ok(id)
     }
 
@@ -334,3 +382,116 @@ pub(crate) const STRIP_REQUEST: &[&str] = &[
 ];
 
 pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length"];
+
+#[cfg(test)]
+mod fence_tests {
+    //! #70: an activation superseded by a newer wake is refused at every enforcement point (the LLM
+    //! proxy's test is in llm.rs).
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stale activation's context: its agent has been woken again (generation 2).
+    fn stale_ctx() -> RunCtx {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "z",
+                name: "a",
+                run: "run_old",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        assert_eq!(ledger.claim_wake(&agent, "run_new", 0).unwrap(), Some(2));
+        let m = wicket_core::Manifest::from_yaml(
+            "task: t\nagent: {name: a}\nzone: {name: z, llm: {}, reach: [{host: example.com, methods: [GET]}]}",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        RunCtx {
+            tenant: TenantId::single(),
+            run: RunId("run_old".into()),
+            zone: Arc::new(CompiledZone::new(m.zone.clone()).unwrap()),
+            ledger: Arc::new(Mutex::new(ledger)),
+            vault: vault::Vault::new(std::env::temp_dir().join("wicket-fence-no-vault")),
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps: vec![],
+            boxes: None,
+            capacity: None,
+            fence: Some(Fence { agent, generation: 1 }),
+            waker: None,
+        }
+    }
+
+    /// Sends one raw HTTP/1.1 request to a unix socket once it exists; returns the response head and body.
+    async fn raw(sock: &std::path::Path, req: &str) -> String {
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut s = tokio::net::UnixStream::connect(sock).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut out)).await.unwrap().unwrap();
+        String::from_utf8_lossy(&out[..n]).into_owned()
+    }
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-fence-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn the_egress_proxy_refuses_a_stale_generation() {
+        let ctx = stale_ctx();
+        let ca = Arc::new(ca::RunCa::generate("run_old").unwrap());
+        let egress = egress::Egress::new(ctx, ca).unwrap();
+        let d = dir("egress");
+        let sock = d.join("egress.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { egress.serve(&sock).await }
+        });
+        // In reach, so only the fence can refuse it: a CONNECT and a plain request.
+        let r = raw(&sock, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("stale"), "{r}");
+        let r = raw(&sock, "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("stale"), "{r}");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn the_gateway_refuses_a_stale_generation() {
+        let gw = gateway::Gateway::new(stale_ctx());
+        let d = dir("gateway");
+        let sock = d.join("gateway.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { gw.serve(&sock).await }
+        });
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: wicket.internal\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw(&sock, &req).await;
+        assert!(r.starts_with("HTTP/1.1 409") && r.contains("stale"), "{r}");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

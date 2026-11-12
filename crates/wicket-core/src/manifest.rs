@@ -89,6 +89,12 @@ pub struct AgentSpec {
     /// (`wicket say <run> …`). "0s" (default) ends the run when the first task is done.
     #[serde(default = "zero")]
     pub idle_timeout: String,
+    /// Long-lived agents (#70): once a turn has ended and `idle_timeout` has passed with no follow-up,
+    /// the box is paused (Idle) instead of closed. At `hibernate_after` (from the end of the turn) the
+    /// agent is hibernated: its box is stopped, its writable state bundled, and it is woken later by
+    /// `wicket wake`, `wicket say` or a message. None (default): the session closes at `idle_timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hibernate_after: Option<String>,
     /// Extra environment for the agent: non-secret configuration only. Variables
     /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
     #[serde(default)]
@@ -101,8 +107,12 @@ pub struct AgentSpec {
 
 /// Adapter settings a manifest may set: presentation and commit metadata only. Hooks, permissions,
 /// MCP servers, environment, credential helpers and the like stay under wicket's control.
-pub const ADAPTER_SETTINGS_ALLOWED: [&str; 6] =
-    ["includeCoAuthoredBy", "attribution", "outputStyle", "alwaysThinkingEnabled", "cleanupPeriodDays", "language"];
+pub const ADAPTER_SETTINGS_ALLOWED: [&str; 5] = ["includeCoAuthoredBy", "attribution", "outputStyle", "alwaysThinkingEnabled", "language"];
+
+/// Adapter settings wicket sets itself and a manifest may not override. `cleanupPeriodDays`: Claude
+/// Code deletes sessions older than it on start, which would erase a long-lived agent's own history
+/// when it wakes (#70).
+pub const ADAPTER_SETTINGS_OWNED: [&str; 1] = ["cleanupPeriodDays"];
 
 fn zero() -> String {
     "0s".into()
@@ -115,6 +125,14 @@ pub const RESERVED_ENV_PREFIXES: [&str; 12] =
 impl AgentSpec {
     pub fn idle(&self) -> Result<std::time::Duration, ManifestError> {
         humantime::parse_duration(&self.idle_timeout).map_err(|e| ManifestError::Invalid(format!("agent.idle_timeout: {e}")))
+    }
+
+    /// When to hibernate after a turn ends, if the agent hibernates at all.
+    pub fn hibernate(&self) -> Result<Option<std::time::Duration>, ManifestError> {
+        self.hibernate_after
+            .as_deref()
+            .map(|h| humantime::parse_duration(h).map_err(|e| ManifestError::Invalid(format!("agent.hibernate_after: {e}"))))
+            .transpose()
     }
 }
 
@@ -214,8 +232,23 @@ pub struct VolumeSpec {
     pub name: String,
     /// Absolute path inside the box, under /volumes.
     pub path: String,
+    /// What happens to it when an agent hibernates (#70).
+    #[serde(default)]
+    pub persist: Persist,
 }
 
+/// A volume's class when an agent hibernates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Persist {
+    /// Per agent, bundled with its state and restored on wake (the agent's own data).
+    Durable,
+    /// Shared by the zone on the node that runs it, kept there and not bundled (the default).
+    #[default]
+    Node,
+    /// Re-derivable (`node_modules`, `target/`): never bundled, and may be empty on wake.
+    Cache,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReachRule {
@@ -356,6 +389,16 @@ impl Manifest {
                     None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
                 }
                 a.idle()?;
+                if let Some(h) = a.hibernate()? {
+                    if h < a.idle()? {
+                        return Err(ManifestError::Invalid("agent.hibernate_after must not be shorter than agent.idle_timeout".into()));
+                    }
+                }
+                if let Some(k) = a.adapter_settings.keys().find(|k| ADAPTER_SETTINGS_OWNED.contains(&k.as_str())) {
+                    return Err(ManifestError::Invalid(format!(
+                        "agent.adapter_settings may not set {k:?}: wicket sets it, so a long-lived agent keeps its sessions"
+                    )));
+                }
                 if let Some(k) = a.adapter_settings.keys().find(|k| !ADAPTER_SETTINGS_ALLOWED.contains(&k.as_str())) {
                     return Err(ManifestError::Invalid(format!(
                         "agent.adapter_settings may not set {k:?} (allowed: {})",
@@ -490,8 +533,17 @@ zone:
             assert!(Manifest::from_yaml(&base(&format!(", adapter_settings: {{ {bad}: {{}} }}"))).is_err(), "{bad} must be refused");
         }
         assert!(Manifest::from_yaml(&base(", idle_timeout: soon")).is_err());
+        let e = Manifest::from_yaml(&base(", adapter_settings: { cleanupPeriodDays: 1 }")).unwrap_err().to_string();
+        assert!(e.contains("cleanupPeriodDays") && e.contains("wicket sets it"), "{e}");
+        assert!(Manifest::from_yaml(&base(", idle_timeout: 1m, hibernate_after: 10m")).is_ok());
+        assert!(Manifest::from_yaml(&base(", idle_timeout: 10m, hibernate_after: 1m")).is_err());
+        assert!(Manifest::from_yaml(&base(", hibernate_after: later")).is_err());
         let vol = |v: &str| format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, volumes: [{v}] }}\n");
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data }")).is_ok());
+        let m = Manifest::from_yaml(&vol("{ name: data, path: /volumes/data, persist: durable }")).unwrap();
+        assert_eq!(m.zone.volumes[0].persist, Persist::Durable);
+        assert_eq!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data }")).unwrap().zone.volumes[0].persist, Persist::Node);
+        assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data, persist: forever }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /workspace/x }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/../etc }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: a, path: /volumes/a }, { name: a, path: /volumes/b }")).is_err());

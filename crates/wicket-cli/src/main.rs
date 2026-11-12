@@ -8,6 +8,7 @@
 mod capacity;
 mod chan;
 mod enrol;
+mod hibernate;
 mod image;
 mod links;
 mod mock;
@@ -98,8 +99,32 @@ enum Cmd {
         lease: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
-    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
+    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A
+    /// long-lived agent can be named by its id or any of its runs; a hibernated one is woken.
     Say { run: String, text: Vec<String> },
+    /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
+    /// and nothing but the agent runs in its box. Otherwise it stays idle (paused).
+    Hibernate {
+        run: String,
+        /// How long to wait for the outcome (seconds).
+        #[arg(long, default_value_t = 120)]
+        wait: u64,
+    },
+    /// Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the
+    /// woken activation in the foreground, like `wicket run`. Text, if given, is the operator's
+    /// message to it.
+    Wake {
+        agent: String,
+        text: Vec<String>,
+        /// What woke it (recorded and told to the agent).
+        #[arg(long, hide = true)]
+        by: Option<String>,
+    },
+    /// Long-lived agents: state, generation, current run and bundle size.
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
     /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
@@ -595,6 +620,7 @@ async fn main() -> Result<()> {
                 parent_run,
                 lease,
                 wrap: None,
+                wake: None,
             })
             .await
         }
@@ -611,6 +637,7 @@ async fn main() -> Result<()> {
                 parent_run: None,
                 lease: None,
                 wrap: Some(argv),
+                wake: None,
             })
             .await
         }
@@ -620,6 +647,36 @@ async fn main() -> Result<()> {
                 bail!("nothing to say");
             }
             let l = Ledger::open(&ledger_path())?;
+            // A long-lived agent is reached through its current run; a hibernated one is woken, and
+            // the message is its first turn.
+            let mut run = run;
+            if l.run_status(&run)?.as_deref() != Some("running") {
+                if let Ok(a) = hibernate::resolve(&l, &run) {
+                    match a.state.as_str() {
+                        "hibernated" if a.restorable => {
+                            if let Some(why) = hibernate::exhausted(&a) {
+                                bail!("agent {} is hibernated and can't be woken: {why}", a.id);
+                            }
+                            l.add_operator_message(&a.id, &text, &operator())?;
+                            l.audit(
+                                &TenantId::single(),
+                                None,
+                                "operator.message",
+                                &serde_json::json!({ "by": operator(), "chars": text.len(), "agent": a.id, "wakes": true }),
+                            )?;
+                            hibernate::trigger_wake(&a.id, &format!("wicket say by {}", operator()));
+                            println!(
+                                "agent {} is hibernated: waking it; the message is its first turn (log: {})",
+                                a.id,
+                                hibernate::agent_dir(&a.id).join("wake.log").display()
+                            );
+                            return Ok(());
+                        }
+                        "active" | "idle" | "waking" | "hibernating" => run = a.run,
+                        s => bail!("agent {} is {s}", a.id),
+                    }
+                }
+            }
             match l.run_status(&run)?.as_deref() {
                 Some("running") => {}
                 Some(s) => bail!("{run} is {s}, not running"),
@@ -635,6 +692,12 @@ async fn main() -> Result<()> {
             println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
             Ok(())
         }
+        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
+        Cmd::Wake { agent, text, by } => {
+            let text = text.join(" ");
+            hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by).await
+        }
+        Cmd::Agents { json } => hibernate::list(json),
         Cmd::Pending => {
             let l = Ledger::open(&ledger_path())?;
             let p = l.pending(&TenantId::single())?;

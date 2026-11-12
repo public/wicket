@@ -10,3 +10,5 @@ publish.workspace = true
 wicket-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+getrandom.workspace = true
+hex.workspace = true
