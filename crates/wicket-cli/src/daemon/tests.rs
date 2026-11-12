@@ -137,18 +137,16 @@ async fn internal_arguments_and_foreign_directories_are_refused() {
     assert!(e.contains("--run-id is for wicket's own use"), "{e}");
     let e = call(&f, &["run", "--parent-run", "x", m], None).await.unwrap_err().to_string();
     assert!(e.contains("--parent-run"), "{e}");
-    // A directory someone else owns can't be mounted in place.
-    let e = call(&f, &["run", "--workspace-dir", "/usr", m], None).await.unwrap_err().to_string();
-    assert!(e.contains("owned by uid 0"), "{e}");
-    // Nor one holding wicket's data, even the caller's own.
-    let e = call(&f, &["run", "--workspace-dir", f.dir.0.to_str().unwrap(), m], None).await.unwrap_err().to_string();
-    assert!(e.contains("holds, wicket's data"), "{e}");
-    // The caller's own directory is fine.
+    // Nothing is mounted in place for an operator: the path could be swapped for a link into the
+    // data after any check. Not even the caller's own directory, nor through wrap.
     let own = f.dir.0.join("project");
     std::fs::create_dir_all(&own).unwrap();
-    let (code, out, _) = call(&f, &["run", "--workspace-dir", own.to_str().unwrap(), m], None).await.unwrap();
-    assert_eq!(code, 0);
-    assert!(out.contains(&format!("--workspace-dir {}", own.display())), "{out}");
+    for d in ["/usr", f.dir.0.to_str().unwrap(), own.to_str().unwrap()] {
+        let e = call(&f, &["run", "--workspace-dir", d, m], None).await.unwrap_err().to_string();
+        assert!(e.contains("only root mounts in place"), "{d}: {e}");
+    }
+    let e = call(&f, &["wrap", "--manifest", m, "--", "claude"], None).await.unwrap_err().to_string();
+    assert!(e.contains("only root can"), "{e}");
     // The console and the daemon aren't started through the daemon.
     assert!(call(&f, &["serve"], None).await.unwrap_err().to_string().contains("systemd"));
 }

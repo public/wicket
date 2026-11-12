@@ -244,6 +244,23 @@ impl Daemon {
             Basis::Root => Some((principal(peer), format!("{}@host (break-glass: uid 0 over wicketd's socket)", peer.user))),
             Basis::Policy => Some((principal(peer), format!("{}@cli (uid {}, over wicketd's socket)", peer.user, peer.uid))),
         };
+        // Mounting in place hands Docker a path, and the caller controls that path: after any check,
+        // it could swap the directory for a link into wicket's data (another run's sockets). So only
+        // root, which could read the data anyway, mounts in place through the daemon.
+        if *basis == Basis::Policy {
+            match cmd {
+                Cmd::Run { workspace_dir: Some(_), .. } => bail!(
+                    "--workspace-dir mounts a directory by its path, which its owner could swap for a link into wicket's data: \
+                     through wicketd only root mounts in place. Copy it in with --workdir"
+                ),
+                Cmd::Wrap { .. } => {
+                    bail!(
+                        "wrap mounts its launcher's directory in place, by its path: through wicketd only root can (sudo wicket wrap ...)"
+                    )
+                }
+                _ => {}
+            }
+        }
         let dir = dir_fd.map(|fd| self.checked_dir(&fd, peer, basis)).transpose()?;
         let default_cwd = || {
             let c = PathBuf::from(&hello.cwd);
@@ -301,8 +318,8 @@ impl Daemon {
         })
     }
 
-    /// A directory the caller passed open (to mount in place): a directory, the caller's own, and
-    /// neither inside nor above the data directory.
+    /// A directory the caller passed open (to mount in place; root only, see `plan`): a directory,
+    /// the caller's own unless root, and neither inside nor above the data directory.
     fn checked_dir(&self, fd: &OwnedFd, peer: &Peer, basis: &Basis) -> Result<PathBuf> {
         let f = std::fs::File::from(fd.try_clone()?);
         let m = f.metadata()?;

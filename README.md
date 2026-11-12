@@ -270,9 +270,10 @@ issuer, the vault, the console's origin and whether it is up, and the placement 
 
 - Enrol a passkey for the console: `sudo wicket operator enrol-link --origin http://localhost:8787` (the console
   doesn't print one in its log, which operators may be able to read).
-- `--workspace-dir` (and `wrap`, which mounts its launcher's directory) mount a directory you own in place. The
-  `wicket` user needs to reach it: `setfacl -m u:wicket:x ~ && setfacl -R -m u:wicket:rwX,d:u:wicket:rwX DIR`.
-  Manifests, `--workdir` and programs' sources are sent to the daemon as content.
+- Manifests, `--workdir` and programs' sources are sent to the daemon as content. Mounting a directory in place
+  (`--workspace-dir`, and `wrap`, which mounts its launcher's directory) is root's only through the daemon: Docker
+  mounts it by its path, which its owner could swap for a link into wicket's data after any check. Operators copy
+  in with `--workdir`; a run's `result.json` is printed when it ends.
 - Restarting `wicketd` stops the runs started through it (each stops its box); console-started runs survive a
   console restart.
 - Without the daemon (no socket), `wicket` works as one user, as below: **development mode**, which `wicket

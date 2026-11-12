@@ -418,8 +418,9 @@ is the only member of the `docker` group. Other users reach wicket only through 
 - runs the command as `wicket` with the caller's stdin, stdout and stderr (passed as `SCM_RIGHTS`), and sets the
   run's principal (`assurance: unix-peercred`) and the operator name in the ledger from the peer credentials.
   Files the caller names (manifest, program source, `--workdir`) arrive as content, so the `wicket` user never
-  reads a path a caller merely names. A directory mounted in place must be the caller's own, passed open, and
-  neither inside nor above the data directory. Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
+  reads a path a caller merely names. Mounting a directory in place (`--workspace-dir`, `wrap`) is root's only
+  through the daemon, since Docker mounts by path and the directory's owner could swap the path for a link into
+  the data after any check; mounting the checked inode itself would lift this. Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
   refused, and refusals are audited.
 
 Without the daemon, the CLI keeps the single-user behaviour (development mode, labelled insecure by `wicket
