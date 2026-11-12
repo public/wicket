@@ -586,8 +586,8 @@ where
     if !host.is_some_and(|h| h.eq_ignore_ascii_case(&state.authority)) {
         return denied();
     }
-    let forwarded = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), forwarded, &state.trusted) };
+    let forwarded: Vec<Option<&str>> = req.headers().get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect();
+    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), &forwarded, &state.trusted) };
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 

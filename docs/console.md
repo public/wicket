@@ -54,6 +54,17 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
     --trusted-proxy 10.0.0.2
 ```
 
+- **Behind a TLS terminator** (nginx, HAProxy, Caddy, a cloud load balancer), `--trusted-proxy` is required. It
+  takes the address or range the proxy connects from, and is repeatable. Without it, every client would
+  look like the proxy: one client's failed sign-ins would lock everyone out, and a few slow connections
+  would fill the per-client connection cap. `X-Forwarded-For` is read only on connections from a trusted
+  proxy. All of its header lines are read, in order, and the client is the right-most entry that isn't a
+  trusted proxy. Anything further left is whatever the client sent. Two rules for the proxy:
+  - **It must add the address it saw.** nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+    HAProxy: `option forwardfor`, which adds a header line of its own; wicket reads every line, so that
+    is fine. Caddy's `reverse_proxy` does it by default.
+  - **It must be the only way in.** Listen on an address that only the proxy can reach, or firewall the
+    port to the proxy. If there are several proxies in a chain, trust each of them.
 - **Transport.** A non-loopback listener refuses to start in plain HTTP unless `--behind-tls-terminator` is given
   with an `https://` `--origin`. TLS is rustls: TLS 1.3, and TLS 1.2 with ECDHE and AEAD suites only; HTTP/1.1
   only (no h2, so there is one HTTP implementation to bound). HTTPS responses carry
@@ -69,7 +80,8 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   minutes and come from two bounded pools. Sign-in challenges get 512 in all, 8 per client and 32 per
   IPv4 /24 or IPv6 /48. Signed-in sessions' action and enrolment challenges get 512 in all and 8 per
   session. A flood of sign-in attempts therefore never stops the operator from approving. Every failure looks the same to the client, and every failure
-  and lockout is in the audit log.
+  and lockout is in the audit log. The limiter remembers 4096 clients. When every entry is a live lockout, the
+  oldest one is dropped to make room, so new clients aren't all refused.
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
   host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately

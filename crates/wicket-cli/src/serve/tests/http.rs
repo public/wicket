@@ -377,6 +377,21 @@ async fn sign_in_without_user_verification_is_refused_like_any_failure() {
     assert!(audits(&t, "operator.signed_in").is_empty());
 }
 
+/// #123: behind a trusted proxy, the client is read from every X-Forwarded-For line. A proxy that
+/// adds its own line (HAProxy's `option forwardfor`) after the client's forged one names the client.
+#[tokio::test]
+async fn forwarded_for_reads_every_header_line() {
+    let mut t = setup("xff-lines");
+    t.state.trusted = vec!["127.0.0.1".parse().unwrap()];
+    let h = [("x-wicket-csrf", "1"), ("origin", ORIGIN), ("content-type", "application/json")];
+    let lines = [("x-forwarded-for", "203.0.113.9"), ("x-forwarded-for", "192.0.2.50")];
+    let all: Vec<(&str, &str)> = h.iter().chain(lines.iter()).copied().collect();
+    let (status, _, _) = call_from(&t.state, PEER, "POST", "/api/login/finish", &all, b"{}").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let failed = audits(&t, "operator.login_failed");
+    assert_eq!(failed.last().unwrap()["client"], "192.0.2.50", "{failed:?}");
+}
+
 #[tokio::test]
 async fn the_challenge_store_is_bounded() {
     let t = setup("challenges");

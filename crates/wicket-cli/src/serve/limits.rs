@@ -11,7 +11,8 @@
 //!   operator out.
 //!
 //! The tables are bounded ([`MAX_ENTRIES`]); when full, the stalest unlocked entry is dropped, and if
-//! every entry is a live lockout the new client is refused (fail closed).
+//! every entry is a live lockout, the oldest lockout is (#123: refusing every new client instead let
+//! a table full of lockouts shut everyone out).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -45,13 +46,15 @@ impl Entry {
 struct Table(HashMap<String, Entry>);
 
 impl Table {
-    /// The entry for `key`, making room if needed. None: full of live lockouts.
+    /// The entry for `key`, making room if needed: the stalest unlocked entry goes, or, when every
+    /// entry is a live lockout, the one locked longest ago.
     fn entry(&mut self, key: &str, now: Instant) -> Option<&mut Entry> {
         if !self.0.contains_key(key) && self.0.len() >= MAX_ENTRIES {
             self.0.retain(|_, e| e.locked(now).is_some() || e.last.is_some_and(|l| now.duration_since(l) < LOCKOUT));
             if self.0.len() >= MAX_ENTRIES {
                 let stalest = self.0.iter().filter(|(_, e)| e.locked(now).is_none()).min_by_key(|(_, e)| e.last).map(|(k, _)| k.clone());
-                self.0.remove(&stalest?);
+                let victim = stalest.or_else(|| self.0.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| k.clone()));
+                self.0.remove(&victim?);
             }
         }
         let e = self.0.entry(key.to_string()).or_default();
@@ -234,21 +237,25 @@ impl Cidr {
     }
 }
 
-/// The client's address: the TCP peer, unless the peer is a trusted proxy, in which case the
-/// right-most `X-Forwarded-For` entry that isn't a trusted proxy (entries further left are whatever
-/// the client claimed). With no trusted proxies configured the header is ignored.
-pub fn client_ip(peer: IpAddr, forwarded_for: Option<&str>, trusted: &[Cidr]) -> IpAddr {
+/// The client's address: the peer's, unless the peer is a trusted proxy, in which case it is the
+/// right-most `X-Forwarded-For` entry that isn't itself a trusted proxy. Every header line counts,
+/// in order (`lines`): a proxy that adds its own line rather than appending to the client's would
+/// otherwise leave the client's forged line as the one read (#123). An entry that isn't an address
+/// (or a line that isn't text, passed as None) stops the walk at the last good hop.
+pub fn client_ip(peer: IpAddr, lines: &[Option<&str>], trusted: &[Cidr]) -> IpAddr {
     if trusted.is_empty() || !trusted.iter().any(|c| c.contains(peer)) {
         return peer;
     }
-    let Some(xff) = forwarded_for else { return peer };
     let mut last = peer;
-    for part in xff.rsplit(',') {
-        let Ok(ip) = part.trim().parse::<IpAddr>() else { return last };
-        if !trusted.iter().any(|c| c.contains(ip)) {
-            return ip;
+    for line in lines.iter().rev() {
+        let Some(line) = line else { return last };
+        for part in line.rsplit(',') {
+            let Ok(ip) = part.trim().parse::<IpAddr>() else { return last };
+            if !trusted.iter().any(|c| c.contains(ip)) {
+                return ip;
+            }
+            last = ip;
         }
-        last = ip;
     }
     last
 }
@@ -332,20 +339,46 @@ mod tests {
         assert!(matches!(l.attempt(locked, t0 + Duration::from_secs(60)), Err(Refusal::Locked(_))), "flooding doesn't clear a lockout");
     }
 
+    /// #123: a table full of live lockouts drops the oldest for a new client, rather than refusing
+    /// every new client (the operator included).
+    #[test]
+    fn a_table_full_of_lockouts_still_admits_new_clients() {
+        let l = Limiter::default();
+        let t0 = Instant::now();
+        let ips: Vec<IpAddr> = (0..MAX_ENTRIES as u32).map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i))).collect();
+        for (i, a) in ips.iter().enumerate() {
+            for _ in 0..FAILURES_TO_LOCK {
+                l.fail(*a, None, t0 + Duration::from_millis(i as u64));
+            }
+        }
+        let later = t0 + Duration::from_secs(10);
+        assert_eq!(l.attempt(ip("192.0.2.1"), later), Ok(()), "a new client gets in");
+        assert!(l.ips.lock().unwrap().0.len() <= MAX_ENTRIES);
+        assert_eq!(l.attempt(ips[0], later), Ok(()), "the oldest lockout made room");
+        assert!(matches!(l.attempt(ips[MAX_ENTRIES - 1], later), Err(Refusal::Locked(_))), "newer lockouts stay");
+    }
+
     #[test]
     fn forwarded_for_is_believed_only_from_trusted_proxies() {
         let trusted: Vec<Cidr> = vec!["10.0.0.0/8".parse().unwrap(), "2001:db8::1".parse().unwrap()];
         let proxy = ip("10.1.2.3");
         // No trusted proxies, or a peer that isn't one: the header is ignored.
-        assert_eq!(client_ip(proxy, Some("192.0.2.5"), &[]), proxy);
-        assert_eq!(client_ip(ip("192.0.2.9"), Some("192.0.2.5"), &trusted), ip("192.0.2.9"));
+        assert_eq!(client_ip(proxy, &[Some("192.0.2.5")], &[]), proxy);
+        assert_eq!(client_ip(ip("192.0.2.9"), &[Some("192.0.2.5")], &trusted), ip("192.0.2.9"));
         // From a trusted proxy: the right-most untrusted entry, not what the client prepended.
-        assert_eq!(client_ip(proxy, Some("203.0.113.66, 192.0.2.5"), &trusted), ip("192.0.2.5"));
-        assert_eq!(client_ip(proxy, Some("192.0.2.5, 10.9.9.9"), &trusted), ip("192.0.2.5"));
-        assert_eq!(client_ip(ip("2001:db8::1"), Some("2001:db8:aa::5"), &trusted), ip("2001:db8:aa::5"));
+        assert_eq!(client_ip(proxy, &[Some("203.0.113.66, 192.0.2.5")], &trusted), ip("192.0.2.5"));
+        assert_eq!(client_ip(proxy, &[Some("192.0.2.5, 10.9.9.9")], &trusted), ip("192.0.2.5"));
+        assert_eq!(client_ip(ip("2001:db8::1"), &[Some("2001:db8:aa::5")], &trusted), ip("2001:db8:aa::5"));
         // Garbage stops the walk at the last good hop.
-        assert_eq!(client_ip(proxy, Some("evil, 10.9.9.9"), &trusted), ip("10.9.9.9"));
-        assert_eq!(client_ip(proxy, None, &trusted), proxy);
+        assert_eq!(client_ip(proxy, &[Some("evil, 10.9.9.9")], &trusted), ip("10.9.9.9"));
+        assert_eq!(client_ip(proxy, &[], &trusted), proxy);
+        // #123: every header line, in order. A proxy that adds its own line after the client's: the
+        // proxy's line names the client, whatever the client wrote in its own.
+        assert_eq!(client_ip(proxy, &[Some("203.0.113.66"), Some("192.0.2.5")], &trusted), ip("192.0.2.5"));
+        assert_eq!(client_ip(proxy, &[Some("203.0.113.66, 10.2.2.2"), Some("192.0.2.5, 10.9.9.9")], &trusted), ip("192.0.2.5"));
+        // Past trusted hops into an earlier line, and an unreadable line stops the walk.
+        assert_eq!(client_ip(proxy, &[Some("192.0.2.7"), Some("10.9.9.9")], &trusted), ip("192.0.2.7"));
+        assert_eq!(client_ip(proxy, &[Some("192.0.2.7"), None, Some("10.9.9.9")], &trusted), ip("10.9.9.9"));
         assert!("10.0.0.0/33".parse::<Cidr>().is_err());
         assert!("0.0.0.0/0".parse::<Cidr>().unwrap().contains(ip("192.0.2.1")));
         assert!(!"0.0.0.0/0".parse::<Cidr>().unwrap().contains(ip("2001:db8::5")));
