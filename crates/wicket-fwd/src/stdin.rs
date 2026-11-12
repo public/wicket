@@ -50,14 +50,12 @@ pub fn run(sock: &Path, argv: &[String]) -> io::Result<i32> {
     std::thread::spawn(move || {
         let mut received = 0u64;
         loop {
-            match UnixStream::connect(&sock) {
-                Ok(mut s) => match relay(&mut s, &mut to, &mut received) {
+            if let Ok(mut s) = UnixStream::connect(&sock) {
+                match relay(&mut s, &mut to, &mut received) {
                     Ok(true) => return, // drops `to`: the command's stdin closes
-                    Ok(false) => {}
                     Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return, // the command closed its stdin
-                    Err(_) => {}
-                },
-                Err(_) => {}
+                    _ => {}
+                }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
