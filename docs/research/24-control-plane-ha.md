@@ -30,7 +30,7 @@ wicket, a named page for prior art). **[M]** a secondary source, or a primary on
     the authority root, the installation CA, the state key) and every hibernated agent. Nothing is
     replicated; the only off-host copy is an audit export, if one is configured [H].
 - **Recommendation: move the run to the node, then lease it what it needs to run alone, then replicate
-  what is left.** Concretely, in five phases (§6, one issue each):
+  what is left.** Concretely, in five phases (§6, one issue each: #151–#155):
   1. **The run lives on its node.** Per-run supervision, the model proxy, the MCP gateway and the run's
      budgets move into `wicket node serve`; the control host keeps policy, keys and the ledger, and
      re-attaches after a restart instead of ending runs. *Survives:* a control-host restart, with a partition
@@ -451,7 +451,7 @@ it held. Revoking the node drops its wrapping, and the control plane re-wraps wh
 
 Each phase says what keeps working during an outage once that phase alone has shipped.
 
-1. **The run lives on its node** (ISSUE_P1). Per-run supervision, the model proxy, the MCP gateway and the
+1. **The run lives on its node** ([#151](https://github.com/public/wicket/issues/151)). Per-run supervision, the model proxy, the MCP gateway and the
    run's budgets move into `wicket node serve`. The control host relays credentials as today, and on restart
    re-attaches to the boxes nodes report instead of ending their runs; the reconciler ends a run only when its
    node says the box is gone or the node's lease of the run has expired. `reap_previous` on a node keeps boxes
@@ -459,22 +459,22 @@ Each phase says what keeps working during an outage once that phase alone has sh
    window), and the gateway's local tools during a partition. *Not yet:* model calls and credentialed hosts in
    a partition (still relayed). This phase alone does not buy outage tolerance for the model; it is the base
    for phase 2, and it fixes the worst failure (a reboot ends every run).
-2. **Credential and budget leases** (ISSUE_P2). Secret residency (`control` | `node`), a node encryption
+2. **Credential and budget leases** ([#152](https://github.com/public/wicket/issues/152)). Secret residency (`control` | `node`), a node encryption
    key, HPKE-sealed memory-only leases, the access-token-only rule for `claude-oauth`, budget leases for any
    shared budget, and `node list` showing what each node holds until when. *Keeps working:* model calls and
    `node`-resident credentialed hosts for the life of their leases, which is still capped by the feed window
    until phase 3.
-3. **Bounded autonomy** (ISSUE_P3). Per-zone `offline` windows in the feed (§5.1), queued asks with
+3. **Bounded autonomy** ([#153](https://github.com/public/wicket/issues/153)). Per-zone `offline` windows in the feed (§5.1), queued asks with
    node-local ids, self-fencing, node issuing keys for agent identities, certificate renewal over the
    channel from any control host, distributed node CA revocations, and local hibernation with per-agent
    data keys. *Keeps working:* configured work for hours with no control host; the node stops what it can't
    supervise.
-4. **State off the host** (ISSUE_P4). Stream the ledger's WAL to S3-compatible storage (Litestream or our
+4. **State off the host** ([#154](https://github.com/public/wicket/issues/154)). Stream the ledger's WAL to S3-compatible storage (Litestream or our
    own, with point-in-time restore), the hibernate store and audit segments on the same store, the feed root
    and authority root offline (or FROST 2-of-3) with online issuing keys under them, and a tested restore onto
    a standby host. *Keeps working:* the installation survives losing the control host, after a restore of
    minutes, with seconds of RPO; nodes ride through the gap on phase 3.
-5. **A replicated control plane** (ISSUE_P5). Three control hosts, `openraft` over the ledger's commands
+5. **A replicated control plane** ([#155](https://github.com/public/wicket/issues/155)). Three control hosts, `openraft` over the ledger's commands
    (deterministic: the leader stamps time and ids), the vault replicated with it, leader-only feed
    publishing and reconciling with term fencing, a stateless console behind one name, and one Claude login
    refresher. *Keeps working:* everything, through the loss of one control host, without a human.
