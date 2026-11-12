@@ -169,6 +169,8 @@ pub enum HostPat {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathPat {
     Glob(String),
+    /// A glob matched ignoring ASCII case, as zone forbids are (`ForbidRule::paths`, #115).
+    GlobAnyCase(String),
     Like(String),
 }
 

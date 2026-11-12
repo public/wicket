@@ -249,6 +249,7 @@ fn http_match(c: &mut Code, m: &HttpMatch) -> Result<String, AuthzError> {
     for p in &m.paths {
         let re = match p {
             PathPat::Glob(g) => path_regex(g)?,
+            PathPat::GlobAnyCase(g) => path_regex(&wicket_core::manifest::fold_case_glob(g))?,
             PathPat::Like(l) => like_regex(l),
         };
         parts.push(format!("$p.matches({})", c.s(&re)));
