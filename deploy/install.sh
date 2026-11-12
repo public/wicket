@@ -181,7 +181,7 @@ fi
 
 say "systemd units"
 units_changed=0
-for u in wicketd wicket-console wicket-reconcile; do
+for u in wicketd wicket-console wicket-reconcile wicket-state; do
     if ! cmp -s "$here/systemd/$u.service" "/etc/systemd/system/$u.service"; then
         install -m 0644 "$here/systemd/$u.service" "/etc/systemd/system/$u.service"
         units_changed=1
@@ -190,12 +190,13 @@ done
 if [ "$systemd" = 1 ]; then
     systemctl daemon-reload
     if [ "$start" = 1 ]; then
-        systemctl enable wicketd wicket-console wicket-reconcile >/dev/null 2>&1
+        # wicket-state starts only once state-store.yaml exists (docs/state.md).
+        systemctl enable wicketd wicket-console wicket-reconcile wicket-state >/dev/null 2>&1
         # Restarting wicketd stops the runs started through it: only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd
         fi
-        for u in wicket-console wicket-reconcile; do
+        for u in wicket-console wicket-reconcile wicket-state; do
             if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q "$u"; then
                 systemctl restart "$u"
             fi

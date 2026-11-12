@@ -61,10 +61,10 @@ fn litestream_desc(l: &LedgerStream) -> String {
     l.litestream.binary.clone().or(l.litestream.image.clone()).unwrap_or_default()
 }
 
-/// Litestream's configuration for the ledger (no secrets: those go in its environment).
-fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path) -> Result<String> {
+/// Litestream's configuration for the ledger, with the store's credentials if given.
+fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, creds: Option<&crate::s3::Creds>) -> Result<String> {
     let c = s.s3()?;
-    let cfg = serde_json::json!({
+    let mut cfg = serde_json::json!({
         "snapshot": { "interval": "1h", "retention": l.retention },
         "dbs": [{
             "path": db.to_string_lossy(),
@@ -74,17 +74,25 @@ fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path) -> Result<Stri
             },
         }],
     });
+    if let Some(k) = creds {
+        cfg["dbs"][0]["replica"]["access-key-id"] = k.access_key_id.clone().into();
+        cfg["dbs"][0]["replica"]["secret-access-key"] = k.secret_access_key.clone().into();
+    }
     Ok(serde_yaml::to_string(&cfg)?)
 }
 
-/// A Litestream command (`replicate` or `restore …`), its config written beside the ledger and its
-/// credentials in its environment.
-fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<std::process::Command> {
+/// A Litestream command (`replicate` or `restore …`), with its config written beside the ledger,
+/// credentials included, 0600 (as the vault holds them): the caller removes it when the command ends.
+/// (Not in its environment: `sudo docker` drops that, and Litestream's restore reads only the config.)
+fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<(std::process::Command, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
     let l = s.ledger.as_ref().context("state-store.yaml has no ledger: section")?;
     let dir = db.parent().context("the ledger's directory")?.to_path_buf();
-    let cfg_path = dir.join("litestream.yml");
-    std::fs::write(&cfg_path, litestream_config(s, l, db)?)?;
     let creds = s.creds()?;
+    let cfg_path = dir.join(format!("litestream-{}.yml", args[0]));
+    let _ = std::fs::remove_file(&cfg_path);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&cfg_path)?;
+    std::io::Write::write_all(&mut f, litestream_config(s, l, db, Some(&creds))?.as_bytes())?;
     let mut cmd = match (&l.litestream.binary, &l.litestream.image) {
         (Some(b), _) => std::process::Command::new(b),
         (None, Some(image)) => {
@@ -94,18 +102,26 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<std::process::
             let mut c = std::process::Command::new(parts.next().context("WICKET_DOCKER is empty")?);
             c.args(parts);
             let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-            c.args(["run", "--rm", "-i", "--network", "host", "--user", &format!("{uid}:{gid}")])
+            // Named after the data directory: one per installation, and findable to stop.
+            let name = {
+                use sha2::Digest;
+                format!("wicket-litestream-{}", &hex::encode(sha2::Sha256::digest(dir.to_string_lossy().as_bytes()))[..12])
+            };
+            // One left by a supervisor killed hard (the client died, the container didn't) goes first.
+            let mut rm = std::process::Command::new(c.get_program());
+            rm.args(c.get_args()).args(["rm", "-f", &name]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            let _ = rm.status();
+            c.args(["run", "--rm", "-i", "--name", &name, "--network", "host", "--user", &format!("{uid}:{gid}")])
                 .arg("-v")
                 .arg(format!("{0}:{0}", dir.display()))
-                .args(["-e", "LITESTREAM_ACCESS_KEY_ID", "-e", "LITESTREAM_SECRET_ACCESS_KEY", image]);
+                .arg(image);
             c
         }
         (None, None) => bail!("ledger.litestream: one of binary or image"),
     };
     let sub = args[0];
     cmd.arg(sub).arg("-config").arg(&cfg_path).args(&args[1..]);
-    cmd.env("LITESTREAM_ACCESS_KEY_ID", &creds.access_key_id).env("LITESTREAM_SECRET_ACCESS_KEY", &creds.secret_access_key);
-    Ok(cmd)
+    Ok((cmd, cfg_path))
 }
 
 /// `wicket state replicate`: streams the ledger to the state store until stopped.
@@ -114,9 +130,11 @@ pub fn replicate() -> Result<()> {
     let db = ledger_path();
     // Litestream needs the database in WAL mode, which the ledger is; make sure it exists.
     drop(wicket_store::Ledger::open(&db)?);
-    let mut cmd = litestream(&s, &["replicate"], &db)?;
+    let (mut cmd, cfg) = litestream(&s, &["replicate"], &db)?;
     println!("[wicket] streaming {} to the state store ({})", db.display(), litestream_desc(s.ledger.as_ref().expect("checked")));
-    let status = cmd.status().context("starting Litestream")?;
+    let status = cmd.status();
+    let _ = std::fs::remove_file(&cfg);
+    let status = status.context("starting Litestream")?;
     if !status.success() {
         bail!("Litestream exited: {status}");
     }
@@ -241,7 +259,10 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     }
     args.extend(["-o".to_string(), tmp.to_string_lossy().to_string(), db.to_string_lossy().to_string()]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = litestream(&s, &argv, &db)?.output().context("starting Litestream")?;
+    let (mut cmd, cfg) = litestream(&s, &argv, &db)?;
+    let out = cmd.output();
+    let _ = std::fs::remove_file(&cfg);
+    let out = out.context("starting Litestream")?;
     if !out.status.success() || !tmp.exists() {
         bail!("Litestream could not restore the ledger: {}", String::from_utf8_lossy(&out.stderr).trim());
     }

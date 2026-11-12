@@ -62,9 +62,19 @@ not a permanent decision.
   - The console runs as `wicket` with direct access to the ledger. It is not yet the untrusted front end
     the design describes (design §14.1.3), so a bug in the console is a bug in the control plane.
 - **Keys are files.** The identity issuer key, the installation CA, and the feed, authorization and
-  approver keys are 0600 files in the data directory. There is no split between an offline root and
-  short-lived issuing keys, and no TPM or KMS (design §3.2). Root on the control host can mint any
-  identity, grant or node certificate.
+  approver keys are 0600 files in the data directory, with no TPM or KMS (design §3.2). The feed root
+  and the authority root can go offline (`wicket keys roots-offline`, #154): boxes' tokens are then
+  minted by an issuing key the authority root certified, for the days chosen. Root on the control host
+  can still mint any identity, grant or node certificate with the keys that stay (the issuer, the CA,
+  the approver and the issuing key), and while the roots are offline, enrolling a node, a feed's new
+  generation and renewing certificates need them back (`WICKET_ROOTS`). The identity issuer and the
+  installation CA have no offline root yet.
+- **Losing the host is a manual restore** (#154, `docs/state.md`). With the state store set up, the
+  ledger streams to it (Litestream, at most its sync interval behind), bundles and audit segments are in
+  it, and `wicket state restore` rebuilds a standby from it and the recovery kit. A standby isn't
+  promoted on its own; runs that were running end as `lost` (their run directories were on the host);
+  the recovery kit is a plain tar of key files, for you to keep offline; bundles are still sealed under
+  one `state.key` (in the kit), not per-agent keys.
 - **The audit log is only as safe as the host.** The hash chain shows tampering after the fact, but
   someone with write access to the ledger can rewrite the whole chain. Export with signed checkpoints
   (`docs/audit-export.md`) to a system they can't reach, and verify against it with

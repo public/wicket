@@ -1314,11 +1314,15 @@ impl Ledger {
     }
 
     /// Records the control host's own built-in node (#146): enrolled by the control host itself, so
-    /// no join token, and no node CA (it decides nothing itself). A no-op if it is already recorded.
+    /// no join token, and no node CA (it decides nothing itself). Already recorded and active, it takes
+    /// the new key and target: the node's directory was made again (lost, or a restore onto a standby,
+    /// #154), and the key it had is gone with it.
     pub fn enrol_builtin_node(&self, node: &NodeRow) -> Result<()> {
         self.conn.execute(
             &format!(
-                "INSERT INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL) ON CONFLICT(name) DO NOTHING"
+                "INSERT INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL) \
+                 ON CONFLICT(name) DO UPDATE SET node_key = excluded.node_key, target = excluded.target, enrolled_at = excluded.enrolled_at \
+                 WHERE nodes.status = 'active'"
             ),
             params![
                 node.name,
