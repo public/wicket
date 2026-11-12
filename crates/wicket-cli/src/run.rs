@@ -455,6 +455,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(crate::spawn::spawner(crate::spawn::SpawnCtx {
             parent: m.clone(),
+            slots: Default::default(),
+            exe: None,
             run: run.clone(),
             dir: dir.clone(),
             image: image.to_string(),
