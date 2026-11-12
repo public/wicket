@@ -170,6 +170,23 @@ impl S3Store {
         }
     }
 
+    /// Writes `key` whatever is there (small objects only: the ledger's lineage list).
+    pub fn put_overwrite(&self, key: &str, body: Vec<u8>) -> Result<()> {
+        if !valid_key(key) {
+            bail!("bad object key {key:?}");
+        }
+        let sha = hex::encode(Sha256::digest(&body));
+        let req = self.request(reqwest::Method::PUT, key, &[], &sha)?.header("content-length", body.len()).body(body);
+        let key2 = key.to_string();
+        block(async move {
+            let r = req.send().await?;
+            match r.status().as_u16() {
+                200 | 201 | 204 => Ok(()),
+                s => bail!("PUT {key2}: HTTP {s}"),
+            }
+        })
+    }
+
     /// Checks the store can be reached and written: puts, reads back and deletes a probe object.
     pub fn probe(&self) -> Result<()> {
         let key = format!("probe/{}", ulid::Ulid::new().to_string().to_lowercase());
@@ -215,17 +232,30 @@ impl ObjectStore for S3Store {
         if self.cfg.conditional_put {
             req = req.header("if-none-match", "*");
         }
-        let body = reqwest::Body::from(tokio::fs::File::from_std(f));
+        // A 409 (ConditionalRequestConflict) is a concurrent conditional write still in progress:
+        // tried again, a moment later, from the spooled copy.
         let key2 = key.to_string();
-        block(async move {
-            let r = req.body(body).send().await.map_err(io_err)?;
-            match r.status().as_u16() {
-                200 | 201 | 204 => Ok(true),
-                // Someone (an earlier attempt) wrote it first.
-                412 | 409 => Ok(false),
-                s => Err(io_err(format!("PUT {key2}: HTTP {s}: {}", wicket_agent::clip(&r.text().await.unwrap_or_default(), 300)))),
+        for attempt in 0..4 {
+            let body = reqwest::Body::from(tokio::fs::File::from_std(f.try_clone()?));
+            let req = req.try_clone().ok_or_else(|| io_err("PUT can't be retried"))?;
+            let key3 = key2.clone();
+            let got = block(async move {
+                let r = req.body(body).send().await.map_err(io_err)?;
+                match r.status().as_u16() {
+                    200 | 201 | 204 => Ok(Some(true)),
+                    // Someone (an earlier attempt) wrote it first.
+                    412 => Ok(Some(false)),
+                    409 => Ok(None),
+                    s => Err(io_err(format!("PUT {key3}: HTTP {s}: {}", wicket_agent::clip(&r.text().await.unwrap_or_default(), 300)))),
+                }
+            })?;
+            if let Some(done) = got {
+                return Ok(done);
             }
-        })
+            std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+            f.rewind()?;
+        }
+        Err(io_err(format!("PUT {key2}: a conflicting write kept it busy (HTTP 409)")))
     }
 
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {

@@ -107,7 +107,9 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Place { .. } => Forward(Privileged),
         // The kit holds every key and secret; a restore replaces the ledger; the roots are the roots.
         Cmd::State { cmd } => match cmd {
-            StateCmd::Check => Forward(Read),
+            StateCmd::Check { probe: false } => Forward(Read),
+            // Writes (and deletes) an object in the store.
+            StateCmd::Check { probe: true } => Forward(Privileged),
             StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
             StateCmd::Kit { .. } | StateCmd::Restore { .. } => Forward(Privileged),
         },

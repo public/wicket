@@ -65,16 +65,32 @@ fn read_seed(path: &Path) -> Option<[u8; 32]> {
     hex::decode(std::fs::read_to_string(path).ok()?.trim()).ok()?.try_into().ok()
 }
 
-/// A root's seed, never made here while the roots are offline.
+/// The public half the installation pinned for a root, if it has one (`<identity dir>/<root>.pub`).
+fn pinned(file: &str) -> Option<[u8; 32]> {
+    hex::decode(std::fs::read_to_string(identity_dir().join(file).with_extension("pub")).ok()?.trim()).ok()?.try_into().ok()
+}
+
+/// A root's seed. Made here only by an installation that never had it (no pinned public half): a
+/// missing root is never made again, and one read from elsewhere must be the pinned one.
 fn root_seed(file: &str, which: &str) -> Result<[u8; 32]> {
     let p = roots_dir().join(file);
     if let Some(s) = read_seed(&p) {
+        let public = wicket_identity::SigningKey::from_bytes(&s).verifying_key().to_bytes();
+        if pinned(file).is_some_and(|pk| pk != public) {
+            bail!("{} is not this installation's {which} (its public half differs from the pinned one)", p.display());
+        }
         return Ok(s);
     }
     if offline() {
         return Err(offline_error(which));
     }
-    // Online and not made yet: made here, as before.
+    if pinned(file).is_some() {
+        bail!(
+            "the {which}'s private key is missing ({}) but its public half is pinned: put the key back (or run with WICKET_ROOTS set to the directory that holds it)",
+            p.display()
+        );
+    }
+    // A new installation: made here, as before.
     Ok(wicket_identity::load_or_create_feed_root_signing(&p)?.to_bytes())
 }
 
@@ -87,8 +103,7 @@ pub fn authz_root_signing() -> Result<wicket_authz::SigningKey> {
 }
 
 fn public(file: &str, which: &str) -> Result<[u8; 32]> {
-    let pubp = identity_dir().join(file).with_extension("pub");
-    if let Some(b) = hex::decode(std::fs::read_to_string(&pubp).unwrap_or_default().trim()).ok().and_then(|b| b.try_into().ok()) {
+    if let Some(b) = pinned(file) {
         return Ok(b);
     }
     Ok(wicket_identity::SigningKey::from_bytes(&root_seed(file, which)?).verifying_key().to_bytes())
@@ -105,8 +120,9 @@ pub fn authz_root_public() -> Result<wicket_authz::PublicKey> {
 }
 
 /// The key boxes' block 0 is minted with, and its certificate: the issuing key while the roots are
-/// offline, else the authority root itself.
-pub fn minting_key() -> Result<(wicket_authz::SigningKey, Option<String>)> {
+/// offline, else the authority root itself. A token that would outlive the certificate (`until`,
+/// Unix ms) isn't minted: its box would be refused mid-run.
+pub fn minting_key(until: i64) -> Result<(wicket_authz::SigningKey, Option<String>)> {
     if !offline() {
         return Ok((authz_root_signing()?, None));
     }
@@ -114,15 +130,22 @@ pub fn minting_key() -> Result<(wicket_authz::SigningKey, Option<String>)> {
     let seed = read_seed(&d.join(ISSUING_KEY)).context("the authority issuing key (authz-issuing.key) is missing")?;
     let cert = std::fs::read_to_string(d.join(ISSUING_CERT)).context("the authority issuing key's certificate")?;
     let key = wicket_authz::SigningKey::from_bytes(&seed)?;
-    // Refused by nodes once expired: say so here, before a box is started with it.
-    let now = wicket_feed::now_ms();
-    if let Err(e) = wicket_feed::AuthzKeyCert::open(&cert, &authz_root_public()?, now) {
-        bail!("{e}: renew it with `WICKET_ROOTS=<dir> wicket keys certify`");
+    let (certified, ends) = wicket_feed::AuthzKeyCert::open(&cert, &authz_root_public()?).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if certified != key.public() {
+        bail!("the authority issuing key's certificate is for another key");
     }
-    if let Some(c) = wicket_feed::jws::payload_unverified::<wicket_feed::AuthzKeyCert>(&cert) {
-        if c.not_after - now < 7 * 86_400_000 {
-            eprintln!("[wicket] the authority issuing key's certificate ends in under a week: renew it with `WICKET_ROOTS=<dir> wicket keys certify`");
-        }
+    let now = wicket_feed::now_ms();
+    if ends < until {
+        bail!(
+            "the authority issuing key's certificate ends before this box's token would ({} s left, {} s needed): renew it with `WICKET_ROOTS=<dir> wicket keys certify`",
+            ((ends - now) / 1000).max(0),
+            (until - now) / 1000
+        );
+    }
+    if ends - now < 7 * 86_400_000 {
+        eprintln!(
+            "[wicket] the authority issuing key's certificate ends in under a week: renew it with `WICKET_ROOTS=<dir> wicket keys certify`"
+        );
     }
     Ok((key, Some(cert)))
 }

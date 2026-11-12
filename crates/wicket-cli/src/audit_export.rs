@@ -604,7 +604,9 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
         .iter()
         .filter_map(|r| Some((serde_json::from_str::<Value>(&r.body).ok()?["rolled_back_after"].as_i64()?, r.ts)))
         .collect();
-    let discarded = |seq: i64, ts: i64| rollbacks.iter().any(|&(after, at)| seq > after && ts < at);
+    // An exported copy that doesn't match is discarded history if a restore went back before it and
+    // it was made before that restore (the same second counts: records carry whole seconds).
+    let discarded = |seq: i64, ts: i64| rollbacks.iter().any(|&(after, at)| seq > after && ts <= at);
     for o in objects {
         match o["type"].as_str() {
             Some("wicket.audit.checkpoint") => {
@@ -623,12 +625,13 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                     a.problems.push("a signed checkpoint without seq and head".into());
                     continue;
                 };
-                if discarded(seq, p["ts"].as_i64().unwrap_or(i64::MAX)) {
+                let local = l.audit_hash_at(seq)?;
+                if local.as_deref() != Some(want) && discarded(seq, p["ts"].as_i64().unwrap_or(i64::MAX)) {
                     a.superseded += 1;
                     continue;
                 }
                 newest = newest.max(seq);
-                match l.audit_hash_at(seq)? {
+                match local {
                     Some(h) if h == want => a.checkpoints += 1,
                     Some(h) => a.problems.push(format!("checkpoint at seq {seq} (signed at {}): exported head {want}, local {h}", p["ts"])),
                     None => a.problems.push(format!("checkpoint at seq {seq}: the local chain ends at {head}")),
@@ -636,10 +639,7 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
             }
             Some("wicket.audit.record") => {
                 let Some(seq) = o["seq"].as_i64() else { continue };
-                if discarded(seq, o["ts"].as_i64().unwrap_or(i64::MAX)) {
-                    a.superseded += 1;
-                    continue;
-                }
+                let gone = discarded(seq, o["ts"].as_i64().unwrap_or(i64::MAX));
                 // Every exported field, not only the hash: a v1 hash covers neither ts, tenant nor
                 // run, so a record moved to another run must be caught here (#120).
                 match l.audit_record_at(seq)? {
@@ -651,10 +651,13 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                             .collect();
                         if differ.is_empty() {
                             a.records += 1;
+                        } else if gone {
+                            a.superseded += 1;
                         } else {
                             a.problems.push(format!("record {seq}: the exported copy's {} differs from the local one", differ.join(", ")));
                         }
                     }
+                    None if gone => a.superseded += 1,
                     None => a.problems.push(format!("record {seq}: exported, but missing locally")),
                 }
             }
@@ -741,6 +744,40 @@ mod tests {
 
     fn rusqlite_conn(path: &Path) -> rusqlite::Connection {
         rusqlite::Connection::open(path).unwrap()
+    }
+
+    #[test]
+    fn exported_copies_a_restore_discarded_are_not_mismatches_and_others_still_are() {
+        let d = TmpDir::new("rollback");
+        let (lp, out) = (d.0.join("ledger.db"), d.0.join("out/audit.jsonl"));
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let l = open_batched(&lp).unwrap();
+        write_records(&l, 0, 10);
+        let mut x = Exporter::new(&lp, jsonl_cfg(&out), Some(issuer)).unwrap();
+        x.pass(true);
+        drop(x);
+        let objs = exported_objects(&std::fs::read_to_string(&out).unwrap());
+        // The restored ledger has the first 6 records, then goes on differently.
+        let all = l.audit_records_after(0, 100).unwrap();
+        let r = Ledger::open_in_memory().unwrap();
+        assert_eq!(r.import_exported_audit(&all[..6]).unwrap(), 6);
+        write_records(&r, 100, 3);
+        let mismatched = verify_against(&r, &objs, &key).unwrap();
+        assert!(!mismatched.problems.is_empty(), "without a restore record the divergence is a mismatch");
+        // Declared by the restore: the copies of 7.. and the checkpoint at 10 are discarded history.
+        let r = Ledger::open_in_memory().unwrap();
+        r.import_exported_audit(&all[..6]).unwrap();
+        r.audit(&TenantId::single(), None, "state.restored", &json!({ "rolled_back_after": 6 })).unwrap();
+        write_records(&r, 100, 3);
+        let a = verify_against(&r, &objs, &key).unwrap();
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert_eq!((a.records, a.superseded), (6, 5), "{a:?}");
+        // A copy of a record the restore kept must still match.
+        let mut forged = objs.clone();
+        let i = forged.iter().position(|o| o["seq"] == 3 && o["type"] == "wicket.audit.record").unwrap();
+        forged[i]["kind"] = json!("forged");
+        assert!(verify_against(&r, &forged, &key).unwrap().problems.iter().any(|p| p.starts_with("record 3:")));
     }
 
     #[test]

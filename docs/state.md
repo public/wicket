@@ -58,22 +58,32 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
    Its objects are `audit/<sink>/…` in the store, one per delivered batch and one per checkpoint,
    never overwritten.
 
-4. **Check it**: `wicket state check` writes, reads back and deletes a probe object, and says where
-   each kind of state goes. The `wicket-state` service starts once `state-store.yaml` exists
-   (`systemctl restart wicket-state`).
+4. **Check it**: `wicket state check --probe` writes, reads back and deletes a probe object, and says
+   where each kind of state goes (without `--probe`, only the latter). The `wicket-state` service
+   starts once `state-store.yaml` exists (`systemctl restart wicket-state`).
+   - Each control host streams to a path of its own, `ledger/<lineage>/`, listed in
+     `ledger/lineages.json` with when each started. A restore takes the lineage that was current (at
+     `--at`, if given) and starts a new one. A host whose lineage was taken over refuses to stream, as
+     does a new host pointed at a store that already holds a ledger.
 
 5. **The recovery kit**: `wicket state kit --out /media/usb/wicket-kit.tar` (`--without-secrets` to
    leave the vault out and set the secrets again on the standby). It holds keys: keep it offline, as
    you would the roots. Make a new one after enrolling a node or changing a config file or secret.
+   A secret linked to a file (`wicket secret link`, and `claude-oauth`, which points at the host's
+   Claude login) comes back as the link: sign in again on the standby.
 
 6. **The roots, offline**: `wicket keys roots-offline --to /media/usb/roots --days 30`.
    - It makes an online *issuing* key for boxes' tokens, with a certificate from the authority root.
    - It certifies every node feed's key for `--days`, copies both roots to the directory, checks the
      copies, and removes them from the host.
    - Nodes pin the same keys as before; tokens then carry the issuing key's certificate, which nodes
-     check (a node needs a build with #154 to load them).
-   - Before `--days` run out, renew with `WICKET_ROOTS=/media/usb/roots wicket keys certify`. Runs warn
-     in the last week.
+     check, by their own clock: past its end a box is refused everything, and a token that would
+     outlive it isn't minted. **Every node needs a build with #154 first**: an older node can't read
+     the new field and refuses the records that carry it.
+   - Before `--days` run out, renew with `wicket keys certify --roots /media/usb/roots` (or
+     `WICKET_ROOTS=…`). Runs warn in the last week. Installed, run it as the wicket user, which must
+     be able to read the directory: `sudo -u wicket WICKET_HOME=/var/lib/wicket HOME=/var/lib/wicket
+     wicket keys certify --roots DIR`.
    - Enrolling a node, a new node's first run, and a feed's new generation need the roots: run those
      with `WICKET_ROOTS` set too. While the roots are offline, a feed's log isn't compacted (that
      starts a new generation).
@@ -85,7 +95,7 @@ On a fresh host with wicket installed (and nothing started), as the wicket user:
 
 ```
 wicket state restore --kit /media/usb/wicket-kit.tar             # or --at 2026-11-12T19:05:05Z
-WICKET_ROOTS=/media/usb/roots wicket keys certify                 # with the roots offline
+wicket keys certify --roots /media/usb/roots                      # with the roots offline
 systemctl start wicketd wicket-console wicket-reconcile wicket-state
 wicket reconcile
 ```
@@ -95,17 +105,22 @@ wicket reconcile
 - restores the ledger with Litestream, as the store last had it or as it was at `--at`, and verifies
   its audit chain;
 - **puts back audit records the store's sink has beyond it** (the ledger's stream stopped before the
-  export did): exported records that continue the restored chain exactly are appended, as they were;
+  export did): exported records that continue the restored chain exactly are appended, as they were,
+  up to the newest checkpoint signed by the installation's issuer (whoever can write the bucket could
+  forge records that chain, not a signed checkpoint), and the chain is verified again;
 - **fences every agent**: its generation moves by 1000, past any the lost host could have handed out
   after the restore point, so a box still running at one of those is refused;
 - sets every node feed to start a new generation (its delta log stayed behind): the next run that
-  reaches a node publishes a fresh snapshot;
+  reaches a node publishes a fresh snapshot, under a certificate version above any the lost host
+  issued (the kit's may be older); with the roots offline that needs `keys certify --roots` first,
+  and until then a run on a node is refused, saying so;
 - records `state.restored` in the audit chain.
 
 Then:
 - `wicket audit --verify --against store:<sink>` compares the restored chain with what was exported.
-- A restore to an earlier point (`--at`) discards what came after it; records exported after that
-  point are reported as discarded, not as a mismatch.
+- What a restore discarded (everything after `--at`, or exported records past the last signed
+  checkpoint) is reported as discarded, not as a mismatch; a copy that disagrees with a record the
+  restore kept is still a mismatch.
 - `wicket wake <agent>` brings a hibernated agent back from its bundle in the store.
 - Runs that were running when the host was lost have no run directory here: the reconciler ends them
   as `lost`, and stops their boxes on nodes that can be reached.

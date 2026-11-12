@@ -73,7 +73,7 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthor
         if log.exists() {
             std::fs::rename(&log, dir.join("deltas.jsonl.restored")).context("setting aside the old delta log")?;
         }
-        let p = open_feed_once(name, &cfg, true).context("starting the feed's new generation after a restore")?;
+        let p = open_feed_inner(name, &cfg, true, true).context("starting the feed's new generation after a restore")?;
         std::fs::remove_file(dir.join(REGENESIS))?;
         println!("[wicket] node {name}'s feed starts a new generation (restored)");
         return Ok(p);
@@ -90,6 +90,13 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthor
 }
 
 fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Result<Publisher<BoxAuthority>> {
+    open_feed_inner(name, cfg, new_generation, false)
+}
+
+/// `restored`: the kit's certificate may be older than versions the node has seen since (the lost
+/// host's feed may have compacted after the kit was made), so the new version is at least the time
+/// in seconds, which no version counted up from 1 reaches.
+fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, restored: bool) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -137,6 +144,7 @@ fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Re
             let root = crate::roots::feed_root_signing().with_context(|| format!("node {name}'s feed needs a certificate"))?;
             // Same key: same version (a renewal). A new key needs a new version (a re-genesis).
             let version = match &old {
+                Some((c, _)) if restored => (c.version + 1).max(u64::try_from(now / 1000).unwrap_or(0)),
                 Some((c, _)) if new_generation => c.version + 1,
                 Some((c, _)) if c.kid == kid => c.version,
                 Some((c, _)) => c.version + 1,
@@ -228,8 +236,11 @@ impl SharedFeed {
         // generation, which nodes take as a snapshot.
         let log = p.log_path().to_path_buf();
         let cap = std::env::var("WICKET_FEED_COMPACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(COMPACT_BYTES);
-        // (Not while the roots are offline: a new generation needs the feed root.)
-        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > cap && p.state().zones.is_empty() && !crate::roots::offline() {
+        // (Only with the feed root at hand: a new generation needs it.)
+        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > cap
+            && p.state().zones.is_empty()
+            && crate::roots::feed_root_signing().is_ok()
+        {
             std::fs::rename(&log, log.with_extension("jsonl.old")).context("setting the old delta log aside")?;
             p = open_feed_once(name, &cfg, true)?;
         }
@@ -397,9 +408,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let paths = crate::enrol::Paths::installation();
     // Block 0 is minted by the authority root, or by its certified issuing key while the roots are
     // offline (#154).
-    let ((minter, issuer_cert), approver) = (crate::roots::minting_key()?, crate::enrol::token_key(&paths.approver_key)?);
     // Until the run's own deadline (the node kills the box then), with an hour's margin.
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
+    let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000;
+    let ((minter, issuer_cert), approver) = (crate::roots::minting_key(until_ms)?, crate::enrol::token_key(&paths.approver_key)?);
     let mut token_issuer = wicket_feed::Issuer::root(
         &minter,
         &s.tenant.0,

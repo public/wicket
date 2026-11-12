@@ -401,9 +401,12 @@ enum AuditCmd {
 
 #[derive(Subcommand)]
 enum StateCmd {
-    /// Where each kind of control-plane state goes (state-store.yaml), and whether the store takes
-    /// writes.
-    Check,
+    /// Where each kind of control-plane state goes (state-store.yaml).
+    Check {
+        /// Also write, read back and delete a probe object in the store.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Stream the ledger to the state store until stopped (Litestream): a lost control host loses
     /// at most `ledger.sync_interval`. Run it as a service beside wicketd.
     Replicate,
@@ -445,10 +448,13 @@ enum KeysCmd {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
-    /// With WICKET_ROOTS set to the roots' directory: renew the issuing key's and every node feed's
-    /// certificate for another --days (as chosen at roots-offline), and start the new generation of
-    /// any feed a restore left.
-    Certify,
+    /// With the roots' directory (--roots, or WICKET_ROOTS): renew the issuing key's and every node
+    /// feed's certificate for another --days (as chosen at roots-offline), and start the new
+    /// generation of any feed a restore left. Installed, the wicket user must be able to read it.
+    Certify {
+        #[arg(long)]
+        roots: Option<PathBuf>,
+    },
     /// Put the roots back on this host.
     RootsOnline {
         #[arg(long)]
@@ -1287,7 +1293,7 @@ async fn main() -> Result<()> {
         Cmd::State { cmd } => {
             // Litestream and the store client block: off the async runtime.
             std::thread::spawn(move || match cmd {
-                StateCmd::Check => state::check(),
+                StateCmd::Check { probe } => state::check(probe),
                 StateCmd::Replicate => state::replicate(),
                 StateCmd::Kit { out, without_secrets, without_roots } => state::kit(&out, !without_secrets, !without_roots),
                 StateCmd::Restore { kit, at, force } => state::restore(&kit, at.as_deref(), force),
@@ -1297,7 +1303,12 @@ async fn main() -> Result<()> {
         }
         Cmd::Keys { cmd } => match cmd {
             KeysCmd::RootsOffline { to, days } => roots::roots_offline(&to, days),
-            KeysCmd::Certify => roots::certify(),
+            KeysCmd::Certify { roots: dir } => {
+                if let Some(d) = dir {
+                    std::env::set_var("WICKET_ROOTS", d);
+                }
+                roots::certify()
+            }
             KeysCmd::RootsOnline { from } => roots::roots_online(&from),
         },
         Cmd::Reconcile { dry_run, every } => {

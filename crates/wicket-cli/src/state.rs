@@ -30,16 +30,75 @@ fn vault_dir() -> PathBuf {
     wicket_proxy::vault::Vault::default_dir()
 }
 
+// ---- the ledger's lineages ----
+//
+// Each control host streams the ledger to a path of its own, `ledger/<lineage>/`: a restored
+// standby must not continue the lost host's stream (Litestream would see a database behind its
+// replica), and a restore to a point in time must find the stream that was current then. The store
+// keeps the list, `ledger/lineages.json`; this host's own lineage is `<data dir>/ledger-lineage`.
+
+const LINEAGES: &str = "ledger/lineages.json";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Lineage {
+    id: String,
+    /// When it started (Unix ms).
+    since: i64,
+}
+
+fn lineage_file() -> PathBuf {
+    data_dir().join("ledger-lineage")
+}
+
+fn lineages(st: &crate::s3::S3Store) -> Result<Vec<Lineage>> {
+    use wicket_store::objects::ObjectStore;
+    let Some(mut r) = st.get(LINEAGES)? else { return Ok(vec![]) };
+    let mut b = vec![];
+    std::io::Read::read_to_end(&mut r, &mut b)?;
+    serde_json::from_slice(&b).context("ledger/lineages.json")
+}
+
+/// Starts a new lineage for this host: recorded here and appended to the store's list.
+fn new_lineage(st: &crate::s3::S3Store, mut list: Vec<Lineage>) -> Result<String> {
+    let id = ulid::Ulid::new().to_string().to_lowercase();
+    list.push(Lineage { id: id.clone(), since: wicket_feed::now_ms() });
+    st.put_overwrite(LINEAGES, serde_json::to_vec(&list)?)?;
+    std::fs::write(lineage_file(), &id)?;
+    Ok(id)
+}
+
+/// This host's lineage, if it may stream: started here on first use, refused if another host has
+/// taken over the store (restored from it) since.
+fn my_lineage(st: &crate::s3::S3Store) -> Result<String> {
+    let list = lineages(st)?;
+    let mine = std::fs::read_to_string(lineage_file()).ok().map(|s| s.trim().to_string());
+    match (mine, list.last()) {
+        (Some(m), Some(last)) if last.id == m => Ok(m),
+        (Some(m), Some(last)) => bail!(
+            "another control host restored from this state store and streams to it now (lineage {}, this host's {m}): this host must not; restore it from the store if it is to take over again",
+            last.id
+        ),
+        (Some(m), None) => bail!("the state store has no ledger lineages, but this host streamed as {m}: is state-store.yaml pointing at another store?"),
+        (None, Some(last)) => bail!(
+            "the state store already holds another installation's ledger (lineage {}): restore from it (`wicket state restore`), or use another prefix",
+            last.id
+        ),
+        (None, None) => new_lineage(st, list),
+    }
+}
+
 /// `wicket state check`: where each kind of state goes, and whether the store takes writes.
-pub fn check() -> Result<()> {
+pub fn check(probe: bool) -> Result<()> {
     let Some(s) = StateStore::load()? else {
         println!("no {}: everything stays on this host", crate::statestore::path().display());
         return Ok(());
     };
     if let Some(c) = &s.s3 {
         println!("state store: {} bucket {} prefix {:?}", c.endpoint, c.bucket, c.prefix);
-        s.open_s3()?.probe().context("writing to the state store")?;
-        println!("  it takes writes (a probe object written, read back and deleted)");
+        if probe {
+            s.open_s3()?.probe().context("writing to the state store")?;
+            println!("  it takes writes (a probe object written, read back and deleted)");
+        }
     }
     println!("bundles: {}", if s.bundles == crate::statestore::Where::S3 { "the state store" } else { "this host" });
     match &s.ledger {
@@ -62,14 +121,14 @@ fn litestream_desc(l: &LedgerStream) -> String {
 }
 
 /// Litestream's configuration for the ledger, with the store's credentials if given.
-fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, creds: Option<&crate::s3::Creds>) -> Result<String> {
+fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, lineage: &str, creds: Option<&crate::s3::Creds>) -> Result<String> {
     let c = s.s3()?;
     let mut cfg = serde_json::json!({
         "snapshot": { "interval": "1h", "retention": l.retention },
         "dbs": [{
             "path": db.to_string_lossy(),
             "replica": {
-                "type": "s3", "bucket": c.bucket, "path": format!("{}ledger", c.prefix), "endpoint": c.endpoint,
+                "type": "s3", "bucket": c.bucket, "path": format!("{}ledger/{lineage}", c.prefix), "endpoint": c.endpoint,
                 "region": c.region, "force-path-style": c.path_style, "sync-interval": l.sync_interval,
             },
         }],
@@ -84,7 +143,7 @@ fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, creds: Option<
 /// A Litestream command (`replicate` or `restore …`), with its config written beside the ledger,
 /// credentials included, 0600 (as the vault holds them): the caller removes it when the command ends.
 /// (Not in its environment: `sudo docker` drops that, and Litestream's restore reads only the config.)
-fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<(std::process::Command, PathBuf)> {
+fn litestream(s: &StateStore, args: &[&str], db: &Path, lineage: &str) -> Result<(std::process::Command, PathBuf)> {
     use std::os::unix::fs::OpenOptionsExt;
     let l = s.ledger.as_ref().context("state-store.yaml has no ledger: section")?;
     let dir = db.parent().context("the ledger's directory")?.to_path_buf();
@@ -92,7 +151,7 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<(std::process:
     let cfg_path = dir.join(format!("litestream-{}.yml", args[0]));
     let _ = std::fs::remove_file(&cfg_path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&cfg_path)?;
-    std::io::Write::write_all(&mut f, litestream_config(s, l, db, Some(&creds))?.as_bytes())?;
+    std::io::Write::write_all(&mut f, litestream_config(s, l, db, lineage, Some(&creds))?.as_bytes())?;
     let mut cmd = match (&l.litestream.binary, &l.litestream.image) {
         (Some(b), _) => std::process::Command::new(b),
         (None, Some(image)) => {
@@ -127,11 +186,17 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path) -> Result<(std::process:
 /// `wicket state replicate`: streams the ledger to the state store until stopped.
 pub fn replicate() -> Result<()> {
     let s = StateStore::load()?.context("no state-store.yaml")?;
+    let Some(l) = &s.ledger else {
+        // Not an error (the service would restart for ever): nothing to stream.
+        println!("[wicket] state-store.yaml has no ledger: section: the ledger isn't streamed");
+        return Ok(());
+    };
     let db = ledger_path();
     // Litestream needs the database in WAL mode, which the ledger is; make sure it exists.
     drop(wicket_store::Ledger::open(&db)?);
-    let (mut cmd, cfg) = litestream(&s, &["replicate"], &db)?;
-    println!("[wicket] streaming {} to the state store ({})", db.display(), litestream_desc(s.ledger.as_ref().expect("checked")));
+    let lineage = my_lineage(&s.open_s3()?)?;
+    let (mut cmd, cfg) = litestream(&s, &["replicate"], &db, &lineage)?;
+    println!("[wicket] streaming {} to the state store as lineage {lineage} ({})", db.display(), litestream_desc(l));
     let status = cmd.status();
     let _ = std::fs::remove_file(&cfg);
     let status = status.context("starting Litestream")?;
@@ -247,7 +312,24 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     let files = unpack_kit(kit)?;
     println!("[wicket] the kit's {} files are in place", files.len());
     let s = StateStore::load()?.context("the kit has no state-store.yaml")?;
-    // The ledger, as the store last had it (or as it was at `at`).
+    // The ledger, as the store last had it (or as it was at `at`), from the lineage current then.
+    let st = s.open_s3()?;
+    let list = lineages(&st)?;
+    let at_ms = match at {
+        Some(t) => Some(
+            humantime::parse_rfc3339_weak(t)
+                .with_context(|| format!("--at {t}: a time like 2026-11-12T19:05:05Z"))?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
+        ),
+        None => None,
+    };
+    let from = match at_ms {
+        None => list.last(),
+        Some(t) => list.iter().rev().find(|l| l.since <= t).or(list.first()),
+    }
+    .context("the state store has no streamed ledger (ledger/lineages.json)")?
+    .clone();
     let tmp = db.with_extension("restoring");
     let _ = std::fs::remove_file(&tmp);
     std::fs::create_dir_all(db.parent().expect("a parent"))?;
@@ -259,7 +341,7 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     }
     args.extend(["-o".to_string(), tmp.to_string_lossy().to_string(), db.to_string_lossy().to_string()]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (mut cmd, cfg) = litestream(&s, &argv, &db)?;
+    let (mut cmd, cfg) = litestream(&s, &argv, &db, &from.id)?;
     let out = cmd.output();
     let _ = std::fs::remove_file(&cfg);
     let out = out.context("starting Litestream")?;
@@ -273,23 +355,30 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     let l = wicket_store::Ledger::open(&db)?;
     l.verify_audit().context("the restored ledger's audit chain")?;
     let (head, _) = l.audit_head()?.unwrap_or((0, String::new()));
-    println!("[wicket] the ledger is restored: its audit chain verifies, up to record {head}");
+    println!("[wicket] the ledger is restored from lineage {}: its audit chain verifies, up to record {head}", from.id);
+    // This host streams as a lineage of its own from now on; the one it came from is superseded.
+    let lineage = new_lineage(&st, list)?;
 
-    // Audit records a store sink exported after the restore point continue the chain: back in.
+    // Audit records a store sink exported after the restore point continue the chain: back in, up to
+    // the newest checkpoint signed by this installation's issuer (anyone who can write the bucket
+    // could make records that chain; not ones a checkpoint signs).
     let mut imported = 0;
-    if at.is_none() {
-        if let Some(cfg) = crate::audit_export::SinksConfig::load()? {
-            for sink in cfg.sinks.iter().filter(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {})) {
-                let recs: Vec<wicket_store::AuditRecord> = crate::audit_export::stored_objects(&sink.name)?
-                    .into_iter()
-                    .filter(|o| o["type"] == "wicket.audit.record")
-                    .filter_map(|o| exported_record(&o))
-                    .collect();
-                let mut recs = recs;
-                recs.sort_by_key(|r| r.seq);
-                recs.dedup_by_key(|r| r.seq);
-                imported += l.import_exported_audit(&recs)?;
+    let mut exported_beyond = 0i64;
+    if let Some(cfg) = crate::audit_export::SinksConfig::load()? {
+        let issuer = crate::issuer()?.verifying_key();
+        for sink in cfg.sinks.iter().filter(|k| matches!(k.kind, crate::audit_export::SinkKind::Store {})) {
+            let objs = crate::audit_export::stored_objects(&sink.name)?;
+            let mut recs: Vec<wicket_store::AuditRecord> =
+                objs.iter().filter(|o| o["type"] == "wicket.audit.record").filter_map(exported_record).collect();
+            recs.sort_by_key(|r| r.seq);
+            recs.dedup_by_key(|r| r.seq);
+            exported_beyond = exported_beyond.max(recs.last().map(|r| r.seq).unwrap_or(0));
+            if at.is_some() {
+                continue;
             }
+            let signed = signed_up_to(&objs, &recs, &issuer);
+            let trusted: Vec<_> = recs.into_iter().filter(|r| r.seq <= signed).collect();
+            imported += l.import_exported_audit(&trusted)?;
         }
     }
     let (new_head, _) = l.audit_head()?.unwrap_or((0, String::new()));
@@ -300,11 +389,12 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
         None,
         "state.restored",
         &serde_json::json!({
-            "kit_files": files.len(), "at": at, "ledger_head": head, "imported_from_export": imported,
+            "kit_files": files.len(), "at": at, "ledger_head": head, "from_lineage": from.id, "lineage": lineage, "imported_from_export": imported,
             "agents_fenced": bumped, "generation_bump": GENERATION_BUMP,
-            // A restore to an earlier point discards what was recorded after it (exported copies of
-            // it are then not compared, `audit --verify --against`).
-            "rolled_back_after": at.map(|_| new_head),
+            // What was recorded after this point and exported (a restore to an earlier point, or
+            // records no signed checkpoint covered) is discarded: `audit --verify --against` then
+            // doesn't compare those copies.
+            "rolled_back_after": (at.is_some() || exported_beyond > new_head).then_some(new_head),
         }),
     )?;
     if imported > 0 {
@@ -328,6 +418,21 @@ pub fn restore(kit: &Path, at: Option<&str>, force: bool) -> Result<()> {
     }
     println!("[wicket] next: start wicket's services, then `wicket reconcile` (runs that were running end as lost)");
     Ok(())
+}
+
+/// The newest seq a checkpoint signed by `issuer` covers whose head is the exported record's hash
+/// at that seq (0: none).
+fn signed_up_to(objs: &[serde_json::Value], recs: &[wicket_store::AuditRecord], issuer: &wicket_identity::VerifyingKey) -> i64 {
+    objs.iter()
+        .filter(|o| o["type"] == "wicket.audit.checkpoint")
+        .filter_map(|o| wicket_identity::verify_checkpoint(o["jws"].as_str()?, issuer).ok())
+        .filter_map(|p| {
+            let seq = p["seq"].as_i64()?;
+            let head = p["head"].as_str()?;
+            recs.iter().any(|r| r.seq == seq && r.hash == head).then_some(seq)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// An exported record, as the ledger stores it (its body back to the string that was hashed).
