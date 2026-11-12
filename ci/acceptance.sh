@@ -33,7 +33,8 @@
 #     it is revoked a dry run has nothing to change;
 #   - a control-host restart (#151): every wicket process of the control host killed hard, the boxes
 #     on this host's own node and (--nodes local) on the other node survive, reconcile adopts their
-#     runs, and their next turns reach the model and the gateway;
+#     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
+#     killed and restarted, and the same boxes take one more turn each;
 #   - `wicket audit --verify`, and audit export to a JSON-lines sink checked with `--against` (a
 #     tampered copy of the export is refused).
 #
@@ -398,6 +399,32 @@ restart_flow() {
     echo "   $l: $res"
     check "  its next turn reached the model, on the same box ($l)" '[ "$(jq -r .turn <<<"$res")" = 2 ] && [ "$(box_of "$r")" = "${boxes[$i]}" ]'
     check "  and its gateway: MCP ping and whoami ($l)" '[ "$(jq -r .ping <<<"$res")" = "{}" ] && [ "$(jq -r .whoami_run <<<"$res")" = "$r" ]'
+  done
+  # Then a node's `serve` alone dies (#151): this host's own is started again by its runs'
+  # supervisors; acc-n1's by this script, as its service manager would. Its boxes are adopted, and
+  # one `wicket say` is one turn (stdin neither lost nor doubled).
+  log "a node's serve restarts alone: its boxes are adopted"
+  for p in $(pgrep -f "$W" 2>/dev/null); do
+    tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"node serve"*) kill -9 "$p" 2>/dev/null ;; esac
+  done
+  if [ "$nodes" = local ] && [ -n "${node_serve_pid:-}" ]; then
+    kill -9 "$node_serve_pid" 2>/dev/null || true
+    sleep 1
+    HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >>"$work/node-serve.log" 2>&1 &
+    node_serve_pid=$!
+    pids+=("$node_serve_pid")
+  fi
+  sleep 3
+  for i in "${!runs[@]}"; do
+    r=${runs[$i]} l=${labels[$i]}
+    w say "$r" "Once more, after the node restarted." >/dev/null 2>&1 || true
+    wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 3 ]' || true
+    sleep 5
+    res=$(restart_result "$r")
+    echo "   $l: $res"
+    check "  after its node's serve restarted, the same box took one more turn, once ($l)" '[ "$(jq -r .turn <<<"$res")" = 3 ] && [ "$(box_of "$r")" = "${boxes[$i]}" ]'
+    check "  with its gateway ($l)" '[ "$(jq -r .ping <<<"$res")" = "{}" ] && [ "$(jq -r .whoami_run <<<"$res")" = "$r" ]'
     wroot identity revoke "$r" --reason "acceptance: restart check done" >/dev/null 2>&1 || true
   done
   for r in "${runs[@]}"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done
