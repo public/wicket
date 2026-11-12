@@ -403,8 +403,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("ledger.db");
         let mut l = Ledger::open(&p).unwrap();
-        // A long linger, so a deferred record visibly waits in the queue.
-        let w = AuditWriter::start(&p, WriterConfig { max_batch: 512, linger: std::time::Duration::from_millis(500) }).unwrap();
+        // A long linger, so a deferred record visibly waits in the queue (a durable one or a flush cuts it short).
+        let w = AuditWriter::start(&p, WriterConfig { max_batch: 512, linger: std::time::Duration::from_secs(30) }).unwrap();
         l.start_audit_writer(Some(w)).unwrap();
         let mut c = ctx(true);
         c.ledger = Arc::new(Mutex::new(l));

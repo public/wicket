@@ -548,6 +548,9 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
             _ => {}
         }
     }
+    if a.checkpoints + a.records == 0 && a.problems.is_empty() {
+        a.problems.push("the exported copies hold no wicket audit records or checkpoints: nothing was compared".into());
+    }
     if newest > head {
         a.problems.push(format!("the local chain ends at seq {head}, before the newest checkpoint ({newest})"));
     }
@@ -654,6 +657,9 @@ mod tests {
         assert_eq!(a.problems.len(), 2, "both checkpoints disagree: {:?}", a.problems);
         let a = verify_against(&l, &objs, &key).unwrap();
         assert!(a.problems.iter().any(|p| p.starts_with("record 3:")), "{:?}", a.problems);
+
+        // An empty or unrelated file proves nothing either: it fails rather than passing vacuously.
+        assert!(!verify_against(&l, &exported_objects("{\"hello\":1}\nnot json\n"), &key).unwrap().problems.is_empty());
 
         // A checkpoint signed by another key proves nothing.
         let other = wicket_identity::Issuer::generate("test.local").verifying_key();

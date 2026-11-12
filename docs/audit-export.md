@@ -139,12 +139,10 @@ exporters:
       default_log_name: wicket-audit
     sending_queue:
       storage: file_storage/queue
-    retry_on_failure:
-      enabled: true
-      max_elapsed_time: 0      # never give up
   # A local copy of everything, records and checkpoints, for `--verify --against`.
   file/audit:
     path: /var/log/otelcol/wicket-audit.jsonl
+    append: true             # the default (false) truncates the file when the Collector starts
 service:
   extensions: [file_storage/queue]
   pipelines:
@@ -152,6 +150,9 @@ service:
       receivers: [otlp]
       exporters: [googlecloud, file/audit]
 ```
+
+`googlecloud` has no `retry_on_failure` key (the Collector refuses to start with one); it retries
+through its own client.
 
 CloudWatch Logs: the same receiver and extension, with this exporter.
 
@@ -163,12 +164,20 @@ exporters:
     log_stream_name: control-host
     sending_queue:
       queue_size: 10000
+      storage: file_storage/queue
+    retry_on_failure:
+      max_elapsed_time: 0      # never give up
 ```
 
-The `awscloudwatchlogs` exporter (alpha) always has a sending queue, but its README documents only
-an in-memory one (`num_consumers`, `queue_size`). Until it documents `storage`, treat records the
-Collector has accepted but not yet sent as lost on a Collector restart. Two ways round that: keep
-the `file/audit` copy above, or point a second wicket sink straight at a JSON lines file that your
-log agent ships.
+The `awscloudwatchlogs` exporter is alpha, and its README documents only an in-memory queue.
+Collector 0.165.0 accepts `storage` on it, but check that on the version you run. Where it isn't
+honoured, keep the `file/audit` copy above, or add a second wicket sink that writes JSON lines
+your log agent ships.
+
+Both examples pass `otelcol-contrib validate` (0.165.0). An `otlp` receiver with the `file/audit`
+exporter was tested end to end:
+- every record arrived, along with the checkpoints;
+- a stopped Collector lost nothing once it was started again;
+- `wicket audit --verify --against` on the file's output caught a consistently re-chained forgery.
 
 The same pattern works for any other Collector logs exporter: Azure Monitor, Splunk HEC, Datadog.

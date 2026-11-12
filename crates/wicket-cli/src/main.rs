@@ -926,7 +926,7 @@ async fn main() -> Result<()> {
                     for p in a.problems.iter().take(20) {
                         println!("  MISMATCH: {p}");
                     }
-                    if a.checkpoints == 0 && a.problems.is_empty() {
+                    if a.checkpoints == 0 && a.records > 0 {
                         println!("  (no signed checkpoints found: only exported records were compared)");
                     }
                     against_bad = a.problems.len();
