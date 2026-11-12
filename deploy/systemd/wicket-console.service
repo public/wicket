@@ -1,0 +1,23 @@
+# The operator console (wicket serve), as the wicket user. Its options are in /etc/wicket/console.env.
+[Unit]
+Description=wicket operator console
+Documentation=https://github.com/public/wicket
+After=network-online.target wicketd.service
+Wants=network-online.target
+
+[Service]
+User=wicket
+Group=wicket
+SupplementaryGroups=docker
+Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
+EnvironmentFile=/etc/wicket/console.env
+ExecStart=/usr/local/bin/wicket serve $WICKET_CONSOLE_ARGS
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+Restart=on-failure
+# Runs started from the console are their own process groups: restarting the console keeps them.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

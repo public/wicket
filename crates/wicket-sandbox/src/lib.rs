@@ -105,6 +105,26 @@ impl Docker {
         Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().map(String::from).collect())
     }
 
+    /// The arguments the daemon passes a runtime (e.g. runsc's `--host-uds=open`), or None if it
+    /// has no such runtime.
+    pub async fn runtime_args(&self, name: &str) -> Result<Option<Vec<String>>> {
+        let out = self
+            .command_with(["info".to_string(), "--format".into(), "{{json .Runtimes}}".into()])
+            .output()
+            .await
+            .context("running docker info")?;
+        if !out.status.success() {
+            bail!("docker info failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("docker info's runtimes")?;
+        Ok(v.get(name).map(|r| {
+            r.get("runtimeArgs")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        }))
+    }
+
     pub async fn image_exists(&self, image: &str) -> Result<bool> {
         let st = self
             .command_with(["image".to_string(), "inspect".into(), image.into()])

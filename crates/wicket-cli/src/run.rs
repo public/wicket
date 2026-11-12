@@ -111,6 +111,29 @@ pub struct RunOpts<'a> {
     pub wake: Option<crate::hibernate::Wake>,
 }
 
+/// Every secret the manifest would send goes only to hosts the vault binds it to: the model secret
+/// to its upstream, each injected secret to its rule's host (a `*.` rule needs a `*.` binding
+/// covering it), and a wrapped agent's login to Anthropic's API. Checked again where each is sent.
+pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<()> {
+    if let Some(llm) = &m.zone.llm {
+        let url = reqwest::Url::parse(&llm.upstream).with_context(|| format!("llm.upstream {:?}", llm.upstream))?;
+        let host = url.host_str().with_context(|| format!("llm.upstream {:?} has no host", llm.upstream))?;
+        vault.check(&llm.secret, host).context("the zone's model route")?;
+        if wrapped {
+            vault.check(&llm.secret, "api.anthropic.com").context("the wrapped agent's login")?;
+        }
+    } else if wrapped {
+        vault.check("claude-oauth", "api.anthropic.com").context("the wrapped agent's login")?;
+    }
+    for i in &m.zone.inject {
+        if i.optional && !vault.has(&i.secret) {
+            continue;
+        }
+        vault.check(&i.secret, &i.host).with_context(|| format!("inject for {}", i.host))?;
+    }
+    Ok(())
+}
+
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap, wake } = o;
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
@@ -175,6 +198,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
     let vault = Vault::new(Vault::default_dir());
+    check_secret_hosts(&m, &vault, wrap.is_some())?;
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
     }

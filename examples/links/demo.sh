@@ -22,7 +22,7 @@ port=${MOCK_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0
 sed "s#http://127.0.0.1:9999#http://127.0.0.1:$port#" demo.yaml >"$work/demo.yaml"
 
 "$WICKET" identity init --trust-domain links.wicket.test >/dev/null
-printf 'mock-model-credential' | "$WICKET" secret set mock >/dev/null
+printf 'mock-model-credential' | "$WICKET" secret set mock --hosts 127.0.0.1 >/dev/null
 "$WICKET" dev mock-llm --listen "127.0.0.1:$port" --command 'bash /workspace/drive.sh' 2>"$work/mock.log" &
 mock_pid=$!
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.2; done

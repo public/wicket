@@ -244,7 +244,9 @@ impl Llm {
             }
         }
         // The real subscription token, injected into the one slot Claude Code uses for it.
-        let token = self.ctx.vault.get(&spec.secret)?;
+        // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
+        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
+        let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
         rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
         let resp = rb.body(body).send().await?;
         let status = resp.status().as_u16();
@@ -399,6 +401,45 @@ mod tests {
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
         (status, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// The model route sends its secret only to an upstream the vault binds it to: a zone pointing
+    /// `upstream` elsewhere gets an error, and the other host never sees a request.
+    #[tokio::test]
+    async fn the_model_secret_goes_only_to_its_bound_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = c.read(&mut buf).await.unwrap_or(0);
+                seen2.lock().await.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = c
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wicket-llm-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "the-model-token").unwrap();
+        vault.set_hosts("model", &["api.anthropic.com".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault.clone();
+        let (status, _) = post(super::Llm::new(c).unwrap(), "unbound").await;
+        assert!(status >= 500, "{status}");
+        assert!(seen.lock().await.is_empty(), "the other host saw nothing");
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault;
+        let (status, _) = post(super::Llm::new(c).unwrap(), "bound").await;
+        assert_eq!(status, 200);
+        assert!(seen.lock().await.iter().any(|r| r.to_ascii_lowercase().contains("authorization: bearer the-model-token")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #70: once the agent has been woken again, an older activation's model calls are refused.

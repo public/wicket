@@ -50,7 +50,7 @@ else
 fi
 
 "$WICKET" identity init --trust-domain ci.wicket.test >/dev/null
-printf 'mock-model-credential' | "$WICKET" secret set mock >/dev/null
+printf 'mock-model-credential' | "$WICKET" secret set mock --hosts 127.0.0.1 >/dev/null
 
 "$WICKET" dev mock-llm --listen 127.0.0.1:9999 --command "$probe" 2>"$work/mock.log" &
 mock_pid=$!

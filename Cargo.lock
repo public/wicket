@@ -3532,6 +3532,7 @@ name = "wicket-sandbox"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "serde_json",
  "tokio",
  "tracing",
  "wicket-core",

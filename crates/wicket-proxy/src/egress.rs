@@ -559,6 +559,8 @@ impl Egress {
         let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
+                // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
+                self.ctx.vault.check(&rule.secret, host)?;
                 let secret = match self.ctx.vault.get(&rule.secret) {
                     Ok(s) => s,
                     Err(_) if rule.optional => break,
@@ -577,7 +579,7 @@ impl Egress {
                 match self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented) {
                     Some(sw) => {
                         let real = match &sw.real {
-                            crate::SwapSource::Vault(name) => self.ctx.vault.get(name)?,
+                            crate::SwapSource::Vault(name) => self.ctx.vault.get_for(name, host)?,
                             crate::SwapSource::Value(v) => v.clone(),
                         };
                         headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {real}"))?);
@@ -631,6 +633,76 @@ mod tests {
         assert!(h.contains(&("x-wicket".into(), "pending-approval".into())));
         assert!(super::parse_head(b"\xff\xfe").is_none());
         assert!(super::parse_head(b"HTTP/1.1 x\r\n\r\n").is_none());
+    }
+
+    /// A run context for a zone, with a vault where `gh` may go only to api.github.com.
+    fn ctx(zone: &str, swaps: Vec<crate::CredentialSwap>, tag: &str) -> (crate::RunCtx, std::path::PathBuf) {
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("wicket-egress-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.join("vault"));
+        vault.set("gh", "the-real-token").unwrap();
+        vault.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, {zone}}}"))
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let c = crate::RunCtx {
+            tenant: wicket_core::TenantId::single(),
+            run: wicket_core::RunId("run_x".into()),
+            zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
+            ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
+            vault,
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps,
+            boxes: None,
+            capacity: None,
+            fence: None,
+            waker: None,
+        };
+        (c, dir)
+    }
+
+    async fn prepare(c: crate::RunCtx, host: &str, auth: Option<&str>) -> anyhow::Result<super::Outgoing> {
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c, ca).unwrap();
+        let mut b = http::Request::get("/x").header("host", host);
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        e.prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), host, "https", "/x").await
+    }
+
+    /// Whatever a zone says, the proxy never attaches a secret to a host it isn't bound to.
+    #[tokio::test]
+    async fn a_secret_is_injected_only_into_its_bound_hosts() {
+        let inject = |host: &str| format!("inject: [{{host: '{host}', header: Authorization, format: 'Bearer {{secret}}', secret: gh}}]");
+        let (c, dir) = ctx(&inject("attacker.example"), vec![], "evil");
+        let e = prepare(c, "attacker.example", None).await.err().expect("refused").to_string();
+        assert!(e.contains("not to attacker.example"), "{e}");
+        let (c, _) = ctx(&inject("*.example"), vec![], "evil-wild");
+        assert!(prepare(c, "attacker.example", None).await.is_err());
+        let (c, _) = ctx(&inject("api.github.com"), vec![], "ok");
+        let out = prepare(c, "api.github.com", None).await.unwrap();
+        assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
+        // A swap from the vault is bound the same way, whatever host the swap names.
+        let swap = |host: &str| crate::CredentialSwap {
+            name: "t".into(),
+            host: host.into(),
+            placeholder: "ph-123".into(),
+            real: crate::SwapSource::Vault("gh".into()),
+        };
+        let (c, _) = ctx("reach: []", vec![swap("attacker.example")], "swap-evil");
+        assert!(prepare(c, "attacker.example", Some("Bearer ph-123")).await.is_err());
+        let (c, _) = ctx("reach: []", vec![swap("api.github.com")], "swap-ok");
+        let out = prepare(c, "api.github.com", Some("Bearer ph-123")).await.unwrap();
+        assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
+        for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
+            let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+        }
     }
 
     #[test]

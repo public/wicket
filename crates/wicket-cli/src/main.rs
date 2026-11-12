@@ -8,6 +8,8 @@
 mod audit_export;
 mod capacity;
 mod chan;
+mod daemon;
+mod doctor;
 mod enrol;
 mod hibernate;
 mod image;
@@ -246,6 +248,10 @@ enum Cmd {
         /// Most simultaneous connections.
         #[arg(long, default_value_t = 256)]
         max_connections: usize,
+        /// Don't print a passkey enrolment link at start when no passkey is enrolled (a system
+        /// install's log may be readable by operators; root prints one with `operator enrol-link`).
+        #[arg(long)]
+        no_bootstrap_link: bool,
     },
     /// Programs: deterministic workloads that run without an agent.
     Program {
@@ -314,6 +320,17 @@ enum Cmd {
     Dev {
         #[command(subcommand)]
         cmd: DevCmd,
+    },
+    /// wicketd (#12): run as the wicket system user and serve other users' commands over a unix
+    /// socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving,
+    /// denying and other privileged commands need root over the socket, or a passkey in the console.
+    /// Installed and started by deploy/install.sh.
+    Daemon {
+        #[arg(long, default_value = daemon::SOCKET_PATH)]
+        socket: PathBuf,
+        /// Who may read, run and revoke (YAML; default: the wicket-operators group).
+        #[arg(long, default_value = daemon::policy::POLICY_PATH)]
+        policy: PathBuf,
     },
 }
 
@@ -476,9 +493,22 @@ enum OperatorCmd {
 #[derive(Subcommand)]
 enum SecretCmd {
     /// Store a secret. Prompts without echo, or reads stdin when it isn't a terminal.
-    Set { name: String },
-    /// List secret names (never values).
+    Set {
+        name: String,
+        /// The only hosts it may be sent to (comma-separated; `*.example.com` for every host under
+        /// it). Without it, the secret keeps the hosts it had; a secret with none is sent nowhere
+        /// (claude-oauth defaults to api.anthropic.com).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+    },
+    /// List secret names and the hosts each may be sent to (never values).
     List,
+    /// Bind a secret to the only hosts it may be sent to, replacing its list.
+    Hosts {
+        name: String,
+        #[arg(long, value_delimiter = ',', required = true)]
+        hosts: Vec<String>,
+    },
     /// Make a secret a reference to a JSON field in another file, re-read on every use (never copied).
     /// E.g. the Claude login on this host:
     /// wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt
@@ -492,6 +522,9 @@ enum SecretCmd {
         pointer: Option<String>,
         #[arg(long)]
         expires_pointer: Option<String>,
+        /// The only hosts it may be sent to (as for `secret set`).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
     },
 }
 
@@ -675,7 +708,13 @@ pub fn issuer() -> Result<wicket_identity::Issuer> {
     Ok(wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref())?)
 }
 
+/// Who is deciding, for the ledger. wicketd sets WICKET_OPERATOR from the caller's peer
+/// credentials for the commands it runs; without it (development mode), it is $USER, which carries
+/// no assurance.
 fn operator() -> String {
+    if let Some(o) = std::env::var("WICKET_OPERATOR").ok().filter(|o| !o.is_empty()) {
+        return o;
+    }
     let user = std::env::var("USER").unwrap_or_else(|_| "operator".into());
     format!("{user}@cli (host break-glass)")
 }
@@ -688,7 +727,25 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // With wicketd installed, this user can't read wicket's data: the daemon runs the command.
+    let route = daemon::policy::route(&cli.cmd);
+    match daemon::client::mode() {
+        daemon::client::Mode::Daemon(sock) => match route {
+            daemon::policy::Route::Forward(_) => {
+                let code = daemon::client::forward(&sock, &cli.cmd).await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return Ok(());
+            }
+            daemon::policy::Route::Refuse(why) => bail!("{why}"),
+            daemon::policy::Route::Local => {}
+        },
+        daemon::client::Mode::Missing(why) if matches!(route, daemon::policy::Route::Forward(_)) => bail!("{why}"),
+        _ => {}
+    }
     match cli.cmd {
+        Cmd::Daemon { socket, policy } => daemon::serve(&socket, policy),
         Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease } => {
             run::run(run::RunOpts {
                 manifest: &manifest,
@@ -1014,7 +1071,7 @@ async fn main() -> Result<()> {
         Cmd::Secret { cmd } => {
             let v = Vault::new(Vault::default_dir());
             match cmd {
-                SecretCmd::Set { name } => {
+                SecretCmd::Set { name, hosts } => {
                     let value = if std::io::stdin().is_terminal() {
                         rpassword::prompt_password(format!("value for {name} (not echoed): "))?
                     } else {
@@ -1026,18 +1083,33 @@ async fn main() -> Result<()> {
                         bail!("empty value");
                     }
                     v.set(&name, &value)?;
-                    println!("stored secret {name}");
+                    if !hosts.is_empty() {
+                        v.set_hosts(&name, &hosts)?;
+                    }
+                    println!("stored secret {name}; {}", secret_hosts_line(&v, &name));
                 }
-                SecretCmd::Link { name, file, pointer, expires_pointer } => {
+                SecretCmd::Link { name, file, pointer, expires_pointer, hosts } => {
                     v.link(&name, &file, pointer.as_deref(), expires_pointer.as_deref())?;
+                    if !hosts.is_empty() {
+                        v.set_hosts(&name, &hosts)?;
+                    }
                     println!(
-                        "secret {name} now refers to {file}{} (read at each use; never copied)",
-                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default()
+                        "secret {name} now refers to {file}{} (read at each use; never copied); {}",
+                        pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default(),
+                        secret_hosts_line(&v, &name)
                     );
+                }
+                SecretCmd::Hosts { name, hosts } => {
+                    if !v.has(&name) {
+                        bail!("no secret {name}");
+                    }
+                    v.set_hosts(&name, &hosts)?;
+                    println!("secret {name}: {}", secret_hosts_line(&v, &name));
                 }
                 SecretCmd::List => {
                     for n in v.list() {
-                        println!("{n}");
+                        let base = n.strip_suffix(" (reference)").unwrap_or(&n);
+                        println!("{n}  {}", secret_hosts_line(&v, base));
                     }
                 }
             }
@@ -1049,7 +1121,7 @@ async fn main() -> Result<()> {
             println!("built {tag}");
             Ok(())
         }
-        Cmd::Doctor { image } => doctor(&image).await,
+        Cmd::Doctor { image } => doctor::doctor(&image).await,
         Cmd::Reconcile { dry_run, every } => {
             let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
             reconcile::command(dry_run, every).await
@@ -1126,39 +1198,9 @@ async fn main() -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
-        Cmd::Serve {
-            listen,
-            origin,
-            rp_id,
-            tls_cert,
-            tls_key,
-            acme_domain,
-            acme_agree_tos,
-            acme_contact,
-            acme_staging,
-            acme_directory,
-            acme_cache,
-            behind_tls_terminator,
-            trusted_proxy,
-            max_connections,
-        } => {
-            serve::serve(serve::ServeOpts {
-                listen,
-                origin,
-                rp_id,
-                tls_cert,
-                tls_key,
-                acme_domain,
-                acme_contact,
-                acme_directory,
-                acme_staging,
-                acme_agree_tos,
-                acme_cache,
-                behind_tls_terminator,
-                trusted_proxy,
-                max_connections,
-            })
-            .await
+        c @ Cmd::Serve { .. } => {
+            let (opts, no_bootstrap_link) = serve_opts(c).expect("a serve command");
+            serve::serve(opts, !no_bootstrap_link).await
         }
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
@@ -1341,55 +1383,55 @@ fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
     Ok((ok, bad))
 }
 
-async fn doctor(image: &str) -> Result<()> {
-    let d = wicket_sandbox::Docker::from_env();
-    let mut ok = true;
-    match d.runtimes().await {
-        Ok(rt) => {
-            println!("docker: ok (runtimes: {})", rt.join(", "));
-            if !rt.iter().any(|r| r == "runsc") {
-                println!("  gVisor (runsc) is not registered: zones default to isolation: gvisor");
-                ok = false;
-            }
-        }
-        Err(e) => {
-            println!("docker: NOT OK ({e})");
-            ok = false;
-        }
+/// A `serve` command's options, and whether it prints no enrolment link at start.
+fn serve_opts(c: Cmd) -> Option<(serve::ServeOpts, bool)> {
+    let Cmd::Serve {
+        listen,
+        origin,
+        rp_id,
+        tls_cert,
+        tls_key,
+        acme_domain,
+        acme_agree_tos,
+        acme_contact,
+        acme_staging,
+        acme_directory,
+        acme_cache,
+        behind_tls_terminator,
+        trusted_proxy,
+        max_connections,
+        no_bootstrap_link,
+    } = c
+    else {
+        return None;
+    };
+    Some((
+        serve::ServeOpts {
+            listen,
+            origin,
+            rp_id,
+            tls_cert,
+            tls_key,
+            acme_domain,
+            acme_contact,
+            acme_directory,
+            acme_staging,
+            acme_agree_tos,
+            acme_cache,
+            behind_tls_terminator,
+            trusted_proxy,
+            max_connections,
+        },
+        no_bootstrap_link,
+    ))
+}
+
+/// Where a secret may be sent, for terminals.
+fn secret_hosts_line(v: &Vault, name: &str) -> String {
+    let h = v.hosts(name);
+    if h.is_empty() {
+        format!("sent to no host (bind it: wicket secret hosts {name} --hosts HOST[,HOST])")
+    } else {
+        format!("sent only to {}", h.join(", "))
     }
-    match d.image_exists(image).await {
-        Ok(true) => println!("image {image}: present"),
-        _ => {
-            println!("image {image}: missing (run: wicket image)");
-            ok = false;
-        }
-    }
-    match wicket_identity::Issuer::load(&issuer_key_path(), trust_domain().as_deref()) {
-        Ok(i) => println!("identity issuer: {}", i.issuer_id()),
-        Err(e) => {
-            println!("identity issuer: NOT OK ({e})");
-            ok = false;
-        }
-    }
-    let v = Vault::new(Vault::default_dir());
-    let names = v.list();
-    println!("vault: {} secret(s){}", names.len(), if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) });
-    if !v.has("claude-oauth") {
-        println!("  no 'claude-oauth' secret: real runs need your Claude subscription token");
-        println!("  (run `claude setup-token`, then: wicket secret set claude-oauth)");
-    }
-    let l = Ledger::open(&ledger_path())?;
-    println!("ledger: {} (audit chain OK, {} records)", ledger_path().display(), l.verify_audit()?);
-    if let Ok(all) = reap::reap(&d, &l, true).await {
-        let orphans: Vec<_> = all.iter().filter(|r| matches!(r.verdict, reap::Verdict::Orphan(_))).map(|r| r.name.as_str()).collect();
-        if orphans.is_empty() {
-            println!("boxes: {} running, none orphaned", all.len());
-        } else {
-            println!("boxes: {} orphaned, with nothing behind them: {} (run: wicket reap)", orphans.len(), orphans.join(", "));
-        }
-    }
-    if !ok {
-        bail!("environment not ready");
-    }
-    Ok(())
 }

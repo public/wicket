@@ -1,0 +1,49 @@
+name: Release
+
+# On a version tag (v0.0.1, ...): build the release binary, package it with what deploy/install.sh
+# needs, and attach the archive and its SHA-256 to the tag's GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    name: Build and attach
+    # The oldest supported runner, so the binary's glibc floor (2.35) runs on Ubuntu 24.04 and
+    # Debian 12 (2.36) alike.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag is the workspace's version
+        id: version
+        run: |
+          v=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ -n "$v" ] || { echo "no workspace version"; exit 1; }
+          if [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $v"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - run: rustup show active-toolchain
+      - run: cargo build --release --locked -p wicket-cli
+      - name: Package
+        run: ci/package.sh target/release/wicket dist
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "wicket $V" --notes "wicket $V. Install: see the README."
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/wicket-$V-x86_64-linux.tar.gz dist/wicket-$V-x86_64-linux.tar.gz.sha256

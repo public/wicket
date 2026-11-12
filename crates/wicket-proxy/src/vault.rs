@@ -5,6 +5,11 @@
 //! use. That is how wicket uses the Claude login already on the host: it reads the current access
 //! token at request time and never touches the refresh token or writes the file, so the host's Claude
 //! Code keeps refreshing its own login.
+//!
+//! **Each secret is bound to the hosts it may be sent to** (`<name>.hosts`, written by whoever stores
+//! it: root, on a system install). The egress proxy, credential swaps and the model proxy send a
+//! secret only to those hosts, whatever a manifest asks; a secret with no hosts is sent nowhere.
+//! `claude-oauth` defaults to `api.anthropic.com`.
 
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -99,6 +104,61 @@ impl Vault {
         self.get(name).map(|_| ())
     }
 
+    /// The hosts `name` may be sent to: its `.hosts` list, else the default for well-known names,
+    /// else none.
+    pub fn hosts(&self, name: &str) -> Vec<String> {
+        let Ok(p) = self.path(name) else { return vec![] };
+        match std::fs::read(p.with_extension("hosts")) {
+            Ok(b) => serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default(),
+            Err(_) => default_hosts(name),
+        }
+    }
+
+    /// Binds `name` to exactly these hosts (patterns: `api.example.com`, `*.example.com`).
+    pub fn set_hosts(&self, name: &str, hosts: &[String]) -> Result<()> {
+        let p = self.path(name)?;
+        let mut v = Vec::new();
+        for h in hosts {
+            let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
+            check_host_pattern(&h)?;
+            if !v.contains(&h) {
+                v.push(h);
+            }
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        let f = p.with_extension("hosts");
+        let tmp = p.with_extension("hosts-tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, &f)?;
+        Ok(())
+    }
+
+    /// Whether `name` may be sent to `host` (a host name, or a `*.` pattern: then every host it
+    /// matches must be allowed).
+    pub fn allows(&self, name: &str, host: &str) -> bool {
+        self.hosts(name).iter().any(|a| covers(a, host))
+    }
+
+    /// Ok if `name` may be sent to `host`, else why not.
+    pub fn check(&self, name: &str, host: &str) -> Result<()> {
+        if self.allows(name, host) {
+            return Ok(());
+        }
+        let hosts = self.hosts(name);
+        if hosts.is_empty() {
+            bail!("secret {name:?} is bound to no hosts, so it is sent nowhere (as root: wicket secret hosts {name} --hosts HOST[,HOST])");
+        }
+        bail!("secret {name:?} may be sent only to {}, not to {host}", hosts.join(", "))
+    }
+
+    /// The secret, if it may be sent to `host`: what every enforcement point uses.
+    pub fn get_for(&self, name: &str, host: &str) -> Result<String> {
+        self.check(name, host)?;
+        self.get(name)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.path(name).map(|p| p.exists() || p.with_extension("ref").exists()).unwrap_or(false)
     }
@@ -119,7 +179,7 @@ impl Vault {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| !n.ends_with(".tmp"))
+                    .filter(|n| !n.ends_with(".tmp") && !n.ends_with(".hosts") && !n.ends_with(".hosts-tmp"))
                     .map(|n| match n.strip_suffix(".ref") {
                         Some(b) => format!("{b} (reference)"),
                         None => n,
@@ -132,9 +192,65 @@ impl Vault {
     }
 }
 
+/// Hosts a well-known secret may go to when nobody bound it.
+fn default_hosts(name: &str) -> Vec<String> {
+    match name {
+        "claude-oauth" => vec!["api.anthropic.com".into()],
+        _ => vec![],
+    }
+}
+
+/// A host name or IP address, or `*.` and a name with at least two labels.
+fn check_host_pattern(h: &str) -> Result<()> {
+    let name = h.strip_prefix("*.").unwrap_or(h);
+    let ok_chars = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    let ok_labels = name.split('.').all(|l| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-'));
+    if !ok_chars || !ok_labels || (h.starts_with("*.") && !name.contains('.')) {
+        bail!("{h:?} is not a host name, or *. and a domain with at least two labels");
+    }
+    Ok(())
+}
+
+/// Whether the allowed pattern `allowed` covers `wanted` (a host, or a `*.` pattern).
+pub fn covers(allowed: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim_end_matches('.').to_ascii_lowercase();
+    match (allowed.strip_prefix("*."), wanted.strip_prefix("*.")) {
+        (Some(a), Some(w)) => w == a || w.ends_with(&format!(".{a}")),
+        (None, Some(_)) => false,
+        _ => wicket_core::manifest::host_matches(allowed, &wanted),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_go_only_to_the_hosts_they_are_bound_to() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let v = Vault::new(dir.clone());
+        v.set("gh", "tok").unwrap();
+        assert!(v.get_for("gh", "api.github.com").unwrap_err().to_string().contains("bound to no hosts"), "unbound: nowhere");
+        v.set_hosts("gh", &["API.github.com.".into(), "*.githubusercontent.com".into()]).unwrap();
+        assert_eq!(v.hosts("gh"), ["api.github.com", "*.githubusercontent.com"]);
+        assert_eq!(v.get_for("gh", "api.github.com").unwrap(), "tok");
+        assert_eq!(v.get_for("gh", "raw.githubusercontent.com").unwrap(), "tok");
+        assert!(v.allows("gh", "*.githubusercontent.com") && v.allows("gh", "*.a.githubusercontent.com"));
+        for bad in ["attacker.example", "github.com", "githubusercontent.com", "*.github.com", "api.github.com.attacker.example"] {
+            assert!(v.get_for("gh", bad).is_err(), "{bad}");
+        }
+        assert_eq!(v.list(), ["gh"], "the binding isn't a secret of its own");
+        // claude-oauth has a default; an explicit binding replaces it.
+        v.set("claude-oauth", "t").unwrap();
+        assert!(v.allows("claude-oauth", "api.anthropic.com") && !v.allows("claude-oauth", "attacker.example"));
+        v.set_hosts("claude-oauth", &["127.0.0.1".into()]).unwrap();
+        assert!(!v.allows("claude-oauth", "api.anthropic.com") && v.allows("claude-oauth", "127.0.0.1"));
+        for bad in ["*", "*.com", "a/b", "", "-a.com", "a..com", "*.*.com"] {
+            assert!(v.set_hosts("gh", &[bad.into()]).is_err(), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn references_read_the_current_value_and_respect_expiry() {
