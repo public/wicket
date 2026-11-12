@@ -12,19 +12,24 @@ WICKET=$(realpath "${WICKET:-target/debug/wicket}")
 IMAGE=${IMAGE:-wicket/claude-code:links}
 cd "$(dirname "$0")"
 
-export WICKET_HOME=${WICKET_HOME:-$(mktemp -d)}
+own_home=
+if [ -z "${WICKET_HOME:-}" ]; then WICKET_HOME=$(mktemp -d); own_home=$WICKET_HOME; fi
+export WICKET_HOME
 work=$(mktemp -d)
-trap 'kill "${mock_pid:-}" 2>/dev/null || true; rm -rf "$work"' EXIT
+trap 'kill "${mock_pid:-}" 2>/dev/null || true; rm -rf "$work" ${own_home:+"$own_home"}' EXIT
+# A free port for the mock model (the box is shared; a fixed one could collide).
+port=${MOCK_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}
+sed "s#http://127.0.0.1:9999#http://127.0.0.1:$port#" demo.yaml >"$work/demo.yaml"
 
 "$WICKET" identity init --trust-domain links.wicket.test >/dev/null
 printf 'mock-model-credential' | "$WICKET" secret set mock >/dev/null
-"$WICKET" dev mock-llm --listen 127.0.0.1:9999 --command 'bash /workspace/drive.sh' 2>"$work/mock.log" &
+"$WICKET" dev mock-llm --listen "127.0.0.1:$port" --command 'bash /workspace/drive.sh' 2>"$work/mock.log" &
 mock_pid=$!
-for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/9999) 2>/dev/null && break; sleep 0.2; done
+for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.2; done
 
 echo "== wicket run demo.yaml"
 run_status=0
-"$WICKET" run --image "$IMAGE" --workdir box demo.yaml 2>&1 | tee "$work/run.log" || run_status=$?
+"$WICKET" run --image "$IMAGE" --workdir box "$work/demo.yaml" 2>&1 | tee "$work/run.log" || run_status=$?
 
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
@@ -53,4 +58,5 @@ if [ "$fail" != 0 ]; then
   for f in "$WICKET_HOME"/runs/*/children/*.log; do [ -f "$f" ] && { echo "== $f"; tail -20 "$f"; }; done
   exit 1
 fi
+echo "per-connection time over the link: $(field per_conn_ms) ms (10 new connections)"
 echo "links demo passed"

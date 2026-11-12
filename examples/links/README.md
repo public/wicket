@@ -33,13 +33,14 @@ of that run and of everything it started).
 - `wicket-entry` adds 198.18.1.1–198.18.1.32 to the box's loopback at start, while it still has
   `NET_ADMIN`. Each linked name in a box gets one of them, and a line in the box's `/etc/hosts`: a file
   wicket owns and rewrites, mounted read-only.
-- In the connecting box, wicket starts (as the agent's user) a `socat` listener on that address and port,
+- In the connecting box, wicket starts (as the agent's user) a `wicket-fwd --listen` on that address and port,
   forwarding to the link's unix socket in the box's socket directory, where wicket listens.
-- For each connection, wicket runs `socat - TCP:127.0.0.1:<port>` in the target box with `docker exec`,
+- For each connection, wicket runs `wicket-fwd --dial 127.0.0.1:<port>` in the target box with `docker exec -i`,
   as the agent's user, and copies bytes both ways. Under gVisor a box can connect out to a host socket,
   but a socket the box creates can't be reached from the host, so wicket reaches in. That costs about
   0.1 s per connection, which is fine for DevTools (one WebSocket) or keep-alive HTTP.
-- Both images need `socat`, and the boxes must run on this host: remote nodes can't link yet.
+- Both images need `wicket-fwd` (any image built on wicket's agent image), and the boxes must run on this
+  host: remote nodes can't link yet.
 
 ## Demo (no model needed)
 

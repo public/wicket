@@ -25,6 +25,10 @@ for _ in $(seq 60); do
 done
 # A second connection over the same link.
 again=$(curl -s -m 5 --noproxy '*' "http://$addr/" || true)
+# Per-connection cost: 10 fetches on new connections, in ms each.
+t0=$(date +%s%N)
+for _ in $(seq 10); do curl -s -m 5 --noproxy '*' -o /dev/null "http://$addr/"; done
+per_conn_ms=$(( ($(date +%s%N) - t0) / 10000000 ))
 listed=$(gw links '{}')
 unlinked=$(gw unlink "$(jq -nc --arg l "$link" '{link:$l}')")
 sleep 5
@@ -32,6 +36,6 @@ after=$(curl -s -m 5 --noproxy '*' -o /dev/null -w '%{http_code}' "http://$addr/
 after_resolved=$(getent hosts "${addr%%:*}" | awk '{print $1}')
 jq -n --arg spawned "$spawned" --arg stranger "$stranger" --arg connected "$connected" --arg addr "$addr" \
   --arg resolved "$resolved" --arg body "$body" --arg again "$again" --arg listed "$listed" --arg unlinked "$unlinked" \
-  --arg after "$after" --arg after_resolved "$after_resolved" --arg link "$link" \
-  '{spawned:$spawned,stranger:$stranger,connected:$connected,link:$link,addr:$addr,resolved:$resolved,body:$body,again:$again,listed:$listed,unlinked:$unlinked,after:$after,after_resolved:$after_resolved}' \
+  --arg after "$after" --arg after_resolved "$after_resolved" --arg link "$link" --arg per_conn_ms "$per_conn_ms" \
+  '{spawned:$spawned,stranger:$stranger,connected:$connected,link:$link,addr:$addr,resolved:$resolved,body:$body,again:$again,listed:$listed,unlinked:$unlinked,after:$after,after_resolved:$after_resolved,per_conn_ms:$per_conn_ms}' \
   > /workspace/out/result.json

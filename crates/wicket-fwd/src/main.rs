@@ -8,6 +8,7 @@ use wicket_fwd::{spec, Config, Forwarder, Kind};
 const USAGE: &str = "\
 usage: wicket-fwd --listen IP:PORT=/path/to/unix.sock [--listen ...]
                   [--max-conns N] [--copy rw|splice] [--buf BYTES] [--bind-timeout SECS] [--verbose]
+       wicket-fwd --dial IP:PORT [--copy rw|splice] [--buf BYTES]
 
 Relays each TCP connection accepted on IP:PORT to a new connection on the unix socket.
   --listen        a TCP listener and the unix socket it relays to (repeatable, at least one)
@@ -15,7 +16,8 @@ Relays each TCP connection accepted on IP:PORT to a new connection on the unix s
   --copy          rw: read/write through a buffer; splice: splice(2), falling back to rw (default splice)
   --buf           buffer or pipe size per direction, in bytes (default 262144)
   --bind-timeout  how long to wait at start for a listen address to appear (default 5)
-  --verbose       one log line per connection (peer, byte counts, duration; never contents)";
+  --verbose       one log line per connection (peer, byte counts, duration; never contents)
+  --dial          instead: one TCP connection to IP:PORT, relayed to stdin/stdout (links between boxes)";
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
     let mut cfg = Config::default();
@@ -33,12 +35,16 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
             "--buf" => cfg.buf_size = number(&flag, &value()?)?,
             "--bind-timeout" => cfg.bind_timeout = Duration::from_secs_f64(number::<f64>(&flag, &value()?)?.clamp(0.0, 3600.0)),
             "--verbose" => cfg.verbose = true,
+            "--dial" => {
+                let v = value()?;
+                cfg.dial = Some(v.trim().parse().map_err(|_| format!("--dial {v:?}: not an IP:PORT (names aren't resolved)"))?);
+            }
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {a:?}")),
         }
     }
-    if cfg.listens.is_empty() {
-        return Err("at least one --listen is needed".into());
+    if cfg.dial.is_some() == !cfg.listens.is_empty() {
+        return Err("give at least one --listen, or one --dial".into());
     }
     if cfg.max_conns == 0 || !(4096..=64 << 20).contains(&cfg.buf_size) {
         return Err("--max-conns must be at least 1 and --buf between 4096 and 64 MiB".into());
@@ -63,6 +69,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(addr) = cfg.dial {
+        return match wicket_fwd::dial(addr, cfg.copy, cfg.buf_size) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                wicket_fwd::log(format_args!("dial {addr}: {e}"));
+                ExitCode::FAILURE
+            }
+        };
+    }
     match Forwarder::start(cfg) {
         Ok(f) => {
             f.wait();
@@ -90,6 +105,8 @@ mod tests {
         assert_eq!(c.copy, wicket_fwd::CopyMode::Splice);
         assert_eq!(c.max_conns, 8);
         assert!(c.verbose);
+        let d = parse(args("--dial 127.0.0.1:9222 --copy rw")).unwrap();
+        assert_eq!(d.dial, Some("127.0.0.1:9222".parse().unwrap()));
     }
 
     #[test]
@@ -104,6 +121,8 @@ mod tests {
             "--listen 127.0.0.1:1=/s --max-conns 0",
             "--listen 127.0.0.1:1=/s --buf 1",
             "--listen 127.0.0.1:1=/s --udp 127.0.0.1:443=/u",
+            "--dial localhost:80",
+            "--dial 127.0.0.1:80 --listen 127.0.0.1:1=/s",
         ] {
             assert!(parse(args(bad)).is_err_and(|e| !e.is_empty()), "{bad:?} should be refused");
         }

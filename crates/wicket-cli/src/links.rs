@@ -1,17 +1,20 @@
 //! Links between boxes on this host (issue #6): what `wicket_proxy::link` needs from Docker.
 //!
-//! - In the connecting box, a `socat` listener on the link's address and port, forwarding to the
+//! - In the connecting box, a `wicket-fwd --listen` on the link's address and port, relaying to the
 //!   link's unix socket in the box's socket directory (where wicket listens). It runs as the agent's
 //!   user, started with `docker exec`; the address is already on the box's loopback (`wicket-entry`).
-//! - Into the target box, one `docker exec -i … socat - TCP:127.0.0.1:<port>` per connection, as the
-//!   agent's user. A socket the box itself creates isn't reachable from the host under gVisor
+//! - Into the target box, one `docker exec -i … wicket-fwd --dial 127.0.0.1:<port>` per connection,
+//!   as the agent's user. A socket the box itself creates isn't reachable from the host under gVisor
 //!   (`--host-uds=open` lets the box connect out to host sockets, not offer its own), so wicket
-//!   reaches in instead; it costs about 0.1 s per connection.
+//!   reaches in instead; it costs one `docker exec` per connection.
 //!
-//! Both images need `socat` (the agent image has it). Boxes on remote nodes can't link yet.
+//! Both boxes need `wicket-fwd` (every image built on wicket's agent image has it). Boxes on remote
+//! nodes can't link yet.
 
 use std::net::Ipv4Addr;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use wicket_core::{Manifest, ZoneSpec};
 use wicket_proxy::link::{BoxOps, Stream};
 use wicket_sandbox::Docker;
@@ -35,13 +38,15 @@ pub struct LocalBoxes {
     pub dir: PathBuf,
     /// uid:gid the boxes run as.
     pub user: String,
+    /// The in-box pid of each link listener, by (run, socket).
+    listeners: Mutex<HashMap<(String, String), u32>>,
 }
 
 impl LocalBoxes {
     pub fn new(docker: Docker, runs: PathBuf, dir: PathBuf) -> LocalBoxes {
         // SAFETY: getuid and getgid can't fail.
         let user = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
-        LocalBoxes { docker, runs, dir, user }
+        LocalBoxes { docker, runs, dir, user, listeners: Mutex::default() }
     }
 }
 
@@ -62,29 +67,35 @@ impl BoxOps for LocalBoxes {
         if !wicket_core::link::in_pool(addr) {
             return Err(format!("{addr} is not a link address"));
         }
-        // Started in the background; still alive a moment later means it bound.
+        // Started in the background; still alive a moment later means it bound. Prints its pid.
         let script = format!(
-            "socat TCP-LISTEN:{port},bind={addr},fork,reuseaddr UNIX-CONNECT:{sock} </dev/null >/dev/null 2>&1 & p=$!; sleep 0.3; kill -0 $p 2>/dev/null"
+            "wicket-fwd --listen {addr}:{port}={sock} --bind-timeout 1 </dev/null >/dev/null 2>&1 & p=$!; sleep 0.3; kill -0 $p 2>/dev/null && echo $p"
         );
         let out = self
             .docker
             .exec_blocking(&box_name(run), &self.user, &[], &["sh".into(), "-c".into(), script])
             .output()
             .map_err(|e| format!("docker exec: {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
+        let pid = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok();
+        match pid {
+            Some(pid) if out.status.success() => {
+                self.listeners.lock().expect("listeners").insert((run.to_string(), sock.to_string()), pid);
+                Ok(())
+            }
+            _ => Err(format!(
                 "the listener on {addr}:{port} didn't start (port in use, or an image whose wicket-entry predates links: rebuild it with `wicket image`) {}",
                 String::from_utf8_lossy(&out.stderr).trim()
-            ))
+            )),
         }
     }
 
     fn unlisten(&self, run: &str, sock: &str) {
+        let Some(pid) = self.listeners.lock().expect("listeners").remove(&(run.to_string(), sock.to_string())) else {
+            return;
+        };
         let _ = self
             .docker
-            .exec_blocking(&box_name(run), &self.user, &[], &["pkill".into(), "-f".into(), format!("UNIX-CONNECT:{sock}")])
+            .exec_blocking(&box_name(run), &self.user, &[], &["kill".into(), pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -93,7 +104,7 @@ impl BoxOps for LocalBoxes {
     fn dial(&self, run: &str, port: u16) -> Result<Stream, String> {
         let mut c = self
             .docker
-            .exec(&box_name(run), &self.user, &["-i"], &["socat".into(), "-".into(), format!("TCP:127.0.0.1:{port}")])
+            .exec(&box_name(run), &self.user, &["-i"], &["wicket-fwd".into(), "--dial".into(), format!("127.0.0.1:{port}")])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
