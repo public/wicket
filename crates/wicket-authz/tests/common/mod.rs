@@ -251,7 +251,7 @@ pub fn example_zones() -> Vec<ZoneSpec> {
     files.iter().map(|f| Manifest::from_yaml(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}")).zone).collect()
 }
 
-/// The example manifests' zones, then the subset tests' 6 parents and 28 children.
+/// The example manifests' zones, then the subset tests' 7 parents and 32 children.
 pub fn all_zones() -> Vec<ZoneSpec> {
     let mut v = example_zones();
     v.extend(subset_cases::parents().into_iter().map(|p| p.zone));
@@ -282,7 +282,20 @@ pub fn probes(zones: &[&ZoneSpec]) -> (Vec<String>, Vec<String>) {
         );
     }
     hosts.extend(["github.com", "api.github.com", "example.com", "169.254.169.254", "localhost", "a.b.example.com"].map(String::from));
-    paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack", "/caf\u{e9}/x", "/repos/acme/scratch/issues"].map(String::from));
+    paths.extend(
+        [
+            "/",
+            "/x",
+            "/octocat/Hello-World.git/git-receive-pack",
+            "/caf\u{e9}/x",
+            "/repos/acme/scratch/issues",
+            "/x/admin",
+            "/x/a/b",
+            "/x/admin/users/delete",
+            "/x/a0b",
+        ]
+        .map(String::from),
+    );
     hosts.sort();
     hosts.dedup();
     paths.sort();

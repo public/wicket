@@ -256,8 +256,19 @@ fn segments_cover(parent: &str, child: &str) -> bool {
 }
 
 /// Whether every segment the pattern `child` matches is matched by the pattern `parent`.
+///
+/// A class (`[!z]`, `[.-0]`) can match `/` even with `literal_separator`, and an escape or a brace
+/// can hide one, so a child segment with `[`, `{` or `\` may span several segments: only the same
+/// text proves it covered (#111). A parent `*` covers child segments made of literals, `*` and `?`,
+/// none of which match `/`.
 fn segment_covers(parent: &str, child: &str) -> bool {
-    if parent == child || parent == "*" {
+    if parent == child {
+        return true;
+    }
+    if child.contains(['[', '{', '\\']) {
+        return false;
+    }
+    if parent == "*" {
         return true;
     }
     if child.contains(META) {
@@ -398,13 +409,23 @@ mod tests {
         assert!(!covered("/a/**/z", "/a/**"));
         // A brace or class that contains `/` is never split at it, so stays unproven.
         assert!(!covered("/a/*/*", "/a/{b/c,d}"));
+        // #111: a class can match `/` even with literal_separator, so `*` doesn't cover it.
+        assert!(!covered("/x/*", "/x/*[!~]*[!~]*"));
+        assert!(!covered("/x/*", "/x/a[!z]b"));
+        assert!(!covered("/x/*", "/x/a[.-0]b"));
+        assert!(!covered("/x/*", "/x/{a,b}"));
+        assert!(!covered("/x/*", "/x/a\\*"));
+        // The same class under a parent that has it is still proven.
+        assert!(covered("/x/a[!z]b", "/x/a[!z]b"));
+        assert!(covered("/**/a[!z]b", "/x/a[!z]b"));
     }
 
     /// The structural check must never claim containment the matcher disagrees with: for small globs
     /// and paths, every path a "covered" child matches must match the parent.
     #[test]
     fn segment_proofs_agree_with_the_matcher() {
-        let segs = ["a", "*", "a*", "**", "{a,b}", ""];
+        // Classes and ranges that match `/` (#111): `[!z]`, `[!~]` and `[.-0]` all do.
+        let segs = ["a", "*", "a*", "**", "{a,b}", "", "a[!z]b", "*[!~]*", "[.-0]"];
         let mut globs = vec![];
         for n in 1..=3 {
             let mut idx = vec![0; n];
@@ -421,7 +442,7 @@ mod tests {
                 idx[k] += 1;
             }
         }
-        let parts = ["a", "b", "ab", "c", ""];
+        let parts = ["a", "b", "ab", "c", "", "0"];
         let mut paths = vec![];
         for n in 1..=4 {
             for mut x in 0..parts.len().pow(n) {
