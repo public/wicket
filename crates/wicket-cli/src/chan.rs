@@ -150,6 +150,10 @@ pub struct RunState {
     pub lease_until: i64,
 }
 
+/// What this build's node understands beyond the base protocol, reported in `Welcome`:
+/// - `issuer_cert`: box tokens minted by a certified authority issuing key (#154).
+pub const FEATURES: &[&str] = &["issuer_cert"];
+
 /// Control messages.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "m", rename_all = "snake_case")]
@@ -309,6 +313,10 @@ pub enum Msg {
         /// What the node has, and what its running boxes are given (for placement).
         #[serde(default)]
         capacity: Option<NodeCapacity>,
+        /// What this node's build understands beyond the base protocol ([`FEATURES`]); a control host
+        /// checks it before using one (#154: `roots-offline` needs `issuer_cert` on every node).
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// The node won't talk to this control host (wrong build, wrong node name).
     Refused {
@@ -597,6 +605,7 @@ mod tests {
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),
                 build: "x".into(),
+                features: vec!["issuer_cert".into()],
                 feed: wicket_feed::Hello::default(),
                 runs: vec![RunState {
                     run: "run_a".into(),

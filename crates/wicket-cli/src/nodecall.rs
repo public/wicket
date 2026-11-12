@@ -353,6 +353,8 @@ pub struct Link {
     /// What the node reported when this connection was made: its capacity, and the runs it has.
     pub capacity: Option<crate::chan::NodeCapacity>,
     pub runs: Vec<crate::chan::RunState>,
+    /// What the node's build understands ([`crate::chan::FEATURES`]).
+    pub features: Vec<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -381,9 +383,9 @@ impl Link {
         let authed = crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello)
             .await
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
-        let (capacity, runs) = match authed.welcome {
-            Msg::Welcome { capacity, runs, .. } => (capacity, runs),
-            _ => (None, vec![]),
+        let (capacity, runs, features) = match authed.welcome {
+            Msg::Welcome { capacity, runs, features, .. } => (capacity, runs, features),
+            _ => (None, vec![], vec![]),
         };
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -405,6 +407,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, capacity, runs, task })
+        Ok(Link { calls, capacity, runs, features, task })
     }
 }

@@ -713,7 +713,14 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
     let capacity = Some(node.capacity());
-    let _ = tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), feed, runs, capacity }));
+    let _ = tx.send(Frame::Msg(Msg::Welcome {
+        node: node.name.clone(),
+        build: node.build.clone(),
+        feed,
+        runs,
+        capacity,
+        features: crate::chan::FEATURES.iter().map(|f| f.to_string()).collect(),
+    }));
     eprintln!("[node] control host connected{}", if scope.is_empty() { String::new() } else { format!(" ({scope})") });
     let result = loop {
         tokio::select! {

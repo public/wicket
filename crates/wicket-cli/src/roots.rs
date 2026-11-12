@@ -220,13 +220,46 @@ fn audit(kind: &str, body: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Active nodes that can't be shown to understand `feature` (unreachable, or whose build doesn't
+/// report it), each with why. This host's own node is started if it isn't serving.
+async fn nodes_lacking(feature: &str) -> Result<Vec<(String, String)>> {
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(wicket_store::Ledger::open(&crate::ledger_path())?));
+    let nodes: Vec<String> = ledger.lock().expect("ledger").nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
+    let mut out = vec![];
+    for n in nodes {
+        if n == crate::localnode::NAME {
+            if let Err(e) = crate::localnode::ensure(&ledger).await {
+                out.push((n, format!("this host's node did not start: {e:#}")));
+                continue;
+            }
+        }
+        let scope = format!("keys:{}", std::process::id());
+        match tokio::time::timeout(std::time::Duration::from_secs(10), crate::nodecall::Link::connect(&n, &scope, &ledger)).await {
+            Ok(Ok(l)) if l.features.iter().any(|f| f == feature) => {}
+            Ok(Ok(_)) => out.push((n, format!("its build doesn't understand `{feature}`: update it (`wicket node install`)"))),
+            Ok(Err(e)) => out.push((n, format!("can't be asked: {e:#}"))),
+            Err(_) => out.push((n, "can't be asked: no answer in 10 s".into())),
+        }
+    }
+    Ok(out)
+}
+
 /// `wicket keys roots-offline --to DIR --days N`.
-pub fn roots_offline(to: &Path, days: i64) -> Result<()> {
+pub async fn roots_offline(to: &Path, days: i64) -> Result<()> {
     if offline() {
         bail!("the roots are already offline");
     }
     if !(1..=365).contains(&days) {
         bail!("--days: 1 to 365");
+    }
+    // Tokens are then minted by the issuing key and carry its certificate: every active node must
+    // understand that, or it would refuse every box (a node's build is checked, not assumed).
+    let lacking = nodes_lacking("issuer_cert").await?;
+    if !lacking.is_empty() {
+        bail!(
+            "not every node can take tokens minted by an issuing key; nothing changed:\n{}\n(update them, or revoke the ones you no longer use)",
+            lacking.iter().map(|(n, why)| format!("  - node {n}: {why}")).collect::<Vec<_>>().join("\n")
+        );
     }
     let d = identity_dir();
     let (feed_seed, authz_seed) = (root_seed(FEED_ROOT, "feed root")?, root_seed(AUTHZ_ROOT, "authority root")?);

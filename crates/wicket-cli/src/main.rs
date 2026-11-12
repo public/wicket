@@ -1303,7 +1303,7 @@ async fn main() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("wicket state panicked"))?
         }
         Cmd::Keys { cmd } => match cmd {
-            KeysCmd::RootsOffline { to, days } => roots::roots_offline(&to, days),
+            KeysCmd::RootsOffline { to, days } => roots::roots_offline(&to, days).await,
             KeysCmd::Certify { roots: dir } => {
                 if let Some(d) = dir {
                     std::env::set_var("WICKET_ROOTS", d);

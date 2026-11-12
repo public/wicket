@@ -169,6 +169,14 @@ t_first=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # the point the fourth host restores to
 sleep 2
 
 echo "== the control host: its roots go offline"
+# Not while a node can't be shown to take issuing-key tokens: the enrolled node's serve stopped.
+kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true
+check "roots-offline refuses while a node can't be asked, naming it, and changes nothing" \
+  '! "${HA[@]}" "$WICKET" keys roots-offline --to "$work/roots-no" --days 30 >"$work/roots-no.log" 2>&1 && grep -q "node rn1: can.t be asked" "$work/roots-no.log" && [ -e "$work/a-home/identity/authz-root.key" ] && [ ! -e "$work/roots-no" ]'
+rm -f "$nodehome/.local/share/wicket-node/ctl/ctl.sock"
+HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >>"$work/node.log" 2>&1 &
+serve_pid=$!
+for _ in $(seq 50); do [ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ] && break; sleep 0.2; done
 "${HA[@]}" "$WICKET" keys roots-offline --to "$work/roots" --days 30 | tee "$work/roots.log"
 check "the roots are off the host, their public halves kept" '[ ! -e "$work/a-home/identity/feed-root.key" ] && [ ! -e "$work/a-home/identity/authz-root.key" ] && [ -s "$work/a-home/identity/authz-root.pub" ] && [ -s "$work/roots/authz-root.key" ]'
 timeout 240 "${HA[@]}" "$WICKET" wake "$A" "Again, with the roots offline." >"$work/a2.log" 2>&1 || true
