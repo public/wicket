@@ -6,6 +6,7 @@
 #                                 the ssh hop replaced by WICKET_NODE_SSH (everything but ssh is real)
 #   ci/node-e2e.sh <node>         an enrolled node (enrolled with --hosts example.com, `wicket node install`
 #                                 done, the agent image present there), with this shell's WICKET_HOME
+#                                 (and WICKET_NODE_SSH, if wicket reaches the node through one)
 #
 # Needs Docker with runsc where the box runs and the agent image (`wicket image`). Env: WICKET (the
 # binary, default target/debug/wicket); IMAGE (the agent image, default wicket/claude-code:poc); for
@@ -64,8 +65,13 @@ else
   target=$(awk '{print $3}' <<<"$row")
   pin="${WICKET_HOME:-$HOME/.local/share/wicket}/nodes/$NODE/known_hosts"
   # WICKET_E2E_SSH_KEY: the identity for the node, if ssh's default keys don't reach it.
-  node_sh() { ssh ${WICKET_E2E_SSH_KEY:+-i "$WICKET_E2E_SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$pin" -o GlobalKnownHostsFile=/dev/null \
-    -o "HostKeyAlias=wicket-node-$NODE" "$target" "$1"; }
+  # WICKET_NODE_SSH (as wicket itself honours it): a stand-in for ssh, e.g. a node on this host.
+  if [ -n "${WICKET_NODE_SSH:-}" ]; then
+    node_sh() { $WICKET_NODE_SSH "$1"; }
+  else
+    node_sh() { ssh ${WICKET_E2E_SSH_KEY:+-i "$WICKET_E2E_SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$pin" -o GlobalKnownHostsFile=/dev/null \
+      -o "HostKeyAlias=wicket-node-$NODE" "$target" "$1"; }
+  fi
   nodedir='$HOME/.local/share/wicket-node'
 fi
 

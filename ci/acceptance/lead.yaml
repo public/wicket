@@ -1,0 +1,20 @@
+# Acceptance (ci/acceptance.sh, #41): the lead agent. The mock model asks it to run drive.sh, which
+# starts lead/steps.sh in the background and returns, so the turn ends and the session stays open
+# (idle_timeout) while the steps run and the script outside approves, denies and revokes.
+task: Run the command you are given and stop.
+agent:
+  name: lead
+  max_turns: 4
+  max_children: 4
+  idle_timeout: 10m
+zone:
+  name: acc-lead
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  forbid:
+    - { host: forbidden.example.com, paths: ["/**"] }
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:MOCK_PORT
+  limits: { memory: 1500m, cpus: 1, timeout: 10m }
