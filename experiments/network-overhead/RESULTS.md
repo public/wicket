@@ -300,7 +300,7 @@ they will hit:
 - large downloads: TLS and socat's buffer;
 - remote nodes: the round trip on every request, until #57 moves the proxy onto the node.
 
-## 8. After the fix: the batched audit writer (2026-11-12)
+## 7. After the fix: the batched audit writer (2026-11-12)
 
 #62's first fix is in: `wicket run` now starts one background audit writer per process, which
 commits in batches (`wicket-store`'s `writer.rs`, `docs/audit-export.md`). The replica has a
@@ -337,7 +337,7 @@ In-process (`netbench micro`, `logs/batched-writer/micro.json`):
 Requests allowed by a human's grant, decisions and approvals still wait for their commit. That is
 one fsync when nothing else is writing, and a share of one under load.
 
-## 7. Reproducing
+## 8. Reproducing
 
 ```sh
 cd experiments/network-overhead
