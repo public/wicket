@@ -107,6 +107,32 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     }
 }
 
+/// What no human approval may widen in a spawned zone (#118): the model route (provider, credential
+/// and upstream) must be the parent's own, and every credential injection one the parent makes to
+/// the same host, header and format. A card can't show a human what sending the model token, or a
+/// vault secret, to a URL the agent picked would mean, so these are refused outright. Each entry
+/// names exactly what the child asked for.
+pub fn unapprovable(child: &ZoneSpec, parent: &ZoneSpec) -> Vec<String> {
+    let mut v = Vec::new();
+    match (&child.llm, &parent.llm) {
+        (Some(cl), Some(pl)) if cl.provider != pl.provider || cl.secret != pl.secret || cl.upstream != pl.upstream => v.push(format!(
+            "the model route must be this zone's own: asked for provider {}, secret {}, upstream {}; this zone's is {}, {}, {}",
+            cl.provider, cl.secret, cl.upstream, pl.provider, pl.secret, pl.upstream
+        )),
+        _ => {}
+    }
+    for i in &child.inject {
+        let same = parent.inject.iter().any(|q| q.host == i.host && q.header == i.header && q.format == i.format && q.secret == i.secret);
+        if !same {
+            v.push(format!(
+                "inject secret {} into {} {}: only this zone's own credential injections can be passed on",
+                i.secret, i.host, i.header
+            ));
+        }
+    }
+    v
+}
+
 /// Whether `inner`'s reach is within `outer`'s: every reach rule covered, every forbid rule kept,
 /// no credential injection or model route `outer` lacks, and no unlisted hosts shown that `outer`
 /// hides. This is the authority a box lends whoever is linked to it (design §4.3): a connector may

@@ -80,6 +80,12 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 l["timeout"] = format!("{}s", time_left.as_secs()).into();
                 obj.insert("limits".into(), l);
             }
+            // A model section that omits the route gets the parent's own (any other is refused).
+            if let (Some(llm), Some(pl)) = (obj.get_mut("llm").and_then(|l| l.as_object_mut()), &p.zone.llm) {
+                for (k, val) in [("provider", &pl.provider), ("secret", &pl.secret), ("upstream", &pl.upstream)] {
+                    llm.entry(k).or_insert_with(|| val.clone().into());
+                }
+            }
             serde_json::from_value(v).map_err(|e| format!("zone: {e}"))?
         }
         None => {
@@ -159,7 +165,12 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     };
     let digest = hex::encode(sha2::Sha256::digest(stated.to_string().as_bytes()));
 
-    // Within the parent's authority, or approved by a human for exactly this zone.
+    // Within the parent's authority, or approved by a human for exactly this zone. A different model
+    // route or credential is never approvable (#118).
+    let hard = subset::unapprovable(&cm.zone, &p.zone);
+    if !hard.is_empty() {
+        return Err(format!("this zone can't be started, with or without a human:\n- {}", hard.join("\n- ")));
+    }
     let bounds = subset::Bounds {
         zone: &p.zone,
         images,
@@ -171,7 +182,10 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let ask = subset::Ask { zone: &cm.zone, image: &image, max_children: req.max_children };
     let mut beyond = false;
     if let Err(violations) = subset::check(&ask, &bounds) {
-        let op = Op::egress(&p.tenant, &c.run, &p.zone.name, "SPAWN", "wicket.internal", &format!("/zones/{zone_name}/{}", &digest[..16]));
+        let mut op =
+            Op::egress(&p.tenant, &c.run, &p.zone.name, "SPAWN", "wicket.internal", &format!("/zones/{zone_name}/{}", &digest[..16]));
+        // Beyond the parent's authority is never a one-click "allow for an hour" (#118).
+        op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
         let mut l = c.ledger.lock().map_err(|_| "ledger lock")?;
         match l.consume_grant(&op).map_err(|e| e.to_string())? {
             Some(gid) => {
@@ -193,7 +207,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 if let Ok(Some(rid)) = l.denied_recently(&op) {
                     return Err(format!("a human denied exactly this zone ({rid}) a few minutes ago; don't ask again"));
                 }
-                let reason = format!("start {} {name} in zone {zone_name}, beyond this agent's own: {}", req.kind, violations.join("; "));
+                let reason = card(&req.kind, name, &image, &cm, &violations);
                 let (rid, _) = l.pending_for(&op, &reason, None).map_err(|e| e.to_string())?;
                 return Ok(format!(
                     "needs human approval: request {rid} (this zone exceeds yours: {}). Call await_grant with {rid}; once granted, call spawn again with exactly the same arguments.",
@@ -249,6 +263,81 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
             "It sends you run_finished when it exits."
         }
     ))
+}
+
+/// What a beyond-parent spawn card says, from wicket's own record of the child (#118): what it
+/// exceeds, then what it gets — the model route and every credential injection first, then reach,
+/// limits, image and children. Agent-chosen strings are stripped and clipped, and the lists bounded,
+/// so nothing pushes a line out of view or rewrites it.
+fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String]) -> String {
+    use wicket_core::text::clip;
+    let z = &cm.zone;
+    let list = |items: Vec<String>, max: usize| {
+        let n = items.len();
+        let mut v: Vec<String> = items.into_iter().take(max).collect();
+        if n > max {
+            v.push(format!("and {} more", n - max));
+        }
+        v.join("; ")
+    };
+    let model = match &z.llm {
+        Some(l) => format!(
+            "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens",
+            clip(&l.provider, 40),
+            clip(&l.upstream, 200),
+            clip(&l.secret, 80),
+            l.max_requests,
+            l.max_output_tokens
+        ),
+        None => "no model route".into(),
+    };
+    let inject = if z.inject.is_empty() {
+        "no credential injections".into()
+    } else {
+        format!(
+            "injects {}",
+            list(
+                z.inject
+                    .iter()
+                    .map(|i| format!("secret {} into {} {}", clip(&i.secret, 80), clip(&i.host, 120), clip(&i.header, 60)))
+                    .collect(),
+                8
+            )
+        )
+    };
+    let reach = list(
+        z.reach
+            .iter()
+            .map(|r| {
+                let methods = if r.methods.is_empty() { "GET, HEAD".to_string() } else { r.methods.join(", ") };
+                let paths = if r.paths.is_empty() { "/**".to_string() } else { r.paths.join(", ") };
+                format!(
+                    "{} {} {}{}",
+                    clip(&methods, 60),
+                    clip(&r.host, 120),
+                    clip(&paths, 200),
+                    if r.allow_dangerous { " (allow_dangerous)" } else { "" }
+                )
+            })
+            .collect(),
+        12,
+    );
+    let l = &z.limits;
+    let children = cm.agent.as_ref().map(|a| a.max_children).unwrap_or(0);
+    format!(
+        "start {kind} {} in zone {}, beyond this agent's own. It exceeds: {}. It gets: {model}; {inject}; reach {}; unlisted hosts {:?}; isolation {:?}; image {}; memory {}, cpus {}, pids {}, timeout {}; may start {children} box(es).",
+        clip(name, 40),
+        clip(&z.name, 200),
+        list(violations.iter().map(|v| clip(v, 240)).collect(), 16),
+        if reach.is_empty() { "none".into() } else { reach },
+        z.unlisted_hosts,
+        z.isolation,
+        clip(image, 120),
+        clip(&l.memory, 20),
+        l.cpus,
+        l.pids,
+        clip(&l.timeout, 20),
+    )
 }
 
 /// Starts the child: another `wicket run`, with its own box, sockets, proxies and identity. Returns
@@ -504,6 +593,53 @@ mod tests {
         assert_eq!(*p.ctx.slots.lock().unwrap(), 0);
         Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
         assert!(spawn(&p.ctx, program("a")).unwrap().starts_with("started"));
+    }
+
+    /// #118: a different model route or credential is refused outright; a card for anything else
+    /// beyond the parent is R4 and says, from wicket's record, what the child gets.
+    #[test]
+    fn beyond_parent_spawns_show_what_they_get() {
+        let zone = "  llm: { secret: model-key }\n  reach:\n    - { host: api.example.com, methods: [GET] }\n  inject: [{ host: api.example.com, header: Authorization, format: \"Bearer {secret}\", secret: ex-token }]\n  limits: { memory: 1g, cpus: 1, timeout: 1h }\n";
+        let p = parent(2, zone);
+        let agent = |z: serde_json::Value| SpawnRequest {
+            kind: "agent".into(),
+            task: Some("work".into()),
+            command: vec![],
+            zone: Some(z),
+            ask_human: true,
+            ..program("x")
+        };
+        for (z, needle) in [
+            (json!({ "llm": { "upstream": "https://collector.example.net" } }), "upstream https://collector.example.net"),
+            (json!({ "llm": { "secret": "other-key" } }), "secret other-key"),
+            (
+                json!({ "llm": {}, "inject": [{ "host": "collector.example.net", "header": "X-Key", "format": "{secret}", "secret": "ex-token" }] }),
+                "inject secret ex-token into collector.example.net X-Key",
+            ),
+        ] {
+            let e = spawn(&p.ctx, agent(z)).unwrap_err();
+            assert!(e.contains("can't be started, with or without a human") && e.contains(needle), "{e}");
+        }
+        assert!(p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty());
+        // The parent's own route, with an extra host and a hostile path: a card.
+        let wide = json!({
+            "llm": { "max_requests": 5 },
+            "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org", "paths": ["/a\u{1b}]0;t\u{7}\u{202e}/**"] }],
+            "inject": [{ "host": "api.example.com", "header": "Authorization", "format": "Bearer {secret}", "secret": "ex-token" }],
+        });
+        assert!(spawn(&p.ctx, agent(wide)).unwrap().starts_with("needs human approval: request r-"));
+        let l = p.ctx.ledger.lock().unwrap();
+        let r = l.pending(&wicket_core::TenantId::single()).unwrap().pop().unwrap();
+        assert_eq!((r.method.as_str(), r.host.as_str(), r.risk.as_str()), ("SPAWN", "wicket.internal", "R4ExecOrPrivilege"));
+        for needle in [
+            "model route anthropic via https://api.anthropic.com with secret model-key",
+            "injects secret ex-token into api.example.com Authorization",
+            "other.example.org",
+            "It exceeds: reach rule 1",
+        ] {
+            assert!(r.reason.contains(needle), "missing {needle:?} in {}", r.reason);
+        }
+        assert!(r.reason.chars().all(|c| !wicket_core::text::is_unsafe(c)), "{:?}", r.reason);
     }
 
     fn at(node: &str, lease: Option<&str>) -> Option<Placed> {
