@@ -32,12 +32,6 @@ pub fn box_name(run: &str) -> String {
     format!("{}-{}", prefix.as_deref().unwrap_or("wicket"), run.replace('_', "-"))
 }
 
-/// A box's hosts file, mounted read-only at /etc/hosts: wicket rewrites it in place as links open
-/// and close.
-pub fn hosts_path(run_dir: &std::path::Path) -> PathBuf {
-    run_dir.join("hosts")
-}
-
 pub struct NodeBoxes {
     ledger: Arc<Mutex<wicket_store::Ledger>>,
     /// This run, its node, and its own connection's calls.

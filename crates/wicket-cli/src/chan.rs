@@ -79,11 +79,18 @@ pub struct BoxStart {
     pub volumes: Vec<(String, String)>,
     /// Stream ids for stdin, stdout and stderr.
     pub streams: [u64; 3],
-    /// Set only for a node that shares the control host's filesystem (the built-in local node,
-    /// #146): the box is laid out by the control host, in the run's own directory, and its sockets
-    /// are the run's own proxies (as for any host a node forwards, without the hop).
+    /// Directories of the control host's own mounted in the box: (host path, path in the box,
+    /// read-only). Only the control host's own node, which shares its filesystem, takes any (an
+    /// in-place workspace, a wrapped session's directory).
     #[serde(default)]
-    pub host: Option<HostBox>,
+    pub binds: Vec<(String, String, bool)>,
+    /// The box's working directory, if not /workspace (a wrapped session's, on the control host's
+    /// own node).
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// The `wicket.owner` label: the control host's process supervising the box.
+    #[serde(default)]
+    pub owner: Option<String>,
     /// A long-lived agent's box (#70, #146): its /tmp is a directory the node keeps (not a tmpfs),
     /// so it can be moved with the rest of its state when it hibernates.
     #[serde(default)]
@@ -95,20 +102,6 @@ pub struct BoxStart {
     /// The box's Docker name (`<prefix>-<run>`), if the control host names it.
     #[serde(default)]
     pub name: Option<String>,
-}
-
-/// A box laid out by the control host on a node that shares its filesystem: what `docker run`
-/// mounts, by path, and how the box is named and labelled.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HostBox {
-    /// The box's Docker name.
-    pub name: String,
-    /// (host path, path in the box, read-only).
-    pub mounts: Vec<(String, String, bool)>,
-    /// uid:gid the box runs as.
-    pub user: String,
-    pub workdir: String,
-    pub labels: Vec<(String, String)>,
 }
 
 /// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).

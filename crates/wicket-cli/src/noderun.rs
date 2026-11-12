@@ -782,7 +782,7 @@ async fn on_frame(
                 let ok_target = ["egress", "llm", "gateway"].contains(&target.as_str());
                 let conn = match (run == sh.run.0, ok_target) {
                     (true, true) => {
-                        tokio::net::UnixStream::connect(sh.dir.join("sock").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
+                        tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
                     }
                     _ => Err(format!("no tunnel to {target} for run {run}")),
                 };

@@ -240,6 +240,10 @@ pub enum Route {
 /// Whether a host is inside one X.509 permitted DNS subtree, as a verifier reads it: `api.example.com`
 /// permits itself and every name under it; `.example.org` permits names under it, not the apex.
 pub fn subtree_permits(subtree: &str, host: &str) -> bool {
+    // The control host's own node's CA: any name.
+    if subtree == "*" {
+        return true;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let subtree = subtree.to_ascii_lowercase();
     match subtree.strip_prefix('.') {
