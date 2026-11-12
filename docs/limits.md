@@ -119,8 +119,8 @@ not a permanent decision.
   After a deliberate clock step, restart `wicket-node`.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
-- **What doesn't work on remote nodes yet:** hibernation, in-place workspaces and wrapped sessions
-  (they need the control host's own node, which shares its filesystem), plain `http://` to a host the
+- **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's
+  own node), plain `http://` to a host the
   node forwards, and MCP decisions on the node (the gateway decides on
   the control host). Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
@@ -129,9 +129,13 @@ not a permanent decision.
 
 ## Hibernated agents
 
-- **Bundles are neither encrypted nor signed.** Each tree is content-addressed and its digest is checked
-  on restore, so corruption is caught. Anyone who can write the object store and the ledger can still
-  change an agent's state. The store is a directory in the data directory; S3 and other remote stores
+- **Bundles are sealed, not signed.** Each object is encrypted and authenticated under the
+  installation's state key, and each tree is content-addressed and checked on restore. Anyone with the
+  data directory (the key and the ledger) can still read or change an agent's state, and object keys and
+  sizes aren't hidden. Bundles written before sealing are read as they are until the agent hibernates
+  again. Sealing is done on the control host: on its way from a remote node the state is protected by
+  the node's channel (ssh), and on the node it is plain files in the run's directory while the box
+  runs, as any box's workspace is, removed once fetched. The store is a directory in the data directory; S3 and other remote stores
   aren't supported ([#106](https://github.com/public/wicket/pull/106)).
 - **A rebuild restores files, not processes.** A box running anything besides the agent stays paused
   instead of hibernating.

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use wicket_core::{Manifest, Persist, RunId, TenantId};
 use wicket_store::bundle::{self, StateManifest, TreeSrc};
 use wicket_store::objects::DirStore;
+use wicket_store::sealed::SealedStore;
 use wicket_store::{AgentRow, Ledger};
 
 /// How long a holder's claim on an agent lasts without renewal (seconds). The supervisor renews it
@@ -36,8 +37,28 @@ pub const BUSY_LEASE_SECS: i64 = 900;
 
 /// The object store agent state goes to: a directory under wicket's data dir (S3-compatible
 /// backends later).
-pub fn store() -> DirStore {
-    DirStore::new(data_dir().join("objects"))
+pub fn store() -> Result<SealedStore<DirStore>> {
+    Ok(SealedStore::new(DirStore::new(data_dir().join("objects")), &state_key()?))
+}
+
+/// The key agent state is sealed with at rest (`<data dir>/state.key`, 0600, made on first use): it
+/// stays on the control host, which bundles and restores agents; nodes never see it.
+fn state_key() -> Result<[u8; 32]> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = data_dir().join("state.key");
+    let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|s| hex::decode(s.trim()).ok()).and_then(|b| b.try_into().ok());
+    if let Some(k) = read(&p) {
+        return Ok(k);
+    }
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    std::fs::create_dir_all(data_dir())?;
+    // Made once: a run racing this one keeps whichever key was written first.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p) {
+        let _ = std::io::Write::write_all(&mut f, hex::encode(k).as_bytes());
+        let _ = f.sync_all();
+    }
+    read(&p).with_context(|| format!("{} could not be read or written", p.display()))
 }
 
 /// Per-agent files on this node: durable volumes, wake logs.
@@ -100,7 +121,7 @@ pub fn push(
     generation: i64,
     trees: &[(String, PathBuf, &[&str])],
 ) -> Result<Option<StateManifest>> {
-    let store = store();
+    let store = store()?;
     let prev = match &agent.head {
         Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
         None => None,
@@ -138,6 +159,64 @@ pub fn stage_volumes(trees: &mut [(String, PathBuf, &[&str])], run_dir: &Path) -
         *p = staged;
     }
     Ok(moved)
+}
+
+/// Makes `dest` hold exactly what `src` holds (files, directories and symlinks, never followed),
+/// leaving the top-level names in `skip` alone: entries not in `src` are removed, the rest copied.
+/// For trees fetched back from a node, where `dest` is wicket's (or the operator's in-place) copy.
+pub fn sync_dir(src: &Path, dest: &Path, skip: &[&str]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn kind(p: &Path) -> Option<std::fs::FileType> {
+        std::fs::symlink_metadata(p).ok().map(|m| m.file_type())
+    }
+    fn walk(src: &Path, dest: &Path, skip: &[&str]) -> Result<()> {
+        if kind(dest).is_some_and(|k| !k.is_dir()) {
+            std::fs::remove_file(dest)?;
+        }
+        std::fs::create_dir_all(dest)?;
+        if let Ok(m) = std::fs::symlink_metadata(src) {
+            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777))?;
+        }
+        // What the source no longer has goes.
+        for e in std::fs::read_dir(dest)?.flatten() {
+            let name = e.file_name();
+            if skip.iter().any(|s| std::ffi::OsStr::new(s) == name) {
+                continue;
+            }
+            let (d, s) = (e.path(), src.join(&name));
+            let same = match (kind(&s), kind(&d)) {
+                (Some(a), Some(b)) => a.is_dir() == b.is_dir() && a.is_symlink() == b.is_symlink(),
+                _ => false,
+            };
+            if !same {
+                if kind(&d).is_some_and(|k| k.is_dir()) {
+                    std::fs::remove_dir_all(&d)?;
+                } else {
+                    std::fs::remove_file(&d)?;
+                }
+            }
+        }
+        for e in std::fs::read_dir(src)?.flatten() {
+            let name = e.file_name();
+            if skip.iter().any(|s| std::ffi::OsStr::new(s) == name) {
+                continue;
+            }
+            let (s, d) = (e.path(), dest.join(&name));
+            let Some(k) = kind(&s) else { continue };
+            if k.is_symlink() {
+                let _ = std::fs::remove_file(&d);
+                std::os::unix::fs::symlink(std::fs::read_link(&s)?, &d)?;
+            } else if k.is_dir() {
+                walk(&s, &d, &[])?;
+            } else if k.is_file() {
+                // Never written through: anything at `d` is replaced, not opened.
+                let _ = std::fs::remove_file(&d);
+                std::fs::copy(&s, &d)?;
+            }
+        }
+        Ok(())
+    }
+    walk(src, dest, skip).with_context(|| format!("syncing {} into {}", src.display(), dest.display()))
 }
 
 /// Puts staged volumes back (the push failed), unless something else is there now.
@@ -251,7 +330,7 @@ pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    bundle::pull_tree(&store(), t, dest).with_context(|| format!("restoring {name}"))?;
+    bundle::pull_tree(&store()?, t, dest).with_context(|| format!("restoring {name}"))?;
     Ok(())
 }
 
@@ -377,9 +456,11 @@ fn wake_text(by: &str, said: &[(String, String)], messages: i64) -> String {
 
 /// `wicket wake <agent>`: claims the agent and runs its next activation in the foreground.
 pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result<()> {
-    let (agent, generation, run, first) = {
+    let (agent, generation, run, first, last_node) = {
         let mut l = Ledger::open(&ledger_path())?;
         let a = resolve(&l, who)?;
+        // Where it last ran (its run before this wake): only a tie-break when placing it.
+        let last_node = l.run_node(&a.run)?;
         for (r, _) in l.agent_runs(&a.id)? {
             if let Some((rv, _, rby, why)) = l.revoked_in_chain(&r)? {
                 l.agent_not_restorable(&a.id, &format!("revoked ({rv} by {rby}: {why})"))?;
@@ -416,12 +497,23 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
             "agent.wake",
             &serde_json::json!({ "agent": a.id, "generation": generation, "by": by, "from_run": a.run, "head": a.head, "operator_messages": said.len() }),
         )?;
-        (l.agent(&a.id)?.expect("claimed"), generation, run, first)
+        (l.agent(&a.id)?.expect("claimed"), generation, run, first, last_node)
     };
+    // The agent's state is its bundle, here, so it can wake on any node: bin-packed into the nodes
+    // available now, by its zone's limits.
+    let node = match place(&agent, last_node.as_deref()).await {
+        Ok(n) => n,
+        Err(e) => {
+            let l = Ledger::open(&ledger_path())?;
+            l.release_failed_wake(&agent.id, generation, &format!("wake failed: {e:#}"))?;
+            return Err(e);
+        }
+    };
+    let node = node.filter(|n| n != crate::localnode::NAME);
     println!("[wicket] waking agent {} ({}): generation {generation}, run {run}", agent.id, agent.name);
     let res = async {
         let t0 = std::time::Instant::now();
-        let state = bundle::read_manifest(&store(), agent.head.as_deref().expect("checked"), &agent.id)?;
+        let state = bundle::read_manifest(&store()?, agent.head.as_deref().expect("checked"), &agent.id)?;
         if state.session_id != agent.session_id {
             bail!("the bundle's session {} isn't the agent's {}", state.session_id, agent.session_id);
         }
@@ -451,7 +543,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         workspace_dir: None,
         task: None,
         image: &image,
-        node: None,
+        node: node.as_deref(),
         ssh_key: None,
         run_id: Some(run.0.clone()),
         parent_run: None,
@@ -468,6 +560,83 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         return Err(e);
     }
     Ok(())
+}
+
+/// A node a box could go on: its name, and its size and use as it reported them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub name: String,
+    pub cap: crate::chan::NodeCapacity,
+}
+
+/// Best fit: of the nodes with room for `want` (vCPUs, MiB), the one left with the least memory free
+/// once it is placed (then the fewest vCPUs free; then `last`, where the agent ran before; then the
+/// name). With room nowhere, the node with the most memory free, and false.
+pub fn pick(cands: &[Candidate], want: (f32, u64), last: Option<&str>) -> Option<(String, bool)> {
+    let free = |c: &Candidate| (c.cap.vcpus - c.cap.used_vcpus, c.cap.memory_mib as i64 - c.cap.used_memory_mib as i64);
+    let fits = |c: &&Candidate| {
+        let (cpu, mem) = free(c);
+        cpu + 1e-3 >= want.0 && mem >= want.1 as i64
+    };
+    let key = |c: &Candidate| {
+        let (cpu, mem) = free(c);
+        (mem - want.1 as i64, ((cpu - want.0) * 1000.0) as i64, Some(c.name.as_str()) != last, c.name.clone())
+    };
+    if let Some(best) = cands.iter().filter(fits).min_by_key(|c| key(c)) {
+        return Some((best.name.clone(), true));
+    }
+    cands.iter().max_by_key(|c| (free(c).1, std::cmp::Reverse(c.name.clone()))).map(|c| (c.name.clone(), false))
+}
+
+/// Where a woken agent's box goes: every enrolled, active node that answers within 10 s (this host's
+/// own among them) and isn't held by a capacity lease, bin-packed ([`pick`]).
+async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
+    let m = Manifest::from_yaml(&agent.manifest)?;
+    let want = (m.zone.limits.cpus, m.zone.limits.memory_bytes().unwrap_or(0) >> 20);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
+    crate::localnode::ensure(&ledger).await?;
+    let (names, leased) = {
+        let l = ledger.lock().expect("ledger");
+        let names: Vec<String> = l.nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
+        let leased: Vec<String> = l.leases(wicket_store::LIVE_LEASES)?.into_iter().filter_map(|x| x.node_name).collect();
+        (names, leased)
+    };
+    let probes = names.into_iter().filter(|n| !leased.contains(n)).map(|n| {
+        let ledger = ledger.clone();
+        async move {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::nodecall::Link::connect(&n, &format!("place:{}", std::process::id()), &ledger),
+            )
+            .await;
+            match r {
+                Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
+                Ok(Err(e)) => {
+                    println!("[wicket] node {n} is not available for the wake: {e:#}");
+                    None
+                }
+                Err(_) => {
+                    println!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                    None
+                }
+            }
+        }
+    });
+    let cands: Vec<Candidate> = futures_util::future::join_all(probes).await.into_iter().flatten().collect();
+    match pick(&cands, want, last) {
+        Some((n, true)) => {
+            println!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
+            Ok(Some(n))
+        }
+        Some((n, false)) => {
+            println!(
+                "[wicket] no available node has room for agent {} ({} vCPU, {} MiB free needed): placing it on {n}, the least loaded",
+                agent.id, want.0, want.1
+            );
+            Ok(Some(n))
+        }
+        None => Ok(None),
+    }
 }
 
 /// `wicket hibernate <run|agent>`: asks the agent's supervisor to hibernate it at the next quiet
@@ -653,6 +822,27 @@ mod outbox_tests {
 
 #[cfg(test)]
 mod tests {
+    fn cand(name: &str, vcpus: f32, mem: u64, used_cpu: f32, used_mem: u64) -> Candidate {
+        Candidate {
+            name: name.into(),
+            cap: crate::chan::NodeCapacity { vcpus, memory_mib: mem, used_vcpus: used_cpu, used_memory_mib: used_mem, boxes: 0 },
+        }
+    }
+
+    /// Wake placement is best fit: the fullest node the box still fits on; where it ran before only
+    /// breaks ties, and with room nowhere the least loaded node is used.
+    #[test]
+    fn a_woken_agent_is_bin_packed_onto_the_fullest_node_it_fits() {
+        let nodes = [cand("local", 4.0, 8192, 1.0, 1024), cand("n1", 2.0, 2048, 0.0, 512), cand("n2", 2.0, 4096, 1.5, 3000)];
+        assert_eq!(pick(&nodes, (1.0, 1024), None), Some(("n1".into(), true)), "n2 has no vCPU, local more room than n1");
+        assert_eq!(pick(&nodes, (0.5, 1024), None), Some(("n2".into(), true)), "n2 fits and is fullest");
+        assert_eq!(pick(&nodes, (1.0, 1024), Some("local")), Some(("n1".into(), true)), "where it ran before doesn't beat a better fit");
+        let twins = [cand("a", 2.0, 2048, 0.0, 0), cand("b", 2.0, 2048, 0.0, 0)];
+        assert_eq!(pick(&twins, (1.0, 512), Some("b")), Some(("b".into(), true)), "it breaks a tie");
+        assert_eq!(pick(&nodes, (8.0, 65536), None), Some(("local".into(), false)), "no room: the least loaded");
+        assert_eq!(pick(&[], (1.0, 1), None), None);
+    }
+
     use super::*;
 
     #[test]

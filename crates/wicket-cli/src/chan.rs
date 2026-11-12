@@ -84,6 +84,17 @@ pub struct BoxStart {
     /// are the run's own proxies (as for any host a node forwards, without the hop).
     #[serde(default)]
     pub host: Option<HostBox>,
+    /// A long-lived agent's box (#70, #146): its /tmp is a directory the node keeps (not a tmpfs),
+    /// so it can be moved with the rest of its state when it hibernates.
+    #[serde(default)]
+    pub long_lived: bool,
+    /// Durable volumes of a long-lived agent: (name, mount path in the box), kept in the run's own
+    /// directory on the node and moved with its state (unlike `volumes`, kept per tenant and zone).
+    #[serde(default)]
+    pub durable: Vec<(String, String)>,
+    /// The box's Docker name (`<prefix>-<run>`), if the control host names it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A box laid out by the control host on a node that shares its filesystem: what `docker run`
@@ -98,6 +109,16 @@ pub struct HostBox {
     pub user: String,
     pub workdir: String,
     pub labels: Vec<(String, String)>,
+}
+
+/// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeCapacity {
+    pub vcpus: f32,
+    pub memory_mib: u64,
+    pub used_vcpus: f32,
+    pub used_memory_mib: u64,
+    pub boxes: u32,
 }
 
 /// How far a box's stdio has got, as the node reports it on reconnect.
@@ -186,8 +207,9 @@ pub enum Msg {
     Close {
         stream: u64,
     },
-    /// Acts on a run's box: `status` (an error unless it is running), `pause`, `unpause`, `processes` (as `user`; the answer's `out` is a JSON
-    /// list of (pid, ppid, command line)) or `hosts` (`arg` becomes the box's /etc/hosts).
+    /// Acts on a run's box: `status` (an error unless it is running), `pause`, `unpause`, `processes`
+    /// (as `user`; the answer's `out` is a JSON list of (pid, ppid, command line)), `hosts` (`arg`
+    /// becomes the box's /etc/hosts) or `usage` (`out`: the bytes under tree `arg`).
     BoxCtl {
         id: u64,
         run: String,
@@ -217,6 +239,21 @@ pub enum Msg {
     Unlisten {
         run: String,
         sock: String,
+    },
+    /// Unpacks the tar archive sent on tunnel `stream` (numbered by the control host) into one of a
+    /// run's trees on the node: `workspace`, `state`, `tmp` or `volume.<name>`. Answered with
+    /// [`Msg::TunnelOpened`], then [`Msg::ExecDone`] once unpacked.
+    PutTree {
+        stream: u64,
+        run: String,
+        tree: String,
+    },
+    /// Sends one of a run's trees on the node as a tar archive on tunnel `stream`. Answered with
+    /// [`Msg::TunnelOpened`], then [`Msg::ExecDone`].
+    GetTree {
+        stream: u64,
+        run: String,
+        tree: String,
     },
 
     // ---- node → control host ----
@@ -248,6 +285,9 @@ pub enum Msg {
         build: String,
         feed: wicket_feed::Hello,
         runs: Vec<RunState>,
+        /// What the node has, and what its running boxes are given (for placement).
+        #[serde(default)]
+        capacity: Option<NodeCapacity>,
     },
     /// The node won't talk to this control host (wrong build, wrong node name).
     Refused {
@@ -541,6 +581,7 @@ mod tests {
                     stderr_total: 0,
                     exited: Some((0, None)),
                 }],
+                capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
             }),
             Frame::Data { stream: TUNNEL_BIT | 4, offset: 1 << 40, bytes: b"hello\0world".to_vec() },
             Frame::Data { stream: 2, offset: 0, bytes: vec![] },

@@ -142,6 +142,9 @@ struct BoxState {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// uid:gid the box runs as (execs in it run as this, unless asked otherwise).
     user: String,
+    /// Its limits, for the node's reported use.
+    cpus: f32,
+    memory_mib: u64,
     /// Link relay sockets listened on in its socket directory, by name.
     listeners: HashMap<String, tokio::task::JoinHandle<()>>,
     /// The control connection that started or last resumed it: its stdio, events, asks and
@@ -193,6 +196,26 @@ impl Node {
     fn owner(&self, run: &str) -> Option<u64> {
         let owner = self.boxes.lock().expect("boxes").get(run).and_then(|b| b.owner)?;
         self.links.lock().expect("links").contains_key(&owner).then_some(owner)
+    }
+
+    /// This machine's size, and what its running boxes are given.
+    fn capacity(&self) -> chan::NodeCapacity {
+        let mem = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
+            .unwrap_or(0)
+            >> 10;
+        let mut c = chan::NodeCapacity {
+            vcpus: std::thread::available_parallelism().map(|n| n.get() as f32).unwrap_or(1.0),
+            memory_mib: mem,
+            ..Default::default()
+        };
+        for b in self.boxes.lock().expect("boxes").values().filter(|b| b.exited.is_none()) {
+            c.used_vcpus += b.cpus;
+            c.used_memory_mib += b.memory_mib;
+            c.boxes += 1;
+        }
+        c
     }
 
     /// Sends to the connection that owns `run`'s box.
@@ -578,7 +601,8 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
         })
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
-    let _ = tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), feed, runs }));
+    let capacity = Some(node.capacity());
+    let _ = tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), feed, runs, capacity }));
     eprintln!("[node] control host connected{}", if scope.is_empty() { String::new() } else { format!(" ({scope})") });
     let result = loop {
         tokio::select! {
@@ -799,6 +823,8 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     }
                 }
             }
+            Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
+            Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),
             Msg::Listen { id, run, sock } => {
                 let error = listen(node, gen, &run, &sock).err().map(|e| format!("{e:#}"));
                 node.send_to(gen, Frame::Msg(Msg::BoxCtlDone { id, out: None, error }));
@@ -844,6 +870,10 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
     let user = if user.is_empty() { box_user.as_str() } else { user };
     match what {
         "status" => Ok(None),
+        "usage" => {
+            let d = tree_dir(&node.paths, run, arg)?;
+            Ok(Some(tokio::task::spawn_blocking(move || du(&d)).await?.to_string()))
+        }
         "pause" => node.docker.pause(&name).await.map(|()| None),
         "unpause" => node.docker.unpause(&name).await.map(|()| None),
         "processes" => Ok(Some(serde_json::to_string(&node.docker.processes(&name, user).await?)?)),
@@ -858,6 +888,79 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
         }
         w => bail!("unknown box operation {w:?}"),
     }
+}
+
+/// `Msg::PutTree` (`put`) or `Msg::GetTree`: one of a run's trees as a tar archive on tunnel `stream`.
+fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u64, run: &str, tree: &str, put: bool) {
+    if stream & TUNNEL_BIT == 0 || stream & chan::CONTROL_TUNNEL_BIT == 0 {
+        return;
+    }
+    let out = node.links.lock().expect("links").get(&gen).map(|l| l.out.clone());
+    let Some(out) = out else { return };
+    let spawned = tree_dir(&node.paths, run, tree).and_then(|d| {
+        std::fs::create_dir_all(&d)?;
+        let mut c = tokio::process::Command::new("tar");
+        c.arg("-C").arg(&d).stderr(std::process::Stdio::null()).kill_on_drop(true);
+        if put {
+            c.args(["--no-same-owner", "-xf", "-"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null());
+        } else {
+            c.args(["-cf", "-", "."]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+        }
+        Ok(c.spawn()?)
+    });
+    match spawned {
+        Err(e) => {
+            node.send_to(gen, Frame::Msg(Msg::TunnelOpened { stream, error: Some(format!("{e:#}")) }));
+        }
+        Ok(mut c) => {
+            let rd: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match c.stdout.take() {
+                Some(r) => Box::new(r),
+                None => Box::new(tokio::io::empty()),
+            };
+            let wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = match c.stdin.take() {
+                Some(w) => Box::new(w),
+                None => Box::new(tokio::io::sink()),
+            };
+            node.send_to(gen, Frame::Msg(Msg::TunnelOpened { stream, error: None }));
+            tunnels.attach(stream, tokio::io::join(rd, wr), out);
+            let n = node.clone();
+            tokio::spawn(async move {
+                let code = c.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+                n.send_to(gen, Frame::Msg(Msg::ExecDone { stream, code }));
+            });
+        }
+    }
+}
+
+/// A run's tree on this node: `workspace`, `state`, `tmp` or `volume.<name>`.
+fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
+    crate::run::check_run_id(run)?;
+    let dir = paths.runs().join(run);
+    let ok = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c));
+    match tree {
+        "workspace" | "state" | "tmp" => Ok(dir.join(tree)),
+        t => match t.strip_prefix("volume.") {
+            Some(v) if ok(v) => Ok(dir.join("volumes").join(v)),
+            _ => bail!("no tree {t:?}"),
+        },
+    }
+}
+
+/// Bytes of the files under `d` (symlinks not followed).
+fn du(d: &std::path::Path) -> u64 {
+    let mut n = 0;
+    let mut stack = vec![d.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else { continue };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => n += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    n
 }
 
 /// `Msg::Listen`: a link's relay socket in a run's socket directory; each connection to it is offered
@@ -929,6 +1032,10 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         Some(h) => host_layout(node, &bs, h)?,
         None => {
             let dir = node.paths.runs().join(&bs.run);
+            if bs.long_lived {
+                std::fs::create_dir_all(dir.join("tmp"))?;
+                std::fs::set_permissions(dir.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
+            }
             for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
                 std::fs::create_dir_all(dir.join(sub))?;
             }
@@ -966,7 +1073,12 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
                 if !ok(name) || !ok(&bs.tenant) || !ok(&bs.zone) {
                     bail!("bad volume name {name:?}");
                 }
-                let d = node.paths.root.join("volumes").join(&bs.tenant).join(&bs.zone).join(name);
+                // A long-lived agent's durable volume is its own, kept with its state in the run's
+                // directory (and moved when it hibernates); any other is the zone's.
+                let d = match bs.long_lived && bs.durable.iter().any(|(n, _)| n == name) {
+                    true => dir.join("volumes").join(name),
+                    false => node.paths.root.join("volumes").join(&bs.tenant).join(&bs.zone).join(name),
+                };
                 std::fs::create_dir_all(&d)?;
                 std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
                 volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
@@ -1061,7 +1173,8 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             }
 
             let spec = SandboxSpec {
-                name: format!("wicket-{}", bs.run.replace('_', "-")),
+                // The name the control host gives it (its box prefix), else wicket's own.
+                name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
                 image: bs.image.clone(),
                 isolation: bs.isolation,
                 mounts: vec![
@@ -1074,6 +1187,8 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
                 ]
                 .into_iter()
                 .chain(volume_mounts)
+                // A long-lived agent's /tmp is a directory here, kept with the rest of its state.
+                .chain(bs.long_lived.then(|| Mount { host: dir.join("tmp"), target: "/tmp".into(), read_only: false }))
                 .collect(),
                 env: bs.env.clone(),
                 argv: bs.argv.clone(),
@@ -1112,6 +1227,8 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             exited: None,
             tasks,
             user: spec.user.clone(),
+            cpus: bs.cpus,
+            memory_mib: bs.memory.parse::<u64>().map(|b| b >> 20).unwrap_or(0),
             listeners: HashMap::new(),
             owner: Some(gen),
         },
@@ -1181,8 +1298,7 @@ fn host_layout(node: &Node, bs: &BoxStart, h: &crate::chan::HostBox) -> Result<L
     if !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it lays out its boxes itself");
     }
-    let ok_name =
-        h.name.len() <= 100 && h.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && h.name.ends_with(&bs.run.replace('_', "-"));
+    let ok_name = box_name_ok(&h.name, &bs.run);
     if !ok_name {
         bail!("bad box name {:?}", h.name);
     }
@@ -1204,6 +1320,13 @@ fn host_layout(node: &Node, bs: &BoxStart, h: &crate::chan::HostBox) -> Result<L
         labels: h.labels.clone(),
     };
     Ok((dir, spec, vec![]))
+}
+
+/// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
+fn box_name_ok(name: &str, run: &str) -> bool {
+    name.len() <= 100
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && name.ends_with(&format!("-{}", run.replace('_', "-")))
 }
 
 /// `wicket node attach`: what the control host runs over ssh. It joins its stdin and stdout to the
@@ -1393,6 +1516,8 @@ mod tests {
                 exited: None,
                 tasks: vec![],
                 user: String::new(),
+                cpus: 0.0,
+                memory_mib: 0,
                 listeners: HashMap::new(),
                 owner: Some(2),
             },
@@ -1569,6 +1694,8 @@ mod tests {
                     exited: None,
                     tasks: vec![],
                     user: String::new(),
+                    cpus: 0.0,
+                    memory_mib: 0,
                     listeners: HashMap::new(),
                     owner: Some(gen),
                 },

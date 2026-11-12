@@ -50,6 +50,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   serves many runs at once, links reach boxes on any nodes (relayed by the control host), and `--node`
   needs an enrolled node: docker over ssh to an unenrolled target is gone
   ([#146](https://github.com/public/wicket/issues/146)).
+- Long-lived agents hibernate and wake on any node, their state moved over the node's channel, and a
+  wake is bin-packed onto the nodes available; `--workspace-dir` works on remote nodes (copied up, synced
+  back). Hibernated agents' state is encrypted at rest (AES-256-GCM, a key that stays on the control
+  host) ([#146](https://github.com/public/wicket/issues/146)).
 
 ### Model budgets
 

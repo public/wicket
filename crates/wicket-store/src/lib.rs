@@ -13,6 +13,7 @@ pub mod bundle;
 mod links;
 mod node;
 pub mod objects;
+pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
 mod lease;
