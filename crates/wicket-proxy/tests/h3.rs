@@ -190,7 +190,7 @@ impl World {
             waker: None,
         };
         let run_ca = Arc::new(RunCa::generate("run_h3").unwrap());
-        let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false };
+        let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false, ..Default::default() };
         let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(Central), relay, up).unwrap();
         let h3 = H3::new(egress, opts).unwrap();
         let names = h3.names().clone();

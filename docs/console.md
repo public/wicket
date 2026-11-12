@@ -28,8 +28,11 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 - **send a follow-up** to a running agent (`wicket say`);
 - **revoke an identity** with a reason (`wicket identity revoke`);
 - **answer `request_access` asks**, including prefix asks: the passkey signs that the grant covers every path
-  under the prefix, and, as for every approval, the agent's verified identity. An agent whose identity doesn't
-  verify (or was revoked since you were shown the ask) can be denied, not approved.
+  under the prefix, and, as for every approval, the agent's verified identity. A prefix covers whole path
+  segments (`/repos/acme/app/…` covers `/repos/acme/app` and what's under it, not `/repos/acme/app-secrets`),
+  and every grant covers nothing riskier than the request you were shown: approving an R2 prefix doesn't
+  allow the R4 operations (workflow edits, merges, access changes) under it. An agent whose identity
+  doesn't verify (or was revoked since you were shown the ask) can be denied, not approved.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
