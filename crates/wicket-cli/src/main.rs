@@ -33,6 +33,7 @@ mod spawn;
 mod state;
 mod statestore;
 mod transcript;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -213,12 +214,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build).
+    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the
+    /// build). Without --dir, from the copy embedded in this binary, so the image matches it.
     Image {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
-        #[arg(long, default_value = "images/claude-code")]
-        dir: PathBuf,
+        /// An image directory to build instead (e.g. images/claude-code, while changing it).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain
     /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
@@ -360,6 +363,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DevCmd,
     },
+    /// Update this installation to another wicket build (#162): blue/green, with a health gate and
+    /// automatic rollback, on the control host and then its nodes. Only artifacts signed by a
+    /// release key this installation trusts, or whose sha256 a human approved (an agent's
+    /// `request_update`), are accepted. See docs/operations.md.
+    #[command(name = "self")]
+    Itself {
+        #[command(subcommand)]
+        cmd: SelfCmd,
+    },
     /// wicketd (#12): run as the wicket system user and serve other users' commands over a unix
     /// socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving,
     /// denying and other privileged commands need root over the socket, or a passkey in the console.
@@ -468,6 +480,75 @@ enum GrantCmd {
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum SelfCmd {
+    /// The staged versions, which is current and previous, and the ledger's schema.
+    Status,
+    /// Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the
+    /// control host to it, hand its processes over, and watch it; then the nodes, a canary first.
+    /// Any failed health check switches back.
+    Update {
+        artifact: PathBuf,
+        /// The detached signature (default: <artifact>.sig).
+        #[arg(long)]
+        sig: Option<PathBuf>,
+        /// Also update these nodes after the control host: `all`, or names (comma-separated). The
+        /// first is the canary.
+        #[arg(long)]
+        nodes: Option<String>,
+        /// The control host already runs this build: only the nodes.
+        #[arg(long, requires = "nodes")]
+        only_nodes: bool,
+        /// How long each new build is watched after its switch.
+        #[arg(long, default_value = "30s")]
+        window: String,
+        /// How often within the window.
+        #[arg(long, default_value = "10s")]
+        interval: String,
+        /// A command (sh -c) that must succeed each time; $WICKET is the new build's binary and
+        /// $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable.
+        #[arg(long)]
+        check: Vec<String>,
+        /// A task manifest the new build runs once on the control host; it must succeed.
+        #[arg(long)]
+        canary: Option<PathBuf>,
+        /// The canary's image (default: the new build's own, wicket/claude-code:<build id>).
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// Switch back to the previous version: the control host (unless --only-nodes) and these nodes.
+    Rollback {
+        /// `all`, or node names (comma-separated).
+        #[arg(long)]
+        nodes: Option<String>,
+        #[arg(long, requires = "nodes")]
+        only_nodes: bool,
+    },
+    /// Trust a release public key (from `wicket self keygen`) for updates.
+    TrustKey { public: PathBuf },
+    /// Make a release key pair: KEY (private, keep it offline) and KEY.pub.
+    Keygen { key: PathBuf },
+    /// Sign an artifact with a release key: writes <artifact>.sig.
+    Sign {
+        #[arg(long)]
+        key: PathBuf,
+        artifact: PathBuf,
+    },
+    /// This build's version, protocol and schema (JSON).
+    #[command(hide = true)]
+    Describe,
+    /// The health check a new build runs on itself during an update.
+    #[command(hide = true)]
+    Health {
+        #[arg(long)]
+        node: Vec<String>,
+        #[arg(long)]
+        canary: Option<PathBuf>,
+        #[arg(long, default_value = "wicket/claude-code:poc")]
+        image: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1278,7 +1359,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir } => {
-            let ctx = image::context(&dir)?;
+            let ctx = match &dir {
+                Some(d) => image::context(d)?,
+                None => image::embedded_context()?,
+            };
             wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
             println!("built {tag}");
             Ok(())
@@ -1388,6 +1472,28 @@ async fn main() -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
+        Cmd::Itself { cmd } => match cmd {
+            SelfCmd::Status => update::status(),
+            SelfCmd::Update { artifact, sig, nodes, only_nodes, window, interval, check, canary, image } => {
+                let gate = update::Gate {
+                    window: humantime::parse_duration(&window).context("bad --window")?,
+                    interval: humantime::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
+                    checks: check,
+                    canary,
+                    image,
+                };
+                update::update(update::UpdateOpts { artifact, sig, nodes, only_nodes, gate }).await
+            }
+            SelfCmd::Rollback { nodes, only_nodes } => update::rollback(nodes, only_nodes).await,
+            SelfCmd::TrustKey { public } => update::trust_key(&public),
+            SelfCmd::Keygen { key } => update::keygen(&key),
+            SelfCmd::Sign { key, artifact } => update::sign(&key, &artifact),
+            SelfCmd::Describe => {
+                println!("{}", serde_json::to_string(&update::describe()?)?);
+                Ok(())
+            }
+            SelfCmd::Health { node, canary, image } => update::health(node, canary, image).await,
+        },
         c @ Cmd::Serve { .. } => {
             let (opts, no_bootstrap_link) = serve_opts(c).expect("a serve command");
             serve::serve(opts, !no_bootstrap_link).await

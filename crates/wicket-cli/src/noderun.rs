@@ -590,7 +590,7 @@ async fn manage(
         }
         match r {
             Err(e) if !p.ever => {
-                // Never connected, or refused (another build): give up. The run sees the box end.
+                // Never connected, or refused (protocols too far apart): give up. The run sees the box end.
                 match ready.take() {
                     Some(t) => {
                         let _ = t.send(Err(e));
@@ -641,6 +641,7 @@ async fn session(
         node: sh.node.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
         build,
+        proto: crate::chan::PROTOCOL,
         observer: false,
         nonce,
         scope: sh.run.0.clone(),
@@ -660,11 +661,22 @@ async fn session(
         }
         Err(e @ HsError::Timeout(_)) => return Err(e.into()),
         Err(HsError::Refused(why)) => {
-            // Refused either way (identity, revocation, another build): not worth retrying.
+            // Refused either way (identity, revocation, protocol): not worth retrying.
             p.ever = false;
             bail!("{why}")
         }
     };
+    // A token minted by the issuing key (the roots offline, #154) is for nodes that can read it.
+    if sh.token_issuer.issuer_cert.is_some() && authed.proto < crate::chan::ISSUER_CERT {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and this box's token (minted by the authority issuing key, the roots being offline) needs {}: update the node (`wicket node install {}`)",
+            sh.node,
+            authed.proto,
+            crate::chan::ISSUER_CERT,
+            sh.node
+        );
+    }
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, .. } => (feed, runs),
         _ => unreachable!("nodeauth::control returns a welcome"),

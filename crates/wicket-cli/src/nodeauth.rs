@@ -87,6 +87,8 @@ pub enum HsError {
 pub struct Authenticated {
     pub welcome: Msg,
     pub cert: NodeCertClaims,
+    /// The protocol version the connection talks (#162).
+    pub proto: u32,
 }
 
 async fn next_msg<R: AsyncRead + Unpin>(rd: &mut R, node: &str) -> Result<Msg, HsError> {
@@ -141,7 +143,12 @@ where
     let cp = hs.prove(issuer).map_err(|e| refused(e.to_string()))?;
     let _ = wr.write_all(&Frame::Msg(Msg::Prove { proof: cp }).encode()).await;
     match next_msg(rd, node).await? {
-        m @ Msg::Welcome { .. } => Ok(Authenticated { welcome: m, cert }),
+        m @ Msg::Welcome { proto, .. } => match chan::negotiate(chan::PROTOCOL, proto) {
+            Ok(proto) => Ok(Authenticated { welcome: m, cert, proto }),
+            Err(e) => Err(refused(format!(
+                "node {node} can't talk to this control host: {e}; update the older of the two (`wicket self update --nodes {node}`)"
+            ))),
+        },
         Msg::Refused { why } => Err(refused(format!("node {node} refused this control host: {why}"))),
         other => Err(refused(format!("unexpected answer from node {node}: {}", short(&other)))),
     }

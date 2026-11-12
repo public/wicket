@@ -668,6 +668,10 @@ pub fn print(done: &[Done], dry_run: bool) {
 
 /// `wicket reconcile [--dry-run] [--every <interval>]`.
 pub async fn command(dry_run: bool, every: Option<std::time::Duration>) -> Result<()> {
+    if every.is_some() {
+        // `wicket self update` moves the reconciler service to the new build with SIGHUP.
+        crate::update::reexec_on_hangup(crate::update::pidfile("reconcile"), crate::update::Versions::control().root, || {});
+    }
     loop {
         match pass(dry_run).await {
             Ok(d) => print(&d, dry_run),

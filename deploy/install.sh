@@ -4,7 +4,8 @@
 # out of date).
 #
 #   sudo deploy/install.sh [--binary PATH] [--operator USER]... [--trust-domain NAME]
-#                          [--console-origin URL] [--skip-gvisor] [--skip-image] [--no-start]
+#                          [--console-origin URL] [--release-key FILE.pub] [--skip-gvisor]
+#                          [--skip-image] [--no-start]
 #
 # What it does:
 #   - Docker (the distribution's docker.io), and gVisor from its signed apt repository, registered
@@ -13,8 +14,11 @@
 #     and the `wicket-operators` group for the people who start runs (--operator, default the
 #     user running sudo); operators are taken out of the docker group;
 #   - /var/lib/wicket (0700, the wicket user's): ledger, vault, issuer key, runs and their sockets;
-#   - /usr/local/bin/wicket, the agent image's directory under /usr/local/share/wicket, and
-#     /etc/wicket (the daemon's policy, the console's options);
+#   - the binary as a version under /var/lib/wicket-versions (`<build id>/wicket`, `current` and
+#     `previous` links; the wicket user's, which `wicket self update` switches: see
+#     docs/operations.md), /usr/local/bin/wicket a link to its `current`, the agent image's directory
+#     under /usr/local/share/wicket, and /etc/wicket (the daemon's policy, the console's options);
+#   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
 #   - the identity issuer, and the agent image.
 # Then the one secret: sudo wicket secret set claude-oauth (from `claude setup-token`).
@@ -27,6 +31,7 @@ binary=""
 operators=()
 trust_domain=""
 origin=""
+release_key=""
 skip_gvisor=0
 skip_image=0
 start=1
@@ -36,10 +41,11 @@ while [ $# -gt 0 ]; do
         --operator) operators+=("$2"); shift 2 ;;
         --trust-domain) trust_domain=$2; shift 2 ;;
         --console-origin) origin=$2; shift 2 ;;
+        --release-key) release_key=$2; shift 2 ;;
         --skip-gvisor) skip_gvisor=1; shift ;;
         --skip-image) skip_image=1; shift ;;
         --no-start) start=0; shift ;;
-        -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -158,11 +164,43 @@ if [ ! -e /etc/wicket/console.env ]; then
 fi
 
 say "wicket $("$binary" --version | awk '{print $2}')"
-# Replaced only when it differs: running `wicket run`s start children from their own binary.
+# The binary is a version under /var/lib/wicket-versions, owned by the wicket user so that `wicket
+# self update` (run by wicketd, as that user) can stage and switch versions; /usr/local/bin/wicket
+# links to `current`. Root then runs a binary the wicket user could replace: no new power, since that
+# user is in the docker group (Docker is root on this host).
+vroot=/var/lib/wicket-versions
+install -d -o wicket -g wicket -m 0755 "$vroot"
+sha=$(sha256sum "$binary" | cut -d' ' -f1)
+id=${sha:0:12}
+if [ ! -f "$vroot/$id/manifest.json" ]; then
+    rm -rf "$vroot/$id.new"
+    install -d -o wicket -g wicket -m 0755 "$vroot/$id.new"
+    install -o wicket -g wicket -m 0755 "$binary" "$vroot/$id.new/wicket"
+    probe=$(mktemp -d)
+    describe=$(WICKET_HOME=$probe "$vroot/$id.new/wicket" self describe)
+    rm -rf "$probe"
+    python3 - "$vroot/$id.new/manifest.json" "$describe" "$sha" <<'PY'
+import json, sys, time
+m = json.loads(sys.argv[2])
+m.update({"artifact_sha256": sys.argv[3], "source": {"installed": True}, "staged_at": int(time.time())})
+with open(sys.argv[1], "w") as f:
+    json.dump(m, f, indent=2)
+PY
+    chown wicket:wicket "$vroot/$id.new/manifest.json"
+    rm -rf "${vroot:?}/$id"
+    mv "$vroot/$id.new" "$vroot/$id"
+fi
 binary_changed=0
-if ! cmp -s "$binary" /usr/local/bin/wicket; then
-    install -m 0755 "$binary" /usr/local/bin/wicket.new
-    mv -f /usr/local/bin/wicket.new /usr/local/bin/wicket
+cur=$(basename "$(readlink "$vroot/current" 2>/dev/null)" 2>/dev/null || true)
+if [ "$cur" != "$id" ]; then
+    [ -n "$cur" ] && [ "$cur" != . ] && ln -sfn "$cur" "$vroot/.previous.new" && mv -Tf "$vroot/.previous.new" "$vroot/previous"
+    ln -sfn "$id" "$vroot/.current.new" && mv -Tf "$vroot/.current.new" "$vroot/current"
+    chown -h wicket:wicket "$vroot/current" "$vroot/previous" 2>/dev/null || true
+    binary_changed=1
+fi
+if [ "$(readlink /usr/local/bin/wicket 2>/dev/null)" != "$vroot/current/wicket" ]; then
+    ln -sfn "$vroot/current/wicket" /usr/local/bin/wicket.new
+    mv -Tf /usr/local/bin/wicket.new /usr/local/bin/wicket
     binary_changed=1
 fi
 rm -rf /usr/local/share/wicket/images.new
@@ -172,6 +210,13 @@ rm -rf /usr/local/share/wicket/images
 mv /usr/local/share/wicket/images.new /usr/local/share/wicket/images
 
 as_wicket() { (cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket "$@"); }
+
+if [ -n "$release_key" ]; then
+    say "release key"
+    install -o wicket -g wicket -m 0644 "$release_key" /var/lib/wicket/release-key.new.pub
+    as_wicket self trust-key /var/lib/wicket/release-key.new.pub
+    rm -f /var/lib/wicket/release-key.new.pub
+fi
 
 say "identity issuer"
 if [ ! -e /var/lib/wicket/identity/issuer.key ]; then

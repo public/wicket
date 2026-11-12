@@ -231,7 +231,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let (image_owned, node_owned, parent_owned, lease_owned, wsd_owned) = match &record {
         Some(r) => (r.image.clone(), r.node.clone(), r.parent_run.clone(), r.lease.clone(), r.workspace_dir.clone()),
-        None => (image.to_string(), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
+        // A new box: the default image means this build's own (#162); a re-attached one keeps its.
+        None => (crate::image::effective(image), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
     };
     let (image, node, parent_run, lease) = (image_owned.as_str(), node_owned.as_deref(), parent_owned, lease_owned);
     let workspace_dir = wsd_owned.as_deref();
@@ -1752,7 +1753,7 @@ pub fn spawn_attach(run: &str) -> Result<()> {
     let dir = data_dir().join("runs").join(run).join("ctl");
     std::fs::create_dir_all(&dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("attach.log"))?;
-    let mut c = std::process::Command::new(std::env::current_exe().context("finding this binary")?);
+    let mut c = std::process::Command::new(crate::update::self_exe()?);
     c.args(["attach", run]).current_dir(&dir).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: async-signal-safe calls only, in the child before exec: its own session, and no
     // descriptor of the reconciler's but stdio.

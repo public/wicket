@@ -353,8 +353,9 @@ pub struct Link {
     /// What the node reported when this connection was made: its capacity, and the runs it has.
     pub capacity: Option<crate::chan::NodeCapacity>,
     pub runs: Vec<crate::chan::RunState>,
-    /// What the node's build understands ([`crate::chan::FEATURES`]).
-    pub features: Vec<String>,
+    /// The node's build (sha256 of its binary), and the protocol version this connection talks.
+    pub build: String,
+    pub proto: u32,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -376,6 +377,7 @@ impl Link {
             node: node.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             build,
+            proto: crate::chan::PROTOCOL,
             observer: false,
             nonce,
             scope: scope.into(),
@@ -383,9 +385,10 @@ impl Link {
         let authed = crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello)
             .await
             .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
-        let (capacity, runs, features) = match authed.welcome {
-            Msg::Welcome { capacity, runs, features, .. } => (capacity, runs, features),
-            _ => (None, vec![], vec![]),
+        let proto = authed.proto;
+        let (capacity, runs, build) = match authed.welcome {
+            Msg::Welcome { capacity, runs, build, .. } => (capacity, runs, build),
+            _ => (None, vec![], String::new()),
         };
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -407,6 +410,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, capacity, runs, features, task })
+        Ok(Link { calls, capacity, runs, build, proto, task })
     }
 }

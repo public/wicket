@@ -220,9 +220,9 @@ fn audit(kind: &str, body: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Active nodes that can't be shown to understand `feature` (unreachable, or whose build doesn't
-/// report it), each with why. This host's own node is started if it isn't serving.
-async fn nodes_lacking(feature: &str) -> Result<Vec<(String, String)>> {
+/// Active nodes that can't be shown to talk protocol `proto` or later (unreachable, or older), each
+/// with why. This host's own node is started if it isn't serving.
+async fn nodes_below(proto: u32) -> Result<Vec<(String, String)>> {
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(wicket_store::Ledger::open(&crate::ledger_path())?));
     let nodes: Vec<String> = ledger.lock().expect("ledger").nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
     let mut out = vec![];
@@ -235,8 +235,11 @@ async fn nodes_lacking(feature: &str) -> Result<Vec<(String, String)>> {
         }
         let scope = format!("keys:{}", std::process::id());
         match tokio::time::timeout(std::time::Duration::from_secs(10), crate::nodecall::Link::connect(&n, &scope, &ledger)).await {
-            Ok(Ok(l)) if l.features.iter().any(|f| f == feature) => {}
-            Ok(Ok(_)) => out.push((n, format!("its build doesn't understand `{feature}`: update it (`wicket node install`)"))),
+            Ok(Ok(l)) if l.proto >= proto => {}
+            Ok(Ok(l)) => out.push((
+                n,
+                format!("it talks protocol {}, and issuing-key tokens need {proto}: update it (`wicket node install`)", l.proto),
+            )),
             Ok(Err(e)) => out.push((n, format!("can't be asked: {e:#}"))),
             Err(_) => out.push((n, "can't be asked: no answer in 10 s".into())),
         }
@@ -254,7 +257,7 @@ pub async fn roots_offline(to: &Path, days: i64) -> Result<()> {
     }
     // Tokens are then minted by the issuing key and carry its certificate: every active node must
     // understand that, or it would refuse every box (a node's build is checked, not assumed).
-    let lacking = nodes_lacking("issuer_cert").await?;
+    let lacking = nodes_below(crate::chan::ISSUER_CERT).await?;
     if !lacking.is_empty() {
         bail!(
             "not every node can take tokens minted by an issuing key; nothing changed:\n{}\n(update them, or revoke the ones you no longer use)",

@@ -26,7 +26,8 @@
 //!   box's stdio, events, asks and tunnels go to the connection that started or last resumed it. A
 //!   newer connection with the same scope replaces the older one, but only once it has proved this
 //!   installation's issuer key and accepted the node's certificate (`nodeauth.rs`). The control
-//!   host must also run the same wicket build (sha256 of the binary): anything else is refused.
+//!   host's protocol version must be within [`chan::PROTOCOL_SKEW`] of this node's (#162; any build
+//!   that speaks it will do, so the two can be updated one at a time).
 //! - **Clock.** Feed decisions use the wall clock read once at start, advanced by a monotonic clock, so
 //!   a wall-clock step while serving can't stretch a freshness statement (wicket-feed's README).
 
@@ -110,8 +111,9 @@ impl NodePaths {
     }
 }
 
-/// The running binary's sha256: control host and node must run the same build. Hashed once per
-/// process (a release binary is large, and every run connects to a node).
+/// The running binary's sha256: what `wicket self` names versions by, and what the channel's hello
+/// reports (for the logs). Hashed once per process (a release binary is large, and every run
+/// connects to a node).
 pub fn build_id() -> Result<String> {
     use sha2::Digest;
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -188,6 +190,9 @@ struct Link {
     kill: Option<oneshot::Sender<()>>,
     /// Tunnels opened for the boxes this connection owns; they die with it.
     tunnels: Arc<Tunnels>,
+    /// The protocol version it talks ([`chan::negotiate`]): a message newer than this isn't sent on it.
+    #[allow(dead_code)]
+    proto: u32,
 }
 
 struct Node {
@@ -472,6 +477,26 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     }
     adopt_previous(&node).await;
     {
+        // `wicket self update` moves a node to a new build with SIGHUP: it saves where each box's
+        // output got to, commits its audit, and re-executes itself from the new version, which
+        // adopts the boxes as a restarted `serve` does (#151). Its boxes never stop.
+        let n = node.clone();
+        // This host's own node runs the control host's versions; another node its own.
+        let versions = match n.paths.shares_host() {
+            true => crate::update::Versions::control().root,
+            false => n.paths.root.join("versions"),
+        };
+        crate::update::reexec_on_hangup(n.paths.root.join("serve.pid"), versions, move || {
+            for b in n.boxes.lock().expect("boxes").values_mut() {
+                save_output(b);
+            }
+            if let Ok(l) = n.audit.lock() {
+                let _ = l.flush_audit();
+            }
+            n.ship_audit();
+        });
+    }
+    {
         // A run whose lease has lapsed (its control host gone longer than the feed window): kept
         // running by default, as before run leases; `WICKET_NODE_LEASE_EXPIRY=stop` stops it instead.
         let n = node.clone();
@@ -622,19 +647,24 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
         return Ok(());
     }
     let refuse = |why: String| Frame::Msg(Msg::Refused { why }).encode();
+    let mut negotiated = 0;
     let (observer, scope) = match hello {
-        Some(Frame::Msg(Msg::Hello { node: n, build, version, observer, nonce, scope })) => {
+        Some(Frame::Msg(Msg::Hello { node: n, build, version, proto, observer, nonce, scope })) => {
             let why = if n != node.name {
                 Some(format!("this is node {}, not {n}", node.name))
-            } else if build != node.build {
-                Some(format!(
-                    "the control host runs wicket {version} build {}…, this node runs build {}…: run `wicket node install {}` from the control host",
-                    &build[..12.min(build.len())],
-                    &node.build[..12],
-                    node.name
-                ))
             } else {
-                None
+                match chan::negotiate(chan::PROTOCOL, proto) {
+                    Ok(p) => {
+                        negotiated = p;
+                        None
+                    }
+                    Err(e) => Some(format!(
+                        "the control host (wicket {version}, build {}…) can't talk to this node: {e}; update the older of the two (`wicket self update --nodes {}`, or `wicket node install {}`)",
+                        &build[..12.min(build.len())],
+                        node.name,
+                        node.name
+                    )),
+                }
             };
             if let Some(why) = why {
                 wr.write_all(&refuse(why.clone())).await?;
@@ -685,7 +715,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
                 }
             }
         }
-        links.insert(gen, Link { out: tx.clone(), scope: scope.clone(), kill: Some(kill_tx), tunnels: tunnels.clone() });
+        links.insert(gen, Link { out: tx.clone(), scope: scope.clone(), kill: Some(kill_tx), tunnels: tunnels.clone(), proto: negotiated });
     }
     let writer = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
@@ -713,15 +743,12 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
     let capacity = Some(node.capacity());
-    let _ = tx.send(Frame::Msg(Msg::Welcome {
-        node: node.name.clone(),
-        build: node.build.clone(),
-        feed,
-        runs,
-        capacity,
-        features: crate::chan::FEATURES.iter().map(|f| f.to_string()).collect(),
-    }));
-    eprintln!("[node] control host connected{}", if scope.is_empty() { String::new() } else { format!(" ({scope})") });
+    let _ =
+        tx.send(Frame::Msg(Msg::Welcome { node: node.name.clone(), build: node.build.clone(), proto: negotiated, feed, runs, capacity }));
+    eprintln!(
+        "[node] control host connected{} (protocol {negotiated})",
+        if scope.is_empty() { String::new() } else { format!(" ({scope})") }
+    );
     let result = loop {
         tokio::select! {
             _ = &mut kill_rx => break Ok(()),
@@ -1957,6 +1984,7 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
             node: paths.name()?,
             version: env!("CARGO_PKG_VERSION").into(),
             build: build_id()?,
+            proto: chan::PROTOCOL,
             observer: true,
             nonce: String::new(),
             scope: String::new(),
@@ -2097,11 +2125,12 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(s)).await.unwrap().unwrap().unwrap()
     }
 
-    fn hello(build: &str) -> impl FnOnce(String) -> Msg + '_ {
+    fn hello(proto: u32) -> impl FnOnce(String) -> Msg {
         move |nonce| Msg::Hello {
             node: "n1".into(),
             version: "t".into(),
-            build: build.into(),
+            build: "any build".into(),
+            proto,
             observer: false,
             nonce,
             scope: String::new(),
@@ -2113,14 +2142,14 @@ mod tests {
     async fn handshake(
         node: &Arc<Node>,
         gen: u64,
-        build: &str,
+        proto: u32,
         i: &Install,
         issuer: &wicket_identity::Issuer,
     ) -> (UnixStream, Result<Msg, HsError>) {
         let (mut a, b) = UnixStream::pair().unwrap();
         tokio::spawn(connection(node.clone(), b, gen));
         let (mut rd, mut wr) = a.split();
-        let r = crate::nodeauth::control(&mut rd, &mut wr, "n1", &i.ledger, issuer, hello(build)).await.map(|a| a.welcome);
+        let r = crate::nodeauth::control(&mut rd, &mut wr, "n1", &i.ledger, issuer, hello(proto)).await.map(|a| a.welcome);
         (a, r)
     }
 
@@ -2130,14 +2159,22 @@ mod tests {
         tokio::spawn(connection(node.clone(), b, gen));
         let (mut rd, mut wr) = a.split();
         let build = node.build.clone();
-        let hello = move |nonce| Msg::Hello { node: "n1".into(), version: "t".into(), build, observer: false, nonce, scope: run.into() };
+        let hello = move |nonce| Msg::Hello {
+            node: "n1".into(),
+            version: "t".into(),
+            build,
+            proto: chan::PROTOCOL,
+            observer: false,
+            nonce,
+            scope: run.into(),
+        };
         let r = crate::nodeauth::control(&mut rd, &mut wr, "n1", &i.ledger, &i.issuer, hello).await.map(|a| a.welcome);
         assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
         a
     }
 
     async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
-        let (a, r) = handshake(node, gen, &node.build, i, &i.issuer).await;
+        let (a, r) = handshake(node, gen, chan::PROTOCOL, i, &i.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
         a
     }
@@ -2194,12 +2231,20 @@ mod tests {
                 record: fake_record("run_a"),
             },
         );
-        // Another build is refused.
-        let (_, r) = handshake(&node, 1, "not-this-build", &inst, &inst.issuer).await;
-        assert!(matches!(r, Err(HsError::Refused(why)) if why.contains("wicket node install n1")));
+        // A control host from before protocol versions, or two versions apart, is refused.
+        let (_, r) = handshake(&node, 1, 0, &inst, &inst.issuer).await;
+        assert!(
+            matches!(&r, Err(HsError::Refused(why)) if why.contains("before protocol versions") && why.contains("self update --nodes n1")),
+            "{r:?}"
+        );
+        let (_, r) = handshake(&node, 1, chan::PROTOCOL + 2, &inst, &inst.issuer).await;
+        assert!(matches!(&r, Err(HsError::Refused(why)) if why.contains("at most 1 apart")), "{r:?}");
+        // One apart either way is accepted, at the lower version (`connect` below is at this build's).
+        let (_, r) = handshake(&node, 1, chan::PROTOCOL + 1, &inst, &inst.issuer).await;
+        assert!(matches!(r, Ok(Msg::Welcome { proto, .. }) if proto == chan::PROTOCOL), "{r:?}");
 
         // Connected: output flows, and is acknowledged.
-        let (mut c, r) = handshake(&node, 2, &node.build, &inst, &inst.issuer).await;
+        let (mut c, r) = handshake(&node, 2, chan::PROTOCOL, &inst, &inst.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { runs, .. }) if runs[0].stdout_total == 0));
         box_output(&node, b"hello\n");
         assert_eq!(next_msg(&mut c).await, Frame::Data { stream: 2, offset: 0, bytes: b"hello\n".to_vec() });
@@ -2223,7 +2268,7 @@ mod tests {
         assert_eq!(node.boxes.lock().unwrap()["run_a"].out[0].start(), 6, "acknowledged output was dropped");
 
         // Reconnect: the welcome says how far stdin and stdout got; a resume replays what was missed.
-        let (mut c, r) = handshake(&node, 3, &node.build, &inst, &inst.issuer).await;
+        let (mut c, r) = handshake(&node, 3, chan::PROTOCOL, &inst, &inst.issuer).await;
         match r {
             Ok(Msg::Welcome { runs, .. }) => {
                 assert_eq!((runs[0].stdin_received, runs[0].stdout_total), (3, 26));
@@ -2256,13 +2301,13 @@ mod tests {
         // A control host with another installation's issuer: it can't verify this node's certificate
         // (so it refuses the node), and the node never sees a proof it accepts.
         let impostor = wicket_identity::Issuer::generate("test.wicket.example");
-        let why = refused(handshake(&node, 2, &node.build, &inst, &impostor).await.1);
+        let why = refused(handshake(&node, 2, chan::PROTOCOL, &inst, &impostor).await.1);
         assert!(why.contains("not signed by this installation"), "{why}");
         // One that skips checking the node and just signs with its own key: the node refuses it.
         let (mut a, b) = UnixStream::pair().unwrap();
         tokio::spawn(connection(node.clone(), b, 3));
         let mut hs = wicket_identity::node::ControlHandshake::new("n1", b"");
-        a.write_all(&Frame::Msg(hello(&node.build)(hs.nonce().into())).encode()).await.unwrap();
+        a.write_all(&Frame::Msg(hello(chan::PROTOCOL)(hs.nonce().into())).encode()).await.unwrap();
         let Frame::Msg(Msg::Challenge { proof }) = next_msg(&mut a).await else { panic!("no challenge") };
         hs.verify_node(&proof, &inst.issuer.verifying_key(), &inst.key.verifying_key(), wicket_store::now()).unwrap();
         a.write_all(&Frame::Msg(Msg::Prove { proof: hs.prove(&impostor).unwrap() }).encode()).await.unwrap();
@@ -2270,7 +2315,7 @@ mod tests {
         // A peer that says hello and then nothing useful.
         let (mut a, b) = UnixStream::pair().unwrap();
         tokio::spawn(connection(node.clone(), b, 4));
-        a.write_all(&Frame::Msg(hello(&node.build)(wicket_identity::node::nonce())).encode()).await.unwrap();
+        a.write_all(&Frame::Msg(hello(chan::PROTOCOL)(wicket_identity::node::nonce())).encode()).await.unwrap();
         let _ = next_msg(&mut a).await;
         a.write_all(&Frame::Msg(Msg::Kill { run: "run_a".into() }).encode()).await.unwrap();
         assert!(matches!(next_msg(&mut a).await, Frame::Msg(Msg::Refused { .. })));
@@ -2279,27 +2324,27 @@ mod tests {
         // The node's certificate from another installation (same key and name).
         let (foreign, _) = impostor.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now(), 3600);
         std::fs::write(&cert_path, &foreign).unwrap();
-        let why = refused(handshake(&node, 5, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 5, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("not signed by this installation"), "{why}");
         // Expired (by the control host's clock).
         let (expired, _) = inst.issuer.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now() - 7200, 3600);
         std::fs::write(&cert_path, &expired).unwrap();
-        let why = refused(handshake(&node, 6, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 6, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("expired"), "{why}");
         // Signed by this issuer, but never recorded (not issued through enrolment or renewal).
         let (unrecorded, _) = inst.issuer.issue_node_cert("n1", &inst.key.verifying_key(), wicket_store::now(), 3600);
         std::fs::write(&cert_path, &unrecorded).unwrap();
-        let why = refused(handshake(&node, 7, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 7, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("never recorded"), "{why}");
         // No certificate at all.
         std::fs::remove_file(&cert_path).unwrap();
-        let why = refused(handshake(&node, 8, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 8, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("no identity certificate"), "{why}");
         // A node whose key isn't the enrolled one (re-keyed or replaced), with a certificate for it.
         let other = wicket_identity::SigningKey::generate(&mut rand_core::OsRng);
         let (theirs, _) = inst.issuer.issue_node_cert("n1", &other.verifying_key(), wicket_store::now(), 3600);
         std::fs::write(&cert_path, &theirs).unwrap();
-        let why = refused(handshake(&node, 9, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 9, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("enrolled key"), "{why}");
         // Through all of that, the authenticated connection kept the link.
         wait_link(&node, Some(1)).await;
@@ -2338,7 +2383,7 @@ mod tests {
 
         // Revoked: refused at once, whatever certificate it holds.
         inst.ledger.lock().unwrap().revoke_node("n1").unwrap();
-        let why = refused(handshake(&node, 12, &node.build, &inst, &inst.issuer).await.1);
+        let why = refused(handshake(&node, 12, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("revoked"), "{why}");
     }
 

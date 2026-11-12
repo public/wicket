@@ -374,7 +374,7 @@ pub fn trigger_wake(agent: &str, by: &str) {
         Ok(f) => f,
         Err(e) => return eprintln!("[wicket] can't wake {agent}: {e}"),
     };
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = crate::update::self_exe() else { return };
     let mut c = std::process::Command::new(exe);
     c.args(["wake", agent, "--by", by]).stdin(std::process::Stdio::null());
     if let Ok(l2) = log.try_clone() {
