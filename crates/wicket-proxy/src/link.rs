@@ -4,8 +4,12 @@
 //! - in A, a listener on `<name>.wicket.internal:P` (an address from the link pool, which
 //!   `wicket-entry` put on A's loopback at start, and a line in A's hosts file, which wicket owns),
 //!   forwarding to a unix socket in A's socket directory;
-//! - on the host, wicket listening on that socket, and for each connection opening a byte stream to
-//!   127.0.0.1:P inside B (`BoxOps::dial`), and copying bytes between the two.
+//! - on A's node, that socket, each connection to it relayed to the process that opened the link
+//!   (`BoxOps::accept`), which opens a byte stream to 127.0.0.1:P inside B on B's node
+//!   (`BoxOps::dial`) and copies bytes between the two.
+//!
+//! A and B may be on any nodes, this host's own included (#146): the relay reaches each over its
+//! node's authenticated control channel, so a link across nodes passes through the control host.
 //!
 //! The process that opens a link runs its relay, and checks the ledger every couple of seconds: the
 //! link is closed (and its live connections dropped) once it's cut (`unlink`, `wicket unlink`),
@@ -17,11 +21,9 @@
 
 use crate::{Event, RunCtx};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use wicket_core::link::{self as policy, Decision, End, Named};
 use wicket_core::{Op, ZoneSpec};
 use wicket_store::LinkRow;
@@ -38,20 +40,29 @@ pub struct Stream {
     pub guard: Box<dyn std::any::Any + Send>,
 }
 
-/// What links need from the boxes themselves, supplied by whoever runs them (`wicket run`).
+type Fut<'a, T> = futures_util::future::BoxFuture<'a, T>;
+
+/// What links need from the boxes themselves, supplied by whoever runs them (`wicket run`): each box
+/// is reached on its own node.
 pub trait BoxOps: Send + Sync {
-    /// The host directory of a run's box: its `sock/` is the box's `/wicket/sock`, its `hosts` the
-    /// box's `/etc/hosts`. None when the box isn't one wicket can link here (e.g. on a remote node).
-    fn box_dir(&self, run: &str) -> Option<PathBuf>;
+    /// Whether wicket can link `run`'s box (on a node it reaches), and if not, why.
+    fn reachable(&self, run: &str) -> Result<(), String>;
     /// The zone of one of this run's own children, from the record of its spawn.
     fn child_zone(&self, child_run: &str) -> Option<ZoneSpec>;
+    /// Rewrites `run`'s box's /etc/hosts.
+    fn set_hosts<'a>(&'a self, run: &'a str, text: String) -> Fut<'a, Result<(), String>>;
+    /// Listens on the unix socket `sock` in `run`'s box's socket directory (the box sees it as
+    /// `/wicket/sock/<sock>`): its connections, as they come.
+    fn accept<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, Result<tokio::sync::mpsc::UnboundedReceiver<Stream>, String>>;
+    /// Stops that (best effort).
+    fn close_accept<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, ()>;
     /// Starts, inside `run`'s box, a listener on `addr:port` that forwards each connection to the
-    /// in-box unix socket `sock`. Blocking.
-    fn listen(&self, run: &str, addr: Ipv4Addr, port: u16, sock: &str) -> Result<(), String>;
-    /// Stops that listener (best effort; the box may be gone). Blocking.
-    fn unlisten(&self, run: &str, sock: &str);
+    /// in-box unix socket `sock`.
+    fn listen<'a>(&'a self, run: &'a str, addr: Ipv4Addr, port: u16, sock: &'a str) -> Fut<'a, Result<(), String>>;
+    /// Stops that listener (best effort; the box may be gone).
+    fn unlisten<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, ()>;
     /// A byte stream to 127.0.0.1:`port` inside `run`'s box.
-    fn dial(&self, run: &str, port: u16) -> Result<Stream, String>;
+    fn dial<'a>(&'a self, run: &'a str, port: u16) -> Fut<'a, Result<Stream, String>>;
 }
 
 type Reply = (String, bool);
@@ -191,7 +202,7 @@ pub async fn connect(ctx: &RunCtx, target: &str, port: Option<u64>) -> Reply {
 }
 
 async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<String, String> {
-    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on this host (this one can't link)")?;
+    let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
     let port = check_port(port)?;
     let to = resolve(ctx, target)?;
     let (me, _) = end_info(ctx, &*ops, &ctx.run.0, None)?;
@@ -204,7 +215,7 @@ async fn connect_inner(ctx: &RunCtx, target: &str, port: Option<u64>) -> Result<
 /// `link(from, to, port)`: the caller, controlling both ends, lets `from` reach `port` of `to`.
 pub async fn link(ctx: &RunCtx, from: &str, to: &str, port: Option<u64>) -> Reply {
     let r = async {
-        let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on this host (this one can't link)")?;
+        let ops = ctx.boxes.clone().ok_or("links need a box wicket runs on a node (this one can't link)")?;
         let port = check_port(port)?;
         let (from, to) = (resolve(ctx, from)?, resolve(ctx, to)?);
         let (f, _) = end_info(ctx, &*ops, &from, None)?;
@@ -257,8 +268,8 @@ pub fn list(ctx: &RunCtx) -> Reply {
     (serde_json::to_string_pretty(&rows).unwrap_or_default(), false)
 }
 
-/// Rewrites a box's hosts file in place (it is bind-mounted by inode) from its open links.
-fn write_hosts(ctx: &RunCtx, dir: &Path, from_run: &str) {
+/// Rewrites a box's hosts file from its open links.
+async fn write_hosts(ctx: &RunCtx, ops: &dyn BoxOps, from_run: &str) {
     let names: Vec<(String, Ipv4Addr)> = ledger(ctx)
         .links_from(from_run)
         .unwrap_or_default()
@@ -266,10 +277,8 @@ fn write_hosts(ctx: &RunCtx, dir: &Path, from_run: &str) {
         .filter(|r| r.status == "open")
         .filter_map(|r| Some((r.name, r.addr.parse().ok()?)))
         .collect();
-    let path = dir.join("hosts");
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).truncate(true).open(&path) {
-        use std::io::Write;
-        let _ = f.write_all(policy::hosts_file(&names).as_bytes());
+    if let Err(e) = ops.set_hosts(from_run, policy::hosts_file(&names)).await {
+        tracing::warn!("rewriting {from_run}'s hosts file failed: {e}");
     }
 }
 
@@ -282,10 +291,8 @@ async fn open(
     d: Decision,
     wanted: &str,
 ) -> Result<String, String> {
-    let dir = ops.box_dir(&from.run).ok_or_else(|| format!("box {} is not one wicket can link here", from.run))?;
-    if ops.box_dir(&to.run).is_none() {
-        return Err(format!("box {} is not one wicket can link here", to.run));
-    }
+    ops.reachable(&from.run)?;
+    ops.reachable(&to.run)?;
     let existing = ledger(ctx).open_link(&from.run, &to.run, port).map_err(|e| e.to_string())?;
     if let Some(r) = existing {
         return Ok(format!("already linked ({}): {}.{}:{port}", r.id, r.name, policy::DOMAIN));
@@ -332,9 +339,9 @@ async fn open(
         .collect();
     let (name, addr) = policy::allocate(&used, &to.run, wanted)?;
     let id = wicket_core::new_link_id();
-    let host_sock = dir.join("sock").join(format!("link-{id}.sock"));
-    let box_sock = format!("/wicket/sock/link-{id}.sock");
-    let listener = UnixListener::bind(&host_sock).map_err(|e| format!("relay socket: {e}"))?;
+    let sock = format!("link-{id}.sock");
+    let box_sock = format!("/wicket/sock/{sock}");
+    let incoming = ops.accept(&from.run, &sock).await.map_err(|e| format!("relay socket: {e}"))?;
     let row = LinkRow {
         id: id.clone(),
         tenant: ctx.tenant.0.clone(),
@@ -351,14 +358,16 @@ async fn open(
         closed_by: None,
         close_reason: None,
     };
-    ledger(ctx).add_link(&row).map_err(|e| e.to_string())?;
-    write_hosts(ctx, &dir, &from.run);
-    let (o2, run2, bs) = (ops.clone(), from.run.clone(), box_sock.clone());
-    let listened = tokio::task::spawn_blocking(move || o2.listen(&run2, addr, port, &bs)).await.map_err(|e| e.to_string())?;
-    if let Err(e) = listened {
-        let _ = std::fs::remove_file(&host_sock);
+    let added = ledger(ctx).add_link(&row);
+    if let Err(e) = added {
+        ops.close_accept(&from.run, &sock).await;
+        return Err(e.to_string());
+    }
+    write_hosts(ctx, &*ops, &from.run).await;
+    if let Err(e) = ops.listen(&from.run, addr, port, &box_sock).await {
+        ops.close_accept(&from.run, &sock).await;
         let _ = ledger(ctx).close_link(&id, "wicket", &format!("could not listen in the box: {e}"));
-        write_hosts(ctx, &dir, &from.run);
+        write_hosts(ctx, &*ops, &from.run).await;
         return Err(format!("could not listen in box {}: {e}", from.run));
     }
     let address = format!("{name}.{}:{port}", policy::DOMAIN);
@@ -373,13 +382,14 @@ async fn open(
     );
     // A link carries traffic only once it is on the record (fail closed).
     if let Err(e) = audited {
-        let _ = std::fs::remove_file(&host_sock);
+        ops.close_accept(&from.run, &sock).await;
+        ops.unlisten(&from.run, &box_sock).await;
         let _ = ledger(ctx).close_link(&id, "wicket", &format!("the audit record could not be written: {e}"));
-        write_hosts(ctx, &dir, &from.run);
+        write_hosts(ctx, &*ops, &from.run).await;
         return Err(format!("link not opened: the audit record could not be written ({e})"));
     }
     ctx.emit(Event::Tool { name: "link".into(), detail: format!("opened {id}: {} → {address} ({}, port {port})", from.agent, to.agent) });
-    tokio::spawn(relay(ctx.clone(), ops, row, listener, host_sock, dir));
+    tokio::spawn(relay(ctx.clone(), ops, row, incoming));
     let who = if from.run == ctx.run.0 { "this box".to_string() } else { format!("box {} ({})", from.agent, from.run) };
     Ok(format!(
         "linked {id}: {who} reaches port {port} of box {} ({}) at {address} ({basis}). Relayed by wicket; it closes when either box ends or is revoked, or on unlink {id}.",
@@ -406,18 +416,18 @@ fn must_close(ctx: &RunCtx, row: &LinkRow) -> Option<String> {
     None
 }
 
-async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, listener: UnixListener, host_sock: PathBuf, dir: PathBuf) {
+async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, mut incoming: tokio::sync::mpsc::UnboundedReceiver<Stream>) {
     let mut conns = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(POLL);
     let mut served = 0u64;
     let reason = loop {
         tokio::select! {
-            a = listener.accept() => match a {
-                Ok((s, _)) => {
+            a = incoming.recv() => match a {
+                Some(s) => {
                     if let Some(r) = must_close(&ctx, &row) {
                         break r;
                     }
-                    match ops.dial(&row.to_run, row.port) {
+                    match ops.dial(&row.to_run, row.port).await {
                         Ok(st) => {
                             served += 1;
                             conns.spawn(pipe(s, st));
@@ -425,7 +435,7 @@ async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, listener: UnixLi
                         Err(e) => tracing::warn!("link {}: dialing {} failed: {e}", row.id, row.to_run),
                     }
                 }
-                Err(e) => break format!("relay socket failed: {e}"),
+                None => break "the relay socket's node channel was lost".to_string(),
             },
             _ = tick.tick() => if let Some(r) = must_close(&ctx, &row) {
                 break r;
@@ -434,12 +444,11 @@ async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, listener: UnixLi
         }
     };
     conns.abort_all();
-    drop(listener);
-    let _ = std::fs::remove_file(&host_sock);
+    drop(incoming);
+    ops.close_accept(&row.from_run, &format!("link-{}.sock", row.id)).await;
     let closed_now = ctx.ledger.lock().ok().and_then(|l| l.close_link(&row.id, "wicket", &reason).ok()).unwrap_or(false);
-    write_hosts(&ctx, &dir, &row.from_run);
-    let (o2, run2, sock) = (ops.clone(), row.from_run.clone(), format!("/wicket/sock/link-{}.sock", row.id));
-    let _ = tokio::task::spawn_blocking(move || o2.unlisten(&run2, &sock)).await;
+    write_hosts(&ctx, &*ops, &row.from_run).await;
+    ops.unlisten(&row.from_run, &format!("/wicket/sock/link-{}.sock", row.id)).await;
     if let Ok(l) = ctx.ledger.lock() {
         let _ = l.audit(
             &ctx.tenant,
@@ -452,8 +461,8 @@ async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, listener: UnixLi
 }
 
 /// Copies bytes both ways until both sides are done.
-async fn pipe(s: UnixStream, st: Stream) {
-    let (mut r, mut w) = s.into_split();
+async fn pipe(s: Stream, st: Stream) {
+    let Stream { read: mut r, write: mut w, guard: g1 } = s;
     let Stream { mut read, mut write, guard } = st;
     let up = async {
         let _ = tokio::io::copy(&mut r, &mut write).await;
@@ -465,6 +474,7 @@ async fn pipe(s: UnixStream, st: Stream) {
     };
     tokio::join!(up, down);
     drop(guard);
+    drop(g1);
 }
 
 #[cfg(test)]
@@ -472,7 +482,9 @@ mod tests {
     use super::*;
     use crate::{IdentityCell, RunIdentity};
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::io::AsyncReadExt;
     use wicket_core::{Manifest, RunId, TenantId};
     use wicket_identity::{AgentKey, Issuer};
@@ -484,24 +496,63 @@ mod tests {
         root: PathBuf,
         zones: HashMap<String, ZoneSpec>,
         listening: Mutex<Vec<(String, Ipv4Addr, u16, String)>>,
+        accepting: Mutex<HashMap<PathBuf, tokio::task::JoinHandle<()>>>,
     }
 
     impl BoxOps for FakeBoxes {
-        fn box_dir(&self, run: &str) -> Option<PathBuf> {
-            let d = self.root.join(run);
-            d.join("hosts").exists().then_some(d)
+        fn reachable(&self, run: &str) -> Result<(), String> {
+            match self.root.join(run).join("hosts").exists() {
+                true => Ok(()),
+                false => Err(format!("box {run} is not on a node wicket reaches")),
+            }
         }
         fn child_zone(&self, run: &str) -> Option<ZoneSpec> {
             self.zones.get(run).cloned()
         }
-        fn listen(&self, run: &str, addr: Ipv4Addr, port: u16, sock: &str) -> Result<(), String> {
+        fn set_hosts<'a>(&'a self, run: &'a str, text: String) -> Fut<'a, Result<(), String>> {
+            Box::pin(async move { std::fs::write(self.root.join(run).join("hosts"), text).map_err(|e| e.to_string()) })
+        }
+        fn accept<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, Result<tokio::sync::mpsc::UnboundedReceiver<Stream>, String>> {
+            Box::pin(async move {
+                let path = self.root.join(run).join("sock").join(sock);
+                let l = UnixListener::bind(&path).map_err(|e| e.to_string())?;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let t = tokio::spawn(async move {
+                    while let Ok((s, _)) = l.accept().await {
+                        let (r, w) = s.into_split();
+                        if tx.send(Stream { read: Box::new(r), write: Box::new(w), guard: Box::new(()) }).is_err() {
+                            break;
+                        }
+                    }
+                });
+                self.accepting.lock().unwrap().insert(path, t);
+                Ok(rx)
+            })
+        }
+        fn close_accept<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, ()> {
+            Box::pin(async move {
+                let path = self.root.join(run).join("sock").join(sock);
+                if let Some(t) = self.accepting.lock().unwrap().remove(&path) {
+                    t.abort();
+                }
+                let _ = std::fs::remove_file(path);
+            })
+        }
+        fn listen<'a>(&'a self, run: &'a str, addr: Ipv4Addr, port: u16, sock: &'a str) -> Fut<'a, Result<(), String>> {
             self.listening.lock().unwrap().push((run.into(), addr, port, sock.into()));
-            Ok(())
+            Box::pin(async { Ok(()) })
         }
-        fn unlisten(&self, _run: &str, sock: &str) {
+        fn unlisten<'a>(&'a self, _run: &'a str, sock: &'a str) -> Fut<'a, ()> {
             self.listening.lock().unwrap().retain(|l| l.3 != sock);
+            Box::pin(async {})
         }
-        fn dial(&self, run: &str, _port: u16) -> Result<Stream, String> {
+        fn dial<'a>(&'a self, run: &'a str, _port: u16) -> Fut<'a, Result<Stream, String>> {
+            Box::pin(async move { self.dial_now(run) })
+        }
+    }
+
+    impl FakeBoxes {
+        fn dial_now(&self, run: &str) -> Result<Stream, String> {
             let (a, b) = tokio::io::duplex(4096);
             let tag = run.to_string();
             let echo = tokio::spawn(async move {
@@ -589,6 +640,7 @@ mod tests {
                 root: self.root.clone(),
                 zones: kids.iter().map(|(r, z)| (r.to_string(), z.clone())).collect(),
                 listening: Mutex::new(vec![]),
+                accepting: Mutex::new(HashMap::new()),
             };
             RunCtx {
                 tenant: TenantId::single(),

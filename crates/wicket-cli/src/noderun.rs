@@ -287,6 +287,8 @@ pub struct Start {
     pub ledger: Arc<Mutex<Ledger>>,
     pub events: mpsc::UnboundedSender<wicket_proxy::Event>,
     pub start: BoxStart,
+    /// Calls on boxes over this run's connection (made before the run's proxies, which use them).
+    pub calls: Arc<Calls>,
 }
 
 struct Shared {
@@ -361,7 +363,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher: feed,
         token_root,
         killed: AtomicBool::new(false),
-        calls: Arc::new(Calls::default()),
+        calls: s.calls.clone(),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),

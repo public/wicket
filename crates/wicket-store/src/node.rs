@@ -160,6 +160,11 @@ impl Ledger {
         Ok(())
     }
 
+    /// The node a run's box was placed on, if recorded.
+    pub fn run_node(&self, run: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT node FROM runs WHERE id = ?1", params![run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())
+    }
+
     /// Whether `node` has ever shipped a v2 record: from then on, v1 records from it are refused.
     fn node_shipped_v2(&self, node: &str) -> Result<bool> {
         Ok(self.conn.query_row(

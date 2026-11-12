@@ -270,7 +270,6 @@ impl Calls {
 /// A control connection of its own to a node, for calls on boxes other processes run (a link
 /// relay's). Authenticated like a run's; it carries no feed and owns no box.
 pub struct Link {
-    pub node: String,
     pub calls: Arc<Calls>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -318,6 +317,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { node: node.into(), calls, task })
+        Ok(Link { calls, task })
     }
 }

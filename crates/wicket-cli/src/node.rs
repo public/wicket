@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use wicket_sandbox::shell_quote;
 
 pub struct Node {
@@ -68,11 +68,6 @@ impl Node {
             .filter(|h| !h.trim().is_empty())
             .map(|h| h.split_whitespace().map(String::from).collect());
         Node { target: target.to_string(), name: name.map(String::from), base, hook }
-    }
-
-    /// The name runs and identities record: the enrolled name, else the ssh target.
-    pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.target.clone())
     }
 
     /// The ssh command up to and including the target (for Docker::over_ssh).

@@ -138,6 +138,8 @@ struct BoxState {
     out: [OutBuf; 2],
     exited: Option<(i32, Option<String>)>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// uid:gid the box runs as (execs in it run as this, unless asked otherwise).
+    user: String,
     /// Link relay sockets listened on in its socket directory, by name.
     listeners: HashMap<String, tokio::task::JoinHandle<()>>,
     /// The control connection that started or last resumed it: its stdio, events, asks and
@@ -745,10 +747,16 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 let (Some(out), true) = (out, stream & TUNNEL_BIT != 0 && stream & chan::CONTROL_TUNNEL_BIT != 0) else {
                     return Ok(());
                 };
-                let name = node.boxes.lock().expect("boxes").get(&run).filter(|b| b.exited.is_none()).map(|b| b.name.clone());
-                let spawned = match name {
+                let found = node
+                    .boxes
+                    .lock()
+                    .expect("boxes")
+                    .get(&run)
+                    .filter(|b| b.exited.is_none())
+                    .map(|b| (b.name.clone(), if user.is_empty() { b.user.clone() } else { user.clone() }));
+                let spawned = match found {
                     None => Err(format!("run {run} has no running box on this node")),
-                    Some(name) => node
+                    Some((name, user)) => node
                         .docker
                         .exec(&name, &user, if stdin { &["-i"] } else { &[] }, &argv)
                         .stdin(if stdin { std::process::Stdio::piped() } else { std::process::Stdio::null() })
@@ -812,14 +820,15 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
 
 /// `Msg::BoxCtl`: pause, unpause, list processes, or rewrite the hosts file of a run's box.
 async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> Result<Option<String>> {
-    let (name, dir) = node
+    let (name, dir, box_user) = node
         .boxes
         .lock()
         .expect("boxes")
         .get(run)
         .filter(|b| b.exited.is_none())
-        .map(|b| (b.name.clone(), b.dir.clone()))
+        .map(|b| (b.name.clone(), b.dir.clone(), b.user.clone()))
         .with_context(|| format!("run {run} has no running box on this node"))?;
+    let user = if user.is_empty() { box_user.as_str() } else { user };
     match what {
         "pause" => node.docker.pause(&name).await.map(|()| None),
         "unpause" => node.docker.unpause(&name).await.map(|()| None),
@@ -1087,6 +1096,7 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
             out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
             exited: None,
             tasks,
+            user: spec.user.clone(),
             listeners: HashMap::new(),
             owner: Some(gen),
         },
@@ -1356,6 +1366,7 @@ mod tests {
                 out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                 exited: None,
                 tasks: vec![],
+                user: String::new(),
                 listeners: HashMap::new(),
                 owner: Some(2),
             },
@@ -1531,6 +1542,7 @@ mod tests {
                     out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
                     exited: None,
                     tasks: vec![],
+                    user: String::new(),
                     listeners: HashMap::new(),
                     owner: Some(gen),
                 },

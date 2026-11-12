@@ -91,6 +91,9 @@ pub fn validate_name(name: &str) -> Result<()> {
     if !ok {
         bail!("{name:?} is not a node name: use 1-63 lowercase letters, digits and '-'");
     }
+    if name == crate::localnode::NAME {
+        bail!("{name:?} is this host's own built-in node: choose another name");
+    }
     Ok(())
 }
 
@@ -646,14 +649,17 @@ fn pinned_node(nodes_dir: &Path, row: &NodeRow, ssh_key: Option<&Path>) -> Resul
 }
 
 /// The node for `--node <arg>`: an enrolled node by name or ssh target, with its host key pinned. A
-/// revoked node is refused. Anything else is an unenrolled target, reached as before (trust on first
-/// use) with a warning.
+/// revoked node is refused, and so is the built-in local node (it has no ssh). Anything else is an
+/// unenrolled target, reached by trust on first use with a warning (only enrolment uses that).
 pub fn resolve(ledger: &Ledger, nodes_dir: &Path, arg: &str, ssh_key: Option<&Path>) -> Result<Node> {
     let row = match ledger.node(arg)? {
         Some(r) => Some(r),
         None => ledger.node_by_target(arg)?,
     };
     match row {
+        Some(r) if r.target.starts_with("unix:") => {
+            bail!("{} is this host's own built-in node: wicket reaches it itself (run without --node)", r.name)
+        }
         Some(r) if r.status == "active" => pinned_node(nodes_dir, &r, ssh_key),
         Some(r) => bail!("node {} ({}) is {}: refusing to use it", r.name, r.target, r.status),
         None => {

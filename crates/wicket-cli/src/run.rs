@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
 use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
-use wicket_sandbox::{Docker, Mount, SandboxSpec};
+use wicket_sandbox::{Mount, SandboxSpec};
 use wicket_store::Ledger;
 
 /// How long an agent identity is valid (seconds). Re-issued at half-life. WICKET_IDENTITY_TTL
@@ -128,6 +128,8 @@ pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap, wake } = o;
+    // `--node local` is this host's own node: the same as no --node.
+    let node = node.filter(|n| *n != crate::localnode::NAME);
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
     // everything wicket prints to a log file instead.
     let mut agent_stdout: Option<std::os::fd::OwnedFd> = None;
@@ -522,6 +524,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         _ => None,
     };
+    // Calls on boxes over this run's node connection (pause, exec, link sockets), made before the
+    // connection itself: the link tools use them.
+    let node_calls = Arc::new(crate::nodecall::Calls::default());
     let ctx = RunCtx {
         tenant: m.tenant.clone(),
         run: run.clone(),
@@ -534,10 +539,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         identity: identity.clone(),
         spawner,
         swaps,
-        boxes: shares_host.then(|| {
-            Arc::new(crate::links::LocalBoxes::new(Docker::from_env(), data_dir().join("runs"), dir.clone()))
-                as Arc<dyn wicket_proxy::link::BoxOps>
-        }),
+        boxes: Some(Arc::new(crate::links::NodeBoxes::new(ledger.clone(), &run.0, &node_name, node_calls.clone(), dir.clone()))
+            as Arc<dyn wicket_proxy::link::BoxOps>),
         capacity,
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
@@ -762,6 +765,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             ledger: ledger.clone(),
             events: ctx.events.clone(),
             start,
+            calls: node_calls.clone(),
         })
         .await?;
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));

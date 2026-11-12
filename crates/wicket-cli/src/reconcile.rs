@@ -519,6 +519,10 @@ impl Lock {
 
 /// Docker on an enrolled node, over its pinned ssh.
 fn node_docker(name: &str) -> Option<Docker> {
+    // This host's own node runs its boxes on the Docker the pass already lists.
+    if name == crate::localnode::NAME {
+        return None;
+    }
     crate::enrol::resolve_installed(name, None).ok().filter(|n| n.name.is_some()).map(|n| Docker::over_ssh(n.ssh_prefix()))
 }
 
