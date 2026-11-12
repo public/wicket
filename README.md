@@ -24,7 +24,7 @@ doesn't protect", before you trust it with anything.
 - Design: [docs/design.md](docs/design.md), [research](docs/research/), [prior art](docs/prior-art.md),
   [test record](docs/poc-results.md).
 
-![Architecture: processes, trust boundaries and what runs where](docs/poc-architecture.svg)
+![Architecture: the control host, nodes and boxes, their trust boundaries and what runs where](docs/architecture.svg)
 
 ## Install
 
