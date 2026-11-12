@@ -24,8 +24,11 @@ host's filesystem. So the control host lays the box out itself, in the run's dir
 its workspace, state, `/tmp` and volumes stay where they always were, and its sockets are the run's own
 proxies, as for any host a node forwards to the control host, without the hop. Its lifecycle is the node's:
 `docker run`, stdio, the timeout, kill, pause and unpause, process lists for hibernation, execs for links.
-What needs the shared filesystem (in-place `--workspace-dir`, wrapped sessions, hibernation, a host `/tmp`)
-needs the local node; a remote node refuses a box laid out that way.
+Nothing needs the shared filesystem but wrapped sessions (`wicket wrap`, which hands the box its launcher's
+own stdio protocol): long-lived agents hibernate and wake on any node, their state moved over the
+channel (`PutTree`/`GetTree`; [agents.md](agents.md)), and an in-place `--workspace-dir` on a remote node
+is copied there before the box starts and synced back into the operator's directory when it ends
+(deletions included; its `out/` stays the operator's).
 
 ```sh
 wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)

@@ -69,6 +69,20 @@ their state, generation and bundle size.
   and by what. A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly
   one wins. The proxies refuse requests from a stale generation, and a push of state only commits under the
   current one.
+- **Any node.** A long-lived agent can run on any node (`wicket run --node`), not only the control host's
+  own (#146). On a node that lays out its own boxes, its state (workspace, `$HOME` and Claude Code's
+  config, `/tmp` and durable volumes) is sent there as tar streams over the node's control channel
+  before the box starts, and fetched back to be bundled when it hibernates; the node keeps none of it
+  afterwards. Its bundle stays on the control host, so a wake isn't tied to a node: it is **bin-packed**
+  onto the nodes available then (enrolled, active, answering, not held by a capacity lease, this host's
+  own included) by best fit for the zone's `limits` (the fullest node it still fits on; where it last ran
+  only breaks ties), and if none has room, onto the least loaded one.
+- **Sealed at rest.** Every object of a bundle is encrypted with AES-256-GCM under a key that stays on
+  the control host (`<data dir>/state.key`), in 64 KiB chunks bound to the object's key and their order,
+  so a changed, swapped or shortened object fails to restore. Bundles written before sealing still
+  restore, and the next hibernation writes them sealed. Object keys (content hashes, agent ids) and sizes
+  aren't hidden. A store that encrypts at rest itself (S3 with server-side encryption) could do without
+  this layer; it also keeps the state from whoever runs the store.
 - **Volumes by class** (`zone.volumes[].persist`):
   - `durable`: the agent's own, bundled;
   - `node` (the default): shared by the zone, kept on the node;
@@ -80,15 +94,18 @@ their state, generation and bundle size.
 - At the timeout, an idle agent at a quiet point hibernates, and any other is stopped.
 - Only a hibernated agent can be woken. If its session ends any other way (stopped, timed out mid-turn, or
   over its `/tmp` cap), the agent is `ended`.
-- A local box's `/tmp` is a host directory in the run's directory, so it is kept with the rest, and survives a
-  crash of the supervisor. wicket stops the box if `/tmp` goes over 512 MiB, checking every 5 s; the old tmpfs
-  enforced that cap exactly.
+- A long-lived agent's `/tmp` is a directory (in the run's directory, or the node's), so it is kept with the
+  rest, and survives a crash of the supervisor. wicket stops the box if `/tmp` goes over 512 MiB, checking
+  every 5 s (on a remote node, by asking it); the old tmpfs enforced that cap exactly.
 - wicket sets Claude Code's `cleanupPeriodDays` itself, so a sleeping agent's sessions aren't swept, and a
   manifest can't set it.
-- `ci/hibernate.sh` tests all of this end to end with the mock model.
+- `ci/hibernate.sh` tests all of this end to end with the mock model; `ci/hibernate.sh --node` with the
+  agents on an enrolled node.
 
-Not yet: encryption and signing of bundles, an S3 backend, the gVisor checkpoint fast path, and hibernating
-boxes on remote nodes or wrapped sessions.
+Not yet: signing of bundles, an S3 backend, and the gVisor checkpoint fast path. Wrapped sessions
+(`wicket wrap`) run only on the control host's own node: the box takes over its launcher's stdio protocol
+and its working directory at the same path, and a node's channel may drop output while disconnected, which
+that protocol can't survive.
 
 ## Inside the box
 
