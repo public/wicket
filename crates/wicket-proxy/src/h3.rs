@@ -769,6 +769,8 @@ fn seqpacket_accept(fd: RawFd) -> io::Result<OwnedFd> {
 pub(crate) struct Up {
     ep: quinn::Endpoint,
     resolve: HashMap<String, SocketAddr>,
+    /// Names are resolved and checked as for HTTP/2 (`crate::dial`, #116).
+    lookup: crate::dial::Lookup,
     state: Arc<Mutex<HashMap<String, State>>>,
 }
 
@@ -804,7 +806,7 @@ impl Up {
         cc.transport_config(Arc::new(t));
         let mut ep = quinn::Endpoint::client("[::]:0".parse()?).or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().expect("addr")))?;
         ep.set_default_client_config(cc);
-        Ok(Up { ep, resolve: u.resolve.clone(), state: Default::default() })
+        Ok(Up { ep, resolve: u.resolve.clone(), lookup: u.lookup(), state: Default::default() })
     }
 
     /// Sends `out` over HTTP/3 if that's available now (see the type's docs). None: use HTTP/2.
@@ -882,11 +884,13 @@ impl Up {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.state.lock().expect("state").insert(host.to_string(), State::Connecting(rx.clone(), Instant::now()));
         let (ep, state, host, fixed) = (self.ep.clone(), self.state.clone(), host.to_string(), self.resolve.get(host).copied());
+        let lookup = self.lookup.clone();
         tokio::spawn(async move {
             let r = tokio::time::timeout(Duration::from_secs(5), async {
+                // The checked address is the one dialled, for the connection's whole life (#116).
                 let addr = match fixed {
                     Some(a) => a,
-                    None => tokio::net::lookup_host((host.as_str(), 443)).await?.next().ok_or_else(|| anyhow!("{host}: no address"))?,
+                    None => crate::dial::resolve_public(&lookup, &host, 443).await?.into_iter().next().ok_or_else(|| anyhow!("{host}: no address"))?,
                 };
                 let conn = ep.connect(addr, &host)?.await?;
                 let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;

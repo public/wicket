@@ -22,6 +22,24 @@ pub enum CanonError {
     NonCanonicalEscape(String),
     #[error("path contains ';' (matrix parameters are not accepted)")]
     Parameter,
+    #[error("{0} is an IP address; use a host name")]
+    IpLiteral(String),
+    #[error("host {0:?} is not a canonical host name")]
+    BadHost(String),
+}
+
+/// The host a request names, lowercased and without a trailing dot, if that is how a URL parser
+/// would spell it too (WHATWG host parsing). IP addresses in any spelling (`[::1]`, `2852039166`,
+/// `0x7f.1`) are refused, as are hosts with escapes or characters a parser would rewrite: the
+/// decision, the audit record and the upstream connection then all name the same host.
+pub fn canonical_host(raw: &str) -> Result<String, CanonError> {
+    let lower = raw.to_ascii_lowercase();
+    let host = lower.strip_suffix('.').unwrap_or(&lower);
+    match url::Host::parse(host) {
+        Ok(url::Host::Domain(d)) if d == host && !host.split('.').any(str::is_empty) => Ok(d),
+        Ok(url::Host::Ipv4(_)) | Ok(url::Host::Ipv6(_)) => Err(CanonError::IpLiteral(raw.to_string())),
+        _ => Err(CanonError::BadHost(raw.to_string())),
+    }
 }
 
 const MAX_PATH: usize = 4096;
@@ -114,6 +132,18 @@ mod tests {
         assert!(matches!(canonical_path("/a%2Fb"), Err(CanonError::EncodedSeparator(_))));
         assert_eq!(canonical_path("/a\\b"), Err(CanonError::BadCharacter));
         assert_eq!(canonical_path("a/b"), Err(CanonError::NotAbsolute));
+    }
+
+    /// #116: hosts are decided in one spelling, and IP addresses in none.
+    #[test]
+    fn hosts_are_canonical_or_refused() {
+        assert_eq!(canonical_host("API.GitHub.com."), Ok("api.github.com".into()));
+        for h in ["[::1]", "2852039166", "0x7f.1", "127.0.0.1", "1.1.1.1"] {
+            assert!(matches!(canonical_host(h), Err(CanonError::IpLiteral(_))), "{h}");
+        }
+        for h in ["", ".", "ex%61mple.com", "a b", "foo.123", "a..b"] {
+            assert!(matches!(canonical_host(h), Err(CanonError::BadHost(_))), "{h}");
+        }
     }
 
     /// #115: spellings most servers read as another, canonical path are refused, so a forbid glob

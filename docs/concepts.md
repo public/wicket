@@ -45,6 +45,13 @@ grant**. A request that needs a grant becomes a pending request. The agent gets 
 can wait with `await_grant`, and a human approves or denies it in the console or with `wicket approve`. A
 grant is bound to the exact request, single-use and expiring by default, and kept in the ledger.
 
+Whatever the zone says, some destinations are **never reachable**: cloud metadata endpoints, `localhost`
+and every non-public address (private, loopback, link-local, CGNAT, multicast, reserved, and IPv6 forms
+that carry an IPv4 address, such as NAT64 and 6to4). A host is parsed as a URL parser would, so
+`2852039166` or `0xa9fea9fe` is 169.254.169.254, and IP addresses aren't proxied at all. wicket resolves
+every upstream name itself and connects only to addresses it has checked; a name with any non-public
+address is refused, and the checked address is the one dialled, so DNS rebinding can't move a connection.
+
 **The subset rule.** An agent with `max_children` can `spawn` an agent or a program in a zone it writes.
 That zone must be within the agent's own (`wicket_core::subset`):
 

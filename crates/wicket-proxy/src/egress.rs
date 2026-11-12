@@ -44,13 +44,23 @@ pub struct Egress {
 /// use; tests point hosts at local origins with their own CA.
 #[derive(Clone, Default)]
 pub struct Upstream {
-    /// Host -> address, instead of DNS.
+    /// Host -> address, instead of DNS. Pinned by whoever configures the proxy, so not subject to the
+    /// dial-time address check (tests point hosts at local origins this way).
     pub resolve: std::collections::HashMap<String, std::net::SocketAddr>,
+    /// Host -> the addresses DNS would answer (tests). Unlike `resolve`, these are checked like real
+    /// answers: a name with a non-public address is refused (#116).
+    pub dns: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
     /// Extra trusted roots (PEM), besides the public ones.
     pub roots_pem: Option<String>,
     /// Re-originate requests that arrived over HTTP/3 over HTTP/3 too, when the upstream offers it
     /// (default on; HTTP/2 or HTTP/1.1 otherwise).
     pub no_h3: bool,
+}
+
+impl Upstream {
+    pub(crate) fn lookup(&self) -> crate::dial::Lookup {
+        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()) }
+    }
 }
 
 /// How a request reached the proxy.
@@ -110,7 +120,9 @@ impl Egress {
         let mut b = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(15));
+            .connect_timeout(std::time::Duration::from_secs(15))
+            // Every name is resolved by wicket and dialled only at checked, public addresses (#116).
+            .dns_resolver(Arc::new(crate::dial::PublicResolver(upstream.lookup())));
         for (host, addr) in &upstream.resolve {
             b = b.resolve(host, *addr);
         }
@@ -142,13 +154,14 @@ impl Egress {
             let Some(auth) = req.uri().authority().cloned() else {
                 return Ok(problem(400, "bad-request", "Bad CONNECT", "CONNECT needs host:port", None));
             };
-            let host = auth.host().trim_end_matches('.').to_ascii_lowercase();
             let port = auth.port_u16().unwrap_or(443);
+            // One spelling per host, and no IP addresses in any spelling (#116).
+            let host = match wicket_core::canonical_host(auth.host()) {
+                Ok(h) => h,
+                Err(e) => return Ok(self.refuse(&auth.host().to_ascii_lowercase(), "CONNECT", "/", &e.to_string())),
+            };
             if port != 443 {
                 return Ok(self.refuse(&host, "CONNECT", "/", &format!("only port 443 is proxied (asked for {port})")));
-            }
-            if host.parse::<std::net::IpAddr>().is_ok() {
-                return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
             }
             // A superseded activation (#70) gets no tunnel at all.
             if let Some(why) = self.ctx.superseded() {
@@ -176,9 +189,13 @@ impl Egress {
             return Ok(Response::new(full(Bytes::new())));
         }
         // Absolute-form plain HTTP request.
-        let host = req.uri().host().map(|h| h.to_ascii_lowercase());
+        let host = req.uri().host().map(|h| (h.to_ascii_lowercase(), wicket_core::canonical_host(h)));
         match host {
-            Some(h) if req.uri().scheme_str() == Some("http") => {
+            Some((raw, Err(e))) if req.uri().scheme_str() == Some("http") => {
+                let method = req.method().to_string();
+                Ok(self.refuse(&raw, &method, "/", &e.to_string()))
+            }
+            Some((_, Ok(h))) if req.uri().scheme_str() == Some("http") => {
                 if let Some(r) = self.judge_host(&h, req.method().as_str()) {
                     return Ok(r);
                 }
@@ -471,7 +488,8 @@ impl Egress {
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
-            Err(e) => problem(502, "upstream", "Upstream error", &e.to_string(), None),
+            // The whole chain: a refused dial (#116) says why at its end.
+            Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
         }
     }
 
@@ -703,6 +721,27 @@ mod tests {
         for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
         }
+    }
+
+    /// #116: a name in reach whose DNS answer is a non-public address is never dialled.
+    #[tokio::test]
+    async fn a_name_resolving_to_a_private_address_is_not_dialled() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: rebind.example, methods: [GET]}, {host: meta.example, methods: [GET]}]", vec![], "rebind");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let mut up = super::Upstream::default();
+        up.dns.insert("rebind.example".into(), vec!["127.0.0.1".parse().unwrap()]);
+        up.dns.insert("meta.example".into(), vec!["93.184.215.14".parse().unwrap(), "169.254.169.254".parse().unwrap()]);
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        for host in ["rebind.example", "meta.example"] {
+            let req = http::Request::get("/latest/user-data").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            let resp = e.clone().handle(req, host.into(), "http", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 502, "{body}");
+            assert!(body.contains("non-public address"), "{body}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

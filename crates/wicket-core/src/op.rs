@@ -178,14 +178,29 @@ pub enum HostVerdict {
 
 /// Why `host` is never reachable from a sandbox, whatever the zone says: metadata endpoints,
 /// localhost and non-public addresses. `None` for every other host.
+///
+/// The host is parsed as a URL parser would (WHATWG host parsing, as the `url` crate and browsers
+/// do), so every spelling of an address is judged as that address: `2852039166`, `0xa9fea9fe`,
+/// `0251.0376.0251.0376`, `169.254.169.254.` and `[::ffff:a9fe:a9fe]` are all 169.254.169.254. A
+/// host that doesn't parse is never reachable either. This is the name check; the address a name
+/// resolves to is checked again when wicket dials it (wicket-proxy).
 pub fn never_reachable(host: &str) -> Option<String> {
-    if FORBIDDEN_HOSTS.contains(&host) || host == "localhost" || host.ends_with(".localhost") {
-        return Some(format!("host {host} is never reachable from a sandbox"));
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) if !is_public_ip(&ip) => Some(format!("non-public address {ip}")),
-        _ => None,
-    }
+    let parsed = match url::Host::parse(host) {
+        Ok(h) => h,
+        Err(e) => return Some(format!("{host:?} is not a valid host ({e})")),
+    };
+    let ip = match parsed {
+        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
+        url::Host::Ipv6(v6) => std::net::IpAddr::V6(v6),
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.');
+            if FORBIDDEN_HOSTS.contains(&d) || d == "localhost" || d.ends_with(".localhost") {
+                return Some(format!("host {d} is never reachable from a sandbox"));
+            }
+            return None;
+        }
+    };
+    (!is_public_ip(&ip)).then(|| format!("non-public address {ip}"))
 }
 
 pub fn host_verdict(zone: &ZoneSpec, host: &str) -> HostVerdict {
@@ -302,7 +317,11 @@ pub fn evaluate(zone: &ZoneSpec, op: &Op) -> Verdict {
     }
 }
 
-fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+/// Whether an address is on the public internet: not private, loopback, link-local, CGNAT,
+/// multicast, reserved, documentation or benchmarking space, and not an IPv6 form that carries or
+/// translates to an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo), which a gateway could
+/// turn into a private one.
+pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -311,17 +330,31 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
                 || o[0] == 0
+                || o[0] >= 240
                 || (o[0] == 100 && (64..128).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113))
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some())
+                || (s[0] & 0xffc0) == 0xfec0
+                || v6.to_ipv4_mapped().is_some()
+                || s[..6] == [0; 6]
+                || (s[0] == 0x64 && s[1] == 0xff9b)
+                || s[0] == 0x2002
+                || (s[0] == 0x2001 && s[1] < 0x0200)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x0100 && s[1..4] == [0; 3]))
         }
     }
 }
@@ -416,6 +449,43 @@ zone:
         assert!(matches!(evaluate(&zone(), &op("GET", "localhost", "/")), Verdict::Forbidden(_)));
     }
 
+    /// #116: every spelling of a non-public address is that address.
+    #[test]
+    fn every_spelling_of_a_non_public_address_is_refused() {
+        for h in [
+            "2852039166",
+            "0xa9fea9fe",
+            "0251.0376.0251.0376",
+            "169.254.169.254.",
+            "169.254.43518",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:a9fe:a9fe]",
+            "[::a9fe:a9fe]",
+            "[64:ff9b::a9fe:a9fe]",
+            "[2002:a9fe:a9fe::]",
+            "[2001:0:4136:e378:8000:63bf:3fff:fdd2]",
+            "[ff02::1]",
+            "[fec0::1]",
+            "224.0.0.1",
+            "240.0.0.1",
+            "192.0.2.1",
+            "0x7f.1",
+            "metadata.",
+            "METADATA.GOOGLE.INTERNAL",
+            "LocalHost",
+            "foo.localhost.",
+            "a b",
+            "foo.123",
+        ] {
+            assert!(never_reachable(h).is_some(), "{h}");
+            assert!(matches!(evaluate(&zone(), &op("GET", h, "/")), Verdict::Forbidden(_)), "{h}");
+        }
+        for h in ["example.com", "api.github.com", "1.1.1.1", "[2606:4700::1111]"] {
+            assert_eq!(never_reachable(h), None, "{h}");
+        }
+    }
+
     #[test]
     fn digest_binds_method_host_path() {
         let a = op("GET", "api.github.com", "/x");
@@ -460,13 +530,8 @@ zone:
     /// changed are R3+ requests whose first matching rule lacks `allow_dangerous` while a later one
     /// has it (`a_later_dangerous_rule_allows_what_an_earlier_rule_matches`).
     fn evaluate_uncompiled(zone: &ZoneSpec, op: &Op) -> Verdict {
-        if FORBIDDEN_HOSTS.contains(&op.host.as_str()) || op.host == "localhost" || op.host.ends_with(".localhost") {
-            return Verdict::Forbidden(format!("host {} is never reachable from a sandbox", op.host));
-        }
-        if let Ok(ip) = op.host.parse::<std::net::IpAddr>() {
-            if !is_public_ip(&ip) {
-                return Verdict::Forbidden(format!("non-public address {ip}"));
-            }
+        if let Some(why) = never_reachable(&op.host) {
+            return Verdict::Forbidden(why);
         }
         if zone.forbid.iter().any(|f| f.matches(&op.host, &op.path)) {
             return Verdict::Forbidden(format!("{} {}{} is forbidden in this zone", op.method, op.host, op.path));
