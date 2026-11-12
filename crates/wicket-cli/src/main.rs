@@ -759,7 +759,8 @@ async fn main() -> Result<()> {
                 &id,
                 &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
             )?;
-            l.audit(
+            // A grant exists only if its approval is on the record (fail closed).
+            if let Err(e) = l.audit(
                 &TenantId::single(),
                 None,
                 "decision",
@@ -770,7 +771,10 @@ async fn main() -> Result<()> {
                     "agent_identity": verified_identity(&l, &req.run, None),
                     "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
                 }),
-            )?;
+            ) {
+                let _ = l.revoke_grant(&gid);
+                return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
+            }
             println!(
                 "approved {id} → grant {gid}: {} {}{} ({}, {})",
                 req.method,

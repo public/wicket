@@ -321,6 +321,13 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         shipped: AtomicI64::new(-1),
         shipping: Mutex::new(()),
     });
+    // Queued audit records are committed (and shipped, if the control host is connected) on a
+    // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
+    let _flush = crate::audit_export::FlushOnDrop(node.audit.clone());
+    {
+        let n = node.clone();
+        crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
+    }
     reap_previous(&node.docker, &node.paths.runs()).await;
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     eprintln!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);

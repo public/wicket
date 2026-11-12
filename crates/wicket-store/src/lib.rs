@@ -487,6 +487,22 @@ impl Ledger {
         Ok(())
     }
 
+    /// Test support: makes every later insert into the audit table fail, as a full or broken disk
+    /// would. Not for production use.
+    #[doc(hidden)]
+    pub fn fail_audit_inserts_for_tests(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS audit_fail BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'audit disk failure (test)'); END;",
+        )?;
+        Ok(())
+    }
+
+    /// Withdraws an undelivered message (one whose audit record could not be written).
+    pub fn withdraw_message(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM messages WHERE id = ?1 AND delivered_at IS NULL", params![id])?;
+        Ok(())
+    }
+
     /// Takes the oldest undelivered message for `run`. Marked delivered in the same transaction, so
     /// each message is handed out once. `created_at` is when wicket recorded it: the time its
     /// sender's identity must have been valid.

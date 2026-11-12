@@ -21,9 +21,15 @@ transaction and one fsync per batch, with the ledger in WAL mode and `synchronou
 - **Order and the chain.** Each batch reads the chain head and appends its records under one
   `BEGIN IMMEDIATE` write lock. Processes that share the ledger interleave whole batches, so the
   hash chain stays a single chain.
-- **Durability.** Once a durable append returns, or a flush after queued appends returns, the record
-  survives a crash. If a process dies before a batch commits, it loses only queued records that
-  nothing has waited on. `wicket run` commits whatever is still queued when it ends, on every path.
+- **Fail closed.** If a record that must wait cannot be committed, the action it records does not
+  happen. A grant-allowed request gets a 503 (`audit-unavailable`) instead of being forwarded. An
+  approval's grant is revoked. A link is closed before it carries traffic, and an expose or a message
+  is withdrawn. Records nothing waits on keep their old behaviour: a failure is reported on stderr.
+- **Durability.** A record is on disk once its durable append returns, or once a flush returns
+  after it was queued. A crash after that loses nothing. `wicket run` and `wicket node serve` commit
+  whatever is still queued when they exit normally, on SIGTERM and on ^C. Only a SIGKILL (or a power
+  cut) can lose anything: at most the last batch of records nothing waited on, a few milliseconds'
+  worth.
 
 ## Exporting
 

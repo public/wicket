@@ -34,11 +34,13 @@ pub struct WriterConfig {
     pub max_batch: usize,
     /// How long a batch of deferred records waits for company before committing.
     pub linger: Duration,
+    /// How many times a failed commit is retried (backing off from 50 ms) before its records fail.
+    pub retries: u32,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
-        WriterConfig { max_batch: 512, linger: Duration::from_millis(2) }
+        WriterConfig { max_batch: 512, linger: Duration::from_millis(2), retries: 5 }
     }
 }
 
@@ -205,7 +207,7 @@ fn writer_loop(mut conn: Connection, rx: Receiver<Msg>, cfg: WriterConfig) {
                 }
             }
         }
-        let outcome = commit_with_retry(&mut conn, &recs);
+        let outcome = commit_with_retry(&mut conn, &recs, cfg.retries);
         match &outcome {
             Ok(seqs) => {
                 for (r, seq) in recs.drain(..).zip(seqs) {
@@ -240,7 +242,7 @@ fn take(m: Msg, recs: &mut Vec<Pending>, flushes: &mut Vec<SyncSender<std::resul
 }
 
 /// Commits a batch, retrying while another process holds the write lock past the busy timeout.
-fn commit_with_retry(conn: &mut Connection, recs: &[Pending]) -> std::result::Result<Vec<i64>, String> {
+fn commit_with_retry(conn: &mut Connection, recs: &[Pending], retries: u32) -> std::result::Result<Vec<i64>, String> {
     if recs.is_empty() {
         return Ok(Vec::new());
     }
@@ -248,7 +250,7 @@ fn commit_with_retry(conn: &mut Connection, recs: &[Pending]) -> std::result::Re
     for attempt in 0.. {
         match commit(conn, recs) {
             Ok(s) => return Ok(s),
-            Err(_) if attempt < 5 => {
+            Err(_) if attempt < retries => {
                 std::thread::sleep(delay);
                 delay *= 2;
             }
@@ -307,7 +309,7 @@ mod tests {
     fn batches_commit_in_order_and_chain() {
         let d = tmp("order");
         let p = d.join("ledger.db");
-        let w = AuditWriter::start(&p, WriterConfig { max_batch: 7, linger: Duration::from_millis(5) }).unwrap();
+        let w = AuditWriter::start(&p, WriterConfig { max_batch: 7, linger: Duration::from_millis(5), retries: 5 }).unwrap();
         let t = TenantId::single();
         for i in 0..100 {
             w.submit(&t, None, "op", &serde_json::json!({ "i": i })).unwrap();
@@ -327,7 +329,7 @@ mod tests {
     fn drop_commits_what_is_queued() {
         let d = tmp("drop");
         let p = d.join("ledger.db");
-        let w = AuditWriter::start(&p, WriterConfig { max_batch: 512, linger: Duration::from_millis(50) }).unwrap();
+        let w = AuditWriter::start(&p, WriterConfig { max_batch: 512, linger: Duration::from_millis(50), retries: 5 }).unwrap();
         for i in 0..50 {
             w.submit(&TenantId::single(), None, "op", &serde_json::json!({ "i": i })).unwrap();
         }
@@ -375,7 +377,7 @@ mod tests {
     #[ignore = "run by a_crash_loses_nothing_acknowledged in a child process"]
     fn crash_child() {
         let Some(p) = std::env::var_os("WICKET_WRITER_CRASH_LEDGER") else { return };
-        let w = AuditWriter::start(Path::new(&p), WriterConfig { max_batch: 16, linger: Duration::from_millis(3) }).unwrap();
+        let w = AuditWriter::start(Path::new(&p), WriterConfig { max_batch: 16, linger: Duration::from_millis(3), retries: 5 }).unwrap();
         let t = TenantId::single();
         use std::io::Write;
         let mut out = std::io::stdout().lock();

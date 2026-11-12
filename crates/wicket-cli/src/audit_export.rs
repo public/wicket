@@ -45,6 +45,34 @@ impl Drop for FlushOnDrop {
     }
 }
 
+/// Until it is aborted: on SIGTERM or SIGINT, commits the audit records still queued (and lets the
+/// background exporter deliver them), runs `then`, and exits (143 or 130). For a process's phases
+/// that have no signal handling of their own, so only a SIGKILL can lose the last unwaited batch.
+pub fn flush_on_signal(ledger: Arc<Mutex<Ledger>>, then: impl FnOnce() + Send + 'static) -> tokio::task::JoinHandle<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    // Registered now, not when the task first runs, so no signal slips past.
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    tokio::spawn(async move {
+        let (Ok(mut term), Ok(mut int)) = (term, int) else { return };
+        let code = tokio::select! {
+            _ = term.recv() => 143,
+            _ = int.recv() => 130,
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(l) = ledger.lock() {
+                if let Err(e) = l.flush_audit() {
+                    eprintln!("wicket: committing the last audit records failed: {e}");
+                }
+            }
+            stop_background(Duration::from_secs(5));
+            then();
+        })
+        .await;
+        std::process::exit(code);
+    })
+}
+
 // ---- configuration ----
 
 /// The installation's sinks file: `$WICKET_AUDIT_SINKS`, else `audit-sinks.yaml` in the data dir.
@@ -704,6 +732,54 @@ mod tests {
         a.release();
         assert_eq!(b.pass(false).records, 3, "b takes over where a left off");
         assert_eq!(exported_objects(&std::fs::read_to_string(&out).unwrap()).len(), 13);
+    }
+
+    /// The child half of `sigterm_commits_what_is_queued`: queues records, then waits for SIGTERM.
+    #[test]
+    #[ignore = "run by sigterm_commits_what_is_queued in a child process"]
+    fn sigterm_child() {
+        let Some(p) = std::env::var_os("WICKET_SIGTERM_LEDGER") else { return };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut l = Ledger::open(Path::new(&p)).unwrap();
+            // A linger far past the test: only the signal path can commit these.
+            let w = wicket_store::AuditWriter::start(
+                Path::new(&p),
+                wicket_store::WriterConfig { linger: Duration::from_secs(600), ..Default::default() },
+            )
+            .unwrap();
+            l.start_audit_writer(Some(w)).unwrap();
+            for i in 0..25 {
+                l.audit_deferred(&TenantId::single(), None, "op", &json!({ "i": i })).unwrap();
+            }
+            let _g = flush_on_signal(Arc::new(Mutex::new(l)), || {});
+            println!("READY");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+    }
+
+    #[test]
+    fn sigterm_commits_what_is_queued() {
+        use std::io::BufRead;
+        let d = TmpDir::new("sigterm");
+        let lp = d.0.join("ledger.db");
+        Ledger::open(&lp).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit_export::tests::sigterm_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("WICKET_SIGTERM_LEDGER", &lp)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while out.read_line(&mut line).unwrap() > 0 && !line.contains("READY") {}
+        assert_eq!(Ledger::open(&lp).unwrap().audit_head().unwrap(), None, "still queued");
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let st = child.wait().unwrap();
+        assert_eq!(st.code(), Some(143));
+        assert_eq!(Ledger::open(&lp).unwrap().verify_audit().unwrap(), 25, "SIGTERM committed every queued record");
     }
 
     // ---- a local OTLP/HTTP receiver ----

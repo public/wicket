@@ -251,7 +251,8 @@ impl RunCtx {
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         l.add_message(&id, &self.tenant, &self.run.0, to_run, &env).map_err(|e| e.to_string())?;
-        let _ = l.audit(
+        // A message is delivered only once its audit record is on disk (fail closed).
+        let audited = l.audit(
             &self.tenant,
             Some(&self.run),
             "message",
@@ -259,41 +260,57 @@ impl RunCtx {
                 "id": id, "kind": kind, "from": me.claims.sub, "to": rec.spiffe_id, "to_run": to_run, "relation": relation, "bytes": size,
             }),
         );
+        if let Err(e) = audited {
+            let _ = l.withdraw_message(&id);
+            return Err(format!("not sent: the audit record could not be written ({e})"));
+        }
         Ok(id)
     }
 
-    /// Records an event in the audit log and sends it to the console.
+    /// Records an event in the audit log and sends it to the console. A failure to record is
+    /// dropped: for events that must be on disk before their request goes ahead, use
+    /// [`record`](Self::record), which fails closed.
+    pub(crate) fn emit(&self, ev: Event) {
+        let _ = self.record(ev);
+    }
+
+    /// Records an event in the audit log, then sends it to the console.
     ///
     /// With the batched audit writer (#62), most records are queued and committed within
     /// milliseconds, off the request path. A request allowed by a human's grant waits for its
-    /// record's commit before it is forwarded ([`must_be_durable`]): the use of an approval is on
-    /// disk before it takes effect. The ledger lock is held only to look up the writer, never across
-    /// a commit.
-    pub(crate) fn emit(&self, ev: Event) {
-        if let Ok(v) = serde_json::to_value(&ev) {
-            let writer = match self.ledger.lock() {
-                Ok(l) => match l.audit_writer() {
-                    Some(w) => Some(w),
-                    None => {
-                        let _ = l.audit(&self.tenant, Some(&self.run), "op", &v);
-                        None
+    /// record's commit ([`must_be_durable`]): the use of an approval is on disk before it takes
+    /// effect. If that commit fails, this returns the error (and the event is not shown as
+    /// allowed): the caller must refuse the request. The ledger lock is held only to look up the
+    /// writer, never across a commit.
+    pub(crate) fn record(&self, ev: Event) -> std::result::Result<(), String> {
+        let durable = must_be_durable(&ev);
+        let v = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
+        let writer = match self.ledger.lock() {
+            Ok(l) => match l.audit_writer() {
+                Some(w) => Some(w),
+                None => {
+                    let r = l.audit(&self.tenant, Some(&self.run), "op", &v);
+                    if durable {
+                        r.map_err(|e| e.to_string())?;
                     }
-                },
-                Err(_) => None,
-            };
-            if let Some(w) = writer {
-                if must_be_durable(&ev) {
-                    if let Ok(t) = w.enqueue(&self.tenant, Some(&self.run), "op", &v) {
-                        wait_blocking(move || {
-                            let _ = t.wait();
-                        });
-                    }
-                } else {
-                    let _ = w.submit(&self.tenant, Some(&self.run), "op", &v);
+                    None
                 }
+            },
+            Err(_) if durable => return Err("the ledger lock is poisoned".into()),
+            Err(_) => None,
+        };
+        if let Some(w) = writer {
+            if durable {
+                let t = w.enqueue(&self.tenant, Some(&self.run), "op", &v).map_err(|e| e.to_string())?;
+                let mut r = Ok(0);
+                wait_blocking(|| r = t.wait());
+                r.map_err(|e| e.to_string())?;
+            } else {
+                let _ = w.submit(&self.tenant, Some(&self.run), "op", &v);
             }
         }
         let _ = self.events.send(ev);
+        Ok(())
     }
 }
 
