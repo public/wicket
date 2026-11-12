@@ -194,6 +194,9 @@ impl Egress {
                     return Ok(self.clone().forward_connect(req, host, why).await);
                 }
             }
+            if let Some(rule) = self.splice_rule(&host) {
+                return Ok(self.clone().splice_connect(req, host, rule).await);
+            }
             let me = self.clone();
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
@@ -234,9 +237,57 @@ impl Egress {
         }
     }
 
+    /// The reach rule that allows `host` wholesale, if this connection may be spliced through (#62):
+    /// the decider says so, and nothing is swapped in for the host.
+    fn splice_rule(&self, host: &str) -> Option<usize> {
+        if self.ctx.swaps.iter().any(|s| host_matches(&s.host, host)) {
+            return None;
+        }
+        if self.model_gate.get().is_some() && host == crate::llm::MODEL_HOST {
+            return None;
+        }
+        self.decider.splice(&self.ctx, host)
+    }
+
+    /// A CONNECT to a host allowed wholesale: dial it now (a refused dial is the CONNECT's answer),
+    /// then relay the box's TLS unmodified (see [`crate::splice`]).
+    async fn splice_connect(self: Arc<Self>, req: Request<Incoming>, host: String, rule: usize) -> Response<BoxBody> {
+        let up = match crate::splice::dial(&self.upstream, &host).await {
+            Ok(s) => s,
+            Err(e) => {
+                let refused = e.kind() == std::io::ErrorKind::PermissionDenied;
+                self.ctx.emit(Event::Egress {
+                    method: "CONNECT".into(),
+                    host: host.clone(),
+                    path: "/".into(),
+                    risk: "-".into(),
+                    outcome: if refused { "forbidden" } else { "error" }.into(),
+                    detail: format!("splice-through (reach rule {rule}): {e}"),
+                });
+                return problem(502, "upstream", "Upstream error", &format!("{host}: {e}"), None);
+            }
+        };
+        let me = self.clone();
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => crate::splice::serve(me, upgraded, up, host, rule).await,
+                Err(e) => tracing::debug!(error = %e, "upgrade failed"),
+            }
+        });
+        Response::new(full(Bytes::new()))
+    }
+
     async fn tunnel(self: Arc<Self>, upgraded: hyper::upgrade::Upgraded, host: String) -> Result<()> {
+        self.tunnel_io(TokioIo::new(upgraded), host).await
+    }
+
+    /// Terminates the box's TLS for `host` on any byte stream and serves its requests.
+    pub(crate) async fn tunnel_io<S>(self: Arc<Self>, io: S, host: String) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let cfg = self.ca.server_config(&host)?;
-        let tls = tokio_rustls::TlsAcceptor::from(cfg).accept(TokioIo::new(upgraded)).await?;
+        let tls = tokio_rustls::TlsAcceptor::from(cfg).accept(io).await?;
         let me = self.clone();
         let svc = service_fn(move |req: Request<Incoming>| {
             let me = me.clone();

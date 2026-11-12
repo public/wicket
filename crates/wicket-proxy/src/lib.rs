@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod h3;
 pub mod link;
 pub mod llm;
+mod splice;
 pub mod vault;
 
 use serde::Serialize;

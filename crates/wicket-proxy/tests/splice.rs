@@ -1,0 +1,291 @@
+//! Splice-through (#62), end to end on the host: a box-side client speaking CONNECT to the egress
+//! proxy's unix socket, then TLS, against local origins with their own CA. A host the zone allows
+//! wholesale is spliced (the box sees the origin's own certificate); any other host is intercepted
+//! (the box sees a leaf from the run's CA).
+
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use wicket_core::{RunId, TenantId, ZoneSpec};
+use wicket_proxy::ca::RunCa;
+use wicket_proxy::decide::Central;
+use wicket_proxy::egress::{Egress, Upstream};
+use wicket_proxy::{Event, RunCtx};
+
+const ALL: [&str; 7] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+
+fn tmpdir() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("splice-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn zone() -> ZoneSpec {
+    serde_json::from_value(serde_json::json!({
+        "name": "splicezone",
+        "reach": [
+            {"host": "open.test", "methods": ALL},
+            {"host": "checked.test", "methods": ["GET"]},
+            {"host": "fenced.test", "methods": ALL},
+            {"host": "private.test", "methods": ALL}
+        ],
+        "forbid": [{"host": "fenced.test", "paths": ["/admin/**"]}]
+    }))
+    .unwrap()
+}
+
+/// One TLS origin per name, all signed by `ca`; each answers `origin <path>`, or N bytes for `/bytes/N`.
+async fn origins(ca: &RunCa, names: &[&str]) -> HashMap<String, SocketAddr> {
+    let mut out = HashMap::new();
+    for name in names {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        out.insert(name.to_string(), l.local_addr().unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(ca.server_config(name).unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
+                        let p = req.uri().path().to_string();
+                        let body = match p.strip_prefix("/bytes/").and_then(|n| n.parse::<usize>().ok()) {
+                            Some(n) => Bytes::from(vec![b'x'; n]),
+                            None => Bytes::from(format!("origin {p}")),
+                        };
+                        Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(body)))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
+                });
+            }
+        });
+    }
+    out
+}
+
+struct World {
+    sock: PathBuf,
+    events: Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>,
+    dir: PathBuf,
+}
+
+impl World {
+    async fn new() -> World {
+        let dir = tmpdir();
+        let origin_ca = RunCa::generate("origin").unwrap();
+        let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test"]).await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = RunCtx {
+            tenant: TenantId::single(),
+            run: RunId("run_splice".into()),
+            zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
+            vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
+            events: tx,
+            escalate: true,
+            attribute: None,
+            identity: None,
+            spawner: None,
+            swaps: vec![],
+            boxes: None,
+            capacity: None,
+            fence: None,
+            waker: None,
+        };
+        let mut up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
+        // Not pinned: checked like a real DNS answer (#116), and refused.
+        up.dns.insert("private.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_splice").unwrap()), Arc::new(Central), None, up).unwrap();
+        let sock = dir.join("egress.sock");
+        let s2 = sock.clone();
+        tokio::spawn(async move { egress.serve(&s2).await });
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        World { sock, events: Mutex::new(rx), dir }
+    }
+
+    fn events(&self) -> Vec<(String, String, String)> {
+        let mut v = vec![];
+        while let Ok(e) = self.events.lock().unwrap().try_recv() {
+            if let Event::Egress { host, outcome, detail, .. } = e {
+                v.push((host, outcome, detail));
+            }
+        }
+        v
+    }
+
+    /// CONNECTs to `host`, returning the proxy's status line and the stream after it.
+    async fn connect(&self, host: &str) -> (String, UnixStream) {
+        let mut s = UnixStream::connect(&self.sock).await.unwrap();
+        s.write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(s.read(&mut b).await.unwrap(), 1, "proxy closed during the CONNECT answer");
+            head.push(b[0]);
+        }
+        let text = String::from_utf8(head).unwrap();
+        // A refusal carries a body; read it so the status line can say why.
+        if !text.starts_with("HTTP/1.1 200") {
+            let mut rest = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut rest)).await.ok().and_then(|r| r.ok()).unwrap_or(0);
+            return (format!("{text}{}", String::from_utf8_lossy(&rest[..n])), s);
+        }
+        (text, s)
+    }
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Accepts any server certificate (the test inspects which one it was).
+#[derive(Debug)]
+struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// TLS over `s` with SNI `sni`, then `GET path`: the leaf's issuer CN and the response body.
+async fn get(s: UnixStream, sni: &str, path: &str) -> (String, Vec<u8>) {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
+    let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+    let issuer = cert.issuer().iter_common_name().next().unwrap().as_str().unwrap().to_string();
+    tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    let body = match resp.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => resp[i + 4..].to_vec(),
+        None => resp,
+    };
+    (issuer, body)
+}
+
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wholesale_host_is_spliced_and_others_are_inspected() {
+    let w = World::new().await;
+
+    // Spliced: the origin's own certificate, end to end, and one audit row for the connection.
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let (issuer, body) = get(s, "open.test", "/hello").await;
+    assert_eq!(issuer, "wicket run CA origin", "the box sees the origin's certificate");
+    assert_eq!(body, b"origin /hello");
+    settle().await;
+    let ev = w.events();
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!((ev[0].0.as_str(), ev[0].1.as_str()), ("open.test", "spliced"));
+    assert!(ev[0].2.contains("reach rule 0") && ev[0].2.contains("bytes up") && !ev[0].2.contains(" 0 bytes up"), "{}", ev[0].2);
+
+    // A large body through splice(2) arrives whole, and the row counts it.
+    let (_, s) = w.connect("open.test").await;
+    let (_, body) = get(s, "open.test", "/bytes/5000000").await;
+    assert_eq!(body.len(), 5_000_000);
+    settle().await;
+    let ev = w.events();
+    let down: u64 = ev[0].2.split(" bytes up, ").nth(1).unwrap().split(" down").next().unwrap().parse().unwrap();
+    assert!(down > 5_000_000, "{}", ev[0].2);
+
+    // Inspected (reach limits methods; a forbid rule names the host): the run CA's leaf, and a
+    // decision per request.
+    for host in ["checked.test", "fenced.test"] {
+        let (status, s) = w.connect(host).await;
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let (issuer, body) = get(s, host, "/hello").await;
+        assert_eq!(issuer, "wicket run CA run_splice", "{host} is intercepted");
+        assert!(String::from_utf8_lossy(&body).contains("origin /hello"), "{host}");
+        settle().await;
+        let ev = w.events();
+        assert!(ev.iter().any(|e| e.0 == host && e.1 == "allow"), "{host}: {ev:?}");
+        assert!(!ev.iter().any(|e| e.1 == "spliced"), "{host}: {ev:?}");
+    }
+    // The forbid rule still applies to the intercepted host.
+    let (_, s) = w.connect("fenced.test").await;
+    let (_, body) = get(s, "fenced.test", "/admin/x").await;
+    assert!(String::from_utf8_lossy(&body).contains("forbidden"), "{}", String::from_utf8_lossy(&body));
+    w.events();
+}
+
+/// A ClientHello that names another host than the CONNECT is not spliced: it is intercepted, as any
+/// other host is, so the box gets the run CA's leaf for the CONNECT host and its requests are
+/// decided one by one (and Host pinning refuses the other name).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sni_that_differs_from_the_connect_host_is_intercepted() {
+    let w = World::new().await;
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let (issuer, body) = get(s, "checked.test", "/hello").await;
+    assert_eq!(issuer, "wicket run CA run_splice");
+    assert!(String::from_utf8_lossy(&body).contains("does not match the tunnel target"), "{}", String::from_utf8_lossy(&body));
+    settle().await;
+    let ev = w.events();
+    assert!(!ev.iter().any(|e| e.1 == "spliced"), "{ev:?}");
+    assert!(ev.iter().any(|e| e.0 == "open.test" && e.1 == "forbidden"), "{ev:?}");
+}
+
+/// The dial-time address check (#116) applies to spliced hosts: refused before the CONNECT is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spliced_host_resolving_to_a_private_address_is_not_dialled() {
+    let w = World::new().await;
+    let (status, _) = w.connect("private.test").await;
+    assert!(status.starts_with("HTTP/1.1 502"), "{status}");
+    assert!(status.contains("non-public"), "{status}");
+    let ev = w.events();
+    assert!(ev.iter().any(|e| e.0 == "private.test" && e.1 == "forbidden" && e.2.contains("non-public")), "{ev:?}");
+}

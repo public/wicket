@@ -306,6 +306,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LeaseCmd,
     },
+    /// The zone view of a manifest: for each host its reach names, whether the egress proxy inspects
+    /// it (terminates TLS and decides every request) or splices it through (decides on the hostname,
+    /// relays the encrypted bytes), and why (#62).
+    Zone {
+        /// The manifest (YAML).
+        manifest: PathBuf,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         #[arg(long, default_value = "wicket/claude-code:poc")]
@@ -1157,6 +1167,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { image } => doctor::doctor(&image).await,
+        Cmd::Zone { manifest, json } => {
+            let m = wicket_core::Manifest::from_yaml(
+                &std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?,
+            )?;
+            print!("{}", zone_view(&m.zone, json));
+            Ok(())
+        }
         Cmd::Reconcile { dry_run, every } => {
             let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
             reconcile::command(dry_run, every).await
@@ -1469,4 +1486,38 @@ fn secret_hosts_line(v: &Vault, name: &str) -> String {
     } else {
         format!("sent only to {}", h.join(", "))
     }
+}
+
+/// The zone view (`wicket zone`): each host the zone's reach names, spliced or inspected, and why.
+fn zone_view(zone: &wicket_core::ZoneSpec, json: bool) -> String {
+    use wicket_core::splice::Inspection;
+    let rows = wicket_core::splice::view(zone);
+    if json {
+        let v: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(h, i)| match i {
+                Inspection::Spliced { rule } => serde_json::json!({ "host": h, "mode": "spliced", "rule": rule }),
+                Inspection::Inspected(why) => serde_json::json!({ "host": h, "mode": "inspected", "why": why }),
+            })
+            .collect();
+        return format!("{}\n", serde_json::to_string_pretty(&serde_json::json!({ "zone": zone.name, "hosts": v })).unwrap_or_default());
+    }
+    let mut out = format!("zone {}: egress over HTTPS (HTTP/3 is always terminated and inspected)\n", zone.name);
+    let w = rows.iter().map(|(h, _)| h.len()).max().unwrap_or(0);
+    for (h, i) in &rows {
+        match i {
+            Inspection::Spliced { rule } => out.push_str(&format!(
+                "  {h:<w$}  SPLICED    reach rule {rule} allows every method and path: decided at connect, not inspected\n"
+            )),
+            Inspection::Inspected(why) => out.push_str(&format!("  {h:<w$}  INSPECTED  {why}\n")),
+        }
+    }
+    if rows.iter().any(|(_, i)| i.is_spliced()) {
+        out.push_str("  Spliced hosts get one audit row per connection, no per-request decisions or header filtering,\n");
+        out.push_str("  and on a shared CDN may reach other sites behind it. Add a forbid rule to inspect one.\n");
+    }
+    if rows.is_empty() {
+        out.push_str("  (reach names no hosts)\n");
+    }
+    out
 }

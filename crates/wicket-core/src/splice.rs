@@ -230,9 +230,33 @@ mod tests {
             "models.example",
         ];
         let segs = [
-            "repos", "o", "r", "graphql", "hooks", "merge", "merges", "actions", "contents", ".github", "git", "refs", "info",
-            "git-receive-pack", "git-upload-pack", "pulls", "1", "update-branch", "keys", "secrets", "comments", "admin", "issues",
-            "collaborators", "dispatches", "releases", "x",
+            "repos",
+            "o",
+            "r",
+            "graphql",
+            "hooks",
+            "merge",
+            "merges",
+            "actions",
+            "contents",
+            ".github",
+            "git",
+            "refs",
+            "info",
+            "git-receive-pack",
+            "git-upload-pack",
+            "pulls",
+            "1",
+            "update-branch",
+            "keys",
+            "secrets",
+            "comments",
+            "admin",
+            "issues",
+            "collaborators",
+            "dispatches",
+            "releases",
+            "x",
         ];
         let queries = ["", "service=git-receive-pack", "service=git-upload-pack", "service=git-upload-pack&x=1"];
         let rules = [
@@ -291,7 +315,9 @@ mod tests {
         let segs = ["repos", "o", "r", "graphql", "hooks", "merge", "contents", ".github", "git", "refs", "info", "git-receive-pack", "x"];
         let mut rng = Rng(42);
         let (t, r) = (TenantId::single(), RunId("r".into()));
-        for host in ["static.example", "github.com.evil.example", "evilgithub.com", "gitlab.com", "registry.npmjs.org", "amazonaws.com.example"] {
+        for host in
+            ["static.example", "github.com.evil.example", "evilgithub.com", "gitlab.com", "registry.npmjs.org", "amazonaws.com.example"]
+        {
             for _ in 0..500 {
                 let path: String = (0..1 + (rng.0 % 6) as usize).map(|_| format!("/{}", rng.pick(&segs))).collect();
                 for m in HTTP_METHODS {
@@ -301,7 +327,9 @@ mod tests {
             }
         }
         // And for the risk hosts it can be raised (so the list isn't stale the other way).
-        for (m, host, path) in [("POST", "github.com", "/o/r.git/git-receive-pack"), ("POST", "api.github.com", "/graphql"), ("GET", "s3.amazonaws.com", "/")] {
+        for (m, host, path) in
+            [("POST", "github.com", "/o/r.git/git-receive-pack"), ("POST", "api.github.com", "/graphql"), ("GET", "s3.amazonaws.com", "/")]
+        {
             assert!(Op::egress(&t, &r, "z", m, host, path).risk >= RiskClass::R3ExternalOrIrreversible, "{host}");
         }
     }

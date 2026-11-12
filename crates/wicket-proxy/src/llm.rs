@@ -543,7 +543,7 @@ impl Llm {
 }
 
 /// The host Claude Code's model calls go to.
-pub(crate) const MODEL_HOST: &str = "api.anthropic.com";
+pub(crate) const MODEL_HOST: &str = wicket_core::splice::MODEL_HOST;
 
 /// The only model endpoints that take a request body (#112). Batches, files and anything else are
 /// refused: a batch carries requests (and tools) of its own.

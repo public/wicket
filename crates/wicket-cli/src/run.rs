@@ -1370,6 +1370,7 @@ fn print_event(ev: &Event) {
                 "pending" => "PENDING",
                 "denied" => "DENIED ",
                 "forwarded" => "FORWARD",
+                "spliced" => "SPLICE ",
                 "unavailable" => "STALE  ",
                 _ => "BLOCKED",
             };
