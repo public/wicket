@@ -507,13 +507,31 @@ pub fn fold_case_glob(glob: &str) -> String {
                     }
                     body.push(n);
                 }
-                out.push_str(&body);
-                if closed {
-                    if body.chars().any(|c| c.is_ascii_alphabetic()) {
-                        // `a-z` gains `A-Z`; a leading `]` (a literal) is kept once.
-                        let rest: String = body.strip_prefix(']').unwrap_or(&body).chars().map(swap).collect();
-                        out.push_str(&rest);
+                if !closed {
+                    out.push_str(&body);
+                } else {
+                    // The other case of each letter and letter range (`a-z` gains `A-Z`), put right
+                    // after a leading `]` or `-` (literals there), so it never joins another range.
+                    let b: Vec<char> = body.chars().collect();
+                    let mut extra = String::new();
+                    let mut i = 0;
+                    while i < b.len() {
+                        if i + 2 < b.len() && b[i + 1] == '-' {
+                            if b[i].is_ascii_alphabetic() && b[i + 2].is_ascii_alphabetic() {
+                                extra.extend([swap(b[i]), '-', swap(b[i + 2])]);
+                            }
+                            i += 3;
+                        } else {
+                            if b[i].is_ascii_alphabetic() {
+                                extra.push(swap(b[i]));
+                            }
+                            i += 1;
+                        }
                     }
+                    let lead = usize::from(matches!(b.first(), Some(']' | '-')));
+                    out.extend(&b[..lead]);
+                    out.push_str(&extra);
+                    out.extend(&b[lead..]);
                     out.push(']');
                 }
             }

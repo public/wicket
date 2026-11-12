@@ -720,7 +720,14 @@ zone:
     fn folded_globs_match_ignoring_case() {
         use crate::manifest::fold_case_glob;
         assert_eq!(fold_case_glob("/a1/*"), "/[aA]1/*");
-        assert_eq!(fold_case_glob("/[a-c]/[!x]/\\q/\\*"), "/[a-cA-C]/[!xX]/[qQ]/\\*");
+        assert_eq!(fold_case_glob("/[a-c]/[!x]/\\q/\\*"), "/[A-Ca-c]/[!Xx]/[qQ]/\\*");
+        assert_eq!(fold_case_glob("/[a-z_-]"), "/[A-Za-z_-]");
+        assert_eq!(fold_case_glob("/[-a]"), "/[-Aa]");
+        // Every folded class still compiles, and matches either case.
+        for g in ["/[a-z_-]/x", "/[-a]", "/[]a]", "/[!a-c0-9-]", "/[0-9a]", "/[a-]"] {
+            assert!(compile_glob(&fold_case_glob(g)).is_ok(), "{g} -> {}", fold_case_glob(g));
+        }
+        assert!(compile_glob(&fold_case_glob("/[a-z_-]/x")).unwrap().is_match("/Q/X"));
         for (g, yes, no) in [
             ("/repos/{acme,octo}/**", "/REPOS/Octo/x", "/repos/other/x"),
             ("/x/[]a]", "/X/A", "/x/b"),
