@@ -275,7 +275,7 @@ mod tests {
             assert!(matches!(canonical_path(p), Err(CanonError::EncodedSeparator(_))), "{p}: {:?}", canonical_path(p));
         }
         assert!(matches!(canonical_path("/@scope%252fname"), Err(CanonError::EncodedSeparator(_))));
-        assert!(matches!(canonical_path("/@scope%2fname%41"), Err(_)));
+        assert!(canonical_path("/@scope%2fname%41").is_err());
         assert_eq!(canonical_path("/@scope%2fname/../x"), Err(CanonError::DotSegment));
         assert_eq!(canonical_path("/@scope%2fname//x"), Err(CanonError::EmptySegment));
         assert_eq!(canonical_path("/@scope%2fname;x"), Err(CanonError::Parameter));
