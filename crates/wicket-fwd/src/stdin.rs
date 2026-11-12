@@ -52,7 +52,7 @@ pub fn run(sock: &Path, argv: &[String]) -> io::Result<i32> {
         loop {
             if let Ok(mut s) = UnixStream::connect(&sock) {
                 match relay(&mut s, &mut to, &mut received) {
-                    Ok(true) => return, // drops `to`: the command's stdin closes
+                    Ok(true) => return,                                        // drops `to`: the command's stdin closes
                     Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return, // the command closed its stdin
                     _ => {}
                 }
