@@ -403,7 +403,7 @@ Also built since then:
 - the principal and delegation chain in every identity, shown with every request.
 
 Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
-name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
+name-constrained node CA (see [nodes.md](nodes.md)). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
 for an mTLS transport, root and issuing key separation, and federation with other installations.
 
 Built since (#12): **wicket as its own system user.** `wicketd` (`wicket daemon`) runs as `wicket`, which owns the
