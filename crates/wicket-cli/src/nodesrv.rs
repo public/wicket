@@ -708,6 +708,8 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
         swaps: vec![],
         boxes: None,
         capacity: None,
+        fence: None,
+        waker: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = match &ca {

@@ -604,6 +604,8 @@ mod tests {
                 swaps: vec![],
                 boxes: Some(Arc::new(boxes)),
                 capacity: None,
+                fence: None,
+                waker: None,
             }
         }
     }

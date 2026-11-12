@@ -8,8 +8,12 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
+mod agents;
+pub mod bundle;
 mod links;
 mod node;
+pub mod objects;
+pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
 mod lease;
 pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
@@ -258,6 +262,7 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
+        conn.execute_batch(agents::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -276,6 +281,7 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
+        conn.execute_batch(agents::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
