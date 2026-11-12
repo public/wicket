@@ -48,6 +48,10 @@ fn tool_result_last(v: &Value) -> bool {
         .is_some_and(|c| c.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")))
 }
 
+/// The Bash tool's own limit for the scripted command (Claude Code's most): the default, two minutes,
+/// would cut off a step that waits for a human or keeps a child agent's box up.
+const BASH_TIMEOUT_MS: u64 = 600_000;
+
 pub async fn serve(listen: &str, command: &str) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     eprintln!("mock LLM on http://{listen} (command: {command})");
@@ -106,7 +110,7 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
     let messages = v.get("messages").and_then(|m| m.as_array()).map(|m| m.len()).unwrap_or(0);
     let (block, stop) = if has_tools && !done {
         (
-            json!({ "type": "tool_use", "id": format!("toolu_mock_{n}"), "name": "Bash", "input": { "command": command, "description": "wicket mock step" } }),
+            json!({ "type": "tool_use", "id": format!("toolu_mock_{n}"), "name": "Bash", "input": { "command": command, "description": "wicket mock step", "timeout": BASH_TIMEOUT_MS } }),
             "tool_use",
         )
     } else {

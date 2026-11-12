@@ -267,6 +267,28 @@ See [docs/audit-export.md](docs/audit-export.md).
   `examples/self-hosting/` runs an agent on wicket's own source.
 - **Crash cleanup:** `wicket reconcile` (or `wicket reap`) stops boxes whose `wicket run` died.
 
+## Acceptance test
+
+`ci/acceptance.sh` runs the main flows against the real image, gVisor and Docker, with the scripted mock
+model (no model credential), checks each outcome, prints a summary and tears everything down, on failure too:
+an agent's egress (HTTP/1.1 and HTTP/3, in reach and out of it), one request approved and one denied, `spawn`
+of a narrower zone and of a wider one with `ask_human`, a `link` between two boxes and a fetch across it,
+revoking the agent and its whole subtree, hibernate and wake, an orphaned box stopped by `wicket reconcile`,
+and `wicket audit --verify`, with an export to a JSON-lines sink checked by `--against`.
+
+```sh
+ci/acceptance.sh                    # development mode: this checkout's binary, fresh data, boxes named acc-*
+ci/acceptance.sh --nodes local      # and the multi-host flow: a capacity lease on localhost as a node
+                                    # (the static backend), a box there, ci/node-e2e.sh, revoke, reconcile
+ci/acceptance.sh --installed        # as an operator, against an installed system (wicketd, sudo wicket)
+ci/install-acceptance.sh            # --installed against deploy/install.sh in a fresh container
+ACC_VULTR=yes ci/acceptance.sh --nodes vultr   # a fresh Vultr node (spends money; see the script's header)
+```
+
+Links between a box on a
+node and one on the control host aren't supported yet; the multi-host flow records that and runs the node
+e2e flow instead.
+
 ## License
 
 See [LICENSE](LICENSE).
