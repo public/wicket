@@ -393,7 +393,11 @@ their state, generation and bundle size.
 - **Volumes by class** (`zone.volumes[].persist`):
   - `durable`: the agent's own, bundled;
   - `node` (the default): shared by the zone, kept on the node;
-  - `cache`: never bundled.
+  - `cache`: never bundled, and may be empty after a wake on another node. On one node it behaves like `node`.
+- `limits.timeout` applies to each activation, Idle time included. At the timeout, an idle agent at a quiet
+  point hibernates, and any other is stopped.
+- Only a hibernated agent can be woken. If its session ends any other way (stopped, timed out mid-turn, or
+  over its `/tmp` cap), the agent is `ended`.
 - A local box's `/tmp` is a host directory in the run's directory, so it is kept with the rest, and survives a
   crash of the supervisor. wicket stops the box if `/tmp` goes over 512 MiB, checking every 5 s; the old tmpfs
   enforced that cap exactly.

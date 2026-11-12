@@ -230,7 +230,7 @@ impl Ledger {
     /// Asks the agent's supervisor for something (`hibernate`). False: the agent isn't held by a box.
     pub fn want_agent(&self, id: &str, want: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE agents SET want = ?2, updated_at = ?3 WHERE id = ?1 AND state IN ('active', 'idle')",
+            "UPDATE agents SET want = ?2, note = NULL, updated_at = ?3 WHERE id = ?1 AND state IN ('active', 'idle')",
             params![id, want, now()],
         )?;
         Ok(n == 1)
@@ -258,6 +258,13 @@ impl Ledger {
     /// Undelivered peer messages waiting for `run`.
     pub fn waiting_messages(&self, run: &str) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND delivered_at IS NULL", params![run], |r| r.get(0))?)
+    }
+
+    /// Operator follow-ups queued for `run` and not yet handed to it.
+    pub fn waiting_operator_messages(&self, run: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL", params![run], |r| r.get(0))?)
     }
 
     /// Every run of an agent, oldest first.

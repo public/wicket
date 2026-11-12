@@ -253,12 +253,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         println!("[wicket] restored and verified the agent's state in {} ms", t0.elapsed().as_millis());
     }
-    for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
-        std::fs::create_dir_all(dir.join(sub))?;
+    // What wicket mounts and writes into must be real directories, whatever a restored bundle held.
+    crate::hibernate::real_dirs(&["sock", "ca", "state", "state/home", "state/claude", "workspace", "workspace/out"].map(|s| dir.join(s)))?;
+    // A local agent's /tmp is a host directory (kept with the rest of its state, and through a
+    // crash), capped at the size the tmpfs had. Programs keep the tmpfs.
+    let tmp_dir = (node.is_none() && m.program.is_none()).then(|| dir.join("tmp"));
+    if let Some(t) = &tmp_dir {
+        crate::hibernate::real_dirs(std::slice::from_ref(t))?;
+        std::fs::set_permissions(t, std::fs::Permissions::from_mode(0o1777))?;
     }
-    // A local box's /tmp is a host directory (kept with the rest of its state, and through a crash),
-    // capped at the size the tmpfs had.
-    let tmp_dir = node.is_none().then(|| dir.join("tmp"));
     if let Some(t) = &tmp_dir {
         std::fs::create_dir_all(t)?;
         std::fs::set_permissions(t, std::fs::Permissions::from_mode(0o1777))?;
@@ -642,7 +645,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 use base64::Engine;
                 state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
             }
-            None => std::fs::write(box_root.join("state/claude/settings.json"), json)?,
+            None => crate::hibernate::write_new(&box_root.join("state/claude/settings.json"), &json)?,
             Some(n) => n.put(&format!("{}/state/claude/settings.json", box_root.display()), &json).await?,
         }
     }
@@ -1121,9 +1124,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let (Some(f), false) = (&fence, superseded) {
         if hibernating {
             let t0 = std::time::Instant::now();
-            let row = ledger.lock().expect("ledger").agent(&f.agent)?.context("the agent row")?;
-            let trees = crate::hibernate::trees(&m, &f.agent, &dir, workspace_dir.as_deref());
-            match crate::hibernate::push(&ledger, &row, f.generation, &trees) {
+            let row = {
+                let l = ledger.lock().expect("ledger");
+                // No heartbeat runs while the state is pushed: hold the claim for long enough.
+                l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::BUSY_LEASE_SECS)?;
+                l.agent(&f.agent)?.context("the agent row")?
+            };
+            let mut trees = crate::hibernate::trees(&m, &f.agent, &dir, workspace_dir.as_deref());
+            let staged = crate::hibernate::stage_volumes(&mut trees, &dir)?;
+            let pushed = crate::hibernate::push(&ledger, &row, f.generation, &trees);
+            if !matches!(pushed, Ok(Some(_))) {
+                crate::hibernate::unstage_volumes(&staged);
+            }
+            match pushed {
                 Ok(Some(st)) => {
                     // The node is released: what was bundled goes (an in-place workspace is the
                     // operator's own directory, and stays).
@@ -1152,6 +1165,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         "trees": st.trees.iter().map(|t| serde_json::json!({ "name": t.name, "digest": t.digest, "files": t.files, "stored_bytes": t.stored_bytes })).collect::<Vec<_>>(),
                     }))?;
                     status = "hibernated".into();
+                    // Anything sent while it was hibernating (this run was still its address) wakes it now.
+                    let waiting = l.waiting_operator_messages(&run.0).unwrap_or(0) + l.waiting_messages(&run.0).unwrap_or(0);
+                    drop(l);
+                    if waiting > 0 {
+                        println!("[wicket] {waiting} message(s) arrived while it hibernated: waking it again");
+                        crate::hibernate::trigger_wake(&f.agent, "a message that arrived while it hibernated");
+                    }
                 }
                 Ok(None) => {
                     println!("[wicket] agent {} was woken elsewhere while this one hibernated; its push was refused", f.agent);

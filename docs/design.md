@@ -1831,7 +1831,7 @@ its label is the join of everything that shaped it.
   - the workspace (or the in-place directory);
   - all of `/wicket/state`;
   - `/tmp`, now a per-box host directory;
-  - `durable` volumes. `node` volumes stay on the node, and `cache` volumes are dropped.
+  - `durable` volumes. `node` and `cache` volumes stay out of the bundle; on one node they behave the same.
 - Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory now). Each is verified by its
   tree digest on restore.
 - Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the

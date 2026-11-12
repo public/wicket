@@ -755,6 +755,57 @@ mod tests {
         deliver(&ctx.identity.as_ref().unwrap().current(), &ctx.run.0, &[], &m, revoked)
     }
 
+    /// #70: a message to a hibernated agent's old run wakes it, and its next activation reads it;
+    /// an envelope for a run that isn't the agent's is still refused.
+    #[test]
+    fn a_message_wakes_a_hibernated_agent_and_follows_it() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let _old = w.agent("t0", "z", "peer", "run_old", None, &["z"]);
+        let agent = wicket_store::new_agent_id();
+        {
+            let mut l = w.ledger.lock().unwrap();
+            l.create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "z",
+                name: "peer",
+                run: "run_old",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+            assert!(l.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+            l.run_ended(&RunId("run_old".into()), "hibernated", "{}").unwrap();
+        }
+        let woken: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let mut lead = w.agent("t0", "z", "lead", "run_lead", None, &[]);
+        assert!(lead.send_message("run_old", "message", json!("hi")).unwrap_err().contains("not running"), "no waker: refused as before");
+        let wk = woken.clone();
+        lead.waker = Some(Arc::new(move |a: &str, by: &str| wk.lock().unwrap().push((a.into(), by.into()))));
+        lead.send_message("run_old", "message", json!("wake up")).unwrap();
+        assert_eq!(woken.lock().unwrap().len(), 1);
+        assert_eq!(woken.lock().unwrap()[0].0, agent);
+        // The waker's claim moves the message to the new activation, which reads it.
+        assert_eq!(w.ledger.lock().unwrap().claim_wake(&agent, "run_new", wicket_store::now() + 30).unwrap(), Some(2));
+        let mut new = w.agent("t0", "z", "peer", "run_new", None, &["z"]);
+        new.fence = Some(crate::Fence { agent: agent.clone(), generation: 2 });
+        let m = new.ledger.lock().unwrap().take_message("run_new").unwrap().expect("retargeted");
+        let earlier: Vec<String> = new.ledger.lock().unwrap().agent_runs(&agent).unwrap().into_iter().map(|(r, _)| r).collect();
+        let me = new.identity.as_ref().unwrap().current();
+        let (text, err) = deliver(&me, "run_new", &earlier, &m, false);
+        assert!(!err && text.contains("wake up"), "{text}");
+        let (text, err) = deliver(&me, "run_new", &[], &m, false);
+        assert!(err && text.contains("does not match"), "only the agent's own runs: {text}");
+        // Sent while the agent is awake again: to its current run, no wake.
+        w.ledger.lock().unwrap().set_agent_state(&agent, 2, "active", None).unwrap();
+        lead.send_message("run_old", "message", json!("again")).unwrap();
+        assert_eq!(woken.lock().unwrap().len(), 1);
+        assert_eq!(w.ledger.lock().unwrap().waiting_messages("run_new").unwrap(), 1);
+    }
+
     #[test]
     fn messages_carry_verified_senders_and_respect_zone_policy() {
         let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };

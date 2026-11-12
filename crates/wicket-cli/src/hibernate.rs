@@ -29,6 +29,11 @@ use wicket_store::{AgentRow, Ledger};
 /// every few seconds; a waker may take over an agent whose holder let it lapse.
 pub const LEASE_SECS: i64 = 30;
 
+/// The claim held across the steps no heartbeat covers (a waker restoring and starting the box, a
+/// supervisor pushing the state): long enough for a big bundle, after which a crashed holder's agent
+/// can be woken again.
+pub const BUSY_LEASE_SECS: i64 = 900;
+
 /// The object store agent state goes to: a directory under wicket's data dir (S3-compatible
 /// backends later).
 pub fn store() -> DirStore {
@@ -120,6 +125,67 @@ pub fn push(
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+/// Moves the agent's durable volumes into the run's directory before they are packed, so that once the
+/// push commits (and the agent can be woken again) nothing this activation removes is shared with the
+/// next one. Returns the moves, to undo if the push fails.
+pub fn stage_volumes(trees: &mut [(String, PathBuf, &[&str])], run_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut moved = Vec::new();
+    for (name, p, _) in trees.iter_mut().filter(|(n, _, _)| n.starts_with("volume.")) {
+        let staged = run_dir.join("hib-volumes").join(name.as_str());
+        std::fs::create_dir_all(staged.parent().expect("a parent"))?;
+        if p.exists() {
+            std::fs::rename(&*p, &staged)?;
+        } else {
+            std::fs::create_dir_all(&staged)?;
+        }
+        moved.push((p.clone(), staged.clone()));
+        *p = staged;
+    }
+    Ok(moved)
+}
+
+/// Puts staged volumes back (the push failed), unless something else is there now.
+pub fn unstage_volumes(moved: &[(PathBuf, PathBuf)]) {
+    for (home, staged) in moved {
+        if !home.exists() {
+            let _ = std::fs::rename(staged, home);
+        }
+    }
+}
+
+/// Makes sure each of `dirs` is a real directory, not a symlink or a file: they come from a bundle the
+/// agent wrote, and wicket mounts them and writes into them on the host.
+pub fn real_dirs(dirs: &[PathBuf]) -> Result<()> {
+    for d in dirs {
+        match std::fs::symlink_metadata(d) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                std::fs::remove_file(d)?;
+                std::fs::create_dir_all(d)?;
+            }
+            Err(_) => std::fs::create_dir_all(d)?,
+        }
+    }
+    Ok(())
+}
+
+/// Writes a file wicket owns into an agent-written tree: whatever is at `p` (a symlink, say) is
+/// removed first, and the file is created new, never followed.
+pub fn write_new(p: &Path, body: &[u8]) -> Result<()> {
+    use std::io::Write;
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => {
+            bundle::make_writable(p)?;
+            std::fs::remove_dir_all(p)?;
+        }
+        Ok(_) => std::fs::remove_file(p)?,
+        Err(_) => {}
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p)?;
+    f.write_all(body)?;
+    Ok(())
 }
 
 /// Restores a tree into `dest`, replacing whatever is there.
@@ -246,7 +312,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
             bail!("agent {} has never hibernated (it is {}); there is nothing to wake", a.id, a.state);
         }
         let run = RunId::new();
-        let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + LEASE_SECS)? else {
+        let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_LEASE_SECS)? else {
             let a = l.agent(&a.id)?.unwrap_or(a);
             println!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
             std::process::exit(2);
@@ -456,6 +522,22 @@ mod tests {
         let t = wake_text("wicket say by op", &[("carry on".into(), "op".into())], 2);
         assert!(t.contains("woken (wicket say by op)") && t.contains("carry on") && t.contains("2 message(s)"));
         assert!(!wake_text("x", &[], 0).contains("message(s)"));
+    }
+
+    #[test]
+    fn wicket_never_writes_through_an_agent_s_symlink() {
+        let d = std::env::temp_dir().join(format!("wicket-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("host")).unwrap();
+        std::fs::create_dir_all(d.join("state")).unwrap();
+        std::os::unix::fs::symlink(d.join("host"), d.join("state/claude")).unwrap();
+        real_dirs(&[d.join("state"), d.join("state/claude"), d.join("state/home")]).unwrap();
+        assert!(std::fs::symlink_metadata(d.join("state/claude")).unwrap().is_dir());
+        std::os::unix::fs::symlink(d.join("host/settings.json"), d.join("state/claude/settings.json")).unwrap();
+        write_new(&d.join("state/claude/settings.json"), b"{}").unwrap();
+        assert!(!d.join("host/settings.json").exists(), "the host file was not written");
+        assert_eq!(std::fs::read(d.join("state/claude/settings.json")).unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
