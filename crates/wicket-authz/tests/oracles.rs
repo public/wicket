@@ -391,3 +391,43 @@ fn oracle3_compiled_equals_generic_engine() {
 fn oracle3_compiled_equals_authorizer_builder_100k() {
     differential(100_000, 1);
 }
+
+/// #143: npm's scoped-package form (`/@scope%2fname`) is decided on its decoded path, and the
+/// zone, the compiled token and the generic engine agree on it, as on the unencoded spelling: a
+/// forbid on `/@scope/**` blocks both, a reach rule allows both.
+#[test]
+fn npm_scoped_paths_decide_alike_in_every_oracle() {
+    let keys = Keys::new(0);
+    let z = wicket_core::Manifest::from_yaml(
+        "task: t\nagent: { name: a }\nzone:\n  name: npm\n  llm: {}\n  reach:\n    - { host: registry.npmjs.org, methods: [GET], paths: [\"/**\"] }\n    - { host: npm.internal.example, methods: [GET], paths: [\"/@acme/**\"] }\n  forbid:\n    - { host: registry.npmjs.org, paths: [\"/@evil/**\", \"/@types/secret\"] }\n",
+    )
+    .unwrap()
+    .zone;
+    let c = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    let l = load_ok(&mint(&keys.root, TENANT, "trigger:t", &c).unwrap(), &keys);
+    let cz = CompiledZone::new(z.clone()).unwrap();
+    let mut generic = l.generic_session();
+    let names = ["@types%2fnode", "@types%2Fsecret", "@evil%2fpkg", "@acme%2flib", "@babel%2fcore", "@eslint-community%2feslint-utils"];
+    let mut kinds = [0usize; 3];
+    for h in ["registry.npmjs.org", "npm.internal.example"] {
+        for name in names {
+            for tail in ["", "/", "/1.0.0", "/-/x-1.0.0.tgz"] {
+                let raw = format!("/{name}{tail}");
+                let decoded = wicket_core::canonical_path(&raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+                let plain = raw.replacen("%2f", "/", 1).replacen("%2F", "/", 1);
+                assert_eq!(decoded, plain.as_str(), "{raw}");
+                for m in METHODS {
+                    let o = op(&z.name, m, h, &decoded);
+                    let want = kind_of_verdict(&cz.evaluate(&o));
+                    assert_eq!(want, kind_of_verdict(&cz.evaluate(&op(&z.name, m, h, &plain))), "{m} {h}{raw}");
+                    let got = l.decide(&http_request("b0", &o));
+                    assert_eq!(kind_of(&got), want, "{m} {h}{raw}: token {got:?}");
+                    let (res, _) = generic.authorize(&http_request("b0", &o));
+                    assert_eq!(l.classify(res), got, "{m} {h}{raw}: generic engine");
+                    kinds[want as usize] += 1;
+                }
+            }
+        }
+    }
+    assert!(kinds.iter().all(|&k| k > 0), "every kind decided: {kinds:?}");
+}

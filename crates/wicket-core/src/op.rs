@@ -571,6 +571,33 @@ zone:
         assert!(matches!(evaluate(&m.zone, &op("api.example.com", "/v1/messages")), Verdict::AllowByReach(0)));
     }
 
+    /// #143: npm's `@scope%2fname` is decided as `/@scope/name`, so rules on the decoded path
+    /// apply to it as to the unencoded spelling, forbids included.
+    #[test]
+    fn npm_scoped_packages_are_decided_decoded() {
+        let m = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: registry.npmjs.org, methods: [GET], paths: [\"/**\"] }]\n  forbid: [{ host: registry.npmjs.org, paths: [\"/@evil/**\", \"/@types/secret\"] }]\n").unwrap();
+        let t = TenantId::single();
+        let r = RunId("run_x".into());
+        let decide = |raw: &str| {
+            let path = crate::canonical_path(raw).unwrap();
+            evaluate(&m.zone, &Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", &path))
+        };
+        for p in ["/@evil%2fpkg", "/@evil%2Fpkg", "/@evil%2fpkg/1.0.0", "/@evil/pkg", "/@types%2fsecret", "/@EVIL%2fpkg"] {
+            match crate::canonical_path(p) {
+                Ok(_) => assert!(matches!(decide(p), Verdict::Forbidden(_)), "{p}"),
+                Err(_) => assert_eq!(p, "/@EVIL%2fpkg", "only the upper-case scope is refused outright"),
+            }
+        }
+        for p in ["/@types%2fnode", "/@types/node", "/@babel%2fcore/7.0.0"] {
+            assert!(matches!(decide(p), Verdict::AllowByReach(0)), "{p}");
+        }
+        assert_eq!(
+            Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", &crate::canonical_path("/@types%2fnode").unwrap()).digest(),
+            Op::egress(&t, &r, "z", "GET", "registry.npmjs.org", "/@types/node").digest(),
+            "both spellings are one op, so one grant covers both"
+        );
+    }
+
     #[test]
     fn hosts_are_judged_before_any_request() {
         let z = |extra: &str| {
