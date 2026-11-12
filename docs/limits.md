@@ -73,8 +73,14 @@ not a permanent decision.
   ledger streams to it (Litestream, at most its sync interval behind), bundles and audit segments are in
   it, and `wicket state restore` rebuilds a standby from it and the recovery kit. A standby isn't
   promoted on its own; runs that were running end as `lost` (their run directories were on the host);
-  the recovery kit is a plain tar of key files, for you to keep offline; bundles are still sealed under
-  one `state.key` (in the kit), not per-agent keys.
+  bundles are still sealed under one `state.key`, not per-agent keys.
+- **Whoever has the recovery kit owns the installation.** `wicket state kit` writes, unencrypted (a
+  plain tar of 0600 files), the identity issuer key, the installation CA, the approver key, the
+  authority issuing key, `state.key` (which opens every hibernated agent's bundle), the vault's secrets
+  (unless `--without-secrets`) and the feed and authority roots if they are on the host (unless
+  `--without-roots`; after `wicket keys roots-offline` they aren't). wicket doesn't encrypt it: keep it
+  offline and encrypted yourself (an encrypted volume, or `age`/`gpg` to a key that isn't on the host),
+  as you would the roots.
 - **The audit log is only as safe as the host.** The hash chain shows tampering after the fact, but
   someone with write access to the ledger can rewrite the whole chain. Export with signed checkpoints
   (`docs/audit-export.md`) to a system they can't reach, and verify against it with
@@ -144,7 +150,11 @@ not a permanent decision.
   the control host, and isn't counted. `box.output` in the node's audit has the bytes read and a lower
   bound on what the host dropped; offsets count bytes read. Output that repeats itself exactly can be
   lined up on the wrong copy when an adopted box's replay is resumed (`box.output.gap` notes one that
-  can't be lined up at all). The control host's run transcript isn't capped.
+  can't be lined up at all). The control host keeps the same amount (#160): the run's transcript
+  (`transcript.jsonl`, then `transcript.1.jsonl` before it) and `agent.stderr.log` keep the newest
+  `limits.output` of each stream, a program's output shown by its run stops there, and `run.output` in
+  the audit records how many bytes of each were dropped. A single line longer than half the cap is kept
+  whole, and a re-attached run's `agent.stderr.log` and stderr count are its own supervisor's only.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's

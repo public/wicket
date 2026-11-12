@@ -117,7 +117,7 @@ pub fn check(probe: bool) -> Result<()> {
 }
 
 fn litestream_desc(l: &LedgerStream) -> String {
-    l.litestream.binary.clone().or(l.litestream.image.clone()).unwrap_or_default()
+    l.litestream.binary.clone().or(l.litestream.image.clone()).unwrap_or_else(|| crate::statestore::LITESTREAM_IMAGE.into())
 }
 
 /// Litestream's configuration for the ledger, with the store's credentials if given.
@@ -152,7 +152,9 @@ fn litestream(s: &StateStore, args: &[&str], db: &Path, lineage: &str) -> Result
     let _ = std::fs::remove_file(&cfg_path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&cfg_path)?;
     std::io::Write::write_all(&mut f, litestream_config(s, l, db, lineage, Some(&creds))?.as_bytes())?;
-    let mut cmd = match (&l.litestream.binary, &l.litestream.image) {
+    let default_image = Some(crate::statestore::LITESTREAM_IMAGE.to_string());
+    let image = l.litestream.image.as_ref().or(default_image.as_ref());
+    let mut cmd = match (&l.litestream.binary, image) {
         (Some(b), _) => std::process::Command::new(b),
         (None, Some(image)) => {
             // Run as this user, with host networking and the data directory at the same path.
@@ -258,11 +260,13 @@ pub fn kit(out: &Path, with_secrets: bool, with_roots: bool) -> Result<()> {
         t.append_data(&mut h, name, body.as_slice())?;
     }
     t.into_inner()?.sync_all()?;
+    let roots = files.iter().any(|(n, _)| n.ends_with("-root.key"));
     println!(
-        "wrote {} ({} files): keep it offline; it holds keys{}",
+        "wrote {} ({} files), unencrypted: the installation's keys and state.key{}{}. Whoever has it owns the installation: encrypt it and keep it offline",
         out.display(),
         files.len(),
-        if with_secrets { " and the vault's secrets" } else { "" }
+        if with_secrets { ", the vault's secrets" } else { "" },
+        if roots { ", and the roots" } else { "" }
     );
     if !with_secrets {
         println!("  without the vault: set the secrets again on the standby before `wicket state restore`'s first use of the store");

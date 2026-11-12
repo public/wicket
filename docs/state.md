@@ -41,12 +41,15 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
    ledger:
      sync_interval: 1s            # the most a lost control host loses
      retention: 72h               # how far back --at can go
-     litestream: { binary: /usr/local/bin/litestream }
-     # or: litestream: { image: litestream/litestream@sha256:… }  (run with Docker, host networking)
+     # litestream: omitted, Litestream v0.5.18's image, pinned by digest, run with Docker (host
+     # networking, the data directory mounted, as the wicket user). Or name another:
+     #   litestream: { image: litestream/litestream@sha256:… }
+     #   litestream: { binary: /usr/local/bin/litestream }   (a release you have checked)
    ```
 
-   Litestream isn't installed by `deploy/install.sh`: install a release you have checked (wicket is
-   tested with v0.5.18), or name its image.
+   `deploy/install.sh` pulls that pinned image (the digest is `LITESTREAM_IMAGE` in
+   `crates/wicket-cli/src/statestore.rs`; a test keeps the two equal), so the `wicket-state` unit needs
+   nothing more. With `--skip-image`, or if the pull fails, the unit pulls it when it first starts.
 
 3. **The audit sink**, in `audit-sinks.yaml`:
 
@@ -67,8 +70,9 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
      does a new host pointed at a store that already holds a ledger.
 
 5. **The recovery kit**: `wicket state kit --out /media/usb/wicket-kit.tar` (`--without-secrets` to
-   leave the vault out and set the secrets again on the standby). It holds keys: keep it offline, as
-   you would the roots. Make a new one after enrolling a node or changing a config file or secret.
+   leave the vault out and set the secrets again on the standby). **It holds every key that stays on
+   the host, `state.key` and the vault, unencrypted, and the roots if they are still here: whoever has
+   it owns the installation.** Encrypt it and keep it offline, as you would the roots. Make a new one after enrolling a node or changing a config file or secret.
    A secret linked to a file (`wicket secret link`, and `claude-oauth`, which points at the host's
    Claude login) comes back as the link: sign in again on the standby.
 
@@ -132,5 +136,7 @@ Then:
 - **Failover is manual.** A standby is restored by you, not promoted on its own (phase 5, #155).
 - **Per-agent data keys** (the issue's other half): bundles are still sealed under one `state.key`,
   which is in the kit.
-- **The kit isn't encrypted by wicket.** It's a tar of 0600 files: keep it where the roots are.
+- **The kit isn't encrypted by wicket.** It's a tar of 0600 files holding every key that stays on the
+  host, `state.key` and the vault (and the roots, if they are still on the host): whoever has it owns
+  the installation. Keep it offline and encrypted (docs/limits.md).
 - **Runs in flight are lost** with their run directories, as above.

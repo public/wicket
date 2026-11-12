@@ -209,6 +209,12 @@ fi
 if [ "$skip_image" = 0 ]; then
     say "agent image"
     as_wicket image --dir /usr/local/share/wicket/images/claude-code
+    # The ledger's stream (wicket-state, docs/state.md) runs Litestream from this image unless
+    # state-store.yaml names another: pinned by digest, the same as LITESTREAM_IMAGE in
+    # crates/wicket-cli/src/statestore.rs (a test keeps the two equal).
+    say "Litestream image (for the ledger's stream)"
+    litestream_image=litestream/litestream@sha256:0ba1cdbb2d0be8876e27b1e646dc031309b7e3928e0ed91503ebaa73ff7e2c5d
+    docker pull -q "$litestream_image" >/dev/null || say "could not pull $litestream_image: wicket-state will pull it when it first starts"
 fi
 
 cat <<EOF

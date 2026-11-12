@@ -53,8 +53,14 @@ pub struct LedgerStream {
     /// How far back a point-in-time restore can go.
     #[serde(default = "default_retention")]
     pub retention: String,
+    /// Default: Litestream's image, pinned ([`LITESTREAM_IMAGE`]; `deploy/install.sh` pulls it).
+    #[serde(default)]
     pub litestream: Litestream,
 }
+
+/// The Litestream wicket is tested with (v0.5.18), by digest: what a `ledger:` section without
+/// `litestream:` runs, and what `deploy/install.sh` pulls.
+pub const LITESTREAM_IMAGE: &str = "litestream/litestream@sha256:0ba1cdbb2d0be8876e27b1e646dc031309b7e3928e0ed91503ebaa73ff7e2c5d";
 
 fn default_sync() -> String {
     "1s".into()
@@ -64,8 +70,8 @@ fn default_retention() -> String {
 }
 
 /// How Litestream runs: a binary on this host, or its image (run with host networking, the data
-/// directory mounted at the same path, as this user).
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+/// directory mounted at the same path, as this user). Neither given: the pinned image.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Litestream {
     #[serde(default)]
@@ -95,8 +101,8 @@ impl StateStore {
         if let Some(l) = &self.ledger {
             humantime::parse_duration(&l.sync_interval).context("ledger.sync_interval")?;
             humantime::parse_duration(&l.retention).context("ledger.retention")?;
-            if l.litestream.binary.is_some() == l.litestream.image.is_some() {
-                bail!("ledger.litestream: one of binary or image");
+            if l.litestream.binary.is_some() && l.litestream.image.is_some() {
+                bail!("ledger.litestream: binary or image, not both");
             }
         }
         Ok(())
@@ -133,6 +139,13 @@ impl StateStore {
 mod tests {
     use super::*;
 
+    /// deploy/install.sh pulls the image a `ledger:` section runs by default: the same digest.
+    #[test]
+    fn install_sh_pulls_the_pinned_litestream() {
+        let sh = include_str!("../../../deploy/install.sh");
+        assert!(sh.contains(&format!("litestream_image={LITESTREAM_IMAGE}\n")), "deploy/install.sh pins another Litestream");
+    }
+
     #[test]
     fn a_state_store_is_checked() {
         let ok = "s3: { endpoint: 'https://s3.example.com', bucket: b-1, access_key_id: k, secret: s3 }\nbundles: s3\nledger: { litestream: { image: 'litestream/litestream:0.5.18' } }\n";
@@ -141,7 +154,10 @@ mod tests {
         assert!(StateStore::parse("bundles: s3\n").is_err());
         assert!(StateStore::parse(&ok.replace("image:", "nope:")).is_err());
         assert!(StateStore::parse(&ok.replace("b-1", "B_1")).is_err());
-        assert!(StateStore::parse(&ok.replace("{ image: 'litestream/litestream:0.5.18' }", "{}")).is_err());
+        let default =
+            StateStore::parse(&ok.replace("ledger: { litestream: { image: 'litestream/litestream:0.5.18' } }", "ledger: {}")).unwrap();
+        assert!(default.ledger.unwrap().litestream.binary.is_none());
+        assert!(StateStore::parse(&ok.replace("{ image: 'litestream/litestream:0.5.18' }", "{ image: a, binary: b }")).is_err());
         assert!(StateStore::parse(&ok.replace("https://s3.example.com", "ftp://x")).is_err());
     }
 }

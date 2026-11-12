@@ -32,6 +32,7 @@ mod serve;
 mod spawn;
 mod state;
 mod statestore;
+mod transcript;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

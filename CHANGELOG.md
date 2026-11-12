@@ -65,6 +65,9 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   kept on its node's host is capped by the zone's new `limits.output` (default `64m`, the newest kept,
   or `on_output_full: stop`), and a re-attached parent keeps its spawn bound
   ([#151](https://github.com/public/wicket/issues/151)).
+- The control host's run transcript, its stderr log and a program's output shown by its run are
+  bounded by `limits.output` too, the newest kept, with `run.output` in the audit
+  ([#160](https://github.com/public/wicket/issues/160)).
 - Remote nodes splice too, while their feed replica is fresh: only for top-level boxes, and only
   for hosts the box's token itself allows for every method. When the replica narrows or closes, the
   node cuts its spliced connections within 2 s and inspects new ones

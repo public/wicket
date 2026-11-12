@@ -33,9 +33,9 @@ WICKET=$(realpath "$WICKET")
 cd "$(dirname "$0")/.."
 DOCKER=${WICKET_DOCKER:-docker}
 export WICKET_DOCKER=$DOCKER
-# Pinned: the S3 gateway (v1.11.0) and Litestream (v0.5.18).
+# Pinned: the S3 gateway (v1.11.0). Litestream is the one an install runs: wicket's default, pinned
+# (LITESTREAM_IMAGE in crates/wicket-cli/src/statestore.rs).
 S3_IMAGE=${S3_IMAGE:-versity/versitygw@sha256:8319a530d08d537426e2f855bae5280709795dc73a3f0c347973ef915d6343c5}
-LITESTREAM_IMAGE=${LITESTREAM_IMAGE:-litestream/litestream@sha256:0ba1cdbb2d0be8876e27b1e646dc031309b7e3928e0ed91503ebaa73ff7e2c5d}
 
 export WICKET_BOX_PREFIX=rst
 work=$(mktemp -d)
@@ -106,7 +106,6 @@ s3:
 bundles: s3
 ledger:
   sync_interval: 1s
-  litestream: { image: '$LITESTREAM_IMAGE' }
 EOF
 printf 'checkpoint_every: 1m\nsinks:\n  - {name: rst, type: store}\n' >"$work/a-home/audit-sinks.yaml"
 cat >"$work/prog.yaml" <<'EOF'
