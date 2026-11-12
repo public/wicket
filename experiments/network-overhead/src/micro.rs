@@ -89,6 +89,29 @@ pub fn run() -> Result<()> {
     }
     let l = Ledger::open(&path)?;
     out.insert("audit_row_file_ledger".into(), time(3000, |_| l.audit(&t, Some(&r), "op", &ev).unwrap()));
+    // The batched writer (#62): what the request path pays to queue a row, and a durable append's
+    // cost per record when 16 threads append at once (they share each batch's fsync).
+    let bpath = dir.join("micro-ledger-batched.db");
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{ext}", bpath.display()));
+    }
+    let w = wicket_store::AuditWriter::start(&bpath, wicket_store::WriterConfig::default())?;
+    out.insert("audit_row_batched_queue".into(), time(3000, |_| w.submit(&t, Some(&r), "op", &ev).unwrap()));
+    w.flush()?;
+    out.insert("audit_row_batched_durable_alone".into(), time(1000, |_| w.append(&t, Some(&r), "op", &ev).unwrap()));
+    let per = 300;
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..16 {
+            sc.spawn(|| {
+                for _ in 0..per {
+                    w.append(&t, Some(&r), "decision", &ev).unwrap();
+                }
+            });
+        }
+    });
+    out.insert("audit_row_batched_durable_16_threads_us_per_record".into(), json!(t0.elapsed().as_secs_f64() * 1e6 / (16 * per) as f64));
+    drop(w);
     let m = Ledger::open_in_memory()?;
     out.insert("audit_row_memory_ledger".into(), time(3000, |_| m.audit(&t, Some(&r), "op", &ev).unwrap()));
     println!("{}", serde_json::to_string_pretty(&out)?);

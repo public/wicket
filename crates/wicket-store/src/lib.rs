@@ -18,6 +18,10 @@ pub use links::{ExposeRow, LinkRow};
 mod lease;
 pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
+mod writer;
+pub use writer::{AuditWriter, Ticket, WriterConfig};
+mod export;
+pub use export::{ExportCursor, EXPORT_LEASE_SECS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -37,6 +41,8 @@ pub enum StoreError {
     Node(String, &'static str),
     #[error("random: {0}")]
     Random(String),
+    #[error("audit writer: {0}")]
+    Writer(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -50,6 +56,9 @@ pub type AuditRow = (i64, i64, String, Option<String>, String);
 
 pub struct Ledger {
     conn: Connection,
+    path: Option<std::path::PathBuf>,
+    /// The process's batched audit writer, once started ([`Ledger::start_audit_writer`]).
+    writer: Option<AuditWriter>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +261,7 @@ impl Ledger {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
+        conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
@@ -263,15 +273,16 @@ impl Ledger {
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
-        Ok(Ledger { conn })
+        Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
     pub fn open_in_memory() -> Result<Ledger> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(links::SCHEMA)?;
+        conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
-        Ok(Ledger { conn })
+        Ok(Ledger { conn, path: None, writer: None })
     }
 
     // ---- runs ----
@@ -479,6 +490,22 @@ impl Ledger {
             "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, tenant.0, from_run, to_run, envelope, now()],
         )?;
+        Ok(())
+    }
+
+    /// Test support: makes every later insert into the audit table fail, as a full or broken disk
+    /// would. Not for production use.
+    #[doc(hidden)]
+    pub fn fail_audit_inserts_for_tests(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS audit_fail BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'audit disk failure (test)'); END;",
+        )?;
+        Ok(())
+    }
+
+    /// Withdraws an undelivered message (one whose audit record could not be written).
+    pub fn withdraw_message(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM messages WHERE id = ?1 AND delivered_at IS NULL", params![id])?;
         Ok(())
     }
 
@@ -817,12 +844,45 @@ impl Ledger {
 
     // ---- audit ----
 
-    /// Appends a hash-chained audit record: hash = sha256(prev || kind || body).
+    /// Starts this process's batched audit writer for this ledger's file (#62), or attaches the one
+    /// it already has (`with`). From then on [`audit`](Self::audit) goes through it and waits for its
+    /// batch's commit, and [`audit_deferred`](Self::audit_deferred) queues without waiting. A no-op
+    /// for an in-memory ledger.
+    pub fn start_audit_writer(&mut self, with: Option<AuditWriter>) -> Result<Option<AuditWriter>> {
+        if self.writer.is_none() {
+            self.writer = match (with, &self.path) {
+                (Some(w), _) => Some(w),
+                (None, Some(p)) => Some(AuditWriter::start(p, WriterConfig::default())?),
+                (None, None) => None,
+            };
+        }
+        Ok(self.writer.clone())
+    }
+
+    /// This ledger's audit writer, if one was started.
+    pub fn audit_writer(&self) -> Option<AuditWriter> {
+        self.writer.clone()
+    }
+
+    /// Waits until every audit record queued so far is committed. A no-op without a writer.
+    pub fn flush_audit(&self) -> Result<()> {
+        match &self.writer {
+            Some(w) => w.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Appends a hash-chained audit record: hash = sha256(prev || kind || body). Durable when it
+    /// returns: with a writer it waits for its batch's commit (a shared flush).
     pub fn audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &serde_json::Value) -> Result<i64> {
         let body = serde_json::to_string(body)?;
-        // Several processes append to one ledger (a run, its children, a link's relay): read the head
-        // and append under one write lock, or two appends can chain from the same record.
         let own = self.conn.is_autocommit();
+        if let (Some(w), true) = (&self.writer, own) {
+            return w.append_str(tenant, run, kind, body);
+        }
+        // Several processes append to one ledger (a run, its children, a link's relay): read the head
+        // and append under one write lock, or two appends can chain from the same record. (Inside a
+        // caller's transaction, the record joins it: the writer's connection would wait on its lock.)
         if own {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
         }
@@ -831,6 +891,16 @@ impl Ledger {
             let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         r
+    }
+
+    /// Appends an audit record without waiting for it to reach the disk: with a writer it is queued
+    /// and committed with its batch a few milliseconds later. For records nothing waits on, such as
+    /// the egress proxy's per-request `op` rows. Without a writer it is [`audit`](Self::audit).
+    pub fn audit_deferred(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &serde_json::Value) -> Result<()> {
+        match &self.writer {
+            Some(w) if self.conn.is_autocommit() => w.submit(tenant, run, kind, body),
+            _ => self.audit(tenant, run, kind, body).map(|_| ()),
+        }
     }
 
     fn append_audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &str) -> Result<i64> {

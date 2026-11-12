@@ -294,7 +294,7 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         }
     };
     let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
-    let audit = Ledger::open(&paths.root.join("audit.db"))?;
+    let audit = crate::audit_export::open_batched(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
     let ctl = paths.socket();
     let ctl_dir = ctl.parent().expect("socket dir");
@@ -321,6 +321,13 @@ pub async fn serve(dir: Option<PathBuf>) -> Result<()> {
         shipped: AtomicI64::new(-1),
         shipping: Mutex::new(()),
     });
+    // Queued audit records are committed (and shipped, if the control host is connected) on a
+    // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
+    let _flush = crate::audit_export::FlushOnDrop(node.audit.clone());
+    {
+        let n = node.clone();
+        crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
+    }
     reap_previous(&node.docker, &node.paths.runs()).await;
     let mode = node.replica.lock().expect("replica").mode((node.clock)());
     eprintln!("[node] {name}: serving on {} (build {}, feed {mode:?})", ctl.display(), &node.build[..12]);

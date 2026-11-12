@@ -277,7 +277,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
 
-    let ledger = Arc::new(Mutex::new(Ledger::open(&ledger_path())?));
+    let ledger: Arc<Mutex<Ledger>> = Arc::new(Mutex::new(crate::audit_export::open_batched(&ledger_path())?));
+    // Commits the audit records still queued however the run ends (#62).
+    let _flush = crate::audit_export::FlushOnDrop(ledger.clone());
+    // Until the run loop handles signals itself: a SIGTERM or ^C commits what is queued first.
+    let early_signals = crate::audit_export::flush_on_signal(ledger.clone(), || {});
+    // Feeds the installation's audit sinks while this run lasts, if it has any (#91).
+    crate::audit_export::spawn_background();
     // The agent's session, and this activation's fencing token: new for a first run, the claimed
     // generation and the agent's own session for a wake.
     let session = match &wake {
@@ -843,6 +849,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut lines = stdout.map(|o| BufReader::new(o).lines());
     let mut wrapped_exit: Option<std::process::ExitStatus> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // From here the loop handles SIGTERM and ^C, and the run ends through `_flush`.
+    early_signals.abort();
     let log_path = dir.join("agent.stderr.log");
     let err_task = tokio::spawn(async move {
         let mut out = String::new();
