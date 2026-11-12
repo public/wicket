@@ -1,0 +1,15 @@
+# The bench zone for real workloads (#62): the registries and a 1 GiB test file, each allowed for
+# every method and path, so the egress proxy splices them through.
+task: network workloads (splice)
+program:
+  name: netwl
+  command: [bash, /workspace/run.sh, splice]
+zone:
+  name: netwl-splice
+  isolation: gvisor
+  reach:
+    - { host: index.crates.io, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: static.crates.io, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: registry.npmjs.org, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: proof.ovh.net, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+  limits: { memory: 2g, cpus: 2, timeout: 20m }

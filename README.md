@@ -19,7 +19,7 @@ doesn't protect", before you trust it with anything.
 - Concepts: [docs/concepts.md](docs/concepts.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 - Reference: [agents](docs/agents.md) (identity, children, links, sessions, hibernation),
   [console](docs/console.md), [nodes](docs/nodes.md) (enrolment, `node serve`, placement, leases),
-  [audit export](docs/audit-export.md).
+  [audit export](docs/audit-export.md), [performance](docs/performance.md).
 - Design: [docs/design.md](docs/design.md), [research](docs/research/), [prior art](docs/prior-art.md),
   [test record](docs/poc-results.md).
 

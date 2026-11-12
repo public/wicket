@@ -29,6 +29,14 @@ not a permanent decision.
   to a host the zone injects a credential into (or swaps one for) is refused.
 - **Response bodies are not scrubbed.** If an upstream echoes an injected credential back in a
   response body, the box sees it. Headers are scrubbed.
+- **A host allowed wholesale is spliced through, not inspected.** If a reach rule allows a host for
+  every method and path, the proxy decides on the hostname and relays the TLS unmodified. This needs
+  nothing injected, nothing forbidden, and not the model host. Such a host gets one audit row per
+  connection, no per-request decisions, no header filtering and no Host pinning, so behind a shared
+  CDN it can reach other sites on the same CDN. `wicket zone MANIFEST` lists spliced hosts. A forbid
+  rule on the host keeps it inspected (`docs/performance.md`).
+- **npm scoped packages fail through an inspected registry:** `@scope%2fname` is refused as an
+  ambiguous path ([#143](https://github.com/public/wicket/issues/143)). A spliced registry works.
 - **Request bodies over 64 MiB fail,** and uploads are buffered rather than streamed
   ([#93](https://github.com/public/wicket/pull/93)).
 - **MCP is wicket's own gateway only.** Adapter-generated tools and isolated third-party MCP servers
@@ -147,6 +155,9 @@ not a permanent decision.
   next reconcile pass destroys the duplicate ([#89](https://github.com/public/wicket/pull/89)).
 
 ## Performance
+
+Measured numbers for the network path, and how they were measured, are in
+[docs/performance.md](performance.md).
 
 - **HTTP/3 under gVisor is slow.** gVisor spends about 110 µs of CPU per UDP datagram, so downloads run at
   40–100 Mbit/s with standard 1452-byte packets. `WICKET_H3_BOX_MTU=16000` reaches 430–460 Mbit/s, but only

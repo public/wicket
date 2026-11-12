@@ -1,0 +1,233 @@
+# Performance of the network path
+
+Every byte a box sends goes through wicket. The box has no network of its own: its connections go
+through a forwarder in the box (`wicket-fwd`), over a bind-mounted unix socket, to the egress proxy on
+the host. This page gives what that path costs, measured, and what each change in 0.0.1 did to it
+([#62](https://github.com/public/wicket/issues/62)).
+
+**The machine.** Every number here comes from one shared VPS: 4 vCPUs (Intel Broadwell), 8 GB of RAM,
+no KVM, gVisor `release-20261102.0` on the systrap platform. Other jobs ran on it at the same time
+(load 2–9), so wall-clock figures carry ±30% noise, and download throughput much more: see the
+min–max columns. CPU seconds per GB, CPU per request and audit-row counts are much steadier. Compare
+arms only within one table, where they were interleaved in the same run.
+
+## In short
+
+| | before | after |
+|---|---|---|
+| audit row per allowed request (batched writer) | 1.3 ms kept-alive request, 930 req/s | 0.47 ms, about 7,000 req/s |
+| in-box forwarder, gVisor (`wicket-fwd` in place of socat) | 14–17 ms new connection, 10–33 MB/s | 4.2–7.3 ms, 170–350 MB/s |
+| egress CPU per GB, host allowed wholesale (splice-through) | 2.67 CPU-s/GB | 0.33 CPU-s/GB |
+| egress CPU per 1,000 kept-alive requests, same host | 162 CPU-ms | 32 CPU-ms |
+| `cargo fetch` of a mid-size project in a gVisor box | 24.3 s, 1,012 audit rows | 15.8 s, 19 audit rows |
+
+## Splice-through for hosts allowed wholesale
+
+The egress proxy terminates TLS for a host so it can decide each request on its own: method, path
+and risk. It also attaches the zone's credential. A host that a reach rule allows wholesale gains
+nothing from that, because every request the decision could see would be allowed anyway. For such a
+host the proxy decides on the hostname at `CONNECT` and relays the box's TLS unmodified. It uses
+splice(2) from the event loop, so the bytes never enter userspace. The box sees the origin's own
+certificate.
+
+**Wholesale** is decided in one place, `wicket_core::splice::inspection`. All of these must hold:
+
+- some reach rule for the host lists every method the proxy forwards (`GET HEAD OPTIONS POST PUT
+  PATCH DELETE`) and the path `/**`;
+- for a host the dangerous-pattern list can rate R3 or higher (GitHub, `*.amazonaws.com`, metadata
+  endpoints), that rule also has `allow_dangerous`;
+- no forbid rule names the host, whatever its paths;
+- no credential is injected for the host or swapped in;
+- the host is not the model host;
+- the box's TLS ClientHello names the `CONNECT` host in SNI and doesn't use Encrypted ClientHello.
+
+When any check fails, the proxy intercepts as before. That includes a ClientHello with no SNI or a
+different name: the bytes already read are replayed into the normal interception path. When in doubt,
+it intercepts.
+
+**What still applies to a spliced connection:**
+
+- the host verdict (forbidden and hidden hosts);
+- the superseded-activation check at `CONNECT` and every 2 s while the connection lasts;
+- the dial-time address check ([#116](https://github.com/public/wicket/issues/116)). The proxy
+  resolves and dials the host itself, at public addresses only, before it answers the `CONNECT`, so
+  a refused dial is the `CONNECT`'s answer.
+
+Each connection writes one audit row when it closes (`outcome: spliced`), with the reach rule and the
+bytes each way.
+
+**What a spliced host gives up.** The proxy can't see inside a spliced connection, so it loses:
+
+- per-request audit rows;
+- the request header allow-list ([#130](https://github.com/public/wicket/issues/130));
+- dropping the box's own `Authorization` header;
+- the request-shape checks;
+- Host pinning.
+
+Without Host pinning, a spliced host behind a shared CDN can be used to reach other sites behind the
+same CDN (domain fronting). To keep a host inspected, add a forbid rule for it, even on a path nothing
+uses. To see which hosts are spliced, run `wicket zone MANIFEST`, or look at the manifest list in the
+console:
+
+```
+$ wicket zone examples/self-hosting/manifest.yaml
+zone wicket-src: egress over HTTPS (HTTP/3 is always terminated and inspected)
+  index.crates.io   INSPECTED  reach limits methods, paths or risk
+  static.crates.io  INSPECTED  reach limits methods, paths or risk
+  github.com        INSPECTED  a credential is injected for github.com
+  api.github.com    INSPECTED  a credential is injected for api.github.com
+```
+
+**Not spliced, by design in 0.0.1:**
+
+- **HTTP/3.** wicket terminates QUIC for every host and decides each request, wholesale or not. A
+  client that wants the fast path to a spliced host should use HTTP/2 or HTTP/1.1 over TCP.
+- **Plain HTTP.** It is always inspected.
+- **Remote nodes.** A node decides from its feed replica, which narrows to reads, then to nothing,
+  when the control host has been unreachable too long. A hostname can't carry that, so a node
+  inspects every host ([#141](https://github.com/public/wicket/issues/141)).
+
+### Measured: the real proxy, with and without splice-through
+
+`netbench bench --only direct,egress-` in `experiments/network-overhead` runs this. It starts
+`wicket_proxy::egress::Egress` the way `wicket run` does: a file ledger with the batched audit writer,
+the run's CA and the central decider. The upstream is a local HTTPS origin that the zone allows
+wholesale. The inspected arm is the same zone with a forbid rule on a path the bench never asks for.
+The client is on the host and connects to the proxy's socket directly (`unix`), or through a forwarder
+(`fwd`, the experiment's own, splicing).
+
+Each workload ran 3 rounds, interleaved, and each figure is the median of the rounds. A round has:
+
+- 150 new-connection requests;
+- 1,000 kept-alive requests;
+- 4 s at 16 connections, kept alive and then new;
+- three 100 MB downloads;
+- three 10 MB uploads.
+
+Measured 2026-11-12.
+
+| setup | new conn p50 (ms) | kept-alive p50 / p99 (µs) | req/s, 16 kept | proxy CPU-ms per 1,000 kept requests | 100 MB, MB/s median (min–max) | proxy CPU-s per GB | 10 MB upload (ms) |
+|---|---|---|---|---|---|---|---|
+| direct | 1.33 | 126 / 1,378 | 25,702 | – | 555 (420–871) | – | 20 |
+| direct, h2 | 1.68 | 195 / 1,330 | 14,450 | – | 336 (244–418) | – | 30 |
+| **inspected** | 1.99 | **409** / 2,673 | **7,789** | **162** | 275 (201–379) | **2.67** | 61 |
+| **spliced** | 2.33 | **208** / 898 | **16,414** | **32** | 523 (343–650) | **0.33** | 20 |
+| spliced, h2 | 2.65 | 288 / 2,000 | 9,781 | 37 | 362 (236–421) | 0.47 | 23 |
+| inspected, via forwarder | 2.52 | 477 / 1,998 | 5,183 | 178 | 310 (259–468) | 2.50 (+0.60 forwarder) | 48 |
+| spliced, via forwarder | 2.41 | 278 / 960 | 15,583 | 47 | 608 (465–753) | 0.37 (+0.27 forwarder) | 22 |
+
+- **Per GB, splice-through costs an eighth of interception** (0.33 against 2.67 CPU-s). Per kept-alive
+  request it costs a fifth (32 against 162 CPU-ms per 1,000), and a kept-alive request takes half as
+  long. The prototype measured 0.17 CPU-s/GB using two blocking threads per connection. The
+  production version drives splice from the event loop: it pays for readiness wakeups, and doesn't
+  use a thread per connection.
+- **Uploads stop being buffered.** The intercepting path reads a whole request body before sending
+  it upstream, and refuses bodies over 64 MiB ([#142](https://github.com/public/wicket/issues/142)).
+  Spliced, a 10 MB upload takes as long as direct.
+- **HTTP/2 goes end to end.** Intercepted, the box side is HTTP/1.1.
+- **A new spliced connection is about 0.3 ms slower than an intercepted one.** The proxy dials the
+  upstream before it answers the `CONNECT`, so that the address check can refuse it. Interception
+  reuses a pooled upstream connection.
+
+### Measured: real workloads in a gVisor box
+
+These ran with `wicket run` (a program, gVisor, 2 CPUs, 2 GB of RAM) against the real registries and a
+1 GiB test file. The zone allowed each host wholesale. The inspected arm adds a forbid rule per host
+on an unused path. `experiments/network-overhead/workloads/` has the manifests and scripts.
+
+The workloads:
+- `cargo fetch --locked` of wicket's own workspace (about 300 crates);
+- `npm install` of a project with 168 packages;
+- a 1 GiB download with curl.
+
+Each arm ran once, spliced first, so the registries' caches were no colder for the inspected arm.
+
+| workload | inspected | spliced |
+|---|---|---|
+| `cargo fetch` (319 index and 366 crate requests) | 24.3 s | 15.8 s |
+| `npm install` (326 requests, 20 MB) | 16.1 s | 19.1 s |
+| 1 GiB download | 10.5 s (103 MB/s) | 8.9 s (121 MB/s) |
+| CPU of the `wicket run` process, whole run | 4.7 s | 1.0 s |
+| audit rows | 1,012 | 19 (one per connection) |
+
+**Wall time here is set by the network and the box, not the proxy.** An earlier run of the same
+workloads had the package caches on the box's `/tmp`, where `npm install` ran out of space. In that
+run, `cargo fetch` took 7.6 s inspected and 7.0 s spliced, and the 1 GiB download took 4.7 s
+inspected and 5.2 s spliced (233 and 211 MB/s).
+
+What holds across both runs:
+- the CPU: spliced, wicket spends about a fifth;
+- the audit rows: one per connection instead of one per request;
+- `cargo fetch` keeps HTTP/2 when spliced: its 366 crate downloads went over 2 connections to
+  `static.crates.io`. Intercepted, they were 366 HTTP/1.1 requests.
+
+**npm scoped packages fail when intercepted.** npm asks for a scoped package as `@scope%2fname`. The
+intercepting proxy refuses an encoded `/` in a path as ambiguous
+([#114](https://github.com/public/wicket/issues/114)), so `npm install` of anything that depends on a
+scoped package fails through an inspected registry
+([#143](https://github.com/public/wicket/issues/143)). A spliced registry isn't affected. The npm project
+above has no scoped packages, so both arms could run.
+
+## The audit writer
+
+Every allowed request is an audit row. Until #62's first fix, each row was written inline with an
+fsync, under the ledger lock, on a tokio worker. That was the largest per-request cost. Now one writer
+per process commits rows in batches (`docs/audit-export.md`). Rows for requests allowed by a grant
+are the exception: they still wait for their commit, to fail closed.
+
+| | kept-alive p50 / p99 (µs) | req/s, 16 kept connections | audit row, p50 (µs) |
+|---|---|---|---|
+| inline fsync (before) | 1,231–1,423 / 3,692–7,166 | 718–1,207 | 2,524–2,752 |
+| batched writer (after) | 413–466 / 1,388–2,326 | 6,651–7,903 | 7.4–7.8 (an enqueue) |
+| in-memory ledger (no disk at all) | 464–516 / 1,497–1,993 | 5,962–6,028 | 75–84 |
+
+These ranges are the three rounds' values. They come from the proxy replica in
+`experiments/network-overhead`, §7 of its `RESULTS.md`.
+
+## The in-box forwarder
+
+`wicket-fwd` replaced socat in the box. socat didn't set `TCP_NODELAY`, so Nagle and delayed ACKs
+added about 40 ms to most new connections. Its 8 KiB buffer also held gVisor downloads to 14 MB/s.
+`wicket-fwd` is one process that sets `TCP_NODELAY` and splices through a 256 KiB pipe. These figures
+are new-connection p50 and 100 MB download medians, from curl in a `--network none` box, over three
+runs:
+
+| box | socat (before) | `wicket-fwd --copy rw` | `wicket-fwd --copy splice` (default) |
+|---|---|---|---|
+| gVisor (systrap) | 14–17 ms, 10–33 MB/s | 4.4–7.5 ms, 141–205 MB/s | 4.2–7.3 ms, 170–350 MB/s |
+| runc | 2.3 ms, 366 MB/s | 1.7 ms, 1,070 MB/s | 2.5 ms, 1,160 MB/s |
+
+In gVisor, the box's own network stack is the ceiling. A download from an origin inside the box, with
+no hop at all, ran at about 100–240 MB/s.
+
+## HTTP/3
+
+A box's QUIC is relayed as datagrams over a unix `SOCK_SEQPACKET` socket and terminated on the host,
+and every request is decided like any other. gVisor spends about 110 µs of CPU per UDP datagram on
+the box's loopback, against about 8 µs in runc. With the standard 1452-byte packets, a gVisor box
+downloads at 40–100 Mbit/s and costs about 190 CPU-s per GB. With `WICKET_H3_BOX_MTU=16000`, a client
+that accepts large packets reaches 430–460 Mbit/s at about 43 CPU-s per GB
+(`experiments/http3/RESULTS.md`, [#92](https://github.com/public/wicket/issues/92)). Over TCP, HTTPS is
+faster in a gVisor box, and it is the path that splice-through applies to.
+
+## Next
+
+- Read-through caches for package registries on each node ([#139](https://github.com/public/wicket/issues/139)).
+- Large inputs and outputs fetched and uploaded host-side ([#140](https://github.com/public/wicket/issues/140)).
+- Splice-through on remote nodes while the feed is fresh ([#141](https://github.com/public/wicket/issues/141)).
+- Streaming request bodies and HTTP/2 upstream pooling on the intercepting path ([#142](https://github.com/public/wicket/issues/142)).
+- The `filtered` network mode, for protocols the proxy can't carry ([#63](https://github.com/public/wicket/issues/63)).
+
+## Reproducing
+
+```sh
+cd experiments/network-overhead
+CARGO_BUILD_JOBS=1 cargo build --release
+# Proxy, per request and per GB: direct, inspected, spliced (about 4 minutes; ports 18128/18443).
+target/release/netbench bench --only direct,egress- --rounds 3 --secs 4 --out logs/splice-through
+# Real workloads in a gVisor box (needs Docker with runsc, the agent image, and the internet).
+workloads/prepare.sh /tmp/ws
+for arm in splice inspect; do wicket run workloads/$arm.yaml --workdir /tmp/ws; done
+```
+
+The raw results are in `experiments/network-overhead/logs/splice-through/results.json`.

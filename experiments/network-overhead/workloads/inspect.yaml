@@ -1,0 +1,19 @@
+# As splice.yaml, plus a forbid rule per host on a path nothing asks for: the proxy inspects them.
+task: network workloads (inspect)
+program:
+  name: netwl
+  command: [bash, /workspace/run.sh, inspect]
+zone:
+  name: netwl-inspect
+  isolation: gvisor
+  reach:
+    - { host: index.crates.io, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: static.crates.io, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: registry.npmjs.org, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+    - { host: proof.ovh.net, methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE] }
+  limits: { memory: 2g, cpus: 2, timeout: 20m }
+  forbid:
+    - { host: index.crates.io, paths: ["/never/**"] }
+    - { host: static.crates.io, paths: ["/never/**"] }
+    - { host: registry.npmjs.org, paths: ["/never/**"] }
+    - { host: proof.ovh.net, paths: ["/never/**"] }

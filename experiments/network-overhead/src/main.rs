@@ -4,6 +4,7 @@
 //!
 //!   netbench origin --listen ADDR --dir DIR          HTTPS origin for `origin.test` (h1 + h2), writes DIR/origin-ca.der
 //!   netbench mitm   --listen unix:P --dir DIR ...    replica of wicket's egress proxy data path (egress.rs at 727e50f)
+//!   netbench egress --listen unix:P --dir DIR ...    wicket's real egress proxy (splices origin.test; --inspect: doesn't)
 //!   netbench pass   --listen unix:P|tcp:A ...        host-only check, then splice-through (the #62 fast path)
 //!   netbench fwd    --listen tcp:A --to unix:P       a forwarder in place of socat
 //!   netbench bench  --out logs/                      starts the processes and runs every leg
@@ -12,6 +13,7 @@
 
 mod client;
 mod driver;
+mod egress;
 mod micro;
 mod mitm;
 mod origin;
@@ -100,12 +102,13 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "origin" => rt.block_on(origin::run(need("--listen")?.parse()?, need("--dir")?.into())),
         "mitm" => rt.block_on(mitm::run()),
+        "egress" => rt.block_on(egress::run()),
         "pass" => rt.block_on(pass::run()),
         "fwd" => rt.block_on(pass::fwd()),
         "bench" => rt.block_on(driver::run()),
         "micro" => micro::run(),
         "probe" => rt.block_on(client::probe()),
-        _ => bail!("usage: netbench origin|mitm|pass|fwd|bench|micro|probe ... (see src/main.rs)"),
+        _ => bail!("usage: netbench origin|mitm|egress|pass|fwd|bench|micro|probe ... (see src/main.rs)"),
     }
 }
 

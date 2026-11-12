@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for rustc, enough for `cargo fetch` (which only asks rustc about the target).
+cat >/dev/null 2>&1 <&0 &
+case "$1" in -vV) cat /workspace/rustc-vV.txt ;; *) cat /workspace/rustc-print.txt ;; esac

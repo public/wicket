@@ -1,0 +1,2 @@
+{ "name": "npm-bench", "version": "1.0.0", "private": true,
+  "dependencies": { "express": "^4", "react": "^18", "react-dom": "^18", "axios": "^1", "lodash": "^4", "moment": "^2", "mocha": "^10", "yargs": "^17", "chalk": "^4", "uuid": "^9", "glob": "^8", "typescript": "^5", "commander": "^12", "debug": "^4", "ws": "^8" } }
