@@ -3,6 +3,7 @@
 //! ever needed inside the box.
 
 pub mod ca;
+pub mod cache;
 pub mod decide;
 mod dial;
 pub mod dns;

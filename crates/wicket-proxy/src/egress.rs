@@ -41,6 +41,8 @@ pub struct Egress {
     /// The run's model proxy, which vets and accounts model calls that reach the model host through
     /// here (a wrapped session's, #112).
     model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
+    /// The node's registry cache (#139), consulted only for requests already decided and allowed.
+    cache: std::sync::OnceLock<Arc<crate::cache::Cache>>,
 }
 
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
@@ -145,6 +147,7 @@ impl Egress {
             h3_up: Default::default(),
             strikes: Default::default(),
             model_gate: Default::default(),
+            cache: Default::default(),
         }))
     }
 
@@ -152,6 +155,12 @@ impl Egress {
     /// go through `llm`'s budget, body filter and accounting (#112).
     pub fn set_model_gate(&self, llm: Arc<crate::llm::Llm>) {
         let _ = self.model_gate.set(llm);
+    }
+
+    /// Serves registry objects from the node's cache, and fills it (#139). The hosts the cache serves
+    /// are then inspected even where the zone would splice them.
+    pub fn set_cache(&self, cache: Arc<crate::cache::Cache>) {
+        let _ = self.cache.set(cache);
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -244,6 +253,9 @@ impl Egress {
             return None;
         }
         if self.model_gate.get().is_some() && host == crate::llm::MODEL_HOST {
+            return None;
+        }
+        if self.cache.get().is_some_and(|c| c.keeps_inspected(host)) {
             return None;
         }
         self.decider.splice(&self.ctx, host)
@@ -503,8 +515,18 @@ impl Egress {
         };
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
+        let mut cached = crate::cache::Lookup::Bypass;
         match self.decider.decide(ctx, &op, who.as_ref()).await {
-            Outcome::Allow(detail) => {
+            Outcome::Allow(mut detail) => {
+                // The cache is asked only now, once the request is allowed (#139); a hit is on the
+                // record as one.
+                if let Some(c) = self.cache.get() {
+                    let credentialed = self.credentials_for(&host);
+                    cached = c.lookup(&ctx.tenant.0, &method, scheme, &host, &path, query, req.headers(), credentialed).await;
+                    if let crate::cache::Lookup::Hit(h) = &cached {
+                        detail = format!("{detail}; {}", h.describe());
+                    }
+                }
                 // A grant's use must be on the record before the request goes ahead (fail closed).
                 let ev = Event::Egress {
                     method: method.clone(),
@@ -578,7 +600,12 @@ impl Egress {
         if let Some(llm) = self.model_gate.get().filter(|_| crate::llm::is_model_call(&host, &path)) {
             return llm.clone().through_egress(&self, req, &host, &pq, via).await;
         }
-        match self.forward(req, &host, scheme, &pq, via).await {
+        let fill = match cached {
+            crate::cache::Lookup::Hit(h) => return h.into_response(),
+            crate::cache::Lookup::Miss(f) => Some(f),
+            crate::cache::Lookup::Bypass => None,
+        };
+        match self.forward_filling(req, &host, scheme, &pq, via, fill).await {
             Ok(r) => r,
             // The whole chain: a refused dial (#116) says why at its end.
             Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
@@ -591,6 +618,35 @@ impl Egress {
     }
 
     pub(crate) async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.forward_filling(req, host, scheme, pq, via, None).await
+    }
+
+    /// As [`Egress::forward`], filling the cache from the response when `fill` is set.
+    async fn forward_filling<B>(
+        &self,
+        req: Request<B>,
+        host: &str,
+        scheme: &str,
+        pq: &str,
+        via: Via,
+        fill: Option<crate::cache::Fill>,
+    ) -> Result<Response<BoxBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let resp = self.forward_inner(req, host, scheme, pq, via).await?;
+        Ok(match fill {
+            Some(f) => f.wrap(resp),
+            None => resp,
+        })
+    }
+
+    async fn forward_inner<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,

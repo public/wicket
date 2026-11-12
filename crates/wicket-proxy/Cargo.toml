@@ -38,6 +38,9 @@ h3.workspace = true
 h3-quinn.workspace = true
 webpki-roots.workspace = true
 libc.workspace = true
+sha2.workspace = true
+blake2 = "0.10"
+rusqlite.workspace = true
 
 [dev-dependencies]
 wicket-authz.workspace = true
