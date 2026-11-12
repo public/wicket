@@ -19,7 +19,9 @@ use std::time::Instant;
 use tokio::net::UnixListener;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
-const MAX_ACCOUNTED_RESPONSE: usize = 8 * 1024 * 1024;
+/// How long a response is still read to its end after the agent stopped reading it, so its final
+/// usage is seen (#113). Past this, the call is charged its whole reservation.
+const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct Llm {
     ctx: RunCtx,
@@ -40,6 +42,9 @@ pub struct Llm {
     pub prior_requests: AtomicU64,
     pub prior_input_tokens: AtomicU64,
     pub prior_output_tokens: AtomicU64,
+    /// Output tokens reserved by model calls in flight (#113): each call reserves its `max_tokens`
+    /// up front, and settles to what it actually generated when its final usage arrives.
+    pub inflight_output_tokens: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
 }
 
@@ -50,10 +55,46 @@ impl Llm {
         let used_r = self.requests.load(Ordering::SeqCst)
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        let used_t = self.output_tokens.load(Ordering::SeqCst)
+        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(self.output_committed())))
+    }
+
+    /// Output tokens spent, handed to children, spent by earlier activations, or reserved by calls
+    /// in flight: what is no longer available to a new call.
+    fn output_committed(&self) -> u64 {
+        self.output_tokens.load(Ordering::SeqCst)
             + self.reserved_output_tokens.load(Ordering::SeqCst)
-            + self.prior_output_tokens.load(Ordering::SeqCst);
-        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(used_t)))
+            + self.prior_output_tokens.load(Ordering::SeqCst)
+            + self.inflight_output_tokens.load(Ordering::SeqCst)
+    }
+
+    /// Reserves up to `want` output tokens for one call, atomically (parallel calls can't each
+    /// claim the same tokens): what is left, if less. None when nothing is left.
+    fn reserve_output(&self, max: u64, want: u64) -> Option<u64> {
+        loop {
+            let inflight = self.inflight_output_tokens.load(Ordering::SeqCst);
+            let used = self.output_tokens.load(Ordering::SeqCst)
+                + self.reserved_output_tokens.load(Ordering::SeqCst)
+                + self.prior_output_tokens.load(Ordering::SeqCst)
+                + inflight;
+            let left = max.saturating_sub(used);
+            if left == 0 {
+                return None;
+            }
+            let take = want.min(left);
+            if self.inflight_output_tokens.compare_exchange(inflight, inflight + take, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some(take);
+            }
+        }
+    }
+
+    /// Settles a call's reservation: releases it and charges what the call used. A call whose final
+    /// usage wasn't seen is charged its whole reservation (or what was seen, if more).
+    fn settle(&self, reserved: u64, u: Usage, settled: bool) {
+        self.inflight_output_tokens.fetch_sub(reserved, Ordering::SeqCst);
+        self.input_tokens.fetch_add(u.input, Ordering::SeqCst);
+        self.cache_read_tokens.fetch_add(u.cache_read, Ordering::SeqCst);
+        self.cache_creation_tokens.fetch_add(u.cache_creation, Ordering::SeqCst);
+        self.output_tokens.fetch_add(if settled { u.output } else { u.output.max(reserved) }, Ordering::SeqCst);
     }
 
     /// Every input token this run's model calls used: uncached, cache reads and cache writes.
@@ -87,6 +128,7 @@ impl Llm {
             prior_requests: AtomicU64::new(0),
             prior_input_tokens: AtomicU64::new(0),
             prior_output_tokens: AtomicU64::new(0),
+            inflight_output_tokens: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
     }
@@ -167,11 +209,7 @@ impl Llm {
                 None,
             );
         }
-        if self.output_tokens.load(Ordering::SeqCst)
-            + self.reserved_output_tokens.load(Ordering::SeqCst)
-            + self.prior_output_tokens.load(Ordering::SeqCst)
-            >= spec.max_output_tokens
-        {
+        if self.output_committed() >= spec.max_output_tokens {
             self.event(None, 429, Usage::default(), "budget: output token cap reached");
             return problem(
                 429,
@@ -218,8 +256,10 @@ impl Llm {
         let mut body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let mut model = None;
         let mut note = String::from("ok");
+        let mut want = 0;
         if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
             model = json.get("model").and_then(|m| m.as_str()).map(String::from);
+            let mut changed = false;
             if !spec.allow_server_tools {
                 if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
                     let before = tools.len();
@@ -229,11 +269,56 @@ impl Llm {
                     });
                     if tools.len() != before {
                         note = format!("stripped {} server-side tool(s)", before - tools.len());
-                        body = Bytes::from(serde_json::to_vec(&json)?);
+                        changed = true;
                     }
                 }
             }
+            // The call's output is reserved up front (#113); one asking for more than is left gets
+            // what is left, so it can't generate past the budget.
+            if let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) {
+                want = asked;
+                let left = spec.max_output_tokens.saturating_sub(self.output_committed());
+                if asked > left && left > 0 {
+                    json["max_tokens"] = left.into();
+                    note = format!("{note}; max_tokens {asked} lowered to the {left} output tokens left");
+                    changed = true;
+                }
+            }
+            if changed {
+                body = Bytes::from(serde_json::to_vec(&json)?);
+            }
         }
+        let Some(reserved) = self.reserve_output(spec.max_output_tokens, want) else {
+            self.event(model, 429, Usage::default(), "budget: output token cap reached");
+            return Ok(problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                None,
+            ));
+        };
+        let up = self.send_upstream(spec, &parts, body).await;
+        let resp = match up {
+            Ok(r) => r,
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                return Err(e);
+            }
+        };
+        let status = resp.status().as_u16();
+        let mut out = Response::builder().status(StatusCode::from_u16(status)?);
+        for (name, value) in resp.headers().iter() {
+            if !STRIP_RESPONSE.contains(&name.as_str()) {
+                out = out.header(name.as_str(), value.as_bytes());
+            }
+        }
+        let sse = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+        let body = self.account(model, status, sse, resp.bytes_stream(), reserved, note);
+        Ok(out.body(body)?)
+    }
+
+    async fn send_upstream(&self, spec: &wicket_core::manifest::LlmSpec, parts: &http::request::Parts, body: Bytes) -> Result<reqwest::Response> {
         let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
         let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
@@ -248,45 +333,101 @@ impl Llm {
         let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
         let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
         rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
-        let resp = rb.body(body).send().await?;
-        let status = resp.status().as_u16();
-        let mut out = Response::builder().status(StatusCode::from_u16(status)?);
-        for (name, value) in resp.headers().iter() {
-            if !STRIP_RESPONSE.contains(&name.as_str()) {
-                out = out.header(name.as_str(), value.as_bytes());
-            }
-        }
-        // Stream through to the agent while keeping a bounded copy for token accounting.
+        Ok(rb.body(body).send().await?)
+    }
+
+    /// Streams an upstream response to the agent while reading its usage as it goes (in constant
+    /// memory, #113), and settles the call's reservation when the response ends. If the agent stops
+    /// reading, the response is still read to its end (for up to [`DRAIN_AFTER_DISCONNECT`]), so a
+    /// call can't escape its charge by disconnecting before the final usage. A successful response
+    /// that ends without its final usage (`message_stop` for a stream) is charged its whole
+    /// reservation; an error response, only what it reports.
+    pub(crate) fn account<S, E>(self: &Arc<Self>, model: Option<String>, status: u16, sse: bool, mut upstream: S, reserved: u64, note: String) -> BoxBody
+    where
+        S: futures_util::Stream<Item = std::result::Result<Bytes, E>> + Send + Unpin + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>(16);
         let me = self.clone();
-        let mut upstream = resp.bytes_stream();
         tokio::spawn(async move {
-            let mut seen: Vec<u8> = Vec::new();
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(b) => {
-                        if seen.len() < MAX_ACCOUNTED_RESPONSE {
-                            seen.extend_from_slice(&b);
-                        }
-                        if tx.send(Ok(Frame::data(b))).await.is_err() {
-                            break;
+            let mut scan = UsageScanner::default();
+            let mut client = true;
+            let mut deadline = None;
+            let mut clean_end = false;
+            loop {
+                let next = match deadline {
+                    None => upstream.next().await,
+                    Some(d) => match tokio::time::timeout_at(d, upstream.next()).await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    },
+                };
+                match next {
+                    Some(Ok(b)) => {
+                        scan.feed(&b);
+                        if client && tx.send(Ok(Frame::data(b))).await.is_err() {
+                            client = false;
+                            deadline = Some(tokio::time::Instant::now() + DRAIN_AFTER_DISCONNECT);
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(Box::new(e))).await;
+                    Some(Err(e)) => {
+                        if client {
+                            let _ = tx.send(Err(Box::new(e))).await;
+                        }
+                        break;
+                    }
+                    None => {
+                        clean_end = true;
                         break;
                     }
                 }
             }
-            let u = usage(&seen);
-            me.input_tokens.fetch_add(u.input, Ordering::SeqCst);
-            me.cache_read_tokens.fetch_add(u.cache_read, Ordering::SeqCst);
-            me.cache_creation_tokens.fetch_add(u.cache_creation, Ordering::SeqCst);
-            me.output_tokens.fetch_add(u.output, Ordering::SeqCst);
-            me.event(model, status, u, &note);
+            let u = scan.usage;
+            let ok = (200..300).contains(&status);
+            let settled = !ok || (clean_end && if sse { scan.stopped } else { scan.saw_output });
+            me.settle(reserved, u, settled);
+            let note = if settled { note } else { format!("{note}; no final usage seen: charged the {reserved} reserved output tokens") };
+            let charged = Usage { output: if settled { u.output } else { u.output.max(reserved) }, ..u };
+            me.event(model, status, charged, &note);
         });
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        Ok(out.body(BodyExt::boxed(StreamBody::new(stream)))?)
+        BodyExt::boxed(StreamBody::new(stream))
+    }
+}
+
+/// Reads token usage from a response as it streams past, in constant memory: each chunk is scanned
+/// with the end of the previous one, so a key or number split across chunks is still read (the
+/// largest value per field wins, so reading one twice changes nothing).
+#[derive(Default)]
+pub(crate) struct UsageScanner {
+    carry: Vec<u8>,
+    pub usage: Usage,
+    /// An `output_tokens` count was seen (a non-streamed response's usage).
+    pub saw_output: bool,
+    /// The stream's `message_stop` event was seen: the final usage (in `message_delta`) came before it.
+    pub stopped: bool,
+}
+
+/// Longer than any key plus its number, so nothing is split past the carried tail.
+const SCAN_CARRY: usize = 96;
+
+impl UsageScanner {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(chunk);
+        let u = usage(&buf);
+        self.usage = Usage {
+            input: self.usage.input.max(u.input),
+            cache_read: self.usage.cache_read.max(u.cache_read),
+            cache_creation: self.usage.cache_creation.max(u.cache_creation),
+            output: self.usage.output.max(u.output),
+        };
+        let text = String::from_utf8_lossy(&buf);
+        self.saw_output |= text.contains("\"output_tokens\"");
+        // As the event's own type, never as text inside a JSON string (where quotes are escaped).
+        self.stopped |= text.contains("event: message_stop") || text.contains("\"type\":\"message_stop\"");
+        let keep = buf.len().saturating_sub(SCAN_CARRY);
+        self.carry = buf.split_off(keep);
     }
 }
 
@@ -481,6 +622,203 @@ mod tests {
         llm.spent_before(1, 0, 100);
         let (status, _) = post(llm, "tokens").await;
         assert_eq!(status, 429);
+    }
+
+    /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing
+    /// `pause` before the last one, then ends cleanly. It records each request it got.
+    async fn sse_upstream(chunks: Vec<Vec<u8>>, pause: std::time::Duration) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let (chunks, seen) = (chunks.clone(), seen2.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = vec![0u8; 65536];
+                    while !String::from_utf8_lossy(&req).contains("\r\n\r\n") {
+                        let n = c.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    // The body follows the head (small in these tests): give it a moment to arrive.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(50), c.read(&mut buf)).await {
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    seen.lock().await.push(String::from_utf8_lossy(&req).into_owned());
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await;
+                    let last = chunks.len().saturating_sub(1);
+                    for (i, ch) in chunks.iter().enumerate() {
+                        if i == last {
+                            tokio::time::sleep(pause).await;
+                        }
+                        if c.write_all(format!("{:x}\r\n", ch.len()).as_bytes()).await.is_err()
+                            || c.write_all(ch).await.is_err()
+                            || c.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = c.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    fn sse(event: &str, data: &str) -> Vec<u8> {
+        format!("event: {event}\ndata: {data}\n\n").into_bytes()
+    }
+
+    /// An Llm with a model route to the mock on `port` and an output budget of `max_output`.
+    fn llm_to(port: u16, max_output: u64, tag: &str) -> (std::sync::Arc<super::Llm>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wicket-llm-v-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}', max_output_tokens: {max_output}, max_requests: 100}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+        c.vault = vault;
+        (super::Llm::new(c).unwrap(), dir)
+    }
+
+    /// Sends one model request; reads the whole response, or (`whole` false) its first frame only,
+    /// then hangs up.
+    async fn call(llm: std::sync::Arc<super::Llm>, tag: &str, body: &str, whole: bool) -> u16 {
+        use http_body_util::BodyExt;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-c-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("llm.sock");
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { llm.serve(&sock).await }
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        let conn = tokio::spawn(conn);
+        let req = http::Request::post("/v1/messages")
+            .header("host", "wicket.internal")
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let mut b = resp.into_body();
+        if whole {
+            let _ = b.collect().await;
+        } else {
+            let _ = b.frame().await;
+            drop(b);
+            drop(send);
+            conn.abort();
+        }
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        status
+    }
+
+    async fn output_settles(llm: &super::Llm, want: u64) -> u64 {
+        for _ in 0..300 {
+            if llm.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0 && llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    const ASK: &str = r#"{"model":"m","max_tokens":300,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    /// #113: an agent that hangs up after the first event is still charged what the call generated.
+    #[tokio::test]
+    async fn a_client_that_disconnects_early_is_charged_the_final_usage() {
+        let chunks = vec![
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
+            sse("content_block_delta", r#"{"type":"content_block_delta","delta":{"text":"lots"}}"#),
+            [sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#), sse("message_stop", r#"{"type":"message_stop"}"#)].concat(),
+        ];
+        let (port, _) = sse_upstream(chunks, std::time::Duration::from_millis(300)).await;
+        let (llm, dir) = llm_to(port, 1000, "early");
+        assert_eq!(call(llm.clone(), "early", ASK, false).await, 200);
+        assert_eq!(output_settles(&llm, 250).await, 250);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: usage at the end of a stream larger than any bounded copy is still read.
+    #[tokio::test]
+    async fn the_final_usage_of_a_large_stream_is_counted() {
+        let delta = sse("content_block_delta", &format!(r#"{{"type":"content_block_delta","delta":{{"text":"{}"}}}}"#, "x".repeat(64 * 1024)));
+        let mut chunks = vec![sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#)];
+        chunks.extend(std::iter::repeat_n(delta, 150)); // ~9.6 MiB
+        chunks.push([sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":77}}"#), sse("message_stop", r#"{"type":"message_stop"}"#)].concat());
+        let (port, _) = sse_upstream(chunks, std::time::Duration::ZERO).await;
+        let (llm, dir) = llm_to(port, 1000, "large");
+        assert_eq!(call(llm.clone(), "large", ASK, true).await, 200);
+        assert_eq!(output_settles(&llm, 77).await, 77);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: a stream that ends without its final usage is charged the whole reservation, and a
+    /// call asking for more than is left is lowered to what is left.
+    #[tokio::test]
+    async fn an_unsettled_call_is_charged_its_reservation_and_asks_are_capped() {
+        let chunks = vec![sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#), b": keep-alive\n\n".to_vec()];
+        let (port, seen) = sse_upstream(chunks, std::time::Duration::ZERO).await;
+        let (llm, dir) = llm_to(port, 1000, "unsettled");
+        assert_eq!(call(llm.clone(), "unsettled", ASK, true).await, 200);
+        assert_eq!(output_settles(&llm, 300).await, 300, "charged max_tokens");
+        // 700 left: an ask for 5000 goes upstream as 700.
+        let big = ASK.replace("\"max_tokens\":300", "\"max_tokens\":5000");
+        assert_eq!(call(llm.clone(), "unsettled2", &big, true).await, 200);
+        assert!(seen.lock().await.iter().any(|r| r.contains("\"max_tokens\":700")), "{:?}", seen.lock().await);
+        assert_eq!(output_settles(&llm, 1000).await, 1000);
+        // Nothing left: refused without a model call.
+        let n = seen.lock().await.len();
+        assert_eq!(call(llm.clone(), "unsettled3", ASK, true).await, 429);
+        assert_eq!(seen.lock().await.len(), n);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: parallel calls reserve from what is left, so together they can't overshoot.
+    #[test]
+    fn reservations_are_carved_from_what_is_left() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();
+        assert_eq!(llm.reserve_output(100, 60), Some(60));
+        assert_eq!(llm.reserve_output(100, 60), Some(40));
+        assert_eq!(llm.reserve_output(100, 1), None);
+        assert_eq!(llm.remaining().map(|r| r.1), Some(0), "spawn carve-outs see the reservations");
+        llm.settle(60, Usage { output: 10, ..Usage::default() }, true);
+        assert_eq!(llm.remaining().map(|r| r.1), Some(50));
+        llm.settle(40, Usage { output: 3, ..Usage::default() }, false);
+        assert_eq!(llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst), 50, "10 settled, 40 charged in full");
+    }
+
+    #[test]
+    fn usage_split_across_chunks_is_read() {
+        let mut s = super::UsageScanner::default();
+        s.feed(b"event: message_delta\ndata: {\"usage\":{\"output_tok");
+        s.feed(b"ens\":12");
+        s.feed(b"34}}\n\nevent: message_st");
+        assert!(!s.stopped);
+        s.feed(b"op\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(s.usage.output, 1234);
+        assert!(s.saw_output && s.stopped);
+        // Text that merely mentions the event doesn't end the stream.
+        let mut t = super::UsageScanner::default();
+        t.feed(br#"data: {"delta":{"text":"say \"type\":\"message_stop\" now"}}"#);
+        assert!(!t.stopped);
     }
 
     #[test]

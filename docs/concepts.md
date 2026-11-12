@@ -36,7 +36,10 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
   look like it doesn't exist);
 - **inject:** credentials added to requests for a host, from the vault (only ever over HTTPS: plain HTTP
   to a host with a credential is refused with a 403);
-- **llm:** the model budget (requests, input and output tokens);
+- **llm:** the model budget (requests, input and output tokens). Each call reserves its `max_tokens` up
+  front (lowered to what is left if it asks for more), and is charged what its final usage reports. A
+  call is read to its end even if the agent hangs up, and one whose final usage never arrives is charged
+  its whole reservation;
 - **limits, isolation, images, volumes:** memory, CPUs and time; the isolation tier; the images a child
   may use; named directories that persist between runs;
 - **accept_from:** the zones whose agents may message this one.
