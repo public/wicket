@@ -59,13 +59,18 @@ put wide "$(gw spawn "$wide")"
 say "wide spawned"
 
 # link: the wide box gets narrow.wicket.internal:8000 (narrow's reach is within wide's).
-put link "$(gw link '{"from":"wide","to":"narrow","port":8000}')"
+# spawn returns before the box is up: retry while it isn't there yet.
+for _ in $(seq 30); do
+  link=$(gw link '{"from":"wide","to":"narrow","port":8000}')
+  case "$link" in linked*) break ;; esac
+  sleep 2
+done
+put link "$link"
 say "linked"
 
-# A child that starts a child of its own, so the subtree is two levels deep.
-leaf='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn","arguments":{"name":"leaf","kind":"program","zone":{"limits":{"memory":"128m","cpus":1,"timeout":"4m"}},"command":["sleep","3000"]}}}'
-midcmd="curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; echo; exec sleep 3000"
-put mid "$(gw spawn "$(jq -nc --argjson l "$lim" --arg c "$midcmd" '{name:"mid",kind:"program",max_children:1,zone:{limits:$l},command:["sh","-c",$c]}')")"
+# A child agent that starts a box of its own, so the subtree is two levels deep. Its workspace has
+# no drive.sh, so the mock model's command (ci/acceptance.sh) spawns the leaf and waits instead.
+put mid "$(gw spawn "$(jq -nc --argjson l "$lim" '{name:"mid",kind:"agent",task:"Run the command you are given.",max_children:1,zone:{limits:$l}}')")"
 say "mid spawned"
 put whoami "$(gw whoami '{}')"
 put done 1

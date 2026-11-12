@@ -19,7 +19,7 @@ NODE=acc-n1
 node_ssh_target=wicket@acc-n1.example.com
 
 node_local_setup() {
-  nodehome=$work/nodehome
+  nodehome=$work/n   # short: the node's run sockets live under it too
   mkdir -p "$nodehome"
   export WICKET_NODE_SSH="env HOME=$nodehome sh -c"
   local token
@@ -47,7 +47,7 @@ EOF
 }
 
 node_local_teardown() {
-  [ -n "${node_serve_pid:-}" ] && kill "$node_serve_pid" 2>/dev/null
+  if [ -n "${node_serve_pid:-}" ]; then kill "$node_serve_pid" 2>/dev/null; fi
   # Boxes `node serve` started run on this Docker, labelled with their runs.
   local r
   for r in $(all_descendants); do for c in $(box_of "$r"); do $DOCKER rm -f "$c" >/dev/null 2>&1; done; done
@@ -114,7 +114,7 @@ multihost() {
   local deadline=$((SECONDS + ${ACC_NODE_WAIT:-900})) approved= released=
   while [ $SECONDS -lt $deadline ] && [ "$(cf done)" != 1 ] && kill -0 "$cap_pid" 2>/dev/null; do
     if [ -z "$approved" ]; then
-      rid=$(w pending 2>/dev/null | grep -E "^r-[a-z0-9]+ +CAPACITY .* run $cap_run " | awk '{print $1}' | head -1)
+      rid=$(w pending 2>/dev/null | grep -E "^r-[a-z0-9]+ +CAPACITY .* run $cap_run " | awk '{print $1}' | head -1 || true)
       if [ -n "$rid" ]; then
         log "approving lease request $rid"
         wroot approve "$rid" >"$work/lease-approve.log" 2>&1 || cat "$work/lease-approve.log"
@@ -123,8 +123,11 @@ multihost() {
     fi
     if [ -z "$released" ] && [ -n "$(cf ready)" ]; then
       lease=$(cf lease)
-      node_name=$(w lease list | awk -v l="$lease" '$1==l' | grep -o "node [a-z0-9-]*" | awk '{print $2}' | head -1)
-      [ "$nodes" = vultr ] && { log "loading the agent image onto $node_name"; node_vultr_image "$node_name" >"$work/image-load.log" 2>&1 || cat "$work/image-load.log"; }
+      node_name=$(cf ready | grep -o "is node [a-z0-9-]*" | awk '{print $3}' || true)
+      if [ "$nodes" = vultr ]; then
+        log "loading the agent image onto $node_name"
+        node_vultr_image "$node_name" >"$work/image-load.log" 2>&1 || cat "$work/image-load.log"
+      fi
       : >"$work/go"
       if [ "$mode" = dev ]; then touch "$WICKET_HOME/runs/$cap_run/workspace/out/go"; else sudo -n touch "$datadir/runs/$cap_run/workspace/out/go"; fi
       released=1
@@ -157,10 +160,10 @@ multihost() {
   wait_for 60 '! kill -0 "$cap_pid" 2>/dev/null' || true
   wroot reconcile >"$work/rec-lease.log" 2>&1 || cat "$work/rec-lease.log"
   cat "$work/rec-lease.log"
-  lrow=$(w lease list | awk -v l="${lease:-none}" '$1==l')
+  lrow=$(w lease list | awk -v l="${lease:-none}" '$1==l' || true)
   echo "   lease: $lrow"
   check "revoking ended the lease" 'grep -qE "ended|released|revoked" <<<"$lrow"'
-  check "  and the lease records what its node billed" 'grep -q "billed \$" <<<"$lrow"'
+  check "  and the lease records what its node billed" 'grep -q "billed [$][0-9]" <<<"$lrow"'
   billed=$(grep -o 'billed \$[0-9.]*' <<<"$lrow" || true)
   if [ "$nodes" = vultr ]; then
     check "  no tagged machine remains (wicket place list)" 'wroot place list 2>/dev/null | grep -q "^0 node(s) tagged"'

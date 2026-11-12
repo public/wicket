@@ -58,9 +58,9 @@ fi
 DOCKER=${WICKET_DOCKER:-docker}
 export WICKET_DOCKER=$DOCKER
 # Short: a run's unix sockets live under it, and sun_path holds 107 bytes.
-work=$(mktemp -d "${ACC_TMP:-/tmp}/wicket-acc.XXXXXX")
+work=$(mktemp -d "${ACC_TMP:-/tmp}/wacc.XXXXXX")
 chmod 755 "$work"
-if [ ${#work} -gt 40 ]; then echo "$work: too long a path for the runs' sockets (ACC_TMP=/tmp)" >&2; rm -rf "$work"; exit 2; fi
+if [ ${#work} -gt 24 ]; then echo "$work: too long a path for the runs' sockets (ACC_TMP=/tmp)" >&2; rm -rf "$work"; exit 2; fi
 pids=()
 our_runs=()
 built_image=
@@ -96,8 +96,10 @@ IMAGE_TAG=${IMAGE:-}
 # ---- results ----
 results=()
 fail=0
+# Checks and waits run without pipefail: `... | grep -q` may stop reading early, and its writer's
+# SIGPIPE isn't a failure.
 check() {
-  if eval "$2"; then results+=("ok   $1"); echo "ok   $1"; else results+=("FAIL $1"); echo "FAIL $1"; fail=1; fi
+  if (set +o pipefail; eval "$2"); then results+=("ok   $1"); echo "ok   $1"; else results+=("FAIL $1"); echo "FAIL $1"; fail=1; fi
 }
 skip() { results+=("skip $1 ($2)"); echo "skip $1 ($2)"; }
 log() { echo "== $(date +%T) $*"; }
@@ -124,15 +126,15 @@ teardown() {
   local status=$?
   set +e
   trap - EXIT INT TERM
-  [ "$nodes" = vultr ] && vultr_teardown
+  if [ "$nodes" = vultr ]; then vultr_teardown; fi
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   sleep 1
   for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
   wait 2>/dev/null
   for c in $(our_boxes); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
-  [ -n "$built_image" ] && $DOCKER rmi "$built_image" >/dev/null 2>&1
-  [ "$nodes" = local ] && node_local_teardown
-  [ -n "${sinks_file:-}" ] && sudo -n rm -f "$sinks_file"
+  if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
+  if [ "$nodes" = local ]; then node_local_teardown; fi
+  if [ -n "${sinks_file:-}" ]; then sudo -n rm -f "$sinks_file"; fi
   if [ "${ACC_KEEP:-}" = 1 ]; then
     echo "kept: $work"
   else
@@ -149,7 +151,7 @@ trap 'exit 143' TERM
 
 free_port() { python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 # Waits up to $1 seconds for the command in $2 to succeed.
-wait_for() { local n=$1; shift; for _ in $(seq "$n"); do eval "$1" && return 0; sleep 1; done; return 1; }
+wait_for() { local n=$1; shift; for _ in $(seq "$n"); do (set +o pipefail; eval "$1") && return 0; sleep 1; done; return 1; }
 run_id_of() { sed -n 's/^wicket run \(run_[a-z0-9]*\).*/\1/p' "$1" | head -1; }
 result_of() { sed -n 's/^\[wicket\] result.json: //p' "$1" | tail -1; }
 box_of() { $DOCKER ps -q --filter "label=wicket.run=$1" 2>/dev/null; }
@@ -193,7 +195,11 @@ elif [ "${ACC_AUDIT_SINK:-}" = 1 ]; then
 fi
 
 port=$(free_port)
-HOME=$HOMEW "$W" dev mock-llm --listen "127.0.0.1:$port" --command 'bash /workspace/drive.sh' 2>"$work/mock.log" &
+# Every agent's turn runs one command: its workspace's drive.sh, or, for the lead's child agent (an
+# empty workspace), spawn a leaf box and stay up until revoked.
+leaf='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn","arguments":{"name":"leaf","kind":"program","zone":{"limits":{"memory":"128m","cpus":1,"timeout":"4m"}},"command":["sleep","3000"]}}}'
+mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
+HOME=$HOMEW "$W" dev mock-llm --listen "127.0.0.1:$port" --command "$mock_cmd" 2>"$work/mock.log" &
 pids+=($!)
 wait_for 10 "(exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null"
 
@@ -242,7 +248,13 @@ check "spawn of a narrower zone starts at once" 'lf narrow | grep -q "^started p
 check "spawn of a wider zone (ask_human) waits for a human" 'lf wide_first | grep -q "^needs human approval: request r-"'
 check "  and starts once approved" 'lf wide_wait | grep -q "^granted" && lf wide | grep -q "^started program wide .*approved by a human beyond your own zone"'
 check "link wires the two children" 'lf link | grep -q "narrow.wicket.internal:8000"'
-child_log() { local c; for c in $(data_ls "runs/$1/children" | grep '\.log$'); do data "runs/$1/children/$c"; done; }
+# A child's output: its log (the supervisor's lines) and its transcript (a program's own output).
+child_log() {
+  local c
+  for c in $(data_ls "runs/$1/children" | sed -n 's/^\(run_[a-z0-9]*\)\.log$/\1/p'); do
+    data "runs/$1/children/$c.log"; data "runs/$c/transcript.jsonl" 2>/dev/null
+  done
+}
 wait_for 90 'child_log "$lead" | grep -q "acc-fetched:"' || true
 check "the wide box fetched the narrow box's page across the link" 'child_log "$lead" | grep -q "acc-fetched:acc-hello-from-narrow"'
 check "the audit log records the spawn approval and the link" 'w audit --tail 400 | grep -q "spawn.beyond_parent" && w audit --tail 400 | grep -q "link.open"'
@@ -254,7 +266,7 @@ wait_for 60 subtree_up || true
 subtree=$(all_descendants)
 running=0
 for r in "$lead" $subtree; do [ -n "$(box_of "$r")" ] && running=$((running + 1)); done
-check "the lead, its 3 children and a grandchild run (5 boxes)" '[ "$running" = 5 ]'
+check "the lead, its 3 children (one an agent) and a grandchild run (5 boxes)" '[ "$running" = 5 ]'
 
 log "revoking the lead"
 wroot identity revoke "$lead" --reason "acceptance: revoke the subtree" >"$work/revoke.log" 2>&1 || cat "$work/revoke.log"
@@ -286,15 +298,14 @@ check "  and the generation went up by one" '[ "$(agent_field generation)" = $((
 
 # ---- 3. reconcile: an orphaned box ----
 log "reconcile: a box whose wicket run was killed hard"
-plain_ws=$(workdir plain)
-HOME=$HOMEW "$W" run "$(manifest plain)" --workdir "$plain_ws" --image "$IMAGE_TAG" >"$work/plain.log" 2>&1 &
-plain_pid=$!
-pids+=($plain_pid)
-wait_for 90 'data runs/$(run_id_of "$work/plain.log")/workspace/out/result.json 2>/dev/null | grep -q waiting' || true
-orphan=$(run_id_of "$work/plain.log")
+HOME=$HOMEW "$W" run "$(manifest orphan)" --image "$IMAGE_TAG" >"$work/orphan.log" 2>&1 &
+orphan_pid=$!
+pids+=($orphan_pid)
+wait_for 90 'grep -q acc-orphan-up "$work/orphan.log" 2>/dev/null' || true
+orphan=$(run_id_of "$work/orphan.log")
 our_runs+=("$orphan")
-kill -9 "$plain_pid" 2>/dev/null || true
-wait "$plain_pid" 2>/dev/null || true
+kill -9 "$orphan_pid" 2>/dev/null || true
+wait "$orphan_pid" 2>/dev/null || true
 sleep 2
 check "the orphan's box outlives its killed wicket run" '[ -n "$orphan" ] && [ -n "$(box_of "$orphan")" ]'
 wroot reconcile --dry-run >"$work/rec-dry1.log" 2>&1 || true
@@ -350,7 +361,7 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 plain decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
   exit 1
 fi
 echo "acceptance passed"
