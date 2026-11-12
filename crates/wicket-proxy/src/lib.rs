@@ -264,8 +264,9 @@ impl RunCtx {
 
     pub(crate) fn emit(&self, ev: Event) {
         if let Ok(v) = serde_json::to_value(&ev) {
+            // Queued, not waited on: the batched writer commits it within milliseconds (#62).
             if let Ok(l) = self.ledger.lock() {
-                let _ = l.audit(&self.tenant, Some(&self.run), "op", &v);
+                let _ = l.audit_deferred(&self.tenant, Some(&self.run), "op", &v);
             }
         }
         let _ = self.events.send(ev);
