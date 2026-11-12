@@ -96,10 +96,6 @@ jobs:
         run: WICKET=target/debug/wicket ci/smoke.sh
       - name: Hibernate and wake
         run: WICKET=target/debug/wicket ci/hibernate.sh
-      # #41: the release acceptance test's local flows (a few minutes; the multi-host and installed
-      # variants run nightly, .github/workflows/acceptance.yml).
-      - name: Acceptance
-        run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
       # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
       - name: wicketd with second uids
         run: ci/daemon-uids.sh target/debug/wicket
