@@ -881,7 +881,7 @@ async fn main() -> Result<()> {
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
-            let lease = capacity::lease_of_request(&req).map(String::from);
+            let lease = capacity::lease_of_request(&l, &req)?;
             let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
             let gid = l.approve(&id, &a)?;
             // A grant exists only if its approval is on the record (fail closed).
@@ -963,7 +963,7 @@ async fn main() -> Result<()> {
             l.deny(&id, &operator())?;
             l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": id, "decision": "deny", "by": operator() }))?;
             let req = l.request(&id)?;
-            if let Some(lease) = capacity::lease_of_request(&req) {
+            if let Some(lease) = capacity::lease_of_request(&l, &req)?.as_deref() {
                 l.lease_ended(lease, "denied", &format!("request {id} denied by {}", operator()), None)?;
                 println!("lease {lease} denied: its reservation is released");
             }

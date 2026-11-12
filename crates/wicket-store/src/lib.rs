@@ -43,6 +43,8 @@ pub enum StoreError {
     Random(String),
     #[error("audit writer: {0}")]
     Writer(String),
+    #[error("not requested: {0}")]
+    Refused(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -331,6 +333,11 @@ impl Ledger {
             )
             .optional()?
         {
+            // In wicket's own namespace the reason is wicket's, always the latest it wrote (#117).
+            if op.is_reserved() {
+                self.conn
+                    .execute("UPDATE requests SET reason = ?2, risk = ?3 WHERE id = ?1", params![id, reason, format!("{:?}", op.risk)])?;
+            }
             if let Some(w) = who {
                 let mut list: Vec<serde_json::Value> = serde_json::from_str(&attr).unwrap_or_default();
                 if !list.iter().any(|x| same_askers(x, w)) && list.len() < 8 {
@@ -537,7 +544,13 @@ impl Ledger {
 
     /// An agent asking ahead for access it needs (request_access), rather than a blocked request.
     /// `prefix` asks for every path under `op.path`. Deduplicated like any pending request.
+    ///
+    /// Refuses wicket's own approval namespace and anything but an HTTP method (#117): the agent
+    /// writes this op, and a request in that namespace would stand in for one wicket raises.
     pub fn ask(&self, op: &Op, reason: &str, prefix: bool, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
+        if let Some(why) = op.refused_for_agents() {
+            return Err(StoreError::Refused(why));
+        }
         let digest = format!("{}{}", op.digest(), if prefix { ":prefix" } else { "" });
         if let Some(id) = self
             .conn
@@ -1475,6 +1488,34 @@ mod tests {
         l.end_console_session("bb33", "sign-out").unwrap();
         assert!(l.console_sessions(&t, at).unwrap().is_empty());
         assert_eq!(l.prune_console_sessions(at + 1000).unwrap(), 3);
+    }
+
+    /// #117: an agent can't file requests in wicket's own approval namespace, or with a method that
+    /// isn't HTTP; and when wicket raises one, the reason on it is wicket's.
+    #[test]
+    fn agents_cannot_ask_in_wickets_namespace() {
+        let l = Ledger::open_in_memory().unwrap();
+        let (t, r) = (TenantId::single(), RunId("run_t".into()));
+        for (m, h, p) in [
+            ("SPAWN", "wicket.internal", "/zones/"),
+            ("CAPACITY", "wicket.internal", "/capacity/l-1"),
+            ("LINK", "wicket.internal", "/links/a/b/80"),
+            ("GET", "wicket.internal", "/"),
+            ("GET", "relay.wicket.internal", "/"),
+            ("SPAWN", "api.example.com", "/"),
+            ("GET\u{1b}[2K", "api.example.com", "/"),
+            ("PROPFIND", "api.example.com", "/"),
+        ] {
+            let e = l.ask(&Op::egress(&t, &r, "z", m, h, p), "please", true, None).unwrap_err();
+            assert!(matches!(e, StoreError::Refused(_)), "{m} {h}{p}: {e}");
+        }
+        assert!(l.pending(&t).unwrap().is_empty());
+        // wicket raises a spawn card; a second raise of the same op keeps wicket's latest reason.
+        let spawn = Op::egress(&t, &r, "z", "SPAWN", "wicket.internal", "/zones/z.x/0123");
+        let (id, _) = l.pending_for(&spawn, "start program x: wicket's list", None).unwrap();
+        l.conn.execute("UPDATE requests SET reason = 'harmless' WHERE id = ?1", params![id]).unwrap();
+        assert_eq!(l.pending_for(&spawn, "start program x: wicket's list", None).unwrap().0, id);
+        assert_eq!(l.request(&id).unwrap().reason, "start program x: wicket's list");
     }
 
     #[test]
