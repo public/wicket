@@ -719,12 +719,13 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 ///
 /// The node is not trusted with what the human sees (#121): the op is rebuilt here from its method,
 /// host and canonical path, its risk is the control host's own classification (raised, never
-/// lowered, by the node's, which saw the query), and only egress asks outside wicket's own approval
-/// namespace are taken (#117).
-fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_json::Value>) -> Msg {
+/// lowered, by the node's, which saw the query), only egress asks outside wicket's own approval
+/// namespace are taken (#117), and the reason on the card is this zone's own verdict, never the
+/// node's text. The node's attribution is kept, shown as reported by the agent.
+fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_json::Value>) -> Msg {
     let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
-    let op = match node_op(sh, run, op) {
-        Ok(op) => op,
+    let (op, why) = match check_node_op(&sh.tenant, &sh.run, &sh.zone, run, op) {
+        Ok(x) => x,
         Err(e) => return reply(None, None, Some(e)),
     };
     let op = &op;
@@ -732,19 +733,17 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_j
     if let Ok(Some(rid)) = l.denied_recently(op) {
         return reply(None, Some(rid), None);
     }
-    match l.pending_for(op, why, who) {
+    match l.pending_for(op, &why, who) {
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
 }
 
-/// The op a node asks about, as the control host classifies it; refused if it isn't this run's, isn't
-/// egress, isn't canonical, or is in wicket's own namespace.
-fn node_op(sh: &Shared, run: &str, op: &Op) -> Result<Op, String> {
-    check_node_op(&sh.tenant, &sh.run, &sh.zone.name, run, op)
-}
-
-pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone: &str, run: &str, op: &Op) -> Result<Op, String> {
+/// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
+/// zone decides it; refused if it isn't this run's, isn't egress, isn't canonical, is in wicket's
+/// own namespace, or doesn't need a grant (forbidden, or already allowed).
+pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &str, op: &Op) -> Result<(Op, String), String> {
+    let zone = zone_spec.name.as_str();
     if run != own.0 || op.run != *own || op.tenant != *tenant || op.zone != zone {
         return Err(format!("not an op of run {own}"));
     }
@@ -766,7 +765,11 @@ pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone: &str, run: &st
         fresh.risk = op.risk;
         fresh.effects.extend(op.effects.iter().map(|e| wicket_core::text::clip(e, 120)));
     }
-    Ok(fresh)
+    match wicket_core::evaluate(zone_spec, &fresh) {
+        wicket_core::Verdict::NeedsGrant(why) => Ok((fresh, why)),
+        wicket_core::Verdict::Forbidden(why) => Err(format!("not requested: {why}")),
+        wicket_core::Verdict::AllowByReach(_) => Err("not requested: this zone already allows it".into()),
+    }
 }
 
 /// Publishes grants approved for this run's requests to hosts the node terminates (and hands them
@@ -919,7 +922,12 @@ mod tests {
     #[test]
     fn a_node_cannot_choose_what_its_ask_shows() {
         let (t, run) = (TenantId::single(), RunId("run_a".into()));
-        let check = |op: &Op| check_node_op(&t, &run, "z", "run_a", op);
+        let zone = wicket_core::Manifest::from_yaml(
+            "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/ok\"] }\n  forbid:\n    - { host: secret.example.com }\n",
+        )
+        .unwrap()
+        .zone;
+        let check = |op: &Op| check_node_op(&t, &run, &zone, "run_a", op).map(|(op, _)| op);
         let egress = |m: &str, h: &str, p: &str| Op::egress(&t, &run, "z", m, h, p);
 
         // An R4 push labelled R1 by the node is shown as R4.
@@ -941,5 +949,12 @@ mod tests {
         assert!(check(&egress("CAPACITY", "api.example.com", "/capacity/l-1")).is_err());
         assert!(check(&egress("PROPFIND", "api.example.com", "/x")).is_err());
         assert!(check(&egress("GET", "x.wicket.internal", "/")).is_err());
+        // Forbidden or already allowed in this zone: nothing to ask.
+        assert!(check(&egress("GET", "secret.example.com", "/x")).is_err());
+        assert!(check(&egress("GET", "api.example.com", "/ok")).is_err());
+        // The reason on the card is this zone's own verdict (ask() never stores the node's text).
+        let o = egress("GET", "api.example.com", "/x");
+        let (_, why) = check_node_op(&t, &run, &zone, "run_a", &o).unwrap();
+        assert_eq!(wicket_core::evaluate(&zone, &o), wicket_core::Verdict::NeedsGrant(why));
     }
 }
