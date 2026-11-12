@@ -14,9 +14,11 @@
 //!   `llm.sock` and `gateway.sock` here are tunnels to them.
 //! - **It keeps an audit log.** A ledger of its own (`audit.db`), hash-chained like the control host's,
 //!   records its decisions; it ships records past the control host's watermark on every connect.
-//! - **One control connection at a time**, on a unix socket in a 0700 directory, reached over ssh
-//!   (`wicket node attach`). A newer connection replaces an older one, but only once it has proved
-//!   this installation's issuer key and accepted the node's certificate (`nodeauth.rs`). The control
+//! - **One control connection per run** (its scope; #146), on a unix socket in a 0700 directory,
+//!   reached over ssh (`wicket node attach`), or directly by this host's own node's control host. A
+//!   box's stdio, events, asks and tunnels go to the connection that started or last resumed it. A
+//!   newer connection with the same scope replaces the older one, but only once it has proved this
+//!   installation's issuer key and accepted the node's certificate (`nodeauth.rs`). The control
 //!   host must also run the same wicket build (sha256 of the binary): anything else is refused.
 //! - **Clock.** Feed decisions use the wall clock read once at start, advanced by a monotonic clock, so
 //!   a wall-clock step while serving can't stretch a freshness statement (wicket-feed's README).

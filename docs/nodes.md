@@ -42,7 +42,7 @@ wicket node revoke n1
   `enrol` refuses unless you pass `--trust-first-use`, and then prints the fingerprint it pinned. After that, every
   ssh call uses a wicket-managed known_hosts (`<data dir>/nodes/<name>/known_hosts`) with
   `StrictHostKeyChecking=yes`, so a node with any other key is refused. A `--node` target that isn't enrolled
-  still works the old way (trust on first use), with a warning. A revoked node is refused.
+  is refused: boxes run only through an enrolled node's `serve`. A revoked node is refused.
 - **Join token.** It's single-use, expires, and names the node. The operator redeems it on the control host
   with `enrol`. It shows that whoever minted it meant that name to join, and it never goes to the node. Passed as `--token`,
   it shows up in `ps` and shell history, which is acceptable only because it's single-use and short-lived.

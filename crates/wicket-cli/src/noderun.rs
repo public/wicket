@@ -1,5 +1,5 @@
-//! The control host's side of a run on an enrolled node (#57): `wicket run --node <name>` talks to
-//! the node's `wicket node serve` instead of running docker over ssh.
+//! The control host's side of a run on a node (#57, #146): every `wicket run` talks to a node's
+//! `wicket node serve`, an enrolled node's (`--node <name>`) or this host's own (`localnode.rs`).
 //!
 //! - **Feed.** One [`Publisher`] per node, under `<data dir>/nodes/<name>/feed`: the node's online feed
 //!   key (made here) and its certificate, signed by the installation's feed root. The run publishes
@@ -8,11 +8,12 @@
 //!   for its requests is a third-party block signed here with the approver key; the token is rebuilt
 //!   from its base with the live grants and published whole (bound to its box; the node counts their
 //!   uses, and the ledger hands them over so it never consumes them too). Revocations of those grants
-//!   go by grant id, and a run revocation also revokes the token's block 0 by its revocation id. Freshness statements go out every refresh. While a run holds the
-//!   feed (an exclusive lock), no other run can use the node: one run per node until the reconciler
-//!   (#38) owns the feed.
+//!   go by grant id, and a run revocation also revokes the token's block 0 by its revocation id. Freshness statements go out every refresh. Many runs share a
+//!   node's feed ([`SharedFeed`]): each commit or statement holds the feed's lock and first reloads the
+//!   delta log if another process appended to it.
 //! - **Channel.** `ssh <pinned> <target> wicket node attach` joins the ssh session to the node's
-//!   control socket. When it drops, the run keeps going: reconnects back off from 0.5 s to 5 s, and on
+//!   control socket (for this host's own node, the socket itself: [`Via`]). The connection is the
+//!   run's own (its scope is the run id). When it drops, the run keeps going: reconnects back off from 0.5 s to 5 s, and on
 //!   each reconnect the node is caught up (deltas or a snapshot, and a statement signed for the
 //!   occasion), stdout and stderr resume where they left off, unsent stdin is resent, and the node
 //!   ships the audit records it made meanwhile.
@@ -24,7 +25,8 @@
 //!   another process: `wicket node revoke`) is dropped within a second and not reconnected.
 //!
 //! Test hooks: `WICKET_FEED_TTL_MS`, `WICKET_FEED_REFRESH_MS` and `WICKET_FEED_NARROW_MS` override the
-//! feed's timings (within the certificate's caps, which follow them).
+//! feed's timings (within the certificate's caps, which follow them); `WICKET_FEED_COMPACT_BYTES` the
+//! delta log size past which an idle feed starts a new generation.
 
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf};
 use crate::nodeauth::HsError;
@@ -52,6 +54,9 @@ pub fn feed_config() -> PublisherConfig {
         ..PublisherConfig::default()
     }
 }
+
+/// A node's delta log past this size starts a new feed generation when no box holds authority from it.
+const COMPACT_BYTES: u64 = 1 << 20;
 
 /// How long a node feed key's certificate lasts; it is renewed (same key and version) when a run
 /// starts with less than a day left.
@@ -199,6 +204,15 @@ impl SharedFeed {
         let dir = crate::data_dir().join("nodes").join(name);
         let _lock = feed_lock(&dir)?;
         let mut p = open_feed(name, cfg.clone())?;
+        // Every run adds a few deltas and the log is replayed on every open: once it is large and no
+        // box holds authority from it (each run drops its token at exit), the feed starts a new
+        // generation, which nodes take as a snapshot.
+        let log = p.log_path().to_path_buf();
+        let cap = std::env::var("WICKET_FEED_COMPACT_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(COMPACT_BYTES);
+        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > cap && p.state().zones.is_empty() {
+            std::fs::rename(&log, log.with_extension("jsonl.old")).context("setting the old delta log aside")?;
+            p = open_feed_once(name, &cfg, true)?;
+        }
         p.note_issued(last_issued(&dir.join("feed")));
         let len = std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0);
         Ok(SharedFeed { name: name.into(), cfg, dir, inner: Mutex::new((p, len)) })

@@ -1,5 +1,6 @@
-//! The node control channel (#57): one multiplexed, length-prefixed byte stream between the control
-//! host's `wicket run --node <name>` and the node's `wicket node serve`, carried over ssh.
+//! The node control channel (#57): one multiplexed, length-prefixed byte stream between a control host
+//! process (a `wicket run`, or a link relay) and a node's `wicket node serve`, carried over ssh, or
+//! over the node's unix socket for this host's own node (#146).
 //!
 //! **Framing.** Each frame is a 4-byte big-endian length `N` (1 ≤ N ≤ [`MAX_FRAME`]) followed by `N`
 //! bytes: one kind byte, then the body.
