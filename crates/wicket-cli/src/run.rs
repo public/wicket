@@ -281,7 +281,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(w) => wicket_agent::AgentSession { id: w.agent.session_id.clone(), resume: true },
         None => wicket_agent::AgentSession::new(),
     };
-    let mut fence: Option<wicket_proxy::Fence> = wake.as_ref().map(|w| wicket_proxy::Fence { agent: w.agent.id.clone(), generation: w.generation });
+    let mut fence: Option<wicket_proxy::Fence> =
+        wake.as_ref().map(|w| wicket_proxy::Fence { agent: w.agent.id.clone(), generation: w.generation });
     {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
@@ -1165,7 +1166,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         } else if wake.is_some() && !saw_assistant {
             let why = stderr_text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output").to_string();
             println!("[wicket] the woken session never started ({}); agent {} stays hibernated", wicket_agent::clip(&why, 200), f.agent);
-            let _ = ledger.lock().expect("ledger").release_failed_wake(&f.agent, f.generation, &format!("wake failed: {}", wicket_agent::clip(&why, 200)));
+            let _ = ledger.lock().expect("ledger").release_failed_wake(
+                &f.agent,
+                f.generation,
+                &format!("wake failed: {}", wicket_agent::clip(&why, 200)),
+            );
             status = "failed (wake)".into();
         } else {
             set_state("ended", Some(&format!("its session closed ({status}) without hibernating")));

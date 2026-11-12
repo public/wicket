@@ -230,7 +230,9 @@ impl RunCtx {
         let current = self.ledger.lock().ok().map(|l| l.agent_generation(&f.agent));
         match current {
             Some(Ok(Some(g))) if g == f.generation => None,
-            Some(Ok(Some(g))) => Some(format!("agent {} was woken again (generation {g}); this activation (generation {}) is stale", f.agent, f.generation)),
+            Some(Ok(Some(g))) => {
+                Some(format!("agent {} was woken again (generation {g}); this activation (generation {}) is stale", f.agent, f.generation))
+            }
             Some(Ok(None)) => Some(format!("agent {} no longer exists", f.agent)),
             _ => Some("the ledger can't be read to check this activation's generation".into()),
         }

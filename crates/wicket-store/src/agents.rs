@@ -168,9 +168,8 @@ impl Ledger {
 
     /// Renews the holder's claim until `until`, if `generation` is still current.
     pub fn renew_agent_lease(&self, id: &str, generation: i64, until: i64) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("UPDATE agents SET lease_until = ?3 WHERE id = ?1 AND generation = ?2", params![id, generation, until])?;
+        let n =
+            self.conn.execute("UPDATE agents SET lease_until = ?3 WHERE id = ?1 AND generation = ?2", params![id, generation, until])?;
         Ok(n == 1)
     }
 

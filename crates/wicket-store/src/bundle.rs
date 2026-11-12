@@ -300,6 +300,16 @@ pub fn unpack_tree(blob: impl Read, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whose bundle a push writes: the agent, the generation pushing it, its sequence number, and the
+/// agent's session.
+#[derive(Clone, Copy)]
+pub struct PushTo<'a> {
+    pub agent: &'a str,
+    pub generation: i64,
+    pub seq: i64,
+    pub session_id: &'a str,
+}
+
 /// A tree to push: its name, where it is, and top-level names to leave out.
 pub struct TreeSrc<'a> {
     pub name: String,
@@ -312,14 +322,12 @@ pub struct TreeSrc<'a> {
 /// manifest and its key; the caller commits the key in the ledger, which is the commit point.
 pub fn push(
     store: &dyn ObjectStore,
-    agent: &str,
-    generation: i64,
-    seq: i64,
-    session_id: &str,
+    to: &PushTo,
     trees: &[TreeSrc],
     prev: Option<&StateManifest>,
     scratch: &Path,
 ) -> Result<(StateManifest, String)> {
+    let PushTo { agent, generation, seq, session_id } = *to;
     std::fs::create_dir_all(scratch)?;
     let mut out = Vec::new();
     for t in trees {
@@ -447,7 +455,8 @@ mod tests {
 
         let store = DirStore::new(&root);
         let trees = [TreeSrc { name: "tmp".into(), path: src.clone(), exclude: &["skip"] }];
-        let (m, key) = push(&store, "agt_x", 1, 1, "s", &trees, None, &root.join(".scratch")).unwrap();
+        let (m, key) =
+            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 1, session_id: "s" }, &trees, None, &root.join(".scratch")).unwrap();
         assert_eq!(key, "a/agt_x/m/1.1");
         assert_eq!(read_manifest(&store, &key, "agt_x").unwrap(), m);
         assert!(read_manifest(&store, &key, "agt_y").is_err());
@@ -464,12 +473,20 @@ mod tests {
         assert!(pull_tree(&store, t, &out).is_err(), "never over an existing tree");
 
         // Unchanged: the next push reuses the blob. Changed: a new blob.
-        let (m2, _) = push(&store, "agt_x", 1, 2, "s", &trees, Some(&m), &root.join(".scratch")).unwrap();
+        let (m2, _) =
+            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 2, session_id: "s" }, &trees, Some(&m), &root.join(".scratch"))
+                .unwrap();
         assert_eq!(m2.trees[0].blob, t.blob);
         std::fs::write(src.join("home/.gitconfig"), "changed").unwrap();
-        let (m3, _) = push(&store, "agt_x", 1, 3, "s", &trees, Some(&m2), &root.join(".scratch")).unwrap();
+        let (m3, _) =
+            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 3, session_id: "s" }, &trees, Some(&m2), &root.join(".scratch"))
+                .unwrap();
         assert_ne!(m3.trees[0].blob, t.blob);
-        assert!(push(&store, "agt_x", 1, 3, "s", &trees, Some(&m2), &root.join(".scratch")).is_err(), "a manifest is never replaced");
+        assert!(
+            push(&store, &PushTo { agent: "agt_x", generation: 1, seq: 3, session_id: "s" }, &trees, Some(&m2), &root.join(".scratch"))
+                .is_err(),
+            "a manifest is never replaced"
+        );
 
         // A blob that was tampered with doesn't verify, and leaves nothing behind.
         let blob_path = root.join(&m3.trees[0].blob);

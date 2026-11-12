@@ -255,7 +255,8 @@ impl AgentSession {
     /// Whether `s` is a session id wicket would choose (a lowercase hyphenated UUID).
     pub fn valid(s: &str) -> bool {
         s.len() == 36
-            && s.char_indices().all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() })
+            && s.char_indices()
+                .all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() })
     }
 }
 
@@ -479,7 +480,9 @@ mod tests {
         assert_eq!(p.argv[at + 1], s.id);
         let r = claude_code_plan(&m, &RunId("run_y".into()), &AgentSession { resume: true, ..s.clone() });
         assert!(r.argv.windows(2).any(|w| w[0] == "--resume" && w[1] == s.id) && !r.argv.contains(&"--session-id".to_string()));
-        let set = claude_settings(&Manifest::from_yaml("task: hi\nagent: {name: a, adapter_settings: {language: fr}}\nzone: {name: z, llm: {}}").unwrap());
+        let set = claude_settings(
+            &Manifest::from_yaml("task: hi\nagent: {name: a, adapter_settings: {language: fr}}\nzone: {name: z, llm: {}}").unwrap(),
+        );
         assert_eq!(set["cleanupPeriodDays"], CLEANUP_PERIOD_DAYS);
         assert_eq!(set["language"], "fr");
         let get = |k: &str| p.env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());

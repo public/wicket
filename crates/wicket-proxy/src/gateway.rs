@@ -414,7 +414,13 @@ impl Gateway {
 ///   exfiltrated key can't produce a message wicket records now), and a matching send time;
 /// - from a sender whose identity has not been revoked;
 /// - addressed to this run, and sent by the run the ledger says sent it.
-fn deliver(me: &crate::RunIdentity, my_run: &str, earlier: &[String], m: &wicket_store::StoredMessage, sender_revoked: bool) -> (String, bool) {
+fn deliver(
+    me: &crate::RunIdentity,
+    my_run: &str,
+    earlier: &[String],
+    m: &wicket_store::StoredMessage,
+    sender_revoked: bool,
+) -> (String, bool) {
     let id = &m.id;
     let (sender, payload) = match wicket_identity::verify_envelope(&m.envelope, &me.issuer, m.created_at) {
         Ok(v) => v,

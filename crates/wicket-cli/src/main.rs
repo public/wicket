@@ -8,9 +8,9 @@
 mod capacity;
 mod chan;
 mod enrol;
+mod hibernate;
 mod image;
 mod links;
-mod hibernate;
 mod mock;
 mod node;
 mod nodeauth;
@@ -655,9 +655,18 @@ async fn main() -> Result<()> {
                     match a.state.as_str() {
                         "hibernated" if a.restorable => {
                             l.add_operator_message(&a.id, &text, &operator())?;
-                            l.audit(&TenantId::single(), None, "operator.message", &serde_json::json!({ "by": operator(), "chars": text.len(), "agent": a.id, "wakes": true }))?;
+                            l.audit(
+                                &TenantId::single(),
+                                None,
+                                "operator.message",
+                                &serde_json::json!({ "by": operator(), "chars": text.len(), "agent": a.id, "wakes": true }),
+                            )?;
                             hibernate::trigger_wake(&a.id, &format!("wicket say by {}", operator()));
-                            println!("agent {} is hibernated: waking it; the message is its first turn (log: {})", a.id, hibernate::agent_dir(&a.id).join("wake.log").display());
+                            println!(
+                                "agent {} is hibernated: waking it; the message is its first turn (log: {})",
+                                a.id,
+                                hibernate::agent_dir(&a.id).join("wake.log").display()
+                            );
                             return Ok(());
                         }
                         "active" | "idle" | "waking" | "hibernating" => run = a.run,

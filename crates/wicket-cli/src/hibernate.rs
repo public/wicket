@@ -74,8 +74,11 @@ pub fn quiet(procs: &[(u32, u32, String)]) -> std::result::Result<(), Vec<String
             || (matches!(base, "bash" | "sh") && second == "wicket-entry")
             || (base == "node" && cmd.contains("claude"))
     };
-    let others: Vec<String> =
-        procs.iter().filter(|(pid, _, cmd)| *pid != 1 && !cmd.is_empty() && !runtime(cmd)).map(|(pid, _, cmd)| format!("{pid}: {}", wicket_agent::clip(cmd, 80))).collect();
+    let others: Vec<String> = procs
+        .iter()
+        .filter(|(pid, _, cmd)| *pid != 1 && !cmd.is_empty() && !runtime(cmd))
+        .map(|(pid, _, cmd)| format!("{pid}: {}", wicket_agent::clip(cmd, 80)))
+        .collect();
     if others.is_empty() {
         Ok(())
     } else {
@@ -92,7 +95,12 @@ pub async fn check_quiet(docker: &wicket_sandbox::Docker, name: &str, user: &str
 /// Pushes an activation's trees as the agent's next bundle and commits it in the ledger. Returns the
 /// manifest, or None if this activation was superseded (its push is refused; the objects it wrote
 /// are orphans for GC).
-pub fn push(ledger: &std::sync::Mutex<Ledger>, agent: &AgentRow, generation: i64, trees: &[(String, PathBuf, &[&str])]) -> Result<Option<StateManifest>> {
+pub fn push(
+    ledger: &std::sync::Mutex<Ledger>,
+    agent: &AgentRow,
+    generation: i64,
+    trees: &[(String, PathBuf, &[&str])],
+) -> Result<Option<StateManifest>> {
     let store = store();
     let prev = match &agent.head {
         Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
@@ -104,8 +112,9 @@ pub fn push(ledger: &std::sync::Mutex<Ledger>, agent: &AgentRow, generation: i64
     let src: Vec<TreeSrc> = trees.iter().map(|(n, p, x)| TreeSrc { name: n.clone(), path: p.clone(), exclude: x }).collect();
     let seq = agent.head_seq + 1;
     let scratch = data_dir().join("objects-scratch");
-    let (m, key) = bundle::push(&store, &agent.id, generation, seq, &agent.session_id, &src, prev.as_ref(), &scratch)
-        .with_context(|| format!("pushing agent {}'s state", agent.id))?;
+    let to = bundle::PushTo { agent: &agent.id, generation, seq, session_id: &agent.session_id };
+    let (m, key) =
+        bundle::push(&store, &to, &src, prev.as_ref(), &scratch).with_context(|| format!("pushing agent {}'s state", agent.id))?;
     let l = ledger.lock().expect("ledger");
     if !l.commit_agent_push(&agent.id, generation, agent.head_seq, seq, &key, m.stored_bytes() as i64)? {
         return Ok(None);
@@ -263,7 +272,14 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         if state.session_id != agent.session_id {
             bail!("the bundle's session {} isn't the agent's {}", state.session_id, agent.session_id);
         }
-        println!("[wicket] state: bundle {} ({} trees, {} stored, {} raw), read in {} ms", agent.head.as_deref().unwrap_or(""), state.trees.len(), human(state.stored_bytes()), human(state.raw_bytes()), t0.elapsed().as_millis());
+        println!(
+            "[wicket] state: bundle {} ({} trees, {} stored, {} raw), read in {} ms",
+            agent.head.as_deref().unwrap_or(""),
+            state.trees.len(),
+            human(state.stored_bytes()),
+            human(state.raw_bytes()),
+            t0.elapsed().as_millis()
+        );
         Ok(state)
     }
     .await;
@@ -321,10 +337,20 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
         let Some(now) = l.agent(&a.id)? else { bail!("agent {} is gone", a.id) };
         match now.state.as_str() {
             "hibernated" => {
-                println!("agent {} hibernated: {} stored (generation {}, bundle {})", a.id, human(now.bundle_bytes as u64), now.generation, now.head.unwrap_or_default());
+                println!(
+                    "agent {} hibernated: {} stored (generation {}, bundle {})",
+                    a.id,
+                    human(now.bundle_bytes as u64),
+                    now.generation,
+                    now.head.unwrap_or_default()
+                );
                 return Ok(());
             }
-            "idle" if now.want.is_none() && now.updated_at >= before && now.note.as_deref().is_some_and(|n| n.starts_with("not hibernated")) => {
+            "idle"
+                if now.want.is_none()
+                    && now.updated_at >= before
+                    && now.note.as_deref().is_some_and(|n| n.starts_with("not hibernated")) =>
+            {
                 println!("agent {} stays idle (paused): {}", a.id, now.note.unwrap_or_default());
                 return Ok(());
             }

@@ -25,7 +25,11 @@ fn last_user_text(v: &Value) -> Option<String> {
     }
     let text = match last.get("content")? {
         Value::String(s) => s.clone(),
-        Value::Array(c) => c.iter().filter_map(|b| (b.get("type")?.as_str()? == "text").then(|| b.get("text")?.as_str().map(String::from))?).collect::<Vec<_>>().join(" "),
+        Value::Array(c) => c
+            .iter()
+            .filter_map(|b| (b.get("type")?.as_str()? == "text").then(|| b.get("text")?.as_str().map(String::from))?)
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => return None,
     };
     (!text.trim().is_empty()).then_some(text)
@@ -108,7 +112,10 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
     } else {
         (json!({ "type": "text", "text": format!("Done: the mock model finished. The request carried {messages} messages.") }), "end_turn")
     };
-    eprintln!("mock: reply {msg_id}: {} ({messages} messages in the request)", if stop == "tool_use" { "run the command" } else { "finish" });
+    eprintln!(
+        "mock: reply {msg_id}: {} ({messages} messages in the request)",
+        if stop == "tool_use" { "run the command" } else { "finish" }
+    );
     if let Some(t) = last_user_text(&v) {
         eprintln!("mock: the user said: {}", t.chars().take(1000).collect::<String>().replace('\n', " "));
     }
