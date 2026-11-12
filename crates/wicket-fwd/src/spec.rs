@@ -4,12 +4,13 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-/// The transport a listener accepts. Only TCP today; UDP (`--udp`) is designed in the crate docs
-/// and will be a second variant, parsed from the same `ADDR:PORT=PATH` shape.
+/// The transport a listener accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A TCP listener; each accepted connection is relayed to a new connection on a unix stream socket.
     Tcp,
+    /// A UDP listener (`--udp`); datagrams are relayed in [`crate::frame`]s over one unix connection.
+    Udp,
 }
 
 /// One listener: where it listens in the box and the host's unix socket it relays to.
@@ -24,6 +25,7 @@ impl fmt::Display for Listen {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let k = match self.kind {
             Kind::Tcp => "tcp",
+            Kind::Udp => "udp",
         };
         write!(f, "{k} {} -> {}", self.addr, self.path.display())
     }
@@ -92,6 +94,10 @@ mod tests {
         let b = parse(Kind::Tcp, "198.18.0.1:3128=/b").unwrap();
         let c = parse(Kind::Tcp, "198.18.0.1:8080=/b").unwrap();
         assert!(check_distinct(&[a.clone(), b]).is_err());
-        assert!(check_distinct(&[a, c]).is_ok());
+        assert!(check_distinct(&[a.clone(), c]).is_ok());
+        // TCP and UDP on one address and port are different listeners.
+        let u = parse(Kind::Udp, "198.18.0.1:3128=/b").unwrap();
+        assert!(check_distinct(&[a, u.clone()]).is_ok());
+        assert_eq!(parse(Kind::Udp, "0.0.0.0:443=/wicket/sock/udp.sock").unwrap().to_string(), "udp 0.0.0.0:443 -> /wicket/sock/udp.sock");
     }
 }
