@@ -231,7 +231,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let (image_owned, node_owned, parent_owned, lease_owned, wsd_owned) = match &record {
         Some(r) => (r.image.clone(), r.node.clone(), r.parent_run.clone(), r.lease.clone(), r.workspace_dir.clone()),
-        None => (image.to_string(), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
+        // A new box: the default image means this build's own (#162); a re-attached one keeps its.
+        None => (crate::image::effective(image), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
     };
     let (image, node, parent_run, lease) = (image_owned.as_str(), node_owned.as_deref(), parent_owned, lease_owned);
     let workspace_dir = wsd_owned.as_deref();

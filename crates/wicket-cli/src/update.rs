@@ -199,6 +199,11 @@ impl Versions {
     }
 }
 
+/// Whether this process runs a staged version.
+pub fn is_staged() -> bool {
+    running_root().is_some()
+}
+
 /// The binary a wicket process starts its children from: the versions root's `current` when this
 /// process runs a staged version (so after a switch every new process is the new build), else this
 /// binary.
@@ -460,7 +465,9 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
             Err(e) => why_not_signed = format!("{} ({e:#})", sig_path.display()),
         }
     }
-    match ledger.lock().expect("ledger").use_update_approval(&sha)? {
+    // Bound first: the ledger's lock must be released before `refuse` takes it again.
+    let approval = ledger.lock().expect("ledger").use_update_approval(&sha)?;
+    match approval {
         Some((request, grant)) => Ok(Accepted { copy, sha256: sha, source: serde_json::json!({ "approved": { "request": request, "grant": grant } }) }),
         None => Err(refuse(format!(
             "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no human has approved an update to it (an agent's request_update, approved with `wicket approve`)"
@@ -526,7 +533,55 @@ pub struct Gate {
     pub checks: Vec<String>,
     /// A manifest the new build runs once on the control host, which must succeed.
     pub canary: Option<PathBuf>,
-    pub image: String,
+    /// The canary's image (default: the new build's own, `wicket/claude-code:<build id>`).
+    pub image: Option<String>,
+}
+
+/// Makes sure version `id`'s own agent image (`wicket/claude-code:<id>`) is in this host's Docker:
+/// built by that version's binary from the image sources embedded in it, so it matches it.
+async fn ensure_image(v: &Versions, id: &str) -> Result<String> {
+    let tag = crate::image::tag_for(id);
+    if wicket_sandbox::Docker::from_env().image_exists(&tag).await? {
+        return Ok(tag);
+    }
+    say(format!("building {tag} with {id}"));
+    let out = tokio::process::Command::new(v.binary(id))
+        .args(["image", "--tag", &tag])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("running `wicket image`")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("building {tag}: {}", err.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    }
+    Ok(tag)
+}
+
+/// Makes sure a node's Docker has `tag`: if not, `docker save` here piped into `docker load` over
+/// the node's pinned ssh.
+async fn ensure_image_on_node(node: &crate::node::Node, tag: &str) -> Result<()> {
+    let remote = wicket_sandbox::Docker::over_ssh(node.ssh_prefix());
+    if remote.image_exists(tag).await? {
+        return Ok(());
+    }
+    say(format!("node {}: loading {tag}", node.name.as_deref().unwrap_or(&node.target)));
+    let here: Vec<String> =
+        std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into()).split_whitespace().map(String::from).collect();
+    let mut save = tokio::process::Command::new(&here[0]);
+    save.args(&here[1..]).args(["save", tag]).stdout(std::process::Stdio::piped());
+    let mut save = save.spawn().context("docker save")?;
+    let mut ssh = node.ssh_prefix();
+    ssh.push("docker load".into());
+    let mut load = tokio::process::Command::new(&ssh[0]);
+    let stdout: std::process::Stdio = save.stdout.take().context("docker save's output")?.try_into()?;
+    load.args(&ssh[1..]).stdin(stdout).stdout(std::process::Stdio::null());
+    let (s, l) = (save.wait(), load.status());
+    let (s, l) = tokio::join!(s, l);
+    if !s?.success() || !l?.success() {
+        bail!("loading {tag} onto node {} failed", node.target);
+    }
+    Ok(())
 }
 
 fn audit(ledger: &Mutex<Ledger>, kind: &str, body: serde_json::Value) {
@@ -578,11 +633,17 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     }
     let blue = v.pointer("current").context("no current version")?;
     let (green, m) = v.stage(&bin, &accepted.sha256, accepted.source.clone())?;
+    // Each version's own agent image: the new one's for its boxes and its canary, the old one's for
+    // a rollback (running boxes keep whatever they started with).
+    let image = ensure_image(&v, &green).await?;
+    if let Err(e) = ensure_image(&v, &blue).await {
+        say(format!("warning: no image of the running version {blue} for a rollback's new boxes: {e:#}"));
+    }
     audit(
         &ledger,
         "self.staged",
         serde_json::json!({ "version": green, "build": m.describe.build, "wicket": m.describe.version, "protocol": m.describe.protocol,
-            "schema": m.describe.schema, "artifact_sha256": accepted.sha256, "source": accepted.source, "by": crate::operator() }),
+            "schema": m.describe.schema, "artifact_sha256": accepted.sha256, "source": accepted.source, "image": image, "by": crate::operator() }),
     );
     say(format!(
         "staged {green} (wicket {}, protocol {}, schema {}), accepted as {}",
@@ -785,7 +846,10 @@ async fn gate_round(bin: &Path, target: &str, nodes: &[String], g: &Gate, first:
             c.args(["--node", n]);
         }
         if let (true, Some(m)) = (first, &g.canary) {
-            c.arg("--canary").arg(m).args(["--image", &g.image]);
+            // `bin` is `<root>/<id>/wicket`.
+            let id = bin.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let image = g.image.clone().unwrap_or_else(|| crate::image::tag_for(&id));
+            c.arg("--canary").arg(m).args(["--image", &image]);
         }
         let out = tokio::time::timeout(Duration::from_secs(600), c.output())
             .await
@@ -943,6 +1007,8 @@ async fn node_update(ledger: &Arc<Mutex<Ledger>>, v: &Versions, name: &str, gree
         Ok((_, runs)) => runs,
         Err(e) => bail!("node {name}: can't reach it before updating it ({e:#}); nothing changed there"),
     };
+    // The version's image first, so the node's new boxes have it the moment it switches.
+    ensure_image_on_node(&node, &crate::image::tag_for(green)).await.with_context(|| format!("node {name}: nothing changed there"))?;
     let bytes = std::fs::read(&bin)?;
     let prev = push_version(&node, &bytes, &sha).await?;
     audit(
@@ -1005,7 +1071,7 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         Some(s) => node_list(&ledger.lock().expect("ledger"), s)?,
         None => vec![],
     };
-    let gate = Gate { window: Duration::ZERO, interval: Duration::from_secs(1), checks: vec![], canary: None, image: String::new() };
+    let gate = Gate { window: Duration::ZERO, interval: Duration::from_secs(1), checks: vec![], canary: None, image: None };
     if !only_nodes {
         let v = Versions::control();
         let cur = v.pointer("current").context("nothing to roll back: no versions here (wicket self status)")?;

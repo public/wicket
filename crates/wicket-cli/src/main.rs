@@ -210,12 +210,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build).
+    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the
+    /// build). Without --dir, from the copy embedded in this binary, so the image matches it.
     Image {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
-        #[arg(long, default_value = "images/claude-code")]
-        dir: PathBuf,
+        /// An image directory to build instead (e.g. images/claude-code, while changing it).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain
     /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
@@ -434,8 +436,9 @@ enum SelfCmd {
         /// A task manifest the new build runs once on the control host; it must succeed.
         #[arg(long)]
         canary: Option<PathBuf>,
-        #[arg(long, default_value = "wicket/claude-code:poc")]
-        image: String,
+        /// The canary's image (default: the new build's own, wicket/claude-code:<build id>).
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Switch back to the previous version: the control host (unless --only-nodes) and these nodes.
     Rollback {
@@ -1269,7 +1272,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir } => {
-            let ctx = image::context(&dir)?;
+            let ctx = match &dir {
+                Some(d) => image::context(d)?,
+                None => image::embedded_context()?,
+            };
             wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
             println!("built {tag}");
             Ok(())
