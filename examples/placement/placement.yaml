@@ -1,0 +1,36 @@
+# Placement for request_capacity (#7) and the reconciler (#38): copy to <data dir>/placement.yaml
+# (or point $WICKET_PLACEMENT at it). Without this file agents can't ask for capacity, and
+# `wicket reconcile` only looks after runs and boxes.
+
+# The owner tag's installation name (default: the identity's trust domain). Keep it stable: the
+# reconciler only ever lists or destroys instances tagged wicket-owner-<owner>.
+owner: wicket.example.com
+
+# `static`: the operator's own machines, each already enrolled (`wicket node enrol`) under the same
+# name. `vultr`: fresh Vultr nodes, created, enrolled and installed per lease, destroyed at its end.
+backend: static
+
+# Every lease together, worst case, in dollars: per hour and in total. An ask that would go over
+# either is refused before a human sees it. Static hosts cost nothing and reserve nothing.
+max_hourly_usd: '0.10'
+max_total_usd: '1.00'
+
+static_hosts:
+  - name: n1
+    ssh_target: wicket@203.0.113.7
+    capacity: { vcpus: 4, memory_mib: 8192 }
+    isolation: gvisor
+    region: lhr
+
+# Run `wicket node install` on a static host when a lease binds it (default: no).
+install_static: false
+
+# For backend: vultr. The API key is the vault secret `vultr-api-key` (`wicket secret set vultr-api-key`).
+# vultr:
+#   region: lhr
+#   ssh_key_ids: [<id of a key in the Vultr account>]
+#   ssh_key: <path to its private half on this host>
+# Hosts the CA of a node enrolled for a lease may issue for (`wicket node enrol --hosts`).
+# node_hosts: [api.example.com]
+# Keep a node whose lease ended until minute 50 of its paid hour instead of destroying it at once.
+# warm_pool: false

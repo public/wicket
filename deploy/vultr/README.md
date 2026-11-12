@@ -12,7 +12,8 @@ its host key pinned at creation; the steps below do the same by hand.
 IP=<the node's IP>; K=<path to the SSH private key>
 
 ssh -i $K root@$IP 'bash -s' < deploy/vultr/node-setup.sh  # Docker + gVisor + user wicket
-tar -C images/claude-code -cf - . | ssh -i $K wicket@$IP \
+# the build context `wicket image` assembles: the image directory plus the in-box forwarder's crate
+tar -cf - -C images/claude-code . -C ../../crates wicket-fwd/Cargo.toml wicket-fwd/src | ssh -i $K wicket@$IP \
   'mkdir -p img && tar -C img -xf - && docker build -q --network host -t wicket/claude-code:poc img'
 
 ./target/release/wicket run examples/hello-github.yaml --node wicket@$IP --ssh-key $K

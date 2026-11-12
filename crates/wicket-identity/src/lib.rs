@@ -21,6 +21,8 @@ use std::path::Path;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
+pub mod node;
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdError {
     #[error("malformed token: {0}")]
@@ -35,6 +37,8 @@ pub enum IdError {
     WrongIssuer(String),
     #[error("trust domain: {0}")]
     TrustDomain(String),
+    #[error("refused: {0}")]
+    Refused(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

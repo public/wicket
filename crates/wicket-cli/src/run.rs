@@ -95,6 +95,8 @@ pub struct RunOpts<'a> {
     pub ssh_key: Option<&'a Path>,
     pub run_id: Option<String>,
     pub parent_run: Option<String>,
+    /// The capacity lease this run is placed on (recorded, so the reconciler stops it at lease end).
+    pub lease: Option<String>,
     /// Wrap this agent command line (launched by another program, e.g. Claude Code Remote Control
     /// through CLAUDE_CODE_PROCESS_WRAPPER) instead of launching the agent ourselves. Its stdin and
     /// stdout stay connected to the launcher; wicket's own output goes to a log file.
@@ -102,7 +104,7 @@ pub struct RunOpts<'a> {
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
-    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, wrap } = o;
+    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap } = o;
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
     // everything wicket prints to a log file instead.
     let mut agent_stdout: Option<std::os::fd::OwnedFd> = None;
@@ -225,6 +227,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
+        // Who supervises it, for the reconciler (#38), and the lease it is placed on, if any.
+        l.set_run_owner(&run.0, &crate::reap::owner_label())?;
+        if let Some(lease) = &lease {
+            l.set_run_lease(&run.0, lease)?;
+        }
         l.audit(
             &m.tenant,
             Some(&run),
@@ -399,6 +406,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             v
         }
     };
+    // request_capacity (#7): agents may ask when a placement backend is configured; a human decides.
+    let capacity = match (&m.agent, crate::capacity::PlacementConfig::load()) {
+        (Some(_), Ok(Some(cfg))) => Some(crate::capacity::hook(m.tenant.clone(), run.clone(), m.zone.name.clone(), ledger.clone(), cfg)),
+        (Some(_), Err(e)) => {
+            eprintln!("[wicket] request_capacity is off: {e:#}");
+            None
+        }
+        _ => None,
+    };
     let ctx = RunCtx {
         tenant: m.tenant.clone(),
         run: run.clone(),
@@ -411,6 +427,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         identity: identity.clone(),
         spawner,
         swaps,
+        capacity,
     };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;

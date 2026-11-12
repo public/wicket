@@ -135,10 +135,10 @@
   <!-- in-box processes -->
   <rect x="366" y="776" width="528" height="50" rx="6" class="bproc"/>
   <text x="378" y="796" class="h">PID 1: tini (--init)  →  <tspan class="m">wicket-entry</tspan></text>
-  <text x="378" y="814" class="s">starts the forwarders, builds the CA bundle, then execs the agent</text>
+  <text x="378" y="814" class="s">starts the forwarder, builds the CA bundle, then execs the agent</text>
 
   <rect x="366" y="838" width="528" height="98" rx="6" class="bproc"/>
-  <text x="378" y="858" class="h">3 × socat: loopback TCP → bind-mounted unix socket</text>
+  <text x="378" y="858" class="h">wicket-fwd: loopback TCP → bind-mounted unix socket</text>
   <text x="378" y="878" class="m">127.0.0.1:3128 → /wicket/sock/egress.sock</text>
   <text x="378" y="896" class="m">127.0.0.1:8080 → /wicket/sock/llm.sock</text>
   <text x="378" y="914" class="m">127.0.0.1:8081 → /wicket/sock/gateway.sock</text>

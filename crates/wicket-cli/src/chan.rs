@@ -11,8 +11,10 @@
 //! | `3` feed | one wicket-feed `Frame` line | control host → node only; verified by the node's replica |
 //!
 //! Integrity of policy comes from the feed's signatures, not from this channel (a tampered feed frame
-//! is refused by the replica); ssh gives the channel confidentiality and authenticates the node by
-//! its pinned host key.
+//! is refused by the replica). ssh gives the channel confidentiality and checks the node's pinned host
+//! key; on top of that, both ends authenticate each other before anything else (`nodeauth.rs`): the
+//! node with its node key and identity certificate, the control host with the installation's issuer
+//! key ([`Msg::Hello`]'s nonce, [`Msg::Challenge`], [`Msg::Prove`]).
 //!
 //! **Streams.** A box's stdio streams are numbered by the control host when it starts the box
 //! ([`BoxStart::streams`]); their data frames carry the byte offset of their first byte, so after a
@@ -103,6 +105,17 @@ pub enum Msg {
         build: String,
         #[serde(default)]
         observer: bool,
+        /// The control host's handshake nonce (base64url, 32 bytes); unused by observers.
+        #[serde(default)]
+        nonce: String,
+    },
+    /// The control host's handshake proof, signed with the issuer key (answers [`Msg::Challenge`]).
+    Prove {
+        proof: wicket_identity::node::ControlProof,
+    },
+    /// A renewed node identity certificate for the node's key.
+    NodeCert {
+        cert: String,
     },
     Start(Box<BoxStart>),
     /// Replay stdout and stderr from these offsets (after a reconnect).
@@ -148,6 +161,15 @@ pub enum Msg {
     },
 
     // ---- node → control host ----
+    /// The node's handshake answer: its nonce, certificate and proof (answers [`Msg::Hello`]).
+    Challenge {
+        proof: wicket_identity::node::NodeProof,
+    },
+    /// Answer to [`Msg::NodeCert`]: installed, or why not.
+    NodeCertInstalled {
+        serial: String,
+        error: Option<String>,
+    },
     Welcome {
         node: String,
         build: String,
@@ -422,7 +444,16 @@ mod tests {
             "/x",
         );
         vec![
-            Frame::Msg(Msg::Hello { node: "n1".into(), version: "0.0.1".into(), build: "ab".repeat(32), observer: false }),
+            Frame::Msg(Msg::Hello {
+                node: "n1".into(),
+                version: "0.0.1".into(),
+                build: "ab".repeat(32),
+                observer: false,
+                nonce: "A".repeat(43),
+            }),
+            Frame::Msg(Msg::Challenge {
+                proof: wicket_identity::node::NodeProof { nonce: "B".repeat(43), cert: "a.b.c".into(), proof: "d.e.f".into() },
+            }),
             Frame::Msg(Msg::Ask { id: 7, run: "run_a".into(), op: Box::new(op), why: "out of reach".into(), who: None }),
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),

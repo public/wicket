@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
+mod lease;
 mod node;
+pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +101,37 @@ pub struct OperatorCredential {
     pub sign_count: u32,
 }
 
+/// A console sign-in session (`wicket serve`). The ledger holds only the SHA-256 of the cookie's
+/// token (`id`), so reading the ledger does not hand out live sessions; the host lists and revokes
+/// sessions here (`wicket operator sessions`, `wicket operator revoke-session`) while the console runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConsoleSession {
+    pub id: String,
+    /// "operator" (signed in with a passkey) or "bootstrap" (opened the one-time enrolment link).
+    pub kind: String,
+    /// The passkey it signed in with (operator sessions), or the id of the enrolment link it was
+    /// opened with (bootstrap sessions).
+    pub credential: Option<String>,
+    /// The client address it signed in from.
+    pub client: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    /// Absolute expiry: no amount of activity extends a session past it.
+    pub expires_at: i64,
+}
+
+fn console_session_row(r: &rusqlite::Row) -> rusqlite::Result<ConsoleSession> {
+    Ok(ConsoleSession {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        credential: r.get(2)?,
+        client: r.get(3)?,
+        created_at: r.get(4)?,
+        last_seen_at: r.get(5)?,
+        expires_at: r.get(6)?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRow {
     pub id: String,
@@ -124,7 +157,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
-  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT
+  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -178,6 +211,27 @@ CREATE TABLE IF NOT EXISTS node_cas (
   hosts TEXT NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS node_cas_node ON node_cas (node, status);
+CREATE TABLE IF NOT EXISTS node_certs (
+  serial TEXT PRIMARY KEY, node TEXT NOT NULL, node_key TEXT NOT NULL, issued_at INTEGER NOT NULL,
+  not_after INTEGER NOT NULL, status TEXT NOT NULL, revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS node_certs_node ON node_certs (node, issued_at);
+CREATE TABLE IF NOT EXISTS console_sessions (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, kind TEXT NOT NULL, credential TEXT, client TEXT NOT NULL,
+  created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+  revoked_at INTEGER, revoked_by TEXT
+);
+CREATE TABLE IF NOT EXISTS console_enrol_links (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+  created_by TEXT NOT NULL, used_at INTEGER, used_client TEXT
+);
+CREATE TABLE IF NOT EXISTS leases (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, request_id TEXT, provider TEXT NOT NULL, spec TEXT NOT NULL,
+  hourly_cap INTEGER NOT NULL, reserved INTEGER NOT NULL, duration_secs INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  not_after INTEGER, status TEXT NOT NULL, node_id TEXT, node_name TEXT, ssh_target TEXT, host_key TEXT, billed INTEGER,
+  ended_at INTEGER, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS leases_status ON leases (tenant, status);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
@@ -198,6 +252,9 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN scope_prefix INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before grants could be handed to a node.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN node TEXT", []);
+        // Ledgers created before runs recorded their supervising process.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
         Ok(Ledger { conn })
     }
 
@@ -224,6 +281,11 @@ impl Ledger {
             .execute("UPDATE runs SET status = ?2, ended_at = ?3, detail = ?4 WHERE id = ?1", params![run.0, status, now(), detail])?;
         let n = self.conn.execute(
             "UPDATE requests SET status = 'withdrawn', decided_at = ?2, decided_by = 'wicket:run-ended' WHERE run = ?1 AND status = 'pending'",
+            params![run.0, now()],
+        )?;
+        // A lease nobody has approved yet goes with the run that asked for it.
+        self.conn.execute(
+            "UPDATE leases SET status = 'withdrawn', detail = 'its run ended before a decision', ended_at = ?2 WHERE run = ?1 AND status = 'pending'",
             params![run.0, now()],
         )?;
         Ok(n)
@@ -649,6 +711,99 @@ impl Ledger {
         Ok(self.conn.execute("UPDATE operator_credentials SET revoked = 1 WHERE tenant = ?1 AND revoked = 0", params![tenant.0])?)
     }
 
+    // ---- console sessions ----
+
+    pub fn add_console_session(&self, tenant: &TenantId, s: &ConsoleSession) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO console_sessions (id, tenant, kind, credential, client, created_at, last_seen_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![s.id, tenant.0, s.kind, s.credential, s.client, s.created_at, s.last_seen_at, s.expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// A session that is neither revoked nor past its absolute expiry at `at` (idle expiry is the
+    /// console's to judge, from `last_seen_at`).
+    pub fn console_session(&self, tenant: &TenantId, id: &str, at: i64) -> Result<Option<ConsoleSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, kind, credential, client, created_at, last_seen_at, expires_at FROM console_sessions
+                 WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL AND expires_at > ?3",
+                params![tenant.0, id, at],
+                console_session_row,
+            )
+            .optional()?)
+    }
+
+    /// Live sessions (not revoked, not past absolute expiry), oldest first.
+    pub fn console_sessions(&self, tenant: &TenantId, at: i64) -> Result<Vec<ConsoleSession>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, kind, credential, client, created_at, last_seen_at, expires_at FROM console_sessions
+             WHERE tenant = ?1 AND revoked_at IS NULL AND expires_at > ?2 ORDER BY created_at",
+        )?;
+        let rows = st.query_map(params![tenant.0, at], console_session_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn touch_console_session(&self, id: &str, at: i64) -> Result<()> {
+        self.conn.execute("UPDATE console_sessions SET last_seen_at = ?2 WHERE id = ?1 AND last_seen_at < ?2", params![id, at])?;
+        Ok(())
+    }
+
+    /// Revokes live sessions whose id starts with `prefix` (every live session with None). Returns
+    /// the ids revoked.
+    pub fn revoke_console_sessions(&self, tenant: &TenantId, prefix: Option<&str>, by: &str) -> Result<Vec<String>> {
+        let at = now();
+        let live = self.console_sessions(tenant, at)?;
+        let ids: Vec<String> = live.into_iter().map(|s| s.id).filter(|id| prefix.is_none_or(|p| id.starts_with(p))).collect();
+        for id in &ids {
+            self.conn.execute(
+                "UPDATE console_sessions SET revoked_at = ?2, revoked_by = ?3 WHERE id = ?1 AND revoked_at IS NULL",
+                params![id, at, by],
+            )?;
+        }
+        Ok(ids)
+    }
+
+    /// Ends one session (sign-out, or rotation at sign-in).
+    pub fn end_console_session(&self, id: &str, by: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE console_sessions SET revoked_at = ?2, revoked_by = ?3 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, now(), by],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets sessions that ended (expired or revoked) before `before`.
+    pub fn prune_console_sessions(&self, before: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM console_sessions WHERE expires_at < ?1 OR (revoked_at IS NOT NULL AND revoked_at < ?1)",
+            params![before],
+        )?)
+    }
+
+    // ---- console enrolment links ----
+
+    /// Records a host-issued, single-use enrolment link. `id` is the SHA-256 of its token (hex), so
+    /// reading the ledger does not hand out usable links.
+    pub fn add_enrol_link(&self, tenant: &TenantId, id: &str, expires_at: i64, by: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO console_enrol_links (id, tenant, created_at, expires_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, tenant.0, now(), expires_at, by],
+        )?;
+        Ok(())
+    }
+
+    /// Uses the enrolment link `id` at `at` from `client`, atomically: true only if it exists for
+    /// `tenant`, has not been used, and has not expired. A link works at most once.
+    pub fn use_enrol_link(&self, tenant: &TenantId, id: &str, at: i64, client: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE console_enrol_links SET used_at = ?3, used_client = ?4
+             WHERE tenant = ?1 AND id = ?2 AND used_at IS NULL AND expires_at > ?3",
+            params![tenant.0, id, at, client],
+        )? == 1)
+    }
+
     // ---- audit ----
 
     /// Appends a hash-chained audit record: hash = sha256(prev || kind || body).
@@ -824,6 +979,33 @@ fn row_to_node_ca(r: &rusqlite::Row) -> rusqlite::Result<NodeCaRow> {
     })
 }
 
+/// One node identity certificate (`wicket_identity::node`) issued to a node.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NodeCertRow {
+    /// The certificate's `jti`.
+    pub serial: String,
+    pub node: String,
+    /// The node key it binds (hex).
+    pub node_key: String,
+    pub issued_at: i64,
+    pub not_after: i64,
+    /// "active" (renewals leave earlier ones active until they expire) or "revoked".
+    pub status: String,
+}
+
+fn row_to_node_cert(r: &rusqlite::Row) -> rusqlite::Result<NodeCertRow> {
+    Ok(NodeCertRow {
+        serial: r.get(0)?,
+        node: r.get(1)?,
+        node_key: r.get(2)?,
+        issued_at: r.get(3)?,
+        not_after: r.get(4)?,
+        status: r.get(5)?,
+    })
+}
+
+const NODE_CERT_COLS: &str = "serial, node, node_key, issued_at, not_after, status";
+
 /// sha256 of a join token: the ledger stores only this.
 fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.trim().as_bytes()))
@@ -938,8 +1120,42 @@ impl Ledger {
         for s in &serials {
             tx.execute("UPDATE node_cas SET status = 'revoked', revoked_at = ?2 WHERE serial = ?1", params![s, t])?;
         }
+        tx.execute("UPDATE node_certs SET status = 'revoked', revoked_at = ?2 WHERE node = ?1 AND status != 'revoked'", params![name, t])?;
         tx.commit()?;
         Ok(serials)
+    }
+
+    /// Records a node identity certificate issued to an active node. Earlier ones stay valid until
+    /// they expire, so a node that lost a renewal on the way still gets in with the one it holds.
+    pub fn record_node_cert(&self, c: &NodeCertRow) -> Result<()> {
+        let status: Option<String> =
+            self.conn.query_row("SELECT status FROM nodes WHERE name = ?1", params![c.node], |r| r.get(0)).optional()?;
+        match status.as_deref() {
+            None => return Err(StoreError::Node(c.node.clone(), "is not enrolled")),
+            Some("active") => {}
+            Some(_) => return Err(StoreError::Node(c.node.clone(), "is revoked")),
+        }
+        self.conn.execute(
+            &format!("INSERT INTO node_certs ({NODE_CERT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, 'active')"),
+            params![c.serial, c.node, c.node_key, c.issued_at, c.not_after],
+        )?;
+        Ok(())
+    }
+
+    /// A node certificate by serial.
+    pub fn node_cert(&self, serial: &str) -> Result<Option<NodeCertRow>> {
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE serial = ?1"), params![serial], row_to_node_cert)
+            .optional()?)
+    }
+
+    /// A node's identity certificates, newest first.
+    pub fn node_certs(&self, node: &str) -> Result<Vec<NodeCertRow>> {
+        let mut st =
+            self.conn.prepare(&format!("SELECT {NODE_CERT_COLS} FROM node_certs WHERE node = ?1 ORDER BY issued_at DESC, rowid DESC"))?;
+        let rows = st.query_map(params![node], row_to_node_cert)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn node(&self, name: &str) -> Result<Option<NodeRow>> {
@@ -1083,6 +1299,31 @@ mod node_tests {
         assert_eq!(l.revoked_node_cas(now()).unwrap().len(), 2);
         assert_eq!(l.nodes().unwrap().len(), 1);
     }
+
+    #[test]
+    fn node_certificates_are_recorded_for_active_nodes_and_revoked_with_them() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let cert = |serial: &str| NodeCertRow {
+            serial: serial.into(),
+            node: "n1".into(),
+            node_key: "00".repeat(32),
+            issued_at: now(),
+            not_after: now() + 86_400,
+            status: "active".into(),
+        };
+        assert!(l.record_node_cert(&cert("c0")).is_err(), "not enrolled");
+        let t = l.create_node_token(&TenantId::single(), "n1", 3600).unwrap();
+        l.enrol_node(&t, &node("n1"), &ca("n1", "0a")).unwrap();
+        l.record_node_cert(&cert("c1")).unwrap();
+        l.record_node_cert(&cert("c2")).unwrap();
+        assert_eq!(l.node_cert("c1").unwrap().unwrap(), cert("c1"));
+        assert_eq!(l.node_certs("n1").unwrap().iter().map(|c| c.serial.as_str()).collect::<Vec<_>>(), vec!["c2", "c1"]);
+        assert!(l.record_node_cert(&cert("c2")).is_err(), "serials are unique");
+        l.revoke_node("n1").unwrap();
+        assert!(l.node_certs("n1").unwrap().iter().all(|c| c.status == "revoked"));
+        assert!(l.record_node_cert(&cert("c3")).is_err(), "revoked");
+        assert!(l.node_cert("nope").unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1091,6 +1332,54 @@ mod tests {
 
     fn op(path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "POST", "github.com", path)
+    }
+
+    #[test]
+    fn enrol_links_work_once_before_they_expire() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let at = now();
+        l.add_enrol_link(&t, "l1", at + 600, "host").unwrap();
+        l.add_enrol_link(&t, "l2", at + 600, "host").unwrap();
+        l.add_enrol_link(&t, "old", at - 1, "host").unwrap();
+        assert!(!l.use_enrol_link(&TenantId("other".into()), "l1", at, "192.0.2.1").unwrap(), "another tenant's");
+        assert!(!l.use_enrol_link(&t, "nope", at, "192.0.2.1").unwrap(), "unknown");
+        assert!(!l.use_enrol_link(&t, "old", at, "192.0.2.1").unwrap(), "expired");
+        assert!(!l.use_enrol_link(&t, "l2", at + 600, "192.0.2.1").unwrap(), "expired at its expiry");
+        assert!(l.use_enrol_link(&t, "l1", at, "192.0.2.1").unwrap());
+        assert!(!l.use_enrol_link(&t, "l1", at, "192.0.2.1").unwrap(), "used");
+        assert!(l.add_enrol_link(&t, "l1", at + 600, "host").is_err(), "ids are unique");
+    }
+
+    #[test]
+    fn console_sessions_expire_and_are_revoked_by_prefix() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let at = now();
+        let s = |id: &str, expires_at| ConsoleSession {
+            id: id.into(),
+            kind: "operator".into(),
+            credential: Some("c".into()),
+            client: "192.0.2.1".into(),
+            created_at: at,
+            last_seen_at: at,
+            expires_at,
+        };
+        l.add_console_session(&t, &s("aa11", at + 100)).unwrap();
+        l.add_console_session(&t, &s("aa22", at + 100)).unwrap();
+        l.add_console_session(&t, &s("bb33", at + 100)).unwrap();
+        assert!(l.console_session(&t, "aa11", at).unwrap().is_some());
+        assert!(l.console_session(&t, "aa11", at + 100).unwrap().is_none(), "past its absolute expiry");
+        assert!(l.console_session(&TenantId("other".into()), "aa11", at).unwrap().is_none());
+        l.touch_console_session("aa11", at + 50).unwrap();
+        l.touch_console_session("aa11", at + 10).unwrap();
+        assert_eq!(l.console_session(&t, "aa11", at).unwrap().unwrap().last_seen_at, at + 50, "never moves back");
+        assert_eq!(l.revoke_console_sessions(&t, Some("aa"), "host").unwrap(), vec!["aa11", "aa22"]);
+        assert!(l.console_session(&t, "aa22", at).unwrap().is_none());
+        assert_eq!(l.console_sessions(&t, at).unwrap().len(), 1);
+        l.end_console_session("bb33", "sign-out").unwrap();
+        assert!(l.console_sessions(&t, at).unwrap().is_empty());
+        assert_eq!(l.prune_console_sessions(at + 1000).unwrap(), 3);
     }
 
     #[test]

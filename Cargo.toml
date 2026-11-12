@@ -15,6 +15,7 @@ members = [
     "crates/wicket-authz",
     "crates/wicket-feed",
     "crates/wicket-placement",
+    "crates/wicket-fwd",
 ]
 
 [workspace.package]

@@ -5,15 +5,19 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod capacity;
 mod chan;
 mod enrol;
+mod image;
 mod mock;
 mod node;
+mod nodeauth;
 mod noderun;
 mod nodesrv;
 mod place;
 mod program;
 mod reap;
+mod reconcile;
 mod run;
 mod serve;
 mod spawn;
@@ -88,6 +92,9 @@ enum Cmd {
         /// Internal: the run that started this one (`spawn_agent`).
         #[arg(long, hide = true)]
         parent_run: Option<String>,
+        /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).
+        #[arg(long, hide = true)]
+        lease: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
     /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
@@ -141,26 +148,59 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Build the agent image.
+    /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build).
     Image {
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
         #[arg(long, default_value = "images/claude-code")]
         dir: PathBuf,
     },
-    /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs) on loopback.
+    /// Serve the operator console (runs, approvals, activity; start, steer and revoke runs). Plain
+    /// HTTP on loopback by default; any other address needs HTTPS (--acme-domain, or --tls-cert and
+    /// --tls-key) or --behind-tls-terminator.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
-        /// Allow a non-loopback listen address (put it behind a tailnet or tunnel anyway).
-        #[arg(long)]
-        allow_remote: bool,
-        /// Browser origin for WebAuthn (default http://localhost:PORT).
+        /// Browser origin for WebAuthn (default: http://localhost:PORT; https://DOMAIN with ACME).
         #[arg(long)]
         origin: Option<String>,
-        /// WebAuthn relying-party id (default localhost).
+        /// WebAuthn relying-party id (default: the origin's host).
         #[arg(long)]
         rp_id: Option<String>,
+        /// Serve HTTPS with this certificate chain (PEM; re-read when it changes).
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// Serve HTTPS with a certificate from an ACME CA (Let's Encrypt) for this name, validated
+        /// with TLS-ALPN-01 on this listener (so listen on :443).
+        #[arg(long)]
+        acme_domain: Option<String>,
+        /// Accept the ACME CA's terms of service (required with --acme-domain).
+        #[arg(long)]
+        acme_agree_tos: bool,
+        /// Contact for the ACME account (mailto:...; repeatable).
+        #[arg(long)]
+        acme_contact: Vec<String>,
+        /// Use Let's Encrypt's staging CA (untrusted certificates; for trying the setup).
+        #[arg(long)]
+        acme_staging: bool,
+        /// Another ACME directory URL.
+        #[arg(long)]
+        acme_directory: Option<String>,
+        /// Where the ACME account and certificate are kept (default $WICKET_HOME/acme).
+        #[arg(long)]
+        acme_cache: Option<PathBuf>,
+        /// A TLS-terminating proxy in front serves the console's https:// --origin; listen in plain HTTP.
+        #[arg(long)]
+        behind_tls_terminator: bool,
+        /// The proxy's address or range (repeatable): its X-Forwarded-For names the client.
+        #[arg(long)]
+        trusted_proxy: Vec<String>,
+        /// Most simultaneous connections.
+        #[arg(long, default_value_t = 256)]
+        max_connections: usize,
     },
     /// Programs: deterministic workloads that run without an agent.
     Program {
@@ -190,6 +230,24 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<PathBuf>,
     },
+    /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
+    /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
+    /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
+    /// ended, here and on enrolled nodes. Records every change in the audit log.
+    Reconcile {
+        /// Only report what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep running, one pass per interval (e.g. 30s).
+        #[arg(long)]
+        every: Option<String>,
+    },
+    /// Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the ask with
+    /// `wicket approve`/`deny` (see `wicket pending`).
+    Lease {
+        #[command(subcommand)]
+        cmd: LeaseCmd,
+    },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
         #[arg(long, default_value = "wicket/claude-code:poc")]
@@ -215,6 +273,14 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum LeaseCmd {
+    /// Every lease: status, holder run, node, money reserved, end.
+    List,
+    /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
+    Release { id: String },
+}
+
+#[derive(Subcommand)]
 enum GrantCmd {
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
@@ -232,7 +298,8 @@ enum NodeCmd {
         ttl: String,
     },
     /// Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a
-    /// short-lived CA certificate constrained to --hosts, the feed root key and the issuer key.
+    /// short-lived identity certificate for its node key, a short-lived CA certificate constrained to
+    /// --hosts, the feed root key and the issuer key.
     Enrol {
         /// e.g. wicket@203.0.113.7
         target: String,
@@ -258,11 +325,15 @@ enum NodeCmd {
         /// Node CA lifetime.
         #[arg(long, default_value = "24h")]
         ca_ttl: String,
+        /// Node identity certificate lifetime (renewed over the control channel at half-life).
+        #[arg(long, default_value = "24h")]
+        cert_ttl: String,
     },
     /// List enrolled nodes.
     List,
-    /// Revoke a node: refuse it from now on (its pinned host key is deleted) and record its CA serials
-    /// for the feed's revocation list.
+    /// Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates
+    /// are revoked, and runs connected to it drop it) and record its CA serials for the feed's
+    /// revocation list.
     Revoke { name: String },
     /// Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node`
     /// systemd user service that runs `wicket node serve` there.
@@ -289,7 +360,9 @@ enum NodeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Issue a node a fresh CA certificate (and CA key, made on the node).
+    /// Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity
+    /// certificate for its node key, over its pinned ssh: also how a node whose identity certificate
+    /// expired while it was unreachable gets back in.
     RenewCa {
         name: String,
         /// Replace the hosts it is constrained to (default: keep them).
@@ -297,6 +370,9 @@ enum NodeCmd {
         hosts: Vec<String>,
         #[arg(long, default_value = "24h")]
         ca_ttl: String,
+        /// Node identity certificate lifetime.
+        #[arg(long, default_value = "24h")]
+        cert_ttl: String,
     },
 }
 
@@ -310,8 +386,27 @@ enum ProgramCmd {
 enum OperatorCmd {
     /// List enrolled passkeys.
     List,
-    /// Host-only break-glass: revoke every passkey, so `wicket serve` prints a fresh enrolment link.
+    /// Host-only break-glass: revoke every passkey (and every console session), so `wicket serve`
+    /// prints a fresh enrolment link.
     Reset,
+    /// Print a fresh single-use link that enrols one passkey in the console (another device, or a
+    /// replacement after `reset`). The only way to add a passkey: a signed-in console session can't.
+    EnrolLink {
+        /// How long the link stays usable (at most 1h).
+        #[arg(long, default_value = "10m")]
+        ttl: String,
+        /// The console's origin, to print the whole link (otherwise just its path).
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// List live console sessions (id, passkey, client address, times).
+    Sessions,
+    /// End console sessions now: one by its id (or a unique prefix of it), or all with --all.
+    RevokeSession {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -479,7 +574,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run } => {
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease } => {
             run::run(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
@@ -490,6 +585,7 @@ async fn main() -> Result<()> {
                 ssh_key: ssh_key.as_deref(),
                 run_id,
                 parent_run,
+                lease,
                 wrap: None,
             })
             .await
@@ -505,6 +601,7 @@ async fn main() -> Result<()> {
                 ssh_key: None,
                 run_id: None,
                 parent_run: None,
+                lease: None,
                 wrap: Some(argv),
             })
             .await
@@ -567,6 +664,7 @@ async fn main() -> Result<()> {
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
+            let lease = capacity::lease_of_request(&req).map(String::from);
             let gid = l.approve(
                 &id,
                 &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
@@ -591,12 +689,26 @@ async fn main() -> Result<()> {
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
                 humantime::format_duration(ttl)
             );
+            if let Some(lease) = lease.as_deref() {
+                // A capacity ask: provision now rather than at the next pass of a running reconciler.
+                drop(l);
+                println!("provisioning lease {lease} (one reconcile pass)");
+                reconcile::print(&reconcile::pass(false).await?, false);
+                if let Some(x) = Ledger::open(&ledger_path())?.lease(lease)? {
+                    println!("lease {lease}: {} {}", x.status, x.node_name.or(x.detail).unwrap_or_default());
+                }
+            }
             Ok(())
         }
         Cmd::Deny { id } => {
             let l = Ledger::open(&ledger_path())?;
             l.deny(&id, &operator())?;
             l.audit(&TenantId::single(), None, "decision", &serde_json::json!({ "request": id, "decision": "deny", "by": operator() }))?;
+            let req = l.request(&id)?;
+            if let Some(lease) = capacity::lease_of_request(&req) {
+                l.lease_ended(lease, "denied", &format!("request {id} denied by {}", operator()), None)?;
+                println!("lease {lease} denied: its reservation is released");
+            }
             println!("denied {id}");
             Ok(())
         }
@@ -707,11 +819,35 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir } => {
-            wicket_sandbox::Docker::from_env().build_image(&tag, &dir).await?;
+            let ctx = image::context(&dir)?;
+            wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
             println!("built {tag}");
             Ok(())
         }
         Cmd::Doctor { image } => doctor(&image).await,
+        Cmd::Reconcile { dry_run, every } => {
+            let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
+            reconcile::command(dry_run, every).await
+        }
+        Cmd::Lease { cmd: LeaseCmd::List } => capacity::list(),
+        Cmd::Lease { cmd: LeaseCmd::Release { id } } => {
+            let l = Ledger::open(&ledger_path())?;
+            let x = l.lease(&id)?.with_context(|| format!("no lease {id}"))?;
+            let why = format!("released by {}", operator());
+            match x.status.as_str() {
+                "active" => {
+                    l.set_lease_not_after(&id, wicket_store::now())?;
+                }
+                "pending" | "approved" => {
+                    l.lease_ended(&id, "withdrawn", &why, None)?;
+                }
+                s => bail!("lease {id} is {s}"),
+            }
+            l.audit(&TenantId::single(), None, "lease.released", &serde_json::json!({ "lease": id, "by": operator() }))?;
+            drop(l);
+            reconcile::print(&reconcile::pass(false).await?, false);
+            Ok(())
+        }
         Cmd::Reap { dry_run, node, ssh_key } => {
             let docker = match node {
                 Some(n) => wicket_sandbox::Docker::over_ssh(enrol::resolve_installed(&n, ssh_key.as_deref())?.ssh_prefix()),
@@ -736,7 +872,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Node { cmd } => match cmd {
             NodeCmd::Token { name, ttl } => enrol::token(name, humantime::parse_duration(&ttl)?),
-            NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl } => {
+            NodeCmd::Enrol { target, token, name, ssh_key, host_key, trust_first_use, hosts, ca_ttl, cert_ttl } => {
                 enrol::enrol(enrol::EnrolOpts {
                     target,
                     token,
@@ -746,6 +882,7 @@ async fn main() -> Result<()> {
                     trust_first_use,
                     hosts,
                     ca_ttl: humantime::parse_duration(&ca_ttl)?,
+                    cert_ttl: humantime::parse_duration(&cert_ttl)?,
                 })
                 .await
             }
@@ -756,13 +893,48 @@ async fn main() -> Result<()> {
                 println!("revoked node {name}; its CA serials {} go on the feed's revocation list", serials.join(", "));
                 Ok(())
             }
-            NodeCmd::RenewCa { name, hosts, ca_ttl } => enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?).await,
+            NodeCmd::RenewCa { name, hosts, ca_ttl, cert_ttl } => {
+                enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?, humantime::parse_duration(&cert_ttl)?).await
+            }
             NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir } => nodesrv::serve(dir).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
-        Cmd::Serve { listen, allow_remote, origin, rp_id } => serve::serve(&listen, allow_remote, origin, rp_id).await,
+        Cmd::Serve {
+            listen,
+            origin,
+            rp_id,
+            tls_cert,
+            tls_key,
+            acme_domain,
+            acme_agree_tos,
+            acme_contact,
+            acme_staging,
+            acme_directory,
+            acme_cache,
+            behind_tls_terminator,
+            trusted_proxy,
+            max_connections,
+        } => {
+            serve::serve(serve::ServeOpts {
+                listen,
+                origin,
+                rp_id,
+                tls_cert,
+                tls_key,
+                acme_domain,
+                acme_contact,
+                acme_directory,
+                acme_staging,
+                acme_agree_tos,
+                acme_cache,
+                behind_tls_terminator,
+                trusted_proxy,
+                max_connections,
+            })
+            .await
+        }
         Cmd::Program { cmd: ProgramCmd::Digest { dir } } => {
             println!("{}", program::digest_dir(&dir)?);
             Ok(())
@@ -775,8 +947,59 @@ async fn main() -> Result<()> {
                         println!("{}  {}  sign count {}", c.id, c.name, c.sign_count);
                     }
                 }
+                OperatorCmd::EnrolLink { ttl, origin } => {
+                    let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+                    if ttl.is_zero() || ttl > Duration::from_secs(3600) {
+                        bail!("--ttl must be more than 0 and at most 1h");
+                    }
+                    let token = serve::issue_enrol_link(&l, &TenantId::single(), ttl.as_secs() as i64, &operator())?;
+                    let origin = origin.as_deref().map(|o| o.trim_end_matches('/')).unwrap_or("");
+                    println!("open within {} (single use) to enrol a passkey:", humantime::format_duration(ttl));
+                    println!("  {origin}/enrol?t={token}");
+                    if origin.is_empty() {
+                        println!("(prefix the console's origin, e.g. https://console.example.com)");
+                    }
+                }
+                OperatorCmd::Sessions => {
+                    let now = wicket_store::now();
+                    let ago = |t: i64| humantime::format_duration(Duration::from_secs((now - t).max(0) as u64)).to_string();
+                    for s in l.console_sessions(&TenantId::single(), now)? {
+                        println!(
+                            "{}  {}  {}  from {}  signed in {} ago, last seen {} ago",
+                            &s.id[..16],
+                            s.kind,
+                            s.credential.as_deref().unwrap_or("-"),
+                            s.client,
+                            ago(s.created_at),
+                            ago(s.last_seen_at)
+                        );
+                    }
+                }
+                OperatorCmd::RevokeSession { id, all } => {
+                    let t = TenantId::single();
+                    let prefix = match (&id, all) {
+                        (Some(p), false) if !p.is_empty() => {
+                            let n = l.console_sessions(&t, wicket_store::now())?.iter().filter(|s| s.id.starts_with(p.as_str())).count();
+                            if n != 1 {
+                                bail!("{p:?} matches {n} live sessions (see wicket operator sessions)");
+                            }
+                            Some(p.as_str())
+                        }
+                        (None, true) => None,
+                        _ => bail!("give a session id (wicket operator sessions) or --all"),
+                    };
+                    let ids = l.revoke_console_sessions(&t, prefix, &operator())?;
+                    l.audit(
+                        &t,
+                        None,
+                        "operator.sessions_revoked",
+                        &serde_json::json!({ "sessions": ids, "by": operator(), "via": "host" }),
+                    )?;
+                    println!("ended {} console session(s)", ids.len());
+                }
                 OperatorCmd::Reset => {
                     let n = l.reset_operator_credentials(&TenantId::single())?;
+                    l.revoke_console_sessions(&TenantId::single(), None, &operator())?;
                     l.audit(
                         &TenantId::single(),
                         None,
@@ -784,7 +1007,7 @@ async fn main() -> Result<()> {
                         &serde_json::json!({ "removed": n, "by": operator(), "via": "host break-glass" }),
                     )?;
                     println!(
-                        "revoked {n} passkey(s) (public keys kept for audit verification); restart `wicket serve` for an enrolment link"
+                        "revoked {n} passkey(s) (public keys kept for audit verification); enrol a new one with `wicket operator enrol-link`"
                     );
                 }
             }

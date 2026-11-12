@@ -1,77 +1,14 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>wicket</title>
-<style>
-  :root { --bg:#fafaf8; --ink:#1d1d1b; --quiet:#6b6b66; --line:#e2e1dc; --card:#fff; --accent:#2f6fde; --warn:#b4540a; --bad:#b42318; --good:#1e7a46; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --ink:#ecebe6; --quiet:#a3a29c; --line:#33332f; --card:#1f1f1d; } }
-  * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.45 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--ink); }
-  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:baseline; }
-  header h1 { font-size:17px; margin:0; }
-  header span { color:var(--quiet); font-size:13px; }
-  main { max-width:760px; margin:0 auto; padding:12px 16px 40px; }
-  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--quiet); margin:22px 0 8px; }
-  .agent { margin:6px 0 2px; font-size:15px; } .agent .ok { color:var(--good); font-weight:700; } .agent .bad { color:var(--bad); font-weight:600; }
-  .agent .chain { font-size:13px; margin-top:2px; }
-  .agent .idline { color:var(--quiet); font-family:ui-monospace,Menlo,monospace; font-size:11px; word-break:break-all; }
-  button:disabled { opacity:.4; cursor:not-allowed; }
-  .who { margin:6px 0; font-size:14px; } .who .cand { margin-left:10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
-  .who .note { color:var(--quiet); font-size:12px; margin-top:2px; } .who .warn { color:var(--warn); font-size:13px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:8px 0; }
-  .req .what { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; word-break:break-all; }
-  .meta { color:var(--quiet); font-size:13px; margin-top:4px; }
-  .why { font-size:13px; margin-top:6px; }
-  .risk { display:inline-block; font-size:12px; font-weight:600; padding:1px 7px; border-radius:20px; border:1px solid currentColor; margin-right:6px; }
-  .r0, .r1 { color:var(--good); } .r2 { color:var(--accent); } .r3 { color:var(--warn); } .r4 { color:var(--bad); }
-  .buttons { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
-  button { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.approve { border-color:var(--accent); color:var(--accent); font-weight:600; }
-  button.deny { border-color:var(--bad); color:var(--bad); }
-  .empty { color:var(--quiet); font-size:14px; }
-  .row { display:flex; justify-content:space-between; gap:10px; font-size:14px; padding:6px 0; border-bottom:1px solid var(--line); }
-  .row:last-child { border-bottom:0; }
-  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; word-break:break-all; }
-  .log { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; }
-  .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
-  select, textarea, input.text { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); width:100%; margin-top:6px; }
-  textarea { min-height:70px; }
-  .row .acts { display:flex; gap:6px; } .row .acts button { padding:3px 9px; font-size:13px; }
-  #msg { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:14px; display:none; }
-</style>
-</head>
-<body>
-<header><h1>wicket</h1><span id="tenant"></span></header>
-<main>
-  <div id="auth" class="card" style="display:none"></div>
-  <div id="console" style="display:none">
-  <h2>Waiting for you</h2>
-  <div id="pending"></div>
-  <h2>Runs</h2>
-  <div class="card" id="runs"></div>
-  <h2>Start a run</h2>
-  <div class="card" id="start"></div>
-  <h2>Recent decisions</h2>
-  <div class="card" id="decided"></div>
-  <h2>Activity</h2>
-  <div class="card log" id="audit"></div>
-  <h2>Operator</h2>
-  <div class="card" id="operator"></div>
-  </div>
-</main>
-<div id="msg"></div>
-<script>
 "use strict";
-// Every string from the ledger is untrusted (agents influence paths and reasons): set as textContent only.
+// The console's script, served as a static file under a strict CSP (no inline script or style, no
+// eval). Every string from the ledger is untrusted (agents influence paths and reasons): set as textContent only.
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = String(text); return e; };
 const strip = s => String(s ?? "").replace(/[\u0000-\u001f\u007f​-‏‪-‮⁦-⁩]/g, " ");
 const ago = (now, t) => { const s = Math.max(0, now - t); return s < 90 ? s + "s ago" : s < 5400 ? Math.round(s / 60) + "m ago" : Math.round(s / 3600) + "h ago"; };
 const riskClass = r => ({ R0Read: "r0", R1ReadScoped: "r1", R2WriteReversible: "r2", R3ExternalOrIrreversible: "r3", R4ExecOrPrivilege: "r4" })[r] || "r4";
 const riskLabel = r => ({ R0Read: "R0 read", R1ReadScoped: "R1 read", R2WriteReversible: "R2 write", R3ExternalOrIrreversible: "R3 external", R4ExecOrPrivilege: "R4 exec/privilege" })[r] || r;
 
-function toast(t) { const m = document.getElementById("msg"); m.textContent = t; m.style.display = "block"; setTimeout(() => m.style.display = "none", 2500); }
+let toastTimer;
+function toast(t) { const m = document.getElementById("msg"); m.textContent = t; m.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { m.hidden = true; }, 3000); }
 
 // ---- passkeys (WebAuthn) ----
 const b2a = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -212,12 +149,37 @@ function renderRun(s, x) {
   if (x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
     const say = el("button", "", "Follow-up…");
-    say.onclick = () => { const text = prompt("Follow-up for " + x.id + " (it arrives as the agent's next turn):"); if (text && text.trim()) signed({ action: "say", run: x.id, text }); };
+    say.onclick = () => openRunForm("say", x.id);
     const rev = el("button", "deny", "Revoke…");
-    rev.onclick = () => { const reason = prompt("Revoke " + x.id + "'s identity: its box is stopped and its requests can't be approved. Reason:", "revoked by the operator"); if (reason !== null) signed({ action: "revoke", run: x.id, reason }); };
+    rev.onclick = () => openRunForm("revoke", x.id);
     acts.append(say, rev); d.append(acts);
   }
   return d;
+}
+
+// The follow-up and revoke forms: one in-page form (no browser dialogs), kept outside the runs list
+// so the 2-second refresh doesn't wipe what the operator is typing.
+function openRunForm(kind, run) {
+  const f = document.getElementById("runform"), text = document.getElementById("runform-text");
+  f.dataset.kind = kind; f.dataset.run = run;
+  f.className = "card " + kind;
+  document.getElementById("runform-title").textContent = kind === "say"
+    ? "Follow-up for " + run + " (it arrives as the agent's next turn):"
+    : "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
+  const go = document.getElementById("runform-go");
+  go.textContent = kind === "say" ? "Send" : "Revoke";
+  go.className = kind === "say" ? "approve" : "deny";
+  text.value = kind === "say" ? "" : "revoked by the operator";
+  f.hidden = false; text.focus();
+}
+function closeRunForm() { const f = document.getElementById("runform"); f.hidden = true; document.getElementById("runform-text").value = ""; }
+function submitRunForm(ev) {
+  ev.preventDefault();
+  const f = document.getElementById("runform"), text = document.getElementById("runform-text").value;
+  const run = f.dataset.run, kind = f.dataset.kind;
+  if (kind === "say") { if (!text.trim()) return; signed({ action: "say", run, text }); }
+  else signed({ action: "revoke", run, reason: text });
+  closeRunForm();
 }
 
 // Runs start only from manifests the server lists (its allowlisted directories); the page sends a
@@ -247,27 +209,30 @@ function renderOperator(s) {
   const box = document.getElementById("operator"); box.replaceChildren();
   for (const k of s.passkeys) { const d = el("div", "row"); d.append(el("span", "", "passkey: " + strip(k.name)), el("span", "mono", String(k.id).slice(0, 16) + "…")); box.append(d); }
   const b = el("div", "buttons");
-  const add = el("button", "", "Add another passkey"); add.onclick = registerPasskey;
-  const out = el("button", "", "Sign out"); out.onclick = async () => { await post("/api/logout"); boot(); };
-  b.append(add, out); box.append(b);
+  const out = el("button", "", "Sign out"); out.onclick = async () => { try { await post("/api/logout"); } catch (e) { /* signed out anyway */ } boot(); };
+  b.append(out); box.append(b);
+  box.append(el("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
 }
 
+// Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
+// passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
-  const me = await (await fetch("/api/me")).json();
+  const r = await fetch("/api/me");
+  const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.style.display = "none"; con.style.display = ""; refresh(); return; }
-  con.style.display = "none"; auth.style.display = "";
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; refresh(); return; }
+  con.hidden = true; auth.hidden = false;
+  document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
     auth.append(el("div", "", "Enrol this device's passkey. It signs you in, and you will sign every approval with it."));
-    const name = el("input"); name.id = "pkname"; name.value = "my phone"; name.style.cssText = "margin-top:10px;padding:8px;font:inherit;width:100%";
+    const name = el("input", "text"); name.id = "pkname"; name.value = "my phone"; name.maxLength = 40;
     const b = el("div", "buttons"); const go = el("button", "approve", "Create passkey"); go.onclick = registerPasskey; b.append(go);
     auth.append(name, b);
-  } else if (me.passkeys > 0) {
+  } else {
     auth.append(el("div", "", "Sign in to approve or deny what your agents are waiting on, start runs and steer them."));
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
-  } else {
-    auth.append(el("div", "", "No passkey is enrolled yet. Open the one-time enrolment link printed by `wicket serve`."));
+    auth.append(el("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
   }
 }
 
@@ -285,7 +250,9 @@ async function refresh() {
     renderOperator(s);
   } catch (e) { /* keep polling */ }
 }
-boot(); setInterval(() => { if (document.getElementById("console").style.display === "") refresh(); }, 2000);
-</script>
-</body>
-</html>
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("runform").addEventListener("submit", submitRunForm);
+  document.getElementById("runform-cancel").addEventListener("click", closeRunForm);
+  boot();
+  setInterval(() => { if (!document.getElementById("console").hidden) refresh(); }, 2000);
+});
