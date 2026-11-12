@@ -17,8 +17,8 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
   the box reaches over bind-mounted unix sockets:
   - the **LLM proxy** swaps the placeholder for the Claude subscription token and enforces the model
     budget;
-  - the **egress proxy** terminates TLS with a per-run CA, decides each HTTP request (HTTP/1.1, HTTP/2,
-    and HTTP/3 through wicket's DNS and QUIC relay), and injects credentials into one declared header;
+  - the **egress proxy** terminates TLS with a per-run CA, decides each HTTP request (HTTP/1.1, and
+    HTTP/3 through wicket's DNS and QUIC relay), and injects credentials into one declared header;
   - the **MCP gateway** is the agent's only MCP server, with wicket's own tools (`await_grant`,
     `request_access`, `spawn`, `send_message`, `expose`, `connect`, `request_capacity`, …).
 - Inside the box, wicket is at `wicket.internal` (198.18.0.1). The box's resolver is wicket too, so a
@@ -72,16 +72,20 @@ side of refusing.
 
 ## Authority: Biscuit tokens and the feed
 
-On a served node, each box's authority is a **Biscuit token chain**:
+On the control host, the proxies decide from the zone (compiled once per run) and the ledger's grants.
+On a served node, each box's authority is a **Biscuit token**:
 
-- block 0 is the zone's ceiling, minted by the control host;
-- spawn blocks narrow it for children;
-- third-party blocks, signed by the approver key, add the grants humans approved.
+- block 0 is the box's zone ceiling, minted by the control host when the run starts;
+- third-party blocks, signed by the approver key, add the grants humans approved (at most 10 live per
+  box).
 
-A Biscuit block can only add checks, so a token can only narrow. Revoking a block's id revokes it and
-every token built on it: a child and its whole subtree. wicket checks tokens with a vendored, patched
-`biscuit-auth` (see limits.md). It runs a structural check before loading and a step budget instead of
-a wall-clock limit, so a decision doesn't depend on load.
+A Biscuit block can only add checks, so a token can only narrow. Revoking a block's id revokes every
+token that contains it. The library also builds spawn blocks, which narrow a parent's token for its
+children so that revoking a parent's block revokes the whole subtree. In 0.0.1 that is tested at library
+level only: a child run on a node gets its own block 0 from its zone, which `spawn` has already checked
+is a subset of its parent's. wicket checks tokens with a vendored, patched `biscuit-auth` (see
+limits.md). It runs a structural check before loading, and uses a step budget instead of a wall-clock
+limit, so a decision doesn't depend on load.
 
 The control host sends these tokens to each node in a **signed policy feed**. The feed has snapshots,
 hash-chained deltas and freshness statements, all signed by a per-node feed key that the feed root
@@ -93,9 +97,9 @@ certifies. The node decides from its verified replica of the feed, in one of thr
 | **narrow** | up to the narrow window after that (120 s) | plain reads in reach only |
 | **closed** | after that | nothing |
 
-So a box on a node keeps working, failing narrow, while the control host is unreachable. Grant and run
-revocations are pushed at once (applied within milliseconds on a live link). A node that hears nothing
-goes stale within the TTL anyway. Tampered, replayed and rolled-back frames are refused.
+So a box on a node keeps working, failing narrow, while the control host is unreachable. Revocations
+are pushed to the node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node
+that hears nothing goes stale within the TTL anyway. Tampered, replayed and rolled-back frames are refused.
 
 ## Links
 

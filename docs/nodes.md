@@ -95,8 +95,8 @@ wicket node revoke n1
   recomputes each node's chain. Feed decisions use the wall clock read once at start and advanced by a monotonic
   clock, so a clock step on the node can't stretch a freshness statement (after a deliberate clock step, restart
   `wicket-node` so it reads the wall clock again).
-- **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), child
-  agents can't use a served node, plain `http://` to a forwarded host is refused, and the MCP gateway still
+- **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), so a
+  child can't share its parent's served node (on a leased node it runs alone), plain `http://` to a forwarded host is refused, and the MCP gateway still
   decides on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 

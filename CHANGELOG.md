@@ -58,8 +58,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   the parent's `forbid` rules, and one-segment `*` globs are proven ([#79](https://github.com/public/wicket/pull/79)).
 - Links: `expose`, `connect` and `link` let boxes reach each other's ports through relays wicket runs;
   every link is audited and can be cut ([#103](https://github.com/public/wicket/pull/103)).
-- Authority as Biscuit tokens: zones, spawns and grants, checked by a vendored, patched `biscuit-auth`
-  ([#83](https://github.com/public/wicket/pull/83)).
+- `wicket-authz`: zone ceilings, spawns and grants as Biscuit tokens, checked by a vendored, patched
+  `biscuit-auth` ([#83](https://github.com/public/wicket/pull/83)). Served nodes decide with these tokens
+  ([#102](https://github.com/public/wicket/pull/102)); the control host decides from the compiled zone and
+  the ledger.
 
 ### Remote nodes and capacity
 

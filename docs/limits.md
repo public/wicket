@@ -69,9 +69,16 @@ not a permanent decision.
 
 - **The Biscuit fork has had no external audit.** Nodes decide every request with a vendored
   `biscuit-auth` (upstream main `aa5a672` plus three performance patches, `third_party/NOTICE`). It is
-  tested against wicket's own matcher and the stock engine (about 74,000 differential decisions in CI;
+  tested against wicket's own matcher and the fork's general engine (about 74,000 differential decisions;
   [#83](https://github.com/public/wicket/pull/83), [#102](https://github.com/public/wicket/pull/102)). No
   one outside the project has reviewed the patches or the structural check.
+- **Spawn chains aren't used on nodes yet.** A child run on a node gets its own block 0 from its zone
+  (checked as a subset by `spawn`), not a spawn block appended to its parent's token. So revoking a
+  parent's block on a node doesn't by itself revoke a child there; the run revocation does
+  ([#102](https://github.com/public/wicket/pull/102)).
+- **At most 10 live grants per box on a node,** and a used-up grant holds its slot until it expires.
+  A path-prefix grant is honoured on a node for the asked path only
+  ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102)).
 - **Spawn refuses what it can't prove.** Path globs that `subset::check` can't prove contained are
   refused, even when they are narrower ([#30](https://github.com/public/wicket/pull/30),
   [#79](https://github.com/public/wicket/pull/79)).
@@ -80,11 +87,13 @@ not a permanent decision.
 
 ## Remote nodes
 
-- **A node can do what its boxes may do.** A compromised node holds its node CA (24 h) and its feed
-  replica. Until they expire it can act within the authority of the boxes it serves, and serve plain
-  reads for the narrow window (120 s) after it stops hearing from the control host. It never holds
-  injected credentials or the model token: those hosts are tunnelled to the control host
-  ([#88](https://github.com/public/wicket/pull/88)).
+- **A node is trusted with the boxes it serves.** It runs their Docker, terminates their TLS with its
+  node CA, and makes their upstream requests. So root on a node can read those boxes' workspaces and
+  their decrypted traffic, and can send any request to hosts within its CA's name constraints,
+  ignoring the zone's reach, until the CA expires (24 h by default). What it never gets: injected
+  credentials, the model token, and the hosts that use them. Those are tunnelled to the control host and
+  decided there ([#88](https://github.com/public/wicket/pull/88)). Enrol nodes with `--hosts` as narrow as
+  their boxes need.
 - **Name constraints are subtrees.** A node CA for `api.example.com` can also mint `x.api.example.com`.
   The reach rules stay the exact gate; the constraint only bounds a stolen CA.
 - **Revoked node CA serials are recorded but not distributed.** Revoking a node removes its pinned key
@@ -111,6 +120,7 @@ not a permanent decision.
   aren't supported ([#106](https://github.com/public/wicket/pull/106)).
 - **A rebuild restores files, not processes.** A box running anything besides the agent stays paused
   instead of hibernating.
+- **Wrapped agents (`wicket wrap`) and boxes on nodes don't hibernate.**
 - **There's no garbage collection** of agents or their bundles yet (design §13.6).
 
 ## The console
@@ -138,6 +148,20 @@ not a permanent decision.
   ([#103](https://github.com/public/wicket/pull/103)).
 - **Waking takes seconds.** A wake rebuilds the box and resumes the session; the gVisor checkpoint fast
   path isn't built ([#90](https://github.com/public/wicket/pull/90)).
+
+## Built, not yet run live
+
+These are covered by tests against fakes and mocks, but haven't run end to end against the real thing:
+
+- **Vultr provisioning:** the live Vultr API (`wicket place create`), the enrol and `node install` step
+  after it, a child actually running on a leased node, and the `wicket reconcile --every` loop
+  ([#89](https://github.com/public/wicket/pull/89), [#98](https://github.com/public/wicket/pull/98)).
+  Enrolment and `node serve` themselves have run against a real Vultr node
+  ([#95](https://github.com/public/wicket/pull/95)).
+- **ACME** has only been tested against a mock CA, not Let's Encrypt
+  ([#99](https://github.com/public/wicket/pull/99)).
+- **Links:** at most 32 link names per box, and the target image must contain `wicket-fwd`;
+  `examples/links/chrome.yaml` hasn't been run ([#103](https://github.com/public/wicket/pull/103)).
 
 ## Not known yet
 

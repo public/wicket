@@ -9,7 +9,7 @@ polices the environment the agent runs in.
 - The agent runs in a **gVisor** box with `--network none`, a read-only root and no capabilities.
 - The box reaches the world only through three proxies on the host: the **LLM proxy** (it holds your
   Claude subscription token, never an API key, and enforces the model budget), the **egress proxy** (it
-  terminates TLS, decides each HTTP/1.1, HTTP/2 or HTTP/3 request and injects credentials), and the
+  terminates TLS, decides each HTTP/1.1 or HTTP/3 request and injects credentials), and the
   **MCP gateway** (wicket's own tools for the agent).
 - Every decision is in a hash-chained audit log that `wicket audit --verify` checks offline.
 
@@ -67,6 +67,15 @@ Who may do what:
 - Manifests and `--workdir` are sent to the daemon as content. Mounting a directory in place
   (`--workspace-dir`, `wicket wrap`) is root's only.
 - Restarting `wicketd` stops the runs started through it.
+- The console is the `wicket-console` unit, listening on 127.0.0.1:8787 by default. Its `wicket serve`
+  options (for a public origin, TLS or ACME) go in `/etc/wicket/console.env`, and `wicket serve` itself is
+  refused through the daemon.
+
+The commands in the rest of this README are written for development mode. On an installed host, prefix the
+privileged ones with `sudo`: `approve`, `deny`, `secret set|link`, `node …`, `place …`, `reconcile`, `reap`,
+`image`, `identity init` and `operator enrol-link|reset|revoke-session`. The release archive holds the
+binary, `deploy/` and `images/`, so the examples and the `docs/` pages are in the repository, not the
+archive.
 
 ### Development mode
 
@@ -90,6 +99,8 @@ wicket doctor
 ```
 
 ## First run
+
+From a checkout (or with `examples/hello-github.yaml` downloaded from the repository):
 
 ```sh
 wicket run examples/hello-github.yaml   # an agent reads a public repo, then asks for example.com
