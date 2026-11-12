@@ -49,9 +49,17 @@ fn bytes_of(path: &str) -> Option<usize> {
 }
 
 async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
-    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // One port number for UDP and TCP: a free UDP port whose TCP twin may be taken, so try a few.
+    let mut pair = None;
+    for _ in 0..50 {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        if let Ok(tcp) = tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+            pair = Some((udp, tcp));
+            break;
+        }
+    }
+    let (udp, tcp) = pair.expect("a port free for both UDP and TCP");
     let both = udp.local_addr().unwrap();
-    let tcp = tokio::net::TcpListener::bind(both).await.unwrap();
     let h1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let h1_addr = h1.local_addr().unwrap();
     // HTTP/3
