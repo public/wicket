@@ -92,7 +92,11 @@ wicket node revoke n1
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
-  recomputes each node's chain. Feed decisions use the wall clock read once at start and advanced by a monotonic
+  recomputes each node's chain. The control host, not the node, decides where a shipped record is filed. It
+  goes under the run's tenant, and under the run it names only if that run was placed on this node for
+  that tenant. Any other record is filed under no run, with `"attributed": false`, and what the node
+  claimed is kept in its body. A node that starts its chain again (its data was wiped) gets a
+  `node.audit.restart` record. Feed decisions use the wall clock read once at start and advanced by a monotonic
   clock, so a clock step on the node can't stretch a freshness statement (after a deliberate clock step, restart
   `wicket-node` so it reads the wall clock again).
 - **For now.** One run per node at a time (the run holds the node's feed; #38's reconciler will own it), so a

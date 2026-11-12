@@ -174,7 +174,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
-  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT
+  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -280,6 +280,8 @@ impl Ledger {
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
+        // Ledgers created before runs recorded the node they were placed on (#120).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN node TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -951,17 +953,19 @@ impl Ledger {
     }
 
     fn append_audit(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: &str) -> Result<i64> {
-        let prev: String = self
+        let (last, prev): (i64, String) = self
             .conn
-            .query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?
-            .unwrap_or_else(|| "0".repeat(64));
-        let hash = chain_hash(&prev, kind, body);
+            .unwrap_or_else(|| (0, CHAIN_ZERO.to_string()));
+        // The record's seq and ts are hashed, so both are fixed here, before the insert.
+        let (seq, ts) = (last + 1, now());
+        let hash = chain_hash_v2(&prev, &ChainFields { seq, ts, tenant: &tenant.0, run: run.map(|r| r.0.as_str()), kind, body });
         self.conn.execute(
-            "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![now(), tenant.0, run.map(|r| r.0.clone()), kind, body, prev, hash],
+            "INSERT INTO audit (seq, ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![seq, ts, tenant.0, run.map(|r| r.0.clone()), kind, body, prev, hash],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(seq)
     }
 
     pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRow>> {
@@ -974,23 +978,79 @@ impl Ledger {
 
     /// Recomputes the whole chain. Returns the number of records verified.
     pub fn verify_audit(&self) -> Result<i64> {
-        let mut st = self.conn.prepare("SELECT seq, kind, body, prev, hash FROM audit ORDER BY seq")?;
+        Ok(self.verify_audit_versions()?.total())
+    }
+
+    /// Recomputes the whole chain, counting the records of each chain version (#120).
+    pub fn verify_audit_versions(&self) -> Result<ChainSummary> {
+        let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit ORDER BY seq")?;
         let mut rows = st.query([])?;
-        let mut prev = "0".repeat(64);
-        let mut n = 0;
+        let mut prev = CHAIN_ZERO.to_string();
+        let mut sum = ChainSummary::default();
         while let Some(r) = rows.next()? {
-            let (seq, kind, body, p, h): (i64, String, String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
-            if p != prev || chain_hash(&prev, &kind, &body) != h {
+            let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
+            let f = ChainFields { seq, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
+            if p != prev || !sum.accept(&prev, &f, &h) {
                 return Err(StoreError::ChainBroken(seq));
             }
             prev = h;
-            n += 1;
         }
-        Ok(n)
+        Ok(sum)
     }
 }
 
-/// An audit record's hash: sha256(prev, 0, kind, 0, body), hex. Nodes chain their own logs the same way.
+/// The `prev` of a chain's first record.
+pub const CHAIN_ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// How a v2 record's hash starts (#120). A hash without it (64 hex digits) is v1.
+pub const CHAIN_V2_PREFIX: &str = "v2:";
+
+/// Every stored field of an audit record, as the v2 chain hashes them.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainFields<'a> {
+    pub seq: i64,
+    pub ts: i64,
+    pub tenant: &'a str,
+    pub run: Option<&'a str>,
+    pub kind: &'a str,
+    pub body: &'a str,
+}
+
+/// What a chain verification found, by chain version.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainSummary {
+    /// Records hashed under v1 (prev, kind and body only): written before #120.
+    pub v1: i64,
+    /// Records hashed under v2 (every stored field).
+    pub v2: i64,
+}
+
+impl ChainSummary {
+    pub fn total(&self) -> i64 {
+        self.v1 + self.v2
+    }
+
+    /// Checks one record's hash under the version it names, and that the chain never goes back
+    /// from v2 to v1 (a v1 hash covers fewer fields, so a downgrade would hide edits to the rest).
+    pub fn accept(&mut self, prev: &str, f: &ChainFields<'_>, hash: &str) -> bool {
+        if hash.starts_with(CHAIN_V2_PREFIX) {
+            if chain_hash_v2(prev, f) != hash {
+                return false;
+            }
+            self.v2 += 1;
+        } else {
+            if self.v2 > 0 || chain_hash(prev, f.kind, f.body) != hash {
+                return false;
+            }
+            self.v1 += 1;
+        }
+        true
+    }
+}
+
+/// A v1 audit record's hash: sha256(prev, 0, kind, 0, body), hex. Ledgers written before #120 hold
+/// these; they still verify, but cover neither seq, ts, tenant nor run. New records use
+/// [`chain_hash_v2`].
 pub fn chain_hash(prev: &str, kind: &str, body: &str) -> String {
     let mut h = Sha256::new();
     h.update(prev.as_bytes());
@@ -999,6 +1059,32 @@ pub fn chain_hash(prev: &str, kind: &str, body: &str) -> String {
     h.update([0u8]);
     h.update(body.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// A v2 audit record's hash (#120): `v2:` and the hex sha256 of a domain tag and every stored
+/// field, each length-prefixed (an absent run is distinct from an empty one). Nodes chain their
+/// own logs the same way.
+pub fn chain_hash_v2(prev: &str, f: &ChainFields<'_>) -> String {
+    fn field(h: &mut Sha256, b: &[u8]) {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    }
+    let mut h = Sha256::new();
+    h.update(b"wicket.audit.v2\0");
+    field(&mut h, prev.as_bytes());
+    h.update(f.seq.to_be_bytes());
+    h.update(f.ts.to_be_bytes());
+    field(&mut h, f.tenant.as_bytes());
+    match f.run {
+        None => h.update([0u8]),
+        Some(r) => {
+            h.update([1u8]);
+            field(&mut h, r.as_bytes());
+        }
+    }
+    field(&mut h, f.kind.as_bytes());
+    field(&mut h, f.body.as_bytes());
+    format!("{CHAIN_V2_PREFIX}{}", hex::encode(h.finalize()))
 }
 
 fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
@@ -1776,6 +1862,60 @@ mod tests {
         assert_eq!(l.verify_audit().unwrap(), 5);
         l.conn.execute("UPDATE audit SET body = '{\"i\":99}' WHERE seq = 3", []).unwrap();
         assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(3))));
+    }
+
+    /// #120: the chain covers every stored field, not only kind and body.
+    #[test]
+    fn audit_chain_covers_seq_ts_tenant_and_run() {
+        let edits = [
+            "UPDATE audit SET ts = ts + 3600 WHERE seq = 2",
+            "UPDATE audit SET tenant = 'other' WHERE seq = 2",
+            "UPDATE audit SET run = 'run_b' WHERE seq = 2",
+            "UPDATE audit SET run = NULL WHERE seq = 2",
+            "UPDATE audit SET run = '' WHERE seq = 2",
+            "UPDATE audit SET seq = 9 WHERE seq = 3",
+        ];
+        for e in edits {
+            let l = Ledger::open_in_memory().unwrap();
+            for i in 0..3 {
+                l.audit(&TenantId::single(), Some(&RunId("run_a".into())), "test", &serde_json::json!({ "i": i })).unwrap();
+            }
+            assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 0, v2: 3 });
+            l.conn.execute(e, []).unwrap();
+            assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(_))), "{e} went unnoticed");
+        }
+    }
+
+    /// #120: a ledger written before v2 still verifies, new records continue it as v2, and a v1
+    /// record after a v2 one (a downgrade, to hide an edit) is refused.
+    #[test]
+    fn v1_ledgers_still_verify_and_never_follow_v2() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut prev = CHAIN_ZERO.to_string();
+        let v1 = |l: &Ledger, prev: &str, i: i64| -> String {
+            let body = serde_json::json!({ "i": i }).to_string();
+            let h = chain_hash(prev, "old", &body);
+            l.conn
+                .execute(
+                    "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (1, 't0', NULL, 'old', ?1, ?2, ?3)",
+                    params![body, prev, h],
+                )
+                .unwrap();
+            h
+        };
+        for i in 0..3 {
+            prev = v1(&l, &prev, i);
+        }
+        assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 3, v2: 0 });
+        l.conn.execute("UPDATE audit SET ts = 99 WHERE seq = 2", []).unwrap();
+        assert_eq!(l.verify_audit().unwrap(), 3, "v1 never covered ts: old ledgers keep verifying");
+        let s = l.audit(&TenantId::single(), None, "new", &serde_json::json!({})).unwrap();
+        assert_eq!(s, 4);
+        assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 3, v2: 1 });
+        let head = l.audit_head().unwrap().unwrap().1;
+        assert!(head.starts_with(CHAIN_V2_PREFIX));
+        v1(&l, &head, 9);
+        assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(5))));
     }
 
     #[test]
