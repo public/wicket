@@ -1,0 +1,60 @@
+name: Acceptance
+
+# The release acceptance test (#41, ci/acceptance.sh): its local flows run on every PR in the smoke
+# job (ci.yml). The longer variants run here, nightly and on demand: development mode with localhost
+# as a node (the static placement backend, the node e2e flow), then as an operator against a fresh
+# install in a container (ci/install-acceptance.sh). The Vultr flow (--nodes vultr) spends money and
+# is never run here.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acceptance
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  acceptance:
+    name: Acceptance (local flows, a local node, an installed system)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install gVisor as a Docker runtime
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          for i in 1 2 3 4; do
+            if sudo apt-get update -q && sudo apt-get install -y -q runsc; then break; fi
+            [ "$i" = 4 ] && exit 1
+            echo "gVisor apt install failed (attempt $i), retrying in $((i * 20)) s"; sleep $((i * 20))
+          done
+          cfg=/etc/docker/daemon.json
+          [ -f "$cfg" ] || echo '{}' | sudo tee "$cfg" >/dev/null
+          jq '.runtimes.runsc = {path: "/usr/bin/runsc", runtimeArgs: ["--host-uds=open"]}' "$cfg" | sudo tee "$cfg.new" >/dev/null
+          sudo mv "$cfg.new" "$cfg"
+          sudo systemctl restart docker
+      - run: cargo build -p wicket-cli --locked
+      - name: Rust's musl target, for the static HTTP/3 client
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q musl-tools
+          cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
+      - name: Build the agent image
+        run: target/debug/wicket image --tag wicket/claude-code:acc
+      - name: Acceptance, development mode, with a local node
+        run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh --nodes local
+      - name: Acceptance, as an operator against a fresh install
+        run: IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/install-acceptance.sh target/debug/wicket ubuntu:24.04
