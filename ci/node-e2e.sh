@@ -106,7 +106,7 @@ sleep 6
 log "approving the out-of-reach request"
 "$WICKET" pending
 rid=$("$WICKET" pending | grep 'example.com/out-of-reach' | grep -o '^r-[a-z0-9]*' | head -1)
-gid=$("$WICKET" approve "$rid" --unlimited --ttl 10m | grep -o 'g-[a-z0-9]*' | head -1)
+gid=$("$WICKET" approve "$rid" --yes --unlimited --ttl 10m | grep -o '→ grant g-[a-z0-9]*' | grep -o 'g-[a-z0-9]*' | head -1)
 t_approve=$(now_ms)
 sleep 6
 log "revoking grant $gid"

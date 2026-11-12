@@ -62,19 +62,24 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             }
         }
     }
+    // Every limit is between a floor of 1 and the parent's own (#126): Docker reads 0 as no limit,
+    // so 0 is never within a finite parent. Written so that NaN or an unreadable value fails.
     match (parse_bytes(&c.limits.memory), parse_bytes(&p.limits.memory)) {
-        (Some(cm), Some(pm)) if cm <= pm => {}
-        _ => v.push(format!("memory {}: more than this zone's {} (or unreadable)", c.limits.memory, p.limits.memory)),
+        (Some(cm), Some(pm)) if cm >= 1 && cm <= pm => {}
+        _ => v.push(format!("memory {}: more than this zone's {} (or zero, or unreadable)", c.limits.memory, p.limits.memory)),
     }
-    if c.limits.cpus > p.limits.cpus {
-        v.push(format!("cpus {}: more than this zone's {}", c.limits.cpus, p.limits.cpus));
+    let (cc, pc) = (c.limits.cpus, p.limits.cpus);
+    if !(cc.is_finite() && cc >= crate::manifest::MIN_CPUS && cc <= pc) {
+        v.push(format!("cpus {cc}: more than this zone's {pc} (or below {})", crate::manifest::MIN_CPUS));
     }
-    if c.limits.pids > p.limits.pids {
-        v.push(format!("pids {}: more than this zone's {}", c.limits.pids, p.limits.pids));
+    if !(c.limits.pids >= 1 && c.limits.pids <= p.limits.pids) {
+        v.push(format!("pids {}: more than this zone's {} (or zero)", c.limits.pids, p.limits.pids));
     }
     match c.limits.timeout() {
-        Ok(t) if t <= parent.time_remaining => {}
-        _ => v.push(format!("timeout {}: more than the {}s this zone has left", c.limits.timeout, parent.time_remaining.as_secs())),
+        Ok(t) if !t.is_zero() && t <= parent.time_remaining => {}
+        _ => {
+            v.push(format!("timeout {}: more than the {}s this zone has left (or zero)", c.limits.timeout, parent.time_remaining.as_secs()))
+        }
     }
     if !parent.images.iter().any(|i| i == ask.image) {
         v.push(format!("image {}: not one this zone may start (allowed: {})", ask.image, parent.images.join(", ")));
@@ -100,6 +105,32 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
     } else {
         Err(v)
     }
+}
+
+/// What no human approval may widen in a spawned zone (#118): the model route (provider, credential
+/// and upstream) must be the parent's own, and every credential injection one the parent makes to
+/// the same host, header and format. A card can't show a human what sending the model token, or a
+/// vault secret, to a URL the agent picked would mean, so these are refused outright. Each entry
+/// names exactly what the child asked for.
+pub fn unapprovable(child: &ZoneSpec, parent: &ZoneSpec) -> Vec<String> {
+    let mut v = Vec::new();
+    match (&child.llm, &parent.llm) {
+        (Some(cl), Some(pl)) if cl.provider != pl.provider || cl.secret != pl.secret || cl.upstream != pl.upstream => v.push(format!(
+            "the model route must be this zone's own: asked for provider {}, secret {}, upstream {}; this zone's is {}, {}, {}",
+            cl.provider, cl.secret, cl.upstream, pl.provider, pl.secret, pl.upstream
+        )),
+        _ => {}
+    }
+    for i in &child.inject {
+        let same = parent.inject.iter().any(|q| q.host == i.host && q.header == i.header && q.format == i.format && q.secret == i.secret);
+        if !same {
+            v.push(format!(
+                "inject secret {} into {} {}: only this zone's own credential injections can be passed on",
+                i.secret, i.host, i.header
+            ));
+        }
+    }
+    v
 }
 
 /// Whether `inner`'s reach is within `outer`'s: every reach rule covered, every forbid rule kept,
@@ -256,8 +287,19 @@ fn segments_cover(parent: &str, child: &str) -> bool {
 }
 
 /// Whether every segment the pattern `child` matches is matched by the pattern `parent`.
+///
+/// A class (`[!z]`, `[.-0]`) can match `/` even with `literal_separator`, and an escape or a brace
+/// can hide one, so a child segment with `[`, `{` or `\` may span several segments: only the same
+/// text proves it covered (#111). A parent `*` covers child segments made of literals, `*` and `?`,
+/// none of which match `/`.
 fn segment_covers(parent: &str, child: &str) -> bool {
-    if parent == child || parent == "*" {
+    if parent == child {
+        return true;
+    }
+    if child.contains(['[', '{', '\\']) {
+        return false;
+    }
+    if parent == "*" {
         return true;
     }
     if child.contains(META) {
@@ -398,13 +440,23 @@ mod tests {
         assert!(!covered("/a/**/z", "/a/**"));
         // A brace or class that contains `/` is never split at it, so stays unproven.
         assert!(!covered("/a/*/*", "/a/{b/c,d}"));
+        // #111: a class can match `/` even with literal_separator, so `*` doesn't cover it.
+        assert!(!covered("/x/*", "/x/*[!~]*[!~]*"));
+        assert!(!covered("/x/*", "/x/a[!z]b"));
+        assert!(!covered("/x/*", "/x/a[.-0]b"));
+        assert!(!covered("/x/*", "/x/{a,b}"));
+        assert!(!covered("/x/*", "/x/a\\*"));
+        // The same class under a parent that has it is still proven.
+        assert!(covered("/x/a[!z]b", "/x/a[!z]b"));
+        assert!(covered("/**/a[!z]b", "/x/a[!z]b"));
     }
 
     /// The structural check must never claim containment the matcher disagrees with: for small globs
     /// and paths, every path a "covered" child matches must match the parent.
     #[test]
     fn segment_proofs_agree_with_the_matcher() {
-        let segs = ["a", "*", "a*", "**", "{a,b}", ""];
+        // Classes and ranges that match `/` (#111): `[!z]`, `[!~]` and `[.-0]` all do.
+        let segs = ["a", "*", "a*", "**", "{a,b}", "", "a[!z]b", "*[!~]*", "[.-0]"];
         let mut globs = vec![];
         for n in 1..=3 {
             let mut idx = vec![0; n];
@@ -421,7 +473,7 @@ mod tests {
                 idx[k] += 1;
             }
         }
-        let parts = ["a", "b", "ab", "c", ""];
+        let parts = ["a", "b", "ab", "c", "", "0"];
         let mut paths = vec![];
         for n in 1..=4 {
             for mut x in 0..parts.len().pow(n) {
@@ -473,6 +525,40 @@ mod tests {
         // An uncapped parent doesn't constrain its children's input.
         assert_eq!(check(&ask(&uncapped), &bounds(&p)), Ok(()));
         assert_eq!(check(&ask(&capped(10)), &bounds(&p)), Ok(()));
+    }
+
+    /// #126: a zero limit is no limit to Docker, so never within a finite parent.
+    #[test]
+    fn zero_limits_are_never_within() {
+        let p = parent();
+        let limits = |l: &str| {
+            let mut z =
+                zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m, pids: 64 }\n");
+            match l {
+                "memory" => z.limits.memory = "0".into(),
+                "memory-half" => z.limits.memory = "0.4b".into(),
+                "cpus" => z.limits.cpus = 0.0,
+                "cpus-nan" => z.limits.cpus = f32::NAN,
+                "cpus-neg" => z.limits.cpus = -1.0,
+                "pids" => z.limits.pids = 0,
+                "timeout" => z.limits.timeout = "0s".into(),
+                _ => {}
+            }
+            z
+        };
+        assert_eq!(check(&ask(&limits("")), &bounds(&p)), Ok(()));
+        for (l, needle) in [
+            ("memory", "memory 0"),
+            ("memory-half", "memory 0.4b"),
+            ("cpus", "cpus 0"),
+            ("cpus-nan", "cpus NaN"),
+            ("cpus-neg", "cpus -1"),
+            ("pids", "pids 0"),
+            ("timeout", "timeout 0s"),
+        ] {
+            let errs = check(&ask(&limits(l)), &bounds(&p)).unwrap_err().join("\n");
+            assert!(errs.contains(needle), "{l}: {errs}");
+        }
     }
 
     #[test]
