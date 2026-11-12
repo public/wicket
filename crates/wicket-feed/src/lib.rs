@@ -51,11 +51,11 @@ mod store;
 pub mod token;
 
 pub use format::{Change, Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, RevokeKind, Revoked, Snapshot, GENESIS, MAX_FRAME_BYTES};
-pub use jws::{kid, sha, sign, sign_as, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
+pub use jws::{kid, sha, sign, sign_as, TYP_AUTHZ_KEY, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 pub use publisher::{PublishError, Publisher, PublisherConfig};
 pub use replica::{Allowed, Decision, Escalation, LoadError, Mode, Replica, ReplicaConfig, Stats};
 pub use state::{Policy, State, Zone};
-pub use token::{BoxAuthority, CompiledAuthority, Issuer, LiveGrant, TokenGrant};
+pub use token::{AuthzKeyCert, BoxAuthority, CompiledAuthority, Issuer, LiveGrant, TokenGrant};
 
 use wicket_core::RiskClass;
 

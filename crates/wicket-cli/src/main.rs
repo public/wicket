@@ -25,9 +25,13 @@ mod place;
 mod program;
 mod reap;
 mod reconcile;
+mod roots;
 mod run;
+mod s3;
 mod serve;
 mod spawn;
+mod state;
+mod statestore;
 mod transcript;
 mod update;
 
@@ -195,7 +199,7 @@ enum Cmd {
         verify: bool,
         /// With --verify: also check the local chain against exported records and signed
         /// checkpoints (JSON lines, or a Collector's OTLP JSON file output). Catches a rewritten
-        /// or truncated chain.
+        /// or truncated chain. `store:<sink>`: what a `store` sink wrote to the state store.
         #[arg(long, requires = "verify")]
         against: Vec<PathBuf>,
         /// The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be
@@ -298,6 +302,17 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<PathBuf>,
     },
+    /// Control-plane state off this host (#154): the state store, the ledger's stream, the recovery
+    /// kit and a restore onto a standby.
+    State {
+        #[command(subcommand)]
+        cmd: StateCmd,
+    },
+    /// The installation's root keys (#154).
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
@@ -394,6 +409,69 @@ enum AuditCmd {
         /// Show each sink's position and last error.
         #[arg(long)]
         status: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCmd {
+    /// Where each kind of control-plane state goes (state-store.yaml).
+    Check {
+        /// Also write, read back and delete a probe object in the store.
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Stream the ledger to the state store until stopped (Litestream): a lost control host loses
+    /// at most `ledger.sync_interval`. Run it as a service beside wicketd.
+    Replicate,
+    /// Write a recovery kit: what a standby needs besides the state store (keys, state.key, nodes'
+    /// feed keys and pinned host keys, config files, and the vault's secrets). Keep it offline.
+    Kit {
+        #[arg(long)]
+        out: PathBuf,
+        /// Leave the vault's secrets out (set them again on the standby).
+        #[arg(long)]
+        without_secrets: bool,
+        /// Leave the roots out even if they are on this host.
+        #[arg(long)]
+        without_roots: bool,
+    },
+    /// Make this fresh host the control host: the kit's files, then the ledger from the state store
+    /// (as of now, or of --at), audit records the store has beyond it, agents fenced, and each node
+    /// feed set to start a new generation.
+    Restore {
+        #[arg(long)]
+        kit: PathBuf,
+        /// Restore the ledger as it was at this time (RFC 3339, UTC), discarding what came after.
+        #[arg(long)]
+        at: Option<String>,
+        /// Replace a ledger this host already has.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Move the feed root and the authority root off this host (to removable media, say): boxes'
+    /// tokens are then minted by a certified issuing key, and certificates the roots issue last
+    /// --days. Nodes pin the same keys as before.
+    RootsOffline {
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
+    /// With the roots' directory (--roots, or WICKET_ROOTS): renew the issuing key's and every node
+    /// feed's certificate for another --days (as chosen at roots-offline), and start the new
+    /// generation of any feed a restore left. Installed, the wicket user must be able to read it.
+    Certify {
+        #[arg(long)]
+        roots: Option<PathBuf>,
+    },
+    /// Put the roots back on this host.
+    RootsOnline {
+        #[arg(long)]
+        from: PathBuf,
     },
 }
 
@@ -1199,10 +1277,19 @@ async fn main() -> Result<()> {
                     };
                     let mut objs = Vec::new();
                     for p in &against {
-                        objs.extend(audit_export::exported_objects(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?));
+                        // `store:<sink>`: what that sink wrote to the state store (#154).
+                        match p.to_str().and_then(|s| s.strip_prefix("store:")) {
+                            Some(sink) => objs.extend(audit_export::stored_objects(sink)?),
+                            None => objs.extend(audit_export::exported_objects(
+                                &std::fs::read_to_string(p).with_context(|| p.display().to_string())?,
+                            )),
+                        }
                     }
                     let a = audit_export::verify_against(&l, &objs, &key)?;
                     println!("against the exported copies: {} signed checkpoint(s) and {} record(s) match", a.checkpoints, a.records);
+                    if a.superseded > 0 {
+                        println!("  ({} exported before a restore to an earlier point, which discarded them: not compared)", a.superseded);
+                    }
                     for p in a.problems.iter().take(20) {
                         println!("  MISMATCH: {p}");
                     }
@@ -1288,6 +1375,27 @@ async fn main() -> Result<()> {
             print!("{}", zone_view(&m.zone, json));
             Ok(())
         }
+        Cmd::State { cmd } => {
+            // Litestream and the store client block: off the async runtime.
+            std::thread::spawn(move || match cmd {
+                StateCmd::Check { probe } => state::check(probe),
+                StateCmd::Replicate => state::replicate(),
+                StateCmd::Kit { out, without_secrets, without_roots } => state::kit(&out, !without_secrets, !without_roots),
+                StateCmd::Restore { kit, at, force } => state::restore(&kit, at.as_deref(), force),
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("wicket state panicked"))?
+        }
+        Cmd::Keys { cmd } => match cmd {
+            KeysCmd::RootsOffline { to, days } => roots::roots_offline(&to, days).await,
+            KeysCmd::Certify { roots: dir } => {
+                if let Some(d) = dir {
+                    std::env::set_var("WICKET_ROOTS", d);
+                }
+                roots::certify()
+            }
+            KeysCmd::RootsOnline { from } => roots::roots_online(&from),
+        },
         Cmd::Reconcile { dry_run, every } => {
             let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
             reconcile::command(dry_run, every).await
