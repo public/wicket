@@ -136,7 +136,7 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 - `npm install` of a project with scoped dependencies (`@types/node`, `@babel/core`) failed through an
   inspected registry: npm's `@scope%2fname` is now decided as `/@scope/name`, so rules on the decoded
   path apply, and is forwarded as written; every other encoded separator is still refused
-  ([#143](https://github.com/public/wicket/issues/143)).
+  ([#145](https://github.com/public/wicket/pull/145)).
 
 ### Upgrading from a development checkout
 
