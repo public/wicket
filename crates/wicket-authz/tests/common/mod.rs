@@ -109,6 +109,7 @@ pub fn level(level: usize, grant_keys: Vec<PublicKey>) -> Ceiling {
         llm: LlmBudget { max_requests: 3000, max_output_tokens: 4_000_000 },
         accept_from: vec!["ops".into()],
         grant_keys,
+        org: None,
     };
     if level == 0 {
         return c;

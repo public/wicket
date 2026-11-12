@@ -131,6 +131,69 @@ pub struct Ceiling {
     /// Keys whose grants this link's reach and risk checks accept: the approval service, plus (for
     /// spawn links) the parent box's grantor key. Never the box's own key.
     pub grant_keys: Vec<PublicKey>,
+    /// The installation's org policy (#51), compiled from Cedar at mint: block 0 only (a spawn link
+    /// inherits block 0's checks). None: no org policy, and nothing in the token about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<OrgLayer>,
+}
+
+/// The org layer of a token (#51): what the installation's org policy (Cedar, compiled by
+/// `wicket-policy`) allows and forbids, as a ceiling over every zone. Its checks are hard: no grant
+/// lifts them, and its forbids beat every grant.
+///
+/// For each op kind, `None` means the org policy doesn't constrain it, and `Some(alts)` that one of
+/// the alternatives must hold (`Some(vec![])`: never).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgLayer {
+    /// The policy's version (a hash of its source, schema and compiler): the `policy` fact.
+    pub version: String,
+    pub http: Option<Vec<HttpMatch>>,
+    /// HTTP requests refused whatever any zone or grant says.
+    pub forbid: Vec<HttpMatch>,
+    pub spawn: Option<Vec<SpawnMatch>>,
+    /// Zones whose boxes may message boxes under this policy (one set: alternatives are unioned).
+    pub msg_from: Option<Vec<String>>,
+    /// Injections allowed (`host|header|secret`, as [`Inject::key`]).
+    pub inject: Option<Vec<String>>,
+}
+
+/// A host pattern: exact, or every name ending in a suffix (`.example.com`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostPat {
+    Exact(String),
+    Suffix(String),
+}
+
+/// A path pattern: a wicket glob (`*` within a segment, `**` across) or a Cedar `like` pattern
+/// (`*` matches anything, `/` included), as a regex for `$p.matches`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathPat {
+    Glob(String),
+    Like(String),
+}
+
+/// One conjunction over an HTTP request; absent parts match anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpMatch {
+    pub hosts: Vec<HostPat>,
+    /// Hosts it must not be (exact).
+    pub not_hosts: Vec<String>,
+    pub methods: Option<Vec<String>>,
+    pub paths: Vec<PathPat>,
+    /// `risk <= n` / `risk >= n` (wicket-core's risk rank).
+    pub max_risk: Option<i64>,
+    pub min_risk: Option<i64>,
+}
+
+/// One conjunction over a spawn; absent parts match anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnMatch {
+    pub images: Option<Vec<String>>,
+    pub min_isolation: Option<i64>,
+    pub max_mem_bytes: Option<i64>,
+    pub max_cpus_milli: Option<i64>,
+    pub max_pids: Option<i64>,
+    pub max_timeout_s: Option<i64>,
 }
 
 /// wicket's isolation strength as an integer (higher is stronger).
@@ -190,6 +253,7 @@ impl Ceiling {
             },
             accept_from: zone.accept_from.clone(),
             grant_keys,
+            org: None,
         };
         c.validate()?;
         Ok(c)
