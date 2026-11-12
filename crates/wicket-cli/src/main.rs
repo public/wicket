@@ -845,24 +845,23 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Cmd::Attach { run } => {
-            run::run(run::RunOpts {
-                manifest: std::path::Path::new("(the run's record)"),
-                workdir: None,
-                workspace_dir: None,
-                task: None,
-                image: "",
-                node: None,
-                ssh_key: None,
-                run_id: Some(run),
-                parent_run: None,
-                lease: None,
-                wrap: None,
-                wake: None,
-                attach: true,
-            })
-            .await
-        }
+        Cmd::Attach { run } => run::run(run::RunOpts {
+            manifest: std::path::Path::new("(the run's record)"),
+            workdir: None,
+            workspace_dir: None,
+            task: None,
+            image: "",
+            node: None,
+            ssh_key: None,
+            run_id: Some(run.clone()),
+            parent_run: None,
+            lease: None,
+            wrap: None,
+            wake: None,
+            attach: true,
+        })
+        .await
+        .inspect_err(|e| run::attach_failed(&run, e)),
         Cmd::Say { run, text } => {
             let text = text.join(" ");
             if text.trim().is_empty() {

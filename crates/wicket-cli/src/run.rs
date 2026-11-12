@@ -1707,6 +1707,23 @@ fn print_event(ev: &Event) {
     }
 }
 
+/// A run that `wicket attach` could not take over is ended as lost (unless another process already
+/// supervises it), so its box is stopped by the next reconcile pass instead of being adopted again.
+pub fn attach_failed(run: &str, e: &anyhow::Error) {
+    let why = format!("{e:#}");
+    if why.contains("another wicket process supervises") || check_run_id(run).is_err() {
+        return;
+    }
+    if let Ok(l) = Ledger::open(&ledger_path()) {
+        if l.run_status(run).ok().flatten().as_deref() == Some("running") {
+            let reason = format!("its supervisor is gone and it could not be taken over: {}", wicket_agent::clip(&why, 300));
+            let _ = l.run_ended(&RunId(run.to_string()), crate::reap::LOST, &reason);
+            let _ =
+                l.audit(&wicket_core::TenantId::single(), Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
+        }
+    }
+}
+
 /// Starts a new supervisor for `run` (`wicket attach <run>`), detached, its output in
 /// `<run dir>/ctl/attach.log`: what the reconciler does for a run whose supervisor is gone but whose
 /// box still runs on its node (#151).

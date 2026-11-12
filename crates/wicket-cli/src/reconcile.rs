@@ -232,11 +232,26 @@ where
                     self.end_run(&run, &why)?;
                     self.did("run_lost", &run, &why, Some(&run));
                 }
-                _ => self.note(
-                    "unreachable",
-                    &run,
-                    &format!("its supervisor is gone and node {node} can't be asked about it: left for the next pass"),
-                ),
+                _ => {
+                    // Its node can't be asked: the run still ends if its node is no longer active
+                    // (revoked: nothing will supervise it there again), or past its own deadline.
+                    let active = self.ledger.node(&node)?.is_some_and(|n| n.status == "active");
+                    let overdue = run_deadline(&run).is_some_and(|d| d < self.now);
+                    if !active || overdue {
+                        let why = match active {
+                            false => format!("its wicket process is gone, and node {node} is no longer active"),
+                            true => format!("its wicket process is gone, node {node} can't be reached, and it is past its timeout"),
+                        };
+                        self.end_run(&run, &why)?;
+                        self.did("run_lost", &run, &why, Some(&run));
+                    } else {
+                        self.note(
+                            "unreachable",
+                            &run,
+                            &format!("its supervisor is gone and node {node} can't be asked about it: left for the next pass"),
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -570,9 +585,20 @@ fn node_docker(name: &str) -> Option<Docker> {
     crate::enrol::resolve_installed(name, None).ok().filter(|n| n.name.is_some()).map(|n| Docker::over_ssh(n.ssh_prefix()))
 }
 
+/// When a run must have ended (Unix seconds): its box's start plus its zone's timeout and a minute's
+/// margin, from the run's record (none for a run without one).
+fn run_deadline(run: &str) -> Option<i64> {
+    crate::run::check_run_id(run).ok()?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(crate::data_dir().join("runs").join(run).join("ctl/run.json")).ok()?).ok()?;
+    let m = wicket_core::Manifest::from_yaml(v["manifest"].as_str()?).ok()?;
+    Some(v["started_ms"].as_i64()? / 1000 + m.zone.limits.timeout().ok()?.as_secs() as i64 + 60)
+}
+
 /// For each node of a running run whose supervisor is gone: the runs it has (exited or not), or
-/// None if it can't be reached within 10 s.
-pub async fn node_runs(ledger: &Ledger) -> Result<HashMap<String, Option<Vec<String>>>> {
+/// None if it can't be reached within 10 s. Unless `dry_run`, this host's own node is started first
+/// if it isn't serving (it adopts its boxes as it starts).
+pub async fn node_runs(ledger: &Ledger, dry_run: bool) -> Result<HashMap<String, Option<Vec<String>>>> {
     let mut nodes: HashSet<String> = HashSet::new();
     for (run, owner) in ledger.running_runs()? {
         if owner.as_deref().map(crate::reap::owner_alive) == Some(Some(false)) {
@@ -584,7 +610,7 @@ pub async fn node_runs(ledger: &Ledger) -> Result<HashMap<String, Option<Vec<Str
     let shared = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&crate::ledger_path())?));
     let mut out = HashMap::new();
     for n in nodes {
-        if n == crate::localnode::NAME {
+        if n == crate::localnode::NAME && !dry_run {
             // This host's own node: started if it isn't serving (it adopts its boxes as it starts).
             if let Err(e) = crate::localnode::ensure(&shared).await {
                 eprintln!("[wicket] this host's own node did not start: {e:#}");
@@ -605,7 +631,7 @@ pub async fn node_runs(ledger: &Ledger) -> Result<HashMap<String, Option<Vec<Str
 pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let _lock = Lock::take()?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
-    let asked = node_runs(&ledger).await?;
+    let asked = node_runs(&ledger, dry_run).await?;
     let local = Docker::from_env();
     let now = wicket_store::now();
     let Some(cfg) = PlacementConfig::load()? else {
@@ -993,9 +1019,30 @@ mod tests {
             l.set_run_owner(run, "dead:1:1").unwrap();
             l.set_run_node(run, node).unwrap();
         }
+        // n2 is enrolled and active, but can't be reached; n3 was revoked.
+        let node = |name: &str| wicket_store::NodeRow {
+            name: name.into(),
+            tenant: "t0".into(),
+            target: format!("unix:{name}"),
+            host_key: String::new(),
+            host_key_fp: String::new(),
+            node_key: String::new(),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: NOW,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        l.enrol_builtin_node(&node("n2")).unwrap();
+        l.enrol_builtin_node(&node("n3")).unwrap();
+        l.revoke_node("n3").unwrap();
+        l.run_started(&TenantId::single(), &RunId("run_revoked".into()), "z", "a").unwrap();
+        l.set_run_owner("run_revoked", "dead:1:1").unwrap();
+        l.set_run_node("run_revoked", "n3").unwrap();
         let mut asked = HashMap::new();
         asked.insert("n1".to_string(), Some(vec!["run_kept".to_string()]));
         asked.insert("n2".to_string(), None);
+        asked.insert("n3".to_string(), None);
         async fn pass(w: &World<Fake>, l: &mut Ledger, asked: &HashMap<String, Option<Vec<String>>>, dry_run: bool) -> Vec<Done> {
             let m = Machines { placer: &w.placer, approver: &w.approver, setup: &w.setup, warm_pool: false };
             let nodes = w.nodes.clone();
@@ -1015,6 +1062,8 @@ mod tests {
         assert_eq!(l.run_status("run_gone").unwrap().as_deref(), Some(LOST));
         assert_eq!(l.run_status("run_far").unwrap().as_deref(), Some("running"));
         assert!(d.iter().any(|x| x.kind == "unreachable" && x.target == "run_far"));
+        // A revoked node will never supervise its runs again: they end.
+        assert_eq!(l.run_status("run_revoked").unwrap().as_deref(), Some(LOST));
         assert_eq!(audited(&l, "reconcile.run_adopted"), 1);
     }
 

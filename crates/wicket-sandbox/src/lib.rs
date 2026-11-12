@@ -261,7 +261,16 @@ impl Docker {
     /// its stdin, if interactive, stays open between attaches, so a supervisor that restarts can
     /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
     pub async fn start_detached(&self, spec: &SandboxSpec) -> Result<()> {
-        let args: Vec<String> = self.build_args(spec).into_iter().map(|a| if a == "--rm" { "-d".to_string() } else { a }).collect();
+        // Its output is replayed from `docker logs` by offset, so it must be whole from byte 0: a
+        // log driver of our own choosing, never rotated (the box's logs go with it when removed).
+        let args: Vec<String> = self
+            .build_args(spec)
+            .into_iter()
+            .flat_map(|a| match a.as_str() {
+                "--rm" => vec!["-d".to_string(), "--log-driver".into(), "json-file".into(), "--log-opt".into(), "max-size=-1".into()],
+                _ => vec![a],
+            })
+            .collect();
         let out = self.command_with(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output().await?;
         if !out.status.success() {
             bail!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim());

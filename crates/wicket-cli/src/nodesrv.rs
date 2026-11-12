@@ -1,17 +1,24 @@
 //! `wicket node serve` (#57, step 3): the node process that owns its boxes and decides their egress
 //! locally, so a box keeps working (for allowed requests) while the control host is unreachable.
 //!
-//! - **It owns the box.** The control host asks it to start a box ([`Msg::Start`]); it runs `docker run`
-//!   here and relays the box's stdin, stdout and stderr over the control channel. When the channel
-//!   drops, the box keeps running and its output is kept (up to [`OUTPUT_CAP`] bytes per stream, oldest
-//!   dropped first; the control host reports a gap) and replayed when the control host reconnects. The
-//!   node also enforces the run's timeout itself.
+//! - **It owns the box.** The control host asks it to start a box ([`Msg::Start`]); it starts it
+//!   detached (`docker run -d`) and relays its stdin (over the box's `sock/stdin.sock`, which
+//!   `wicket-fwd --stdin-from` reads), stdout and stderr (from `docker logs`) over the control channel.
+//!   When the channel drops, the box keeps running and its output is kept (up to [`OUTPUT_CAP`] bytes
+//!   per stream, oldest dropped first; the control host reports a gap) and replayed when the control
+//!   host reconnects. The node also enforces the run's timeout itself, and holds the control host's
+//!   lease of the run ([`Msg::RunLease`], #151).
+//! - **Its boxes outlive it** (#151). A record of each box (`node-box.json`) lets a restarted `serve`
+//!   adopt the boxes the last one started (`adopt_previous`).
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
 //!   node's verified feed replica (`wicket_proxy::decide::NodeDecider`) and terminating TLS with the
 //!   node's name-constrained CA. Hosts the node must not terminate (an `inject` rule, a credential
 //!   swap, outside the CA's constraints, or an expired CA) are tunnelled to the control host's egress
-//!   proxy for the run. The LLM proxy and the MCP gateway stay on the control host too: the box's
-//!   `llm.sock` and `gateway.sock` here are tunnels to them.
+//!   proxy for the run.
+//! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy checks each call and
+//!   relays it to the run's own on the control host, which holds the credential and checks it again;
+//!   the gateway relays each call to the run's, which decides every tool, and answers MCP's own
+//!   handshake itself while the control host can't be reached.
 //! - **It keeps an audit log.** A ledger of its own (`audit.db`), hash-chained like the control host's,
 //!   records its decisions; it ships records past the control host's watermark on every connect.
 //! - **One control connection per run** (its scope; #146), on a unix socket in a 0700 directory,
@@ -1376,11 +1383,17 @@ impl BoxRecord {
 struct StdinFeed {
     buf: std::sync::Mutex<(OutBuf, bool)>,
     more: tokio::sync::Notify,
+    /// The box's forwarder has connected at least once.
+    seen: std::sync::atomic::AtomicBool,
 }
 
 impl StdinFeed {
     fn new(at: u64, closed: bool) -> StdinFeed {
-        StdinFeed { buf: std::sync::Mutex::new((OutBuf::starting_at(OUTPUT_CAP, at), closed)), more: tokio::sync::Notify::new() }
+        StdinFeed {
+            buf: std::sync::Mutex::new((OutBuf::starting_at(OUTPUT_CAP, at), closed)),
+            more: tokio::sync::Notify::new(),
+            seen: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn push(&self, b: &[u8]) {
@@ -1410,6 +1423,7 @@ impl StdinFeed {
     async fn feed(&self, mut c: UnixStream) -> std::io::Result<()> {
         let mut off = [0u8; 8];
         c.read_exact(&mut off).await?;
+        self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut at = u64::from_be_bytes(off);
         loop {
             let more = self.more.notified();
@@ -1461,6 +1475,29 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             Ok(t) => tasks.push(t),
             Err(e) => eprintln!("[node] {}: the box's stdin socket failed: {e:#}", bs.run),
         }
+        // An image from before stdin came over a socket never asks for it, and its agent would wait
+        // for ever: stopped, saying why (on the box's stderr, which the control host shows).
+        let (n, f, run, name) = (node.clone(), f.clone(), bs.run.clone(), name.clone());
+        tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            if f.seen.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let why =
+                "[wicket] the box never read its stdin: its image predates wicket's stdin socket (#151); rebuild it with `wicket image`\n";
+            eprintln!("[node] {run}: {}", why.trim());
+            let frame = {
+                let mut boxes = n.boxes.lock().expect("boxes");
+                boxes.get_mut(&run).filter(|b| b.exited.is_none()).map(|b| {
+                    let at = b.out[1].write(why.as_bytes());
+                    Frame::Data { stream: b.streams[2], offset: at, bytes: why.as_bytes().to_vec() }
+                })
+            };
+            if let Some(fr) = frame {
+                n.send_run(&run, fr);
+                let _ = n.docker.kill(&name).await;
+            }
+        }));
     }
     node.boxes.lock().expect("boxes").insert(
         bs.run.clone(),

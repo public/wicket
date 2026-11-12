@@ -590,7 +590,16 @@ async fn session(
         p.ever = false;
         bail!("{why}: not reconnecting");
     }
-    let d = sh.via.dial().await?;
+    let d = match sh.via.dial().await {
+        Ok(d) => d,
+        // This host's own node's `serve` is gone (killed, or exited): start it again, and it adopts
+        // its boxes, this run's among them (#151).
+        Err(e) if sh.node == crate::localnode::NAME => {
+            crate::localnode::ensure(&sh.ledger).await.map_err(|e2| e.context(format!("restarting this host's node: {e2:#}")))?;
+            sh.via.dial().await?
+        }
+        Err(e) => return Err(e),
+    };
     let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
     let build = crate::nodesrv::build_id()?;
     let hello = |nonce| Msg::Hello {
