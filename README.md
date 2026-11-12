@@ -29,8 +29,8 @@ What it does:
   human approves or denies them with `wicket approve` / `wicket deny`, and the grant is single-use and expiring by
   default, recorded in a SQLite ledger;
 - every decision goes into a **hash-chained audit log** (`wicket audit --verify`).
-- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reap`
-  (each box is labelled with the process that owns it); the run ends as `lost`.
+- if a `wicket run` process dies hard, its box is flagged by `wicket doctor` and stopped by `wicket reconcile`
+  (or `wicket reap`; each box is labelled with the process that owns it); the run ends as `lost`.
 
 #### Agent identity and child agents
 
@@ -76,7 +76,7 @@ wicket node enrol wicket@203.0.113.7 --token wkt_… --host-key 'SHA256:…' --h
 wicket node install n1                      # copies this wicket binary there, starts the wicket-node service
 wicket run task.yaml --node n1
 wicket node list
-wicket node renew-ca n1                     # a fresh node CA (default 24 h)
+wicket node renew-ca n1                     # a fresh node CA and identity certificate (default 24 h each), over ssh
 wicket node revoke n1
 ```
 
@@ -93,13 +93,25 @@ wicket node revoke n1
   and a P-256 **node CA** key with `openssl`, and neither private key leaves the node. The control host signs the
   CA's request as a short-lived (24 h) intermediate under the installation CA (`ca.key`, next to the issuer key).
   The intermediate has path length 0 and is **name-constrained** to `--hosts`, with all IP addresses excluded.
-  The node also gets the feed root's and the issuer's public keys.
+  The node also gets the feed root's and the issuer's public keys, and a **node identity certificate**
+  (`node-cert.jwt`, below).
+- **Node identity and mutual authentication.** The issuer certifies the node key as
+  `spiffe://<trust domain>/node/<name>` in a short-lived (24 h, `--cert-ttl`) certificate, and the ledger
+  records its serial. Every control connection starts with a handshake on top of ssh: the node signs a fresh
+  challenge with its node key and shows its certificate; the control host signs one with the issuer key. The
+  control host refuses a node whose certificate isn't this installation's, names another node, binds a key
+  other than the enrolled one, has expired, was never recorded or is revoked. The node refuses a control host
+  that can't prove the issuer key, and until one does, the connection it already has is left alone. At
+  half-life the run renews the certificate over the channel; a node that was unreachable until its certificate
+  expired gets a new one with `wicket node renew-ca`. The handshake doesn't depend on ssh: a QUIC or mTLS
+  transport would reuse it, passing its TLS exporter as the channel binding (`wicket_identity::node`).
 - **Name constraints are subtrees.** `api.example.com` also permits names under it (`x.api.example.com`), and
   `*.example.org` permits every name under `example.org` but not `example.org` itself. X.509 can't express
   "exactly this host". The reach rules stay the exact gate, and the constraint bounds what a stolen node CA can
   do until it expires.
-- **Revoking** deletes the pinned key and records the node CA's serials for the feed's revocation list (not
-  distributed yet).
+- **Revoking** deletes the pinned key, revokes the node's identity certificates (a run connected to the node
+  stops its box there and drops it within a second, and nothing reconnects), and records the node CA's serials
+  for the feed's revocation list (not distributed yet).
 
 ##### `wicket node serve`: boxes that outlive the control channel
 
@@ -177,8 +189,49 @@ wicket place release <instance-id>                  # destroy now and revoke the
   only that key), enrols the node with `--host-key`, and replaces the instance's user data so the private key
   isn't left in the metadata service. There's no trust on first use: `wicket node enrol --trust-first-use` is
   only for nodes made some other way.
-- **Not yet:** `spawn` with a placement hint, warm reuse across processes, and the reconciler daemon (#38,
-  for which `wicket_placement::reconcile` is the pure decision function).
+- **Not yet:** warm reuse across processes.
+
+#### Capacity leases and the reconciler
+
+An agent asks for a machine of its own with the gateway's `request_capacity` tool (CPU, memory, isolation tier,
+region, duration, an hourly price cap, a reason). Capacity is a **lease**, never a cloud credential:
+
+1. The ask becomes a pending lease in the ledger with its worst case reserved (every started hour at the
+   agent's own cap), atomically against `max_hourly_usd`/`max_total_usd` in `placement.yaml`
+   (`examples/placement/placement.yaml`; without it the tool is off). Over budget is refused before a human sees it.
+2. A human decides it like any escalation (`wicket pending`, `wicket approve`/`deny`, or the console). The
+   approval is bound to that lease: the placer may spend only on its node, and only up to its reservation.
+3. The reconciler acquires the node (a static host, or a fresh Vultr node with its host key pinned before it
+   boots), enrols it and runs `wicket node install`. The agent waits with `request_capacity {lease}`, then
+   starts children there with `spawn` and `placement: {"lease": "l-…"}` (or `{"node": "<name>"}` for the node
+   it runs on, or a leased one). A child runs there through `wicket node serve`.
+4. At the lease's end, or when its holder run ends, the runs placed on it stop and its node is destroyed (on
+   Vultr, before the next paid hour); the lease records what the node billed.
+
+```sh
+wicket reconcile --dry-run        # what one pass would change
+wicket reconcile                  # one pass
+wicket reconcile --every 30s      # the daemon: run it beside `wicket serve`, e.g. as a systemd user service
+wicket lease list                 # status, holder run, node, reserved, end, billed
+wicket lease release <lease>      # end it now (one pass)
+```
+
+One pass (`wicket reconcile`, #38) compares the provider's instances, enrolled nodes and the boxes on this host
+and on every node with the ledger's runs and leases, and makes them agree. `wicket approve` of a capacity ask runs
+a pass at once; everything else (lease ends, approvals on the console) waits for the next `--every` pass.
+
+- **Runs** whose `wicket run` process is gone end as `lost` (a run supervised on another machine is left to it).
+- **Leases** end when their run has ended or their end has passed; denied or withdrawn asks give their
+  reservation back.
+- **Machines.** Only instances tagged `wicket-owner-<installation>` are ever listed. One no live lease needs is
+  destroyed; one that matches a lease the ledger lost track of (a crash between create and record) is adopted,
+  not created again. Ownership is checked again right before every destroy, so a tag changed or a
+  `wicket-protected` tag added since the list saves the machine.
+- **Boxes** (`wicket=1` containers) whose run ended or whose owner process died are stopped; a box whose run this
+  ledger doesn't know is left alone, since Docker may be shared. This subsumes `wicket reap`.
+- Every change is an audit record `reconcile.<what>`. One pass at a time per installation (a file lock).
+- So killing every control-plane process mid-run and restarting leaves no orphaned machine or box after one
+  pass. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).
 
 ## Requirements
 
@@ -212,8 +265,10 @@ cargo build --release -p wicket-cli
 
 The console (`wicket serve`) shows what's waiting for you, runs, recent decisions and activity, and you approve
 or deny from a browser or phone. It uses **passkeys**:
-- the first passkey is enrolled through a one-time link printed at start-up (single use, 10 minutes, valid only
-  while no passkey exists, and it can do nothing but enrol);
+- passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
+  passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
+  (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey). A
+  signed-in console session can't add a passkey, so a stolen cookie can't either;
 - sign-in is a passkey with user verification;
 - **every approve or deny is signed again**, over a challenge that is the hash of exactly that decision
   (request, method, host, path, decision, uses, lifetime). The server checks it, uses it once, and stores the
@@ -238,6 +293,56 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
+
+#### The console on the public internet
+
+The console is built to be reachable directly from the internet, with no VPN or access proxy in front (#23).
+Passkeys stay the only authentication.
+
+```sh
+# HTTPS from wicket itself, with a Let's Encrypt certificate validated over TLS-ALPN-01 on this listener:
+wicket serve --listen 0.0.0.0:443 --acme-domain console.example.com --acme-agree-tos \
+    --acme-contact mailto:ops@example.com          # --acme-staging to try it out first
+# ...or with certificate files (re-read when they change, e.g. after certbot renews them):
+wicket serve --listen 0.0.0.0:443 --origin https://console.example.com \
+    --tls-cert /etc/wicket/fullchain.pem --tls-key /etc/wicket/privkey.pem
+# ...or behind a TLS-terminating proxy (which then must be the only way in):
+wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://console.example.com \
+    --trusted-proxy 10.0.0.2
+```
+
+- **Transport.** A non-loopback listener refuses to start in plain HTTP unless `--behind-tls-terminator` is given
+  with an `https://` `--origin`. TLS is rustls: TLS 1.3, and TLS 1.2 with ECDHE and AEAD suites only; HTTP/1.1
+  only (no h2, so there is one HTTP implementation to bound). HTTPS responses carry
+  `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (submitting the domain to the
+  preload list is your step). ACME keeps its account and certificate in `$WICKET_HOME/acme` (0700/0600) and
+  renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
+- **Before sign-in** a client can fetch only the page, its static files (script, stylesheet, manifest, icons)
+  and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
+  no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
+- **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
+  address (IPv4, or IPv6 /64; `X-Forwarded-For` is honoured only from a `--trusted-proxy`) and per passkey:
+  20 a minute, and 5 failures lock out for 15 minutes, doubling up to a day. Pending challenges are bounded
+  (1024 in all, 8 per client, 2-minute expiry). Every failure looks the same to the client, and every failure
+  and lockout is in the audit log.
+- **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
+  sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
+  host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately
+  passkey-signed, so a stolen cookie alone approves nothing.
+- **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
+  Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
+  'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  no CORS, `Referrer-Policy: no-referrer`, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`. POSTs need the
+  `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
+- **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
+  handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB
+  bodies. A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
+  checks it never panics and never reaches a signed-in handler.
+- **Installable:** the console has a web app manifest and icons, so it can be added to a phone's home screen.
+- **Privilege separation** is #12: the console is meant to run as the unprivileged wicket system user. Nothing
+  here needs root (bind :443 with `CAP_NET_BIND_SERVICE` instead), its TLS and ACME state is in its own files,
+  and it starts runs through one launch callback (a detached `wicket run`), so moving launching behind a
+  separate, more privileged process later changes only that callback.
 
 ![console](docs/console-passkey.png)
 

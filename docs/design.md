@@ -324,11 +324,11 @@ assert identity *on the box's behalf*:
 
 | Who needs the proof | Mechanism |
 |---|---|
-| wicket's own proxies | The socket a request arrives on *is* the box (no token; already the PoC's model). On remote nodes, the forwarded socket rides an SSH or mTLS channel to a node wicket enrolled, with the host key pinned at provisioning. The PoC pins it at `wicket node enrol` (#16); targets that aren't enrolled are still trusted on first use, with a warning. |
+| wicket's own proxies | The socket a request arrives on *is* the box (no token; already the PoC's model). On remote nodes, the forwarded socket rides an SSH or mTLS channel to a node wicket enrolled, with the host key pinned at provisioning. The PoC pins it at `wicket node enrol` (#16), and both ends then authenticate each other on the channel itself (node certificate and node key one way, the issuer key the other; below); targets that aren't enrolled are still trusted on first use, with a warning. |
 | Other zones, other tenants (§15 sharing), the console | Every gate message, handle and output is wrapped by the gateway in a **signed envelope**: issuer, identity record digest, content digest, labels. A receiver verifies wicket's signature, never the sender's claim. |
 | External services | `wicket-egress` signs outbound requests with **HTTP Message Signatures** (RFC 9421), as Web Bot Auth does. It is opt-in per reach rule, and carries a `Signature-Agent` that resolves to the zone's identity. |
 | Anyone auditing a result later | A **launch attestation** signed at start (the identity record) and a **result attestation** signed at end (output digests, the egress decisions, grants used). This is in-toto/SLSA-style provenance, chained into the audit log. |
-| wicket, about its own nodes | Node enrolment with a one-time join token leads to a node key, held in a TPM where there is one, and short-lived mTLS certificates. Later, a hardware attestation (SEV-SNP/TDX quote, TPM quote) that the node runs the expected runtime. Until then a node is trusted because wicket created it through the provider API and pinned its host key. |
+| wicket, about its own nodes | Node enrolment with a one-time join token leads to a node key, held in a TPM where there is one, and short-lived node identity certificates (built: JWT-SVID-style, `spiffe://<install>/node/<name>`; see "Node identity" below). Later, a hardware attestation (SEV-SNP/TDX quote, TPM quote) that the node runs the expected runtime. Until then a node is trusted because wicket created it through the provider API and pinned its host key. |
 
 **Naming.** wicket is the issuer for its trust domain, in the way SPIRE is for SPIFFE. Identities look like
 `spiffe://<install>/t/<tenant>/z/<zone>/a/<agent>`, with the activation and run as claims. Signing keys
@@ -403,8 +403,38 @@ Also built since then:
 - the principal and delegation chain in every identity, shown with every request.
 
 Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
-name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, mTLS node certificates,
-the separate system user, root and issuing key separation, and federation with other installations.
+name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
+for an mTLS transport, the separate system user, root and issuing key separation, and federation with other installations.
+
+**Node identity (#16, built).** Nodes get short-lived identity certificates, and the control channel
+authenticates both ends whatever carries it:
+- **Certificate.** The issuer signs a JWS (`typ: wicket-node+jwt`, the shape of a SPIFFE JWT-SVID): subject
+  `spiffe://<install>/node/<name>`, a serial, 24 h by default, and a `cnf` binding the node's Ed25519 key.
+  The key is made on the node at enrolment and never leaves it, so the issuer can renew the certificate
+  without the node sending anything but its proof. The ledger records every serial (`node_certs`).
+- **Handshake.** The control host's hello carries a nonce. The node answers with its own nonce, its
+  certificate and a proof signed with the node key. The control host answers with a proof signed with the
+  issuer key, and only then does the node welcome it. Each proof is a JWS (`typ: wicket-node-auth+jwt`)
+  over the role, the node name, both nonces, the certificate's digest and a channel binding. The control
+  host checks the certificate against its issuer key and the ledger: unexpired by its own clock, binding
+  the enrolled key, recorded, and neither it nor the node revoked. The node checks the control host's
+  proof against the issuer public key installed at enrolment. Before both checks pass, neither end acts
+  on the other: the control host sends no feed or box, and the node keeps its current control connection.
+- **Transport independence.** The handshake (`wicket_identity::node`) takes the channel binding as input
+  and knows nothing about ssh. Over ssh (0.0.1) the binding is empty, because ssh with the pinned host key
+  already keeps a third party off the stream. A QUIC or mTLS transport passes its TLS exporter
+  (RFC 9266), so a proof can't be relayed onto another connection. Its X.509 certificate would bind the
+  same node key.
+- **Renewal and revocation.** A run renews the certificate over the channel at half-life, and the node
+  checks it and swaps it in atomically. Earlier certificates stay valid until they expire, so a lost
+  renewal doesn't lock a node out. A node unreachable past expiry is renewed over its pinned ssh
+  (`wicket node renew-ca`). `wicket node revoke` revokes the node's certificates. A run connected to the
+  node rechecks every second, then stops its box and drops the node, which is not reconnected.
+- **Limits.** In the PoC the control host proves the issuer key itself, which is the long-lived key. With
+  root and issuing keys split, it would present a short-lived control-host certificate from the issuer
+  instead, and the handshake would gain a chain. `wicket dev node-feed-probe` connects as an observer and
+  skips the handshake: it can only send feed frames, which the node verifies against the feed root, and it
+  never takes over the control connection.
 
 Built since (#24): the console starts runs (from allowlisted manifest directories, the manifest's digest
 signed), sends follow-ups, revokes identities and answers prefix asks, each with a passkey assertion over
@@ -1237,6 +1267,11 @@ pub trait HostProvider: Send + Sync {             // wicket-provisioner: the ONL
   - `ProviderApi`: Vultr and Hetzner, trust on first use, checked against the provider API;
   - `InstanceIdentity`: signed documents on AWS, GCP and Azure;
   - `Tpm`, `SevSnp`, `Tdx`: hardware attestation, later.
+
+  Whatever the level, a node then proves itself on every control connection with its node key and a
+  short-lived identity certificate from the issuer, and the control host proves the issuer key back
+  (§3.2 "Node identity"). That handshake is the same on every cloud and transport, so a stronger level
+  changes how the first certificate is earned, not how it is used.
 
   Measured boot of `wicket-node`'s own image is the first hardware attestation worth building, because
   it is what lets the vault release credentials to a node. High-sensitivity zones can demand

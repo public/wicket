@@ -56,6 +56,8 @@
 pub mod billing;
 pub mod boot;
 pub mod envelope;
+#[cfg(feature = "mock")]
+pub mod mock;
 pub mod model;
 pub mod money;
 pub mod placer;

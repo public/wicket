@@ -2,7 +2,7 @@
 # End-to-end smoke test: one Claude Code agent in a gVisor box, driven by `wicket dev mock-llm`.
 # Needs Docker with the runsc runtime, and the agent image (`wicket image`). No model credential.
 #
-#   WICKET=target/debug/wicket ci/smoke.sh
+#   WICKET=target/debug/wicket ci/smoke.sh      (IMAGE=tag to test an image other than the default)
 #
 # Checks, from inside the box (the probe the mock model asks the agent to run):
 #   - the kernel is gVisor's;
@@ -41,7 +41,7 @@ for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/9999) 2>/dev/null && break; s
 
 echo "== wicket run ci/smoke.yaml"
 run_status=0
-"$WICKET" run ci/smoke.yaml 2>&1 | tee "$work/run.log" || run_status=$?
+"$WICKET" run ci/smoke.yaml ${IMAGE:+--image "$IMAGE"} 2>&1 | tee "$work/run.log" || run_status=$?
 
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }

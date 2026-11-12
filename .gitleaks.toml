@@ -5,3 +5,7 @@ useDefault = true
 [[allowlists]]
 description = "third-party code vendored as is"
 paths = ['''^experiments/[^/]+/vendor/''', '''^third_party/''']
+
+[[allowlists]]
+description = "RFC 8410 §10.3's published example Ed25519 key, a test vector (crates/wicket-identity/src/node.rs), in two commits before its PEM armour was built at runtime"
+commits = ["dc0e969a96370e9ebb81ec46a33d69d589b46725", "67f2eebfe8e8df23c46b5a0013adfe145d8c4a19"]

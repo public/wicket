@@ -18,10 +18,15 @@ hex.workspace = true
 base64.workspace = true
 ulid.workspace = true
 time = { workspace = true, features = ["parsing"] }
+# The `mock` feature: a local Vultr API mock for tests (here and in dependent crates).
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[features]
+mock = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
 
 [dev-dependencies]
-hyper.workspace = true
-hyper-util.workspace = true
-http-body-util.workspace = true
+wicket-placement = { path = ".", features = ["mock"] }
 http.workspace = true
-bytes.workspace = true

@@ -592,6 +592,7 @@ mod tests {
                 spawner: None,
                 swaps: vec![],
                 boxes: Some(Arc::new(boxes)),
+                capacity: None,
             }
         }
     }

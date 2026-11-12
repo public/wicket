@@ -307,6 +307,7 @@ mod tests {
             spawner: None,
             swaps: vec![],
             boxes: None,
+            capacity: None,
         }
     }
 
