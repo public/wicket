@@ -15,6 +15,8 @@
 //!   canonical paths, decisions (reach, forbid, risk, grants, pending requests, node policy),
 //!   credential injection and audit as HTTP/1.1 through CONNECT. Upstream it is re-originated over
 //!   HTTP/3 when the origin offers it, raced against HTTP/2 ([`Up`]), else HTTP/2 or HTTP/1.1.
+//! - **A superseded activation** (#70: its agent was woken again) is refused like everywhere else:
+//!   no DNS answers, no QUIC connections, and every request on an open one gets the egress proxy's 403.
 //! - **0-RTT is refused** (no early data is ever accepted: a replayed request would replay a request
 //!   that was already decided and audited). **Migration** is on: only the client's port inside the
 //!   box can change, and the frame carries it. The **idle timeout** is 30 s.
@@ -249,8 +251,13 @@ impl H3 {
     /// refused).
     fn dns(&self, q: &[u8]) -> Option<Vec<u8>> {
         let e = &self.egress;
-        let reachable = |h: &str| e.decider.host_verdict(&e.ctx, h) == HostVerdict::Open;
+        // A superseded activation (#70) resolves nothing, unaudited (it is refused everywhere).
+        let stale = e.ctx.superseded().is_some();
+        let reachable = |h: &str| !stale && e.decider.host_verdict(&e.ctx, h) == HostVerdict::Open;
         let (reply, what) = dns::answer(&self.names, q, self.opts.https_records, reachable)?;
+        if stale {
+            return Some(reply);
+        }
         let emit = |host: &str, outcome: &str, detail: String| {
             e.ctx.emit(Event::Egress {
                 method: "DNS".into(),
@@ -330,6 +337,12 @@ impl H3 {
             inc.refuse();
             return;
         };
+        // A superseded activation (#70) gets no connection at all, as it gets no CONNECT tunnel.
+        if let Some(why) = self.egress.ctx.superseded() {
+            self.refused(&host, why);
+            inc.refuse();
+            return;
+        }
         if self.egress.decider.host_verdict(&self.egress.ctx, &host) != HostVerdict::Open {
             inc.refuse();
             return;

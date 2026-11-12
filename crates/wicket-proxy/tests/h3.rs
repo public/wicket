@@ -123,6 +123,7 @@ async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
 
 struct World {
     run_ca: Arc<RunCa>,
+    names: Arc<wicket_proxy::dns::Names>,
     sock: PathBuf,
     events: Mutex<UnboundedReceiver<Event>>,
     dir: PathBuf,
@@ -134,15 +135,40 @@ impl World {
     }
 
     async fn with_relay(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Relay>>) -> World {
+        World::build(stream, opts, relay, false).await
+    }
+
+    /// `stale`: this run is an activation of an agent that has since been woken again (#70).
+    async fn build(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Relay>>, stale: bool) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca).await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ledger = wicket_store::Ledger::open_in_memory().unwrap();
+        let agent = wicket_store::new_agent_id();
+        ledger
+            .create_agent(&wicket_store::NewAgent {
+                id: &agent,
+                tenant: "t0",
+                zone: "h3zone",
+                name: "a",
+                run: "run_h3",
+                session_id: "s",
+                manifest: "m",
+                image: "i",
+                workspace: None,
+                lease_until: 0,
+            })
+            .unwrap();
+        assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
+        if stale {
+            assert_eq!(ledger.claim_wake(&agent, "run_new", 0).unwrap(), Some(2));
+        }
         let ctx = RunCtx {
             tenant: TenantId::single(),
             run: RunId("run_h3".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
-            ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
+            ledger: Arc::new(Mutex::new(ledger)),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,
             escalate: true,
@@ -152,11 +178,14 @@ impl World {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            fence: Some(wicket_proxy::Fence { agent, generation: 1 }),
+            waker: None,
         };
         let run_ca = Arc::new(RunCa::generate("run_h3").unwrap());
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false };
         let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(Central), relay, up).unwrap();
         let h3 = H3::new(egress, opts).unwrap();
+        let names = h3.names().clone();
         let sock = dir.join("udp.sock");
         let s2 = sock.clone();
         tokio::spawn(async move {
@@ -172,7 +201,7 @@ impl World {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        World { run_ca, sock, events: Mutex::new(rx), dir }
+        World { run_ca, names, sock, events: Mutex::new(rx), dir }
     }
 
     fn events(&self) -> Vec<Event> {
@@ -682,4 +711,28 @@ async fn on_a_node_forwarded_hosts_refuse_http3_and_say_why() {
         ev.iter().any(|(m, h, o, d)| m == "QUIC" && h == "h1only.test" && o == "forbidden" && d.contains("isn't served on this node")),
         "{ev:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_activation_resolves_nothing_and_connects_nowhere() {
+    // The same world, current then stale: only the fence differs.
+    let live = World::build(false, Options::default(), None, false).await;
+    let lb = FakeBox::connect(&live, false);
+    let ip = tokio::task::spawn_blocking(move || lb.resolve("h3.test")).await.unwrap();
+    assert!(ip.is_some(), "a current activation resolves");
+
+    let w = World::build(false, Options::default(), None, true).await;
+    let b = FakeBox::connect(&w, false);
+    let b = tokio::task::spawn_blocking(move || {
+        assert_eq!(b.resolve("h3.test"), None, "no answers for a stale activation");
+        b
+    })
+    .await
+    .unwrap();
+    // Even at an address minted earlier (here: forced into the map), QUIC is refused.
+    let ip = w.names.mint("h3.test").unwrap().0;
+    let to = b.relay_to(ip);
+    assert!(get(&client(&w), to, "h3.test", "GET", "https://h3.test/allowed/a").await.is_err());
+    let ev = egress_events(&w);
+    assert!(ev.iter().any(|(m, _, _, d)| m == "QUIC" && d.contains("stale")), "{ev:?}");
 }
