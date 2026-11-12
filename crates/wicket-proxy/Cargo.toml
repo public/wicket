@@ -34,4 +34,5 @@ hex.workspace = true
 x509-parser = "0.16"
 
 [dev-dependencies]
+wicket-authz.workspace = true
 ed25519-dalek = "2"

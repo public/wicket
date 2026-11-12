@@ -47,7 +47,7 @@ use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use wicket_core::{Op, Verdict};
+use wicket_core::{Op, Verdict, ZoneSpec};
 
 /// The node's mode, from its own clock and the signed deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +78,8 @@ impl Default for ReplicaConfig {
 pub enum Allowed {
     /// By the zone's reach rule `n`.
     Reach(usize),
+    /// By the ceilings of the box's token (every block's reach), without a grant.
+    Ceiling,
     /// By a live grant (one use consumed).
     Grant(String),
     /// A lease on a grant, until (Unix ms).
@@ -188,6 +190,8 @@ pub struct Replica<P: Policy> {
     node: String,
     root: VerifyingKey,
     cfg: ReplicaConfig,
+    /// What compiling an entry needs (for tokens, their root key).
+    ctx: P::Ctx,
     cert: Option<Cert>,
     state: Option<State<P>>,
     /// Chain heads of recent epochs held.
@@ -213,14 +217,35 @@ enum Plan<P: Policy> {
     Fresh(Statement),
 }
 
+impl<P: Policy> Replica<P>
+where
+    P::Ctx: Default,
+{
+    /// [`Replica::new_with`] for payloads that compile without context ([`wicket_core::ZoneSpec`]).
+    pub fn new(node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Replica<P> {
+        Self::new_with(node, root, cfg, P::Ctx::default())
+    }
+
+    /// [`Replica::reset_with`] without context.
+    pub fn reset(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
+        Self::reset_with(dir, node, root, cfg, P::Ctx::default())
+    }
+
+    /// [`Replica::open_with`] without context.
+    pub fn open(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
+        Self::open_with(dir, node, root, cfg, P::Ctx::default())
+    }
+}
+
 impl<P: Policy> Replica<P> {
     /// A replica with no state and no persistence: [`Mode::Closed`] until it has a snapshot and a
-    /// live statement.
-    pub fn new(node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Replica<P> {
+    /// live statement. `ctx` is what compiling an entry needs (for tokens, their root key).
+    pub fn new_with(node: &str, root: VerifyingKey, cfg: ReplicaConfig, ctx: P::Ctx) -> Replica<P> {
         Replica {
             node: node.into(),
             root,
             cfg,
+            ctx,
             cert: None,
             state: None,
             heads: BTreeMap::new(),
@@ -234,8 +259,8 @@ impl<P: Policy> Replica<P> {
     }
 
     /// Discards any persisted feed in `dir` (keeping grant use counts) and starts empty, persisting
-    /// from now on. For first start, and after [`Replica::open`] found a corrupt file.
-    pub fn reset(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
+    /// from now on. For first start, and after [`Replica::open_with`] found a corrupt file.
+    pub fn reset_with(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig, ctx: P::Ctx) -> Result<Replica<P>, LoadError> {
         std::fs::create_dir_all(dir)?;
         for f in [STATEMENTS, DELTAS, SNAPSHOT, CERT] {
             match std::fs::remove_file(dir.join(f)) {
@@ -243,7 +268,7 @@ impl<P: Policy> Replica<P> {
                 _ => {}
             }
         }
-        let mut r = Replica::new(node, root, cfg);
+        let mut r = Replica::new_with(node, root, cfg, ctx);
         r.used = load_uses(dir)?;
         r.dir = Some(dir.to_path_buf());
         Ok(r)
@@ -251,9 +276,9 @@ impl<P: Policy> Replica<P> {
 
     /// Loads and re-verifies the feed persisted in `dir` (creating it if needed), and keeps persisting
     /// there. Fails if any file doesn't verify; nothing from a failed load is trusted.
-    pub fn open(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig) -> Result<Replica<P>, LoadError> {
+    pub fn open_with(dir: &Path, node: &str, root: VerifyingKey, cfg: ReplicaConfig, ctx: P::Ctx) -> Result<Replica<P>, LoadError> {
         std::fs::create_dir_all(dir)?;
-        let mut r = Replica::new(node, root, cfg);
+        let mut r = Replica::new_with(node, root, cfg, ctx);
         r.load(dir)?;
         r.used = load_uses(dir)?;
         r.dir = Some(dir.to_path_buf());
@@ -303,7 +328,7 @@ impl<P: Policy> Replica<P> {
             return Err(LoadError::Corrupt { file: SNAPSHOT, why: "wrong feed or version".into() });
         }
         self.heads = BTreeMap::from([(s.epoch, s.head.clone())]);
-        self.state = Some(State::from_snapshot(&s));
+        self.state = Some(State::from_snapshot(&s, self.ctx.clone()));
 
         let text = deltas.unwrap_or_default();
         let (complete, _torn) = lines(&text);
@@ -629,7 +654,7 @@ impl<P: Policy> Replica<P> {
                 if regenesis {
                     self.vouched = None;
                 }
-                self.state = Some(State::from_snapshot(&s));
+                self.state = Some(State::from_snapshot(&s, self.ctx.clone()));
                 self.revouch();
                 self.persist_statements().map_err(io)
             }
@@ -684,7 +709,31 @@ impl<P: Policy> Replica<P> {
         self.used.get(grant).copied().unwrap_or(0)
     }
 
-    fn live_grant(&self, st: &State<P>, g: &Grant, op: &Op, now: i64) -> bool {
+    /// The checks every decision starts with: the mode (closed refuses), and run revocation.
+    pub(crate) fn gate(&self, op: &Op, now: i64) -> Result<(Mode, &State<P>), Decision> {
+        let mode = self.mode(now);
+        if mode == Mode::Closed {
+            return Err(Decision::Refused { mode, why: "closed: no state vouched for by a live freshness statement".into() });
+        }
+        let st = self.state.as_ref().expect("not closed");
+        if st.is_revoked(RevokeKind::Run, &op.run.0) {
+            return Err(Decision::Forbidden(format!("run {} is revoked", op.run)));
+        }
+        Ok((mode, st))
+    }
+
+    /// Records one use of a counted grant, durably before it is honoured.
+    pub(crate) fn record_use(&mut self, id: &str) -> Result<(), String> {
+        if let Some(dir) = &self.dir {
+            append_line(&dir.join(USES), id).map_err(|e| format!("could not record a use of grant {id}: {e}"))?;
+        }
+        *self.used.entry(id.to_string()).or_default() += 1;
+        Ok(())
+    }
+}
+
+impl Replica<ZoneSpec> {
+    fn live_grant(&self, st: &State<ZoneSpec>, g: &Grant, op: &Op, now: i64) -> bool {
         g.zone == op.zone
             && g.not_after > now
             && !st.is_revoked(RevokeKind::Grant, &g.id)
@@ -698,16 +747,12 @@ impl<P: Policy> Replica<P> {
     /// The decision for one op at `now`: the mode, the zone's compiled policy, the live grants
     /// (consuming one use of a counted grant) and the revocations. See the crate docs for the rule.
     pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
-        let mode = self.mode(now);
+        let (mode, st) = match self.gate(op, now) {
+            Ok(v) => v,
+            Err(d) => return d,
+        };
         let refused = |why: String| Decision::Refused { mode, why };
-        if mode == Mode::Closed {
-            return refused("closed: no state vouched for by a live freshness statement".into());
-        }
-        let st = self.state.as_ref().expect("not closed");
         let Some(zone) = st.zones.get(&op.zone) else { return Decision::Forbidden(format!("unknown zone {}", op.zone)) };
-        if st.is_revoked(RevokeKind::Run, &op.run.0) {
-            return Decision::Forbidden(format!("run {} is revoked", op.run));
-        }
         match zone.evaluate(op) {
             Verdict::Forbidden(r) => Decision::Forbidden(r),
             Verdict::AllowByReach(i) if mode == Mode::Fresh || op.risk <= NARROW_MAX_RISK => Decision::Allow(Allowed::Reach(i)),
@@ -725,18 +770,17 @@ impl<P: Policy> Replica<P> {
                     .map(|g| (g.id.clone(), g.uses.is_some()));
                 let Some((id, counted)) = found else { return Decision::NeedsGrant(r) };
                 if counted {
-                    if let Some(dir) = &self.dir {
-                        if let Err(e) = append_line(&dir.join(USES), &id) {
-                            return refused(format!("could not record a use of grant {id}: {e}"));
-                        }
+                    if let Err(e) = self.record_use(&id) {
+                        return refused(e);
                     }
-                    *self.used.entry(id.clone()).or_default() += 1;
                 }
                 Decision::Allow(Allowed::Grant(id))
             }
         }
     }
+}
 
+impl<P: Policy> Replica<P> {
     /// Whether the node may issue a lease, start a spawn or sign an approval at `now`: only when
     /// fresh, and never for revoked or expired grants.
     pub fn escalate(&self, e: &Escalation<'_>, now: i64) -> Decision {

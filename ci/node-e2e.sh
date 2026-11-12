@@ -169,7 +169,7 @@ PY
 # Push latency of the revocation: ledger → published (the run polls the ledger every 250 ms) → applied
 # on the node (after the node fsyncs it). Remote: the two clocks differ by their skew.
 [ "$MODE" = --local ] || node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
-pub=$(grep -o 'published [0-9]* grant change(s) to node [a-z0-9-]*, epoch [0-9]* (at [0-9]* ms)' "$work/run.log" | tail -1 || true)
+pub=$(grep -o 'token with [0-9]* live grant(s) to node [a-z0-9-]*, epoch [0-9]* (at [0-9]* ms)' "$work/run.log" | tail -1 || true)
 if [ -n "$pub" ]; then
   ep=$(sed -E 's/.*epoch ([0-9]+).*/\1/' <<<"$pub"); tp=$(sed -E 's/.*at ([0-9]+) ms.*/\1/' <<<"$pub")
   ta=$(grep "feed delta applied, epoch $ep " "$work/node.log" 2>/dev/null | sed -E 's/.*at ([0-9]+) ms.*/\1/' | tail -1 || true)

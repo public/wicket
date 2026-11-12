@@ -3284,6 +3284,7 @@ dependencies = [
  "tracing-subscriber",
  "wicket-agent",
  "wicket-auth",
+ "wicket-authz",
  "wicket-core",
  "wicket-feed",
  "wicket-identity",
@@ -3322,6 +3323,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "wicket-authz",
  "wicket-core",
 ]
 
@@ -3391,6 +3393,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "ulid",
+ "wicket-authz",
  "wicket-core",
  "wicket-feed",
  "wicket-identity",

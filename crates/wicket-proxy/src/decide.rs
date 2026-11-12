@@ -5,8 +5,9 @@
 //!   by reach, else a live ledger grant is consumed, else a pending request is raised (or a recent
 //!   denial repeated).
 //! - [`NodeDecider`]: a remote node's verified feed replica (`wicket_feed::Replica::decide`), so a box
-//!   keeps working while the control host is unreachable, failing narrow: fresh, everything the zone
-//!   and live grants allow; narrow, plain reads (R1) only; closed, nothing. A request that needs a
+//!   keeps working while the control host is unreachable, failing narrow: fresh, everything the box's
+//!   token and its live grants allow; narrow, plain reads (R1) only; closed, nothing. The feed
+//!   carries each box's authority as a Biscuit token chain (`wicket_feed::token`), loaded once. A request that needs a
 //!   grant is put to the control host (which raises the pending request, so `wicket pending` and
 //!   `wicket approve` work as usual) when the node is connected; when it isn't, it fails with a clear
 //!   403 and no request id. Grant uses are counted on the node, for its boxes only.
@@ -15,7 +16,7 @@ use crate::RunCtx;
 use futures_util::future::BoxFuture;
 use std::sync::{Arc, Mutex};
 use wicket_core::{HostVerdict, Op, Verdict, ZoneSpec};
-use wicket_feed::{Allowed, Decision, Mode, Replica};
+use wicket_feed::{Allowed, BoxAuthority, Decision, Mode, Replica};
 
 /// What the egress proxy does with one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +124,7 @@ pub const UNREACHABLE: &str = "wicket's control plane is unreachable from this n
 
 /// Decisions from a node's verified feed replica.
 pub struct NodeDecider {
-    pub replica: Arc<Mutex<Replica<ZoneSpec>>>,
+    pub replica: Arc<Mutex<Replica<BoxAuthority>>>,
     pub clock: Clock,
     pub control: Arc<dyn ControlLink>,
 }
@@ -147,20 +148,17 @@ pub fn stale_text(mode: Mode, why: &str) -> String {
 }
 
 impl Decider for NodeDecider {
-    fn host_verdict(&self, _ctx: &RunCtx, host: &str) -> HostVerdict {
-        let r = self.replica.lock().expect("replica");
-        match r.state().and_then(|s| s.zones.get(&_ctx.zone.name)).map(|z| &z.compiled) {
-            Some(Ok(z)) => z.host_verdict(host),
-            Some(Err(e)) => HostVerdict::Forbidden(format!("this zone's policy is invalid: {e}")),
-            // No policy for the zone (yet): the request itself is refused by `decide`.
-            None => HostVerdict::Open,
-        }
+    fn host_verdict(&self, ctx: &RunCtx, host: &str) -> HostVerdict {
+        // An early refusal from the zone the box's token was minted from; the token decides each
+        // request. No (valid) token for the box: the request itself is refused by `decide`.
+        self.replica.lock().expect("replica").host_verdict(&ctx.run.0, host)
     }
 
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
             match self.decide_now(op) {
                 Decision::Allow(Allowed::Reach(i)) => Outcome::Allow(format!("reach rule {i} (node)")),
+                Decision::Allow(Allowed::Ceiling) => Outcome::Allow("the box's token (node)".into()),
                 Decision::Allow(Allowed::Grant(g)) => Outcome::Allow(format!("grant {g} (counted on the node)")),
                 Decision::Allow(other) => Outcome::Allow(format!("{other:?}")),
                 Decision::Forbidden(why) => Outcome::Forbidden(why),
@@ -226,7 +224,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use wicket_core::{Manifest, RunId, TenantId};
-    use wicket_feed::{Change, KeyCert, Publisher, PublisherConfig, ReplicaConfig};
+    use wicket_feed::{Change, Issuer, KeyCert, LiveGrant, Publisher, PublisherConfig, ReplicaConfig};
 
     fn zone() -> ZoneSpec {
         Manifest::from_yaml(
@@ -310,19 +308,20 @@ mod tests {
         }
     }
 
-    /// A publisher and a replica fed from it, with the clock in the test's hands.
-    fn feed() -> (Publisher<ZoneSpec>, Arc<Mutex<Replica<ZoneSpec>>>, std::path::PathBuf) {
+    /// A publisher of box authority and a replica fed from it, with the clock in the test's hands.
+    fn feed() -> (Publisher<BoxAuthority>, Arc<Mutex<Replica<BoxAuthority>>>, std::path::PathBuf, wicket_authz::SigningKey) {
         use ed25519_dalek::SigningKey;
         let dir = std::env::temp_dir().join(format!("wicket-decide-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&dir);
         let root = SigningKey::from_bytes(&[7; 32]);
         let key = SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
         let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000, 120_000);
         let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
         let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, narrow_ms: 2_000, retain: 100 };
-        let p = Publisher::open(&dir, "n1", &root.verifying_key(), key, &cert_jws, cfg).unwrap();
-        let r = Replica::new("n1", root.verifying_key(), ReplicaConfig::default());
-        (p, Arc::new(Mutex::new(r)), dir)
+        let p = Publisher::open_with(&dir, "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+        (p, Arc::new(Mutex::new(r)), dir, authz_root)
     }
 
     fn op(method: &str, path: &str) -> Op {
@@ -331,7 +330,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_node_decider_fails_narrow_and_escalates_only_when_connected() {
-        let (mut p, replica, dir) = feed();
+        let (mut p, replica, dir, authz_root) = feed();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
         let now = Arc::new(AtomicI64::new(1_000_000));
         let clock: Clock = {
             let now = now.clone();
@@ -343,16 +343,19 @@ mod tests {
         let t0 = now.load(Ordering::SeqCst);
         // Closed before any feed arrives.
         assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Unavailable(_)));
-        p.commit(vec![Change::PutZone { zone: zone() }], t0).unwrap();
+        let tenant = TenantId::single().0;
+        let issuer = Issuer::root(&authz_root, &tenant, "run:run_a", "run_a", 0, &zone(), &[], 3_600, vec![approver.public()]).unwrap();
+        p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], t0).unwrap();
         let hello = replica.lock().unwrap().hello();
         for f in p.catch_up(&hello, t0).unwrap() {
             replica.lock().unwrap().accept(&f, t0).unwrap();
         }
-        // Fresh: reads and writes by reach; out of reach is put to the control host.
-        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(_)));
+        // Fresh: reads and writes by the token's ceiling; out of reach is put to the control host.
+        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(t) if t.contains("token")));
         assert!(matches!(d.decide(&c, &op("POST", "/v1/a"), None).await, Outcome::Allow(_)));
         assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Pending { request, .. } if request == "r-0"));
         assert!(matches!(d.decide(&ctx(false), &op("GET", "/other"), None).await, Outcome::NoEscalation(_)));
+        assert_eq!(d.host_verdict(&c, "169.254.169.254"), wicket_core::CompiledZone::new(zone()).unwrap().host_verdict("169.254.169.254"));
         link.up.store(false, Ordering::SeqCst);
         assert_eq!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Unavailable(UNREACHABLE.into()));
         assert_eq!(link.asks.load(Ordering::SeqCst), 1, "no ask while disconnected");
@@ -363,19 +366,23 @@ mod tests {
         // Past the narrow window: closed.
         now.store(t0 + 3_500, Ordering::SeqCst);
         assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Unavailable(t) if t.contains("allows nothing")));
-        // A grant bound to the box, counted on the node; a revocation applies at once.
+        // A grant: a block appended to the box's token on the control host, its uses counted on the
+        // node; a revocation applies at once.
         let t1 = t0 + 4_000;
         now.store(t1, Ordering::SeqCst);
-        let g = wicket_feed::Grant {
-            id: "g-1".into(),
-            zone: "z".into(),
-            op: op("GET", "/other").digest(),
-            what: "GET api.example.com/other".into(),
-            not_after: t1 + 60_000,
-            uses: Some(2),
-            box_id: Some("run_a".into()),
+        let g = wicket_authz::Grant {
+            gid: "g-1".into(),
+            box_id: String::new(),
+            epoch: 0,
+            host: "api.example.com".into(),
+            method: "GET".into(),
+            path: "/other".into(),
+            not_after: 3_600,
+            approver: "human:test".into(),
+            digest: vec![],
         };
-        let delta = p.commit(vec![Change::AddGrant { grant: g }], t1).unwrap();
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: Some(2) }]).unwrap();
+        let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
         replica.lock().unwrap().accept(&delta, t1).unwrap();
         replica.lock().unwrap().accept(&p.statement(t1), t1).unwrap();
         assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Allow(t) if t.contains("g-1")));
