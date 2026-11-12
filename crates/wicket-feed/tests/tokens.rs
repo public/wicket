@@ -70,8 +70,11 @@ fn cert(root: &FeedKey, feed: &FeedKey) -> String {
 
 impl Cp {
     fn new() -> Cp {
+        Cp::new_with_authz_root(SigningKey::generate())
+    }
+
+    fn new_with_authz_root(authz_root: SigningKey) -> Cp {
         let (root, feed_key) = (FeedKey::generate(&mut rand_core::OsRng), FeedKey::generate(&mut rand_core::OsRng));
-        let authz_root = SigningKey::generate();
         let dir = TempDir::new("cp");
         let p = Publisher::open_with(
             dir.path(),
@@ -397,4 +400,49 @@ fn a_hostile_appended_block_is_refused_at_load() {
     a.run = "r1".into();
     let e = cp.p.commit(vec![Change::PutZone { zone: a }], T0 + 10);
     assert!(matches!(&e, Err(PublishError::Invalid(w)) if w.contains("load")), "{e:?}");
+}
+
+/// #154: with the authority root offline, an online issuing key the root certified mints block 0;
+/// a node loads such a token with its certificate, refuses it without one or with one from another
+/// root, and forbids the box everything once the certificate has ended.
+#[test]
+fn a_token_minted_by_a_certified_issuing_key_loads_until_its_certificate_expires() {
+    let seed = [7u8; 32];
+    let root = SigningKey::from_bytes(&seed).unwrap();
+    // The root's seed signs certificates as an Ed25519 JWS key: the same public key.
+    assert_eq!(FeedKey::from_bytes(&seed).verifying_key().to_bytes(), root.public().0);
+    let issuing = SigningKey::generate();
+    let now = now_ms();
+    let z = zone("zp", &["/repos/acme/**"]);
+    let mut i = Issuer::root(&issuing, TENANT, "trigger:t", "p", 0, &z, &[], secs(now) + 3600, vec![]).unwrap();
+    i.issuer_cert = Some(AuthzKeyCert::sign(&seed, &issuing.public(), now + 3_600_000));
+    let a = i.publish(&SigningKey::generate(), &[]).unwrap();
+    let load = |a: &BoxAuthority| a.compile(&root.public(), &|_, _| false).map(|_| ()).map_err(|e| e.to_string());
+    assert_eq!(load(&a), Ok(()));
+    // A child carries its parent's certificate.
+    let keys = vec![];
+    let zc = zone("zc", &["/repos/acme/app/**"]);
+    let c = i.child("c", 0, &zc, &Ceiling::from_zone(&zc, "p/c", secs(now) + 3600, keys).unwrap()).unwrap();
+    assert_eq!(load(&c.publish(&SigningKey::generate(), &[]).unwrap()), Ok(()));
+    let with = |cert: Option<String>| BoxAuthority { issuer_cert: cert, ..a.clone() };
+    assert!(load(&with(None)).is_err(), "the issuing key isn't the root");
+    // A certificate for a minute: the box is allowed until then, and forbidden everything after, by
+    // the node's clock (the token itself lasts an hour).
+    let mut short = Issuer::root(&issuing, TENANT, "trigger:t", "s", 0, &z, &[], secs(now) + 3600, vec![]).unwrap();
+    short.issuer_cert = Some(AuthzKeyCert::sign(&seed, &issuing.public(), now + 60_000));
+    let mut cp = Cp::new_with_authz_root(root.clone());
+    cp.put(short.publish(&SigningKey::generate(), &[]).unwrap(), now - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, now);
+    let get = gh("zp", "s", "GET", "/repos/acme/app");
+    assert_eq!(kind(&r.decide(&get, now)), "allow");
+    let later = now + 120_000;
+    r.accept(&cp.p.statement(later), later).unwrap();
+    let d = r.decide(&get, later);
+    assert!(matches!(&d, Decision::Forbidden(w) if w.contains("no longer certified")), "{d:?}");
+    assert!(load(&with(Some(AuthzKeyCert::sign(&[8u8; 32], &issuing.public(), now + 3_600_000)))).is_err(), "another root");
+    // A record the root minted itself has no certificate, and no new field on the wire.
+    let cp = Cp::new();
+    let plain = cp.issue("q", &z).publish(&cp.approver, &[]).unwrap();
+    assert!(serde_json::to_value(&plain).unwrap().get("issuer_cert").is_none());
 }

@@ -226,7 +226,7 @@ fi
 
 say "systemd units"
 units_changed=0
-for u in wicketd wicket-console wicket-reconcile; do
+for u in wicketd wicket-console wicket-reconcile wicket-state; do
     if ! cmp -s "$here/systemd/$u.service" "/etc/systemd/system/$u.service"; then
         install -m 0644 "$here/systemd/$u.service" "/etc/systemd/system/$u.service"
         units_changed=1
@@ -235,12 +235,13 @@ done
 if [ "$systemd" = 1 ]; then
     systemctl daemon-reload
     if [ "$start" = 1 ]; then
-        systemctl enable wicketd wicket-console wicket-reconcile >/dev/null 2>&1
+        # wicket-state starts only once state-store.yaml exists (docs/state.md).
+        systemctl enable wicketd wicket-console wicket-reconcile wicket-state >/dev/null 2>&1
         # Restarting wicketd stops the runs started through it: only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
             systemctl restart wicketd
         fi
-        for u in wicket-console wicket-reconcile; do
+        for u in wicket-console wicket-reconcile wicket-state; do
             if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q "$u"; then
                 systemctl restart "$u"
             fi
@@ -259,6 +260,12 @@ if [ "$skip_image" = 0 ]; then
     tag=wicket/claude-code:$id
     docker image inspect "$tag" >/dev/null 2>&1 || as_wicket image --tag "$tag"
     docker tag "$tag" wicket/claude-code:poc
+    # The ledger's stream (wicket-state, docs/state.md) runs Litestream from this image unless
+    # state-store.yaml names another: pinned by digest, the same as LITESTREAM_IMAGE in
+    # crates/wicket-cli/src/statestore.rs (a test keeps the two equal).
+    say "Litestream image (for the ledger's stream)"
+    litestream_image=litestream/litestream@sha256:0ba1cdbb2d0be8876e27b1e646dc031309b7e3928e0ed91503ebaa73ff7e2c5d
+    docker pull -q "$litestream_image" >/dev/null || say "could not pull $litestream_image: wicket-state will pull it when it first starts"
 fi
 
 cat <<EOF

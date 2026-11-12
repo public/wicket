@@ -150,6 +150,12 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 - `wicket doctor` and `wicket reap` find and stop boxes whose `wicket run` died
   ([#82](https://github.com/public/wicket/pull/82)); `wicket reconcile` subsumes the reaper
   ([#98](https://github.com/public/wicket/pull/98)).
+- Control-plane state off the host: an S3-compatible state store for hibernated agents' bundles and
+  audit segments (a `store` audit sink, `audit --verify --against store:<sink>`), the ledger streamed
+  to it by Litestream (`wicket state replicate`, the `wicket-state` service), a recovery kit
+  (`wicket state kit`), `wicket state restore` onto a standby, and the feed and authority roots offline
+  (`wicket keys roots-offline`/`certify`/`roots-online`) with a certified issuing key minting boxes'
+  tokens. `ci/restore.sh` tests a restore end to end ([#154](https://github.com/public/wicket/issues/154)).
 - `wicket secret link` can reference a whole file, re-read at each use
   ([#96](https://github.com/public/wicket/pull/96)).
 - CI on every pull request: a secrets and machine-details check, fmt, clippy, tests, and gVisor smoke,

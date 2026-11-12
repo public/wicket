@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -331,6 +331,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN max_risk INTEGER", []);
         // The run a grant is bound to (#127); NULL is zone-wide, as every grant was before.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN run TEXT", []);
+        // The feed epoch that carries a grant handed to a node, until the node reports it applied.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN node_epoch INTEGER", []);
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
@@ -1411,11 +1413,15 @@ impl Ledger {
     }
 
     /// Records the control host's own built-in node (#146): enrolled by the control host itself, so
-    /// no join token, and no node CA (it decides nothing itself). A no-op if it is already recorded.
+    /// no join token, and no node CA (it decides nothing itself). Already recorded and active, it takes
+    /// the new key and target: the node's directory was made again (lost, or a restore onto a standby,
+    /// #154), and the key it had is gone with it.
     pub fn enrol_builtin_node(&self, node: &NodeRow) -> Result<()> {
         self.conn.execute(
             &format!(
-                "INSERT INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL) ON CONFLICT(name) DO NOTHING"
+                "INSERT INTO nodes ({NODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL) \
+                 ON CONFLICT(name) DO UPDATE SET node_key = excluded.node_key, target = excluded.target, enrolled_at = excluded.enrolled_at \
+                 WHERE nodes.status = 'active'"
             ),
             params![
                 node.name,
