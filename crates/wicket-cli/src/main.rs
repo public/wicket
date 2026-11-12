@@ -160,6 +160,10 @@ enum Cmd {
         /// Don't ask for confirmation at a terminal (the request is printed either way).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Let any run in the request's zone use the grant, until it expires. By default only the
+        /// run that asked may, and the grant ends with that run.
+        #[arg(long)]
+        zone_wide: bool,
     },
     /// Deny a pending request.
     Deny { id: String },
@@ -887,7 +891,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Approve { id, uses, unlimited, ttl, prefix, yes } => {
+        Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
             if ttl > Duration::from_secs(24 * 3600) {
                 bail!("grants are capped at 24h in the PoC");
@@ -902,7 +906,7 @@ async fn main() -> Result<()> {
             }
             let lease = capacity::lease_of_request(&l, &req)?;
             let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
-            let gid = l.approve(&id, &a)?;
+            let gid = if zone_wide { l.approve_zone_wide(&id, &a)? } else { l.approve(&id, &a)? };
             // A grant exists only if its approval is on the record (fail closed).
             if let Err(e) = l.audit(
                 &TenantId::single(),
@@ -914,18 +918,20 @@ async fn main() -> Result<()> {
                     "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
                     "agent_identity": verified_identity(&l, &req.run, None),
                     "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
+                    "scope": if zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone,
                 }),
             ) {
                 let _ = l.revoke_grant(&gid);
                 return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
             }
             println!(
-                "approved {id} → grant {gid}: {} {}{} ({}, {})",
+                "approved {id} → grant {gid}: {} {}{} ({}, {}, {})",
                 wicket_agent::clip(&req.method, 16),
                 wicket_agent::clip(&req.host, 255),
                 wicket_agent::clip(&prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), 400),
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
-                humantime::format_duration(ttl)
+                humantime::format_duration(ttl),
+                if zone_wide { format!("any run in zone {}", wicket_agent::clip(&req.zone, 64)) } else { format!("run {} only", req.run) }
             );
             if let Some(lease) = lease.as_deref() {
                 // A capacity ask: provision now rather than at the next pass of a running reconciler.

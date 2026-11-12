@@ -62,8 +62,11 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     };
 
     // The child's zone: what the caller wrote, with omitted fields defaulted from the parent (never
-    // wider than it), the parent's forbid rules prepended, and a name under the parent's.
-    let zone_name = format!("{}.{name}", p.zone.name);
+    // wider than it), the parent's forbid rules prepended, and a name under the parent's that no
+    // other run can make (#127): `<parent zone>.<name>.<parent run>`. A name has no dots and a run
+    // id a fixed length, so two different (parent zone, name, run) never give the same zone name,
+    // and none collides with another zone's grants, accept_from entries or volumes.
+    let zone_name = format!("{}.{name}.{}", p.zone.name, c.run.0.strip_prefix("run_").unwrap_or(&c.run.0));
     let mut z: ZoneSpec = match &req.zone {
         Some(v) => {
             let mut v = v.clone();
@@ -593,6 +596,14 @@ mod tests {
         assert_eq!(*p.ctx.slots.lock().unwrap(), 0);
         Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
         assert!(spawn(&p.ctx, program("a")).unwrap().starts_with("started"));
+    }
+
+    /// #127: a spawned zone's name carries the parent run, so no other run can make it.
+    #[test]
+    fn spawned_zone_names_are_unique_to_the_parent_run() {
+        let p = parent(1, ZONE);
+        let out = spawn(&p.ctx, program("worker")).unwrap();
+        assert!(out.contains("zone z.worker.01parent,"), "{out}");
     }
 
     /// #118: a different model route or credential is refused outright; a card for anything else
