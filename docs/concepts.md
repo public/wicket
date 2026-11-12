@@ -53,6 +53,13 @@ that carry an IPv4 address, such as NAT64 and 6to4). A host is parsed as a URL p
 every upstream name itself and connects only to addresses it has checked; a name with any non-public
 address is refused, and the checked address is the one dialled, so DNS rebinding can't move a connection.
 
+A request goes upstream as it was decided. Only allow-listed request headers are forwarded (content
+negotiation, caching, conditional requests, the body's type and encoding, `git-protocol`, and a
+provider's own, such as `x-github-api-version` to GitHub's API), and wicket adds the credential itself.
+Requests that could run as something else are refused: methods other than GET, HEAD, POST, PUT, PATCH,
+DELETE and OPTIONS (so TRACE, and CONNECT inside a tunnel), method-override and URL-rewrite headers
+(`X-HTTP-Method-Override`, `X-Original-URL` and the like), and bodies on GET and HEAD.
+
 **The subset rule.** An agent with `max_children` can `spawn` an agent or a program in a zone it writes.
 That zone must be within the agent's own (`wicket_core::subset`):
 

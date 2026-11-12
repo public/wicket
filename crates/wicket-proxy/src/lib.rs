@@ -442,6 +442,51 @@ pub(crate) const STRIP_REQUEST: &[&str] = &[
     "cookie",
 ];
 
+/// Request headers the egress proxy forwards from a box to any upstream (#130, design §9.0): content
+/// negotiation, caching and conditional requests, the body's own description, and git's protocol
+/// version. Every other header is dropped; [`provider_request_header`] adds a provider's own.
+pub(crate) const FORWARD_REQUEST: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-encoding",
+    "content-language",
+    "content-type",
+    "git-protocol",
+    "idempotency-key",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "user-agent",
+    "x-request-id",
+];
+
+/// A provider's own request headers, forwarded to its hosts only (what an adapter would declare).
+pub(crate) fn provider_request_header(host: &str, name: &str) -> bool {
+    match host {
+        "api.github.com" | "uploads.github.com" => name == "x-github-api-version",
+        // Claude Code's model and Remote Control traffic (wrapped sessions).
+        "api.anthropic.com" => name.starts_with("anthropic-") || name.starts_with("x-stainless-") || name.starts_with("x-claude-") || name == "x-app",
+        _ => false,
+    }
+}
+
+/// Headers that make some servers run a request as another method or on another path than the one
+/// decided: a request carrying one is refused outright (#130).
+pub(crate) const REFUSE_REQUEST: &[&str] =
+    &["x-http-method-override", "x-http-method", "x-method-override", "x-original-method", "x-original-url", "x-rewrite-url"];
+
+/// The methods the egress proxy forwards. TRACE, TRACK, CONNECT inside a tunnel and anything
+/// unknown are refused.
+pub(crate) const FORWARD_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
 pub(crate) const STRIP_RESPONSE: &[&str] = &["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length"];
 
 #[cfg(test)]

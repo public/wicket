@@ -10,7 +10,7 @@
 
 use crate::ca::{Minter, RunCa};
 use crate::decide::{Central, Decider, Outcome, Route};
-use crate::{full, problem, BoxBody, Event, RunCtx, STRIP_REQUEST, STRIP_RESPONSE};
+use crate::{full, problem, BoxBody, Event, RunCtx, FORWARD_METHODS, FORWARD_REQUEST, REFUSE_REQUEST, STRIP_RESPONSE};
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -398,6 +398,9 @@ impl Egress {
                 return self.refuse(&host, &method, "/", &format!("Host header {h:?} does not match the tunnel target"));
             }
         }
+        if let Some(why) = refused_shape(&req) {
+            return self.refuse(&host, &method, "/", &why);
+        }
         // A credential never goes out in cleartext (#129): plain HTTP to a host the zone injects a
         // credential into, or swaps a placeholder for, is refused before anything is decided or read
         // from the vault, whether or not this request would have carried one.
@@ -587,9 +590,13 @@ impl Egress {
         let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let url = format!("{scheme}://{host}{pq}");
+        if matches!(parts.method, Method::GET | Method::HEAD) && !body.is_empty() {
+            anyhow::bail!("refused: a {} request with a body", parts.method);
+        }
+        // Only allow-listed headers go upstream (#130); credentials are added below, by wicket.
         let mut headers = http::HeaderMap::new();
         for (name, value) in parts.headers.iter() {
-            if !STRIP_REQUEST.contains(&name.as_str()) {
+            if FORWARD_REQUEST.contains(&name.as_str()) || crate::provider_request_header(host, name.as_str()) {
                 headers.append(name.clone(), value.clone());
             }
         }
@@ -631,6 +638,27 @@ impl Egress {
         }
         Ok(Outgoing { method: parts.method, url, headers, body, injected })
     }
+}
+
+/// Why a request is refused before any decision, by its method, headers or body framing (#130,
+/// design §9.1): methods other than the usual ones (TRACE, and CONNECT inside a tunnel, among them),
+/// method-override and URL-rewrite headers, and a body on GET or HEAD.
+fn refused_shape<B>(req: &Request<B>) -> Option<String> {
+    let method = req.method().as_str();
+    if !FORWARD_METHODS.contains(&method) {
+        return Some(format!("the {method} method is not proxied"));
+    }
+    if let Some(h) = REFUSE_REQUEST.iter().find(|h| req.headers().contains_key(**h)) {
+        return Some(format!("the {h} header is refused: the request must be decided as it will run"));
+    }
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        let h = req.headers();
+        let length = h.get(http::header::CONTENT_LENGTH).map(|v| v.as_bytes() != b"0").unwrap_or(false);
+        if length || h.contains_key(http::header::TRANSFER_ENCODING) {
+            return Some(format!("a {method} request with a body is not proxied"));
+        }
+    }
+    None
 }
 
 /// A response head: status, reason phrase, and headers with lowercase names.
@@ -742,6 +770,63 @@ mod tests {
         for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
         }
+    }
+
+    /// #130: only allow-listed headers go upstream, and requests that could run as something other
+    /// than what was decided are refused before the decision.
+    #[tokio::test]
+    async fn headers_are_forwarded_by_allowlist_and_override_shapes_are_refused() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "shape");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c, ca).unwrap();
+        let empty = || http_body_util::Full::new(bytes::Bytes::new());
+        let refused = [
+            http::Request::builder().method("TRACE").uri("/x").body(empty()).unwrap(),
+            http::Request::builder().method("TRACK").uri("/x").body(empty()).unwrap(),
+            http::Request::builder().method("CONNECT").uri("/x").body(empty()).unwrap(),
+            http::Request::post("/repos/a/b/issues").header("x-http-method-override", "DELETE").body(empty()).unwrap(),
+            http::Request::get("/safe").header("X-Original-URL", "/admin").body(empty()).unwrap(),
+            http::Request::get("/safe").header("x-rewrite-url", "/admin").body(empty()).unwrap(),
+            http::Request::get("/safe").header("content-length", "5").body(http_body_util::Full::new(bytes::Bytes::from_static(b"hello"))).unwrap(),
+            http::Request::head("/safe").header("transfer-encoding", "chunked").body(empty()).unwrap(),
+        ];
+        for req in refused {
+            let what = format!("{} {:?}", req.method(), req.headers());
+            let resp = e.clone().handle(req, "api.github.com".into(), "https", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 403, "{what}: {body}");
+            assert!(body.contains("malformed request") || body.contains("not proxied") || body.contains("refused"), "{what}: {body}");
+        }
+        // What does go upstream: the allow-list, plus the provider's own headers on its hosts only.
+        let req = || {
+            http::Request::post("/x")
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("git-protocol", "version=2")
+                .header("x-github-api-version", "2022-11-28")
+                .header("anthropic-beta", "b")
+                .header("x-forwarded-for", "10.0.0.1")
+                .header("x-forwarded-host", "internal")
+                .header("forwarded", "for=10.0.0.1")
+                .header("cookie", "a=b")
+                .header("x-api-key", "k")
+                .header("x-anything", "y")
+                .body(empty())
+                .unwrap()
+        };
+        let gh = e.prepare(req(), "api.github.com", "https", "/x").await.unwrap();
+        let names: Vec<&str> = gh.headers.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["accept", "content-type", "git-protocol", "x-github-api-version"], "{names:?}");
+        let other = e.prepare(req(), "example.com", "https", "/x").await.unwrap();
+        assert!(!other.headers.contains_key("x-github-api-version") && !other.headers.contains_key("anthropic-beta"));
+        let ant = e.prepare(req(), "api.anthropic.com", "https", "/x").await.unwrap();
+        assert!(ant.headers.contains_key("anthropic-beta") && !ant.headers.contains_key("x-github-api-version"));
+        // A GET body that arrives without framing headers (HTTP/3) is caught when it is read.
+        let get = http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::from_static(b"x"))).unwrap();
+        assert!(e.prepare(get, "api.github.com", "https", "/x").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// #129: no credential is ever sent over plain HTTP: requests to a host with an inject rule or a
