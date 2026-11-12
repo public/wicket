@@ -126,6 +126,14 @@ pub struct RunState {
     pub stderr_total: u64,
     /// The exit, if it has exited: (code, result.json if any).
     pub exited: Option<(i32, Option<String>)>,
+    /// The oldest stdout and stderr bytes the node still holds (it drops what was acknowledged).
+    #[serde(default)]
+    pub stdout_start: u64,
+    #[serde(default)]
+    pub stderr_start: u64,
+    /// The control host's lease of the run, as the node holds it (Unix ms; 0: none).
+    #[serde(default)]
+    pub lease_until: i64,
 }
 
 /// Control messages.
@@ -172,6 +180,12 @@ pub enum Msg {
     },
     StdinClose {
         run: String,
+    },
+    /// The control host's lease of a run it supervises (#151), renewed with every freshness
+    /// statement, until `until` (Unix ms). The node keeps the run's box while it is live.
+    RunLease {
+        run: String,
+        until: i64,
     },
     Kill {
         run: String,
@@ -419,8 +433,12 @@ impl OutBuf {
         OutBuf { start: 0, data: Default::default(), cap }
     }
 
+    /// An empty buffer whose next byte is at offset `at` (a stream picked up part way).
+    pub fn starting_at(cap: usize, at: u64) -> OutBuf {
+        OutBuf { start: at, data: Default::default(), cap }
+    }
+
     /// The offset of the oldest byte held.
-    #[cfg(test)]
     pub fn start(&self) -> u64 {
         self.start
     }
@@ -573,6 +591,9 @@ mod tests {
                     stdout_total: 9,
                     stderr_total: 0,
                     exited: Some((0, None)),
+                    stdout_start: 2,
+                    stderr_start: 0,
+                    lease_until: 1,
                 }],
                 capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
             }),

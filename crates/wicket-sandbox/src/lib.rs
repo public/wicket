@@ -257,6 +257,93 @@ impl Docker {
         c.spawn().context("starting docker run")
     }
 
+    /// Starts the box detached (`docker run -d`, kept after it exits so its exit code can be read):
+    /// its stdin, if interactive, stays open between attaches, so a supervisor that restarts can
+    /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
+    pub async fn start_detached(&self, spec: &SandboxSpec) -> Result<()> {
+        let args: Vec<String> = self.build_args(spec).into_iter().map(|a| if a == "--rm" { "-d".to_string() } else { a }).collect();
+        let out = self.command_with(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output().await?;
+        if !out.status.success() {
+            bail!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    /// Writes to a detached box's stdin (piped), for as long as the returned process lives; its own
+    /// output is discarded ([`Docker::logs`] reads the box's).
+    pub fn attach_stdin(&self, name: &str) -> Command {
+        let mut c = self.command_with(["attach".to_string(), "--sig-proxy=false".into(), name.into()]);
+        c.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        c
+    }
+
+    /// A box's stdout and stderr from its start, followed until it exits (piped).
+    pub fn logs(&self, name: &str) -> Command {
+        let mut c = self.command_with(["logs".to_string(), "--follow".into(), name.into()]);
+        c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        c
+    }
+
+    /// Waits for a box to exit; its exit code.
+    pub async fn wait(&self, name: &str) -> Result<i32> {
+        let out = self.command_with(["wait".to_string(), name.into()]).stdin(Stdio::null()).stderr(Stdio::piped()).output().await?;
+        if !out.status.success() {
+            bail!("docker wait failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        String::from_utf8_lossy(&out.stdout).trim().parse().context("docker wait's exit code")
+    }
+
+    /// Whether a box exists, and if so whether it runs and its exit code.
+    pub async fn state(&self, name: &str) -> Result<Option<(bool, i32)>> {
+        let out = self
+            .command_with(["inspect".to_string(), "-f".into(), "{{.State.Running}} {{.State.ExitCode}}".into(), name.into()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut it = s.split_whitespace();
+        Ok(Some((it.next() == Some("true"), it.next().and_then(|c| c.parse().ok()).unwrap_or(-1))))
+    }
+
+    /// wicket boxes that have exited and are still there (started detached): (name, run).
+    pub async fn exited_boxes(&self) -> Result<Vec<(String, String)>> {
+        let out = self
+            .command_with([
+                "ps".to_string(),
+                "-a".into(),
+                "--filter".into(),
+                "label=wicket=1".into(),
+                "--filter".into(),
+                "status=exited".into(),
+                "--format".into(),
+                "{{.Names}}\t{{.Label \"wicket.run\"}}".into(),
+            ])
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker ps")?;
+        if !out.status.success() {
+            bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(_, r)| !r.is_empty())
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect())
+    }
+
+    /// Removes a box (running or not).
+    pub async fn remove(&self, name: &str) -> Result<()> {
+        let _ =
+            self.command_with(["rm".to_string(), "-f".into(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        Ok(())
+    }
+
     /// Every running wicket box (label `wicket=1`).
     pub async fn boxes(&self) -> Result<Vec<BoxInfo>> {
         let out = self

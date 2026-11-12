@@ -63,4 +63,7 @@ while [ $i -lt 50 ]; do
   i=$((i + 1)); sleep 0.1
 done
 
+# An interactive box's stdin comes from wicket's node over a socket (#151), so it outlives the node
+# process writing it: the forwarder runs the agent and feeds it.
+if [ -n "${WICKET_STDIN_SOCK:-}" ]; then set -- wicket-fwd --stdin-from "$WICKET_STDIN_SOCK" -- "$@"; fi
 exec setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --bounding-set=-all -- "$@"

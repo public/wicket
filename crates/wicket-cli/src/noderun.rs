@@ -670,6 +670,9 @@ async fn session(
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
+                // The run's lease on its node (#151): renewed with the feed's freshness, for as long
+                // as a statement lasts (its TTL and narrow window).
+                send(Frame::Msg(Msg::RunLease { run: sh.run.0.clone(), until: wicket_feed::now_ms() + sh.cfg.ttl_ms + sh.cfg.narrow_ms }));
             }
             _ = grants.tick() => {
                 for f in sync_grants(sh, p) {

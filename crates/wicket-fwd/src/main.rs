@@ -9,6 +9,7 @@ const USAGE: &str = "\
 usage: wicket-fwd --listen IP:PORT=/path/to/unix.sock [--listen ...] [--udp IP:PORT=/path/to/unix.sock ...]
                   [--max-conns N] [--copy rw|splice] [--buf BYTES] [--bind-timeout SECS] [--verbose]
        wicket-fwd --dial IP:PORT [--copy rw|splice] [--buf BYTES]
+       wicket-fwd --stdin-from /path/to/unix.sock -- CMD [ARGS...]
 
 Relays each TCP connection accepted on IP:PORT to a new connection on the unix socket.
   --listen        a TCP listener and the unix socket it relays to (repeatable)
@@ -19,7 +20,9 @@ Relays each TCP connection accepted on IP:PORT to a new connection on the unix s
   --buf           buffer or pipe size per direction, in bytes (default 262144)
   --bind-timeout  how long to wait at start for a listen address to appear (default 5)
   --verbose       one log line per connection (peer, byte counts, duration; never contents)
-  --dial          instead: one TCP connection to IP:PORT, relayed to stdin/stdout (links between boxes)";
+  --dial          instead: one TCP connection to IP:PORT, relayed to stdin/stdout (links between boxes)
+  --stdin-from    instead: runs CMD with its stdin fed from wicket's node over the unix socket,
+                  reconnecting if the node restarts; exits with CMD's exit code";
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
     let mut cfg = Config::default();
@@ -61,7 +64,21 @@ fn number<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
-    let cfg = match parse(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--stdin-from") {
+        let (Some(sock), Some("--")) = (argv.get(1), argv.get(2).map(String::as_str)) else {
+            eprintln!("wicket-fwd: --stdin-from SOCK -- CMD [ARGS...]\n\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        return match wicket_fwd::stdin::run(std::path::Path::new(sock), &argv[3..]) {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(e) => {
+                wicket_fwd::log(format_args!("--stdin-from: {e}"));
+                ExitCode::from(127)
+            }
+        };
+    }
+    let cfg = match parse(argv) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
             println!("{USAGE}");
