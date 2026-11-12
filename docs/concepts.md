@@ -39,7 +39,12 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
 - **llm:** the model budget (requests, input and output tokens). Each call reserves its `max_tokens` up
   front (lowered to what is left if it asks for more), and is charged what its final usage reports. A
   call is read to its end even if the agent hangs up, and one whose final usage never arrives is charged
-  its whole reservation;
+  its whole reservation. Model requests are vetted too: only `POST /v1/messages` and
+  `/v1/messages/count_tokens` take a body, which must be uncompressed JSON; only known request fields and
+  client tools (custom, bash, text editor, memory, computer use) are forwarded, since server tools, the MCP
+  connector and containers make the provider reach hosts the zone never allowed (`llm.allow_server_tools`
+  lets them through). A wrapped Claude Code session's model calls, which reach the model host through the
+  egress proxy, get the same budget, checks and accounting there;
 - **limits, isolation, images, volumes:** memory, CPUs and time; the isolation tier; the images a child
   may use; named directories that persist between runs;
 - **accept_from:** the zones whose agents may message this one.

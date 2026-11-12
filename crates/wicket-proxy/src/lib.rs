@@ -423,25 +423,6 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
 /// What every refusal reminds the agent of: where it is, and that there is no other way out.
 pub(crate) const SANDBOX_FACT: &str = "You are in a wicket sandbox (a gVisor container with no network of its own); wicket's proxy is its only route out, so no other tool, host, mirror or cache will reach this either.";
 
-/// Headers never forwarded from a sandbox to an upstream: hop-by-hop headers and every client
-/// credential (the proxy injects its own).
-pub(crate) const STRIP_REQUEST: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-    "authorization",
-    "x-api-key",
-    "cookie",
-];
-
 /// Request headers the egress proxy forwards from a box to any upstream (#130, design §9.0): content
 /// negotiation, caching and conditional requests, the body's own description, and git's protocol
 /// version. Every other header is dropped; [`provider_request_header`] adds a provider's own.

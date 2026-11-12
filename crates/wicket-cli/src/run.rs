@@ -552,6 +552,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
+    // A wrapped session's model calls reach the model host through the egress proxy: they get the
+    // model proxy's budget, filter and accounting there (#112).
+    egress.set_model_gate(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70).
     let prior_secs = match &wake {
         Some(w) => {

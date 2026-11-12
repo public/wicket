@@ -38,6 +38,9 @@ pub struct Egress {
     h3_up: tokio::sync::OnceCell<Option<Arc<crate::h3::Up>>>,
     /// Blocked attempts this run: per request (or host), and in total.
     strikes: std::sync::Mutex<(std::collections::HashMap<String, u32>, u32)>,
+    /// The run's model proxy, which vets and accounts model calls that reach the model host through
+    /// here (a wrapped session's, #112).
+    model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
 }
 
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
@@ -132,7 +135,13 @@ impl Egress {
             }
         }
         let client = b.build()?;
-        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, upstream, h3_up: Default::default(), strikes: Default::default() }))
+        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, upstream, h3_up: Default::default(), strikes: Default::default(), model_gate: Default::default() }))
+    }
+
+    /// Model calls to the model host that come through this proxy (a wrapped Claude Code session's)
+    /// go through `llm`'s budget, body filter and accounting (#112).
+    pub fn set_model_gate(&self, llm: Arc<crate::llm::Llm>) {
+        let _ = self.model_gate.set(llm);
     }
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
@@ -505,6 +514,9 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
+        if let Some(llm) = self.model_gate.get().filter(|_| crate::llm::is_model_call(&host, &path)) {
+            return llm.clone().through_egress(&self, req, &host, &pq, via).await;
+        }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
             // The whole chain: a refused dial (#116) says why at its end.
@@ -517,7 +529,7 @@ impl Egress {
         self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host)) || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
     }
 
-    async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
+    pub(crate) async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -826,6 +838,39 @@ mod tests {
         // A GET body that arrives without framing headers (HTTP/3) is caught when it is read.
         let get = http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::from_static(b"x"))).unwrap();
         assert!(e.prepare(get, "api.github.com", "https", "/x").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
+    /// proxy's budget and body checks there: never forwarded once the budget is spent, nor as a
+    /// batch or an encoded body.
+    #[tokio::test]
+    async fn model_calls_through_egress_are_vetted_and_counted() {
+        use http_body_util::BodyExt;
+        let (c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [GET, POST]}]", vec![], "model-gate");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c.clone(), ca).unwrap();
+        let llm = crate::llm::Llm::new(c).unwrap();
+        e.set_model_gate(llm.clone());
+        let send = |path: &str, enc: Option<&str>| {
+            let mut b = http::Request::post(path).header("content-type", "application/json");
+            if let Some(x) = enc {
+                b = b.header("content-encoding", x);
+            }
+            let req = b.body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[]}"#))).unwrap();
+            let e = e.clone();
+            async move {
+                let r = e.handle(req, "api.anthropic.com".into(), "https", super::Via::Tcp).await;
+                let st = r.status().as_u16();
+                (st, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned())
+            }
+        };
+        assert_eq!(send("/v1/messages/batches", None).await.0, 403);
+        assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
+        llm.spent_before(u64::MAX / 4, 0, 0);
+        let (st, body) = send("/v1/messages", None).await;
+        assert_eq!(st, 429, "{body}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

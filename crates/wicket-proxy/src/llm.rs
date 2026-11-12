@@ -3,7 +3,7 @@
 //! enforces request and token budgets, strips server-side tools the zone doesn't allow (they would
 //! bypass the egress proxy), and is the run's liveness sensor.
 
-use crate::{problem, BoxBody, Event, RunCtx, STRIP_REQUEST, STRIP_RESPONSE};
+use crate::{problem, BoxBody, Event, RunCtx, FORWARD_REQUEST, STRIP_RESPONSE};
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -195,39 +195,8 @@ impl Llm {
             self.event(None, 409, Usage::default(), "stale generation");
             return problem(409, "stale-generation", "This activation is stale", &why, None);
         }
-        let n = self.requests.fetch_add(1, Ordering::SeqCst)
-            + 1
-            + self.reserved_requests.load(Ordering::SeqCst)
-            + self.prior_requests.load(Ordering::SeqCst);
-        if n > spec.max_requests {
-            self.event(None, 429, Usage::default(), "budget: request cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model request budget exhausted",
-                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
-                None,
-            );
-        }
-        if self.output_committed() >= spec.max_output_tokens {
-            self.event(None, 429, Usage::default(), "budget: output token cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model token budget exhausted",
-                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
-                None,
-            );
-        }
-        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
-            self.event(None, 429, Usage::default(), "budget: input token cap reached");
-            return problem(
-                429,
-                "budget",
-                "Model token budget exhausted",
-                &format!("{} may use at most {max} input tokens, cached ones included", self.whose()),
-                None,
-            );
+        if let Some(r) = self.admit(Some(spec)) {
+            return r;
         }
         match self.forward(req).await {
             Ok(r) => r,
@@ -236,6 +205,47 @@ impl Llm {
                 problem(502, "upstream", "Model upstream error", &e.to_string(), None)
             }
         }
+    }
+
+    /// Counts a model request and checks the budgets before it is sent: None if it may go, else the
+    /// refusal. Without a model route (a wrapped session's zone may have none), only counts.
+    fn admit(&self, spec: Option<&wicket_core::manifest::LlmSpec>) -> Option<Response<BoxBody>> {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst)
+            + 1
+            + self.reserved_requests.load(Ordering::SeqCst)
+            + self.prior_requests.load(Ordering::SeqCst);
+        let spec = spec?;
+        if n > spec.max_requests {
+            self.event(None, 429, Usage::default(), "budget: request cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model request budget exhausted",
+                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
+                None,
+            ));
+        }
+        if self.output_committed() >= spec.max_output_tokens {
+            self.event(None, 429, Usage::default(), "budget: output token cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                None,
+            ));
+        }
+        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
+            self.event(None, 429, Usage::default(), "budget: input token cap reached");
+            return Some(problem(
+                429,
+                "budget",
+                "Model token budget exhausted",
+                &format!("{} may use at most {max} input tokens, cached ones included", self.whose()),
+                None,
+            ));
+        }
+        None
     }
 
     fn event(&self, model: Option<String>, status: u16, u: Usage, outcome: &str) {
@@ -253,41 +263,11 @@ impl Llm {
     async fn forward(self: &Arc<Self>, req: Request<Incoming>) -> Result<Response<BoxBody>> {
         let spec = self.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
         let (parts, body) = req.into_parts();
-        let mut body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
-        let mut model = None;
-        let mut note = String::from("ok");
-        let mut want = 0;
-        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            model = json.get("model").and_then(|m| m.as_str()).map(String::from);
-            let mut changed = false;
-            if !spec.allow_server_tools {
-                if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                    let before = tools.len();
-                    tools.retain(|t| {
-                        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        !(ty.starts_with("web_search") || ty.starts_with("web_fetch") || ty.starts_with("code_execution"))
-                    });
-                    if tools.len() != before {
-                        note = format!("stripped {} server-side tool(s)", before - tools.len());
-                        changed = true;
-                    }
-                }
-            }
-            // The call's output is reserved up front (#113); one asking for more than is left gets
-            // what is left, so it can't generate past the budget.
-            if let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) {
-                want = asked;
-                let left = spec.max_output_tokens.saturating_sub(self.output_committed());
-                if asked > left && left > 0 {
-                    json["max_tokens"] = left.into();
-                    note = format!("{note}; max_tokens {asked} lowered to the {left} output tokens left");
-                    changed = true;
-                }
-            }
-            if changed {
-                body = Bytes::from(serde_json::to_vec(&json)?);
-            }
-        }
+        let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
+        let Filtered { body, model, note, want } = match self.filter(Some(spec), &parts, body) {
+            Ok(f) => f,
+            Err(r) => return Ok(r),
+        };
         let Some(reserved) = self.reserve_output(spec.max_output_tokens, want) else {
             self.event(model, 429, Usage::default(), "budget: output token cap reached");
             return Ok(problem(
@@ -323,9 +303,11 @@ impl Llm {
         let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
         let mut rb = self.client.request(method, &url);
+        // Allow-listed headers only (#112, as on the egress proxy): never a client credential.
         for (name, value) in parts.headers.iter() {
-            if !STRIP_REQUEST.contains(&name.as_str()) && name.as_str() != "accept-encoding" {
-                rb = rb.header(name.as_str(), value.as_bytes());
+            let n = name.as_str();
+            if n != "accept-encoding" && (FORWARD_REQUEST.contains(&n) || crate::provider_request_header(MODEL_HOST, n)) {
+                rb = rb.header(n, value.as_bytes());
             }
         }
         // The real subscription token, injected into the one slot Claude Code uses for it.
@@ -334,6 +316,133 @@ impl Llm {
         let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
         rb = rb.header("authorization", format!("Bearer {token}")).header("accept-encoding", "identity");
         Ok(rb.body(body).send().await?)
+    }
+
+    /// Vets a model request's body (#112) and reserves nothing yet. Only `POST /v1/messages` and
+    /// `/v1/messages/count_tokens` carry bodies; reads (GET, HEAD) pass without one. The body must be
+    /// a plain (not `Content-Encoding`-ed) JSON object; it is re-encoded from what was parsed, keeping
+    /// only known top-level fields, and only client tools (executed by the agent, in its box) unless
+    /// the zone has `allow_server_tools`: server tools, the MCP connector and containers make the
+    /// provider fetch from or send to hosts the zone never allowed. A `max_tokens` above what is left
+    /// of the output budget is lowered to it (#113).
+    pub(crate) fn filter(
+        &self,
+        spec: Option<&wicket_core::manifest::LlmSpec>,
+        parts: &http::request::Parts,
+        body: Bytes,
+    ) -> std::result::Result<Filtered, Response<BoxBody>> {
+        let refuse = |status: u16, why: String| {
+            self.event(None, status, Usage::default(), &format!("refused: {why}"));
+            problem(status, "forbidden", "Blocked by wicket: model request refused", &format!("{why}. {}", crate::SANDBOX_FACT), None)
+        };
+        let path = parts.uri.path();
+        if matches!(parts.method, http::Method::GET | http::Method::HEAD) {
+            if !body.is_empty() {
+                return Err(refuse(400, format!("a {} request with a body", parts.method)));
+            }
+            return Ok(Filtered { body, model: None, note: "ok".into(), want: 0 });
+        }
+        if parts.method != http::Method::POST || !MODEL_ENDPOINTS.contains(&path) {
+            return Err(refuse(403, format!("{} {path} is not a model call wicket proxies (only POST {})", parts.method, MODEL_ENDPOINTS.join(" and "))));
+        }
+        if let Some(enc) = parts.headers.get(http::header::CONTENT_ENCODING) {
+            if !enc.as_bytes().eq_ignore_ascii_case(b"identity") {
+                return Err(refuse(415, "a Content-Encoding-ed model request body (send it uncompressed)".into()));
+            }
+        }
+        let Ok(serde_json::Value::Object(mut json)) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return Err(refuse(400, "a model request body that isn't a JSON object".into()));
+        };
+        let server_ok = spec.is_some_and(|s| s.allow_server_tools);
+        let model = json.get("model").and_then(|m| m.as_str()).map(String::from);
+        let mut notes = Vec::new();
+        let before = json.len();
+        json.retain(|k, _| REQUEST_FIELDS.contains(&k.as_str()) || (server_ok && SERVER_FIELDS.contains(&k.as_str())));
+        if json.len() != before {
+            notes.push(format!("stripped {} request field(s)", before - json.len()));
+        }
+        if !server_ok {
+            if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                let before = tools.len();
+                tools.retain(|t| client_tool(t.get("type").and_then(|v| v.as_str())));
+                if tools.len() != before {
+                    notes.push(format!("stripped {} server-side tool(s)", before - tools.len()));
+                }
+            }
+        }
+        let mut want = 0;
+        if let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) {
+            want = asked;
+            if let Some(spec) = spec {
+                let left = spec.max_output_tokens.saturating_sub(self.output_committed());
+                if asked > left && left > 0 {
+                    json.insert("max_tokens".into(), left.into());
+                    notes.push(format!("max_tokens {asked} lowered to the {left} output tokens left"));
+                }
+            }
+        }
+        let body = match serde_json::to_vec(&json) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => return Err(refuse(400, format!("the model request body can't be re-encoded ({e})"))),
+        };
+        Ok(Filtered { body, model, note: if notes.is_empty() { "ok".into() } else { notes.join("; ") }, want })
+    }
+
+    /// A wrapped session's model call, which reaches the model host through the egress proxy (its
+    /// credential swapped there) rather than through this proxy (#112): the same budget, body
+    /// filter and accounting as a call to this proxy, then the egress proxy's own forwarding.
+    pub(crate) async fn through_egress<B>(
+        self: &Arc<Self>,
+        egress: &crate::egress::Egress,
+        req: Request<B>,
+        host: &str,
+        pq: &str,
+        via: crate::egress::Via,
+    ) -> Response<BoxBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Ok(mut t) = self.last_activity.lock() {
+            *t = Instant::now();
+        }
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return r;
+        }
+        let (parts, body) = req.into_parts();
+        let body = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => return problem(400, "bad-request", "Bad model request", &format!("request body: {e}"), None),
+        };
+        let f = match self.filter(spec, &parts, body) {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+        let reserved = match spec {
+            None => 0,
+            Some(s) => match self.reserve_output(s.max_output_tokens, f.want) {
+                Some(r) => r,
+                None => {
+                    self.event(f.model, 429, Usage::default(), "budget: output token cap reached");
+                    return problem(429, "budget", "Model token budget exhausted", &format!("{} may generate at most {} output tokens", self.whose(), s.max_output_tokens), None);
+                }
+            },
+        };
+        let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
+        match egress.forward(req, host, "https", pq, via).await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let sse = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+                let (head, body) = resp.into_parts();
+                Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, f.note))
+            }
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                self.event(f.model, 502, Usage::default(), &format!("upstream error: {e:#}"));
+                problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
+            }
+        }
     }
 
     /// Streams an upstream response to the agent while reading its usage as it goes (in constant
@@ -345,7 +454,7 @@ impl Llm {
     pub(crate) fn account<S, E>(self: &Arc<Self>, model: Option<String>, status: u16, sse: bool, mut upstream: S, reserved: u64, note: String) -> BoxBody
     where
         S: futures_util::Stream<Item = std::result::Result<Bytes, E>> + Send + Unpin + 'static,
-        E: std::error::Error + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>(16);
         let me = self.clone();
@@ -372,7 +481,7 @@ impl Llm {
                     }
                     Some(Err(e)) => {
                         if client {
-                            let _ = tx.send(Err(Box::new(e))).await;
+                            let _ = tx.send(Err(e.into())).await;
                         }
                         break;
                     }
@@ -393,6 +502,69 @@ impl Llm {
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
         BodyExt::boxed(StreamBody::new(stream))
     }
+}
+
+/// The host Claude Code's model calls go to.
+pub(crate) const MODEL_HOST: &str = "api.anthropic.com";
+
+/// The only model endpoints that take a request body (#112). Batches, files and anything else are
+/// refused: a batch carries requests (and tools) of its own.
+const MODEL_ENDPOINTS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
+
+/// Whether a request to the model host is a model call, vetted and accounted as one, when it
+/// arrives at the egress proxy (a wrapped session's).
+pub(crate) fn is_model_call(host: &str, path: &str) -> bool {
+    host == MODEL_HOST && (path == "/v1/messages" || path.starts_with("/v1/messages/") || path == "/v1/complete")
+}
+
+/// Top-level Messages request fields that are forwarded (#112): none of them makes the provider
+/// reach another host.
+const REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "max_tokens",
+    "metadata",
+    "stop_sequences",
+    "stream",
+    "temperature",
+    "top_k",
+    "top_p",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "output_config",
+    "output_format",
+    "service_tier",
+    "context_management",
+    "inference_geo",
+    "speed",
+    "cache_control",
+    "thread",
+];
+
+/// Fields that run things on the provider's side (the MCP connector, code-execution containers and
+/// skills): forwarded only with `allow_server_tools`.
+const SERVER_FIELDS: &[&str] = &["mcp_servers", "container"];
+
+/// Whether a tool `type` is one the agent itself executes: a custom tool (no type, or `custom`), or
+/// one of the schema-less client tools (bash, text editor, memory, computer use). Everything else
+/// (web search and fetch, code execution, tool search, MCP toolsets, the advisor, and any type
+/// added later) runs on the provider's side.
+fn client_tool(ty: Option<&str>) -> bool {
+    match ty {
+        None | Some("custom") => true,
+        Some(t) => ["bash_", "text_editor_", "memory_", "computer_2"].iter().any(|p| t.starts_with(p)),
+    }
+}
+
+/// A vetted model request body, and what it reserves.
+pub(crate) struct Filtered {
+    pub body: Bytes,
+    pub model: Option<String>,
+    pub note: String,
+    /// Output tokens it asks for (`max_tokens`).
+    pub want: u64,
 }
 
 /// Reads token usage from a response as it streams past, in constant memory: each chunk is scanned
@@ -819,6 +991,52 @@ mod tests {
         let mut t = super::UsageScanner::default();
         t.feed(br#"data: {"delta":{"text":"say \"type\":\"message_stop\" now"}}"#);
         assert!(!t.stopped);
+    }
+
+    /// #112: only known fields and client tools reach the provider, unless the zone allows server
+    /// tools; bodies that can't be vetted, and endpoints other than messages, are refused.
+    #[test]
+    fn model_requests_are_filtered_by_allowlist() {
+        let parts = |m: &str, path: &str, enc: Option<&str>| {
+            let mut b = http::Request::builder().method(m).uri(path);
+            if let Some(e) = enc {
+                b = b.header("content-encoding", e);
+            }
+            b.body(()).unwrap().into_parts().0
+        };
+        let body = br#"{"model":"m","max_tokens":10,"messages":[],"mcp_servers":[{"type":"url","url":"https://evil.example/mcp","name":"x"}],"container":{"skills":[]},"some_future_field":1,
+            "tools":[{"name":"a","input_schema":{}},{"type":"custom","name":"b","input_schema":{}},{"type":"bash_20250124","name":"bash"},
+                     {"type":"web_search_20260209","name":"web_search"},{"type":"web_fetch_20250910","name":"web_fetch"},{"type":"code_execution_20260521","name":"code_execution"},
+                     {"type":"mcp_toolset","mcp_server_name":"x"},{"type":"tool_search_tool_regex_20251119","name":"t"},{"type":"advisor_20260301","name":"adv"},{"type":"some_new_server_tool","name":"n"}]}"#;
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        let f = llm.filter(Some(&spec), &parts("POST", "/v1/messages?beta=true", None), bytes::Bytes::from_static(body)).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["max_tokens", "messages", "model", "tools"], "{out}");
+        let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["a", "b", "bash"]);
+        assert!(f.note.contains("stripped 3 request field(s)") && f.note.contains("stripped 7 server-side tool(s)"), "{}", f.note);
+        // With server tools allowed, they and their fields go through.
+        let mut open = spec.clone();
+        open.allow_server_tools = true;
+        let f = llm.filter(Some(&open), &parts("POST", "/v1/messages", None), bytes::Bytes::from_static(body)).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert!(out.get("mcp_servers").is_some() && out["tools"].as_array().unwrap().len() == 10);
+        // Refused: unparseable, encoded, a batch, another method.
+        for (m, path, enc, b, status) in [
+            ("POST", "/v1/messages", None, &b"\x1f\x8b gzip"[..], 400),
+            ("POST", "/v1/messages", None, &b"[1]"[..], 400),
+            ("POST", "/v1/messages", Some("gzip"), &body[..], 415),
+            ("POST", "/v1/messages/batches", None, &body[..], 403),
+            ("POST", "/v1/files", None, &b"{}"[..], 403),
+            ("PUT", "/v1/messages", None, &body[..], 403),
+            ("GET", "/v1/models", None, &b"{}"[..], 400),
+        ] {
+            let r = llm.filter(Some(&spec), &parts(m, path, enc), bytes::Bytes::copy_from_slice(b));
+            assert_eq!(r.err().map(|r| r.status().as_u16()), Some(status), "{m} {path}");
+        }
+        assert!(llm.filter(Some(&spec), &parts("GET", "/v1/models", None), bytes::Bytes::new()).is_ok());
     }
 
     #[test]
