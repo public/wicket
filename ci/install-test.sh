@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# deploy/install.sh in a disposable container (#40, #12): a fresh Ubuntu 24.04 (or Debian 12) gets
+# the users, groups, directories, policy, units and binary; then wicketd is started by hand (no
+# systemd in a container) and real users check #12's acceptance: an operator reads state and starts
+# nothing it shouldn't, can't open the data or approve; root can. The script runs twice (idempotent).
+#
+# Not covered here (needs a real VM): gVisor (runsc can't run inside an unprivileged container),
+# Docker itself, systemd starting the units, and building the agent image.
+#   ci/install-test.sh [path/to/wicket] [ubuntu:24.04|debian:12]
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+bin=$(realpath "${1:-$repo/target/release/wicket}")
+image=${2:-ubuntu:24.04}
+docker=${DOCKER:-docker}
+name=wicket-install-test-$$
+trap '$docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+
+$docker run --rm --name "$name" --network host \
+    -v "$repo:/src:ro" -v "$bin:/opt/wicket-under-test:ro" \
+    "$image" bash -euo pipefail -c '
+fail() { echo "FAIL: $*"; exit 1; }
+useradd --create-home alex
+groupadd --system docker
+usermod -aG docker alex   # an operator who had Docker: the install takes it away
+
+/src/deploy/install.sh --binary /opt/wicket-under-test --operator alex --skip-gvisor --skip-image --trust-domain wicket.example.com >/tmp/install1.log
+echo "ok: install.sh ran"
+/src/deploy/install.sh --binary /opt/wicket-under-test --operator alex --skip-gvisor --skip-image >/tmp/install2.log
+echo "ok: install.sh ran again"
+
+[ "$(stat -c "%U %G %a" /var/lib/wicket)" = "wicket wicket 700" ] || fail "data dir: $(stat -c "%U %G %a" /var/lib/wicket)"
+id -nG wicket | tr " " "\n" | grep -qx docker || fail "wicket is not in the docker group"
+id -nG alex | tr " " "\n" | grep -qx docker && fail "alex is still in the docker group"
+id -nG alex | tr " " "\n" | grep -qx wicket-operators || fail "alex is not an operator"
+[ "$(getent passwd wicket | cut -d: -f7)" = /usr/sbin/nologin ] || fail "wicket has a login shell"
+for u in wicketd wicket-console wicket-reconcile; do [ -f /etc/systemd/system/$u.service ] || fail "no $u unit"; done
+[ -f /etc/wicket/wicketd.yaml ] && [ -f /etc/wicket/console.env ] || fail "no /etc/wicket config"
+[ -f /var/lib/wicket/identity/issuer.key ] || fail "no issuer key"
+[ "$(stat -c %U /var/lib/wicket/identity/issuer.key)" = wicket ] || fail "issuer key not the wicket user'"'"'s"
+echo "ok: users, groups, data dir, config, units and issuer in place"
+
+# What systemd would do: the runtime directory, then the daemon as wicket.
+install -d -o wicket -g wicket -m 0755 /run/wicket
+(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket daemon) 2>/tmp/wicketd.log &
+for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
+[ -S /run/wicket/wicketd.sock ] || { cat /tmp/wicketd.log; fail "wicketd did not start"; }
+
+as_alex() { (cd /home/alex && runuser -u alex -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/alex USER=alex /usr/local/bin/wicket "$@"); }
+out=$(as_alex pending) || fail "alex: pending: $out"
+[ "$out" = "no pending requests" ] || fail "alex: pending: $out"
+as_alex identity issuer | grep -q wicket.example.com || fail "alex: identity issuer"
+echo "ok: alex reads state through wicketd"
+runuser -u alex -- ls /var/lib/wicket >/dev/null 2>&1 && fail "alex listed the data dir"
+runuser -u alex -- cat /var/lib/wicket/ledger.db >/dev/null 2>&1 && fail "alex read the ledger"
+runuser -u alex -- test -r /var/lib/wicket/identity/issuer.key && fail "alex can read the issuer key"
+[ -S /var/run/docker.sock ] && runuser -u alex -- test -w /var/run/docker.sock && fail "alex can reach docker"
+echo "ok: alex can'"'"'t reach the data dir, the ledger, the issuer key or Docker"
+for c in "approve R1" "deny R1" "operator enrol-link" "operator reset" "reap"; do
+    if out=$(as_alex $c 2>&1); then fail "alex: $c succeeded: $out"; fi
+    case "$out" in *"needs root on the host"*) ;; *) fail "alex: $c: $out" ;; esac
+done
+echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reap"
+out=$(as_alex run --run-id x /src/examples/demo.yaml 2>&1) && fail "alex passed --run-id"
+case "$out" in *"for wicket'"'"'s own use"*) ;; *) fail "alex: --run-id: $out" ;; esac
+out=$(as_alex run --workspace-dir /var/lib /src/examples/demo.yaml 2>&1) && fail "alex mounted /var/lib"
+case "$out" in *"owned by uid 0"*) ;; *) fail "alex: --workspace-dir /var/lib: $out" ;; esac
+echo "ok: alex can'"'"'t pass internal arguments or mount directories that aren'"'"'t its own"
+useradd --create-home eve
+out=$(cd /home/eve && runuser -u eve -- /usr/local/bin/wicket pending 2>&1) && fail "eve (no operator) read state"
+case "$out" in *"may not read state"*) ;; *) fail "eve: $out" ;; esac
+echo "ok: a user outside wicket-operators gets nothing"
+
+out=$(cd / && wicket approve R1 2>&1) && fail "root: approve of a missing request succeeded"
+case "$out" in *"needs root"*) fail "root refused: $out" ;; *R1*) ;; *) fail "root: $out" ;; esac
+echo token-value | (cd / && wicket secret set claude-oauth) >/dev/null || fail "root: secret set"
+[ "$(stat -c "%U %a" /var/lib/wicket/.config/wicket/secrets/claude-oauth)" = "wicket 600" ] || fail "secret file ownership"
+echo "ok: root approves and sets the secret, as the wicket user"
+
+out=$(as_alex doctor 2>&1) && fail "doctor passed without Docker"
+for want in "mode: system install, through wicketd" "not readable by you (good)" "docker: not reachable by you (good)" \
+    "mode: system install, as wicket" "data /var/lib/wicket: ours, mode 0700" "docker group: only us" \
+    "policy /etc/wicket/wicketd.yaml: read [group wicket-operators]" "vault: 1 secret(s): claude-oauth" "docker: NOT OK"; do
+    case "$out" in *"$want"*) ;; *) printf "%s\n" "$out"; fail "doctor did not say: $want" ;; esac
+done
+echo "ok: doctor reports the install (and the missing Docker daemon)"
+n=$(wicket audit --tail 200 | grep -c daemon.refused) || true
+[ "$n" -ge 8 ] || fail "only $n refusals audited"
+wicket audit --verify >/dev/null || fail "audit chain"
+echo "ok: $n refusals audited; the chain verifies"
+echo "install-test: all checks passed"
+'

@@ -146,7 +146,12 @@ impl Daemon {
         };
         let mut plan = match self.plan(&peer, &basis, &cmd, &hello, dir_fd) {
             Ok(p) => p,
-            Err(e) => return refuse(&mut w, &format!("{e:#}")),
+            Err(e) => {
+                let why = format!("{e:#}");
+                eprintln!("wicketd: refused uid {} ({}): {}: {why}", peer.uid, peer.user, words(&hello.argv));
+                self.audit_refusal(&peer, &hello, &why);
+                return refuse(&mut w, &why);
+            }
         };
         proto::write_json(
             &mut w,
