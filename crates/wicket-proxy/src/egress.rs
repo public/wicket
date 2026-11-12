@@ -196,6 +196,11 @@ impl Egress {
                 Ok(self.refuse(&raw, &method, "/", &e.to_string()))
             }
             Some((_, Ok(h))) if req.uri().scheme_str() == Some("http") => {
+                // The URL sent upstream has no port: say so rather than quietly using port 80.
+                if let Some(port) = req.uri().port_u16().filter(|p| *p != 80) {
+                    let method = req.method().to_string();
+                    return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP is proxied to port 80 only (asked for {port})")));
+                }
                 if let Some(r) = self.judge_host(&h, req.method().as_str()) {
                     return Ok(r);
                 }
@@ -393,6 +398,17 @@ impl Egress {
                 return self.refuse(&host, &method, "/", &format!("Host header {h:?} does not match the tunnel target"));
             }
         }
+        // A credential never goes out in cleartext (#129): plain HTTP to a host the zone injects a
+        // credential into, or swaps a placeholder for, is refused before anything is decided or read
+        // from the vault, whether or not this request would have carried one.
+        if scheme != "https" && self.credentials_for(&host) {
+            return self.refuse(
+                &host,
+                &method,
+                "/",
+                &format!("plain HTTP to {host} is refused: wicket attaches a credential to requests for this host and never sends one unencrypted; use https://{host}/"),
+            );
+        }
         let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
         let path = match canonical_path(&pq) {
             Ok(p) => p.to_string(),
@@ -491,6 +507,11 @@ impl Egress {
             // The whole chain: a refused dial (#116) says why at its end.
             Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
         }
+    }
+
+    /// Whether the zone injects a credential into requests for `host`, or swaps one in.
+    fn credentials_for(&self, host: &str) -> bool {
+        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host)) || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
     }
 
     async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
@@ -720,6 +741,36 @@ mod tests {
         assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
         for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+        }
+    }
+
+    /// #129: no credential is ever sent over plain HTTP: requests to a host with an inject rule or a
+    /// swap are refused with a 403 that says to use https, before the vault is read.
+    #[tokio::test]
+    async fn plain_http_to_a_credentialed_host_is_refused() {
+        use http_body_util::BodyExt;
+        let swap = crate::CredentialSwap {
+            name: "t".into(),
+            host: "api.github.com".into(),
+            placeholder: "ph-123".into(),
+            real: crate::SwapSource::Vault("gh".into()),
+        };
+        let inject = "reach: [{host: api.github.com, methods: [GET]}], inject: [{host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh}]";
+        for (zone, swaps, tag) in [(inject, vec![], "http-inject"), ("reach: [{host: api.github.com, methods: [GET]}]", vec![swap], "http-swap")] {
+            let (c, dir) = ctx(zone, swaps, tag);
+            let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+            let e = super::Egress::new(c, ca).unwrap();
+            let req = http::Request::get("/user")
+                .header("host", "api.github.com")
+                .header("authorization", "Bearer ph-123")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            let resp = e.clone().handle(req, "api.github.com".into(), "http", super::Via::Tcp).await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+            assert_eq!(status, 403, "{tag}: {body}");
+            assert!(body.contains("never sends one unencrypted") && !body.contains("the-real-token"), "{tag}: {body}");
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 

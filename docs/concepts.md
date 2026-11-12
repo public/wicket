@@ -34,7 +34,8 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
   `%64` for `d`, a `;` parameter or a dot segment, are refused before any decision);
 - **`unlisted_hosts`:** what happens to a host the zone doesn't name (`escalate`, or `hide` to make it
   look like it doesn't exist);
-- **inject:** credentials added to requests for a host, from the vault;
+- **inject:** credentials added to requests for a host, from the vault (only ever over HTTPS: plain HTTP
+  to a host with a credential is refused with a 403);
 - **llm:** the model budget (requests, input and output tokens);
 - **limits, isolation, images, volumes:** memory, CPUs and time; the isolation tier; the images a child
   may use; named directories that persist between runs;

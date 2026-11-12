@@ -24,6 +24,9 @@ not a permanent decision.
   since wicket can't read the operation); posting comments, reviews, releases, issues and pull
   requests (R3). A POST that an allowed path accepts is otherwise allowed, whatever it does at the
   provider.
+- **Reach rules and grants carry no scheme or port.** HTTPS (port 443) and plain HTTP (port 80) to a
+  host are decided alike, except that a credential is never sent over plain HTTP: a plain-HTTP request
+  to a host the zone injects a credential into (or swaps one for) is refused.
 - **Response bodies are not scrubbed.** If an upstream echoes an injected credential back in a
   response body, the box sees it. Headers are scrubbed.
 - **Request bodies over 64 MiB fail,** and uploads are buffered rather than streamed
