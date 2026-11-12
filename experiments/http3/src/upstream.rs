@@ -65,7 +65,8 @@ impl Upstream {
         if let Some(s) = g.get(host) {
             return Ok(s.clone());
         }
-        let conn = tokio::time::timeout(self.h3_timeout, self.ep.connect(self.addr(host)?, host)?).await.context("h3 connect timed out")??;
+        let conn =
+            tokio::time::timeout(self.h3_timeout, self.ep.connect(self.addr(host)?, host)?).await.context("h3 connect timed out")??;
         let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;

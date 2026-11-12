@@ -106,7 +106,13 @@ fn main() -> Result<()> {
         }
         "origin" => {
             let names = |k: &str| a.get(k).unwrap_or("").split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
-            rt()?.block_on(origin::run(a.req("ca-out")?, a.req("h3")?.parse()?, names("h3-names"), a.req("h2")?.parse()?, names("h2-names")))
+            rt()?.block_on(origin::run(
+                a.req("ca-out")?,
+                a.req("h3")?.parse()?,
+                names("h3-names"),
+                a.req("h2")?.parse()?,
+                names("h2-names"),
+            ))
         }
         "get" => {
             if a.rest.is_empty() {
@@ -135,7 +141,13 @@ fn main() -> Result<()> {
             client::resolve(&a.rest);
             Ok(())
         }
-        "udpbench" => udpbench::run(a.get("send").unwrap_or("sendto"), a.get("recv").unwrap_or("one"), a.num("n", 100000)?, a.num("size", 1452)?, a.get("to").unwrap_or("198.19.0.5:9000").parse()?),
+        "udpbench" => udpbench::run(
+            a.get("send").unwrap_or("sendto"),
+            a.get("recv").unwrap_or("one"),
+            a.num("n", 100000)?,
+            a.num("size", 1452)?,
+            a.get("to").unwrap_or("198.19.0.5:9000").parse()?,
+        ),
         c => bail!("unknown command {c}"),
     }
 }

@@ -64,6 +64,8 @@ def serve_dgram():
     while True:
         m, peer = s.recvfrom(70000)
         log(f"dgram {len(m)} bytes from {peer!r}")
+        if isinstance(peer, str) and peer.startswith("/wicket/sock/"):
+            peer = f"{d}/{peer[len('/wicket/sock/'):]}"  # the box's path, as the host sees it
         try:
             s.sendto(m, peer)
         except Exception as e:  # noqa: BLE001

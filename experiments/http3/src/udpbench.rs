@@ -24,7 +24,8 @@ pub fn run(send: &str, recv: &str, n: usize, size: usize, to: SocketAddr) -> any
         let mut got = 0usize;
         let mut calls = 0usize;
         let mut bufs = vec![[0u8; 2048]; 32];
-        let mut iovs: Vec<libc::iovec> = bufs.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr() as *mut _, iov_len: 2048 }).collect();
+        let mut iovs: Vec<libc::iovec> =
+            bufs.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr() as *mut _, iov_len: 2048 }).collect();
         let mut msgs: Vec<libc::mmsghdr> = vec![unsafe { std::mem::zeroed() }; 32];
         for (m, iov) in msgs.iter_mut().zip(iovs.iter_mut()) {
             m.msg_hdr.msg_iov = iov;
@@ -39,7 +40,8 @@ pub fn run(send: &str, recv: &str, n: usize, size: usize, to: SocketAddr) -> any
                 if a < 0 {
                     break;
                 }
-                let b = unsafe { libc::recvmmsg(rx.as_raw_fd(), msgs[1..].as_mut_ptr(), 31, libc::MSG_DONTWAIT as _, std::ptr::null_mut()) };
+                let b =
+                    unsafe { libc::recvmmsg(rx.as_raw_fd(), msgs[1..].as_mut_ptr(), 31, libc::MSG_DONTWAIT as _, std::ptr::null_mut()) };
                 calls += 2;
                 1 + b.max(0) as usize
             } else {

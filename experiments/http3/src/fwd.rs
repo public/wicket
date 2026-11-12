@@ -132,7 +132,15 @@ fn up_quic(sock: &UdpSocket, host: RawFd, port: u16, net: u32, mask: u32, batch:
         } else {
             msgs[0].msg_len = r as _;
             let more = if batch > 1 {
-                unsafe { libc::recvmmsg(sock.as_raw_fd(), msgs[1..].as_mut_ptr(), (batch - 1) as _, libc::MSG_DONTWAIT as _, std::ptr::null_mut()) }
+                unsafe {
+                    libc::recvmmsg(
+                        sock.as_raw_fd(),
+                        msgs[1..].as_mut_ptr(),
+                        (batch - 1) as _,
+                        libc::MSG_DONTWAIT as _,
+                        std::ptr::null_mut(),
+                    )
+                }
             } else {
                 0
             };

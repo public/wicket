@@ -24,7 +24,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use wicket_core::{CompiledZone, HostVerdict, Op, RunId, TenantId, Verdict, ZoneSpec};
 
-
 pub struct Opts {
     pub sock: String,
     pub zone: ZoneSpec,
@@ -134,8 +133,18 @@ pub async fn run(o: Opts) -> Result<()> {
             Err(_) => continue,
         };
         eprintln!("term: box connected");
-        let relay = Arc::new(Relay { fd: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::WRITABLE)? }, shared: shared.clone(), stats: Default::default(), gso: o.gso.clamp(1, 40).min((60_000 / o.mtu_upper.unwrap_or(1452) as usize).max(1)) });
-        let ep = quinn::Endpoint::new_with_abstract_socket(endpoint_config(o.mtu_upper), Some(sc.clone()), relay.clone(), Arc::new(quinn::TokioRuntime))?;
+        let relay = Arc::new(Relay {
+            fd: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::WRITABLE)? },
+            shared: shared.clone(),
+            stats: Default::default(),
+            gso: o.gso.clamp(1, 40).min((60_000 / o.mtu_upper.unwrap_or(1452) as usize).max(1)),
+        });
+        let ep = quinn::Endpoint::new_with_abstract_socket(
+            endpoint_config(o.mtu_upper),
+            Some(sc.clone()),
+            relay.clone(),
+            Arc::new(quinn::TokioRuntime),
+        )?;
         let shared = shared.clone();
         tokio::spawn(async move {
             while let Some(inc) = ep.accept().await {
@@ -167,7 +176,9 @@ async fn conn(shared: Arc<Shared>, inc: quinn::Incoming) -> Result<()> {
     let c = match inc.accept_with(Arc::new(shared.server_config(&host)?))?.await {
         Ok(c) => c,
         Err(e) => {
-            shared.audit(serde_json::json!({"event": "quic-refused", "why": format!("handshake: {e}"), "host": host, "remote": remote.to_string()}));
+            shared.audit(
+                serde_json::json!({"event": "quic-refused", "why": format!("handshake: {e}"), "host": host, "remote": remote.to_string()}),
+            );
             return Ok(());
         }
     };
@@ -177,7 +188,8 @@ async fn conn(shared: Arc<Shared>, inc: quinn::Incoming) -> Result<()> {
         return Ok(());
     }
     shared.audit(serde_json::json!({"event": "quic-open", "host": host, "remote": remote.to_string(), "local": format!("{local:?}")}));
-    let mut h3c: h3::server::Connection<h3_quinn::Connection, Bytes> = h3::server::Connection::new(h3_quinn::Connection::new(c.clone())).await?;
+    let mut h3c: h3::server::Connection<h3_quinn::Connection, Bytes> =
+        h3::server::Connection::new(h3_quinn::Connection::new(c.clone())).await?;
     loop {
         match h3c.accept().await {
             Ok(Some(resolver)) => {
@@ -220,8 +232,17 @@ async fn request(shared: Arc<Shared>, host: String, req: http::Request<()>, mut 
     };
     // A connection serves one host (RFC 9114 coalescing would let a client ask this connection for another).
     if authority.as_deref() != Some(host.as_str()) {
-        shared.audit(serde_json::json!({"event": "request", "host": host, "authority": authority, "method": method, "path": path, "status": 421}));
-        return refuse(&mut down, 421, "misdirected", "Blocked by wicket sandbox: wrong host for this connection", "This connection serves one host only.").await;
+        shared.audit(
+            serde_json::json!({"event": "request", "host": host, "authority": authority, "method": method, "path": path, "status": 421}),
+        );
+        return refuse(
+            &mut down,
+            421,
+            "misdirected",
+            "Blocked by wicket sandbox: wrong host for this connection",
+            "This connection serves one host only.",
+        )
+        .await;
     }
     let canon = match wicket_core::canonical_path(&pq) {
         Ok(p) => p.to_string(),
@@ -272,7 +293,8 @@ async fn refuse(down: &mut Down, status: u16, kind: &str, title: &str, detail: &
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "type": format!("https://wicket.dev/e/{kind}"), "title": title, "status": status, "detail": detail,
     }))?;
-    let resp = http::Response::builder().status(status).header("content-type", "application/problem+json").header("x-wicket", kind).body(())?;
+    let resp =
+        http::Response::builder().status(status).header("content-type", "application/problem+json").header("x-wicket", kind).body(())?;
     down.send_response(resp).await?;
     down.send_data(Bytes::from(body)).await?;
     down.finish().await?;
@@ -388,7 +410,10 @@ impl AsyncUdpSocket for Relay {
 
 /// recvmsg into [header, payload] so the payload lands straight in quinn's buffer.
 fn recv2(fd: i32, hdr: &mut [u8; HDR], buf: &mut [u8]) -> io::Result<usize> {
-    let mut iov = [libc::iovec { iov_base: hdr.as_mut_ptr() as *mut _, iov_len: HDR }, libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() }];
+    let mut iov = [
+        libc::iovec { iov_base: hdr.as_mut_ptr() as *mut _, iov_len: HDR },
+        libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() },
+    ];
     let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
     m.msg_iov = iov.as_mut_ptr();
     m.msg_iovlen = 2;

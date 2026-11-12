@@ -35,7 +35,11 @@ pub async fn run(ca_out: &str, h3_addr: SocketAddr, h3_names: Vec<String>, h2_ad
         while let Some(inc) = ep.accept().await {
             tokio::spawn(async move {
                 let Ok(c) = inc.await else { return };
-                let Ok(mut h): Result<h3::server::Connection<_, Bytes>, _> = h3::server::Connection::new(h3_quinn::Connection::new(c)).await else { return };
+                let Ok(mut h): Result<h3::server::Connection<_, Bytes>, _> =
+                    h3::server::Connection::new(h3_quinn::Connection::new(c)).await
+                else {
+                    return;
+                };
                 while let Ok(Some(r)) = h.accept().await {
                     tokio::spawn(async move {
                         let Ok((req, mut s)) = r.resolve_request().await else { return };
@@ -52,7 +56,8 @@ pub async fn run(ca_out: &str, h3_addr: SocketAddr, h3_names: Vec<String>, h2_ad
                                     left -= k as u64;
                                 }
                             } else {
-                                s.send_response(http::Response::builder().status(200).header("content-type", "text/plain").body(())?).await?;
+                                s.send_response(http::Response::builder().status(200).header("content-type", "text/plain").body(())?)
+                                    .await?;
                                 s.send_data(Bytes::from(format!("hello over h3 from the origin: {} {}\n", req.method(), path))).await?;
                             }
                             s.finish().await?;
@@ -102,7 +107,9 @@ async fn h2_server(addr: SocketAddr, tls: Arc<rustls::ServerConfig>) -> Result<(
                     });
                     StreamBody::new(s).boxed()
                 } else {
-                    http_body_util::Full::new(Bytes::from(format!("hello over h2 from the origin: {method} {path}\n"))).map_err(|e| match e {}).boxed()
+                    http_body_util::Full::new(Bytes::from(format!("hello over h2 from the origin: {method} {path}\n")))
+                        .map_err(|e| match e {})
+                        .boxed()
                 };
                 Ok::<_, std::convert::Infallible>(http::Response::builder().status(200).body(body).unwrap())
             });
@@ -114,4 +121,3 @@ async fn h2_server(addr: SocketAddr, tls: Arc<rustls::ServerConfig>) -> Result<(
         });
     }
 }
-

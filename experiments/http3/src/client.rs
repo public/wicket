@@ -72,7 +72,11 @@ pub async fn run(o: Opts) -> Result<()> {
         let t0 = Instant::now();
         let addr = match o.connect.get(&host) {
             Some(a) => *a,
-            None => (host.as_str(), 443).to_socket_addrs().with_context(|| format!("resolving {host}"))?.next().ok_or_else(|| anyhow!("{host}: no address"))?,
+            None => (host.as_str(), 443)
+                .to_socket_addrs()
+                .with_context(|| format!("resolving {host}"))?
+                .next()
+                .ok_or_else(|| anyhow!("{host}: no address"))?,
         };
         let dns_ms = now_ms(t0);
         let connecting = ep.connect(addr, &host)?;
@@ -87,11 +91,17 @@ pub async fn run(o: Opts) -> Result<()> {
                     });
                     let r = one(&mut send, first, &o.method, o.body_bytes).await;
                     let acc = accepted.await;
-                    println!("{}", json!({"event": "zero-rtt", "offered": true, "accepted": acc, "request": r.as_ref().map(|r| r.status).ok(), "error": r.err().map(|e| format!("{e:#}")), "ms": now_ms(early)}));
+                    println!(
+                        "{}",
+                        json!({"event": "zero-rtt", "offered": true, "accepted": acc, "request": r.as_ref().map(|r| r.status).ok(), "error": r.err().map(|e| format!("{e:#}")), "ms": now_ms(early)})
+                    );
                     (c, Some(send))
                 }
                 Err(connecting) => {
-                    println!("{}", json!({"event": "zero-rtt", "offered": false, "why": "no 0-RTT-capable session ticket (server allows no early data)"}));
+                    println!(
+                        "{}",
+                        json!({"event": "zero-rtt", "offered": false, "why": "no 0-RTT-capable session ticket (server allows no early data)"})
+                    );
                     (connecting.await?, None)
                 }
             }
@@ -110,7 +120,10 @@ pub async fn run(o: Opts) -> Result<()> {
             }
         };
         let ready_ms = now_ms(t0);
-        println!("{}", json!({"event": "connected", "conn": ci, "addr": addr.to_string(), "dns_ms": dns_ms, "handshake_ms": hs_ms, "h3_ready_ms": ready_ms}));
+        println!(
+            "{}",
+            json!({"event": "connected", "conn": ci, "addr": addr.to_string(), "dns_ms": dns_ms, "handshake_ms": hs_ms, "h3_ready_ms": ready_ms})
+        );
         for url in &o.urls {
             for i in 0..o.n {
                 if o.rebind_after == Some(done) {
@@ -140,9 +153,12 @@ pub async fn run(o: Opts) -> Result<()> {
             }
         }
         let s = conn.stats();
-        println!("{}", json!({"event": "conn-stats", "conn": ci, "rtt_us": s.path.rtt.as_micros() as u64, "mtu": s.path.current_mtu,
+        println!(
+            "{}",
+            json!({"event": "conn-stats", "conn": ci, "rtt_us": s.path.rtt.as_micros() as u64, "mtu": s.path.current_mtu,
             "lost_packets": s.path.lost_packets, "sent_packets": s.path.sent_packets, "udp_tx": s.udp_tx.datagrams, "udp_rx": s.udp_rx.datagrams,
-            "udp_tx_ios": s.udp_tx.ios, "udp_rx_ios": s.udp_rx.ios, "udp_rx_bytes": s.udp_rx.bytes, "congestion_events": s.path.congestion_events}));
+            "udp_tx_ios": s.udp_tx.ios, "udp_rx_ios": s.udp_rx.ios, "udp_rx_bytes": s.udp_rx.bytes, "congestion_events": s.path.congestion_events})
+        );
         conn.close(0u32.into(), b"done");
         // Let the server's session ticket arrive for the next (resumed / 0-RTT) connection.
         tokio::time::sleep(Duration::from_millis(50)).await;
