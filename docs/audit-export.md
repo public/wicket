@@ -56,8 +56,8 @@ sinks:
 **Who sends.** `wicket serve` and every `wicket run` start an exporter thread when the sinks file
 exists. `wicket audit export` runs one in the foreground (`--once` for a single pass, `--checkpoint`
 to send a checkpoint now, `--status` for each sink's position and last error). Each sink is fed by
-one process at a time, which holds a lease on it in the ledger. If that process exits, another takes
-over within 30 s. Exporters use their own ledger connection and never touch a request's path.
+one process at a time, which holds a lease on it in the ledger. A run that ends makes a last pass and
+hands its sinks over; if a process dies instead, another takes over within 30 s. Exporters use their own ledger connection and never touch a request's path.
 
 **Delivery** is at least once, by sequence number:
 - Each sink's cursor in the ledger is the last `seq` it acknowledged. The ledger is the buffer: a sink

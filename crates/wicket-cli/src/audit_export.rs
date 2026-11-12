@@ -30,7 +30,8 @@ pub fn open_batched(path: &Path) -> Result<Ledger> {
     Ok(l)
 }
 
-/// Commits the audit records still queued when it is dropped (the end of a run, on any path).
+/// Commits the audit records still queued when it is dropped (the end of a run, on any path), then
+/// lets the background exporter deliver them and hand its sinks over.
 pub struct FlushOnDrop(pub Arc<Mutex<Ledger>>);
 
 impl Drop for FlushOnDrop {
@@ -40,6 +41,7 @@ impl Drop for FlushOnDrop {
                 eprintln!("wicket: committing the last audit records failed: {e}");
             }
         }
+        stop_background(Duration::from_secs(10));
     }
 }
 
@@ -170,7 +172,13 @@ pub fn otlp_body(items: &[Value], resource: &BTreeMap<String, String>) -> Value 
                 json!({ "key": "wicket.audit.type", "value": s(ty) }),
                 json!({ "key": "wicket.audit.seq", "value": { "intValue": it["seq"].as_i64().unwrap_or(0).to_string() } }),
             ];
-            for (k, f) in [("wicket.audit.kind", "kind"), ("wicket.audit.hash", "hash"), ("wicket.audit.head", "head"), ("wicket.run", "run"), ("wicket.tenant", "tenant")] {
+            for (k, f) in [
+                ("wicket.audit.kind", "kind"),
+                ("wicket.audit.hash", "hash"),
+                ("wicket.audit.head", "head"),
+                ("wicket.run", "run"),
+                ("wicket.tenant", "tenant"),
+            ] {
                 if let Some(v) = it[f].as_str() {
                     attrs.push(json!({ "key": k, "value": s(v) }));
                 }
@@ -223,6 +231,8 @@ pub struct Pass {
     pub records: usize,
     pub checkpoints: usize,
     pub failures: Vec<(String, String)>,
+    /// Sinks another process is feeding (this pass left them alone).
+    pub busy: Vec<String>,
 }
 
 impl Exporter {
@@ -230,7 +240,11 @@ impl Exporter {
     pub fn new(ledger_path: &Path, cfg: SinksConfig, issuer: Option<wicket_identity::Issuer>) -> Result<Exporter> {
         let mut nonce = [0u8; 6];
         getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-        let sinks = cfg.sinks.iter().map(|s| Sink { spec: s.clone(), next_try: Instant::now(), backoff: Duration::from_secs(1), held: false, renewed: None }).collect();
+        let sinks = cfg
+            .sinks
+            .iter()
+            .map(|s| Sink { spec: s.clone(), next_try: Instant::now(), backoff: Duration::from_secs(1), held: false, renewed: None })
+            .collect();
         Ok(Exporter {
             ledger: Ledger::open(ledger_path)?,
             cfg,
@@ -262,7 +276,11 @@ impl Exporter {
                 s.held = held;
                 s.renewed = held.then_some(now);
             }
-            if !self.sinks[i].held || now < self.sinks[i].next_try {
+            if !self.sinks[i].held {
+                out.busy.push(name);
+                continue;
+            }
+            if now < self.sinks[i].next_try {
                 continue;
             }
             match self.feed(i, force_checkpoint) {
@@ -364,7 +382,12 @@ impl Exporter {
                     // A 2xx can still reject some records (OTLP partial success): hold the cursor.
                     let rejected = serde_json::from_str::<Value>(&text)
                         .ok()
-                        .and_then(|v| v["partialSuccess"]["rejectedLogRecords"].as_str().map(String::from).or_else(|| v["partialSuccess"]["rejectedLogRecords"].as_i64().map(|n| n.to_string())))
+                        .and_then(|v| {
+                            v["partialSuccess"]["rejectedLogRecords"]
+                                .as_str()
+                                .map(String::from)
+                                .or_else(|| v["partialSuccess"]["rejectedLogRecords"].as_i64().map(|n| n.to_string()))
+                        })
                         .and_then(|n| n.parse::<i64>().ok())
                         .unwrap_or(0);
                     if rejected > 0 {
@@ -410,6 +433,7 @@ pub fn spawn_background() {
     };
     let issuer = crate::issuer().map_err(|e| eprintln!("wicket: audit checkpoints are off (no issuer key: {e})")).ok();
     let path = crate::ledger_path();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<()>>();
     let _ = std::thread::Builder::new().name("wicket-audit-export".into()).spawn(move || {
         let mut x = match Exporter::new(&path, cfg, issuer) {
             Ok(x) => x,
@@ -417,9 +441,34 @@ pub fn spawn_background() {
         };
         loop {
             x.pass(false);
-            std::thread::sleep(Duration::from_secs(1));
+            match stop_rx.recv_timeout(Duration::from_secs(1)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(done) => {
+                    // A last pass for what the process wrote at the end, then hand the sinks over.
+                    x.pass(false);
+                    x.release();
+                    let _ = done.send(());
+                    return;
+                }
+                Err(_) => return,
+            }
         }
     });
+    if let Ok(mut s) = BACKGROUND.lock() {
+        *s = Some(stop_tx);
+    }
+}
+
+static BACKGROUND: Mutex<Option<std::sync::mpsc::Sender<std::sync::mpsc::SyncSender<()>>>> = Mutex::new(None);
+
+/// Stops the background exporter, if this process runs one: one last pass, then its sinks' leases
+/// are given up so the next process takes over at once. Waits at most `wait`.
+pub fn stop_background(wait: Duration) {
+    let Some(tx) = BACKGROUND.lock().ok().and_then(|mut s| s.take()) else { return };
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    if tx.send(done_tx).is_ok() {
+        let _ = done_rx.recv_timeout(wait);
+    }
 }
 
 // ---- verification against exported copies ----
@@ -534,7 +583,11 @@ mod tests {
     }
 
     fn jsonl_cfg(path: &Path) -> SinksConfig {
-        SinksConfig::parse(&format!("checkpoint_every: 1h\nbatch: 7\nsinks:\n  - name: file\n    type: jsonl\n    path: {}\n", path.display())).unwrap()
+        SinksConfig::parse(&format!(
+            "checkpoint_every: 1h\nbatch: 7\nsinks:\n  - name: file\n    type: jsonl\n    path: {}\n",
+            path.display()
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -622,8 +675,10 @@ mod tests {
         x.pass(true);
         rusqlite_conn(&lp2).execute("DELETE FROM audit WHERE seq > 6", []).unwrap();
         assert_eq!(l.verify_audit().unwrap(), 6);
-        let cps: Vec<Value> =
-            exported_objects(&std::fs::read_to_string(&out2).unwrap()).into_iter().filter(|o| o["type"] == "wicket.audit.checkpoint").collect();
+        let cps: Vec<Value> = exported_objects(&std::fs::read_to_string(&out2).unwrap())
+            .into_iter()
+            .filter(|o| o["type"] == "wicket.audit.checkpoint")
+            .collect();
         let a = verify_against(&l, &cps, &key).unwrap();
         assert!(a.problems.iter().any(|p| p.contains("ends at seq 6")), "{:?}", a.problems);
     }
@@ -679,7 +734,11 @@ mod tests {
                                 (200, "{}".to_string())
                             };
                             Ok::<_, std::convert::Infallible>(
-                                hyper::Response::builder().status(status).header("content-type", "application/json").body(http_body_util::Full::new(bytes::Bytes::from(text))).unwrap(),
+                                hyper::Response::builder()
+                                    .status(status)
+                                    .header("content-type", "application/json")
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(text)))
+                                    .unwrap(),
                             )
                         }
                     });
@@ -698,7 +757,10 @@ mod tests {
         let lp = d.0.join("ledger.db");
         let issuer = wicket_identity::Issuer::generate("test.local");
         let key = issuer.verifying_key();
-        let cfg = SinksConfig::parse(&format!("checkpoint_every: 1h\nbatch: 16\nsinks:\n  - {{name: otel, type: otlp, endpoint: '{endpoint}'}}\n")).unwrap();
+        let cfg = SinksConfig::parse(&format!(
+            "checkpoint_every: 1h\nbatch: 16\nsinks:\n  - {{name: otel, type: otlp, endpoint: '{endpoint}'}}\n"
+        ))
+        .unwrap();
         let l = open_batched(&lp).unwrap();
         write_records(&l, 0, 40);
 
@@ -751,9 +813,9 @@ mod tests {
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
                         let _ = req.into_body().collect().await;
-                        Ok::<_, std::convert::Infallible>(
-                            hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(r#"{"partialSuccess":{"rejectedLogRecords":"2","errorMessage":"bad"}}"#))),
-                        )
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+                            r#"{"partialSuccess":{"rejectedLogRecords":"2","errorMessage":"bad"}}"#,
+                        ))))
                     });
                     let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
                 });

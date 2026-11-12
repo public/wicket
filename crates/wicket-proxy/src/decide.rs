@@ -419,7 +419,11 @@ mod tests {
         };
         c.emit(ev("reach rule 0"));
         c.emit(ev("grant g-1"));
-        assert_eq!(reader.audit_tail(10).unwrap().len(), 2, "the grant's use committed before emit returned, with what was queued before it");
+        assert_eq!(
+            reader.audit_tail(10).unwrap().len(),
+            2,
+            "the grant's use committed before emit returned, with what was queued before it"
+        );
         c.emit(ev("reach rule 0"));
         assert_eq!(reader.audit_tail(10).unwrap().len(), 2, "a reach-allowed request doesn't wait for its record");
         c.ledger.lock().unwrap().flush_audit().unwrap();

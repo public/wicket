@@ -54,7 +54,8 @@ impl Ledger {
 
     /// Gives up the lease on `sink`, if `holder` has it.
     pub fn release_export(&self, sink: &str, holder: &str) -> Result<()> {
-        self.conn.execute("UPDATE audit_export SET holder = NULL, lease_until = 0 WHERE sink = ?1 AND holder = ?2", params![sink, holder])?;
+        self.conn
+            .execute("UPDATE audit_export SET holder = NULL, lease_until = 0 WHERE sink = ?1 AND holder = ?2", params![sink, holder])?;
         Ok(())
     }
 
@@ -87,7 +88,16 @@ impl Ledger {
         Ok(self.conn.query_row(
             "SELECT sink, seq, checkpoint_at, holder, lease_until, error FROM audit_export WHERE sink = ?1",
             params![sink],
-            |r| Ok(ExportCursor { sink: r.get(0)?, seq: r.get(1)?, checkpoint_at: r.get(2)?, holder: r.get(3)?, lease_until: r.get(4)?, error: r.get(5)? }),
+            |r| {
+                Ok(ExportCursor {
+                    sink: r.get(0)?,
+                    seq: r.get(1)?,
+                    checkpoint_at: r.get(2)?,
+                    holder: r.get(3)?,
+                    lease_until: r.get(4)?,
+                    error: r.get(5)?,
+                })
+            },
         )?)
     }
 

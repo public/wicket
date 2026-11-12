@@ -533,6 +533,11 @@ fn audit_export_cmd(once: bool, checkpoint: bool, status: bool) -> Result<()> {
             eprintln!("wicket: audit sink {sink}: {e}");
         }
         if once {
+            for sink in &p.busy {
+                eprintln!("wicket: audit sink {sink} is fed by another wicket process (see --status); left to it");
+            }
+        }
+        if once {
             if !p.failures.is_empty() {
                 bail!("{} sink(s) failed", p.failures.len());
             }
@@ -888,7 +893,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Audit { tail, verify, against, issuer_jwk, cmd } => {
             if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
-                return audit_export_cmd(once, checkpoint, status);
+                // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
+                return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the audit exporter panicked"))?;
             }
             let l = Ledger::open(&ledger_path())?;
             if verify {

@@ -107,10 +107,7 @@ impl AuditWriter {
             .name("wicket-audit".into())
             .spawn(move || writer_loop(conn, rx, cfg))
             .map_err(|e| StoreError::Writer(e.to_string()))?;
-        Ok(AuditWriter {
-            inner: Arc::new(Inner { tx: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)) }),
-            path: path.to_path_buf(),
-        })
+        Ok(AuditWriter { inner: Arc::new(Inner { tx: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)) }), path: path.to_path_buf() })
     }
 
     /// The ledger file this writer appends to.
@@ -120,7 +117,10 @@ impl AuditWriter {
 
     fn send(&self, m: Msg) -> Result<()> {
         let g = self.inner.tx.lock().map_err(|_| StoreError::Writer("lock".into()))?;
-        g.as_ref().ok_or_else(|| StoreError::Writer("the audit writer stopped".into()))?.send(m).map_err(|_| StoreError::Writer("the audit writer stopped".into()))
+        g.as_ref()
+            .ok_or_else(|| StoreError::Writer("the audit writer stopped".into()))?
+            .send(m)
+            .map_err(|_| StoreError::Writer("the audit writer stopped".into()))
     }
 
     fn queue(&self, tenant: &TenantId, run: Option<&RunId>, kind: &str, body: String, reply: Option<Reply>) -> Result<()> {
@@ -261,13 +261,12 @@ fn commit_with_retry(conn: &mut Connection, recs: &[Pending]) -> std::result::Re
 /// One batch: read the head and chain every record under one write lock.
 fn commit(conn: &mut Connection, recs: &[Pending]) -> rusqlite::Result<Vec<i64>> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut prev: String = tx
-        .query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
-        .optional()?
-        .unwrap_or_else(|| "0".repeat(64));
+    let mut prev: String =
+        tx.query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).optional()?.unwrap_or_else(|| "0".repeat(64));
     let mut seqs = Vec::with_capacity(recs.len());
     {
-        let mut st = tx.prepare_cached("INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        let mut st =
+            tx.prepare_cached("INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
         for r in recs {
             let hash = chain_hash(&prev, &r.kind, &r.body);
             st.execute(params![r.ts, r.tenant, r.run, r.kind, r.body, prev, hash])?;
