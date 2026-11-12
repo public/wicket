@@ -17,6 +17,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+/// The text of the conversation's last message, if it is the user's words (not a tool result).
+fn last_user_text(v: &Value) -> Option<String> {
+    let last = v.get("messages")?.as_array()?.last()?;
+    if last.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    let text = match last.get("content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(c) => c.iter().filter_map(|b| (b.get("type")?.as_str()? == "text").then(|| b.get("text")?.as_str().map(String::from))?).collect::<Vec<_>>().join(" "),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 static REPLIES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the conversation's last message carries a tool result (the command ran): then the turn
@@ -95,6 +109,9 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
         (json!({ "type": "text", "text": format!("Done: the mock model finished. The request carried {messages} messages.") }), "end_turn")
     };
     eprintln!("mock: reply {msg_id}: {} ({messages} messages in the request)", if stop == "tool_use" { "run the command" } else { "finish" });
+    if let Some(t) = last_user_text(&v) {
+        eprintln!("mock: the user said: {}", t.chars().take(1000).collect::<String>().replace('\n', " "));
+    }
     if !stream {
         return json_resp(json!({
             "id": msg_id, "type": "message", "role": "assistant", "model": model,

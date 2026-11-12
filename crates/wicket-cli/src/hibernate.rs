@@ -64,10 +64,15 @@ pub fn trees(m: &Manifest, agent: &str, run_dir: &Path, in_place: Option<&Path>)
 /// Whether a box is at a quiet point: nothing runs in it but the agent runtime (the init, wicket's
 /// forwarder, Claude Code). Err: what else runs.
 pub fn quiet(procs: &[(u32, u32, String)]) -> std::result::Result<(), Vec<String>> {
+    // The init, wicket's entrypoint (a shell running wicket-entry, which stays as the parent of the
+    // forwarder), the forwarder and Claude Code.
     let runtime = |cmd: &str| {
-        let argv0 = cmd.split_whitespace().next().unwrap_or("");
-        let base = argv0.rsplit('/').next().unwrap_or("");
-        matches!(base, "docker-init" | "tini" | "wicket-fwd" | "claude") || (base == "node" && cmd.contains("claude"))
+        let mut words = cmd.split_whitespace().map(|w| w.rsplit('/').next().unwrap_or(""));
+        let base = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("");
+        matches!(base, "docker-init" | "tini" | "wicket-fwd" | "claude" | "wicket-entry")
+            || (matches!(base, "bash" | "sh") && second == "wicket-entry")
+            || (base == "node" && cmd.contains("claude"))
     };
     let others: Vec<String> =
         procs.iter().filter(|(pid, _, cmd)| *pid != 1 && !cmd.is_empty() && !runtime(cmd)).map(|(pid, _, cmd)| format!("{pid}: {}", wicket_agent::clip(cmd, 80))).collect();
@@ -127,6 +132,22 @@ pub fn drop_tree(p: &Path) {
     if p.exists() {
         let _ = bundle::make_writable(p);
         let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+/// Removes everything in a tree but the named top-level entries.
+pub fn drop_tree_except(p: &Path, keep: &[&str]) {
+    let Ok(rd) = std::fs::read_dir(p) else { return };
+    for e in rd.flatten() {
+        if keep.iter().any(|k| e.file_name() == *k) {
+            continue;
+        }
+        let path = e.path();
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            drop_tree(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -389,7 +410,8 @@ mod tests {
     fn only_the_agent_runtime_is_quiet() {
         let idle = vec![
             (1, 0, "/sbin/docker-init -- wicket-entry claude -p".to_string()),
-            (5, 1, "wicket-fwd --listen 198.18.0.1:3128=/wicket/sock/egress.sock".to_string()),
+            (5, 1, "/bin/bash /usr/local/bin/wicket-entry claude -p".to_string()),
+            (6, 5, "wicket-fwd --listen 198.18.0.1:3128=/wicket/sock/egress.sock".to_string()),
             (9, 1, "claude -p --input-format stream-json".to_string()),
             (12, 9, String::new()),
         ];
@@ -397,8 +419,9 @@ mod tests {
         let mut busy = idle.clone();
         busy.push((40, 1, "sleep 600".into()));
         busy.push((41, 9, "/usr/bin/node /workspace/server.js".into()));
+        busy.push((42, 9, "bash -c sleep 1000".into()));
         let e = quiet(&busy).unwrap_err();
-        assert_eq!(e.len(), 2, "{e:?}");
+        assert_eq!(e.len(), 3, "{e:?}");
         assert!(e[0].contains("sleep 600"));
     }
 

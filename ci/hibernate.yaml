@@ -1,0 +1,17 @@
+# Hibernate and wake (#70, ci/hibernate.sh): a long-lived Claude Code agent in a gVisor box, driven by
+# the scripted mock model. Each turn, the mock asks the agent to run /workspace/step.sh.
+task: Run the command you are given and stop.
+agent:
+  name: hib
+  max_turns: 6
+  idle_timeout: 1s
+  hibernate_after: 4s
+zone:
+  name: ci-hibernate
+  isolation: gvisor
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:9998
+  volumes:
+    - { name: data, path: /volumes/data, persist: durable }
+  limits: { memory: 1500m, cpus: 1, timeout: 5m }

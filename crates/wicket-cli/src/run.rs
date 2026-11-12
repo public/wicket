@@ -901,6 +901,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
                             if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                                if wake.is_some() && !saw_assistant {
+                                    println!("[wicket] the woken agent's first reply, {} ms after its box started", started.elapsed().as_millis());
+                                }
                                 saw_assistant = true;
                             }
                             if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
@@ -1124,8 +1127,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     // The node is released: what was bundled goes (an in-place workspace is the
                     // operator's own directory, and stays).
                     for (name, p, _) in &trees {
-                        if name != "workspace" || workspace_dir.is_none() {
-                            crate::hibernate::drop_tree(p);
+                        match (name.as_str(), &workspace_dir) {
+                            ("workspace", Some(_)) => {}
+                            // The outbox stays: it is this run's result, read below.
+                            ("workspace", None) => crate::hibernate::drop_tree_except(p, &["out"]),
+                            _ => crate::hibernate::drop_tree(p),
                         }
                     }
                     let ms = t0.elapsed().as_millis();
