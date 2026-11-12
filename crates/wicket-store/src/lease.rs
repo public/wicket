@@ -281,6 +281,15 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The process supervising a run, as last recorded (it changes when a supervisor re-attaches).
+    pub fn run_owner(&self, run: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT owner FROM runs WHERE id = ?1", params![run], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
     /// Runs recorded as `running`, with their owner label if any.
     pub fn running_runs(&self) -> Result<Vec<(String, Option<String>)>> {
         let mut st = self.conn.prepare("SELECT id, owner FROM runs WHERE status = 'running' ORDER BY started_at")?;

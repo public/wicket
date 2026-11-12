@@ -256,11 +256,18 @@ pub struct NodeCtl {
     keep: bool,
     forgotten: AtomicBool,
     done: tokio::sync::Notify,
+    /// How far into the box's stdout and stderr this supervisor got.
+    next: [std::sync::atomic::AtomicU64; 2],
 }
 
 impl NodeCtl {
     fn send(&self, f: Frame) -> bool {
         self.link.lock().expect("link").as_ref().is_some_and(|l| l.send(f).is_ok())
+    }
+
+    /// How far into the box's stdout and stderr this supervisor got.
+    pub fn offsets(&self) -> (u64, u64) {
+        (self.next[0].load(Ordering::SeqCst), self.next[1].load(Ordering::SeqCst))
     }
 
     /// Whether the box's files are still kept on the node (after its exit, until forgotten).
@@ -327,6 +334,10 @@ pub struct Start {
     pub trees: Vec<(String, PathBuf, Vec<String>)>,
     /// Who in the box made a request (the run's own reading of the agent's events).
     pub attribute: Option<wicket_proxy::Attributor>,
+    /// Re-attach to a box already on the node (#151): no start; its output resumes from
+    /// `resume_from` (stdout, stderr), what the last supervisor had.
+    pub attach: bool,
+    pub resume_from: [u64; 2],
     /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
     /// fetched first).
     pub keep: bool,
@@ -348,6 +359,9 @@ struct Shared {
     /// The box's base token (block 0), and the key that signs its grant blocks.
     token_issuer: wicket_feed::Issuer,
     approver: wicket_authz::SigningKey,
+    /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
+    attach: bool,
+    carried: Vec<LiveGrant>,
     /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
     /// didn't attribute).
     attribute: Option<wicket_proxy::Attributor>,
@@ -376,7 +390,20 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         vec![approver.public()],
     )
     .context("minting the box's token")?;
-    let authority = token_issuer.publish(&approver, &[]).context("the box's token")?;
+    // A re-attached run's token carries the grants the ledger already handed this node for it, so
+    // nothing a human approved is lost with the supervisor that published them.
+    let carried: Vec<LiveGrant> = match s.attach {
+        false => vec![],
+        true => {
+            let now_s = wicket_store::now();
+            let gs = s.ledger.lock().expect("ledger").grants_for_run(&s.run.0).unwrap_or_default();
+            gs.into_iter()
+                .filter(|g| g.node.as_deref() == Some(name.as_str()) && !g.revoked && g.expires_at > now_s)
+                .map(|g| live_grant(&s.tenant, &s.run, &s.zone.name, &token_issuer, &g))
+                .collect()
+        }
+    };
+    let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
     // Several runs share the node's feed. Tokens of runs that have ended (whose own exit didn't
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
@@ -411,6 +438,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         keep: s.keep,
         forgotten: AtomicBool::new(false),
         done: tokio::sync::Notify::new(),
+        next: [std::sync::atomic::AtomicU64::new(s.resume_from[0]), std::sync::atomic::AtomicU64::new(s.resume_from[1])],
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -428,6 +456,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         token_issuer,
         approver,
         attribute: s.attribute.clone(),
+        attach: s.attach,
+        carried,
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -448,17 +478,19 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         Ok(Ok(Err(e))) => return Err(e),
         _ => bail!("node {name} did not come up fresh on the feed within 60 s"),
     }
-    for (tree, src, exclude) in &s.trees {
-        let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
-        ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
-    }
-    if !ctl.send(Frame::Msg(Msg::Start(Box::new(s.start)))) {
-        bail!("lost node {name} while starting the box");
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(e))) => bail!("node {name} could not start the box: {e}"),
-        _ => bail!("node {name} did not start the box within 120 s"),
+    if !s.attach {
+        for (tree, src, exclude) in &s.trees {
+            let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
+            ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
+        }
+        if !ctl.send(Frame::Msg(Msg::Start(Box::new(s.start)))) {
+            bail!("lost node {name} while starting the box");
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(e))) => bail!("node {name} could not start the box: {e}"),
+            _ => bail!("node {name} did not start the box within 120 s"),
+        }
     }
     Ok(NodeBox { stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
 }
@@ -480,6 +512,8 @@ struct Progress {
     revoked: HashSet<String>,
     /// The grants the box's token carries now.
     live: Vec<LiveGrant>,
+    /// The node has listed the run at least once (a re-attached run that it doesn't list is gone).
+    ever_resumed: bool,
     ever: bool,
     exited: bool,
     /// The node's certificate, as last authenticated or renewed.
@@ -500,11 +534,12 @@ async fn manage(
     let mut p = Progress {
         stdin: OutBuf::new(crate::nodesrv::OUTPUT_CAP),
         stdin_closed: false,
-        next: [0, 0],
-        published: HashSet::new(),
+        next: [sh.ctl.next[0].load(Ordering::SeqCst), sh.ctl.next[1].load(Ordering::SeqCst)],
+        published: sh.carried.iter().map(|g| g.grant.gid.clone()).collect(),
         revoked: HashSet::new(),
-        live: vec![],
+        live: sh.carried.clone(),
         ever: false,
+        ever_resumed: false,
         exited: false,
         cert: None,
         renewing: None,
@@ -617,7 +652,19 @@ async fn session(
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
     }
+    if sh.attach && !p.ever_resumed && !runs.iter().any(|r| r.run == sh.run.0) {
+        p.ever = false;
+        bail!("node {} has no box for run {}: it is gone", sh.node, sh.run);
+    }
     if let Some(r) = runs.iter().find(|r| r.run == sh.run.0) {
+        p.ever_resumed = true;
+        // Pick the streams up where the node is: stdin from what it has taken (a new supervisor's
+        // buffer starts there), stdout and stderr no earlier than what it still holds.
+        if p.stdin.end() < r.stdin_received {
+            p.stdin = OutBuf::starting_at(crate::nodesrv::OUTPUT_CAP, r.stdin_received);
+        }
+        p.next[0] = p.next[0].max(r.stdout_start);
+        p.next[1] = p.next[1].max(r.stderr_start);
         println!("[wicket] node {} reconnected; resuming the box's output", sh.node);
         send(Frame::Msg(Msg::Resume { run: r.run.clone(), stdout_from: p.next[0], stderr_from: p.next[1] }));
         p.stdin.ack(r.stdin_received);
@@ -721,6 +768,7 @@ async fn on_frame(
         Frame::Data { stream, offset, bytes } => {
             let Some(i) = [1usize, 2].into_iter().find(|&i| sh.streams[i] == stream) else { return Ok(()) };
             let (fresh, gap) = accept_at(&mut p.next[i - 1], offset, &bytes);
+            sh.ctl.next[i - 1].store(p.next[i - 1], Ordering::SeqCst);
             if gap {
                 println!(
                     "[wicket] some of the box's {} was lost while node {} was unreachable (it keeps {} MiB per stream)",
@@ -982,7 +1030,6 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             );
             continue;
         }
-        let op = Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path);
         // A node's grant covers its path whatever the query, and carries no risk bound: hand it over
         // only if no query makes that path riskier than the human approved (#119; a fetch's ref
         // discovery approved at R1 is a push's at R4). Otherwise the control host keeps deciding it.
@@ -996,20 +1043,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             }
             continue;
         }
-        let live = LiveGrant {
-            grant: wicket_authz::Grant {
-                gid: g.id.clone(),
-                box_id: sh.token_issuer.box_path.clone(),
-                epoch: sh.token_issuer.epoch,
-                host: op.host.clone(),
-                method: op.method.clone(),
-                path: op.path.clone(),
-                not_after: u64::try_from(g.expires_at).unwrap_or(0),
-                approver: g.request_id.as_deref().map_or_else(|| "operator".to_string(), |r| format!("request:{r}")),
-                digest: hex::decode(op.digest()).unwrap_or_default(),
-            },
-            uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
-        };
+        let live = live_grant(&sh.tenant, &sh.run, &sh.zone.name, &sh.token_issuer, &g);
         let mut trial = p.live.clone();
         trial.push(live.clone());
         if let Err(e) = loads(&trial) {
@@ -1069,6 +1103,26 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             println!("[wicket] could not publish grants to node {}: {e}", sh.node);
             vec![]
         }
+    }
+}
+
+/// A ledger grant as a block of the box's token. Its use count is the ledger's at handover: a
+/// re-minted token (a re-attached run) gives the node that count again.
+fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::Issuer, g: &wicket_store::GrantRow) -> LiveGrant {
+    let op = Op::egress(tenant, run, zone, &g.method, &g.host, &g.path);
+    LiveGrant {
+        grant: wicket_authz::Grant {
+            gid: g.id.clone(),
+            box_id: issuer.box_path.clone(),
+            epoch: issuer.epoch,
+            host: op.host.clone(),
+            method: op.method.clone(),
+            path: op.path.clone(),
+            not_after: u64::try_from(g.expires_at).unwrap_or(0),
+            approver: g.request_id.as_deref().map_or_else(|| "operator".to_string(), |r| format!("request:{r}")),
+            digest: hex::decode(op.digest()).unwrap_or_default(),
+        },
+        uses: g.uses_left.map(|u| u.clamp(0, i64::from(u32::MAX)) as u32),
     }
 }
 

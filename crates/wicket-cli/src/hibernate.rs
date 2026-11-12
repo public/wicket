@@ -550,6 +550,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         lease: None,
         wrap: None,
         wake: Some(Wake { agent: agent.clone(), generation, state, first }),
+        attach: false,
     };
     if let Err(e) = crate::run::run(opts).await {
         let l = Ledger::open(&ledger_path())?;

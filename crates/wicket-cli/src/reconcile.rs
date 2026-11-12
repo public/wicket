@@ -2,9 +2,13 @@
 //! ledger, and `wicket reconcile --every <interval>` runs passes for ever.
 //!
 //! **What it compares.**
-//! - *Runs*: a run recorded as `running` whose supervising `wicket run` process (its owner label,
-//!   `<machine>:<pid>:<start>`) is gone on this machine is ended as `lost`. A run supervised on another
-//!   machine is left alone: only that machine can tell.
+//! - *Runs*: a run recorded as `running` whose supervising process (its owner in the ledger,
+//!   `<machine>:<pid>:<start>`) is gone on this machine is asked about on its node (#151). If the node
+//!   still has its box, the run is **adopted**: a new supervisor (`wicket attach <run>`) takes it over,
+//!   its box untouched. If the node says the box is gone, the run is ended as `lost`; if the node
+//!   can't be reached, the run is left for the next pass. A run with no node recorded (from before
+//!   #146) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
+//!   tell.
 //! - *Leases* (`wicket_store::LeaseRow`): a pending lease whose request a human granted becomes
 //!   `approved`, one denied or withdrawn ends. An approved or active lease ends when its holder run has
 //!   ended or (active) when `not_after` has passed; runs placed on it are stopped first.
@@ -18,8 +22,9 @@
 //!   destroy** (`Placer::release` reads the instance and refuses one without the owner tag or with
 //!   `wicket-protected`), so a tag changed between list and destroy saves the machine.
 //! - *Boxes*: Docker's `wicket=1` containers, here and on every active enrolled node (over its pinned
-//!   ssh), by their `wicket.run` label. A box whose run has ended, or (here) whose owner process is gone,
-//!   is stopped. **A box whose run this ledger doesn't know is left alone**: Docker may be shared.
+//!   ssh), by their `wicket.run` label. A box whose run has ended is stopped; a running run's box is
+//!   left to its run (above). **A box whose run this ledger doesn't know is left alone**: Docker may
+//!   be shared.
 //!
 //! **Order.** Runs, then leases, then machines, then boxes, so killing every control-plane process
 //! mid-run and restarting leaves nothing behind after one pass: the lost runs end, their leases end,
@@ -104,6 +109,11 @@ pub struct Pass<'a, P, S, B, F> {
     pub node_boxes: F,
     /// Whether an owner label's process is running (None: not this machine's to say).
     pub owner_alive: fn(&str) -> Option<bool>,
+    /// The runs each node reported having (None: it couldn't be reached), for runs whose supervisor
+    /// is gone; fetched before the pass ([`node_runs`]).
+    pub node_runs: HashMap<String, Option<Vec<String>>>,
+    /// Starts a new supervisor for a run (`wicket attach <run>`, detached).
+    pub adopt: fn(&str) -> Result<()>,
     pub now: i64,
     pub dry_run: bool,
     done: Vec<Done>,
@@ -126,12 +136,19 @@ where
             local,
             node_boxes,
             owner_alive: crate::reap::owner_alive,
+            node_runs: HashMap::new(),
+            adopt: crate::run::spawn_attach,
             now,
             dry_run,
             done: vec![],
             runs_ended: HashSet::new(),
             leases_ended: HashSet::new(),
         }
+    }
+
+    pub fn with_node_runs(mut self, m: HashMap<String, Option<Vec<String>>>) -> Self {
+        self.node_runs = m;
+        self
     }
 
     pub async fn run(mut self) -> Result<Vec<Done>> {
@@ -187,9 +204,39 @@ where
     fn runs(&mut self) -> Result<()> {
         for (run, owner) in self.ledger.running_runs()? {
             let Some(o) = owner else { continue };
-            if (self.owner_alive)(&o) == Some(false) {
+            if (self.owner_alive)(&o) != Some(false) {
+                continue;
+            }
+            let Some(node) = self.ledger.run_node(&run)? else {
                 self.end_run(&run, "its wicket process is gone (found by the reconciler)")?;
                 self.did("run_lost", &run, "its wicket process is gone", Some(&run));
+                continue;
+            };
+            match self.node_runs.get(&node).cloned() {
+                Some(Some(list)) if list.contains(&run) => {
+                    if !self.dry_run {
+                        if let Err(e) = (self.adopt)(&run) {
+                            self.note("error", &run, &format!("starting its new supervisor: {e:#}"));
+                            continue;
+                        }
+                    }
+                    self.did(
+                        "run_adopted",
+                        &run,
+                        &format!("its supervisor is gone, its box still runs on node {node}: a new one takes it over"),
+                        Some(&run),
+                    );
+                }
+                Some(Some(_)) => {
+                    let why = format!("its wicket process is gone, and node {node} has no box for it");
+                    self.end_run(&run, &why)?;
+                    self.did("run_lost", &run, &why, Some(&run));
+                }
+                _ => self.note(
+                    "unreachable",
+                    &run,
+                    &format!("its supervisor is gone and node {node} can't be asked about it: left for the next pass"),
+                ),
             }
         }
         Ok(())
@@ -468,10 +515,7 @@ where
                 self.note("left_alone", &b.name, "its run is not in this ledger");
                 return Ok(());
             }
-            Some("running") if node.is_none() && b.owner.as_deref().map(self.owner_alive) == Some(Some(false)) => {
-                self.end_run(run, "its box's wicket process is gone (found by the reconciler)")?;
-                "its wicket process is gone".to_string()
-            }
+            // Its run decides (adopted, or ended above).
             Some("running") => return Ok(()),
             Some(s) => format!("its run has ended ({s})"),
         };
@@ -526,15 +570,47 @@ fn node_docker(name: &str) -> Option<Docker> {
     crate::enrol::resolve_installed(name, None).ok().filter(|n| n.name.is_some()).map(|n| Docker::over_ssh(n.ssh_prefix()))
 }
 
+/// For each node of a running run whose supervisor is gone: the runs it has (exited or not), or
+/// None if it can't be reached within 10 s.
+pub async fn node_runs(ledger: &Ledger) -> Result<HashMap<String, Option<Vec<String>>>> {
+    let mut nodes: HashSet<String> = HashSet::new();
+    for (run, owner) in ledger.running_runs()? {
+        if owner.as_deref().map(crate::reap::owner_alive) == Some(Some(false)) {
+            if let Some(n) = ledger.run_node(&run)? {
+                nodes.insert(n);
+            }
+        }
+    }
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&crate::ledger_path())?));
+    let mut out = HashMap::new();
+    for n in nodes {
+        if n == crate::localnode::NAME {
+            // This host's own node: started if it isn't serving (it adopts its boxes as it starts).
+            if let Err(e) = crate::localnode::ensure(&shared).await {
+                eprintln!("[wicket] this host's own node did not start: {e:#}");
+            }
+        }
+        let scope = format!("reconcile:{}", std::process::id());
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), crate::nodecall::Link::connect(&n, &scope, &shared)).await;
+        let runs = match r {
+            Ok(Ok(l)) => Some(l.runs.iter().map(|r| r.run.clone()).collect()),
+            _ => None,
+        };
+        out.insert(n, runs);
+    }
+    Ok(out)
+}
+
 /// One pass with this installation's ledger, Docker, nodes and placement configuration.
 pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
     let _lock = Lock::take()?;
     let mut ledger = Ledger::open(&crate::ledger_path())?;
+    let asked = node_runs(&ledger).await?;
     let local = Docker::from_env();
     let now = wicket_store::now();
     let Some(cfg) = PlacementConfig::load()? else {
         let none: Option<Machines<'_, static_hosts::StaticHosts, setup::Static>> = None;
-        return Pass::new(&mut ledger, none, &local, node_docker, now, dry_run).run().await;
+        return Pass::new(&mut ledger, none, &local, node_docker, now, dry_run).with_node_runs(asked).run().await;
     };
     let approver = LeaseApprover::default();
     match cfg.backend {
@@ -543,7 +619,7 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             let placer = Placer::new(provider, approver.clone(), cfg.owner(), cfg.envelope()?);
             let s = setup::Static { install: cfg.install_static };
             let m = Machines { placer: &placer, approver: &approver, setup: &s, warm_pool: cfg.warm_pool };
-            Pass::new(&mut ledger, Some(m), &local, node_docker, now, dry_run).run().await
+            Pass::new(&mut ledger, Some(m), &local, node_docker, now, dry_run).with_node_runs(asked.clone()).run().await
         }
         capacity::Backend::Vultr => {
             let v = cfg.vultr.clone().context("vultr settings")?;
@@ -551,7 +627,7 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             let placer = Placer::new(provider, approver.clone(), cfg.owner(), cfg.envelope()?);
             let s = setup::Vultr { ssh_key: v.ssh_key.clone(), hosts: cfg.node_hosts.clone() };
             let m = Machines { placer: &placer, approver: &approver, setup: &s, warm_pool: cfg.warm_pool };
-            Pass::new(&mut ledger, Some(m), &local, node_docker, now, dry_run).run().await
+            Pass::new(&mut ledger, Some(m), &local, node_docker, now, dry_run).with_node_runs(asked.clone()).run().await
         }
     }
 }
@@ -897,6 +973,49 @@ mod tests {
 
     fn audited(l: &Ledger, kind: &str) -> usize {
         l.audit_tail(1000).unwrap().iter().filter(|r| r.2 == kind).count()
+    }
+
+    static ADOPTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn adopt(run: &str) -> Result<()> {
+        ADOPTED.lock().unwrap().push(run.to_string());
+        Ok(())
+    }
+
+    /// #151: a run whose supervisor is gone is taken over if its node still has its box, ended as
+    /// lost if its node says the box is gone, and left alone while its node can't be asked; its box
+    /// is never stopped while the run is running.
+    #[tokio::test]
+    async fn a_run_whose_supervisor_is_gone_is_adopted_if_its_node_still_has_it() {
+        let w = World::new(Fake::default());
+        let mut l = Ledger::open_in_memory().unwrap();
+        for (run, node) in [("run_kept", "n1"), ("run_gone", "n1"), ("run_far", "n2")] {
+            l.run_started(&TenantId::single(), &RunId(run.into()), "z", "a").unwrap();
+            l.set_run_owner(run, "dead:1:1").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        let mut asked = HashMap::new();
+        asked.insert("n1".to_string(), Some(vec!["run_kept".to_string()]));
+        asked.insert("n2".to_string(), None);
+        async fn pass(w: &World<Fake>, l: &mut Ledger, asked: &HashMap<String, Option<Vec<String>>>, dry_run: bool) -> Vec<Done> {
+            let m = Machines { placer: &w.placer, approver: &w.approver, setup: &w.setup, warm_pool: false };
+            let nodes = w.nodes.clone();
+            let mut p = Pass::new(l, Some(m), &w.local, move |n: &str| nodes.get(n).cloned(), NOW, dry_run).with_node_runs(asked.clone());
+            p.owner_alive = alive;
+            p.adopt = adopt;
+            p.run().await.unwrap()
+        }
+        // A dry run says so and changes nothing.
+        let d = pass(&w, &mut l, &asked, true).await;
+        assert!(d.iter().any(|x| x.kind == "run_adopted" && x.target == "run_kept"));
+        assert!(ADOPTED.lock().unwrap().is_empty());
+        assert_eq!(l.run_status("run_gone").unwrap().as_deref(), Some("running"));
+        let d = pass(&w, &mut l, &asked, false).await;
+        assert_eq!(*ADOPTED.lock().unwrap(), vec!["run_kept".to_string()]);
+        assert_eq!(l.run_status("run_kept").unwrap().as_deref(), Some("running"));
+        assert_eq!(l.run_status("run_gone").unwrap().as_deref(), Some(LOST));
+        assert_eq!(l.run_status("run_far").unwrap().as_deref(), Some("running"));
+        assert!(d.iter().any(|x| x.kind == "unreachable" && x.target == "run_far"));
+        assert_eq!(audited(&l, "reconcile.run_adopted"), 1);
     }
 
     #[tokio::test]

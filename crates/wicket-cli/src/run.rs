@@ -109,6 +109,71 @@ pub struct RunOpts<'a> {
     /// Wake a hibernated agent (#70): its claim, bundle and first turn. The manifest, image and
     /// workspace come from the agent, not from the options above.
     pub wake: Option<crate::hibernate::Wake>,
+    /// Re-attach to run `run_id`, still running on its node after this run's supervisor died (#151):
+    /// everything comes from the run's record (`ctl/run.json`), nothing from the options above.
+    pub attach: bool,
+}
+
+/// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RunRecord {
+    /// The effective manifest (YAML).
+    manifest: String,
+    image: String,
+    /// The enrolled node it runs on (None: this host's own).
+    node: Option<String>,
+    workspace_dir: Option<std::path::PathBuf>,
+    wrapped: bool,
+    parent_run: Option<String>,
+    lease: Option<String>,
+    /// When the box started (Unix ms), and what earlier activations of its agent spent in a box.
+    started_ms: i64,
+    prior_secs: u64,
+    /// The long-lived agent this run is an activation of, its generation, and its session.
+    fence: Option<(String, i64)>,
+    session_id: String,
+    escalate: bool,
+}
+
+/// What a supervisor saves as it goes (`ctl/progress.json`), every few seconds: the model spend and
+/// how far into the box's output it got.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct RunProgress {
+    requests: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    output_tokens: u64,
+    stdout: u64,
+    stderr: u64,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+}
+
+fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = p.with_extension("json.new");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    std::io::Write::write_all(&mut f, &serde_json::to_vec(v)?)?;
+    std::fs::rename(&tmp, p)?;
+    Ok(())
+}
+
+/// Holds `<run dir>/ctl/supervisor.lock` for as long as this process supervises the run: one
+/// supervisor per run (a second `wicket attach` is refused).
+struct SupervisorLock(#[allow(dead_code)] std::fs::File);
+
+fn supervise_lock(dir: &Path) -> Result<SupervisorLock> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir.join("ctl"))?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("ctl/supervisor.lock"))?;
+    // SAFETY: flock on a file descriptor this function owns.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("another wicket process supervises this run");
+    }
+    Ok(SupervisorLock(f))
 }
 
 /// Every secret the manifest would send goes only to hosts the vault binds it to: the model secret
@@ -135,7 +200,41 @@ pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<
 }
 
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
-    let RunOpts { manifest: manifest_path, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, wrap, wake } = o;
+    let RunOpts {
+        manifest: manifest_path,
+        workdir,
+        workspace_dir,
+        task,
+        image,
+        node,
+        ssh_key,
+        run_id,
+        parent_run,
+        lease,
+        wrap,
+        wake,
+        attach,
+    } = o;
+    // Re-attaching (#151): the run's own record says what it is.
+    let record: Option<RunRecord> = match (&run_id, attach) {
+        (Some(id), true) => {
+            check_run_id(id)?;
+            let d = data_dir().join("runs").join(id);
+            let r: RunRecord = read_json(&d.join("ctl/run.json")).with_context(|| format!("run {id} has no record to re-attach from"))?;
+            if r.wrapped {
+                bail!("run {id} wraps an agent whose launcher was this run's own process: it can't be re-attached");
+            }
+            Some(r)
+        }
+        (None, true) => bail!("re-attaching needs a run id"),
+        _ => None,
+    };
+    let (image_owned, node_owned, parent_owned, lease_owned, wsd_owned) = match &record {
+        Some(r) => (r.image.clone(), r.node.clone(), r.parent_run.clone(), r.lease.clone(), r.workspace_dir.clone()),
+        None => (image.to_string(), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
+    };
+    let (image, node, parent_run, lease) = (image_owned.as_str(), node_owned.as_deref(), parent_owned, lease_owned);
+    let workspace_dir = wsd_owned.as_deref();
     // `--node local` is this host's own node: the same as no --node.
     let node = node.filter(|n| *n != crate::localnode::NAME);
     // A wrapped agent's stdout is its launcher's protocol channel: keep it for the agent, and send
@@ -173,9 +272,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
     let workspace_dir = workspace_dir.or(wake_ws.as_deref());
-    let raw = match &wake {
-        Some(w) => w.agent.manifest.clone(),
-        None => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
+    let raw = match (&wake, &record) {
+        (Some(w), _) => w.agent.manifest.clone(),
+        (None, Some(r)) => r.manifest.clone(),
+        (None, None) => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
     };
     let mut m = Manifest::from_yaml(&raw)?;
     if let Some(t) = task {
@@ -205,6 +305,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
+        Some(_) if record.is_some() => None,
         Some(p) => {
             let base = manifest_path.parent().unwrap_or(Path::new("."));
             let src = p.source.as_ref().map(|s| base.join(s));
@@ -267,6 +368,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let dir = data_dir().join("runs").join(&run.0);
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let _supervising = supervise_lock(&dir)?;
     if let Some(w) = &wake {
         // The agent's writable state, verified against its manifest as it is unpacked.
         let t0 = std::time::Instant::now();
@@ -288,7 +390,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if box_tmp && dir.join("tmp").exists() {
         crate::hibernate::real_dirs(&[dir.join("tmp")])?;
     }
-    for w in workdir.into_iter().chain(program_src.as_ref().map(|(s, _)| s.as_path())) {
+    for w in workdir.into_iter().filter(|_| record.is_none()).chain(program_src.as_ref().map(|(s, _)| s.as_path())) {
         let st = std::process::Command::new("cp").arg("-a").arg(format!("{}/.", w.display())).arg(dir.join("workspace")).status()?;
         if !st.success() {
             bail!("copying {} failed", w.display());
@@ -304,13 +406,32 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     crate::audit_export::spawn_background();
     // The agent's session, and this activation's fencing token: new for a first run, the claimed
     // generation and the agent's own session for a wake.
-    let session = match &wake {
-        Some(w) => wicket_agent::AgentSession { id: w.agent.session_id.clone(), resume: true },
-        None => wicket_agent::AgentSession::new(),
+    let session = match (&wake, &record) {
+        (Some(w), _) => wicket_agent::AgentSession { id: w.agent.session_id.clone(), resume: true },
+        (None, Some(r)) => wicket_agent::AgentSession { id: r.session_id.clone(), resume: true },
+        (None, None) => wicket_agent::AgentSession::new(),
     };
     let mut fence: Option<wicket_proxy::Fence> =
         wake.as_ref().map(|w| wicket_proxy::Fence { agent: w.agent.id.clone(), generation: w.generation });
-    {
+    if let Some(r) = &record {
+        fence = r.fence.as_ref().map(|(a, g)| wicket_proxy::Fence { agent: a.clone(), generation: *g });
+        let l = ledger.lock().expect("ledger");
+        if l.run_status(&run.0)?.as_deref() != Some("running") {
+            bail!("run {run} is not running in the ledger");
+        }
+        if let Some(f) = &fence {
+            match l.agent(&f.agent)? {
+                Some(a) if a.generation == f.generation => {
+                    l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::LEASE_SECS)?;
+                }
+                _ => bail!("agent {} has moved past generation {}: this activation was superseded", f.agent, f.generation),
+            }
+        }
+        // This process supervises it now (the reconciler judges the run by this).
+        l.set_run_owner(&run.0, &crate::reap::owner_label())?;
+        l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::reap::owner_label(), "node": node_name }))?;
+    }
+    if record.is_none() {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
         // Who supervises it, for the reconciler (#38), and the lease it is placed on, if any.
@@ -353,7 +474,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
 
     // Enforcement points, on unix sockets that only this box gets.
-    let ca = Arc::new(RunCa::generate(&run.0)?);
+    // Its key is kept in `ctl/` (never mounted in the box), for a supervisor that re-attaches.
+    let ca = match &record {
+        Some(_) => Arc::new(RunCa::load(
+            &std::fs::read_to_string(dir.join("ctl/run-ca.pem")).context("the run CA's certificate")?,
+            &std::fs::read_to_string(dir.join("ctl/run-ca.key")).context("the run CA's key")?,
+        )?),
+        None => {
+            let ca = RunCa::generate(&run.0)?;
+            std::fs::create_dir_all(dir.join("ctl"))?;
+            std::fs::write(dir.join("ctl/run-ca.pem"), ca.cert_pem())?;
+            write_secret(&dir.join("ctl/run-ca.key"), &ca.key_pem())?;
+            Arc::new(ca)
+        }
+    };
     std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
@@ -367,6 +501,38 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let workload_name = m.agent.as_ref().map(|a| a.name.clone()).or_else(|| m.program.as_ref().map(|p| p.name.clone()));
     let identity: Option<Arc<wicket_proxy::IdentityCell>> = match &workload_name {
         None => None,
+        Some(_) if record.is_some() => {
+            // The same facts as the run's identity in the ledger, with a fresh key.
+            let issuer = crate::issuer()?;
+            let row = ledger.lock().expect("ledger").identity(&run.0)?.context("the run's identity")?;
+            // Verified as of when it was issued (it may have expired while nobody supervised the run).
+            let old = wicket_identity::verify_identity(&row.jws, &issuer.verifying_key(), row.issued_at).context("the run's identity")?;
+            let spec = wicket_identity::IdentitySpec {
+                tenant: old.tenant,
+                zone: old.zone,
+                agent: old.agent,
+                run: old.run,
+                parent_run: old.parent_run,
+                manifest_sha256: old.manifest_sha256,
+                image: old.image,
+                node: old.node,
+                principal: old.principal,
+                act: old.act,
+            };
+            let key = wicket_identity::AgentKey::generate();
+            let now = wicket_store::now();
+            let jws = issuer.issue(&spec, now, identity_ttl, &key.public());
+            let claims = wicket_identity::verify_identity(&jws, &issuer.verifying_key(), now)?;
+            {
+                let l = ledger.lock().expect("ledger");
+                l.rotate_identity(&run.0, &jws, now, claims.exp)?;
+                l.audit(&m.tenant, Some(&run), "identity.rotated", &serde_json::json!({
+                    "id": claims.sub, "identity_sha256": wicket_identity::identity_digest(&jws), "expires_at": claims.exp, "reattached": true,
+                }))?;
+            }
+            id_spec = Some(spec);
+            Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: issuer.verifying_key() })))
+        }
         Some(wname) => {
             let issuer = crate::issuer()?;
             let key = wicket_identity::AgentKey::generate();
@@ -554,14 +720,34 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A wrapped session's model calls reach the model host through the egress proxy: they get the
     // model proxy's budget, filter and accounting there (#112).
     egress.set_model_gate(llm.clone());
-    // A woken agent's budget continues from what its earlier activations spent (#70).
-    let prior_secs = match &wake {
-        Some(w) => {
+    // A woken agent's budget continues from what its earlier activations spent (#70); a re-attached
+    // long-lived agent's from what its agent row records (this activation's spend included, up to its
+    // supervisor's last heartbeat), any other re-attached run's from what its supervisor last saved.
+    let attach_agent = match (&record, &fence) {
+        (Some(_), Some(f)) => ledger.lock().expect("ledger").agent(&f.agent)?,
+        _ => None,
+    };
+    let prior_secs = match (&wake, &attach_agent, &record) {
+        (Some(w), _, _) => {
             let a = &w.agent;
             llm.spent_before(a.used_requests.max(0) as u64, a.used_input_tokens.max(0) as u64, a.used_output_tokens.max(0) as u64);
             a.used_secs.max(0) as u64
         }
-        None => 0,
+        (None, Some(a), _) => {
+            llm.spent_before(a.used_requests.max(0) as u64, a.used_input_tokens.max(0) as u64, a.used_output_tokens.max(0) as u64);
+            a.used_secs.max(0) as u64
+        }
+        (None, None, Some(r)) => {
+            use std::sync::atomic::Ordering::SeqCst;
+            let p: RunProgress = read_json(&dir.join("ctl/progress.json")).unwrap_or_default();
+            llm.requests.store(p.requests, SeqCst);
+            llm.input_tokens.store(p.input_tokens, SeqCst);
+            llm.cache_read_tokens.store(p.cache_read_tokens, SeqCst);
+            llm.cache_creation_tokens.store(p.cache_creation_tokens, SeqCst);
+            llm.output_tokens.store(p.output_tokens, SeqCst);
+            r.prior_secs + u64::try_from((wicket_feed::now_ms() - r.started_ms).max(0) / 1000).unwrap_or(0)
+        }
+        (None, None, None) => 0,
     };
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
@@ -668,6 +854,30 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
+    // What another supervisor needs to take this run over (#151).
+    if record.is_none() {
+        write_json(
+            &dir.join("ctl/run.json"),
+            &RunRecord {
+                manifest: text.clone(),
+                image: image.to_string(),
+                node: node.as_ref().and_then(|n| n.name.clone()),
+                workspace_dir: workspace_dir.clone(),
+                wrapped: wrap.is_some(),
+                parent_run: parent_run.clone(),
+                lease: lease.clone(),
+                started_ms: wicket_feed::now_ms(),
+                prior_secs,
+                fence: fence.as_ref().map(|f| (f.agent.clone(), f.generation)),
+                session_id: session.id.clone(),
+                escalate,
+            },
+        )?;
+    }
+    let resume_from: [u64; 2] = match &record {
+        Some(_) => read_json::<RunProgress>(&dir.join("ctl/progress.json")).map(|p| [p.stdout, p.stderr]).unwrap_or_default(),
+        None => [0, 0],
+    };
     // A wrapped agent's stdout, copied to its launcher until the box's ends.
     let mut wrapped_out: Option<tokio::task::JoinHandle<()>> = None;
     let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = {
@@ -753,6 +963,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             calls: node_calls.clone(),
             trees,
             keep: keep_on_node,
+            attach: record.is_some(),
+            resume_from,
             attribute: ctx.attribute.clone(),
         })
         .await?;
@@ -793,7 +1005,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         (BoxProc(nb.exit), Stopper(nb.ctl), si, so, Box::new(nb.stderr) as Reader)
     };
-    if let Some(f) = &fence {
+    if let Some(f) = fence.as_ref().filter(|_| record.is_none()) {
         let l = ledger.lock().expect("ledger");
         l.set_agent_state(&f.agent, f.generation, "active", None)?;
         if wake.is_some() {
@@ -853,12 +1065,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
     // written the same way while the session is open; closing stdin ends it.
     let mut stdin = stdin;
-    if let (Some(si), Some(t)) = (stdin.as_mut(), &stdin_task) {
+    if let (Some(si), Some(t), None) = (stdin.as_mut(), &stdin_task, &record) {
         use tokio::io::AsyncWriteExt;
         si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
     }
     let idle = m.agent.as_ref().map(|a| a.idle()).transpose()?.unwrap_or_default();
-    let mut turn_running = true;
+    // Re-attached: between turns if the box's last output line was a turn's result.
+    let mut turn_running = match &record {
+        Some(_) => !std::fs::read_to_string(dir.join("transcript.jsonl"))
+            .ok()
+            .and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()).map(String::from))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")),
+        None => true,
+    };
     let mut last_result = std::time::Instant::now();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
@@ -879,7 +1099,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         out
     });
     let transcript = dir.join("transcript.jsonl");
-    let mut transcript_f = std::fs::File::create(&transcript)?;
+    let mut transcript_f = std::fs::OpenOptions::new().create(true).append(true).open(&transcript)?;
+    if record.is_none() {
+        transcript_f.set_len(0)?;
+    }
+    let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(3));
     // limits.timeout is a long-lived agent's total time in a box: a wake gets what is left.
     let timeout = m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs));
     let deadline = tokio::time::sleep(timeout);
@@ -977,6 +1201,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None => break,
             },
             Some(ev) = rx.recv() => print_event(&ev),
+            _ = progress_tick.tick() => {
+                use std::sync::atomic::Ordering::SeqCst;
+                let (o, e) = stopper.0.offsets();
+                let _ = write_json(&dir.join("ctl/progress.json"), &RunProgress {
+                    requests: llm.requests.load(SeqCst),
+                    input_tokens: llm.input_tokens.load(SeqCst),
+                    cache_read_tokens: llm.cache_read_tokens.load(SeqCst),
+                    cache_creation_tokens: llm.cache_creation_tokens.load(SeqCst),
+                    output_tokens: llm.output_tokens.load(SeqCst),
+                    stdout: o,
+                    stderr: e,
+                });
+            }
             _ = heartbeat.tick(), if !stopping && !is_program => {
                 // The holder's claim on its agent: renewed while the box lives. If it can't be, a
                 // newer activation has the agent, and this box must not go on.
@@ -1462,6 +1699,44 @@ fn print_event(ev: &Event) {
             );
         }
     }
+}
+
+/// Starts a new supervisor for `run` (`wicket attach <run>`), detached, its output in
+/// `<run dir>/ctl/attach.log`: what the reconciler does for a run whose supervisor is gone but whose
+/// box still runs on its node (#151).
+pub fn spawn_attach(run: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    check_run_id(run)?;
+    let dir = data_dir().join("runs").join(run).join("ctl");
+    std::fs::create_dir_all(&dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("attach.log"))?;
+    let mut c = std::process::Command::new(std::env::current_exe().context("finding this binary")?);
+    c.args(["attach", run]).current_dir(&dir).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    // SAFETY: async-signal-safe calls only, in the child before exec: its own session, and no
+    // descriptor of the reconciler's but stdio.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
+                n if n > 0 => n.min(65_536) as libc::c_int,
+                _ => 1024,
+            };
+            for fd in 3..max {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    c.spawn().context("starting `wicket attach`")?;
+    Ok(())
+}
+
+/// Writes a file only this user can read.
+fn write_secret(p: &Path, body: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+    std::io::Write::write_all(&mut f, body.as_bytes())?;
+    Ok(())
 }
 
 /// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).

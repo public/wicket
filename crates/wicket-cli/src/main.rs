@@ -133,6 +133,10 @@ enum Cmd {
     /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
     /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
+    /// Supervise a run again whose supervisor died (#151): what `wicket reconcile` starts for a run
+    /// still running on its node.
+    #[command(hide = true)]
+    Attach { run: String },
     Wrap {
         #[arg(long)]
         manifest: PathBuf,
@@ -819,6 +823,7 @@ async fn main() -> Result<()> {
                 lease,
                 wrap: None,
                 wake: None,
+                attach: false,
             })
             .await
         }
@@ -836,6 +841,25 @@ async fn main() -> Result<()> {
                 lease: None,
                 wrap: Some(argv),
                 wake: None,
+                attach: false,
+            })
+            .await
+        }
+        Cmd::Attach { run } => {
+            run::run(run::RunOpts {
+                manifest: std::path::Path::new("(the run's record)"),
+                workdir: None,
+                workspace_dir: None,
+                task: None,
+                image: "",
+                node: None,
+                ssh_key: None,
+                run_id: Some(run),
+                parent_run: None,
+                lease: None,
+                wrap: None,
+                wake: None,
+                attach: true,
             })
             .await
         }
