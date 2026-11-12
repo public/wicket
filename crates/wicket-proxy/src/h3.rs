@@ -236,7 +236,7 @@ impl H3 {
         let reachable = |h: &str| e.decider.host_verdict(&e.ctx, h) == HostVerdict::Open;
         let (reply, what) = dns::answer(&self.names, q, self.opts.https_records, reachable)?;
         let emit = |host: &str, outcome: &str, detail: String| {
-            e.ctx.emit(Event::Egress { method: "DNS".into(), host: host.into(), path: "/".into(), risk: "-".into(), outcome: outcome.into(), detail })
+            e.ctx.emit(Event::Egress { method: "DNS".into(), host: host.into(), path: String::new(), risk: "-".into(), outcome: outcome.into(), detail })
         };
         match what {
             Answered::Resolved { name, ip, fresh: true } => emit(&name, "allow", format!("resolved to {ip} (wicket DNS, for HTTP/3)")),
@@ -281,7 +281,7 @@ impl H3 {
         self.egress.ctx.emit(Event::Egress {
             method: "QUIC".into(),
             host: host.into(),
-            path: "/".into(),
+            path: String::new(),
             risk: "-".into(),
             outcome: "forbidden".into(),
             detail: why,
