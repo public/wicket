@@ -322,6 +322,10 @@ pub struct Start {
     pub node: String,
     pub via: Via,
     pub tenant: TenantId,
+    /// Who the run acts for (`<type>:<id>` of its identity's principal), and how many spawn links are
+    /// above it: what the org policy's conditions on the principal are decided with at mint (#51).
+    pub principal: String,
+    pub depth: i64,
     pub run: RunId,
     pub zone: ZoneSpec,
     pub dir: PathBuf,
@@ -378,18 +382,23 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let (authz_root, approver) = (crate::enrol::token_key(&paths.authz_root_key)?, crate::enrol::token_key(&paths.approver_key)?);
     // Until the run's own deadline (the node kills the box then), with an hour's margin.
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
-    let token_issuer = wicket_feed::Issuer::root(
-        &authz_root,
-        &s.tenant.0,
-        &format!("run:{}", s.run),
-        &s.run.0,
-        0,
+    // Block 0 is compiled from Cedar (#51): the zone's policy and, if the installation has one, the
+    // org policy, for this box as it is now (its zone's groups, its principal, its spawn depth).
+    let org = crate::policy::org()?;
+    let mint = org.as_ref().map(|o| crate::policy::mint_ctx(o, &s.zone.name, &s.tenant.0, &s.principal, s.depth));
+    let ceiling = wicket_policy::ceiling(
         &s.zone,
-        std::slice::from_ref(&s.start.image),
+        &s.run.0,
         not_after,
         vec![approver.public()],
+        std::slice::from_ref(&s.start.image),
+        org.as_ref().zip(mint.as_ref()),
     )
-    .context("minting the box's token")?;
+    .context("compiling the box's policy")?;
+    let token_issuer =
+        wicket_feed::Issuer::from_ceiling(&authz_root, &s.tenant.0, &format!("run:{}", s.run), &s.run.0, 0, &s.zone, &ceiling)
+            .context("minting the box's token")?;
+    s.ledger.lock().expect("ledger").set_run_policy(&s.run.0, org.as_ref().map(|o| o.version()).as_deref())?;
     // A re-attached run's token carries the grants the ledger already handed this node for it, so
     // nothing a human approved is lost with the supervisor that published them.
     let carried: Vec<LiveGrant> = match s.attach {

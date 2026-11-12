@@ -163,10 +163,7 @@ fn int_cmp(cx: &Cx, op: &str, n: i64, attr_name: &str) -> Result<F, CompileError
         ">=" => lit(Cmp::Ge, n),
         ">" => lit(Cmp::Ge, n.checked_add(1).ok_or(()).or_else(|_| cx.err("integer overflow"))?),
         "==" => F::And(Box::new(lit(Cmp::Le, n)), Box::new(lit(Cmp::Ge, n))),
-        "!=" => F::Or(
-            Box::new(lit(Cmp::Le, n.checked_sub(1).unwrap_or(i64::MIN))),
-            Box::new(lit(Cmp::Ge, n.checked_add(1).unwrap_or(i64::MAX))),
-        ),
+        "!=" => F::Or(Box::new(lit(Cmp::Le, n.saturating_sub(1))), Box::new(lit(Cmp::Ge, n.saturating_add(1)))),
         _ => return cx.err(format!("`{op}` on context.{attr_name}")),
     })
 }

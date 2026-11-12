@@ -20,6 +20,7 @@ wicket-auth.workspace = true
 wicket-identity.workspace = true
 wicket-placement.workspace = true
 wicket-feed.workspace = true
+wicket-policy.workspace = true
 wicket-authz.workspace = true
 serde.workspace = true
 thiserror.workspace = true

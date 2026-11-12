@@ -135,3 +135,47 @@ fn no_org_policy_leaves_block_zero_as_it_was() {
     with.org = Some(org(None, vec![]));
     assert!(mint(&keys.root, TENANT, "t", &with).unwrap().print().contains("policy("));
 }
+
+/// The org layer's checks stay on the compiled evaluator, agree with the generic engine, and keep a
+/// request well inside the step budget.
+#[test]
+fn the_org_layer_is_compiled_and_agrees_with_the_generic_engine() {
+    let o = OrgLayer {
+        http: Some(vec![
+            HttpMatch { methods: Some(vec!["GET".into(), "HEAD".into()]), ..Default::default() },
+            HttpMatch {
+                hosts: vec![HostPat::Suffix(".github.com".into())],
+                not_hosts: vec!["evil.github.com".into()],
+                paths: vec![PathPat::Glob("/repos/acme/**".into()), PathPat::Like("/repos/*".into())],
+                max_risk: Some(3),
+                ..Default::default()
+            },
+        ]),
+        forbid: vec![
+            HttpMatch { paths: vec![PathPat::GlobAnyCase("/repos/acme/secrets-vault/**".into())], ..Default::default() },
+            HttpMatch { min_risk: Some(4), methods: Some(vec!["DELETE".into()]), ..Default::default() },
+        ],
+        spawn: Some(vec![SpawnMatch {
+            images: Some(vec!["img:rust".into()]),
+            max_mem_bytes: Some(1 << 30),
+            min_isolation: Some(2),
+            ..Default::default()
+        }]),
+        msg_from: Some(vec!["ops".into()]),
+        inject: Some(vec![GH_INJECT.into()]),
+        ..org(None, vec![])
+    };
+    let (k, t, g) = chain(Some(o));
+    for tok in [&t, &g] {
+        let l = load_ok(tok, &k);
+        assert!(l.is_compiled(), "the org layer must not push the token onto the generic engine");
+        for (_, r) in scenarios(5) {
+            let compiled = l.authorize_compiled(&r).is_ok();
+            let (generic, _) = l.authorize_generic(&r);
+            assert_eq!(compiled, generic.is_ok(), "{r:?}");
+            let _ = l.decide(&r);
+            assert!(!l.last_fell_back(), "{r:?} fell back to the generic engine");
+            assert!(l.last_steps() < STEP_BUDGET / 10, "{} steps", l.last_steps());
+        }
+    }
+}

@@ -22,6 +22,7 @@ mod nodecall;
 mod noderun;
 mod nodesrv;
 mod place;
+mod policy;
 mod program;
 mod reap;
 mod reconcile;
@@ -298,6 +299,12 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<PathBuf>,
     },
+    /// The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled
+    /// into each box's token when it is minted.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
+    },
     /// Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past
     /// their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again
     /// right before each destroy), adopt or create the ones leases need, and stop boxes whose run has
@@ -395,6 +402,31 @@ enum AuditCmd {
         #[arg(long)]
         status: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// The org policy's version, and the running runs minted under another.
+    Show,
+    /// Validate and compile an org policy without installing it.
+    Check {
+        file: PathBuf,
+        /// The groups zones are in (Cedar entities JSON).
+        #[arg(long)]
+        entities: Option<PathBuf>,
+    },
+    /// Install an org policy, and revoke the running runs minted under an older version (their boxes
+    /// stop; new runs get the new policy).
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        entities: Option<PathBuf>,
+        /// Leave running runs on the policy they were minted under until they end.
+        #[arg(long)]
+        keep_runs: bool,
+    },
+    /// A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from).
+    Zone { manifest: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -1288,6 +1320,18 @@ async fn main() -> Result<()> {
             print!("{}", zone_view(&m.zone, json));
             Ok(())
         }
+        Cmd::Policy { cmd } => match cmd {
+            PolicyCmd::Show => policy::show(),
+            PolicyCmd::Check { file, entities } => {
+                policy::sanity(&file)?;
+                policy::check(&file, entities.as_deref())
+            }
+            PolicyCmd::Apply { file, entities, keep_runs } => {
+                policy::sanity(&file)?;
+                policy::apply(&file, entities.as_deref(), keep_runs)
+            }
+            PolicyCmd::Zone { manifest } => policy::zone(&manifest),
+        },
         Cmd::Reconcile { dry_run, every } => {
             let every = every.as_deref().map(humantime::parse_duration).transpose().context("bad --every")?;
             reconcile::command(dry_run, every).await

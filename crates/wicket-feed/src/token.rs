@@ -334,7 +334,27 @@ impl Issuer {
     ) -> Result<Issuer, authz::AuthzError> {
         let mut c = authz::Ceiling::from_zone(zone, run, not_after, grant_keys)?;
         c.spawn.images.extend(images.iter().cloned());
-        let base = authz::mint(root, tenant, principal, &c)?;
+        Issuer::from_ceiling(root, tenant, principal, run, epoch, zone, &c)
+    }
+
+    /// A top-level box whose ceiling was compiled already: from its zone's and the org's Cedar
+    /// policies (`wicket-policy`, #51). `zone` is the one the ceiling was compiled from.
+    pub fn from_ceiling(
+        root: &authz::SigningKey,
+        tenant: &str,
+        principal: &str,
+        run: &str,
+        epoch: i64,
+        zone: &ZoneSpec,
+        ceiling: &authz::Ceiling,
+    ) -> Result<Issuer, authz::AuthzError> {
+        if ceiling.box_prefix != run {
+            return Err(authz::AuthzError::Ceiling(format!(
+                "a top-level box's ceiling is bounded to its own run, not {}",
+                ceiling.box_prefix
+            )));
+        }
+        let base = authz::mint(root, tenant, principal, ceiling)?;
         Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone() })
     }
 

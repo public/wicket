@@ -960,10 +960,35 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 crate::nodecall::Via::Unix(crate::localnode::socket()?)
             }
         };
+        // Who the run acts for, and its spawn depth: what the org policy decides at mint (#51).
+        let principal = identity
+            .as_ref()
+            .map(|c| {
+                let p = c.current().claims.principal.clone();
+                format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
+            })
+            .unwrap_or_else(|| {
+                let p = crate::cli_principal();
+                format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
+            });
+        let depth = {
+            let l = ledger.lock().expect("ledger");
+            let (mut d, mut at) = (0i64, parent_run.clone());
+            while let Some(p) = at.take() {
+                d += 1;
+                at = l.identity(&p).ok().flatten().and_then(|i| i.parent_run);
+                if d > 64 {
+                    break;
+                }
+            }
+            d
+        };
         let nb = crate::noderun::start(crate::noderun::Start {
             node: node_name.clone(),
             via,
             tenant: m.tenant.clone(),
+            principal,
+            depth,
             run: run.clone(),
             zone: m.zone.clone(),
             dir: dir.clone(),

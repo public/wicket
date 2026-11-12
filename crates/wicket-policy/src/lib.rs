@@ -96,15 +96,18 @@ pub fn zone_layer(zone: &ZoneSpec, base: &Ceiling) -> Result<(String, Layer), Co
 }
 
 /// A box's ceiling, compiled from Cedar: the zone layer from the zone's policy and, if the
-/// installation has one, the org layer (block 0 only: pass `org` for a top-level box).
+/// installation has one, the org layer (block 0). `images`: what the box may start children from
+/// beyond the zone's own (its own image, which the zone doesn't name).
 pub fn ceiling(
     zone: &ZoneSpec,
     box_prefix: &str,
     not_after: u64,
     grant_keys: Vec<PublicKey>,
+    images: &[String],
     org: Option<(&OrgPolicy, &MintCtx)>,
 ) -> Result<Ceiling, CompileError> {
-    let base = Ceiling::from_zone(zone, box_prefix, not_after, grant_keys).map_err(|e| CompileError::Cedar(e.to_string()))?;
+    let mut base = Ceiling::from_zone(zone, box_prefix, not_after, grant_keys).map_err(|e| CompileError::Cedar(e.to_string()))?;
+    base.spawn.images.extend(images.iter().cloned());
     let (_, layer) = zone_layer(zone, &base)?;
     let mut c = zone::ceiling_fields(&layer, &base)?;
     c.org = match org {

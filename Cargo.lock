@@ -4168,6 +4168,7 @@ dependencies = [
  "wicket-feed",
  "wicket-identity",
  "wicket-placement",
+ "wicket-policy",
  "wicket-proxy",
  "wicket-sandbox",
  "wicket-store",

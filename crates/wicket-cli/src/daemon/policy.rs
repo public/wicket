@@ -11,7 +11,7 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd, SelfCmd};
+use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -105,6 +105,13 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         // Spends money after a terminal prompt.
         Cmd::Place { .. } => Forward(Privileged),
+        // Applying an org policy changes what every box may do, and revokes runs.
+        Cmd::Policy { cmd } => match cmd {
+            PolicyCmd::Show => Forward(Read),
+            PolicyCmd::Apply { .. } => Forward(Privileged),
+            // Read files the caller names, in the caller's own process.
+            PolicyCmd::Check { .. } | PolicyCmd::Zone { .. } => Local,
+        },
         Cmd::Itself { cmd } => match cmd {
             SelfCmd::Status => Forward(Read),
             // Changes the code that holds every key: root's alone, and never the daemon's own uid

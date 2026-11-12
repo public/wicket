@@ -58,7 +58,7 @@ fn every_zones_cedar_compiles_back_to_its_zone_fields() {
     assert!(zones.len() > 40);
     for z in &zones {
         let base = Ceiling::from_zone(z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
-        let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], None)
+        let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], &[], None)
             .unwrap_or_else(|e| panic!("zone {}: {e}\n{}", z.name, wicket_policy::zone::cedar(z, &base)));
         assert_eq!(canon(&c), canon(&base), "zone {}", z.name);
     }
@@ -458,7 +458,7 @@ fn cedar_and_the_compiled_token_agree() {
                 depth: 0,
                 groups: org.groups_of(&z.name),
             };
-            let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], Some((&org, &m))).unwrap();
+            let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], &[], Some((&org, &m))).unwrap();
             let token = wicket_authz::mint(&keys.root, TENANT, "human:alex", &c).unwrap();
             let loaded = load(&token.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap_or_else(|e| panic!("{e}\n{text}"));
             let cedar = Cedar {
@@ -484,4 +484,41 @@ fn cedar_and_the_compiled_token_agree() {
     );
     assert!(refused < 40, "most generated policies compile ({refused} refused)");
     assert!(kinds.iter().all(|&k| k > 100), "every outcome exercised: {kinds:?}");
+}
+
+/// Nothing on a node evaluates Cedar: the crates a node runs on don't depend on it (Cargo.lock).
+#[test]
+fn nodes_dont_depend_on_cedar() {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")).unwrap();
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    for pkg in lock.split("[[package]]").skip(1) {
+        let name = pkg.lines().find_map(|l| l.strip_prefix("name = \"")).map(|n| n.trim_end_matches('"').to_string()).unwrap();
+        let ds: Vec<String> = pkg
+            .split("dependencies = [")
+            .nth(1)
+            .map(|d| {
+                d.split(']')
+                    .next()
+                    .unwrap_or("")
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix('"'))
+                    .map(|l| l.split([' ', '"']).next().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        deps.entry(name).or_default().extend(ds);
+    }
+    for root in ["wicket-core", "wicket-authz", "wicket-feed"] {
+        let mut seen = HashSet::new();
+        let mut todo = vec![root.to_string()];
+        while let Some(n) = todo.pop() {
+            if seen.insert(n.clone()) {
+                todo.extend(deps.get(&n).cloned().unwrap_or_default());
+            }
+        }
+        for bad in ["cedar-policy", "cedar-policy-core", "wicket-policy"] {
+            assert!(!seen.contains(bad), "{root} depends on {bad}");
+        }
+        assert!(seen.len() > 3, "{root}: the lock file was read ({} crates)", seen.len());
+    }
 }
