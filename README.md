@@ -285,9 +285,8 @@ ci/install-acceptance.sh            # --installed against deploy/install.sh in a
 ACC_VULTR=yes ci/acceptance.sh --nodes vultr   # a fresh Vultr node (spends money; see the script's header)
 ```
 
-Links between a box on a
-node and one on the control host aren't supported yet; the multi-host flow records that and runs the node
-e2e flow instead.
+The multi-host flow also links the agent's box on the control host to the box on the
+node and fetches a page across the link.
 
 ## License
 

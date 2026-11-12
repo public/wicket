@@ -119,12 +119,13 @@ not a permanent decision.
   After a deliberate clock step, restart `wicket-node`.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
-- **What doesn't work on nodes yet:** more than one run per node (a child can't share its parent's
-  served node; on a leased node it runs alone), links between boxes on nodes, hibernation on nodes,
-  plain `http://` to a host the node forwards, and MCP decisions on the node (the gateway decides on
+- **What doesn't work on remote nodes yet:** hibernation, in-place workspaces and wrapped sessions
+  (they need the control host's own node, which shares its filesystem), plain `http://` to a host the
+  node forwards, and MCP decisions on the node (the gateway decides on
   the control host). Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
-  [#103](https://github.com/public/wicket/pull/103)).
+  [#103](https://github.com/public/wicket/pull/103)). A link to a box on a remote node passes through the
+  control host, and each connection into the target box costs a `docker exec` there.
 
 ## Hibernated agents
 

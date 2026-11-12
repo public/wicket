@@ -715,6 +715,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
+    // A wrapped agent's stdout, copied to its launcher until the box's ends.
+    let mut wrapped_out: Option<tokio::task::JoinHandle<()>> = None;
     let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -771,20 +773,37 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
         // A wrapped agent's stdin and stdout are its launcher's: joined to the box's, not read here.
         if let Some(fd) = agent_stdout.take() {
-            let (mut box_in, mut box_out) = (si.take(), so.take().expect("stdout"));
-            tokio::spawn(async move {
-                if let Some(w) = box_in.as_mut() {
-                    let _ = tokio::io::copy(&mut tokio::io::stdin(), w).await;
+            let (box_in, mut box_out) = (si.take(), so.take().expect("stdout"));
+            if let Some(mut w) = box_in {
+                // Read on a thread of its own: a blocking read of the launcher's stdin must not hold
+                // up the runtime's shutdown.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; 32 * 1024];
+                    let mut input = std::io::stdin().lock();
+                    while let Ok(n) = input.read(&mut buf) {
+                        if n == 0 || tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
                     use tokio::io::AsyncWriteExt;
+                    while let Some(b) = rx.recv().await {
+                        if w.write_all(&b).await.is_err() {
+                            break;
+                        }
+                    }
                     let _ = w.shutdown().await;
-                }
-            });
-            tokio::spawn(async move {
+                });
+            }
+            wrapped_out = Some(tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let mut out = tokio::fs::File::from_std(std::fs::File::from(fd));
                 let _ = tokio::io::copy(&mut box_out, &mut out).await;
                 let _ = out.flush().await;
-            });
+            }));
         }
         (BoxProc(nb.exit), Stopper(nb.ctl), si, so, Box::new(nb.stderr) as Reader)
     };
@@ -1138,6 +1157,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(e) => e,
         None => child.wait().await?,
     };
+    if let Some(t) = wrapped_out.take() {
+        // Everything the box wrote reaches the launcher before the run ends.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
+    }
     while let Ok(ev) = rx.try_recv() {
         print_event(&ev);
     }

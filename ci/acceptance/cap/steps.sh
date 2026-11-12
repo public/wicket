@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs inside the cap agent's box: ask for a node, wait for it, start a box there, try to link to it.
+# Runs inside the cap agent's box: ask for a node, wait for it, start a box there, link to it.
 set -u
 out=/workspace/out
 r='{}'
@@ -22,7 +22,7 @@ put remote "$(gw spawn "$(jq -nc --arg l "$lease" --arg c "$probe" '{name:"remot
 # A link to it (its server is up for 45 s): retried while its box is still starting.
 for _ in $(seq 20); do
   c=$(gw connect '{"box":"remote","port":8000}')
-  case "$c" in *"No such container"* | *"not running"*) sleep 2 ;; *) break ;; esac
+  case "$c" in *"No such container"* | *"not running"* | *"no running box"*) sleep 2 ;; *) break ;; esac
 done
 put connect "$c"
 put connect_fetch "$(curl -s -m 5 --noproxy '*' http://remote.wicket.internal:8000/ 2>/dev/null || true)"
