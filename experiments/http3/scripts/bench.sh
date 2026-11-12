@@ -35,7 +35,7 @@ pids+=($!)
 
 ticks box-start
 box "
-G='/opt/h3spike get --ca /wicket/ca/ca.pem --quiet'
+G='/opt/h3spike get --ca /wicket/ca/ca.pem --quiet ${CLIENT_ARGS:-}'
 fwdpid=\$(cat /tmp/fwd.pid)
 fc() { echo \"{\\\"event\\\":\\\"fwd-cpu\\\",\\\"what\\\":\\\"\$1\\\",\\\"ticks\\\":\$(awk '{print \$14+\$15}' /proc/\$fwdpid/stat),\\\"wall_ms\\\":\$(date +%s%3N)}\"; }
 echo '{\"event\":\"phase\",\"phase\":\"chain-new\"}'; \$G --conns 30 $SMALL

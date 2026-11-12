@@ -12,6 +12,7 @@ mod dns;
 mod fwd;
 mod origin;
 mod term;
+mod udpbench;
 mod upstream;
 mod wire;
 
@@ -84,6 +85,7 @@ fn main() -> Result<()> {
             prefix: a.num("prefix", 16)?,
             batch: a.num("batch", 32)?,
             sockbuf: a.num("sockbuf", 4 << 20)?,
+            gro: a.num("gro", 32)?,
         }),
         "term" => {
             let zone: wicket_core::ZoneSpec = serde_json::from_str(&std::fs::read_to_string(a.req("zone")?)?).context("zone JSON")?;
@@ -97,7 +99,9 @@ fn main() -> Result<()> {
                 https_records: a.has("https-records"),
                 migration: !a.has("no-migration"),
                 mtu_upper: a.get("mtu-upper").map(|s| s.parse()).transpose()?,
+                initial_mtu: a.get("initial-mtu").map(|s| s.parse()).transpose()?,
                 idle_secs: a.num("idle", 30)?,
+                gso: a.num("gso", 32)?,
             }))
         }
         "origin" => {
@@ -118,6 +122,7 @@ fn main() -> Result<()> {
                 rebind_after: a.get("rebind-after").map(|s| s.parse()).transpose()?,
                 pause_secs: a.num("pause", 0)?,
                 mtu_upper: a.get("mtu-upper").map(|s| s.parse()).transpose()?,
+                initial_mtu: a.get("initial-mtu").map(|s| s.parse()).transpose()?,
                 gso: !a.has("no-gso"),
                 idle_secs: a.num("idle", 30)?,
                 method: a.get("method").unwrap_or("GET").into(),
@@ -130,6 +135,7 @@ fn main() -> Result<()> {
             client::resolve(&a.rest);
             Ok(())
         }
+        "udpbench" => udpbench::run(a.get("send").unwrap_or("sendto"), a.get("recv").unwrap_or("one"), a.num("n", 100000)?, a.num("size", 1452)?, a.get("to").unwrap_or("198.19.0.5:9000").parse()?),
         c => bail!("unknown command {c}"),
     }
 }

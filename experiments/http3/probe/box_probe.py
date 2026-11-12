@@ -111,6 +111,25 @@ def uds_dgram_unconnected():
     return f"reply {len(got)} bytes to autobound {s.getsockname()!r}"
 
 
+def uds_dgram_bound():
+    """Bind the box's datagram socket to a path in the bind-mounted directory first, so the host has
+    a named peer to reply to (needs gVisor to create a host socket file: --host-uds=create)."""
+    path = f"{SOCKDIR}/dgram.sock"
+    mine = f"{SOCKDIR}/box-{os.getpid()}.sock"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    try:
+        s.bind(mine)
+    except OSError as e:
+        return f"FAIL bind {mine}: {e!r} (no reply path: SOCK_DGRAM can't be answered)"
+    try:
+        s.sendto(b"x" * 1200, path)
+        got = s.recv(2000)
+        return f"reply {len(got)} bytes to {mine}"
+    finally:
+        os.unlink(mine)
+
+
 def mtu():
     import fcntl
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -199,6 +218,7 @@ check("uds-stream", lambda: uds("stream", socket.SOCK_STREAM))
 check("uds-seqpacket", lambda: uds("seqpacket", socket.SOCK_SEQPACKET))
 check("uds-dgram-connected", lambda: uds("dgram", socket.SOCK_DGRAM))
 check("uds-dgram-unconnected", uds_dgram_unconnected)
+check("uds-dgram-bound", uds_dgram_bound)
 check("udp-gso-setsockopt", gso)
 check("udp-gso-send", gso_send)
 check("udp-gro-setsockopt", gro)

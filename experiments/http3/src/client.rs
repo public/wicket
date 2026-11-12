@@ -21,6 +21,8 @@ pub struct Opts {
     pub rebind_after: Option<usize>,
     pub pause_secs: u64,
     pub mtu_upper: Option<u16>,
+    /// Start at this MTU instead of 1200 (the box leg has no real link to discover).
+    pub initial_mtu: Option<u16>,
     pub gso: bool,
     pub idle_secs: u64,
     pub method: String,
@@ -48,6 +50,9 @@ pub async fn run(o: Opts) -> Result<()> {
         m.upper_bound(up);
         t.mtu_discovery_config(Some(m));
     }
+    if let Some(i) = o.initial_mtu {
+        t.initial_mtu(i);
+    }
     cc.transport_config(Arc::new(t));
     let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
     if let Some(n) = o.rcvbuf {
@@ -57,7 +62,7 @@ pub async fn run(o: Opts) -> Result<()> {
     let gso = quinn::udp::UdpSocketState::new((&sock).into()).map(|s| s.max_gso_segments()).unwrap_or(0);
     let gro = quinn::udp::UdpSocketState::new((&sock).into()).map(|s| s.gro_segments()).unwrap_or(0);
     println!("{}", json!({"event": "socket", "so_rcvbuf": rcvbuf, "max_gso_segments": gso, "gro_segments": gro, "gso_enabled": o.gso}));
-    let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, Arc::new(quinn::TokioRuntime))?;
+    let mut ep = quinn::Endpoint::new(crate::term::endpoint_config(o.mtu_upper), None, sock, Arc::new(quinn::TokioRuntime))?;
     ep.set_default_client_config(cc);
 
     let first = o.urls.first().ok_or_else(|| anyhow!("no URL"))?;

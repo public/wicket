@@ -35,7 +35,11 @@ pub struct Opts {
     pub https_records: bool,
     pub migration: bool,
     pub mtu_upper: Option<u16>,
+    /// Start at this MTU instead of 1200 (the box leg has no real link to discover).
+    pub initial_mtu: Option<u16>,
     pub idle_secs: u64,
+    /// Datagrams per relay message, each way (1: one datagram per message).
+    pub gso: usize,
 }
 
 struct Shared {
@@ -93,6 +97,9 @@ pub async fn run(o: Opts) -> Result<()> {
         m.upper_bound(up);
         t.mtu_discovery_config(Some(m));
     }
+    if let Some(i) = o.initial_mtu {
+        t.initial_mtu(i);
+    }
     t.stream_receive_window((8u32 << 20).into());
     t.receive_window((16u32 << 20).into());
     t.send_window(16 << 20);
@@ -127,8 +134,8 @@ pub async fn run(o: Opts) -> Result<()> {
             Err(_) => continue,
         };
         eprintln!("term: box connected");
-        let relay = Arc::new(Relay { fd: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::WRITABLE)? }, shared: shared.clone(), stats: Default::default() });
-        let ep = quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), Some(sc.clone()), relay.clone(), Arc::new(quinn::TokioRuntime))?;
+        let relay = Arc::new(Relay { fd: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::WRITABLE)? }, shared: shared.clone(), stats: Default::default(), gso: o.gso.clamp(1, 40).min((60_000 / o.mtu_upper.unwrap_or(1452) as usize).max(1)) });
+        let ep = quinn::Endpoint::new_with_abstract_socket(endpoint_config(o.mtu_upper), Some(sc.clone()), relay.clone(), Arc::new(quinn::TokioRuntime))?;
         let shared = shared.clone();
         tokio::spawn(async move {
             while let Some(inc) = ep.accept().await {
@@ -285,6 +292,7 @@ pub struct Relay {
     fd: AsyncFd<OwnedFd>,
     shared: Arc<Shared>,
     stats: Mutex<Stats>,
+    gso: usize,
 }
 
 impl fmt::Debug for Relay {
@@ -314,7 +322,8 @@ impl AsyncUdpSocket for Relay {
             return Ok(()); // nothing else exists in the box: drop
         };
         let mut hdr = [0u8; HDR];
-        wire::put_head(&mut hdr, &Head { kind: KIND_QUIC, src: to, dst: SocketAddrV4::new(from, 443) });
+        let seg = t.segment_size.filter(|&s| s < t.contents.len()).unwrap_or(0) as u16;
+        wire::put_head(&mut hdr, &Head { kind: KIND_QUIC, seg, src: to, dst: SocketAddrV4::new(from, 443) });
         self.fd.try_io(Interest::WRITABLE, |fd| wire::send(fd.as_raw_fd(), &[&hdr, t.contents]))?;
         self.stats.lock().unwrap().tx += 1;
         Ok(())
@@ -351,11 +360,20 @@ impl AsyncUdpSocket for Relay {
                 self.dns(h, &q);
                 continue;
             }
-            meta[n] = RecvMeta { addr: SocketAddr::V4(h.src), len: plen, stride: plen, ecn: None, dst_ip: Some(IpAddr::V4(*h.dst.ip())) };
+            let stride = if h.seg > 0 { h.seg as usize } else { plen };
+            meta[n] = RecvMeta { addr: SocketAddr::V4(h.src), len: plen, stride, ecn: None, dst_ip: Some(IpAddr::V4(*h.dst.ip())) };
             n += 1;
         }
         self.stats.lock().unwrap().rx += n as u64;
         Poll::Ready(Ok(n))
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.gso
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.gso
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -398,4 +416,14 @@ impl UdpPoller for Poller {
         let _g = ready!(self.relay.fd.poll_write_ready(cx))?;
         Poll::Ready(Ok(()))
     }
+}
+
+/// With a raised MTU bound, also advertise (and accept) datagrams that large: the box leg is
+/// loopback plus a unix socket, never a real link.
+pub fn endpoint_config(mtu_upper: Option<u16>) -> quinn::EndpointConfig {
+    let mut c = quinn::EndpointConfig::default();
+    if let Some(m) = mtu_upper {
+        let _ = c.max_udp_payload_size(m.max(1200));
+    }
+    c
 }

@@ -23,6 +23,8 @@ pub struct Opts {
     pub batch: usize,
     /// SO_SNDBUF/SO_RCVBUF for the relay and UDP sockets.
     pub sockbuf: i32,
+    /// Most datagrams of one flow packed into one relay message, box -> host (1: never pack).
+    pub gro: usize,
 }
 
 static UP: AtomicU64 = AtomicU64::new(0);
@@ -44,9 +46,10 @@ pub fn run(o: Opts) -> Result<()> {
 
     let (q, h) = (quic.try_clone()?, host.clone());
     let batch = o.batch;
+    let gro = o.gro.clamp(1, 40);
     let port = o.quic_port;
     std::thread::spawn(move || {
-        if let Err(e) = up_quic(&q, h.as_raw_fd(), port, net, mask, batch) {
+        if let Err(e) = up_quic(&q, h.as_raw_fd(), port, net, mask, batch, gro) {
             eprintln!("fwd: quic up: {e}");
             std::process::exit(1);
         }
@@ -58,7 +61,7 @@ pub fn run(o: Opts) -> Result<()> {
         loop {
             let Ok((n, peer)) = d.recv_from(&mut buf[HDR..]) else { continue };
             let std::net::SocketAddr::V4(peer) = peer else { continue };
-            wire::put_head(&mut buf, &Head { kind: KIND_DNS, src: peer, dst: dns_addr });
+            wire::put_head(&mut buf, &Head { kind: KIND_DNS, seg: 0, src: peer, dst: dns_addr });
             let _ = wire::send(h.as_raw_fd(), &[&buf[..HDR + n]]);
         }
     });
@@ -69,7 +72,7 @@ pub fn run(o: Opts) -> Result<()> {
         });
     }
     // Host -> box.
-    let mut buf = vec![0u8; 70000];
+    let mut buf = vec![0u8; 1 << 18];
     loop {
         let n = match wire::recv(host.as_raw_fd(), &mut buf) {
             Ok(0) => anyhow::bail!("host closed the relay socket"),
@@ -81,8 +84,14 @@ pub fn run(o: Opts) -> Result<()> {
         let payload = &buf[HDR..n];
         match h.kind {
             KIND_QUIC => {
-                DOWN.fetch_add(1, Ordering::Relaxed);
-                let _ = send_from(quic.as_raw_fd(), payload, *h.dst.ip(), h.src);
+                if h.seg > 0 && payload.len() > h.seg as usize {
+                    let parts: Vec<&[u8]> = payload.chunks(h.seg as usize).collect();
+                    DOWN.fetch_add(parts.len() as u64, Ordering::Relaxed);
+                    let _ = send_many_from(quic.as_raw_fd(), &parts, *h.dst.ip(), h.src);
+                } else {
+                    DOWN.fetch_add(1, Ordering::Relaxed);
+                    let _ = send_from(quic.as_raw_fd(), payload, *h.dst.ip(), h.src);
+                }
             }
             KIND_DNS => {
                 let _ = dns.send_to(payload, h.src);
@@ -92,7 +101,7 @@ pub fn run(o: Opts) -> Result<()> {
     }
 }
 
-fn up_quic(sock: &UdpSocket, host: RawFd, port: u16, net: u32, mask: u32, batch: usize) -> io::Result<()> {
+fn up_quic(sock: &UdpSocket, host: RawFd, port: u16, net: u32, mask: u32, batch: usize, gro: usize) -> io::Result<()> {
     const CMSG: usize = 64;
     const MAXB: usize = 64;
     let batch = batch.clamp(1, MAXB);
@@ -136,19 +145,55 @@ fn up_quic(sock: &UdpSocket, host: RawFd, port: u16, net: u32, mask: u32, batch:
             }
             return Err(e);
         }
+        // Runs of datagrams of one flow, all but the last of one size, go as one message (GRO).
+        let mut run: Option<(Head, Vec<usize>)> = None;
+        let flush = |run: &mut Option<(Head, Vec<usize>)>, bufs: &mut Vec<[u8; HDR + 65536]>, lens: &[usize]| -> io::Result<()> {
+            let Some((mut h, idx)) = run.take() else { return Ok(()) };
+            UP.fetch_add(idx.len() as u64, Ordering::Relaxed);
+            let first = idx[0];
+            if idx.len() == 1 {
+                wire::put_head(&mut bufs[first], &h);
+                wire::send(host, &[&bufs[first][..HDR + lens[first]]])?;
+                return Ok(());
+            }
+            h.seg = lens[first] as u16;
+            wire::put_head(&mut bufs[first], &h);
+            let mut parts: Vec<&[u8]> = vec![&bufs[first][..HDR + lens[first]]];
+            for &i in &idx[1..] {
+                parts.push(&bufs[i][HDR..HDR + lens[i]]);
+            }
+            // Blocking send: the host's receive buffer is the flow control.
+            wire::send(host, &parts)?;
+            Ok(())
+        };
+        let mut lens = [0usize; MAXB];
         for i in 0..n as usize {
-            let len = msgs[i].msg_len as usize;
+            lens[i] = msgs[i].msg_len as usize;
+        }
+        for i in 0..n as usize {
+            let len = lens[i];
             let Some(dst) = pktinfo_dst(&msgs[i].msg_hdr) else { continue };
             if u32::from(dst) & mask != net {
                 continue;
             }
             let sa = &names[i];
             let src = SocketAddrV4::new(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr)), u16::from_be(sa.sin_port));
-            wire::put_head(&mut bufs[i], &Head { kind: KIND_QUIC, src, dst: SocketAddrV4::new(dst, port) });
-            UP.fetch_add(1, Ordering::Relaxed);
-            // Blocking send: the host's receive buffer is the flow control.
-            wire::send(host, &[&bufs[i][..HDR + len]])?;
+            let h = Head { kind: KIND_QUIC, seg: 0, src, dst: SocketAddrV4::new(dst, port) };
+            let joins = match &run {
+                Some((rh, idx)) => {
+                    let last = *idx.last().unwrap();
+                    rh.src == h.src && rh.dst == h.dst && idx.len() < gro && lens[last] == lens[idx[0]] && len <= lens[idx[0]]
+                }
+                None => false,
+            };
+            if joins {
+                run.as_mut().unwrap().1.push(i);
+            } else {
+                flush(&mut run, &mut bufs, &lens)?;
+                run = Some((h, vec![i]));
+            }
         }
+        flush(&mut run, &mut bufs, &lens)?;
     }
 }
 
@@ -194,6 +239,47 @@ fn send_from(fd: RawFd, payload: &[u8], from: Ipv4Addr, to: SocketAddrV4) -> io:
         if libc::sendmsg(fd, &m, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
+    }
+    Ok(())
+}
+
+/// sendmmsg of several datagrams to one client, all from `from`: one trapped syscall in gVisor.
+fn send_many_from(fd: RawFd, parts: &[&[u8]], from: Ipv4Addr, to: SocketAddrV4) -> io::Result<()> {
+    let n = parts.len();
+    let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    name.sin_family = libc::AF_INET as _;
+    name.sin_port = to.port().to_be();
+    name.sin_addr.s_addr = u32::from(*to.ip()).to_be();
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) } as usize;
+    let mut ctrl = vec![[0u8; 64]; n];
+    let mut iovs: Vec<libc::iovec> = parts.iter().map(|p| libc::iovec { iov_base: p.as_ptr() as *mut _, iov_len: p.len() }).collect();
+    let mut msgs: Vec<libc::mmsghdr> = vec![unsafe { std::mem::zeroed() }; n];
+    for i in 0..n {
+        let m = &mut msgs[i].msg_hdr;
+        m.msg_name = &mut name as *mut _ as *mut _;
+        m.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
+        m.msg_iov = &mut iovs[i];
+        m.msg_iovlen = 1;
+        m.msg_control = ctrl[i].as_mut_ptr() as *mut _;
+        m.msg_controllen = space as _;
+        unsafe {
+            let c = libc::CMSG_FIRSTHDR(m);
+            (*c).cmsg_level = libc::IPPROTO_IP;
+            (*c).cmsg_type = libc::IP_PKTINFO;
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
+            let pi = libc::CMSG_DATA(c) as *mut libc::in_pktinfo;
+            (*pi).ipi_ifindex = 0;
+            (*pi).ipi_spec_dst.s_addr = u32::from(from).to_be();
+            (*pi).ipi_addr.s_addr = 0;
+        }
+    }
+    let mut off = 0;
+    while off < n {
+        let r = unsafe { libc::sendmmsg(fd, msgs[off..].as_mut_ptr(), (n - off) as _, 0) };
+        if r <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        off += r as usize;
     }
     Ok(())
 }

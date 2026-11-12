@@ -1,5 +1,7 @@
 //! The relay frame between the in-box forwarder and the host, one per SOCK_SEQPACKET message:
-//! `kind u8 | src ip4 | src port u16 | dst ip4 | dst port u16 | payload`. `src` is the box client's
+//! `kind u8 | seg u16 | src ip4 | src port u16 | dst ip4 | dst port u16 | payload`. `seg` is 0 for
+//! one datagram; otherwise the payload is several datagrams of `seg` bytes each (the last may be
+//! shorter), all of one flow: GSO/GRO over the relay, so a batch costs one unix message. `src` is the box client's
 //! address, `dst` the address it sent to (a synthetic address, or wicket.internal:53), in both
 //! directions, so the forwarder keeps no state: a reply goes from `dst` to `src`.
 
@@ -7,23 +9,25 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-pub const HDR: usize = 13;
+pub const HDR: usize = 15;
 pub const KIND_QUIC: u8 = 0;
 pub const KIND_DNS: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Head {
     pub kind: u8,
+    pub seg: u16,
     pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
 }
 
 pub fn put_head(buf: &mut [u8], h: &Head) {
     buf[0] = h.kind;
-    buf[1..5].copy_from_slice(&h.src.ip().octets());
-    buf[5..7].copy_from_slice(&h.src.port().to_be_bytes());
-    buf[7..11].copy_from_slice(&h.dst.ip().octets());
-    buf[11..13].copy_from_slice(&h.dst.port().to_be_bytes());
+    buf[1..3].copy_from_slice(&h.seg.to_be_bytes());
+    buf[3..7].copy_from_slice(&h.src.ip().octets());
+    buf[7..9].copy_from_slice(&h.src.port().to_be_bytes());
+    buf[9..13].copy_from_slice(&h.dst.ip().octets());
+    buf[13..15].copy_from_slice(&h.dst.port().to_be_bytes());
 }
 
 pub fn get_head(buf: &[u8]) -> Option<Head> {
@@ -34,8 +38,9 @@ pub fn get_head(buf: &[u8]) -> Option<Head> {
     let port = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
     Some(Head {
         kind: buf[0],
-        src: SocketAddrV4::new(ip(&buf[1..5]), port(&buf[5..7])),
-        dst: SocketAddrV4::new(ip(&buf[7..11]), port(&buf[11..13])),
+        seg: port(&buf[1..3]),
+        src: SocketAddrV4::new(ip(&buf[3..7]), port(&buf[7..9])),
+        dst: SocketAddrV4::new(ip(&buf[9..13]), port(&buf[13..15])),
     })
 }
 
