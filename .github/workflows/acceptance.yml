@@ -1,11 +1,10 @@
 name: Acceptance
 
-# The release acceptance test (#41, ci/acceptance.sh): every main flow against the real image,
-# gVisor and Docker, driven by the scripted mock model (no model credential). It takes longer than
-# the smoke job has room for, so it runs nightly and on demand: in development mode with localhost
-# as a node (the static placement backend), then as an operator against a fresh install in a
-# container (ci/install-acceptance.sh). The Vultr flow (--nodes vultr) spends money and is never
-# run here.
+# The release acceptance test (#41, ci/acceptance.sh): its local flows run on every PR in the smoke
+# job (ci.yml). The longer variants run here, nightly and on demand: development mode with localhost
+# as a node (the static placement backend, the node e2e flow), then as an operator against a fresh
+# install in a container (ci/install-acceptance.sh). The Vultr flow (--nodes vultr) spends money and
+# is never run here.
 on:
   schedule:
     - cron: "17 3 * * *"

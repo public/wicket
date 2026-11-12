@@ -299,7 +299,8 @@ hres=$(result_of "$work/hib2.log")
 hf() { jq -r ".$1 // empty" <<<"$hres" 2>/dev/null; }
 check "wicket wake resumed its own session" 'grep -q "session .* resumed" "$work/hib2.log"'
 check "  its files survived (/tmp, \$HOME, workspace, durable volume)" '[ "$(hf tmp)" = tmp-kept ] && [ "$(hf home)" = home-kept ] && [ "$(hf ws)" = ws-kept ] && [ "$(hf vol)" = vol-kept ]'
-check "  and the model saw the earlier conversation" 'grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
+# A fresh session's requests carry 2 and 4 messages; the resumed one's carry the earlier turn too.
+check "  and the model saw the earlier conversation, then the operator's text" 'grep -qE "finish \(([5-9]|[1-9][0-9]) messages" "$work/mock.log" && grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
 check "  and the generation went up by one" '[ "$(agent_field generation)" = $((gen1 + 1)) ]'
 
 # ---- 3. reconcile: an orphaned box ----

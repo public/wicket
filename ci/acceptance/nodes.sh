@@ -10,8 +10,8 @@
 #   local: the static backend, with localhost as an enrolled node (`wicket node serve` run directly
 #          with its own data dir; the ssh hop replaced by WICKET_NODE_SSH, as ci/node-e2e.sh --local
 #          does). Nothing costs money.
-#   vultr: `backend: vultr`, the cheapest plan that fits 1 vCPU and 1 GiB, an envelope of $0.05 an
-#          hour and $0.05 in total. The agent image is loaded onto the node over its pinned ssh.
+#   vultr: `backend: vultr`, the cheapest plan that fits 1 vCPU and 1 GiB, at most $0.02 an hour,
+#          in an envelope of $0.05 an hour and $0.05 in total (owner tag wicket-owner-acc.wicket.test). The agent image is loaded onto the node over its pinned ssh.
 #
 # Links reach only boxes on the control host (a remote box has no host directory here), so a link
 # to the box on the node is refused: cross-node links are a known gap, recorded as such.
@@ -61,6 +61,7 @@ node_vultr_setup() {
   [ "$mode" = dev ] || f=$work/placement.yaml
   cat >"$f" <<EOF
 backend: vultr
+owner: acc.wicket.test
 max_hourly_usd: '0.05'
 max_total_usd: '0.05'
 node_hosts: [example.com]
@@ -78,11 +79,14 @@ vultr_teardown() {
   wroot identity revoke "$cap_run" --reason "acceptance teardown" >/dev/null 2>&1
   [ -n "${lease:-}" ] && wroot lease release "$lease" >/dev/null 2>&1
   wroot reconcile >/dev/null 2>&1
-  if wroot place list 2>/dev/null | grep -q "^0 node(s) tagged"; then
+  if wroot place list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"; then
     echo "teardown: no tagged Vultr machine remains"
   else
-    echo "!!!! TEARDOWN: a tagged Vultr machine may remain: check \`wicket place list\` and \`wicket place release <id>\` NOW"
-    wroot place list 2>&1 | sed 's/^/!!!! /'
+    ACC_KEEP=1   # keep the ledger: it is how this machine is found and released
+    echo "!!!! TEARDOWN: a Vultr machine tagged for this test may remain, and it bills by the hour. Now:"
+    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket place list --owner acc.wicket.test"
+    echo "!!!!   WICKET_HOME=${WICKET_HOME:-$datadir} wicket place release --owner acc.wicket.test <instance id>"
+    wroot place list --owner acc.wicket.test 2>&1 | sed 's/^/!!!! /'
   fi
   if [ "$mode" = installed ]; then sudo -n rm -f "$datadir/placement.yaml"; fi
 }
@@ -144,13 +148,20 @@ multihost() {
   check "  its egress was decided on the node: in reach 200" 'child_log "$cap_run" | grep -q "acc-remote in=200"'
   check "  and out of reach 403" 'child_log "$cap_run" | grep -q "acc-remote .*out=403"'
   # Cross-node links: not supported yet.
-  check "a link to the box on the node is refused (cross-node links: known gap)" 'cf connect | grep -qiv "^connected\|wicket.internal:8000$"'
-  skip "a box on the node linked to a box on the control host" "cross-node links are a known gap; the node e2e flow runs instead"
+  echo "   connect to the box on the node: $(cf connect)"
+  if cf connect | grep -q "wicket.internal:8000"; then
+    check "a box on the node, linked to the control host's agent, serves it across nodes" '[ "$(cf connect_fetch)" = acc-remote ]'
+  else
+    check "a link to the box on the node is refused cleanly (cross-node links: known gap)" 'cf connect | grep -q "is not one wicket can link here"'
+    skip "a box on the node linked to a box on the control host" "cross-node links are a known gap; the node e2e flow runs instead"
+  fi
 
   # The node e2e flow, against the same node, once the remote box has ended (one run per node).
+  remote_run=$(cf remote | grep -o 'run_[a-z0-9]*' | head -1 || true)
+  wait_for 90 'child_log "$cap_run" | grep -qE "run $remote_run: [a-z]+ in"' || true
   if [ "${ACC_NODE_E2E:-1}" = 1 ] && [ -n "${node_name:-}" ]; then
     log "node e2e flow on $node_name"
-    if HOME=$HOMEW WICKET="$W" IMAGE="$IMAGE_TAG" ${ACC_VULTR_SSH_KEY:+WICKET_E2E_SSH_KEY=$ACC_VULTR_SSH_KEY} \
+    if TMPDIR=$work HOME=$HOMEW WICKET="$W" IMAGE="$IMAGE_TAG" ${ACC_VULTR_SSH_KEY:+WICKET_E2E_SSH_KEY=$ACC_VULTR_SSH_KEY} \
       timeout 600 ci/node-e2e.sh "$node_name" >"$work/node-e2e.log" 2>&1; then e2e=0; else e2e=$?; fi
     grep -E '^(ok|FAIL) ' "$work/node-e2e.log" | sed 's/^/   node-e2e: /'
     check "the node e2e flow passed (ci/node-e2e.sh $node_name)" '[ "$e2e" = 0 ]'
@@ -167,7 +178,7 @@ multihost() {
   check "  and the lease records what its node billed" 'grep -q "billed [$][0-9]" <<<"$lrow"'
   billed=$(grep -o 'billed \$[0-9.]*' <<<"$lrow" || true)
   if [ "$nodes" = vultr ]; then
-    check "  no tagged machine remains (wicket place list)" 'wroot place list 2>/dev/null | grep -q "^0 node(s) tagged"'
+    check "  no tagged machine remains (wicket place list)" 'wroot place list --owner acc.wicket.test 2>/dev/null | grep -q "^0 node(s) tagged"'
     echo "   Vultr: the lease ${billed:-billed ?}; compare with the account's billing for this instance"
   else
     check "  no box remains on the node" '[ -z "$(for r in $(all_descendants); do box_of "$r"; done)" ]'

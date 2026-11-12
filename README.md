@@ -310,7 +310,8 @@ ci/install-acceptance.sh            # --installed against deploy/install.sh in a
 ACC_VULTR=yes ci/acceptance.sh --nodes vultr   # a fresh Vultr node (spends money; see the script's header)
 ```
 
-`.github/workflows/acceptance.yml` runs the first two and the container test nightly. Links between a box on a
+CI runs the local flows on every PR, and `--nodes local` and the container test nightly
+(`.github/workflows/acceptance.yml`). Links between a box on a
 node and one on the control host aren't supported yet; the multi-host flow records that and runs the node
 e2e flow instead.
 
