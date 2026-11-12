@@ -236,7 +236,14 @@ impl H3 {
         let reachable = |h: &str| e.decider.host_verdict(&e.ctx, h) == HostVerdict::Open;
         let (reply, what) = dns::answer(&self.names, q, self.opts.https_records, reachable)?;
         let emit = |host: &str, outcome: &str, detail: String| {
-            e.ctx.emit(Event::Egress { method: "DNS".into(), host: host.into(), path: String::new(), risk: "-".into(), outcome: outcome.into(), detail })
+            e.ctx.emit(Event::Egress {
+                method: "DNS".into(),
+                host: host.into(),
+                path: String::new(),
+                risk: "-".into(),
+                outcome: outcome.into(),
+                detail,
+            })
         };
         match what {
             Answered::Resolved { name, ip, fresh: true } => emit(&name, "allow", format!("resolved to {ip} (wicket DNS, for HTTP/3)")),
@@ -326,17 +333,21 @@ impl H3 {
         };
         let sni = conn.handshake_data().and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok()).and_then(|h| h.server_name);
         if !sni.as_deref().is_some_and(|s| s.trim_end_matches('.').eq_ignore_ascii_case(&host)) {
-            self.refused(&host, format!("the TLS server name ({}) is not the host this address stands for", sni.as_deref().unwrap_or("none")));
+            self.refused(
+                &host,
+                format!("the TLS server name ({}) is not the host this address stands for", sni.as_deref().unwrap_or("none")),
+            );
             conn.close(0x0101u32.into(), b"wicket: the server name does not match the address");
             return;
         }
-        let mut h3c: h3::server::Connection<h3_quinn::Connection, Bytes> = match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(%host, error = %e, "HTTP/3 setup failed");
-                return;
-            }
-        };
+        let mut h3c: h3::server::Connection<h3_quinn::Connection, Bytes> =
+            match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(%host, error = %e, "HTTP/3 setup failed");
+                    return;
+                }
+            };
         loop {
             match h3c.accept().await {
                 Ok(Some(resolver)) => {
@@ -357,7 +368,12 @@ impl H3 {
         }
     }
 
-    async fn request(self: Arc<Self>, host: String, req: Request<()>, stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) {
+    async fn request(
+        self: Arc<Self>,
+        host: String,
+        req: Request<()>,
+        stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ) {
         let (mut send, recv) = stream.split();
         let resp = self.decide(&host, req, recv).await;
         if let Err(e) = send_response(&mut send, resp).await {
@@ -397,7 +413,9 @@ impl H3 {
                     host,
                     &method,
                     "/",
-                    &format!("HTTP/3 to {host} isn't served on this node ({why}); use HTTPS through the proxy (HTTPS_PROXY), which reaches it"),
+                    &format!(
+                        "HTTP/3 to {host} isn't served on this node ({why}); use HTTPS through the proxy (HTTPS_PROXY), which reaches it"
+                    ),
                 );
             }
         }
@@ -494,7 +512,13 @@ impl AsyncUdpSocket for RelaySocket {
                 continue; // larger than quinn takes: dropped, as the kernel would truncate it
             }
             bufs[n][..d.data.len()].copy_from_slice(&d.data);
-            meta[n] = RecvMeta { addr: SocketAddr::V4(d.src), len: d.data.len(), stride: d.data.len(), ecn: None, dst_ip: Some(IpAddr::V4(d.dst)) };
+            meta[n] = RecvMeta {
+                addr: SocketAddr::V4(d.src),
+                len: d.data.len(),
+                stride: d.data.len(),
+                ecn: None,
+                dst_ip: Some(IpAddr::V4(d.dst)),
+            };
             n += 1;
         }
         if n == 0 {
@@ -681,7 +705,8 @@ fn register(fd: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
 
 fn seqpacket_accept(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: accept4 on a listening socket, without the peer's address.
-    let c = cvt(unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) } as isize)?;
+    let c =
+        cvt(unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) } as isize)?;
     set_bufs(c as RawFd);
     // SAFETY: accept4 succeeded: a fresh descriptor owned here.
     Ok(unsafe { OwnedFd::from_raw_fd(c as RawFd) })

@@ -495,7 +495,11 @@ impl Egress {
                 parts.headers.remove(&name);
                 continue;
             }
-            let leaks = parts.headers.get_all(&name).iter().any(|v| injected.iter().any(|s| v.as_bytes().windows(s.len()).any(|w| w == s.as_bytes())));
+            let leaks = parts
+                .headers
+                .get_all(&name)
+                .iter()
+                .any(|v| injected.iter().any(|s| v.as_bytes().windows(s.len()).any(|w| w == s.as_bytes())));
             if leaks {
                 parts.headers.remove(&name);
             }

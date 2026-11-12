@@ -90,7 +90,9 @@ async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
                         let m = req.method().clone();
                         let p = req.uri().path().to_string();
                         let n = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
-                        Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(Bytes::from(format!("h1 {m} {p} body={n}")))))
+                        Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(Bytes::from(format!(
+                            "h1 {m} {p} body={n}"
+                        )))))
                     });
                     let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
                 });
@@ -134,7 +136,13 @@ impl World {
         let h3 = H3::new(egress, opts).unwrap();
         let sock = dir.join("udp.sock");
         let s2 = sock.clone();
-        tokio::spawn(async move { if stream { h3.serve_stream(&s2).await } else { h3.serve(&s2).await } });
+        tokio::spawn(async move {
+            if stream {
+                h3.serve_stream(&s2).await
+            } else {
+                h3.serve(&s2).await
+            }
+        });
         for _ in 0..100 {
             if sock.exists() {
                 break;
