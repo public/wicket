@@ -222,7 +222,20 @@ pub fn manifest_roots() -> Vec<(String, PathBuf)> {
     roots
 }
 
-pub async fn serve(opts: ServeOpts) -> Result<()> {
+/// What `wicket serve` with these options would serve: origin, relying-party id, transport and
+/// listening address (for `wicket doctor`).
+pub fn describe(opts: &ServeOpts) -> Result<(String, String, &'static str, std::net::SocketAddr)> {
+    let plan = net::plan(opts, &data_dir())?;
+    let how = match (&plan.tls, plan.behind_terminator) {
+        (Some(net::TlsSource::Files { .. }), _) => "HTTPS, certificate files",
+        (Some(net::TlsSource::Acme(_)), _) => "HTTPS, ACME",
+        (None, true) => "HTTP behind a TLS terminator",
+        (None, false) => "HTTP, loopback only",
+    };
+    Ok((plan.origin, plan.rp_id, how, plan.addr))
+}
+
+pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     let plan = net::plan(&opts, &data_dir())?;
     let tenant = TenantId::single();
     let l = Ledger::open(&ledger_path())?;
@@ -270,6 +283,8 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     }
     if has_passkeys {
         println!("sign in with your passkey. (Lost them all? On the host: wicket operator reset)");
+    } else if !bootstrap_link {
+        println!("no operator passkey yet. On the host, as root: wicket operator enrol-link --origin {}", plan.origin);
     } else {
         let token = issue_enrol_link(&state.ledger()?, &state.tenant, BOOTSTRAP_TTL, "wicket serve (no passkey yet)")?;
         println!("no operator passkey yet. Enrol one within 10 minutes (single use):");

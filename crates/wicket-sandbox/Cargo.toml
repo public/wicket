@@ -9,5 +9,6 @@ publish.workspace = true
 [dependencies]
 wicket-core.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
