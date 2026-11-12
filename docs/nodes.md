@@ -15,20 +15,31 @@ below). The ledger, the keys that matter, the LLM proxy and the MCP gateway stay
 Every box runs on a node through `wicket node serve` (#146). `wicket run` without `--node` places the box on
 the control host's own built-in node, `local`, which is served by the same runtime and reached over its unix
 socket instead of ssh. The control host makes and enrols it the first time a run needs it
-(`<data dir>/local-node/`: its own node key, an identity certificate the control host renews itself, no node
-CA), and starts its `serve` on demand: one per wicket build, detached, exiting after 10 minutes with no boxes
-and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`). `wicket node list` shows it; `enrol` refuses the name.
+(`<data dir>/local-node/`: its own node key, an identity certificate, and a node CA, each renewed by the
+control host itself), and starts its `serve` on demand: one per wicket build, detached, exiting after 10
+minutes with no boxes and no connections (`WICKET_LOCAL_NODE_IDLE_SECS`). `wicket node list` shows it;
+`enrol` refuses the name.
 
-The local node differs from a remote one only in how it is reached, and in that it shares the control
-host's filesystem. So the control host lays the box out itself, in the run's directory (as `chan::HostBox`):
-its workspace, state, `/tmp` and volumes stay where they always were, and its sockets are the run's own
-proxies, as for any host a node forwards to the control host, without the hop. Its lifecycle is the node's:
-`docker run`, stdio, the timeout, kill, pause and unpause, process lists for hibernation, execs for links.
-Nothing needs the shared filesystem but wrapped sessions (`wicket wrap`, which hands the box its launcher's
-own stdio protocol): long-lived agents hibernate and wake on any node, their state moved over the
-channel (`PutTree`/`GetTree`; [agents.md](agents.md)), and an in-place `--workspace-dir` on a remote node
-is copied there before the box starts and synced back into the operator's directory when it ends
-(deletions included; its `out/` stays the operator's).
+**No code path distinguishes the control host's boxes but how their node is reached.** The local node
+lays out its boxes, runs their egress proxy, DNS and HTTP/3, and decides from its replica of the feed (the
+box's token and the grants published to it, splice-through included) exactly as a remote node does; its
+audit records are shipped as `node.audit` like any node's. Its CA is the one difference in kind: a 24-hour
+intermediate with no DNS name constraint (`*`; IP addresses still excluded), since it serves whatever its
+boxes reach, while a remote node's is constrained to `--hosts`. What a node doesn't decide itself (hosts
+with an `inject` rule or a credential swap, the model, the MCP gateway) goes to the run's own proxies
+(`<run dir>/ctl/`) over the node's channel.
+
+Sharing the filesystem is used only as transport:
+
+- the local node lays boxes out in the runs' own directories (`<data dir>/runs/<run>`), so a run's
+  workspace and state needn't be copied to it and back, and its zone volumes stay in `<data dir>/volumes`;
+- its tunnels to a run's proxies are those sockets themselves, not frames over the channel;
+- it can mount a directory of the control host's in a box: an in-place `--workspace-dir`, and a wrapped
+  session's directory. Wrapped sessions (`wicket wrap`, which hands the box its launcher's own stdio
+  protocol) are the one thing only the local node runs. Long-lived agents hibernate and wake on any
+  node, their state moved over the channel (`PutTree`/`GetTree`; [agents.md](agents.md)), and an in-place
+  `--workspace-dir` on a remote node is copied there before the box starts and synced back into the
+  operator's directory when it ends (deletions included; its `out/` stays the operator's).
 
 ```sh
 wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)

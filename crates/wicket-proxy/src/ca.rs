@@ -516,6 +516,22 @@ mod tests {
         assert!(NodeCa::load(&cert.pem, &other.serialize_pem()).is_err());
     }
 
+    /// #146: the control host's own node's CA may mint for any name (it serves whatever its boxes
+    /// reach) but never an IP literal; only `load_any` takes it, so a remote node never would.
+    #[tokio::test]
+    async fn the_local_node_ca_mints_any_name_and_no_ip() {
+        let root = InstallationCa::generate().unwrap();
+        let (key, cert) = node_ca(&root, &["*"]);
+        assert_eq!(cert.permitted, vec!["*"]);
+        assert!(NodeCa::load(&cert.pem, &key.serialize_pem()).is_err(), "a remote node refuses an unconstrained CA");
+        let ca = NodeCa::load_any(&cert.pem, &key.serialize_pem()).unwrap();
+        for host in ["api.example.com", "evil.example.net", "example.org"] {
+            handshake(&root, Minter::server_config(&ca, host).unwrap(), host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        assert!(Minter::server_config(&ca, "203.0.113.7").is_err());
+        assert!(crate::decide::subtree_permits("*", "anything.example"));
+    }
+
     #[test]
     fn host_lists_that_would_leave_names_unconstrained_are_refused() {
         for bad in [&[][..], &["203.0.113.7"], &["*.com"], &["a.*.example.com"], &["localhost"], &["exa mple.com"], &["*"]] {

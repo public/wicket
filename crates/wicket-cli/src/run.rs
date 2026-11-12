@@ -753,6 +753,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             calls: node_calls.clone(),
             trees,
             keep: keep_on_node,
+            attribute: ctx.attribute.clone(),
         })
         .await?;
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
@@ -1185,13 +1186,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if keep_on_node && !superseded {
         match fetch_trees(
             &stopper,
-            &run.0,
-            &m,
-            fence.as_ref().map(|f| f.agent.as_str()),
-            &dir,
-            workspace_dir.as_deref(),
-            hibernating,
-            shares_host,
+            Fetch {
+                run: &run.0,
+                m: &m,
+                agent: fence.as_ref().map(|f| f.agent.as_str()),
+                dir: &dir,
+                in_place: workspace_dir.as_deref(),
+                hibernating,
+                same_dir: shares_host,
+            },
         )
         .await
         {
@@ -1370,16 +1373,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
 /// in-place one into the operator's directory), and if it is hibernating, its state, /tmp and durable
 /// volumes, where they are bundled from. Each comes into a fresh directory first, then replaces the
 /// copy here, so what the box deleted is gone here too.
-async fn fetch_trees(
-    stopper: &Stopper,
-    run: &str,
-    m: &Manifest,
-    agent: Option<&str>,
-    dir: &Path,
-    in_place: Option<&Path>,
+struct Fetch<'a> {
+    run: &'a str,
+    m: &'a Manifest,
+    agent: Option<&'a str>,
+    dir: &'a Path,
+    in_place: Option<&'a Path>,
     hibernating: bool,
+    /// The node keeps the box in the run's own directory (this host's own node).
     same_dir: bool,
-) -> Result<()> {
+}
+
+async fn fetch_trees(stopper: &Stopper, f: Fetch<'_>) -> Result<()> {
+    let Fetch { run, m, agent, dir, in_place, hibernating, same_dir } = f;
     let calls = &stopper.0.calls;
     let staging = dir.join("fetch");
     let _ = std::fs::remove_dir_all(&staging);
