@@ -56,7 +56,11 @@ node_local_teardown() {
 
 node_vultr_setup() {
   : "${ACC_VULTR_SSH_KEY_ID:?the id of an ssh key in the Vultr account}" "${ACC_VULTR_SSH_KEY:?its private half on this host}"
-  wroot secret list | grep -q '^vultr-api-key ' || { echo "no vault secret vultr-api-key (wicket secret set vultr-api-key)"; exit 1; }
+  # ACC_VULTR_API_KEY_FILE: link the key into this run's vault by reference (never copied).
+  if [ -n "${ACC_VULTR_API_KEY_FILE:-}" ] && ! wroot secret list | grep -q '^vultr-api-key '; then
+    wroot secret link vultr-api-key --file "$ACC_VULTR_API_KEY_FILE" --hosts api.vultr.com >/dev/null
+  fi
+  wroot secret list | grep -q '^vultr-api-key ' || { echo "no vault secret vultr-api-key (wicket secret set vultr-api-key, or ACC_VULTR_API_KEY_FILE)"; exit 1; }
   local f=$WICKET_HOME/placement.yaml
   [ "$mode" = dev ] || f=$work/placement.yaml
   cat >"$f" <<EOF
