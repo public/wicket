@@ -266,7 +266,7 @@ impl Llm {
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
         let Filtered { body, model, note, want } = match self.filter(Some(spec), &parts, body) {
             Ok(f) => f,
-            Err(r) => return Ok(r),
+            Err(r) => return Ok(*r),
         };
         let Some(reserved) = self.reserve_output(spec.max_output_tokens, want) else {
             self.event(model, 429, Usage::default(), "budget: output token cap reached");
@@ -293,12 +293,21 @@ impl Llm {
                 out = out.header(name.as_str(), value.as_bytes());
             }
         }
-        let sse = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+        let sse = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
         let body = self.account(model, status, sse, resp.bytes_stream(), reserved, note);
         Ok(out.body(body)?)
     }
 
-    async fn send_upstream(&self, spec: &wicket_core::manifest::LlmSpec, parts: &http::request::Parts, body: Bytes) -> Result<reqwest::Response> {
+    async fn send_upstream(
+        &self,
+        spec: &wicket_core::manifest::LlmSpec,
+        parts: &http::request::Parts,
+        body: Bytes,
+    ) -> Result<reqwest::Response> {
         let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
         let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
@@ -330,10 +339,16 @@ impl Llm {
         spec: Option<&wicket_core::manifest::LlmSpec>,
         parts: &http::request::Parts,
         body: Bytes,
-    ) -> std::result::Result<Filtered, Response<BoxBody>> {
+    ) -> std::result::Result<Filtered, Box<Response<BoxBody>>> {
         let refuse = |status: u16, why: String| {
             self.event(None, status, Usage::default(), &format!("refused: {why}"));
-            problem(status, "forbidden", "Blocked by wicket: model request refused", &format!("{why}. {}", crate::SANDBOX_FACT), None)
+            Box::new(problem(
+                status,
+                "forbidden",
+                "Blocked by wicket: model request refused",
+                &format!("{why}. {}", crate::SANDBOX_FACT),
+                None,
+            ))
         };
         let path = parts.uri.path();
         if matches!(parts.method, http::Method::GET | http::Method::HEAD) {
@@ -343,7 +358,10 @@ impl Llm {
             return Ok(Filtered { body, model: None, note: "ok".into(), want: 0 });
         }
         if parts.method != http::Method::POST || !MODEL_ENDPOINTS.contains(&path) {
-            return Err(refuse(403, format!("{} {path} is not a model call wicket proxies (only POST {})", parts.method, MODEL_ENDPOINTS.join(" and "))));
+            return Err(refuse(
+                403,
+                format!("{} {path} is not a model call wicket proxies (only POST {})", parts.method, MODEL_ENDPOINTS.join(" and ")),
+            ));
         }
         if let Some(enc) = parts.headers.get(http::header::CONTENT_ENCODING) {
             if !enc.as_bytes().eq_ignore_ascii_case(b"identity") {
@@ -417,7 +435,7 @@ impl Llm {
         };
         let f = match self.filter(spec, &parts, body) {
             Ok(f) => f,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         let reserved = match spec {
             None => 0,
@@ -425,7 +443,13 @@ impl Llm {
                 Some(r) => r,
                 None => {
                     self.event(f.model, 429, Usage::default(), "budget: output token cap reached");
-                    return problem(429, "budget", "Model token budget exhausted", &format!("{} may generate at most {} output tokens", self.whose(), s.max_output_tokens), None);
+                    return problem(
+                        429,
+                        "budget",
+                        "Model token budget exhausted",
+                        &format!("{} may generate at most {} output tokens", self.whose(), s.max_output_tokens),
+                        None,
+                    );
                 }
             },
         };
@@ -433,7 +457,11 @@ impl Llm {
         match egress.forward(req, host, "https", pq, via).await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let sse = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+                let sse = resp
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("text/event-stream"));
                 let (head, body) = resp.into_parts();
                 Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, f.note))
             }
@@ -451,7 +479,15 @@ impl Llm {
     /// call can't escape its charge by disconnecting before the final usage. A successful response
     /// that ends without its final usage (`message_stop` for a stream) is charged its whole
     /// reservation; an error response, only what it reports.
-    pub(crate) fn account<S, E>(self: &Arc<Self>, model: Option<String>, status: u16, sse: bool, mut upstream: S, reserved: u64, note: String) -> BoxBody
+    pub(crate) fn account<S, E>(
+        self: &Arc<Self>,
+        model: Option<String>,
+        status: u16,
+        sse: bool,
+        mut upstream: S,
+        reserved: u64,
+        note: String,
+    ) -> BoxBody
     where
         S: futures_util::Stream<Item = std::result::Result<Bytes, E>> + Send + Unpin + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
@@ -903,7 +939,9 @@ mod tests {
 
     async fn output_settles(llm: &super::Llm, want: u64) -> u64 {
         for _ in 0..300 {
-            if llm.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0 && llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want {
+            if llm.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst) == want
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -919,7 +957,11 @@ mod tests {
         let chunks = vec![
             sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#),
             sse("content_block_delta", r#"{"type":"content_block_delta","delta":{"text":"lots"}}"#),
-            [sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#), sse("message_stop", r#"{"type":"message_stop"}"#)].concat(),
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":250}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
         ];
         let (port, _) = sse_upstream(chunks, std::time::Duration::from_millis(300)).await;
         let (llm, dir) = llm_to(port, 1000, "early");
@@ -931,10 +973,17 @@ mod tests {
     /// #113: usage at the end of a stream larger than any bounded copy is still read.
     #[tokio::test]
     async fn the_final_usage_of_a_large_stream_is_counted() {
-        let delta = sse("content_block_delta", &format!(r#"{{"type":"content_block_delta","delta":{{"text":"{}"}}}}"#, "x".repeat(64 * 1024)));
+        let delta =
+            sse("content_block_delta", &format!(r#"{{"type":"content_block_delta","delta":{{"text":"{}"}}}}"#, "x".repeat(64 * 1024)));
         let mut chunks = vec![sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#)];
         chunks.extend(std::iter::repeat_n(delta, 150)); // ~9.6 MiB
-        chunks.push([sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":77}}"#), sse("message_stop", r#"{"type":"message_stop"}"#)].concat());
+        chunks.push(
+            [
+                sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":77}}"#),
+                sse("message_stop", r#"{"type":"message_stop"}"#),
+            ]
+            .concat(),
+        );
         let (port, _) = sse_upstream(chunks, std::time::Duration::ZERO).await;
         let (llm, dir) = llm_to(port, 1000, "large");
         assert_eq!(call(llm.clone(), "large", ASK, true).await, 200);
@@ -946,7 +995,10 @@ mod tests {
     /// call asking for more than is left is lowered to what is left.
     #[tokio::test]
     async fn an_unsettled_call_is_charged_its_reservation_and_asks_are_capped() {
-        let chunks = vec![sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#), b": keep-alive\n\n".to_vec()];
+        let chunks = vec![
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#),
+            b": keep-alive\n\n".to_vec(),
+        ];
         let (port, seen) = sse_upstream(chunks, std::time::Duration::ZERO).await;
         let (llm, dir) = llm_to(port, 1000, "unsettled");
         assert_eq!(call(llm.clone(), "unsettled", ASK, true).await, 200);

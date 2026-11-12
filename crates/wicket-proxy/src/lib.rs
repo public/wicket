@@ -454,7 +454,9 @@ pub(crate) fn provider_request_header(host: &str, name: &str) -> bool {
     match host {
         "api.github.com" | "uploads.github.com" => name == "x-github-api-version",
         // Claude Code's model and Remote Control traffic (wrapped sessions).
-        "api.anthropic.com" => name.starts_with("anthropic-") || name.starts_with("x-stainless-") || name.starts_with("x-claude-") || name == "x-app",
+        "api.anthropic.com" => {
+            name.starts_with("anthropic-") || name.starts_with("x-stainless-") || name.starts_with("x-claude-") || name == "x-app"
+        }
         _ => false,
     }
 }

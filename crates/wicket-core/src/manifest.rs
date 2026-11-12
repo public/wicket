@@ -500,7 +500,7 @@ pub fn fold_case_glob(glob: &str) -> String {
                     out.push('[');
                 }
                 let mut closed = false;
-                while let Some(n) = chars.next() {
+                for n in chars.by_ref() {
                     if n == ']' && !body.is_empty() {
                         closed = true;
                         break;

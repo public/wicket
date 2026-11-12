@@ -135,7 +135,17 @@ impl Egress {
             }
         }
         let client = b.build()?;
-        Ok(Arc::new(Egress { ctx, ca, decider, relay, client, upstream, h3_up: Default::default(), strikes: Default::default(), model_gate: Default::default() }))
+        Ok(Arc::new(Egress {
+            ctx,
+            ca,
+            decider,
+            relay,
+            client,
+            upstream,
+            h3_up: Default::default(),
+            strikes: Default::default(),
+            model_gate: Default::default(),
+        }))
     }
 
     /// Model calls to the model host that come through this proxy (a wrapped Claude Code session's)
@@ -800,7 +810,10 @@ mod tests {
             http::Request::post("/repos/a/b/issues").header("x-http-method-override", "DELETE").body(empty()).unwrap(),
             http::Request::get("/safe").header("X-Original-URL", "/admin").body(empty()).unwrap(),
             http::Request::get("/safe").header("x-rewrite-url", "/admin").body(empty()).unwrap(),
-            http::Request::get("/safe").header("content-length", "5").body(http_body_util::Full::new(bytes::Bytes::from_static(b"hello"))).unwrap(),
+            http::Request::get("/safe")
+                .header("content-length", "5")
+                .body(http_body_util::Full::new(bytes::Bytes::from_static(b"hello")))
+                .unwrap(),
             http::Request::head("/safe").header("transfer-encoding", "chunked").body(empty()).unwrap(),
         ];
         for req in refused {
@@ -857,7 +870,8 @@ mod tests {
             if let Some(x) = enc {
                 b = b.header("content-encoding", x);
             }
-            let req = b.body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[]}"#))).unwrap();
+            let req =
+                b.body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[]}"#))).unwrap();
             let e = e.clone();
             async move {
                 let r = e.handle(req, "api.anthropic.com".into(), "https", super::Via::Tcp).await;
@@ -886,7 +900,9 @@ mod tests {
             real: crate::SwapSource::Vault("gh".into()),
         };
         let inject = "reach: [{host: api.github.com, methods: [GET]}], inject: [{host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh}]";
-        for (zone, swaps, tag) in [(inject, vec![], "http-inject"), ("reach: [{host: api.github.com, methods: [GET]}]", vec![swap], "http-swap")] {
+        for (zone, swaps, tag) in
+            [(inject, vec![], "http-inject"), ("reach: [{host: api.github.com, methods: [GET]}]", vec![swap], "http-swap")]
+        {
             let (c, dir) = ctx(zone, swaps, tag);
             let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
             let e = super::Egress::new(c, ca).unwrap();
@@ -912,10 +928,11 @@ mod tests {
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
         let mut up = super::Upstream::default();
         up.dns.insert("rebind.example".into(), vec!["127.0.0.1".parse().unwrap()]);
-        up.dns.insert("meta.example".into(), vec!["93.184.215.14".parse().unwrap(), "169.254.169.254".parse().unwrap()]);
+        up.dns.insert("meta.example".into(), vec!["8.8.8.8".parse().unwrap(), "169.254.169.254".parse().unwrap()]);
         let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
         for host in ["rebind.example", "meta.example"] {
-            let req = http::Request::get("/latest/user-data").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            let req =
+                http::Request::get("/latest/user-data").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
             let resp = e.clone().handle(req, host.into(), "http", super::Via::Tcp).await;
             let status = resp.status();
             let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();

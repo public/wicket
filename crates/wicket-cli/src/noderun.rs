@@ -790,7 +790,10 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
         if worst.risk.rank() > g.max_risk.unwrap_or(0) {
             if p.published.insert(g.id.clone()) {
-                println!("[wicket] grant {} is bounded below what {} {}{} can be; it stays with the control host", g.id, g.method, g.host, g.path);
+                println!(
+                    "[wicket] grant {} is bounded below what {} {}{} can be; it stays with the control host",
+                    g.id, g.method, g.host, g.path
+                );
             }
             continue;
         }

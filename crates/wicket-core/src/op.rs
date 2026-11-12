@@ -24,7 +24,9 @@ impl RiskClass {
     /// The class named as `{:?}` prints it (`R2WriteReversible`).
     pub fn from_name(name: &str) -> Option<RiskClass> {
         use RiskClass::*;
-        [R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege].into_iter().find(|r| format!("{r:?}") == name)
+        [R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege]
+            .into_iter()
+            .find(|r| format!("{r:?}") == name)
     }
 }
 
@@ -250,12 +252,7 @@ impl CompiledZone {
         let forbid = spec
             .forbid
             .iter()
-            .map(|f| {
-                f.paths
-                    .iter()
-                    .map(|p| compile_glob(p).and_then(|_| compile_glob(&fold_case_glob(p))))
-                    .collect::<Result<Vec<_>, _>>()
-            })
+            .map(|f| f.paths.iter().map(|p| compile_glob(p).and_then(|_| compile_glob(&fold_case_glob(p)))).collect::<Result<Vec<_>, _>>())
             .collect::<Result<_, _>>()?;
         let reach = spec.reach.iter().map(|r| globs(&r.paths)).collect::<Result<_, _>>()?;
         Ok(Self { spec, forbid, reach })
@@ -480,7 +477,7 @@ zone:
             "[2001:0:4136:e378:8000:63bf:3fff:fdd2]",
             "[ff02::1]",
             "[fec0::1]",
-            "224.0.0.1",
+            "0xe0000001",
             "240.0.0.1",
             "192.0.2.1",
             "0x7f.1",
@@ -686,7 +683,9 @@ zone:
         assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/pulls/7/Reviews"), R3ExternalOrIrreversible);
         // git over HTTPS: push in any case, and ref discovery for anything but a plain fetch.
         assert_eq!(risk("POST", "github.com", "/acme/app.git/GIT-RECEIVE-PACK"), R4ExecOrPrivilege);
-        let disc = |q: &str| Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/a/b.git/info/refs", q).risk;
+        let disc = |q: &str| {
+            Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/a/b.git/info/refs", q).risk
+        };
         assert_eq!(disc("service=git-upload-pack"), R1ReadScoped);
         assert_eq!(disc(""), R1ReadScoped);
         for q in ["service=git-receive-p%61ck", "service=git-upload-pack&service=git-receive-pack", "service=GIT-RECEIVE-PACK"] {
@@ -699,7 +698,14 @@ zone:
     fn forbids_ignore_case() {
         let z = Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: api.github.com, methods: [GET, PUT], paths: [\"/repos/**\"] }]\n  forbid: [{ host: api.github.com, paths: [\"/repos/acme/prod/**\", \"/repos/[a-c]x/Secret\"] }]\n").unwrap().zone;
         let cz = CompiledZone::new(z.clone()).unwrap();
-        for p in ["/repos/acme/prod/x", "/repos/ACME/prod/x", "/repos/acme/PROD/contents/a", "/repos/Acme/Prod/x", "/repos/BX/secret", "/repos/ax/SECRET"] {
+        for p in [
+            "/repos/acme/prod/x",
+            "/repos/ACME/prod/x",
+            "/repos/acme/PROD/contents/a",
+            "/repos/Acme/Prod/x",
+            "/repos/BX/secret",
+            "/repos/ax/SECRET",
+        ] {
             assert!(matches!(cz.evaluate(&op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
             assert!(matches!(evaluate_uncompiled(&z, &op("PUT", "api.github.com", p)), Verdict::Forbidden(_)), "{p}");
         }

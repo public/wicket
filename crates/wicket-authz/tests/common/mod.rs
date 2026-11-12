@@ -284,7 +284,18 @@ pub fn probes(zones: &[&ZoneSpec]) -> (Vec<String>, Vec<String>) {
         paths.extend(z.forbid.iter().flat_map(|f| f.paths.iter()).flat_map(|g| paths_for(g)).map(|p| p.to_ascii_uppercase()));
     }
     hosts.extend(["github.com", "api.github.com", "example.com", "169.254.169.254", "localhost", "a.b.example.com"].map(String::from));
-    paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack", "/caf\u{e9}/x", "/CAF\u{e9}/X", "/repos/acme/scratch/issues", "/REPOS/ACME/SCRATCH/ISSUES"].map(String::from));
+    paths.extend(
+        [
+            "/",
+            "/x",
+            "/octocat/Hello-World.git/git-receive-pack",
+            "/caf\u{e9}/x",
+            "/CAF\u{e9}/X",
+            "/repos/acme/scratch/issues",
+            "/REPOS/ACME/SCRATCH/ISSUES",
+        ]
+        .map(String::from),
+    );
     hosts.sort();
     hosts.dedup();
     paths.sort();

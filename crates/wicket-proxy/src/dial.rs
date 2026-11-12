@@ -73,9 +73,9 @@ mod tests {
     async fn a_name_with_any_non_public_address_is_refused() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let fixed = HashMap::from([
-            ("public.example".to_string(), vec![ip("93.184.215.14"), ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c")]),
+            ("public.example".to_string(), vec![ip("8.8.8.8"), ip("2606:4700::1111")]),
             ("meta.example".to_string(), vec![ip("169.254.169.254")]),
-            ("mixed.example".to_string(), vec![ip("93.184.215.14"), ip("10.0.0.7")]),
+            ("mixed.example".to_string(), vec![ip("8.8.8.8"), ip("10.0.0.7")]),
             ("loop6.example".to_string(), vec![ip("::1")]),
             ("nat64.example".to_string(), vec![ip("64:ff9b::a9fe:a9fe")]),
             ("none.example".to_string(), vec![]),

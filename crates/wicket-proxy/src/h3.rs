@@ -890,7 +890,11 @@ impl Up {
                 // The checked address is the one dialled, for the connection's whole life (#116).
                 let addr = match fixed {
                     Some(a) => a,
-                    None => crate::dial::resolve_public(&lookup, &host, 443).await?.into_iter().next().ok_or_else(|| anyhow!("{host}: no address"))?,
+                    None => crate::dial::resolve_public(&lookup, &host, 443)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("{host}: no address"))?,
                 };
                 let conn = ep.connect(addr, &host)?.await?;
                 let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;

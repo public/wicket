@@ -1619,7 +1619,8 @@ mod tests {
         // A raw-prefix grant from an older ledger: segment-bounded too, and without a risk bound it
         // covers nothing.
         let (id, _) = l.ask(&o("GET", "/repos/acme/api"), "read", true, None).unwrap();
-        let gid = l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let gid =
+            l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         l.conn.execute("UPDATE grants SET path = '/repos/acme/api', max_risk = 1 WHERE id = ?1", params![gid]).unwrap();
         assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
         assert!(l.consume_grant(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
@@ -1627,10 +1628,26 @@ mod tests {
         assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
 
         // An exact grant for a fetch's ref discovery doesn't cover the push's (same path, R4).
-        let fetch = Op::egress_with_query(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "github.com", "/a/b.git/info/refs", "service=git-upload-pack");
+        let fetch = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("run_t".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/a/b.git/info/refs",
+            "service=git-upload-pack",
+        );
         let (id, _) = l.pending_for(&fetch, "fetch", None).unwrap();
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        let push = Op::egress_with_query(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "github.com", "/a/b.git/info/refs", "service=git-receive-pack");
+        let push = Op::egress_with_query(
+            &TenantId::single(),
+            &RunId("run_t".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/a/b.git/info/refs",
+            "service=git-receive-pack",
+        );
         assert_eq!(push.digest(), fetch.digest());
         assert!(l.consume_grant(&push).unwrap().is_none());
         assert!(l.consume_grant(&fetch).unwrap().is_some());
