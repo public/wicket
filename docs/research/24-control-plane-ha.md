@@ -305,7 +305,55 @@ console as "holds the model credential until …".
 
 ## 4. Prior art: what keeps working when the control plane is down
 
-PRIOR_ART_PLACEHOLDER
+What each system keeps working when its control plane is down, and for how long. Tags carry over from the
+pages read; "not found" means the behaviour could not be confirmed from a primary source.
+
+| System | Control-plane HA | Data plane while it's down | Bound | Revocation while it's down |
+|---|---|---|---|---|
+| **Nomad** | 3 or 5 servers per region, Raft [H] | Allocations keep running; without a `disconnect` block they are never stopped on the client [H] | `disconnect.stop_on_client_after`: the client stops its own allocations after this; `lost_after` lets the servers wait before replacing; `heartbeat_grace` 10 s, `failover_heartbeat_ttl` 5 min [H] | Not possible: servers can only stop what they reach |
+| **Consul** | Raft on servers, 3 tolerate 1 failure, 5 tolerate 2 [H] | Agents serve cached results (`stale-if-error`, background refresh) [H] | ACL `token_ttl`/`policy_ttl`/`role_ttl` 30 s; `acl.down_policy` default `extend-cache` uses cached entries past their TTL [H] | Lags by the TTL; with `extend-cache`, indefinitely while servers are down [H] |
+| **Kubernetes** | etcd quorum, 3 or 5 members [H] | Pods keep running; nothing can be started, stopped or updated; kubelets keep serving the same pods even if storage is lost [H] | Node marked unhealthy after `--node-monitor-grace-period` (50 s), pods evicted after the default `tolerationSeconds` 300; clusters of ≤50 nodes in a mostly unhealthy zone stop evicting [H] | Not possible; the kubelet keeps running pods (the opposite of Nomad's `stop_on_client_after`) |
+| **Vault** | One active node holding a lock, standbys forward; integrated Raft storage, 5 servers recommended [H] | Vault Agent caches tokens and leased secrets and renews them; entries go at max TTL or failed renewal [H]. Explicit outage behaviour: not found | Each secret's lease TTL | Revocations made directly on the server can go unnoticed by the agent's cache [H] |
+| **Boundary** | Several controllers sharing Postgres [H] | **Workers cancel every proxied session** once they have gone `successful_status_grace_period` (15 s) without reaching a controller [H, source] | 15 s | Immediate: a cut-off worker fails closed |
+| **Teleport** | Auth instances behind a load balancer, over an HA backend (etcd, Postgres, DynamoDB, Firestore); SQLite isn't HA [H] | SSH sessions continue with async recording, uploaded later; agents cache roles and configuration [H]. New logins with Auth down: not found | User certificates 12 h by default [H] | Locks: `best_effort` (default) keeps the last known locks; `strict` ends interactions when locks can't be shown fresh [H] |
+| **SPIRE** | Several servers on a shared SQL datastore, each with its own CA [H] | Agents keep SVIDs and rotate them early so they outlast an outage [H] | `availability_target` (minimum 24 h) is the outage the agent is sized for; X.509 SVIDs 1 h by default, JWT 5 min, CA 24 h [H] | At SVID expiry |
+| **Tailscale** | One coordination service [H] | Existing devices keep talking with stored keys and cached ACLs; no new devices, ACL changes or revocations [H]. A client that restarts used to lose its network map; an on-disk cache is rolling out [H] | Node keys 180 days by default [H] | None while it's down [H] |
+| **Cloudflare Access** | A global edge with a separate control plane [H] | A 40 h control-plane outage (2023-11): security services kept working, configuration changes failed [H]. A 2025-06 storage outage: identity logins failed, by design closed; service tokens, mTLS and IP policies kept working [H]. 2025-11: existing sessions unaffected, new logins failed [H] | Sessions default to 24 h [H] | Per-application "revoke existing tokens" is immediate; logout takes 20–30 s [H] |
+
+What wicket takes from them:
+- **Two schools, and wicket needs both, per zone.** Consul, Kubernetes, Tailscale and Teleport (`best_effort`)
+  keep the data plane running on cached policy, and revocation waits. Boundary and Teleport's `strict` mode
+  fail closed in seconds. wicket's feed is the second school today (150 s). The proposal (§5.1) is to let a
+  zone choose its place between them, with defaults near Boundary's for writes and near SPIRE's for reads.
+- **Size autonomy explicitly.** SPIRE's `availability_target` is the best model: a declared outage the
+  data plane must survive, from which rotation is derived. wicket's `offline` windows are the same idea,
+  per zone.
+- **The node fences itself, the control plane waits.** Nomad's `stop_on_client_after` (client side) with
+  `lost_after` (server side) is exactly §5.2's pair.
+- **Restarting the data plane must not lose the cache.** Tailscale's restart problem is wicket's
+  `reap_previous`: a node or run process that restarts during an outage must come back from what it
+  persisted, not empty.
+- **Hidden central dependencies cause the outages.** Both Cloudflare write-ups trace failures to a store
+  everything quietly depended on. wicket's equivalents are the ledger and `state.key`.
+- **Credential caches are where revocation goes to die.** Vault Agent's cache can miss revocations made on
+  the server, and Consul's `extend-cache` serves revoked tokens while servers are down. Leased credentials
+  on a node must be pushed revocations and must expire on their own.
+
+Supporting tools:
+- **openraft** 0.10 (stable, active, breaking changes possible before 1.0), with a Jepsen suite and a
+  deterministic simulation fuzzer in CI; used by Databend [H].
+- **rqlite**: Raft over SQLite, writes through its HTTP API, up to about 11 voters [H].
+- **Litestream** 0.5 moved to the LTX format with compaction, and uses S3 conditional writes as a
+  single-writer lease without a separate coordinator [H]. **LiteFS** is pre-1.0 and "outside [Fly's] scope of
+  support", and LiteFS Cloud was retired [H]/[M].
+- **FROST** (RFC 9591, June 2024, Informational) has Ed25519, ristretto255, Ed448, P-256 and secp256k1
+  ciphersuites; the Zcash Foundation's `frost-ed25519` is at 3.0, described as stable, with an audit of an
+  earlier version [H].
+- **Anthropic's terms** for subscription OAuth: it is for "ordinary use of Claude Code and other native
+  Anthropic applications", and allows an end user signing in to the unmodified Claude Code binary with their
+  own subscription; third parties may not route requests through subscription credentials on behalf of
+  their users [H]. A per-node model proxy that relays the box's own Claude Code requests for the owner keeps
+  to that, as the control host's does; the token must never serve any other client.
 
 ---
 
@@ -463,4 +511,43 @@ plus a standby may be enough.
 
 ## 7. Sources
 
-SOURCES_PLACEHOLDER
+wicket: `crates/wicket-cli/src/{reconcile,noderun,nodesrv,run,hibernate}.rs`, `crates/wicket-proxy/src/{llm,gateway,vault}.rs`,
+`crates/wicket-feed/src/lib.rs`, `crates/wicket-cli/src/serve/mod.rs`, at the merge of #150.
+
+Prior art (read 2026-11-12):
+- Nomad: https://developer.hashicorp.com/nomad/docs/concepts/architecture ·
+  https://developer.hashicorp.com/nomad/docs/configuration/server ·
+  https://developer.hashicorp.com/nomad/docs/job-specification/disconnect
+- Consul: https://developer.hashicorp.com/consul/docs/concept/consensus ·
+  https://developer.hashicorp.com/consul/docs/reference/agent/configuration-file/acl ·
+  https://developer.hashicorp.com/consul/api-docs/features/caching
+- Kubernetes: https://etcd.io/docs/v3.5/faq/ · https://kubernetes.io/docs/tasks/debug/debug-cluster/ ·
+  https://kubernetes.io/docs/concepts/workloads/pods/static-pods/ ·
+  https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/ ·
+  https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/ ·
+  https://kubernetes.io/docs/tasks/tls/certificate-rotation/
+- Vault: https://developer.hashicorp.com/vault/docs/concepts/ha ·
+  https://developer.hashicorp.com/vault/docs/internals/integrated-storage ·
+  https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent/caching
+- Boundary: https://developer.hashicorp.com/boundary/docs/configuration/controller ; source
+  `internal/daemon/worker/session_info.go`, `internal/server/repository.go` (hashicorp/boundary main)
+- Teleport: https://goteleport.com/docs/reference/deployment/backends/ ·
+  https://goteleport.com/docs/reference/architecture/session-recording/ ·
+  https://goteleport.com/docs/reference/deployment/scaling/ ·
+  https://goteleport.com/docs/identity-governance/locking/
+- SPIRE: https://spiffe.io/docs/latest/deploying/spire_server/ ·
+  https://spiffe.io/docs/latest/deploying/spire_agent/ · https://spiffe.io/docs/latest/planning/scaling_spire/
+- Tailscale: https://tailscale.com/kb/1091/what-happens-if-the-coordination-server-is-down ·
+  https://tailscale.com/kb/1508/control-data-planes · https://tailscale.com/blog/making-tailscale-faster ·
+  https://tailscale.com/kb/1028/key-expiry
+- Cloudflare: https://blog.cloudflare.com/post-mortem-on-cloudflare-control-plane-and-analytics-outage/ ·
+  https://blog.cloudflare.com/cloudflare-service-outage-june-12-2025/ ·
+  https://blog.cloudflare.com/18-november-2025-outage/ ·
+  https://developers.cloudflare.com/cloudflare-one/identity/users/session-management/
+- FROST: https://www.rfc-editor.org/rfc/rfc9591.html · https://github.com/ZcashFoundation/frost
+- openraft: https://github.com/databendlabs/openraft · rqlite: https://rqlite.io/docs/faq/
+- LiteFS: https://docs.fly.io/litefs · Litestream: https://github.com/benbjohnson/litestream/releases/tag/v0.5.0 ·
+  https://fly.io/blog/litestream-revamped/
+- HPKE: RFC 9180. Demarcation protocol: Barbara and Garcia-Molina, "The Demarcation Protocol: A Technique for
+  Maintaining Constraints in Distributed Database Systems", VLDB Journal 1994 [M].
+- Anthropic: https://code.claude.com/docs/en/legal-and-compliance
