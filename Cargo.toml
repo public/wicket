@@ -2,7 +2,7 @@
 resolver = "2"
 # Vendored third-party crates (the patched Biscuit fork) are path dependencies, not members: workspace
 # lint and test runs cover wicket's own code only.
-exclude = ["third_party"]
+exclude = ["third_party", "ci/h3get"]
 members = [
     "crates/wicket-core",
     "crates/wicket-store",

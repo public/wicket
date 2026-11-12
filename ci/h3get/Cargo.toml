@@ -1,0 +1,24 @@
+# The smoke test's HTTP/3 client (ci/smoke.sh): curl in the agent image has no HTTP/3, so the smoke
+# test builds this (statically, for musl) and copies it into the box's workspace. Not part of wicket.
+[package]
+name = "h3get"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# Standalone: not a member of the repository's workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+http = "1"
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+[profile.release]
+strip = true
