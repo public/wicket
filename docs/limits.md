@@ -1,0 +1,145 @@
+# What wicket doesn't protect (0.0.1)
+
+wicket 0.0.1 keeps credentials out of the box, gives the box no network of its own, and decides every
+request the box makes against its zone. This page lists what that does not cover. Each item gives the
+design section or pull request that has the detail. Unless an item says otherwise, it is a gap in 0.0.1,
+not a permanent decision.
+
+## Data inside a zone's reach
+
+- **Anything the zone can reach is a way out.** wicket checks where a request goes (host, method,
+  path). It does not check what the request carries. So an agent that has read something sensitive
+  can send it to any host and path the zone allows: in a request body, a query string, or a commit.
+  The defences the design plans for this are labels, handles, typed gates and sink provenance
+  (design §4.2–§4.3, M5). None of them is built, so 0.0.1 has no taint tracking and no "no writing
+  down" rule. Keep reach narrow, and keep write access in zones that read nothing untrusted.
+- **Labels don't cross links.** No labels exist yet, so a box connected to another through a link
+  ([#103](https://github.com/public/wicket/pull/103)) can pass it anything, whatever either box has
+  read. Each `link.open` audit record says so.
+- **Requests are judged by host, method and path, not by meaning.** There are no provider adapters yet
+  (design §10, M2). Risk comes from a short, hand-maintained dangerous-pattern list that covers only
+  GitHub: pushes, and writes under `.github/`. A POST that an allowed path accepts is allowed, whatever
+  it does at the provider.
+- **Response bodies are not scrubbed.** If an upstream echoes an injected credential back in a
+  response body, the box sees it. Headers are scrubbed.
+- **Request bodies over 64 MiB fail,** and uploads are buffered rather than streamed
+  ([#93](https://github.com/public/wicket/pull/93)).
+- **MCP is wicket's own gateway only.** Adapter-generated tools and isolated third-party MCP servers
+  (design §8.2, M4/M4b) aren't built, so an agent has no third-party MCP servers.
+- **Agents inside one box are one principal.** With `in_box_subagents: true` (the default), Claude
+  Code's own subagents share the box, its identity and its reach. Only wicket children (`spawn`) get
+  their own box and identity.
+
+## The control host
+
+- **Docker is root on the host.** Whoever can talk to Docker can escape any box. Under
+  `deploy/install.sh` only the `wicket` user is in the `docker` group.
+- **Development mode trusts the operator's whole user account.** Without `wicketd`, `wicket` runs as
+  your user. Anything else running as that user, including an agent session outside wicket, can reach
+  run sockets, read the ledger and vault, approve requests, and set `WICKET_PRINCIPAL` to claim another
+  principal ([#87](https://github.com/public/wicket/pull/87)). `wicket doctor` reports this mode as
+  insecure. The daemon install (#12, #40) closes this; see the README's Install section.
+- **Under the daemon:**
+  - Mounting a directory in place (`--workspace-dir`, and `wicket wrap`, which mounts its launcher's
+    directory) is root's only. So wrapping a Remote Control session needs root. Docker mounts by path,
+    and the directory's owner could swap the path for a link into wicket's data after any check.
+  - The console runs as `wicket` with direct access to the ledger. It is not yet the untrusted front end
+    the design describes (design §14.1.3), so a bug in the console is a bug in the control plane.
+- **Keys are files.** The identity issuer key, the installation CA, and the feed, authorization and
+  approver keys are 0600 files in the data directory. There is no split between an offline root and
+  short-lived issuing keys, and no TPM or KMS (design §3.2). Root on the control host can mint any
+  identity, grant or node certificate.
+- **The audit log is only as safe as the host.** The hash chain shows tampering after the fact, but
+  someone with write access to the ledger can rewrite the whole chain. Export with signed checkpoints
+  (`docs/audit-export.md`) to a system they can't reach, and verify against it with
+  `wicket audit --verify --against`. A SIGKILL or power cut can lose the last batch of records that
+  nothing waited on, a few milliseconds' worth ([#107](https://github.com/public/wicket/pull/107)).
+
+## The box
+
+- **gVisor is the strongest isolation available.** It is a user-space kernel, not a VM. MicroVMs
+  (Firecracker, Kata) need KVM and aren't supported yet (design §7.2). `isolation: runc` is weaker
+  still.
+- **Each box can use UDP port 443 only through wicket.** The in-box forwarder holds UDP 443 on every
+  address, so a server in the box can't bind it, even on 127.0.0.1.
+- **The `/tmp` cap is a poll, not a quota.** wicket stops a box whose `/tmp` goes over 512 MiB, checking
+  every 5 s, so a fast writer can exceed the cap briefly ([#106](https://github.com/public/wicket/pull/106)).
+
+## Authority and the Biscuit fork
+
+- **The Biscuit fork has had no external audit.** Nodes decide every request with a vendored
+  `biscuit-auth` (upstream main `aa5a672` plus three performance patches, `third_party/NOTICE`). It is
+  tested against wicket's own matcher and the stock engine (about 74,000 differential decisions in CI;
+  [#83](https://github.com/public/wicket/pull/83), [#102](https://github.com/public/wicket/pull/102)). No
+  one outside the project has reviewed the patches or the structural check.
+- **Spawn refuses what it can't prove.** Path globs that `subset::check` can't prove contained are
+  refused, even when they are narrower ([#30](https://github.com/public/wicket/pull/30),
+  [#79](https://github.com/public/wicket/pull/79)).
+- **A child's reservation counts as spent.** Model budget handed to a child isn't credited back when the
+  child spends less ([#106](https://github.com/public/wicket/pull/106)).
+
+## Remote nodes
+
+- **A node can do what its boxes may do.** A compromised node holds its node CA (24 h) and its feed
+  replica. Until they expire it can act within the authority of the boxes it serves, and serve plain
+  reads for the narrow window (120 s) after it stops hearing from the control host. It never holds
+  injected credentials or the model token: those hosts are tunnelled to the control host
+  ([#88](https://github.com/public/wicket/pull/88)).
+- **Name constraints are subtrees.** A node CA for `api.example.com` can also mint `x.api.example.com`.
+  The reach rules stay the exact gate; the constraint only bounds a stolen CA.
+- **Revoked node CA serials are recorded but not distributed.** Revoking a node removes its pinned key
+  and revokes its identity certificates. Its CA stays valid until it expires (24 h by default)
+  ([#85](https://github.com/public/wicket/pull/85)).
+- **The feed's root key can't be rotated,** and the publisher checks its own log's hash chain on open,
+  not its signatures ([#84](https://github.com/public/wicket/pull/84)).
+- **A node's clock is read once.** Feed freshness uses the wall clock at start plus a monotonic clock.
+  After a deliberate clock step, restart `wicket-node`.
+- **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
+  and short-lived ([#85](https://github.com/public/wicket/pull/85)).
+- **What doesn't work on nodes yet:** more than one run per node (a child can't share its parent's
+  served node; on a leased node it runs alone), links between boxes on nodes, hibernation on nodes,
+  plain `http://` to a host the node forwards, and MCP decisions on the node (the gateway decides on
+  the control host). Egress events from a disconnected period reach the audit log, not the live console
+  ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
+  [#103](https://github.com/public/wicket/pull/103)).
+
+## Hibernated agents
+
+- **Bundles are neither encrypted nor signed.** Each tree is content-addressed and its digest is checked
+  on restore, so corruption is caught. Anyone who can write the object store and the ledger can still
+  change an agent's state. The store is a directory in the data directory; S3 and other remote stores
+  aren't supported ([#106](https://github.com/public/wicket/pull/106)).
+- **A rebuild restores files, not processes.** A box running anything besides the agent stays paused
+  instead of hibernating.
+- **There's no garbage collection** of agents or their bundles yet (design §13.6).
+
+## The console
+
+- **No external review yet.** The console is built to face the internet
+  ([#99](https://github.com/public/wicket/pull/99)), but the dedicated security review (#44) and a TLS
+  and headers scan on a real hostname are still to do.
+- **`wicket approve` on the host is break-glass.** It is audited as such, but it bypasses the passkey.
+
+## Money
+
+- **Charges aren't reconciled against the provider.** Leases record what they billed by wicket's own
+  arithmetic. Nothing compares that with Vultr's invoices yet (design §8.5,
+  [#98](https://github.com/public/wicket/pull/98)).
+- **Vultr has no idempotency token.** Two processes racing on one key can both create an instance; the
+  next reconcile pass destroys the duplicate ([#89](https://github.com/public/wicket/pull/89)).
+
+## Performance
+
+- **HTTP/3 under gVisor is slow.** gVisor spends about 110 µs of CPU per UDP datagram, so downloads run at
+  40–100 Mbit/s with standard 1452-byte packets. `WICKET_H3_BOX_MTU=16000` reaches 430–460 Mbit/s, but only
+  for clients that accept large packets. HTTP/3 hasn't been checked with `curl --http3` or a browser yet
+  ([#104](https://github.com/public/wicket/pull/104), [#108](https://github.com/public/wicket/pull/108)).
+- **A new connection over a link takes 140–200 ms,** because each one runs `docker exec`
+  ([#103](https://github.com/public/wicket/pull/103)).
+- **Waking takes seconds.** A wake rebuilds the box and resumes the session; the gVisor checkpoint fast
+  path isn't built ([#90](https://github.com/public/wicket/pull/90)).
+
+## Not known yet
+
+- **How agents behave at the edge** (design §21, E1). Agents get clear refusals and `await_grant`, but
+  nobody has measured whether agents wait, route around a denial, or give up.
