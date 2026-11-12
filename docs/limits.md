@@ -133,7 +133,9 @@ not a permanent decision.
   installation's state key, and each tree is content-addressed and checked on restore. Anyone with the
   data directory (the key and the ledger) can still read or change an agent's state, and object keys and
   sizes aren't hidden. Bundles written before sealing are read as they are until the agent hibernates
-  again. The store is a directory in the data directory; S3 and other remote stores
+  again. Sealing is done on the control host: on its way from a remote node the state is protected by
+  the node's channel (ssh), and on the node it is plain files in the run's directory while the box
+  runs, as any box's workspace is, removed once fetched. The store is a directory in the data directory; S3 and other remote stores
   aren't supported ([#106](https://github.com/public/wicket/pull/106)).
 - **A rebuild restores files, not processes.** A box running anything besides the agent stays paused
   instead of hibernating.
