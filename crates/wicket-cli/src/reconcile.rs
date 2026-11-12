@@ -585,15 +585,21 @@ fn node_docker(name: &str) -> Option<Docker> {
     crate::enrol::resolve_installed(name, None).ok().filter(|n| n.name.is_some()).map(|n| Docker::over_ssh(n.ssh_prefix()))
 }
 
-/// When a run must have ended (Unix seconds): its box's start plus its zone's timeout and a minute's
-/// margin, from the run's record (none for a run without one).
+/// When a run's box must have stopped (Unix seconds), from the run's record (none for a run without
+/// one): its box's start plus its zone's timeout, after which its node also holds no authority for it
+/// (#153: block 0 never outlasts the timeout), plus [`FENCE_MARGIN_SECS`]. A run on a node that can't
+/// be asked is ended only after this, so nothing replaces a box its node may still be running.
 fn run_deadline(run: &str) -> Option<i64> {
     crate::run::check_run_id(run).ok()?;
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(crate::data_dir().join("runs").join(run).join("ctl/run.json")).ok()?).ok()?;
     let m = wicket_core::Manifest::from_yaml(v["manifest"].as_str()?).ok()?;
-    Some(v["started_ms"].as_i64()? / 1000 + m.zone.limits.timeout().ok()?.as_secs() as i64 + 60)
+    Some(v["started_ms"].as_i64()? / 1000 + m.zone.limits.timeout().ok()?.as_secs() as i64 + FENCE_MARGIN_SECS)
 }
+
+/// Past a run's timeout, how long before its node is certainly done with it: a long-lived agent's
+/// node backstop (120 s) and clock skew between the hosts.
+const FENCE_MARGIN_SECS: i64 = 180;
 
 /// For each node of a running run whose supervisor is gone: the runs it has (exited or not), or
 /// None if it can't be reached within 10 s. Unless `dry_run`, this host's own node is started first

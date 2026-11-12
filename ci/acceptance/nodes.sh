@@ -185,3 +185,65 @@ multihost() {
   fi
   results+=("info lease ${lease:-?} on node ${node_name:-?}: ${billed:-billed ?}")
 }
+
+# A node on its own (#152, #153), --nodes local: an agent's box on acc-n1 calls the model (through the
+# credential sealed to its node) and its egress every 5 s. Its control channel is cut for 165 s, longer
+# than the old 150 s offline window: the box keeps working, model calls included, and an out-of-reach
+# request is queued on the node. Meanwhile its model secret is removed from the vault: when the channel
+# is back, the node deletes its copy within seconds and model calls stop. At its authority's end (5 min
+# from the run's start) the node stops the box.
+offline_flow() {
+  log "a node on its own: a 165 s partition, the model sealed to the node, the box stopped at its authority's end"
+  printf 'mock-model-credential' | wroot secret set mock-offline --hosts 127.0.0.1 >/dev/null
+  local ws; ws=$(workdir offline)
+  local t_start; t_start=$(date +%s%3N)
+  HOME=$HOMEW "$W" run "$(manifest offline)" --workdir "$ws" --image "$IMAGE_TAG" --node "$NODE" >"$work/offline.log" 2>&1 &
+  local run_pid=$!
+  pids+=("$run_pid")
+  wait_for 90 '[ -n "$(run_id_of "$work/offline.log")" ]' || true
+  local r; r=$(run_id_of "$work/offline.log")
+  our_runs+=("$r")
+  local nd=$nodehome/.local/share/wicket-node
+  local olog=$nd/runs/$r/workspace/out/offline.log
+  wait_for 120 'grep -q "model=200" "$olog" 2>/dev/null' || true
+  check "  the box on $NODE calls the model through its node" 'grep -q "model=200" "$olog"'
+  check "  its model secret is sealed on the node, not in the clear" '[ -s "$nd/secrets/$r.json" ] && ! grep -rqs "mock-model-credential" "$nd/secrets" && grep -q "\"mock-offline\"" "$nd/secrets/$r.json"'
+  log "cutting $r's control channel"
+  mv "$nd/ctl/ctl.sock" "$nd/ctl/ctl.sock.off"
+  local t_cut; t_cut=$(date +%s%3N)
+  kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
+  local c; for c in $(pgrep -P "$run_pid"); do kill_tree "$c"; done
+  sleep 150
+  wroot secret rm mock-offline >/dev/null
+  sleep 15
+  local t_restore; t_restore=$(date +%s%3N)
+  mv "$nd/ctl/ctl.sock.off" "$nd/ctl/ctl.sock"
+  log "restored after $(( (t_restore - t_cut) / 1000 )) s"
+  local mock_cut; mock_cut=$(wc -l <"$work/mock.log")
+  # Lines from the box's own clock, between the cut and the restore.
+  in_cut() { awk -v a="$t_cut" -v b="$t_restore" -v k="$1" '$1>=a && $1<b && index($0,k)' "$olog" | wc -l; }
+  late_ok=$(awk -v a=$((t_cut + 155000)) -v b="$t_restore" '$1>=a && $1<b && /model=200/ && / write=200/' "$olog" | wc -l)
+  echo "   during the cut: $(in_cut model=200) model calls ok, $(in_cut ' write=200') writes ok, $(in_cut ':queued') asks queued; $late_ok fully working lines past 155 s"
+  check "  the box kept working through the cut, model calls and writes included, past 155 s" '[ "$(in_cut model=200)" -ge 25 ] && [ "$late_ok" -ge 1 ]'
+  check "  an out-of-reach request was queued on the node while it was cut off" '[ "$(in_cut ":queued")" -ge 1 ] && grep -q "q-" "$nd/asks.json"'
+  wait_for 30 'grep -q "reconnected" "$work/offline.log"' || true
+  wait_for 20 '[ ! -e "$nd/secrets/$r.json" ]' || true
+  check "  reconnected, the node deleted the secret removed meanwhile" 'grep -q "reconnected" "$work/offline.log" && [ ! -e "$nd/secrets/$r.json" ]'
+  # The control host already has this op's pending request from before the cut, so the raised ask
+  # finds it: what shows it was delivered is the node taking it off its queue.
+  wait_for 20 '! grep -q "q-" "$nd/asks.json"' || true
+  check "  and the queued ask was delivered to the control host" '! grep -q "q-" "$nd/asks.json" && w pending | grep -q "example.com/out-of-reach"'
+  sleep 12
+  check "  and model calls stop with the secret (not relayed elsewhere)" '[ "$(awk -v a=$((t_restore + 10000)) '"'"'$1>=a && /model=200/'"'"' "$olog" | wc -l)" -eq 0 ]'
+  # The box's authority ends 5 min after the run started: its node stops it then.
+  local t_end=$((t_start + 300000))
+  wait_for 200 '[ -z "$(box_of "$r")" ]' || true
+  local t_gone; t_gone=$(date +%s%3N)
+  local last; last=$(tail -1 "$olog" | awk '{print $1}')
+  echo "   authority ends ~$(( (t_end - t_start) / 1000 )) s after the start; box gone by $(( (t_gone - t_start) / 1000 )) s; last line at $(( (last - t_start) / 1000 )) s"
+  check "  its node stopped the box when its authority expired" '[ -z "$(box_of "$r")" ] && [ "$last" -le $((t_end + 7000)) ] && grep -q "authority expired" "$work/node-serve.log"'
+  check "  the node's audit records it" 'w audit --tail 500 | grep -q "node.authority_expired"'
+  wait_for 60 '! kill -0 "$run_pid" 2>/dev/null' || true
+  check "  and its run ended" '! kill -0 "$run_pid" 2>/dev/null'
+  echo "   mock model: $mock_cut log lines at the restore"
+}

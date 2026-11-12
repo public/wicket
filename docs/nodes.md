@@ -5,9 +5,12 @@ Reference for running boxes on other machines. The README has the short version;
 ## Enrolment
 
 `wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`).
-On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress locally from
-a signed policy feed, so the box keeps working, failing narrow, while the control host is unreachable (#57;
-below). The ledger, the keys that matter, the LLM proxy and the MCP gateway stay on the control host. A
+On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress, its model
+calls and its injected credentials locally, from a signed policy feed and the secrets leased to it, so the
+box keeps working while the control host is unreachable, for exactly as long as its grants last (#57, #152,
+#153; below). The ledger, the keys that matter and the MCP gateway's tools stay on the control host, which
+issues authority (tokens, grants, leases, secrets), takes human approvals, and reconciles counts and audit
+afterwards; it isn't asked during a request. A
 `--node` target must be enrolled: there is no other way to run a box.
 
 ## The control host is a node too
@@ -109,39 +112,80 @@ wicket node revoke n1
   last bytes it read; the control host drops what it already has), its
   timeout is still counted from when it started. A box whose run has no authority in the feed any more is
   stopped. Exited boxes are kept until their exit is read, then removed.
-- **Run leases** (#151). The control host leases each run it supervises to its node with every freshness
-  statement, for the feed's window (TTL plus the narrow window, 150 s by default); the node shows the lease
-  in what it reports. A lapsed lease keeps the box running on the feed it holds, as before leases
-  (`ci/node-e2e.sh` relies on that); `WICKET_NODE_LEASE_EXPIRY=stop` on the node stops it instead. How long
-  a node runs alone, and whether it stops its boxes then, are open decisions (research doc 24, §6.4).
-- **The model proxy and the MCP gateway run on the node** (#151), per box. The model proxy checks each call
-  as on the control host (routes, models, server tools, the budget, starting from what the run already
-  spent) and relays it over the channel to the run's own model proxy on the control host, which adds the
-  credential (it never reaches the node), **checks it again**, counts it and shows it: a node can't skip the
-  checks that matter. The gateway relays each call whole to the run's gateway, which decides every tool (they
-  read or write the ledger); while the control host can't be reached the node answers MCP's own handshake
-  (`initialize`, `ping`) and refuses each tool call with a clear, retryable error. Model calls and tools
-  that need the control host stop while it is away (phase 2, #152, moves credentials).
+- **A node works on its grants** (#153). A box's authority is its token in the feed, and every part of it
+  has a lifetime: block 0 lasts the zone's `limits.authority` (default: the run's `timeout`), counted from
+  the run's start (a re-attach doesn't extend it); each grant lasts its `--ttl` (at most 24 h). The node
+  works for the box, connected or not, for exactly as long as these are valid, and **stops the box when
+  its authority expires**, whether or not it can reach the control host: the workload's grants decide, not
+  the node (this replaces #151's run lease and `WICKET_NODE_LEASE_EXPIRY`). What the node reports for each
+  box says when its authority ends (`authority_until`). A run on a node that can't be reached is ended by
+  `wicket reconcile` only past its timeout plus 3 minutes, so nothing replaces a box its node may still be
+  running.
+- **Secrets and budget slices are leased to the node** (#152). For each run the control host leases its
+  node the secrets the run's zone names (its model credential, `llm.secret`, and the secrets of its
+  `inject` rules) that the vault holds, with their host bindings, and a slice of the run's model budget.
+  The Claude login goes as its current **access token only**: the refresh token and refreshing stay on the
+  control host. The lease is sent on every connect and again within 2 s of any change (a refreshed token, a
+  secret removed or rebound, a renewed slice), and replaces the run's whole set, so a secret the control
+  host stops leasing is deleted from a connected node within seconds. Each secret is **sealed to the
+  node** at rest (`secrets/`, 0700): AES-256-GCM under the node's secrets key, bound to node, run, name,
+  hosts and expiries; the node's secrets key is derived on the control host and wrapped to the node's own
+  key (X25519 from its Ed25519 node key, HKDF-SHA256, AES-256-GCM, as age's `ssh-ed25519` recipients
+  do). The node opens a secret in memory at each use, never past the run's authority or the upstream
+  token's own expiry, whichever is first, deletes expired ones, and drops all of a run's when its box
+  ends. What this protects, and what it doesn't: [limits.md](limits.md).
+- **Lifetimes** (#153). Everything a node holds that carries authority ends on its own:
+
+  | what | lasts | set by |
+  |---|---|---|
+  | a box's base authority (its token's block 0) | the run's timeout, from the run's start | zone `limits.authority` (never longer than `limits.timeout`; a child's never longer than its parent's) |
+  | a grant | its TTL, at most 24 h | `wicket approve --ttl` (default 10 min) |
+  | a leased secret | the box's authority, or the upstream token's own expiry if earlier | the zone; the upstream |
+  | a budget slice | until spent, renewed while connected | `WICKET_NODE_BUDGET_SLICE` on the control host (fraction, default 0.25) |
+  | an agent identity | 10 min, re-issued every 5 by the run's supervisor | `WICKET_IDENTITY_TTL` |
+  | the node's certificate and node CA | 24 h, renewed over the channel at half-life, or by `renew-ca` | `enrol --cert-ttl`, `--ca-ttl` |
+  | the node feed key's certificate | 7 days, renewed when a run starts with less than a day left | (fixed) |
+  | a capacity lease | its duration | `request_capacity`'s duration |
+  | a join token | its TTL | `wicket node token --ttl` |
+
+  Links and exposed ports have no clock of their own: they end with either run.
+- **The model proxy runs on the node** (#151, #152), per box, and decides there: routes, models, server
+  tools, the budget (starting from what the run already spent) and the node's **budget slice**. With the
+  model credential leased to the node it calls the model itself (no round trip to the control host),
+  counts the call, keeps its count beside the box (`node-spend.json`, so a restarted `serve` doesn't reset
+  it) and reports it; the run's own counters on the control host take the node's totals, so spawn
+  carve-outs, a long-lived agent's budget and the console see what the node spent. A slice is a quarter of
+  the zone's budget by default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while
+  connected once less than half of it is left: offline, a node spends what is left of its slice and nothing
+  more. Without the credential (the vault doesn't hold it), the call is relayed to the run's own proxy on
+  the control host as in #151, which adds the credential and counts it there.
+- **The MCP gateway runs on the node** (#151), relaying each call whole to the run's gateway on the control
+  host, which decides every tool (they read or write the ledger); while the control host can't be reached
+  the node answers MCP's own handshake (`initialize`, `ping`) and refuses each tool call with a clear,
+  retryable error.
 - **Decisions on the node.** Each box's egress proxy decides from the node's verified replica of the feed
   (`wicket-feed`; the zone, and grants bound to the box), with the same proxy code as the control host (only
   the decision source differs, `wicket_proxy::decide`):
 
   | node's feed | allowed | out of reach |
   |---|---|---|
-  | fresh (a statement within the TTL, 30 s) | reach rules and live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
-  | narrow (up to the narrow window after, 120 s) | plain reads (R1) in reach only | 403 "the control plane is unreachable; retry later", no request id |
-  | closed | nothing | 403, the same |
+  | fresh (a statement within the TTL, 30 s) | the box's token and its live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
+  | offline (no live statement) | the same, each until its own expiry | queued on the node (`asks.json`; a node-local id `q-…` in the 403) and raised when the control host is back, saying how old it is; no approvals on the node alone |
+  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 403, retry |
+  | closed (no verified state, or the feed key's certificate expired) | nothing | 403 |
 
   Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
   counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
   a node for the asked path only. `wicket grant revoke <id>` (picked up within 250 ms) and a run revocation
   (`wicket identity revoke`, within 2 s) are pushed to the node, which applies them as soon as they arrive; a node
-  that hears nothing goes stale within the TTL anyway. A tampered, replayed or rolled-back
+  that hears nothing keeps what it holds until it expires: for a cut-off node, revocation takes the
+  remaining lifetime of what was revoked. A tampered, replayed or rolled-back
   feed frame is refused.
 - **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
   the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
   the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
-  it with the run CA), for: hosts with an `inject` rule or a credential swap (secrets stay on the control host),
+  it with the run CA), for: hosts with an `inject` rule whose secret isn't leased to the node (one it holds is terminated and
+  injected there, #152), hosts with a credential swap,
   hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
   every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.

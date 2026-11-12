@@ -361,6 +361,11 @@ pub struct Limits {
     pub cpus: f32,
     #[serde(default = "default_timeout")]
     pub timeout: String,
+    /// How long the box's authority lasts from the run's start (#153): its token's block 0, and so
+    /// how long its node keeps working for it without the control host. The box stops when it
+    /// ends. Default: the run's `timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
     #[serde(default = "default_pids")]
     pub pids: u32,
     /// What a box's output may take on its node's disk (its stdout and stderr together), outside
@@ -388,6 +393,7 @@ impl Default for Limits {
             memory: default_memory(),
             cpus: default_cpus(),
             timeout: default_timeout(),
+            authority: None,
             pids: default_pids(),
             output: default_output(),
             on_output_full: OnOutputFull::default(),
@@ -415,6 +421,19 @@ fn default_pids() -> u32 {
 impl Limits {
     pub fn timeout(&self) -> Result<Duration, ManifestError> {
         humantime::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
+    }
+
+    /// How long the box's authority lasts from the run's start (#153): `authority`, or the
+    /// `timeout`. Never longer than the timeout (the box stops then anyway), never zero.
+    pub fn authority(&self) -> Result<Duration, ManifestError> {
+        let t = self.timeout()?;
+        match &self.authority {
+            None => Ok(t),
+            Some(a) => match humantime::parse_duration(a) {
+                Ok(d) if !d.is_zero() => Ok(d.min(t)),
+                _ => Err(ManifestError::Duration(a.clone())),
+            },
+        }
     }
 
     /// The memory limit in bytes, if readable.
@@ -462,6 +481,7 @@ impl Manifest {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.zone.limits.authority()?;
         match (&self.agent, &self.program) {
             (Some(a), None) => {
                 if a.kind != "claude-code" {

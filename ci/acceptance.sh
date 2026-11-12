@@ -31,6 +31,10 @@
 #   - an agent hibernates and is woken: its files and its session survive;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
+#   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
+#     165 s cut of its control channel, its model calls included (the credential sealed to the node),
+#     an out-of-reach request is queued there and raised on reconnect, a secret removed meanwhile is
+#     deleted from the node on reconnect, and the node stops the box when its authority expires;
 #   - a control-host restart (#151): every wicket process of the control host killed hard, the boxes
 #     on this host's own node and (--nodes local) on the other node survive, reconcile adopts their
 #     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
@@ -391,6 +395,9 @@ check "with on_output_full: stop, the box is stopped, saying why, and its run en
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
   multihost
+fi
+if [ "$nodes" = local ]; then
+  offline_flow
 fi
 
 # ---- 5. a control-host restart (#151) ----

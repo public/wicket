@@ -606,6 +606,15 @@ impl Egress {
                     crate::SANDBOX_FACT
                 ), Some(&rid));
             }
+            Outcome::Queued { id, why } => {
+                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
+                emit("queued", format!("{id}: {why}{for_line}"));
+                let note = self.strike(&op.digest());
+                return problem(403, "queued", "Blocked by wicket sandbox: needs human approval (queued offline)", &format!(
+                    "{why}. wicket's control plane is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
+                    crate::SANDBOX_FACT
+                ), None);
+            }
             Outcome::Unavailable(why) => {
                 emit("unavailable", why.clone());
                 return problem(
@@ -752,6 +761,13 @@ impl Egress {
         let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
+                // On a node, the secret is fetched from the control host on its first use (#152).
+                if let Err(e) = self.ctx.vault.ensure(&rule.secret).await {
+                    if rule.optional {
+                        break;
+                    }
+                    return Err(e);
+                }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
                 self.ctx.vault.check(&rule.secret, host)?;
                 let secret = match self.ctx.vault.get(&rule.secret) {

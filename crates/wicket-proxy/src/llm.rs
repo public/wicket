@@ -19,6 +19,9 @@ use std::time::Instant;
 use tokio::net::UnixListener;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
+/// What a node's secret source says when its control host keeps the credential (an older protocol):
+/// the call is relayed there instead.
+pub const RELAY_INSTEAD: &str = "the control host speaks an older protocol";
 /// How long a response is still read to its end after the agent stopped reading it, so its final
 /// usage is seen (#113). Past this, the call is charged its whole reservation.
 const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -34,9 +37,9 @@ pub type LlmRelay =
 pub struct Llm {
     ctx: RunCtx,
     client: reqwest::Client,
-    /// On a node (#151): the vetted request goes to the run's model proxy on the control host, which
-    /// holds the credential, checks the request again and is the one that counts it; this proxy's
-    /// checks give early refusals and nothing more. None: straight to the upstream, with the secret.
+    /// On a node without a secret source (#151): the vetted request goes to the run's model proxy on
+    /// the control host, which adds the credential. Otherwise (a node's cache, #152, or None) the call
+    /// goes straight to the upstream from here, with the secret.
     relay: Option<LlmRelay>,
     pub requests: AtomicU64,
     /// Uncached input tokens.
@@ -57,7 +60,44 @@ pub struct Llm {
     /// Output tokens reserved by model calls in flight (#113): each call reserves its `max_tokens`
     /// up front, and settles to what it actually generated when its final usage arrives.
     pub inflight_output_tokens: AtomicU64,
+    /// On a node (#152): the slice of the budget the control host has leased it, as caps on this
+    /// activation's own counters. None: no slice (the zone's budget alone bounds it).
+    slice: std::sync::Mutex<Option<Slice>>,
     last_activity: std::sync::Mutex<Instant>,
+}
+
+/// A budget slice leased to a node (#152): this activation may count up to these totals of its own
+/// (requests; output tokens, in flight included; input tokens, cached ones included) before the
+/// control host leases it more. Offline, the node spends its current slice and nothing more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Slice {
+    pub requests: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+}
+
+/// What a run's model proxy has counted, as a node reports it to its control host (#152).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Spent {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl Spent {
+    /// What was counted since `base`.
+    pub fn since(self, base: Spent) -> Spent {
+        Spent {
+            requests: self.requests.saturating_sub(base.requests),
+            input_tokens: self.input_tokens.saturating_sub(base.input_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_sub(base.cache_read_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.saturating_sub(base.cache_creation_tokens),
+            output_tokens: self.output_tokens.saturating_sub(base.output_tokens),
+        }
+    }
 }
 
 impl Llm {
@@ -142,6 +182,7 @@ impl Llm {
             prior_input_tokens: AtomicU64::new(0),
             prior_output_tokens: AtomicU64::new(0),
             inflight_output_tokens: AtomicU64::new(0),
+            slice: std::sync::Mutex::new(None),
             last_activity: std::sync::Mutex::new(Instant::now()),
         }))
     }
@@ -152,6 +193,50 @@ impl Llm {
         let mut l = Arc::into_inner(Llm::new(ctx)?).expect("fresh");
         l.relay = Some(relay);
         Ok(Arc::new(l))
+    }
+
+    /// What this activation has counted itself.
+    pub fn spent(&self) -> Spent {
+        Spent {
+            requests: self.requests.load(Ordering::SeqCst),
+            input_tokens: self.input_tokens.load(Ordering::SeqCst),
+            cache_read_tokens: self.cache_read_tokens.load(Ordering::SeqCst),
+            cache_creation_tokens: self.cache_creation_tokens.load(Ordering::SeqCst),
+            output_tokens: self.output_tokens.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Takes in what another counter of this activation has seen (#152): the run's node, which
+    /// calls the model itself and is the counter of record. Counters only go up.
+    pub fn merge_spent(&self, s: Spent) {
+        self.requests.fetch_max(s.requests, Ordering::SeqCst);
+        self.input_tokens.fetch_max(s.input_tokens, Ordering::SeqCst);
+        self.cache_read_tokens.fetch_max(s.cache_read_tokens, Ordering::SeqCst);
+        self.cache_creation_tokens.fetch_max(s.cache_creation_tokens, Ordering::SeqCst);
+        self.output_tokens.fetch_max(s.output_tokens, Ordering::SeqCst);
+    }
+
+    /// The budget slice leased to this node (#152).
+    pub fn set_slice(&self, s: Option<Slice>) {
+        *self.slice.lock().expect("slice") = s;
+    }
+
+    pub fn slice(&self) -> Option<Slice> {
+        *self.slice.lock().expect("slice")
+    }
+
+    /// The slice this activation may be leased next (#152): what it has counted plus `fraction` of
+    /// the zone's budget, never past what is left of it.
+    pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
+        let spec = self.ctx.zone.llm.as_ref()?;
+        let part = |max: u64| ((max as f64) * fraction).ceil().max(1.0) as u64;
+        let (left_r, left_o) = self.remaining()?;
+        let s = self.spent();
+        Some(Slice {
+            requests: s.requests + left_r.min(part(spec.max_requests)),
+            output_tokens: s.output_tokens + left_o.min(part(spec.max_output_tokens)),
+            input_tokens: spec.max_input_tokens.map(|m| self.input_total() + self.remaining_input().unwrap_or(0).min(part(m))),
+        })
     }
 
     /// Starts this activation from what the agent's earlier ones spent (#70).
@@ -235,6 +320,27 @@ impl Llm {
     /// Counts a model request and checks the budgets before it is sent: None if it may go, else the
     /// refusal. Without a model route (a wrapped session's zone may have none), only counts.
     fn admit(&self, spec: Option<&wicket_core::manifest::LlmSpec>) -> Option<Response<BoxBody>> {
+        // A node's slice (#152), before counting: a refusal here spends nothing, so a box retrying
+        // against a spent slice offline doesn't burn its budget.
+        if let (Some(_), Some(sl)) = (spec, self.slice()) {
+            let over = if self.requests.load(Ordering::SeqCst) >= sl.requests {
+                Some("request")
+            } else if sl.input_tokens.is_some_and(|m| self.input_total() >= m) {
+                Some("input token")
+            } else {
+                None
+            };
+            if let Some(what) = over {
+                self.event(None, 429, Usage::default(), &format!("budget: this node's {what} slice is spent"));
+                return Some(problem(
+                    429,
+                    "budget",
+                    "Model budget slice exhausted on this node",
+                    "this node has spent the slice of the model budget it was leased; the control host leases more when it can be reached. Retry later",
+                    None,
+                ));
+            }
+        }
         let n = self.requests.fetch_add(1, Ordering::SeqCst)
             + 1
             + self.reserved_requests.load(Ordering::SeqCst)
@@ -293,9 +399,25 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
+        // On a node (#152), the credential comes from the node's cache (fetched from the control host
+        // on first use) and the call goes from here; the control host isn't asked per call. Without
+        // the credential (first use while the control host is unreachable), the call fails clearly.
+        // With a control host too old to release it, the call is relayed to the run's own proxy there.
+        let mut relay = !self.ctx.vault.is_sourced();
+        if self.ctx.vault.is_sourced() {
+            if let Err(e) = self.ctx.vault.ensure(&spec.secret).await {
+                if self.relay.is_some() && format!("{e:#}").contains(RELAY_INSTEAD) {
+                    relay = true;
+                } else {
+                    self.settle(reserved, Usage::default(), true);
+                    self.event(model, 503, Usage::default(), "credential unavailable on this node");
+                    return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
+                }
+            }
+        }
         let up = match &self.relay {
-            Some(r) => self.send_relayed(r, &parts, body).await,
-            None => self.send_upstream(spec, &parts, body).await.map(|r| {
+            Some(r) if relay => self.send_relayed(r, &parts, body).await,
+            _ => self.send_upstream(spec, &parts, body).await.map(|r| {
                 let (status, headers) = (r.status().as_u16(), r.headers().clone());
                 let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
                 (status, headers, stream)
@@ -450,7 +572,16 @@ impl Llm {
                 return Err(refuse(400, "a messages request without an integer max_tokens".into()));
             };
             if let Some(spec) = spec {
-                let Some(r) = self.reserve_output(spec.max_output_tokens, asked) else {
+                // A node's slice (#152) caps this activation's own output, in flight included.
+                let cap = match self.slice() {
+                    Some(sl) => spec.max_output_tokens.min(
+                        sl.output_tokens
+                            + self.reserved_output_tokens.load(Ordering::SeqCst)
+                            + self.prior_output_tokens.load(Ordering::SeqCst),
+                    ),
+                    None => spec.max_output_tokens,
+                };
+                let Some(r) = self.reserve_output(cap, asked) else {
                     self.event(model.clone(), 429, Usage::default(), "budget: output token cap reached");
                     return Err(Box::new(problem(
                         429,
@@ -1202,6 +1333,35 @@ mod tests {
     }
 
     /// #113: parallel calls reserve from what is left, so together they can't overshoot.
+    /// #152: a node spends its budget slice and nothing more; the next slice is a fraction of the
+    /// zone's budget on top of what was counted, never past what is left; the node's counts merge in.
+    #[test]
+    fn a_node_spends_its_slice_and_nothing_more() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 8, max_output_tokens: 1000}")).unwrap();
+        assert_eq!(llm.next_slice(0.25), Some(super::Slice { requests: 2, output_tokens: 250, input_tokens: None }));
+        llm.set_slice(llm.next_slice(0.25));
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        assert!(llm.admit(Some(&spec)).is_none());
+        assert!(llm.admit(Some(&spec)).is_none());
+        let r = llm.admit(Some(&spec)).expect("the third request is past the slice");
+        assert_eq!(r.status(), 429);
+        assert_eq!(r.headers()["x-wicket"], "budget");
+        // Output is capped by the slice too, in flight included.
+        let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let f = llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":900,"messages":[]}"#)).ok().unwrap();
+        assert_eq!(f.reserved, 250);
+        llm.settle(f.reserved, Usage { output: 250, ..Usage::default() }, true);
+        // Renewed (connected): what was counted plus a quarter, never past the budget.
+        assert_eq!(llm.spent().requests, 2, "the refusal spent nothing");
+        let next = llm.next_slice(0.25).unwrap();
+        assert_eq!((next.requests, next.output_tokens), (2 + 2, 250 + 250));
+        llm.merge_spent(super::Spent { requests: 7, output_tokens: 900, ..Default::default() });
+        assert_eq!(llm.next_slice(0.25).map(|s| (s.requests, s.output_tokens)), Some((8, 1000)), "never past what is left");
+        assert_eq!(llm.spent().requests, 7, "a node's count only raises this one");
+        llm.merge_spent(super::Spent { requests: 1, ..Default::default() });
+        assert_eq!(llm.spent().requests, 7);
+    }
+
     #[test]
     fn reservations_are_carved_from_what_is_left() {
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();

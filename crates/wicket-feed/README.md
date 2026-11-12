@@ -1,7 +1,7 @@
 # wicket-feed
 
-The signed policy feed that lets a node decide locally while the control host is unreachable, and
-fail narrow when it stays unreachable (#57, research 18 §5.1, architecture A). It ports the
+The signed policy feed that lets a node decide locally while the control host is unreachable, for
+exactly as long as the tokens and grants it holds are valid (#57, #153, research 18 §5.1, architecture A). It ports the
 `experiments/freshness-feed` prototype (experiment #60) and adds the changes its `RESULTS.md` §7
 asks for.
 
@@ -22,11 +22,11 @@ It is a library: no sockets, no threads, no timers. Every call that depends on t
 ## Format
 
 - A pinned **root key** (offline) signs a `KeyCert` for each node feed's online **feed key**:
-  `kid, x, version, not_after, max_ttl_ms, max_narrow_ms`.
+  `kid, x, version, not_after, max_ttl_ms` (an older certificate's `max_narrow_ms` is accepted and ignored).
 - The feed key signs, for one node (`feed` = node id) and one certificate `version`:
   - a **snapshot**: zones, grants, revocations at an epoch, with the chain head;
   - **deltas**: epoch n−1 → n, a batch of changes, with `prev` = head(n−1); head(n) = sha256(delta JWS);
-  - **freshness statements**: epoch, head, `issued_at`, `fresh_until`, `narrow_until`.
+  - **freshness statements**: epoch, head, `issued_at`, `fresh_until` (an older statement's `narrow_until` is accepted and ignored).
 - **Grants** are bound to `Op::digest` (tenant, zone, method, host, path), with `not_after` (node
   clock), an optional use count (counted on the node) and an optional box (run id).
 - **Revocations** name a grant, run or token id, with `until` (the revoked thing's own expiry):
@@ -53,7 +53,7 @@ The feed is generic over its entries (`Policy`):
   knows which grant to count, and a grant without a block in the token never fires.
 - **`ZoneSpec`**, the original payload: zone policies compiled into `CompiledZone`, with the feed's own
   grant records. Kept as the differential oracle (`tests/tokens.rs` checks token decisions match it
-  on every example and subset-test zone, fresh and narrow).
+  on every example and subset-test zone, fresh and offline).
 
 **Revocation by block id.** `Revoke { kind: Token, id }` names a block's revocation id (hex) and
 refuses every token containing that block. Revoking a spawn block therefore revokes the box it
@@ -73,28 +73,28 @@ node).
 
 | mode | when | allowed |
 |---|---|---|
-| fresh | a statement names an epoch the node holds, before its effective `fresh_until` | reach, live grants, leases, spawns, approvals |
-| narrow | stale, before the effective `narrow_until` of the last statement that vouched for the state held | reach-allowed ops at risk ≤ R1 only |
-| closed | no state, feed key past its certificate, or past `narrow_until` | nothing |
+| fresh | a statement names an epoch the node holds, before its effective `fresh_until` | the token and its live grants; leases, spawns, approvals |
+| offline | verified state that a statement once vouched for, and no live statement | the token and its live grants, each until its own expiry; no leases, spawns or approvals |
+| lagging | a live statement names an epoch the node doesn't hold | nothing, until the deltas arrive |
+| closed | no state, a feed key past its certificate, or nothing ever vouched for the state | nothing |
 
-`Forbidden` stays forbidden and revoked runs are refused in every mode; grant expiry is by the
-node's clock in every mode; a node that knows it is behind (lagging) is stale.
+`Forbidden` stays forbidden and revoked runs are refused in every mode; token and grant expiry is by the
+node's clock in every mode. There is no separate offline window (#153): a node works alone for as long
+as what it holds is valid, and `Replica::authority_until(run)` says when a box's token stops allowing
+anything (the earliest expiry of its first-party blocks), so the node can stop the box then.
 
-`Replica::decide(op, now)` returns `Allow(Reach | Grant)`, `NeedsGrant`, `Forbidden` or
-`Refused { mode }`. `Replica::escalate` answers whether the node may issue a lease, start a spawn or
-sign an approval (fresh only).
+`Replica::decide(op, now)` returns `Allow(Reach | Ceiling | Grant)`, `NeedsGrant` (the caller raises it,
+or queues it offline), `Forbidden` or `Refused { mode }`. `Replica::escalate` answers whether the node
+may issue a lease, start a spawn or sign an approval (fresh only).
 
 ## Defaults and bounds
 
-TTL 30 s, refresh 5 s, narrow window 120 s (`DEFAULT_*`; `PublisherConfig` overrides them, within the
-certificate's caps). Statements issued up to 2 s in the future (node clock) are accepted.
+TTL 30 s, refresh 5 s (`DEFAULT_*`; `PublisherConfig` overrides them, within the certificate's cap).
+Statements issued up to 2 s in the future (node clock) are accepted.
 
-- Revocation of grants, leases and runs: when the delta applies (about 1 ms with push); at worst 30 s
-  after it is committed if the node hears nothing.
-- Removing a reach rule, for plain reads on a partitioned node: at worst 150 s.
-- A partitioned node refuses everything 150 s after the last statement it received was issued.
-
-Both bounds also include clock skew up to the 2 s tolerance.
+- Revocation of grants, tokens and runs: when the delta applies (about 1 ms with push). A node that
+  hears nothing keeps what it holds until it expires: the revoked thing's remaining lifetime.
+- The feed key's certificate caps everything a node holds.
 
 ## Changes from the prototype (RESULTS.md §7)
 

@@ -24,8 +24,7 @@
 //!   its life the node's certificate is renewed over the channel, and a node revoked meanwhile (from
 //!   another process: `wicket node revoke`) is dropped within a second and not reconnected.
 //!
-//! Test hooks: `WICKET_FEED_TTL_MS`, `WICKET_FEED_REFRESH_MS` and `WICKET_FEED_NARROW_MS` override the
-//! feed's timings (within the certificate's caps, which follow them); `WICKET_FEED_COMPACT_BYTES` the
+//! Test hooks: `WICKET_FEED_TTL_MS` and `WICKET_FEED_REFRESH_MS` override the feed's timings (within the certificate's caps, which follow them); `WICKET_FEED_COMPACT_BYTES` the
 //! delta log size past which an idle feed starts a new generation.
 
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf};
@@ -50,7 +49,6 @@ pub fn feed_config() -> PublisherConfig {
     PublisherConfig {
         ttl_ms: env("WICKET_FEED_TTL_MS", wicket_feed::DEFAULT_TTL_MS),
         refresh_ms: env("WICKET_FEED_REFRESH_MS", wicket_feed::DEFAULT_REFRESH_MS),
-        narrow_ms: env("WICKET_FEED_NARROW_MS", wicket_feed::DEFAULT_NARROW_MS),
         ..PublisherConfig::default()
     }
 }
@@ -119,7 +117,6 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     let cert_path = dir.join("cert.jws");
     let old = std::fs::read_to_string(&cert_path).ok().and_then(|j| wicket_feed::jws::payload_unverified::<KeyCert>(&j).map(|c| (c, j)));
     let want_ttl = cfg.ttl_ms.max(wicket_feed::DEFAULT_TTL_MS);
-    let want_narrow = cfg.narrow_ms.max(wicket_feed::DEFAULT_NARROW_MS);
     let kid = wicket_feed::kid(&key.verifying_key());
     // With the roots offline (#154) a certificate is used to its end (`wicket keys certify` renews it);
     // with them here, renewed when under a day is left.
@@ -130,8 +127,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
             if !new_generation
                 && c.kid == kid
                 && c.not_after > now + margin
-                && c.max_ttl_ms >= cfg.ttl_ms
-                && c.max_narrow_ms >= cfg.narrow_ms =>
+                && c.max_ttl_ms >= cfg.ttl_ms =>
         {
             if offline && c.not_after < now + 7 * 86_400_000 {
                 eprintln!(
@@ -150,7 +146,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
                 Some((c, _)) => c.version + 1,
                 None => 1,
             };
-            let c = KeyCert::new(&key.verifying_key(), version, now + crate::roots::cert_ms(), want_ttl, want_narrow);
+            let c = KeyCert::new(&key.verifying_key(), version, now + crate::roots::cert_ms(), want_ttl);
             let j = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &c);
             std::fs::write(&cert_path, &j)?;
             j
@@ -359,6 +355,9 @@ pub struct Start {
     pub ledger: Arc<Mutex<Ledger>>,
     pub events: mpsc::UnboundedSender<wicket_proxy::Event>,
     pub start: BoxStart,
+    /// How long the box's authority has left from now (#153): its token's block 0 ends then, and
+    /// its node stops the box. Counted from the run's start, so a re-attach doesn't extend it.
+    pub authority_secs: u64,
     /// Calls on boxes over this run's connection (made before the run's proxies, which use them).
     pub calls: Arc<Calls>,
     /// Trees sent to the node before the box starts: (tree, local directory, top-level names left out).
@@ -372,6 +371,15 @@ pub struct Start {
     /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
     /// fetched first).
     pub keep: bool,
+    /// The run's own model proxy: it leases the node budget slices and takes the node's spend
+    /// (#152). None: no model route.
+    pub llm: Option<Arc<wicket_proxy::llm::Llm>>,
+    /// Where the secrets the node fetches come from (#152).
+    pub vault: wicket_proxy::vault::Vault,
+    /// A re-attached long-lived agent: its earlier spend, this activation's included, is already in
+    /// the model proxy's `prior` counters, so the node's first report is the base its later ones
+    /// count from (#152).
+    pub spent_counted: bool,
 }
 
 struct Shared {
@@ -396,6 +404,13 @@ struct Shared {
     /// Who in the box made a request, as the run reads the agent's event stream (for asks the node
     /// didn't attribute).
     attribute: Option<wicket_proxy::Attributor>,
+    llm: Option<Arc<wicket_proxy::llm::Llm>>,
+    vault: wicket_proxy::vault::Vault,
+    /// What the node had counted when this supervisor took over, if that was already counted.
+    spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
+    /// Hosts this host swaps a credential in for (#169): the node forwards them here, so their
+    /// grants stay here too.
+    swap_hosts: Vec<String>,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
@@ -407,9 +422,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
     // Block 0 is minted by the authority root, or by its certified issuing key while the roots are
-    // offline (#154).
-    // Until the run's own deadline (the node kills the box then), with an hour's margin.
-    let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
+    // offline (#154). Every grant has a lifetime (#153), block 0 included: the zone's
+    // `limits.authority` (default the run's timeout), counted from the run's start. The node works
+    // for the box until then and stops it at that time, whether or not it can reach this host.
+    let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.authority_secs.max(1);
     let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000;
     let ((minter, issuer_cert), approver) = (crate::roots::minting_key(until_ms)?, crate::enrol::token_key(&paths.approver_key)?);
     let mut token_issuer = wicket_feed::Issuer::root(
@@ -491,6 +507,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         token_issuer,
         approver,
         attribute: s.attribute.clone(),
+        llm: s.llm.clone(),
+        vault: s.vault.clone(),
+        spent_base: Mutex::new(s.spent_counted.then_some(None)),
+        swap_hosts: s.start.swap_hosts.clone(),
         attach: s.attach,
         carried,
     });
@@ -557,6 +577,13 @@ struct Progress {
     renewing: Option<NodeCertClaims>,
     /// No renewal attempt before this (after a failed one).
     renew_after: i64,
+    /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
+    proto: u32,
+    /// Whether a lease went on this connection, and the slice in the last one (#152).
+    lease_sent: bool,
+    slice: Option<wicket_proxy::llm::Slice>,
+    /// The secrets released to the node for this run, and what each was (to tell a change).
+    fetched: std::collections::HashMap<String, String>,
 }
 
 async fn manage(
@@ -579,6 +606,10 @@ async fn manage(
         cert: None,
         renewing: None,
         renew_after: 0,
+        proto: 0,
+        lease_sent: false,
+        slice: None,
+        fetched: std::collections::HashMap::new(),
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -678,7 +709,10 @@ async fn session(
         );
     }
     let (feed, runs) = match authed.welcome {
-        Msg::Welcome { feed, runs, .. } => (feed, runs),
+        Msg::Welcome { feed, runs, proto, .. } => {
+            p.proto = proto;
+            (feed, runs)
+        }
         _ => unreachable!("nodeauth::control returns a welcome"),
     };
     p.ever = true;
@@ -707,6 +741,11 @@ async fn session(
     let now = wicket_feed::now_ms();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
+    }
+    // The run's secrets and budget slice, sealed to the node (#152), before anything the box does.
+    p.lease_sent = false;
+    if let Some(f) = lease_due(sh, p) {
+        send(f);
     }
     if sh.attach && !p.ever_resumed && !runs.iter().any(|r| r.run == sh.run.0) {
         p.ever = false;
@@ -743,6 +782,7 @@ async fn session(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis((sh.cfg.refresh_ms / 2).clamp(50, 1000) as u64));
     let mut grants = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut ident = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut leases = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut buf = vec![0u8; 32 * 1024];
     let result = loop {
         tokio::select! {
@@ -773,9 +813,14 @@ async fn session(
                 if let Some(f) = f {
                     send(feed_frame(f));
                 }
-                // The run's lease on its node (#151): renewed with the feed's freshness, for as long
-                // as a statement lasts (its TTL and narrow window).
-                send(Frame::Msg(Msg::RunLease { run: sh.run.0.clone(), until: wicket_feed::now_ms() + sh.cfg.ttl_ms + sh.cfg.narrow_ms }));
+            }
+            _ = leases.tick() => {
+                if let Some(f) = lease_due(sh, p) {
+                    send(f);
+                }
+                for f in secrets_changed(sh, p) {
+                    send(f);
+                }
             }
             _ = grants.tick() => {
                 for f in sync_grants(sh, p) {
@@ -893,7 +938,30 @@ async fn on_frame(
                     let _ = sh.events.send(ev);
                 }
             }
-            Msg::Ask { id, run, op, why, who } => send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref()))),
+            Msg::Ask { id, run, op, why, who, queued } => {
+                send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref())))
+            }
+            Msg::SecretFetch { id, run, name } => {
+                // Only for this run, over its own connection: another run's ask is refused.
+                let reply = match run == sh.run.0 {
+                    true => fetch_secret(sh, p, id, &name),
+                    false => Msg::SecretFetched { id, secret: None, error: Some(format!("not run {}'s connection", run)) },
+                };
+                send(Frame::Msg(reply));
+            }
+            Msg::Spent { run, spent } if run == sh.run.0 => {
+                // The node calls the model itself and is the counter of record (#152).
+                if let Some(l) = &sh.llm {
+                    let base = {
+                        let mut b = sh.spent_base.lock().expect("spent base");
+                        match &mut *b {
+                            Some(slot) => *slot.get_or_insert(spent),
+                            None => wicket_proxy::llm::Spent::default(),
+                        }
+                    };
+                    l.merge_spent(spent.since(base));
+                }
+            }
             Msg::TunnelOpen { stream, run, target } => {
                 let ok_target = ["egress", "llm", "gateway"].contains(&target.as_str());
                 let conn = match (run == sh.run.0, ok_target) {
@@ -975,12 +1043,17 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 /// lowered, by the node's, which saw the query), only egress asks outside wicket's own approval
 /// namespace are taken (#117), and the reason on the card is this zone's own verdict, never the
 /// node's text. The node's attribution is kept, shown as reported by the agent.
-fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_json::Value>) -> Msg {
+fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_json::Value>, queued: Option<&(String, i64)>) -> Msg {
     let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
-    let (op, why) = match check_node_op(&sh.tenant, &sh.run, &sh.zone, run, op) {
+    let (op, mut why) = match check_node_op(&sh.tenant, &sh.run, &sh.zone, run, op) {
         Ok(x) => x,
         Err(e) => return reply(None, None, Some(e)),
     };
+    // Raised while this host was unreachable (#153): the human sees that it is old.
+    if let Some((q, at)) = queued {
+        let secs = (wicket_feed::now_ms() - at).max(0) / 1000;
+        why = format!("{why} (asked {secs}s ago, queued on node {} as {q} while the control host was unreachable)", sh.node);
+    }
     let op = &op;
     // The node reports who asked if it knows; else the run's own attribution, read from the agent's
     // event stream outside the box (reported, not proven, either way).
@@ -997,6 +1070,90 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
+}
+
+/// The fraction of a run's model budget leased to its node at a time (#152):
+/// `WICKET_NODE_BUDGET_SLICE` on the control host, default 0.25. Offline, the node can spend what is
+/// left of its slice and nothing more; connected, it is renewed before half of it is gone.
+fn slice_fraction() -> f64 {
+    std::env::var("WICKET_NODE_BUDGET_SLICE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| *f > 0.0 && *f <= 1.0).unwrap_or(0.25)
+}
+
+/// The run's lease for its node (#152), if it differs from the last one sent on this connection:
+/// its budget slice, renewed once less than half a slice is left, and lowered at once if what is
+/// left of the budget shrinks below it (a spawn's carve-out).
+fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
+    if p.proto < crate::chan::NODE_LEASES {
+        return None;
+    }
+    let l = sh.llm.as_ref()?;
+    let next = l.next_slice(slice_fraction())?;
+    let spent = l.spent();
+    let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
+    let slice = match p.slice {
+        Some(cur)
+            if !low(cur.requests, next.requests, spent.requests)
+                && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
+                && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, l.input_total()))
+                && cur.requests <= next.requests
+                && cur.output_tokens <= next.output_tokens
+                && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
+        {
+            cur
+        }
+        _ => next,
+    };
+    if p.lease_sent && p.slice == Some(slice) {
+        return None;
+    }
+    if !p.lease_sent {
+        println!("[wicket] leasing node {} a budget slice for {}: {slice:?}", sh.node, sh.run);
+    }
+    p.lease_sent = true;
+    p.slice = Some(slice);
+    Some(Frame::Msg(Msg::Lease { run: sh.run.0.clone(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }))
+}
+
+/// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone
+/// uses it and the vault's binding covers the hosts it uses it for. Audited either way.
+fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
+    let r = crate::nodesecrets::release(&sh.zone, &sh.vault, name, sh.ctl.token_root.1);
+    let (ok, why) = match &r {
+        Ok(f) => {
+            p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
+            (true, None)
+        }
+        Err(e) => (false, Some(e.clone())),
+    };
+    let _ = sh.ledger.lock().expect("ledger").audit(
+        &sh.tenant,
+        Some(&sh.run),
+        "node.secret_fetch",
+        &serde_json::json!({ "node": sh.node, "secret": name, "released": ok, "why": why }),
+    );
+    match r {
+        Ok(f) => Msg::SecretFetched { id, secret: Some(Box::new(f)), error: None },
+        Err(e) => Msg::SecretFetched { id, secret: None, error: Some(e) },
+    }
+}
+
+/// Secrets this run's node fetched that have since changed, been rebound or removed on this host:
+/// the node is told to drop them (#152).
+fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
+    let mut out = vec![];
+    if p.proto < crate::chan::NODE_LEASES {
+        return out;
+    }
+    let names: Vec<String> = p.fetched.keys().cloned().collect();
+    for name in names {
+        let now = crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.token_root.1).ok().map(|f| crate::nodesecrets::digest(&f));
+        if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
+            p.fetched.remove(&name);
+            println!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
+            out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
+        }
+    }
+    out
 }
 
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
@@ -1076,7 +1233,20 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
-        let route = wicket_proxy::decide::route(&g.host, &sh.zone, &[], ca.as_ref().map(|c| (&c.hosts[..], c.not_after)), now_s);
+        // As the node routes it: a host injected with a secret leased to the node is decided there.
+        if sh.swap_hosts.iter().any(|h| wicket_core::manifest::host_matches(h, &g.host)) {
+            continue;
+        }
+        let route = wicket_proxy::decide::route_sealed(
+            &g.host,
+            &sh.zone,
+            &[],
+            ca.as_ref().map(|c| (&c.hosts[..], c.not_after)),
+            now_s,
+            // A version-3 node fetches a zone's injected secrets on first use, and decides those hosts
+            // itself; an older node forwards them here.
+            &|_| p.proto >= crate::chan::NODE_LEASES,
+        );
         if route != wicket_proxy::decide::Route::Terminate {
             continue;
         }

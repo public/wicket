@@ -516,21 +516,49 @@ plus a standby may be enough.
 - **Keeping the model proxy central and only replicating it**: it fixes control-host loss, not partitions,
   and partitions are what remote nodes see most.
 
-### 6.4 Open decisions for the owner
+### 6.4 Decisions (the owner, 2026-11-12)
 
-1. **How long a node runs alone.** Proposal: per zone, defaults `fresh` 30 s (as now), `work` 15 min,
-   `reads` 1 h, hard cap 24 h (the certificates). Longer windows mean slower revocation for a cut-off node.
-2. **Whether model calls continue offline.** That needs the Claude access token on the node (§3.2): a
-   rooted node can then use the subscription until the token expires, and wicket can't revoke it short of
-   signing the login out. Proposal: off by default; opt-in per zone and per node.
-3. **Whether static secrets may ever be node-resident.** Proposal: only by an explicit per-secret choice,
-   never by default.
-4. **Whether a node stops its boxes when its window closes** (Nomad's choice) **or keeps them running
-   without egress** (Kubernetes'). Proposal: stop, hibernating locally where it can.
-5. **Whether running the Claude login's access token through per-node proxies** is within the
-   subscription terms as the owner reads them (§4, last item); the design assumes yes, for the box's own
-   Claude Code only.
-6. **Whether to build phase 5 at all**, or stop at a single control host with streamed state and a standby.
+The owner decided these on [#152](https://github.com/public/wicket/issues/152) and
+[#153](https://github.com/public/wicket/issues/153); they replace the proposals this section first made,
+and where §3 and §5 differ, these win. Built in #152/#153's PR; what that changed is in nodes.md and
+limits.md.
+
+1. **How long a node runs alone: exactly as long as the grants on the tokens it holds are valid.** There
+   is no separate fresh/narrow/work/reads window (§5.1's proposed per-zone `offline` windows are not
+   built). Every grant has a lifetime, the base authority included: block 0 lasts the zone's
+   `limits.authority`, by default the run's timeout, counted from the run's start; grants their TTL (at
+   most 24 h); leased secrets the run's authority, or their upstream expiry if earlier. The freshness
+   statements stay, as the "connected and caught up" signal: revocations and new grants still arrive
+   through the feed while connected. *As built:* offline, the node decides exactly as when fresh, except
+   that nothing new is leased, spawned or approved and asks are queued; a node that knows it is behind
+   (lagging) refuses until it catches up.
+2. **Model calls continue offline: the Claude access token may be on the node.** Not opt-in per zone: the
+   token's access part is leased to the node of every run whose zone uses it, sealed to the node, and
+   never the refresh token. Using the subscription token through per-node proxies is fine (item 5 below).
+   Budgets are leased to nodes in slices (§3.3), part of the run's lease. *As built,* with Alex's later
+   rule that authorization decisions happen at the edge of the sandbox: with the credential on the node,
+   the node's model proxy decides and calls the model itself, with no per-call relay to the control host
+   (§3.1's relay re-enforcement is not built for that path); the control host reconciles the node's spend
+   afterwards.
+3. **Secrets are cached on nodes, encrypted at rest.** Every secret a run's zone names (model credential,
+   injected secrets) goes to its node, sealed to the node: a per-node key derived on the control host and
+   wrapped to the node's key. *Deviation:* the wrapping uses X25519 from the node's existing Ed25519 key
+   (age's `ssh-ed25519` construction, domain-separated with HKDF) instead of a separate X25519 key
+   certified at enrolment (§3.2), so no enrolment change is needed; it is not HPKE. Leases are on the
+   node's disk (sealed), not in memory only, so a node keeps working through a restart of its `serve`
+   while offline. Revocation removes them when connected; expiry ends their use when not.
+4. **When a workload's grants expire, its boxes stop.** The workload's grants decide this, not the node
+   (no node-wide setting; #151's `WICKET_NODE_LEASE_EXPIRY` is gone). Asks raised offline are queued on the
+   node and delivered on reconnect, with their age; there are no approvals on the node alone.
+5. **The Claude subscription token through per-node proxies** is within the terms as the owner reads them,
+   for the box's own Claude Code only.
+6. **The replicated control plane (phase 5, #155) waits for a later release.**
+
+Not built with these (phase 3's other items, left for later issues): node issuing keys for agent
+identities (§3.5; identities on a cut-off node still lapse after 10 minutes), certificate renewal over the
+channel from any control host, distributing node CA revocations, local hibernation with per-agent data
+keys (§5.5), and the control plane's time fence before waking an agent elsewhere (beyond reconcile's wait
+past a run's timeout).
 
 ---
 
