@@ -28,7 +28,7 @@ The three changes:
 
 Also: put the synthetic range on `lo` as **one address with a /16 prefix**. gVisor makes the whole
 prefix local. gVisor refuses `ip route add local` (`Operation not supported`), and adding 4096 /32s
-takes 10.7 s.
+takes 10.7–12.7 s.
 
 ## Setup
 
@@ -54,9 +54,9 @@ takes 10.7 s.
 |---|---|---|
 | bind 198.19.0.5:443 and 198.19.0.6:443 (/32s on lo) | ok | ok |
 | wildcard `0.0.0.0:443` + `IP_PKTINFO`: original destination seen, reply sent from it | ok | ok |
-| `ip addr add 198.20.0.1/16 dev lo`, then traffic to 198.20.3.4 and 198.20.77.1 | ok (the whole prefix is local) | ok |
+| `ip addr add 198.18.64.1/18 dev lo`, then traffic to 198.18.67.4, 198.18.64.9, 198.18.77.1 (also with the wildcard socket) | ok (the whole prefix is local) | ok |
 | `ip route add local 198.19.0.0/16 dev lo table local` | **refused** (`Operation not supported`) | ok |
-| 4096 /32s via `ip -batch` | ok, 10.7 s | ok |
+| 4096 /32s via `ip -batch` | ok, 10.7–12.7 s | ok, 0.7 s |
 | UDP 1500 / 9000 / 65000-byte datagrams on lo (lo MTU 65522) | ok | ok |
 | unix `SOCK_STREAM`, `SOCK_SEQPACKET` to a host socket (1 B – 65000 B, boundaries kept) | ok | ok |
 | unix `SOCK_DGRAM`, connected | host receives, can't reply (peer unnamed) | same |

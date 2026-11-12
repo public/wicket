@@ -22,11 +22,11 @@ ip addr add 198.19.0.6/32 dev lo
 if ip route add local 198.19.0.0/16 dev lo table local 2>/tmp/route.err; then echo "route-local-198.19.0.0/16: ok"; else echo "route-local-198.19.0.0/16: FAIL $(cat /tmp/route.err)"; fi
 # A whole /16 as one address with its prefix (Linux makes the prefix local on lo), and a pool of
 # 4096 /32s, timed.
-if ip addr add 198.20.0.1/16 dev lo 2>/tmp/p.err; then echo "addr-prefix-198.20.0.1/16: ok"; else echo "addr-prefix: FAIL $(cat /tmp/p.err)"; fi
+if ip addr add 198.18.64.1/18 dev lo 2>/tmp/p.err; then echo "addr-prefix-198.18.64.1/18: ok"; else echo "addr-prefix: FAIL $(cat /tmp/p.err)"; fi
 t0=$(date +%s%N)
-for a in $(seq 0 15); do for b in $(seq 0 255); do echo "address add 198.21.$a.$b/32 dev lo"; done; done | ip -batch - 2>/tmp/pool.err && echo "pool-4096-addrs: ok in $(( ($(date +%s%N) - t0) / 1000000 )) ms" || echo "pool-4096-addrs: FAIL $(head -2 /tmp/pool.err)"
+for a in $(seq 0 15); do for b in $(seq 0 255); do echo "address add 198.18.$((128 + a)).$b/32 dev lo"; done; done | ip -batch - 2>/tmp/pool.err && echo "pool-4096-addrs: ok in $(( ($(date +%s%N) - t0) / 1000000 )) ms" || echo "pool-4096-addrs: FAIL $(head -2 /tmp/pool.err)"
 ip link show lo | head -1
-echo "--- ip addr / ip route (table local)"; ip -4 addr show dev lo | sed -n "s/^ *inet /inet /p" | grep -v "198.21" ; echo "(198.21.x: $(ip -4 addr show dev lo | grep -c 198.21) addresses)"; ip route show table local 2>&1 | head -20
+echo "--- ip addr / ip route (table local)"; ip -4 addr show dev lo | sed -n "s/^ *inet /inet /p" | grep -v "198.18.1[234]" ; echo "(198.18.128-143.x: $(ip -4 addr show dev lo | grep -cE "198.18.1(2[89]|3[0-9]|4[0-3])\.") addresses)"; ip route show table local 2>&1 | head -20
 echo "--- resolv.conf"; cat /etc/resolv.conf
 echo "---"
 exec setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all --bounding-set=-all -- python3 /probe/box_probe.py

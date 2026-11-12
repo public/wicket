@@ -207,9 +207,9 @@ check("udp-bound-198.19.0.5:443", lambda: udp_roundtrip(("198.19.0.5", 443), ("1
 check("udp-bound-198.19.0.6:443", lambda: udp_roundtrip(("198.19.0.6", 443), ("198.19.0.6", 443)))
 check("udp-routed-local-198.19.200.7:443", lambda: udp_roundtrip(("198.19.200.7", 443), ("198.19.200.7", 443)))
 check("udp-pktinfo-wildcard-443", lambda: pktinfo_wildcard(443, ["198.19.0.5", "198.19.0.6"]))
-check("udp-prefix16-198.20.3.4:443", lambda: udp_roundtrip(("198.20.3.4", 443), ("198.20.3.4", 443)))
-check("udp-pktinfo-wildcard-prefix16", lambda: pktinfo_wildcard(8443, ["198.20.0.9", "198.20.77.1"]))
-check("udp-pool-198.21.15.250:443", lambda: udp_roundtrip(("198.21.15.250", 443), ("198.21.15.250", 443)))
+check("udp-prefix18-198.18.67.4:443", lambda: udp_roundtrip(("198.18.67.4", 443), ("198.18.67.4", 443)))
+check("udp-pktinfo-wildcard-prefix18", lambda: pktinfo_wildcard(8443, ["198.18.64.9", "198.18.77.1"]))
+check("udp-pool-198.18.143.250:443", lambda: udp_roundtrip(("198.18.143.250", 443), ("198.18.143.250", 443)))
 check("udp-127.0.0.2:443", lambda: udp_roundtrip(("127.0.0.2", 443), ("127.0.0.2", 443)))
 for n in (1500, 9000, 65000):
     check(f"udp-datagram-{n}", lambda n=n: big_datagram(n))
