@@ -352,6 +352,11 @@ fi
 # the `serve` of the node acc-n1 (another machine's, in --nodes local). Then one reconcile pass: the
 # boxes must still run, the same containers, their runs taken over, and each agent's next turn must
 # reach its model and its gateway (MCP's ping and whoami).
+# A restart-check run's result: in its run directory here, or on the other node for a box there.
+restart_result() {
+  data "runs/$1/workspace/out/result.json" 2>/dev/null \
+    || cat "${nodehome:-/nonexistent}/.local/share/wicket-node/runs/$1/workspace/out/result.json" 2>/dev/null || true
+}
 restart_start() {   # $1: label, then wicket run options
   local label=$1; shift
   local ws; ws=$(workdir restart)
@@ -360,7 +365,7 @@ restart_start() {   # $1: label, then wicket run options
   wait_for 90 '[ -n "$(run_id_of "$work/restart-$label.log")" ]' || true
   local r; r=$(run_id_of "$work/restart-$label.log")
   our_runs+=("$r")
-  wait_for 120 '[ "$(data "runs/'"$r"'/workspace/out/result.json" 2>/dev/null | jq -r .turn 2>/dev/null)" = 1 ]' || true
+  wait_for 120 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 1 ]' || true
   echo "$r"
 }
 restart_flow() {
@@ -388,8 +393,8 @@ restart_flow() {
     check "  reconcile adopted the run on $l" 'grep -q "^run_adopted .*$r" "$work/rec-restart.log"'
     wait_for 60 'grep -q "run.attach\|reconnected" "$WICKET_HOME/runs/'"$r"'/ctl/attach.log" 2>/dev/null' || true
     w say "$r" "Again, after the restart." >/dev/null 2>&1 || true
-    wait_for 180 '[ "$(data "runs/'"$r"'/workspace/out/result.json" 2>/dev/null | jq -r .turn 2>/dev/null)" = 2 ]' || true
-    local res; res=$(data "runs/$r/workspace/out/result.json" 2>/dev/null)
+    wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
+    local res; res=$(restart_result "$r")
     echo "   $l: $res"
     check "  its next turn reached the model, on the same box ($l)" '[ "$(jq -r .turn <<<"$res")" = 2 ] && [ "$(box_of "$r")" = "${boxes[$i]}" ]'
     check "  and its gateway: MCP ping and whoami ($l)" '[ "$(jq -r .ping <<<"$res")" = "{}" ] && [ "$(jq -r .whoami_run <<<"$res")" = "$r" ]'
