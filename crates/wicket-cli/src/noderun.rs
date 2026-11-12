@@ -253,11 +253,27 @@ pub struct NodeCtl {
     killed: AtomicBool,
     /// Calls on the box (pause, processes, exec, link sockets) over the run's connection.
     pub calls: Arc<Calls>,
+    keep: bool,
+    forgotten: AtomicBool,
+    done: tokio::sync::Notify,
 }
 
 impl NodeCtl {
     fn send(&self, f: Frame) -> bool {
         self.link.lock().expect("link").as_ref().is_some_and(|l| l.send(f).is_ok())
+    }
+
+    /// Whether the box's files are still kept on the node (after its exit, until forgotten).
+    fn kept(&self) -> bool {
+        self.keep && !self.forgotten.load(Ordering::SeqCst)
+    }
+
+    /// The node may delete the box's files now (its state was fetched); the connection then ends.
+    pub fn forget(&self) {
+        if self.keep && !self.forgotten.swap(true, Ordering::SeqCst) {
+            self.calls.forget(&self.run);
+            self.done.notify_one();
+        }
     }
 
     /// Stops the box (now if connected, else as soon as the node is reachable again).
@@ -307,6 +323,11 @@ pub struct Start {
     pub start: BoxStart,
     /// Calls on boxes over this run's connection (made before the run's proxies, which use them).
     pub calls: Arc<Calls>,
+    /// Trees sent to the node before the box starts: (tree, local directory, top-level names left out).
+    pub trees: Vec<(String, PathBuf, Vec<String>)>,
+    /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
+    /// fetched first).
+    pub keep: bool,
 }
 
 struct Shared {
@@ -382,6 +403,9 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         token_root,
         killed: AtomicBool::new(false),
         calls: s.calls.clone(),
+        keep: s.keep,
+        forgotten: AtomicBool::new(false),
+        done: tokio::sync::Notify::new(),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -417,6 +441,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => return Err(e),
         _ => bail!("node {name} did not come up fresh on the feed within 60 s"),
+    }
+    for (tree, src, exclude) in &s.trees {
+        let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
+        ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
     }
     if !ctl.send(Frame::Msg(Msg::Start(Box::new(s.start)))) {
         bail!("lost node {name} while starting the box");
@@ -481,7 +509,7 @@ async fn manage(
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
         sh.ctl.calls.set_out(None);
-        if p.exited {
+        if p.exited && !sh.ctl.kept() {
             return;
         }
         match r {
@@ -609,12 +637,13 @@ async fn session(
     let mut buf = vec![0u8; 32 * 1024];
     let result = loop {
         tokio::select! {
+            _ = sh.ctl.done.notified(), if p.exited => break Ok(()),
             f = in_rx.recv() => match f {
                 Some(f) => {
                     if let Err(e) = on_frame(sh, io, p, f, &out_tx, ready, started, target_epoch).await {
                         break Err(e);
                     }
-                    if p.exited {
+                    if p.exited && !sh.ctl.kept() {
                         break Ok(());
                     }
                 }
@@ -731,7 +760,9 @@ async fn on_frame(
                 if let Some(t) = io.exit.take() {
                     let _ = t.send(code);
                 }
-                send(Frame::Msg(Msg::Forget { run }));
+                if !sh.ctl.keep {
+                    send(Frame::Msg(Msg::Forget { run }));
+                }
                 // The box is gone: its token leaves the feed (the node no longer needs it).
                 let dropped = sh.ctl.publisher.lock().and_then(|mut f| {
                     f.commit(vec![Change::DropZone { name: sh.run.0.clone() }], wicket_feed::now_ms()).map_err(Into::into)
@@ -1018,18 +1049,6 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             vec![]
         }
     }
-}
-
-/// The workspace directory as a tar archive (for [`BoxStart::workspace_tar`]).
-pub fn tar_dir(dir: &Path) -> Result<Vec<u8>> {
-    let out = std::process::Command::new("tar").arg("-C").arg(dir).args(["-cf", "-", "."]).output()?;
-    if !out.status.success() {
-        bail!("archiving {} failed", dir.display());
-    }
-    if out.stdout.len() > crate::chan::MAX_FRAME / 2 {
-        bail!("the workspace is too large to send to a node ({} bytes)", out.stdout.len());
-    }
-    Ok(out.stdout)
 }
 
 #[cfg(test)]

@@ -188,7 +188,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let text = serde_yaml::to_string(&m)?;
     let workspace_dir = match workspace_dir {
         None => None,
-        Some(_) if node.is_some() => bail!("--workspace-dir mounts a local directory; it can't be used with --node"),
         Some(_) if workdir.is_some() => bail!("use either --workdir (copy in) or --workspace-dir (mount in place)"),
         Some(w) => {
             let w = std::fs::canonicalize(w).with_context(|| format!("--workspace-dir {}", w.display()))?;
@@ -260,7 +259,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
     // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
-    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none() && shares_host;
+    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none();
     if wake.is_some() && !long_lived {
         bail!("only a local claude-code agent can be woken");
     }
@@ -532,6 +531,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         _ => None,
     };
+    // A node that lays out its own boxes keeps this one's files after it exits, until its state (or
+    // an in-place workspace) is fetched back.
+    let keep_on_node = !shares_host && (long_lived || workspace_dir.is_some());
     // Calls on boxes over this run's node connection (pause, exec, link sockets), made before the
     // connection itself: the link tools use them.
     let node_calls = Arc::new(crate::nodecall::Calls::default());
@@ -642,7 +644,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // `state/` may hold restored, agent-written entries: never write through them.
         crate::hibernate::write_owned(&box_root.join("state"), rel, body.as_ref())?;
     }
-    if let (Some(w), None) = (&workspace_dir, &wrap_cwd) {
+    if let (Some(w), None, true) = (&workspace_dir, &wrap_cwd, shares_host) {
         // Create the outbox mount point ourselves, so it isn't left behind owned by root.
         std::fs::create_dir_all(w.join("out"))?;
     }
@@ -726,8 +728,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A wrapped agent's stdout, copied to its launcher until the box's ends.
     let mut wrapped_out: Option<tokio::task::JoinHandle<()>> = None;
     let (mut child, stopper, stdin, stdout, stderr): (BoxProc, Stopper, Option<Writer>, Option<Reader>, Reader) = {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
         // This host's own node mounts the box as laid out here; another node is sent the workspace.
         let host = shares_host.then(|| crate::chan::HostBox {
             name: spec.name.clone(),
@@ -736,7 +736,27 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             workdir: spec.workdir.clone(),
             labels: spec.labels.clone(),
         });
-        let workspace_tar = if shares_host { String::new() } else { b64.encode(crate::noderun::tar_dir(&dir.join("workspace"))?) };
+        // A node that lays out its own boxes is sent their trees before the box starts: the workspace
+        // (an in-place one too, copied up and brought back at the end), and a long-lived agent's
+        // state, /tmp and durable volumes, as restored here from its bundle.
+        let mut trees: Vec<(String, std::path::PathBuf, Vec<String>)> = vec![];
+        if !shares_host {
+            match &workspace_dir {
+                Some(w) => trees.push(("workspace".into(), w.clone(), vec!["out".into()])),
+                None => trees.push(("workspace".into(), dir.join("workspace"), vec![])),
+            }
+            if let Some(f) = fence.as_ref().filter(|_| long_lived) {
+                trees.push(("state".into(), dir.join("state"), vec![]));
+                if dir.join("tmp").is_dir() {
+                    trees.push(("tmp".into(), dir.join("tmp"), vec![]));
+                }
+                for v in m.zone.volumes.iter().filter(|v| v.persist == wicket_core::Persist::Durable) {
+                    let d = crate::hibernate::durable_volume(&f.agent, &v.name);
+                    std::fs::create_dir_all(&d)?;
+                    trees.push((format!("volume.{}", v.name), d, vec![]));
+                }
+            }
+        }
         let start = crate::chan::BoxStart {
             run: run.0.clone(),
             tenant: m.tenant.0.clone(),
@@ -755,11 +775,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 + if long_lived { 120 } else { 0 },
             escalate,
             ca_pem: ca.cert_pem(),
-            workspace_tar,
+            workspace_tar: String::new(),
             state_files: state_files.clone(),
             volumes: m.zone.volumes.iter().map(|v| (v.name.clone(), v.path.clone())).collect(),
             streams: [1, 2, 3],
             host,
+            long_lived: long_lived && !shares_host,
+            durable: match long_lived && !shares_host {
+                true => m
+                    .zone
+                    .volumes
+                    .iter()
+                    .filter(|v| v.persist == wicket_core::Persist::Durable)
+                    .map(|v| (v.name.clone(), v.path.clone()))
+                    .collect(),
+                false => vec![],
+            },
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -779,6 +810,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             events: ctx.events.clone(),
             start,
             calls: node_calls.clone(),
+            trees,
+            keep: keep_on_node,
         })
         .await?;
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
@@ -1020,8 +1053,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
                     }
                 }
-                if let Some(t) = tmp_dir.clone() {
-                    if tokio::task::spawn_blocking(move || crate::hibernate::over(&t, tmp_cap)).await.unwrap_or(false) {
+                let over = match tmp_dir.clone() {
+                    Some(t) => tokio::task::spawn_blocking(move || crate::hibernate::over(&t, tmp_cap)).await.unwrap_or(false),
+                    // A long-lived agent's /tmp on a node that lays out its boxes: measured there.
+                    None if long_lived && !shares_host => stopper
+                        .0
+                        .calls
+                        .ctl(&run.0, "usage", "", "tmp")
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.parse::<u64>().ok())
+                        .is_some_and(|b| b > tmp_cap),
+                    None => false,
+                };
+                {
+                    if over {
                         println!("[wicket] the box's /tmp is over its {} MiB cap; stopping the box", wicket_sandbox::TMP_CAP_MB);
                         hibernating = false;
                         stopper.kill().await?;
@@ -1192,6 +1239,26 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let Some(f) = &fence {
         ledger.lock().expect("ledger").record_agent_usage(&f.agent, f.generation, &usage())?;
     }
+    // A node that lays out its own boxes kept this one's files: its state comes back here first (to be
+    // bundled), and an in-place workspace goes back into the operator's directory.
+    let mut fetched = !keep_on_node;
+    if keep_on_node && !superseded {
+        match fetch_trees(&stopper, &run.0, &m, fence.as_ref().map(|f| f.agent.as_str()), &dir, workspace_dir.as_deref(), hibernating).await
+        {
+            Ok(()) => fetched = true,
+            Err(e) => {
+                println!("[wicket] fetching the box's files from node {node_name} failed: {e:#} (they stay there)");
+                if hibernating {
+                    hibernating = false;
+                    set_state("failed", Some(&format!("hibernate failed: fetching its state from node {node_name}: {e:#}")));
+                    status = format!("failed (hibernate: fetching its state: {e})");
+                }
+            }
+        }
+    }
+    if fetched || superseded {
+        stopper.0.forget();
+    }
     // A long-lived agent's activation ends: hibernated (its state pushed), a wake that never got its
     // session going (back to hibernated, to be retried), or ended.
     if let (Some(f), false) = (&fence, superseded) {
@@ -1347,6 +1414,51 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         println!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
     }
     println!("[wicket] transcript {}", transcript.display());
+    Ok(())
+}
+
+/// Brings a kept box's files back from its node: its workspace (into the run's directory, or an
+/// in-place one into the operator's directory), and if it is hibernating, its state, /tmp and durable
+/// volumes, where they are bundled from. Each comes into a fresh directory first, then replaces the
+/// copy here, so what the box deleted is gone here too.
+async fn fetch_trees(
+    stopper: &Stopper,
+    run: &str,
+    m: &Manifest,
+    agent: Option<&str>,
+    dir: &Path,
+    in_place: Option<&Path>,
+    hibernating: bool,
+) -> Result<()> {
+    let calls = &stopper.0.calls;
+    let staging = dir.join("fetch");
+    let _ = std::fs::remove_dir_all(&staging);
+    let mut wanted: Vec<(String, std::path::PathBuf)> = vec![];
+    if hibernating {
+        for t in ["state", "tmp"] {
+            wanted.push((t.into(), dir.join(t)));
+        }
+        if let Some(a) = agent {
+            for v in m.zone.volumes.iter().filter(|v| v.persist == wicket_core::Persist::Durable) {
+                wanted.push((format!("volume.{}", v.name), crate::hibernate::durable_volume(a, &v.name)));
+            }
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let ws_staged = staging.join("workspace");
+    calls.get_tree(run, "workspace", &ws_staged).await?;
+    for (tree, _) in &wanted {
+        calls.get_tree(run, tree, &staging.join(tree)).await?;
+    }
+    match in_place {
+        Some(w) => crate::hibernate::sync_dir(&ws_staged, w, &["out"])?,
+        None => crate::hibernate::sync_dir(&ws_staged, &dir.join("workspace"), &[])?,
+    }
+    for (tree, dest) in &wanted {
+        crate::hibernate::sync_dir(&staging.join(tree), dest, &[])?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    println!("[wicket] fetched the box's files from its node in {} ms", t0.elapsed().as_millis());
     Ok(())
 }
 

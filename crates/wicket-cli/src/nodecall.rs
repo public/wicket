@@ -242,6 +242,85 @@ impl Calls {
         Ok((code, out))
     }
 
+    /// Opens tunnel `stream` for a tree transfer (`put`: to the node) and waits for the node's go.
+    async fn tree(&self, run: &str, tree: &str, put: bool) -> Result<(u64, BoxStream, oneshot::Receiver<i32>)> {
+        let stream = TUNNEL_BIT | CONTROL_TUNNEL_BIT | self.id();
+        let (etx, erx) = oneshot::channel();
+        self.exits.lock().expect("exits").insert(stream, etx);
+        let (ours, theirs) = tokio::io::duplex(1 << 20);
+        let out = self.out.lock().expect("out").clone().context("the node is not connected")?;
+        self.tunnels.attach(stream, theirs, out);
+        let f = match put {
+            true => Msg::PutTree { stream, run: run.into(), tree: tree.into() },
+            false => Msg::GetTree { stream, run: run.into(), tree: tree.into() },
+        };
+        match self.answer(stream, Frame::Msg(f), "a tree transfer").await {
+            Ok(Msg::TunnelOpened { error: None, .. }) => Ok((stream, ours, erx)),
+            r => {
+                self.tunnels.close(stream);
+                self.exits.lock().expect("exits").remove(&stream);
+                match r {
+                    Ok(Msg::TunnelOpened { error: Some(e), .. }) => bail!("{e}"),
+                    Err(e) => Err(e),
+                    _ => bail!("an unexpected answer to a tree transfer"),
+                }
+            }
+        }
+    }
+
+    /// Copies local directory `src` (less the top-level names in `exclude`) into `run`'s tree `tree`
+    /// on the node.
+    pub async fn put_tree(&self, run: &str, tree: &str, src: &std::path::Path, exclude: &[&str]) -> Result<()> {
+        let (_, mut s, exit) = self.tree(run, tree, true).await?;
+        let mut tar = tokio::process::Command::new("tar");
+        tar.arg("-C").arg(src);
+        for x in exclude {
+            tar.arg(format!("--exclude=./{x}"));
+        }
+        let mut tar = tar.args(["-cf", "-", "."]).stdout(std::process::Stdio::piped()).kill_on_drop(true).spawn().context("tar")?;
+        let mut from = tar.stdout.take().expect("stdout");
+        tokio::io::copy(&mut from, &mut s).await.context("sending a tree to the node")?;
+        s.shutdown().await?;
+        if !tar.wait().await?.success() {
+            bail!("archiving {} failed", src.display());
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(600), exit).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(c)) => bail!("the node could not unpack {tree} (tar exited {c})"),
+            _ => bail!("the node did not finish unpacking {tree}"),
+        }
+    }
+
+    /// Copies `run`'s tree `tree` on the node into local directory `dest` (made if needed).
+    pub async fn get_tree(&self, run: &str, tree: &str, dest: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(dest)?;
+        let (_, mut s, exit) = self.tree(run, tree, false).await?;
+        let mut tar = tokio::process::Command::new("tar")
+            .arg("-C")
+            .arg(dest)
+            .args(["--no-same-owner", "-xf", "-"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("tar")?;
+        let mut to = tar.stdin.take().expect("stdin");
+        tokio::io::copy(&mut s, &mut to).await.context("fetching a tree from the node")?;
+        drop(to);
+        if !tar.wait().await?.success() {
+            bail!("unpacking {tree} from the node failed");
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(60), exit).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(c)) => bail!("the node could not archive {tree} (tar exited {c})"),
+            _ => bail!("the node did not finish archiving {tree}"),
+        }
+    }
+
+    /// The node may delete `run`'s files (a box it kept after exiting, for its state to be fetched).
+    pub fn forget(&self, run: &str) {
+        self.send(Frame::Msg(Msg::Forget { run: run.into() }));
+    }
+
     /// Listens on link socket `sock` in `run`'s socket directory: its connections, as they come.
     pub async fn listen(&self, run: &str, sock: &str) -> Result<mpsc::UnboundedReceiver<BoxStream>> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -271,6 +350,8 @@ impl Calls {
 /// relay's). Authenticated like a run's; it carries no feed and owns no box.
 pub struct Link {
     pub calls: Arc<Calls>,
+    /// What the node reported when this connection was made.
+    pub capacity: Option<crate::chan::NodeCapacity>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -296,7 +377,13 @@ impl Link {
             nonce,
             scope: scope.into(),
         };
-        crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello).await.map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
+        let authed = crate::nodeauth::control(&mut rd, &mut wr, node, ledger, &issuer, hello)
+            .await
+            .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
+        let capacity = match authed.welcome {
+            Msg::Welcome { capacity, .. } => capacity,
+            _ => None,
+        };
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
@@ -317,6 +404,6 @@ impl Link {
             writer.abort();
             c.set_out(None);
         });
-        Ok(Link { calls, task })
+        Ok(Link { calls, capacity, task })
     }
 }
