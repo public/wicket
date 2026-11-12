@@ -264,19 +264,9 @@ impl Llm {
         let spec = self.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
         let (parts, body) = req.into_parts();
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
-        let Filtered { body, model, note, want } = match self.filter(Some(spec), &parts, body) {
+        let Filtered { body, model, note, reserved } = match self.filter(Some(spec), &parts, body) {
             Ok(f) => f,
             Err(r) => return Ok(*r),
-        };
-        let Some(reserved) = self.reserve_output(spec.max_output_tokens, want) else {
-            self.event(model, 429, Usage::default(), "budget: output token cap reached");
-            return Ok(problem(
-                429,
-                "budget",
-                "Model token budget exhausted",
-                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
-                None,
-            ));
         };
         let up = self.send_upstream(spec, &parts, body).await;
         let resp = match up {
@@ -327,13 +317,14 @@ impl Llm {
         Ok(rb.body(body).send().await?)
     }
 
-    /// Vets a model request's body (#112) and reserves nothing yet. Only `POST /v1/messages` and
+    /// Vets a model request's body (#112) and reserves its output (#113). Only `POST /v1/messages` and
     /// `/v1/messages/count_tokens` carry bodies; reads (GET, HEAD) pass without one. The body must be
     /// a plain (not `Content-Encoding`-ed) JSON object; it is re-encoded from what was parsed, keeping
     /// only known top-level fields, and only client tools (executed by the agent, in its box) unless
-    /// the zone has `allow_server_tools`: server tools, the MCP connector and containers make the
-    /// provider fetch from or send to hosts the zone never allowed. A `max_tokens` above what is left
-    /// of the output budget is lowered to it (#113).
+    /// the zone has `allow_server_tools`: server tools, the MCP connector, containers and URL
+    /// sources make the provider fetch from or send to hosts the zone never allowed. A messages call
+    /// must say its `max_tokens`, which is reserved, lowered to what is left of the output budget if
+    /// it asks for more (#113). The caller settles `reserved`.
     pub(crate) fn filter(
         &self,
         spec: Option<&wicket_core::manifest::LlmSpec>,
@@ -355,7 +346,7 @@ impl Llm {
             if !body.is_empty() {
                 return Err(refuse(400, format!("a {} request with a body", parts.method)));
             }
-            return Ok(Filtered { body, model: None, note: "ok".into(), want: 0 });
+            return Ok(Filtered { body, model: None, note: "ok".into(), reserved: 0 });
         }
         if parts.method != http::Method::POST || !MODEL_ENDPOINTS.contains(&path) {
             return Err(refuse(
@@ -388,22 +379,44 @@ impl Llm {
                 }
             }
         }
-        let mut want = 0;
-        if let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) {
-            want = asked;
+        // URL sources (images, documents) are fetched by the provider: a way around the egress proxy.
+        if !server_ok && has_url_source(&serde_json::Value::Object(json.clone())) {
+            return Err(refuse(403, "a content block with a URL source, which the provider would fetch (send the content itself)".into()));
+        }
+        // The call's output is reserved up front (#113), here, so the amount reserved is the amount
+        // the body asks for: one asking for more than is left is lowered to what is left, and
+        // parallel calls can't each claim the same tokens.
+        let mut reserved = 0;
+        if path == "/v1/messages" {
+            let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) else {
+                return Err(refuse(400, "a messages request without an integer max_tokens".into()));
+            };
             if let Some(spec) = spec {
-                let left = spec.max_output_tokens.saturating_sub(self.output_committed());
-                if asked > left && left > 0 {
-                    json.insert("max_tokens".into(), left.into());
-                    notes.push(format!("max_tokens {asked} lowered to the {left} output tokens left"));
+                let Some(r) = self.reserve_output(spec.max_output_tokens, asked) else {
+                    self.event(model.clone(), 429, Usage::default(), "budget: output token cap reached");
+                    return Err(Box::new(problem(
+                        429,
+                        "budget",
+                        "Model token budget exhausted",
+                        &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                        None,
+                    )));
+                };
+                if r < asked {
+                    json.insert("max_tokens".into(), r.into());
+                    notes.push(format!("max_tokens {asked} lowered to the {r} output tokens left"));
                 }
+                reserved = r;
             }
         }
         let body = match serde_json::to_vec(&json) {
             Ok(b) => Bytes::from(b),
-            Err(e) => return Err(refuse(400, format!("the model request body can't be re-encoded ({e})"))),
+            Err(e) => {
+                self.settle(reserved, Usage::default(), true);
+                return Err(refuse(400, format!("the model request body can't be re-encoded ({e})")));
+            }
         };
-        Ok(Filtered { body, model, note: if notes.is_empty() { "ok".into() } else { notes.join("; ") }, want })
+        Ok(Filtered { body, model, note: if notes.is_empty() { "ok".into() } else { notes.join("; ") }, reserved })
     }
 
     /// A wrapped session's model call, which reaches the model host through the egress proxy (its
@@ -437,22 +450,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return *r,
         };
-        let reserved = match spec {
-            None => 0,
-            Some(s) => match self.reserve_output(s.max_output_tokens, f.want) {
-                Some(r) => r,
-                None => {
-                    self.event(f.model, 429, Usage::default(), "budget: output token cap reached");
-                    return problem(
-                        429,
-                        "budget",
-                        "Model token budget exhausted",
-                        &format!("{} may generate at most {} output tokens", self.whose(), s.max_output_tokens),
-                        None,
-                    );
-                }
-            },
-        };
+        let reserved = f.reserved;
         let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
         match egress.forward(req, host, "https", pq, via).await {
             Ok(resp) => {
@@ -599,8 +597,19 @@ pub(crate) struct Filtered {
     pub body: Bytes,
     pub model: Option<String>,
     pub note: String,
-    /// Output tokens it asks for (`max_tokens`).
-    pub want: u64,
+    /// Output tokens reserved for it (its `max_tokens`, or what was left): to be settled.
+    pub reserved: u64,
+}
+
+/// Whether any content block (at any depth: messages, system, tool results) has a URL source.
+fn has_url_source(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(o) => {
+            o.get("source").and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("url") || o.values().any(has_url_source)
+        }
+        serde_json::Value::Array(a) => a.iter().any(has_url_source),
+        _ => false,
+    }
 }
 
 /// Reads token usage from a response as it streams past, in constant memory: each chunk is scanned
@@ -742,7 +751,7 @@ mod tests {
         tokio::spawn(conn);
         let req = http::Request::post("/v1/messages")
             .header("host", "wicket.internal")
-            .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"max_tokens":1,"messages":[]}"#)))
             .unwrap();
         let resp = send.send_request(req).await.unwrap();
         let status = resp.status().as_u16();
@@ -833,7 +842,7 @@ mod tests {
     }
 
     /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing
-    /// `pause` before the last one, then ends cleanly. It records each request it got.
+    /// `pause` before each of the last two, then ends cleanly. It records each request it got.
     async fn sse_upstream(chunks: Vec<Vec<u8>>, pause: std::time::Duration) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -862,7 +871,7 @@ mod tests {
                     let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await;
                     let last = chunks.len().saturating_sub(1);
                     for (i, ch) in chunks.iter().enumerate() {
-                        if i == last {
+                        if i > 0 && i + 1 >= last {
                             tokio::time::sleep(pause).await;
                         }
                         if c.write_all(format!("{:x}\r\n", ch.len()).as_bytes()).await.is_err()
@@ -1013,6 +1022,36 @@ mod tests {
         assert_eq!(call(llm.clone(), "unsettled3", ASK, true).await, 429);
         assert_eq!(seen.lock().await.len(), n);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #113: the amount a call reserves is the amount its body asks for, so a call made while
+    /// another holds part of the budget goes upstream lowered to what is left; a messages call that
+    /// doesn't say how much it may generate isn't sent.
+    #[test]
+    fn a_call_asks_upstream_for_no_more_than_it_reserved() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        let parts = || http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let ask = |n: &str| bytes::Bytes::from(format!(r#"{{"model":"m","max_tokens":{n},"messages":[]}}"#));
+        let first = llm.filter(Some(&spec), &parts(), ask("60")).ok().unwrap();
+        assert_eq!(first.reserved, 60);
+        let second = llm.filter(Some(&spec), &parts(), ask("60")).ok().unwrap();
+        assert_eq!(second.reserved, 40);
+        let out: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(out["max_tokens"], 40);
+        assert_eq!(llm.filter(Some(&spec), &parts(), ask("1")).err().map(|r| r.status().as_u16()), Some(429));
+        llm.settle(60, Usage::default(), true);
+        for bad in
+            [r#"{"messages":[]}"#, r#"{"max_tokens":64000.0,"messages":[]}"#, r#"{"max_tokens":"9","messages":[]}"#, r#"{"max_tokens":-1}"#]
+        {
+            let r = llm.filter(Some(&spec), &parts(), bytes::Bytes::from(bad));
+            assert_eq!(r.err().map(|r| r.status().as_u16()), Some(400), "{bad}");
+        }
+        // A URL source is a fetch by the provider.
+        let url = r#"{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"url","url":"https://evil.example/x.png"}}]}]}]}"#;
+        assert_eq!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(url)).err().map(|r| r.status().as_u16()), Some(403));
+        let b64 = r#"{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}]}"#;
+        assert!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(b64)).is_ok());
     }
 
     /// #113: parallel calls reserve from what is left, so together they can't overshoot.
