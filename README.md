@@ -78,9 +78,9 @@ Who may do what:
 
 The commands in the rest of this README are written for development mode. On an installed host, prefix the
 privileged ones with `sudo`: `approve`, `deny`, `secret set|link`, `node …`, `place …`, `reconcile`, `reap`,
-`image`, `identity init`, `secret hosts` and `operator enrol-link|reset|revoke-session`. The release archive holds the
-binary, `deploy/` and `images/`, so the examples and the `docs/` pages are in the repository, not the
-archive.
+`image`, `identity init`, `secret hosts` and `operator enrol-link|reset|revoke-session`. The release archive
+holds the binary, `deploy/` and `images/`, so the examples and the `docs/` pages are in the repository, not
+the archive.
 
 ### Development mode
 
