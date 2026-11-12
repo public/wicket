@@ -17,6 +17,7 @@ members = [
     "crates/wicket-placement",
     "crates/wicket-fwd",
     "crates/wicket-policy",
+    "crates/wicket-policy-diff",
 ]
 
 [workspace.package]

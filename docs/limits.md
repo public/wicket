@@ -88,6 +88,12 @@ not a permanent decision.
   tested against wicket's own matcher and the fork's general engine (about 74,000 differential decisions;
   [#83](https://github.com/public/wicket/pull/83), [#102](https://github.com/public/wicket/pull/102)). No
   one outside the project has reviewed the patches or the structural check.
+- **The Cedar compiler is in the trusted computing base** (#51). Org and zone policies compile to
+  token checks only within a fragment of Cedar (docs/policy.md); the compiler is differentially
+  tested against Cedar's own evaluation (about 12,500 decisions over generated policies and requests in
+  CI), not proven. A policy change reaches running boxes only when `wicket policy apply` revokes them
+  (or at their token's end, with `--keep-runs`). SymCC treats path globs as opaque, so a changed glob
+  reads as "may widen".
 - **Spawn chains aren't used on nodes yet.** A child run on a node gets its own block 0 from its zone
   (checked as a subset by `spawn`), not a spawn block appended to its parent's token. So revoking a
   parent's block on a node doesn't by itself revoke a child there; the run revocation does

@@ -522,3 +522,24 @@ fn nodes_dont_depend_on_cedar() {
         assert!(seen.len() > 3, "{root}: the lock file was read ({} crates)", seen.len());
     }
 }
+
+/// The example org policy (docs/policy.md) compiles, and does what the docs say.
+#[test]
+fn the_example_org_policy_compiles_as_documented() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/policy");
+    let p = OrgPolicy::parse(
+        &std::fs::read_to_string(format!("{dir}/org.cedar")).unwrap(),
+        &std::fs::read_to_string(format!("{dir}/org-entities.json")).unwrap(),
+    )
+    .unwrap();
+    let dev =
+        MintCtx { zone: "dev-api".into(), tenant: TENANT.into(), principal: "human:alex".into(), depth: 0, groups: p.groups_of("dev-api") };
+    let other = MintCtx { zone: "ops".into(), groups: p.groups_of("ops"), ..dev.clone() };
+    let (ld, lo) = (p.layer(&dev).unwrap(), p.layer(&other).unwrap());
+    // HTTP isn't narrowed beyond the forbids; a dev zone has one forbid more.
+    assert_eq!((ld.http.as_ref(), lo.http.as_ref()), (None, None));
+    assert_eq!(ld.forbid.len(), lo.forbid.len() + 1);
+    // Spawns: gVisor, under 2 GiB.
+    let s = &ld.spawn.as_ref().unwrap()[0];
+    assert_eq!((s.min_isolation, s.max_mem_bytes), (Some(2), Some(2 << 30)));
+}
