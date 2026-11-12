@@ -438,10 +438,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         capacity,
     };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
+    let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
     let gateway = Gateway::new(ctx.clone());
     let (es, ls, gs) = (dir.join("sock/egress.sock"), dir.join("sock/llm.sock"), dir.join("sock/gateway.sock"));
+    // HTTP/3 and DNS (#92): the box's UDP forwarder connects here. A box on a remote node reaches
+    // the run over SSH-forwarded sockets, which carry streams only: it gets the stream variant.
+    let (us, us_stream) = (dir.join("sock/udp.sock"), dir.join("sock/udp-stream.sock"));
+    let u_task = tokio::spawn({
+        let (h3, us) = (h3.clone(), us.clone());
+        async move { h3.serve(&us).await }
+    });
+    let us_task = (node.is_some() && !served).then(|| {
+        let (h3, p) = (h3.clone(), us_stream.clone());
+        tokio::spawn(async move { h3.serve_stream(&p).await })
+    });
     let g_task = tokio::spawn({
         let gs = gs.clone();
         async move { gateway.serve(&gs).await }
@@ -456,7 +468,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         async move { llm.serve(&ls).await }
     });
     for _ in 0..50 {
-        if es.exists() && ls.exists() && gs.exists() {
+        if es.exists() && ls.exists() && gs.exists() && us.exists() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -491,6 +503,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     (format!("{rd}/sock/egress.sock"), es.as_path()),
                     (format!("{rd}/sock/llm.sock"), ls.as_path()),
                     (format!("{rd}/sock/gateway.sock"), gs.as_path()),
+                    (format!("{rd}/sock/udp.sock"), us_stream.as_path()),
                 ])
                 .await?;
             let user = n.sh("echo $(id -u):$(id -g)").await?;
@@ -880,6 +893,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     e_task.abort();
     l_task.abort();
     g_task.abort();
+    u_task.abort();
+    if let Some(t) = &us_task {
+        t.abort();
+    }
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A served node sent it with
     // the exit.)

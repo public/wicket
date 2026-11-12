@@ -22,7 +22,9 @@
 //!   110 µs of CPU in the box, so throughput is bound by datagrams, not bytes (#92's measurements:
 //!   40–100 Mbit/s at the usual 1452-byte MTU, 430–460 Mbit/s with path MTU discovery allowed up to
 //!   16000, for clients that advertise large datagrams). The default stays conservative (quinn's
-//!   1452 bound); [`Options::box_mtu`] raises it.
+//!   1452 bound); [`Options::box_mtu`] (`WICKET_H3_BOX_MTU=16000`) raises it. Bounds of 32000 and
+//!   up measured faster still (545–573 Mbit/s at 60000) but added ~60 ms to the first request on a
+//!   new connection, unexplained; 16000 is the value to use.
 //!
 //! On a remote node, hosts the node forwards to the control host (`decide::route`) aren't served
 //! over HTTP/3: their requests get a 403 that says to use the proxy (CONNECT), which forwards them.
@@ -73,6 +75,21 @@ pub struct Options {
     pub box_mtu: Option<u16>,
     /// QUIC idle timeout towards the box (at least 30 s).
     pub idle: Duration,
+}
+
+impl Options {
+    /// The defaults, with `WICKET_H3_BOX_MTU` (1200–65535; e.g. 16000) raising the box leg's MTU and
+    /// `WICKET_H3_HTTPS_RECORDS=0` turning HTTPS records off.
+    pub fn from_env() -> Options {
+        let mut o = Options::default();
+        if let Some(m) = std::env::var("WICKET_H3_BOX_MTU").ok().and_then(|v| v.parse::<u16>().ok()).filter(|m| *m >= 1200) {
+            o.box_mtu = Some(m);
+        }
+        if std::env::var("WICKET_H3_HTTPS_RECORDS").is_ok_and(|v| v == "0") {
+            o.https_records = false;
+        }
+        o
+    }
 }
 
 impl Default for Options {

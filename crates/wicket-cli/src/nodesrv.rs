@@ -714,8 +714,20 @@ async fn start_box(node: &Arc<Node>, bs: BoxStart) -> Result<()> {
     });
     let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
+    // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
+    // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
+    // the proxy, which forwards them.
+    let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
     let mut tasks = vec![];
+    tasks.push(tokio::spawn({
+        let us = sock.join("udp.sock");
+        async move {
+            if let Err(e) = h3.serve(&us).await {
+                eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
+            }
+        }
+    }));
     let es = sock.join("egress.sock");
     tasks.push(tokio::spawn({
         let es = es.clone();
