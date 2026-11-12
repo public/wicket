@@ -82,8 +82,8 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
      copies, and removes them from the host.
    - Nodes pin the same keys as before; tokens then carry the issuing key's certificate, which nodes
      check, by their own clock: past its end a box is refused everything, and a token that would
-     outlive it isn't minted. **Every node needs a build with #154 first**: an older node can't read
-     the new field and refuses the records that carry it.
+     outlive it isn't minted. (Nodes run the control host's own build: they refuse one running
+     another, so every node reads these tokens.)
    - Before `--days` run out, renew with `wicket keys certify --roots /media/usb/roots` (or
      `WICKET_ROOTS=…`). Runs warn in the last week. Installed, run it as the wicket user, which must
      be able to read the directory: `sudo -u wicket WICKET_HOME=/var/lib/wicket HOME=/var/lib/wicket
