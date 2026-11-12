@@ -1372,9 +1372,19 @@ fn print_event(ev: &Event) {
                 "unavailable" => "STALE  ",
                 _ => "BLOCKED",
             };
-            println!("[egress] {tag} {method} {host}{}  ({risk}; {detail})", wicket_agent::clip(path, 120));
+            // A node sends these events, and an agent chose the method, host and path: printed only
+            // stripped (#128), and the hint only for what is shaped like a request id (#121).
+            let clip = wicket_agent::clip;
+            println!(
+                "[egress] {tag} {} {}{}  ({}; {})",
+                clip(method, 16),
+                clip(host, 120),
+                clip(path, 120),
+                clip(risk, 24),
+                clip(detail, 240)
+            );
             if outcome == "pending" {
-                if let Some(id) = detail.split([' ', ':']).next() {
+                if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
@@ -1382,9 +1392,15 @@ fn print_event(ev: &Event) {
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
             println!(
-                "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({outcome})",
-                model.as_deref().unwrap_or("?")
+                "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
+                wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
+                wicket_agent::clip(outcome, 120)
             );
         }
     }
+}
+
+/// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).
+fn is_request_id(id: &str) -> bool {
+    id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
 }

@@ -652,6 +652,32 @@ pub fn verified_identity(l: &Ledger, run: &str, at: Option<i64>) -> serde_json::
     }
 }
 
+/// A request as `wicket pending` and `wicket approve` show it: wicket's own record, with every
+/// agent-written field (method, host, path, reason, attribution) stripped of terminal escapes,
+/// bidi and zero-width characters (#128).
+pub fn show_request(l: &Ledger, r: &wicket_store::Request) -> String {
+    let clip = wicket_agent::clip;
+    let age = wicket_store::now() - r.created_at;
+    let mut out = format!(
+        "{}  {} {}{}{}  [{}]  run {}  {}s ago{}\n    why: {}\n",
+        r.id,
+        clip(&r.method, 16),
+        clip(&r.host, 255),
+        clip(&r.path, 400),
+        if r.scope_prefix { "*  (every path under it)" } else { "" },
+        r.risk,
+        clip(&r.run, 64),
+        age,
+        if r.status == "pending" { String::new() } else { format!("  ({})", clip(&r.status, 16)) },
+        clip(&r.reason, 2000)
+    );
+    out.push_str(&format!("    agent: {}\n", clip(&identity_line(&verified_identity(l, &r.run, None)), 400)));
+    for a in &r.attribution {
+        out.push_str(&format!("    for: {}  (reported by the agent, unverified)\n", clip(&wicket_proxy::attribution_line(a), 240)));
+    }
+    out
+}
+
 /// One line for terminals.
 pub fn identity_line(v: &serde_json::Value) -> String {
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
@@ -844,26 +870,7 @@ async fn main() -> Result<()> {
                 println!("no pending requests");
             }
             for r in p {
-                let age = wicket_store::now() - r.created_at;
-                println!(
-                    "{}  {} {}{}{}  [{}]  run {}  {}s ago\n    why: {}",
-                    r.id,
-                    r.method,
-                    r.host,
-                    r.path,
-                    if r.scope_prefix { "*  (every path under it)" } else { "" },
-                    r.risk,
-                    r.run,
-                    age,
-                    r.reason
-                );
-                println!("    agent: {}", identity_line(&verified_identity(&l, &r.run, None)));
-                for a in &r.attribution {
-                    println!(
-                        "    for: {}  (reported by the agent, unverified)",
-                        wicket_agent::clip(&wicket_proxy::attribution_line(a), 240)
-                    );
-                }
+                print!("{}", show_request(&l, &r));
             }
             Ok(())
         }
@@ -875,10 +882,8 @@ async fn main() -> Result<()> {
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
             let lease = capacity::lease_of_request(&req).map(String::from);
-            let gid = l.approve(
-                &id,
-                &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
-            )?;
+            let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
+            let gid = l.approve(&id, &a)?;
             // A grant exists only if its approval is on the record (fail closed).
             if let Err(e) = l.audit(
                 &TenantId::single(),
@@ -897,9 +902,9 @@ async fn main() -> Result<()> {
             }
             println!(
                 "approved {id} → grant {gid}: {} {}{} ({}, {})",
-                req.method,
-                req.host,
-                prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path),
+                wicket_agent::clip(&req.method, 16),
+                wicket_agent::clip(&req.host, 255),
+                wicket_agent::clip(&prefix.as_deref().map(|p| format!("{p}* [prefix]")).unwrap_or(req.path), 400),
                 if unlimited { "unlimited uses".into() } else { format!("{uses} use(s)") },
                 humantime::format_duration(ttl)
             );
