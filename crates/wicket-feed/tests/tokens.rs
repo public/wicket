@@ -179,7 +179,14 @@ fn token_decisions_match_compiled_zones_fresh_and_offline() {
         }
     }
     println!("token vs CompiledZone on {} zones: {counts:?}", boxes.len());
-    for k in [("fresh", "allow"), ("fresh", "forbidden"), ("fresh", "needs-grant"), ("offline", "allow"), ("offline", "forbidden"), ("offline", "needs-grant")] {
+    for k in [
+        ("fresh", "allow"),
+        ("fresh", "forbidden"),
+        ("fresh", "needs-grant"),
+        ("offline", "allow"),
+        ("offline", "forbidden"),
+        ("offline", "needs-grant"),
+    ] {
         assert!(counts.get(&k).copied().unwrap_or(0) > 500, "too few {k:?}: {counts:?}");
     }
     // A box's token decides only for its own zone and run.

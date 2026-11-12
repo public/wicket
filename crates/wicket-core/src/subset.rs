@@ -531,7 +531,8 @@ mod tests {
     #[test]
     fn authority_narrows() {
         let p = parent();
-        let child = |l: &str| zone(&format!("  llm: {{ max_requests: 10, max_output_tokens: 1000 }}\n  limits: {{ memory: 1g, cpus: 1, {l} }}\n"));
+        let child =
+            |l: &str| zone(&format!("  llm: {{ max_requests: 10, max_output_tokens: 1000 }}\n  limits: {{ memory: 1g, cpus: 1, {l} }}\n"));
         assert_eq!(check(&ask(&child("timeout: 10m")), &bounds(&p)), Ok(()));
         assert_eq!(check(&ask(&child("timeout: 10m, authority: 5m")), &bounds(&p)), Ok(()));
         assert_eq!(child("timeout: 10m, authority: 2h").limits.authority().unwrap(), std::time::Duration::from_secs(600));

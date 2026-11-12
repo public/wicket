@@ -689,7 +689,14 @@ mod tests {
             Frame::Msg(Msg::Challenge {
                 proof: wicket_identity::node::NodeProof { nonce: "B".repeat(43), cert: "a.b.c".into(), proof: "d.e.f".into() },
             }),
-            Frame::Msg(Msg::Ask { id: 7, run: "run_a".into(), op: Box::new(op), why: "out of reach".into(), who: None, queued: Some(("q-1".into(), 5)) }),
+            Frame::Msg(Msg::Ask {
+                id: 7,
+                run: "run_a".into(),
+                op: Box::new(op),
+                why: "out of reach".into(),
+                who: None,
+                queued: Some(("q-1".into(), 5)),
+            }),
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),
                 build: "x".into(),

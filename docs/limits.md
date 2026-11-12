@@ -124,23 +124,26 @@ not a permanent decision.
   their decrypted traffic, and can send any request to hosts within its CA's name constraints,
   ignoring the zone's reach, until the CA expires (24 h by default). Enrol nodes with `--hosts` as narrow
   as their boxes need.
-- **A node holds the secrets of the runs it serves** (#152). The model credential (the Claude login's
-  current access token: never the refresh token, never an API key) and each injected secret a run's zone
-  names are leased to the run's node and sealed there at rest. Sealing protects the node's *disk* (a
-  copied data directory, a backup, another local user): a secret on disk opens only with the node's own
-  key. It doesn't protect against **root on the node**, which reads the node key and so every secret
-  leased to it, and can use them for anything until they expire: the Claude subscription (at the
-  owner's quota and reputational risk) until the access token's upstream expiry, wicket's own expiry
-  (the run's authority) notwithstanding, since wicket can't revoke a subscription token short of signing
-  the login out; each injected secret until it is rotated upstream. On such a node the model proxy's
-  checks (models, server tools, the budget and its slice) and the reach rules are advisory: a rooted node
-  can call the upstream directly. Budget slices bound an honest node offline; only a credential's own
-  lifetime bounds a compromised one.
+- **A node holds the secrets its runs have used** (#152), in `node serve`'s memory: the model credential
+  (the Claude login's current access token: never the refresh token, never an API key) and each injected
+  secret a run used there. A stolen disk, a backup or a VM snapshot of a node gets none of them: they are
+  never written to disk (only a sealed memfd carries them across a self-update's re-exec). **Root on a
+  running node can still read the process's memory**, and so every secret held there, and use them for
+  anything until they expire: the Claude subscription (at the owner's quota and reputational risk) until
+  the access token's upstream expiry, whatever wicket's own expiry says, since wicket can't revoke a
+  subscription token short of signing the login out; each injected secret until it is rotated upstream.
+  Swap, core dumps and other users' `ptrace` are kept out (locked memory, a non-dumpable process), but a
+  hibernating VM's memory image isn't. The channel frames that carry a secret aren't zeroed. On a rooted
+  node the model proxy's checks (models, server tools, the budget and its slice) and the reach rules are
+  advisory: it can call the upstream directly. Budget slices bound an honest node offline; only a
+  credential's own lifetime bounds a compromised one.
 - **A node works alone for as long as its grants last** (#153), and so does a node cut off on purpose.
   Revoking a grant, a run or a node reaches a connected node within seconds; a node that hears nothing
   keeps what it holds until it expires: the box's authority (`limits.authority`, default the run's
-  timeout), each grant's TTL (at most 24 h), each leased secret (the run's authority, or its upstream
-  expiry if earlier). Then it stops the box. The node certificate and node CA (24 h, renewed over the
+  timeout, plus 30 s), each grant's TTL (at most 24 h), each secret it fetched (the run's authority, or
+  its upstream expiry if earlier). Then it stops the box. A secret first needed while it is cut off isn't
+  there: that request fails until the control host is back, and a restart of `serve` while cut off
+  empties the cache. The node certificate and node CA (24 h, renewed over the
   channel or with `wicket node renew-ca`) and the feed key's certificate (7 days) cap how long a node can
   work alone, and reconnect, without an operator. Model calls offline end at the earlier of the run's
   authority and the access token's upstream expiry (a few hours, observed; not documented), and at the

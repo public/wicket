@@ -6,7 +6,7 @@ Reference for running boxes on other machines. The README has the short version;
 
 `wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`).
 On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress, its model
-calls and its injected credentials locally, from a signed policy feed and the secrets leased to it, so the
+calls and its injected credentials locally, from a signed policy feed and the secrets it fetched, so the
 box keeps working while the control host is unreachable, for exactly as long as its grants last (#57, #152,
 #153; below). The ledger, the keys that matter and the MCP gateway's tools stay on the control host, which
 issues authority (tokens, grants, leases, secrets), takes human approvals, and reconciles counts and audit
@@ -113,7 +113,7 @@ wicket node revoke n1
   timeout is still counted from when it started. A box whose run has no authority in the feed any more is
   stopped. Exited boxes are kept until their exit is read, then removed.
 - **A node works on its grants** (#153). A box's authority is its token in the feed, and every part of it
-  has a lifetime: block 0 lasts the zone's `limits.authority` (default: the run's `timeout`), counted from
+  has a lifetime: block 0 lasts the zone's `limits.authority` (default: the run's `timeout`, plus 30 s), counted from
   the run's start (a re-attach doesn't extend it); each grant lasts its `--ttl` (at most 24 h). The node
   works for the box, connected or not, for exactly as long as these are valid, and **stops the box when
   its authority expires**, whether or not it can reach the control host: the workload's grants decide, not
@@ -121,26 +121,36 @@ wicket node revoke n1
   box says when its authority ends (`authority_until`). A run on a node that can't be reached is ended by
   `wicket reconcile` only past its timeout plus 3 minutes, so nothing replaces a box its node may still be
   running.
-- **Secrets and budget slices are leased to the node** (#152). For each run the control host leases its
-  node the secrets the run's zone names (its model credential, `llm.secret`, and the secrets of its
-  `inject` rules) that the vault holds, with their host bindings, and a slice of the run's model budget.
-  The Claude login goes as its current **access token only**: the refresh token and refreshing stay on the
-  control host. The lease is sent on every connect and again within 2 s of any change (a refreshed token, a
-  secret removed or rebound, a renewed slice), and replaces the run's whole set, so a secret the control
-  host stops leasing is deleted from a connected node within seconds. Each secret is **sealed to the
-  node** at rest (`secrets/`, 0700): AES-256-GCM under the node's secrets key, bound to node, run, name,
-  hosts and expiries; the node's secrets key is derived on the control host and wrapped to the node's own
-  key (X25519 from its Ed25519 node key, HKDF-SHA256, AES-256-GCM, as age's `ssh-ed25519` recipients
-  do). The node opens a secret in memory at each use, never past the run's authority or the upstream
-  token's own expiry, whichever is first, deletes expired ones, and drops all of a run's when its box
-  ends. What this protects, and what it doesn't: [limits.md](limits.md).
+- **Secrets come to a node only when used, and stay in its memory** (#152). A secret reaches a node only
+  when one of its runs first needs it: the run's model credential (`llm.secret`) on its first model call,
+  an `inject` rule's secret on the first request to its host. The node asks over that run's own
+  connection; the control host releases it only if the run's zone uses it, the vault holds it and its
+  host binding covers the hosts the zone uses it for, and audits the release (`node.secret_fetch`). It is
+  never prefetched, and never sent for another run, zone or node. The Claude login goes as its current
+  **access token only**: the refresh token and refreshing stay on the control host. The node keeps each
+  secret in `serve`'s memory only, never on disk, encrypted or not: locked against swap, zeroed when
+  dropped, the process not dumpable (`PR_SET_DUMPABLE` 0), never logged. A run's use of a secret lasts
+  until its authority ends, or the upstream token's own expiry if earlier; the node drops a secret when
+  the last run that used it ends, and when the control host says it changed, was rebound or removed
+  (checked every 2 s while connected; the next use fetches it again). While the node is cut off, the
+  secrets it holds keep working; one first needed then fails with "credential … not cached on this node;
+  control host unreachable" (audited as `node.secret_unavailable`) until the control host is back. A
+  restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,
+  while plain egress the token allows goes on. A self-update's re-exec (`wicket self update`, #162) hands
+  the cache to the new process through a sealed memfd, never a file. What this protects, and what it
+  doesn't: [limits.md](limits.md).
+- **Budget slices are leased to the node** (#152), per run: a quarter of the zone's model budget by
+  default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while connected once less
+  than half of it is left, and lowered at once when what is left shrinks (a spawn's carve-out). Offline, a
+  node spends what is left of its slice and nothing more; a slice is kept on the node's disk
+  (`slices/`), so a restart doesn't hand an offline node a fresh one.
 - **Lifetimes** (#153). Everything a node holds that carries authority ends on its own:
 
   | what | lasts | set by |
   |---|---|---|
-  | a box's base authority (its token's block 0) | the run's timeout, from the run's start | zone `limits.authority` (never longer than `limits.timeout`; a child's never longer than its parent's) |
+  | a box's base authority (its token's block 0) | the run's timeout plus 30 s (so the timeout itself ends the run), from the run's start | zone `limits.authority` (never longer than `limits.timeout`; a child's never longer than its parent's) |
   | a grant | its TTL, at most 24 h | `wicket approve --ttl` (default 10 min) |
-  | a leased secret | the box's authority, or the upstream token's own expiry if earlier | the zone; the upstream |
+  | a run's use of a secret its node fetched | the box's authority, or the upstream token's own expiry if earlier | the zone; the upstream |
   | a budget slice | until spent, renewed while connected | `WICKET_NODE_BUDGET_SLICE` on the control host (fraction, default 0.25) |
   | an agent identity | 10 min, re-issued every 5 by the run's supervisor | `WICKET_IDENTITY_TTL` |
   | the node's certificate and node CA | 24 h, renewed over the channel at half-life, or by `renew-ca` | `enrol --cert-ttl`, `--ca-ttl` |
@@ -151,14 +161,14 @@ wicket node revoke n1
   Links and exposed ports have no clock of their own: they end with either run.
 - **The model proxy runs on the node** (#151, #152), per box, and decides there: routes, models, server
   tools, the budget (starting from what the run already spent) and the node's **budget slice**. With the
-  model credential leased to the node it calls the model itself (no round trip to the control host),
+  model credential in its cache it calls the model itself (no round trip to the control host),
   counts the call, keeps its count beside the box (`node-spend.json`, so a restarted `serve` doesn't reset
   it) and reports it; the run's own counters on the control host take the node's totals, so spawn
   carve-outs, a long-lived agent's budget and the console see what the node spent. A slice is a quarter of
   the zone's budget by default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while
   connected once less than half of it is left: offline, a node spends what is left of its slice and nothing
-  more. Without the credential (the vault doesn't hold it), the call is relayed to the run's own proxy on
-  the control host as in #151, which adds the credential and counts it there.
+  more. With a control host on protocol 1 (#162's skew), the call is relayed to the run's own proxy there
+  as in #151, which adds the credential and counts it.
 - **The MCP gateway runs on the node** (#151), relaying each call whole to the run's gateway on the control
   host, which decides every tool (they read or write the ledger); while the control host can't be reached
   the node answers MCP's own handshake (`initialize`, `ping`) and refuses each tool call with a clear,
@@ -184,8 +194,8 @@ wicket node revoke n1
 - **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
   the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
   the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
-  it with the run CA), for: hosts with an `inject` rule whose secret isn't leased to the node (one it holds is terminated and
-  injected there, #152), hosts with a credential swap,
+  it with the run CA), for: hosts with a credential swap (an `inject` rule's host is terminated and injected on the node, its
+  secret fetched on first use, #152, unless the control host speaks protocol 1),
   hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
   every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.

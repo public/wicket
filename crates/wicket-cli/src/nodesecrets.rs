@@ -141,12 +141,15 @@ struct Entry {
 /// How a node fetches a secret for a run: over the run's own connection to its control host.
 pub type Fetcher = Arc<dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Result<Fetched, String>> + Send + Sync>;
 
+/// One fetch in flight for a run and a secret.
+type Inflight = Arc<tokio::sync::Mutex<()>>;
+
 /// The node's secret cache: in this process's memory only.
 pub struct Cache {
     entries: Mutex<HashMap<String, Entry>>,
     clock: wicket_proxy::decide::Clock,
     /// One fetch at a time per run and secret: concurrent first uses share it.
-    inflight: Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    inflight: Mutex<HashMap<(String, String), Inflight>>,
 }
 
 /// Where a self-update's re-exec finds the cache handed over (#162): a sealed memfd's descriptor.
@@ -170,11 +173,7 @@ impl Drop for Handed {
 
 impl Cache {
     pub fn new(clock: wicket_proxy::decide::Clock) -> Arc<Cache> {
-        Arc::new(Cache {
-            entries: Mutex::new(HashMap::new()),
-            clock,
-            inflight: Mutex::new(HashMap::new()),
-        })
+        Arc::new(Cache { entries: Mutex::new(HashMap::new()), clock, inflight: Mutex::new(HashMap::new()) })
     }
 
     /// Keeps this process's memory out of core dumps and `ptrace` attach by other processes of the
@@ -246,7 +245,6 @@ impl Cache {
         v
     }
 
-
     /// Run `run`'s view, for its proxies' vault, fetching through `fetch` on first use.
     pub fn source(self: &Arc<Self>, run: &str, fetch: Fetcher) -> Arc<dyn wicket_proxy::vault::SecretSource> {
         Arc::new(RunSecrets { cache: self.clone(), run: run.into(), fetch })
@@ -262,7 +260,13 @@ impl Cache {
             .expect("cache")
             .iter()
             .map(|(n, e)| {
-                Ok(Handed { name: n.clone(), value: e.value.text()?, hosts: e.hosts.clone(), upstream_expiry: e.upstream_expiry, users: e.users.clone() })
+                Ok(Handed {
+                    name: n.clone(),
+                    value: e.value.text()?,
+                    hosts: e.hosts.clone(),
+                    upstream_expiry: e.upstream_expiry,
+                    users: e.users.clone(),
+                })
             })
             .collect::<Result<_>>()?;
         let mut bytes = serde_json::to_vec(&handed)?;
@@ -449,17 +453,18 @@ impl Asks {
         let _ = write_atomic(&self.file, &serde_json::to_vec(held).unwrap_or_default());
     }
 
-    /// Queues an ask (or finds the one already queued for the same run and op): its id.
-    pub fn push(&self, run: &str, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>, at: i64) -> String {
+    /// Queues an ask (or finds the one already queued for the same run and op): its id, and
+    /// whether it is new.
+    pub fn push(&self, run: &str, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>, at: i64) -> (String, bool) {
         let mut held = self.held.lock().expect("asks");
         let digest = hex::encode(op.digest());
         if let Some(q) = held.values().find(|q| q.run == run && hex::encode(q.op.digest()) == digest) {
-            return q.id.clone();
+            return (q.id.clone(), false);
         }
         let id = format!("q-{}", &digest[..12]);
         held.insert(id.clone(), QueuedAsk { id: id.clone(), run: run.into(), op: op.clone(), why: why.into(), who: who.cloned(), at });
         self.save(&held);
-        id
+        (id, true)
     }
 
     /// The queued asks of `run`.
@@ -638,8 +643,9 @@ mod tests {
         let d = tmp("asks");
         let op = wicket_core::Op::egress(&wicket_core::TenantId::single(), &wicket_core::RunId(RA.into()), "z", "GET", "x.example", "/a");
         let a = Asks::open(&d);
-        let id = a.push(RA, &op, "out of reach", None, 5);
-        assert_eq!(a.push(RA, &op, "out of reach", None, 9), id, "deduplicated");
+        let (id, new) = a.push(RA, &op, "out of reach", None, 5);
+        assert!(new);
+        assert_eq!(a.push(RA, &op, "out of reach", None, 9), (id.clone(), false), "deduplicated");
         let a = Asks::open(&d);
         assert_eq!(a.of(RA).len(), 1);
         assert_eq!(a.of(RA)[0].at, 5, "keeps its original time");

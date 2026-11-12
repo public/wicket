@@ -137,8 +137,9 @@ certifies. The node decides from its verified replica of the feed:
 So a box on a node keeps working while the control host is unreachable, for exactly as long as its
 grants last: every grant has a lifetime, the box's own authority (its token's block 0, the zone's
 `limits.authority`, by default the run's timeout) included, and the node stops the box when that ends.
-The node also holds the run's secrets (its model credential and injected secrets) sealed to it, and a
-slice of its model budget, so model calls go on too ([nodes.md](nodes.md)). Revocations are pushed to the
+The node also keeps, in memory only, the secrets its runs have used (their model credential and
+injected secrets, fetched on first use) and a slice of each run's model budget, so model calls go on
+too ([nodes.md](nodes.md)). Revocations are pushed to the
 node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node that hears nothing
 keeps what it holds until it expires. Tampered, replayed and rolled-back frames are refused.
 

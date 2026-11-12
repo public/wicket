@@ -533,20 +533,21 @@ limits.md.
    that nothing new is leased, spawned or approved and asks are queued; a node that knows it is behind
    (lagging) refuses until it catches up.
 2. **Model calls continue offline: the Claude access token may be on the node.** Not opt-in per zone: the
-   token's access part is leased to the node of every run whose zone uses it, sealed to the node, and
-   never the refresh token. Using the subscription token through per-node proxies is fine (item 5 below).
+   token's access part goes to the node of a run that uses it, on its first use, and never the refresh
+   token. Using the subscription token through per-node proxies is fine (item 5 below).
    Budgets are leased to nodes in slices (§3.3), part of the run's lease. *As built,* with Alex's later
    rule that authorization decisions happen at the edge of the sandbox: with the credential on the node,
    the node's model proxy decides and calls the model itself, with no per-call relay to the control host
    (§3.1's relay re-enforcement is not built for that path); the control host reconciles the node's spend
    afterwards.
-3. **Secrets are cached on nodes, encrypted at rest.** Every secret a run's zone names (model credential,
-   injected secrets) goes to its node, sealed to the node: a per-node key derived on the control host and
-   wrapped to the node's key. *Deviation:* the wrapping uses X25519 from the node's existing Ed25519 key
-   (age's `ssh-ed25519` construction, domain-separated with HKDF) instead of a separate X25519 key
-   certified at enrolment (§3.2), so no enrolment change is needed; it is not HPKE. Leases are on the
-   node's disk (sealed), not in memory only, so a node keeps working through a restart of its `serve`
-   while offline. Revocation removes them when connected; expiry ends their use when not.
+3. **Secrets are cached on nodes**, at first **encrypted at rest**; then (the owner, later the same day)
+   **in memory only, and only the ones a run needed**: a node fetches a secret over a run's own
+   connection on that run's first use of it, the control host checks it against the run's zone and the
+   secret's host binding and audits it, and the node keeps it in locked, zeroized memory (the process
+   not dumpable), never on disk, dropping it when its last user ends or it expires. A restart of `serve`
+   while cut off loses the cache; a self-update's re-exec hands it over in a sealed memfd. Not HPKE and no
+   node encryption key: §3.2's sealed, certified-key leases aren't built. Revocation removes them when
+   connected; expiry ends their use when not.
 4. **When a workload's grants expire, its boxes stop.** The workload's grants decide this, not the node
    (no node-wide setting; #151's `WICKET_NODE_LEASE_EXPIRY` is gone). Asks raised offline are queued on the
    node and delivered on reconnect, with their age; there are no approvals on the node alone.

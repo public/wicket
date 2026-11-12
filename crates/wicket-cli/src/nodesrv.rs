@@ -414,7 +414,14 @@ impl ControlLink for Control {
             self.0.asks.lock().expect("asks").insert(id, tx);
             let sent = self.0.send_run(
                 &self.1,
-                Frame::Msg(Msg::Ask { id, run: self.1.clone(), op: Box::new(op.clone()), why: why.into(), who: who.cloned(), queued: None }),
+                Frame::Msg(Msg::Ask {
+                    id,
+                    run: self.1.clone(),
+                    op: Box::new(op.clone()),
+                    why: why.into(),
+                    who: who.cloned(),
+                    queued: None,
+                }),
             );
             let reply = match sent {
                 true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
@@ -433,8 +440,14 @@ impl ControlLink for Control {
     /// Queued on this node's disk (#153) and raised, with its original time, when the run's
     /// control connection is back.
     fn queue(&self, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>) -> std::result::Result<String, String> {
-        let id = self.0.queue.push(&self.1, op, why, who, (self.0.clock)());
-        self.0.audit_note(&self.1, "node.ask_queued", serde_json::json!({ "id": id, "host": op.host, "method": op.method, "path": op.path }));
+        let (id, new) = self.0.queue.push(&self.1, op, why, who, (self.0.clock)());
+        if new {
+            self.0.audit_note(
+                &self.1,
+                "node.ask_queued",
+                serde_json::json!({ "id": id, "host": op.host, "method": op.method, "path": op.path }),
+            );
+        }
         Ok(id)
     }
 }
@@ -599,18 +612,33 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+            // Stopped once each: the kill is in flight until the box's exit is read.
+            let mut stopped: std::collections::HashSet<String> = std::collections::HashSet::new();
             loop {
                 t.tick().await;
                 let now = (n.clock)();
-                let running: Vec<(String, String)> =
-                    n.boxes.lock().expect("boxes").iter().filter(|(_, b)| b.exited.is_none()).map(|(r, b)| (r.clone(), b.name.clone())).collect();
+                let running: Vec<(String, String)> = n
+                    .boxes
+                    .lock()
+                    .expect("boxes")
+                    .iter()
+                    .filter(|(_, b)| b.exited.is_none())
+                    .map(|(r, b)| (r.clone(), b.name.clone()))
+                    .collect();
                 let expired: Vec<(String, String, i64)> = {
                     let r = n.replica.lock().expect("replica");
-                    running.into_iter().filter_map(|(run, name)| r.authority_until(&run).filter(|u| *u <= now).map(|u| (run, name, u))).collect()
+                    running
+                        .into_iter()
+                        .filter_map(|(run, name)| r.authority_until(&run).filter(|u| *u <= now).map(|u| (run, name, u)))
+                        .collect()
                 };
                 // Secrets past their expiry are dropped (#152); their use already ended.
                 n.secrets.sweep();
+                stopped.retain(|r| n.boxes.lock().expect("boxes").get(r).is_some_and(|b| b.exited.is_none()));
                 for (run, name, until) in expired {
+                    if !stopped.insert(run.clone()) {
+                        continue;
+                    }
                     eprintln!("[node] {run}: its authority expired at {until} ms; stopping the box");
                     n.audit_note(&run, "node.authority_expired", serde_json::json!({ "until_ms": until }));
                     let _ = n.docker.unpause(&name).await;
@@ -2023,7 +2051,7 @@ async fn serve_box(
                 if now != last {
                     let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
                 }
-                if (now != last || i % 10 == 0) && n.proto_of(&run) >= chan::NODE_LEASES {
+                if (now != last || i.is_multiple_of(10)) && n.proto_of(&run) >= chan::NODE_LEASES {
                     n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
                 }
                 last = now;

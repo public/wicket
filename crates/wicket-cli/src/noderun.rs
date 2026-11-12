@@ -123,12 +123,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     let offline = crate::roots::offline();
     let margin = if offline { 0 } else { 86_400_000 };
     let cert_jws = match old {
-        Some((c, j))
-            if !new_generation
-                && c.kid == kid
-                && c.not_after > now + margin
-                && c.max_ttl_ms >= cfg.ttl_ms =>
-        {
+        Some((c, j)) if !new_generation && c.kid == kid && c.not_after > now + margin && c.max_ttl_ms >= cfg.ttl_ms => {
             if offline && c.not_after < now + 7 * 86_400_000 {
                 eprintln!(
                     "[wicket] node {name}'s feed certificate ends in under a week: renew it with `WICKET_ROOTS=<dir> wicket keys certify`"
@@ -938,9 +933,7 @@ async fn on_frame(
                     let _ = sh.events.send(ev);
                 }
             }
-            Msg::Ask { id, run, op, why, who, queued } => {
-                send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref())))
-            }
+            Msg::Ask { id, run, op, why, who, queued } => send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref()))),
             Msg::SecretFetch { id, run, name } => {
                 // Only for this run, over its own connection: another run's ask is refused.
                 let reply = match run == sh.run.0 {

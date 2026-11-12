@@ -949,11 +949,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
         }
         // The box's authority (#153): the zone's `limits.authority`, left over the run's (or the
-        // agent's) life. Unset, it is the node's own timeout backstop, which it never outlasts.
+        // agent's) life.
         let backstop = m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
             + if long_lived { 120 } else { 0 };
+        // Unset, it outlasts the timeouts by 30 s, so a run that times out ends by its timeout (its
+        // block 0 is minted before its box starts, a few seconds before the node's own clock starts).
         let authority_secs = match m.zone.limits.authority {
-            None => backstop,
+            None => backstop + 30,
             Some(_) => m.zone.limits.authority()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs().min(backstop),
         };
         let start = crate::chan::BoxStart {

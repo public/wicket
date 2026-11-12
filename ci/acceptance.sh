@@ -435,6 +435,10 @@ restart_flow() {
     case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"dev mock-llm"* | *"${nodehome:-/nonexistent}"*) continue ;; esac
     kill -9 "$p" 2>/dev/null && killed=$((killed + 1))
   done
+  # This host's node's `serve` is non-dumpable (#152): its environment can't be read, so it is found
+  # by its pid file.
+  p=$(head -1 "$WICKET_HOME/local-node/serve/serve.pid" 2>/dev/null || true)
+  if [ -n "$p" ] && tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q "node serve"; then kill -9 "$p" 2>/dev/null && killed=$((killed + 1)); fi
   echo "   killed $killed wicket processes"
   sleep 3
   for i in "${!runs[@]}"; do
@@ -461,6 +465,8 @@ restart_flow() {
     tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
     case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"node serve"*) kill -9 "$p" 2>/dev/null ;; esac
   done
+  p=$(head -1 "$WICKET_HOME/local-node/serve/serve.pid" 2>/dev/null || true)
+  if [ -n "$p" ] && tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q "node serve"; then kill -9 "$p" 2>/dev/null || true; fi
   if [ "$nodes" = local ] && [ -n "${node_serve_pid:-}" ]; then
     kill -9 "$node_serve_pid" 2>/dev/null || true
     sleep 1

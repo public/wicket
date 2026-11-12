@@ -1337,7 +1337,8 @@ mod tests {
     /// zone's budget on top of what was counted, never past what is left; the node's counts merge in.
     #[test]
     fn a_node_spends_its_slice_and_nothing_more() {
-        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 8, max_output_tokens: 1000}")).unwrap();
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_requests: 8, max_output_tokens: 1000}"))
+            .unwrap();
         assert_eq!(llm.next_slice(0.25), Some(super::Slice { requests: 2, output_tokens: 250, input_tokens: None }));
         llm.set_slice(llm.next_slice(0.25));
         let spec = llm.ctx.zone.llm.clone().unwrap();
@@ -1348,7 +1349,8 @@ mod tests {
         assert_eq!(r.headers()["x-wicket"], "budget");
         // Output is capped by the slice too, in flight included.
         let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
-        let f = llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":900,"messages":[]}"#)).ok().unwrap();
+        let f =
+            llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":900,"messages":[]}"#)).ok().unwrap();
         assert_eq!(f.reserved, 250);
         llm.settle(f.reserved, Usage { output: 250, ..Usage::default() }, true);
         // Renewed (connected): what was counted plus a quarter, never past the budget.

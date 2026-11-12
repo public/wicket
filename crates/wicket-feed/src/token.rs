@@ -226,48 +226,46 @@ impl Replica<BoxAuthority> {
     pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
         let found = match self.gate(op, now) {
             Err(d) => Found::Done(d),
-            Ok((_, st)) => {
-                match st.zones.get(&op.run.0) {
-                    None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
-                    Some(entry) => match &entry.compiled {
-                        Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
-                        Ok(_) if entry.spec.zone.name != op.zone => Found::Done(Decision::Forbidden(format!(
-                            "op for zone {}, but box {} holds authority for zone {}",
-                            op.zone, op.run, entry.spec.zone.name
-                        ))),
-                        Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => Found::Done(Decision::Forbidden(
-                            "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
-                        )),
-                        Ok(c) => {
-                            let mut req = request(&entry.spec, op, now);
-                            match c.loaded.decide(&req) {
-                                authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
-                                authz::Decision::Allow => Found::Done(Decision::Allow(Allowed::Ceiling)),
-                                authz::Decision::NeedsGrant(r) => {
-                                    let r = reason(c, op, false, r);
-                                    let candidates = entry.spec.grants.iter().filter(|g| {
-                                        g.host.eq_ignore_ascii_case(&op.host)
-                                            && g.method.eq_ignore_ascii_case(&op.method)
-                                            && g.path == op.path
-                                            && !st.is_revoked(RevokeKind::Grant, &g.id)
-                                            && g.uses.is_none_or(|max| self.uses(&g.id) < max)
-                                    });
-                                    let mut hit = None;
-                                    for g in candidates {
-                                        let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
-                                        req.uses_left = vec![(g.id.clone(), left)];
-                                        if c.loaded.decide(&req) == authz::Decision::Allow {
-                                            hit = Some(Found::Grant { id: g.id.clone(), counted: g.uses.is_some() });
-                                            break;
-                                        }
+            Ok((_, st)) => match st.zones.get(&op.run.0) {
+                None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
+                Some(entry) => match &entry.compiled {
+                    Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
+                    Ok(_) if entry.spec.zone.name != op.zone => Found::Done(Decision::Forbidden(format!(
+                        "op for zone {}, but box {} holds authority for zone {}",
+                        op.zone, op.run, entry.spec.zone.name
+                    ))),
+                    Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => Found::Done(Decision::Forbidden(
+                        "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
+                    )),
+                    Ok(c) => {
+                        let mut req = request(&entry.spec, op, now);
+                        match c.loaded.decide(&req) {
+                            authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
+                            authz::Decision::Allow => Found::Done(Decision::Allow(Allowed::Ceiling)),
+                            authz::Decision::NeedsGrant(r) => {
+                                let r = reason(c, op, false, r);
+                                let candidates = entry.spec.grants.iter().filter(|g| {
+                                    g.host.eq_ignore_ascii_case(&op.host)
+                                        && g.method.eq_ignore_ascii_case(&op.method)
+                                        && g.path == op.path
+                                        && !st.is_revoked(RevokeKind::Grant, &g.id)
+                                        && g.uses.is_none_or(|max| self.uses(&g.id) < max)
+                                });
+                                let mut hit = None;
+                                for g in candidates {
+                                    let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
+                                    req.uses_left = vec![(g.id.clone(), left)];
+                                    if c.loaded.decide(&req) == authz::Decision::Allow {
+                                        hit = Some(Found::Grant { id: g.id.clone(), counted: g.uses.is_some() });
+                                        break;
                                     }
-                                    hit.unwrap_or(Found::Done(Decision::NeedsGrant(r)))
                                 }
+                                hit.unwrap_or(Found::Done(Decision::NeedsGrant(r)))
                             }
                         }
-                    },
-                }
-            }
+                    }
+                },
+            },
         };
         match found {
             Found::Done(d) => d,

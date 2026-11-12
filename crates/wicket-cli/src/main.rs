@@ -713,9 +713,7 @@ enum SecretCmd {
     List,
     /// Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their
     /// run's lease next reaches them, within seconds while connected (#152).
-    Rm {
-        name: String,
-    },
+    Rm { name: String },
     /// Bind a secret to the only hosts it may be sent to, replacing its list.
     Hosts {
         name: String,

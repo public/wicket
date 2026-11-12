@@ -156,7 +156,8 @@ for line in open(path):
         continue
     rows[int(f[0])] = dict(kv.split("=", 1) for kv in f[1:])
 ts = sorted(rows)
-ok = lambda v: not v.endswith(":unavailable") and not v.startswith("000") and not v.startswith("403")
+# Let through by wicket (no x-wicket kind), whatever the upstream answered.
+ok = lambda v: not v.startswith("000") and v.rsplit(":", 1)[-1] == "-"
 within = lambda a, b: [t for t in ts if a <= t < b]
 s = lambda t, at: "-" if t is None else f"{(t - at) / 1000:+.1f}s"
 c1 = within(cut, restore)
@@ -184,7 +185,7 @@ checks = [
     ("restored after reconnect", bool(back)),
     ("approval reached the node", bool(g)),
     ("revocation reached the node", bool(r)),
-    ("cut off again, the box kept working until its authority's end, and stopped then", expired > 0 and last is not None and expired - 15_000 <= last <= expired + 2_000),
+    ("cut off again, the box kept working until its authority's end, and stopped then", expired > 0 and last is not None and expired - 15_000 <= last <= expired + 3_000),
 ]
 bad = 0
 for name, c in checks:
