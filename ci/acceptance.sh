@@ -67,8 +67,10 @@ built_image=
 
 if [ "$mode" = dev ]; then
   W=$(realpath "${WICKET:-target/debug/wicket}")
-  # A data dir and a vault of our own: the vault is $HOME/.config/wicket/secrets.
+  # A data dir and a vault of our own: the vault is $HOME/.config/wicket/secrets. With --nodes
+  # vultr, the operator's own vault, which holds the Vultr API key (the `mock` secret is added to it).
   export WICKET_HOME=$work/home HOME_FOR_WICKET=$work/userhome
+  [ "$nodes" = vultr ] && HOME_FOR_WICKET=$HOME
   mkdir -p "$WICKET_HOME" "$HOME_FOR_WICKET"
   export WICKET_BOX_PREFIX=acc
   HOMEW=$HOME_FOR_WICKET
@@ -92,6 +94,10 @@ else
   box_filter=(--filter label=wicket=1)
 fi
 IMAGE_TAG=${IMAGE:-}
+
+# The multi-host flow and its teardown (defined before the EXIT trap can need them).
+# shellcheck source=ci/acceptance/nodes.sh
+[ -z "$nodes" ] || . ci/acceptance/nodes.sh
 
 # ---- results ----
 results=()
@@ -200,7 +206,7 @@ port=$(free_port)
 leaf='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn","arguments":{"name":"leaf","kind":"program","zone":{"limits":{"memory":"128m","cpus":1,"timeout":"4m"}},"command":["sleep","3000"]}}}'
 mock_cmd="[ -f /workspace/drive.sh ] && exec bash /workspace/drive.sh; curl -s -m 120 http://wicket.internal:8081/ -H 'content-type: application/json' -d '$leaf'; sleep 500"
 HOME=$HOMEW "$W" dev mock-llm --listen "127.0.0.1:$port" --command "$mock_cmd" 2>"$work/mock.log" &
-pids+=($!)
+pids+=("$!")
 wait_for 10 "(exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null"
 
 # ---- 1. an agent: egress, approvals, spawn, link, subtree revoke ----
@@ -209,7 +215,7 @@ lead_ws=$(workdir lead)
 cp "$work/h3get" "$lead_ws/h3get"
 HOME=$HOMEW "$W" run "$(manifest lead)" --workdir "$lead_ws" --image "$IMAGE_TAG" >"$work/lead.log" 2>&1 &
 lead_pid=$!
-pids+=($lead_pid)
+pids+=("$lead_pid")
 wait_for 60 '[ -n "$(run_id_of "$work/lead.log")" ]' || true
 lead=$(run_id_of "$work/lead.log")
 our_runs+=("$lead")
@@ -300,7 +306,7 @@ check "  and the generation went up by one" '[ "$(agent_field generation)" = $((
 log "reconcile: a box whose wicket run was killed hard"
 HOME=$HOMEW "$W" run "$(manifest orphan)" --image "$IMAGE_TAG" >"$work/orphan.log" 2>&1 &
 orphan_pid=$!
-pids+=($orphan_pid)
+pids+=("$orphan_pid")
 wait_for 90 'grep -q acc-orphan-up "$work/orphan.log" 2>/dev/null' || true
 orphan=$(run_id_of "$work/orphan.log")
 our_runs+=("$orphan")
@@ -326,8 +332,6 @@ check "no box of ours is left" '[ -z "$(our_boxes)" ]'
 
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
-  # shellcheck source=ci/acceptance/nodes.sh
-  . ci/acceptance/nodes.sh
   multihost
 fi
 

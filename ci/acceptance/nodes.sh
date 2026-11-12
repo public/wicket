@@ -1,3 +1,4 @@
+# shellcheck shell=bash disable=SC2154  # sourced by ci/acceptance.sh, which sets work, mode, nodes, datadir
 # The multi-host part of ci/acceptance.sh (sourced by it; uses its helpers and variables).
 #
 # An agent asks for a machine of its own (request_capacity), a human approves the lease, the
@@ -30,7 +31,7 @@ node_local_setup() {
   wroot node install "$NODE" --no-service >>"$work/enrol.log" 2>&1
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >"$work/node-serve.log" 2>&1 &
   node_serve_pid=$!
-  pids+=($node_serve_pid)
+  pids+=("$node_serve_pid")
   wait_for 20 '[ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ]'
   cat >"$WICKET_HOME/placement.yaml" <<EOF
 owner: acc.wicket.test
@@ -102,7 +103,7 @@ multihost() {
   cap_ws=$(workdir cap)
   HOME=$HOMEW "$W" run "$(manifest cap)" --workdir "$cap_ws" --image "$IMAGE_TAG" >"$work/cap.log" 2>&1 &
   cap_pid=$!
-  pids+=($cap_pid)
+  pids+=("$cap_pid")
   wait_for 60 '[ -n "$(run_id_of "$work/cap.log")" ]' || true
   cap_run=$(run_id_of "$work/cap.log")
   our_runs+=("$cap_run")
@@ -111,7 +112,7 @@ multihost() {
 
   # Approve the lease (the approval runs a reconcile pass, which acquires the node), then let the
   # agent go on once the node has the image.
-  local deadline=$((SECONDS + ${ACC_NODE_WAIT:-900})) approved= released=
+  local deadline=$((SECONDS + ${ACC_NODE_WAIT:-900})) approved="" released=""
   while [ $SECONDS -lt $deadline ] && [ "$(cf done)" != 1 ] && kill -0 "$cap_pid" 2>/dev/null; do
     if [ -z "$approved" ]; then
       rid=$(w pending 2>/dev/null | grep -E "^r-[a-z0-9]+ +CAPACITY .* run $cap_run " | awk '{print $1}' | head -1 || true)
