@@ -1,0 +1,91 @@
+{
+  "audit_row_batched_durable_16_threads_us_per_record": 79.87076687500002,
+  "audit_row_batched_durable_alone": {
+    "max_us": 7646.065,
+    "mean_us": 748.542336,
+    "min_us": 291.963,
+    "n": 1000,
+    "p50_us": 746.422,
+    "p99_us": 2705.402
+  },
+  "audit_row_batched_queue": {
+    "max_us": 25.298,
+    "mean_us": 1.1248723333333333,
+    "min_us": 0.581,
+    "n": 3000,
+    "p50_us": 0.624,
+    "p99_us": 7.16
+  },
+  "audit_row_file_ledger": {
+    "max_us": 4652.692,
+    "mean_us": 643.383482,
+    "min_us": 266.561,
+    "n": 3000,
+    "p50_us": 646.54,
+    "p99_us": 2589.924
+  },
+  "audit_row_memory_ledger": {
+    "max_us": 133.59,
+    "mean_us": 22.400741333333333,
+    "min_us": 18.585,
+    "n": 3000,
+    "p50_us": 19.267,
+    "p99_us": 54.113
+  },
+  "decide_canonical_op_evaluate": {
+    "max_us": 43.175,
+    "mean_us": 1.2135515049999999,
+    "min_us": 1.066,
+    "n": 200000,
+    "p50_us": 1.112,
+    "p99_us": 2.405
+  },
+  "host_verdict": {
+    "max_us": 20.467,
+    "mean_us": 0.076472475,
+    "min_us": 0.063,
+    "n": 200000,
+    "p50_us": 0.067,
+    "p99_us": 0.126
+  },
+  "keypair_generate_p256": {
+    "max_us": 94.084,
+    "mean_us": 44.265456666666665,
+    "min_us": 40.704,
+    "n": 300,
+    "p50_us": 41.017,
+    "p99_us": 78.321
+  },
+  "leaf_cached": {
+    "max_us": 130.332,
+    "mean_us": 0.21746373,
+    "min_us": 0.168,
+    "n": 100000,
+    "p50_us": 0.193,
+    "p99_us": 0.413
+  },
+  "leaf_first_mint": {
+    "max_us": 305.672,
+    "mean_us": 136.55519,
+    "min_us": 114.392,
+    "n": 300,
+    "p50_us": 126.346,
+    "p99_us": 200.698
+  },
+  "needs_inspection": {
+    "max_us": 18.939,
+    "mean_us": 0.43965248500000004,
+    "min_us": 0.391,
+    "n": 200000,
+    "p50_us": 0.406,
+    "p99_us": 0.965
+  },
+  "tls13_handshake_both_sides": {
+    "max_us": 1013.748,
+    "mean_us": 641.3045999999999,
+    "min_us": 572.332,
+    "n": 500,
+    "p50_us": 626.659,
+    "p99_us": 926.765
+  }
+}

@@ -300,6 +300,43 @@ they will hit:
 - large downloads: TLS and socat's buffer;
 - remote nodes: the round trip on every request, until #57 moves the proxy onto the node.
 
+## 8. After the fix: the batched audit writer (2026-11-12)
+
+#62's first fix is in: `wicket run` now starts one background audit writer per process, which
+commits in batches (`wicket-store`'s `writer.rs`, `docs/audit-export.md`). The replica has a
+`--batched` mode that does what `RunCtx::emit` now does. With a writer present, it holds the ledger
+lock only long enough to clone the writer, then queues an allowed-by-reach row without waiting for
+it. Same box, same day, load 5–6. The three arms were interleaved over 3 rounds (`netbench bench
+--only mitm/unix,mitm-batched/unix,mitm-memaudit/unix,mitm/fwd,mitm-batched/fwd --rounds 3 --big
+20000000`). Raw output is in `logs/batched-writer/`.
+
+| setup | kept-alive p50 / p99 (µs) | new conn p50 (ms) | req/s, 16 kept conns | `audit_emit` p50 / p99 (µs) |
+|---|---|---|---|---|
+| mitm/unix (inline fsync, as before) | 1,231–1,423 / 3,692–7,166 | 2.74–4.99 | 718–1,207 | 2,524–2,752 / 12,452–30,800 |
+| **mitm-batched/unix** | **413–466 / 1,388–2,326** | **1.89–2.12** | **6,651–7,903** | **7.4–7.8 / 795–1,049** |
+| mitm-memaudit/unix (in-memory ledger) | 464–516 / 1,497–1,993 | 1.64–2.01 | 5,962–6,028 | 75–84 / 2,737–2,969 |
+| mitm/fwd | 1,408–1,575 / 4,048–5,618 | 3.61–5.50 | 778–1,068 | 2,647–3,029 / 15,873–19,462 |
+| mitm-batched/fwd | 504–543 / 1,203–1,907 | 2.55–2.88 | 4,845–7,594 | 7.2–7.6 / 601–992 |
+
+Ranges are the three rounds' values. The batched writer brings a kept-alive request down to what it
+costs with no disk at all: 0.47 ms, against 1.3 ms with the inline fsync. It raises throughput about
+7×, past the in-memory arm. Under 16 connections, `audit_emit` used to be mostly waiting for the
+ledger mutex (2.5 ms p50). It is now a 7 µs enqueue. The in-memory arm still writes under the lock,
+which is why it lands a little behind the batched arm.
+
+In-process (`netbench micro`, `logs/batched-writer/micro.json`):
+
+| step | p50 (µs) | p99 (µs) |
+|---|---|---|
+| audit row, file ledger, inline (fsync per row) | 647 | 2,590 |
+| queue a row with the batched writer (`submit`) | 0.62 | 7.2 |
+| durable append, one thread alone (`append`: waits for its commit) | 746 | 2,705 |
+| durable append, 16 threads at once (mean per record) | 80 | – |
+| audit row, in-memory ledger | 19 | 54 |
+
+Requests allowed by a human's grant, decisions and approvals still wait for their commit. That is
+one fsync when nothing else is writing, and a share of one under load.
+
 ## 7. Reproducing
 
 ```sh
