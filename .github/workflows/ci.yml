@@ -94,3 +94,5 @@ jobs:
         run: target/debug/wicket image
       - name: Smoke test
         run: WICKET=target/debug/wicket ci/smoke.sh
+      - name: Hibernate and wake
+        run: WICKET=target/debug/wicket ci/hibernate.sh

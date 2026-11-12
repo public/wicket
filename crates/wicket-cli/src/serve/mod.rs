@@ -226,6 +226,8 @@ pub async fn serve(opts: ServeOpts) -> Result<()> {
     let plan = net::plan(&opts, &data_dir())?;
     let tenant = TenantId::single();
     let l = Ledger::open(&ledger_path())?;
+    // The console is the control host's long-lived process: it feeds the audit sinks (#91).
+    crate::audit_export::spawn_background();
     let has_passkeys = !l.operator_credentials(&tenant)?.is_empty();
     let _ = l.prune_console_sessions(wicket_store::now() - 30 * 86400);
     drop(l);
@@ -1082,12 +1084,16 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 request,
                 &Approval { uses: *uses, ttl: Duration::from_secs(*ttl_secs), path_prefix: None, decided_by: by.clone() },
             )?;
-            l.audit(
+            // A grant exists only if its approval is on the record (fail closed).
+            if let Err(e) = l.audit(
                 t,
                 None,
                 "decision",
                 &json!({ "action": "decide", "request": request, "decision": "approve", "grant": gid, "prefix": req.scope_prefix, "by": by, "signed": signed }),
-            )?;
+            ) {
+                let _ = l.revoke_grant(&gid);
+                return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
+            }
             let scope = if req.scope_prefix { format!(" for every path under {}{}", req.host, req.path) } else { String::new() };
             Ok(format!("approved {request} → {gid}{scope} (signed with {})", oc.name))
         }

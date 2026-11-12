@@ -219,7 +219,54 @@ pub mod anyhow_free {
     pub type Result<T> = std::result::Result<T, Error>;
 }
 
-pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
+/// How long Claude Code keeps sessions (its `cleanupPeriodDays`). Claude Code deletes transcripts older
+/// than this when it starts, which would erase a long-lived agent's own history on wake (#70), so
+/// wicket sets it in every generated settings file and a manifest can't lower it.
+pub const CLEANUP_PERIOD_DAYS: u32 = 36_500;
+
+/// The settings.json wicket generates for a Claude Code agent: the manifest's allowlisted
+/// `adapter_settings`, plus what wicket owns (applied last, so it always wins).
+pub fn claude_settings(m: &Manifest) -> Value {
+    let mut s = m.agent.as_ref().map(|a| a.adapter_settings.clone()).unwrap_or_default();
+    s.insert("cleanupPeriodDays".into(), Value::from(CLEANUP_PERIOD_DAYS));
+    Value::Object(s)
+}
+
+/// Which Claude Code session an activation runs (#70). The first activation of an agent starts the
+/// session wicket chose; a wake resumes it, so the agent continues its own conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSession {
+    /// A UUID, chosen by wicket.
+    pub id: String,
+    pub resume: bool,
+}
+
+impl AgentSession {
+    /// A new session with a fresh random (v4) UUID.
+    pub fn new() -> AgentSession {
+        let mut b = [0u8; 16];
+        getrandom::getrandom(&mut b).expect("random bytes");
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        let h = hex::encode(b);
+        AgentSession { id: format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]), resume: false }
+    }
+
+    /// Whether `s` is a session id wicket would choose (a lowercase hyphenated UUID).
+    pub fn valid(s: &str) -> bool {
+        s.len() == 36
+            && s.char_indices()
+                .all(|(i, c)| if [8, 13, 18, 23].contains(&i) { c == '-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() })
+    }
+}
+
+impl Default for AgentSession {
+    fn default() -> Self {
+        AgentSession::new()
+    }
+}
+
+pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> LaunchPlan {
     let agent = m.agent.as_ref().expect("an agent manifest");
     let env = vec![
         ("ANTHROPIC_BASE_URL", LLM_URL.to_string()),
@@ -283,6 +330,8 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId) -> LaunchPlan {
         argv.push("--max-turns".into());
         argv.push(n.to_string());
     }
+    argv.push(if session.resume { "--resume" } else { "--session-id" }.into());
+    argv.push(session.id.clone());
     LaunchPlan { env, argv, stdin_task: Some(user_message(&m.task)) }
 }
 
@@ -423,7 +472,19 @@ mod tests {
     #[test]
     fn plan_has_no_real_credentials_and_routes_through_proxies() {
         let m = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
-        let p = claude_code_plan(&m, &RunId("run_x".into()));
+        let s = AgentSession::new();
+        assert!(AgentSession::valid(&s.id), "{}", s.id);
+        assert!(!AgentSession::valid("../../etc") && !AgentSession::valid(&s.id.to_uppercase()));
+        let p = claude_code_plan(&m, &RunId("run_x".into()), &s);
+        let at = p.argv.iter().position(|a| a == "--session-id").expect("a chosen session id");
+        assert_eq!(p.argv[at + 1], s.id);
+        let r = claude_code_plan(&m, &RunId("run_y".into()), &AgentSession { resume: true, ..s.clone() });
+        assert!(r.argv.windows(2).any(|w| w[0] == "--resume" && w[1] == s.id) && !r.argv.contains(&"--session-id".to_string()));
+        let set = claude_settings(
+            &Manifest::from_yaml("task: hi\nagent: {name: a, adapter_settings: {language: fr}}\nzone: {name: z, llm: {}}").unwrap(),
+        );
+        assert_eq!(set["cleanupPeriodDays"], CLEANUP_PERIOD_DAYS);
+        assert_eq!(set["language"], "fr");
         let get = |k: &str| p.env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
         assert!(get("CLAUDE_CODE_OAUTH_TOKEN").unwrap().contains("placeholder"));
         assert!(get("ANTHROPIC_API_KEY").is_none(), "never an API key");

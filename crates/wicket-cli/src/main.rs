@@ -5,9 +5,11 @@
 //! every decision in the ledger. `wicket approve` / `wicket deny` decide pending escalations from
 //! another terminal while the run waits.
 
+mod audit_export;
 mod capacity;
 mod chan;
 mod enrol;
+mod hibernate;
 mod image;
 mod links;
 mod mock;
@@ -98,8 +100,32 @@ enum Cmd {
         lease: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
-    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn.
+    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A
+    /// long-lived agent can be named by its id or any of its runs; a hibernated one is woken.
     Say { run: String, text: Vec<String> },
+    /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
+    /// and nothing but the agent runs in its box. Otherwise it stays idle (paused).
+    Hibernate {
+        run: String,
+        /// How long to wait for the outcome (seconds).
+        #[arg(long, default_value_t = 120)]
+        wait: u64,
+    },
+    /// Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the
+    /// woken activation in the foreground, like `wicket run`. Text, if given, is the operator's
+    /// message to it.
+    Wake {
+        agent: String,
+        text: Vec<String>,
+        /// What woke it (recorded and told to the agent).
+        #[arg(long, hide = true)]
+        by: Option<String>,
+    },
+    /// Long-lived agents: state, generation, current run and bundle size.
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
     /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
@@ -144,12 +170,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GrantCmd,
     },
-    /// Show or verify the hash-chained audit log.
+    /// Show or verify the hash-chained audit log, or export it to the configured sinks.
     Audit {
         #[arg(long, default_value_t = 40)]
         tail: usize,
         #[arg(long)]
         verify: bool,
+        /// With --verify: also check the local chain against exported records and signed
+        /// checkpoints (JSON lines, or a Collector's OTLP JSON file output). Catches a rewritten
+        /// or truncated chain.
+        #[arg(long, requires = "verify")]
+        against: Vec<PathBuf>,
+        /// The issuer public key (JWK, as `wicket identity issuer` prints it) checkpoints must be
+        /// signed with. Default: this installation's issuer key.
+        #[arg(long, requires = "against")]
+        issuer_jwk: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: Option<AuditCmd>,
     },
     /// Manage vault secrets (values are read from the terminal, never from arguments).
     Secret {
@@ -286,6 +323,25 @@ enum LeaseCmd {
     List,
     /// End a lease now: what runs on it stops and its node is destroyed (one reconcile pass).
     Release { id: String },
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// Feed the sinks in the sinks file (`audit-sinks.yaml` in the data dir, or
+    /// $WICKET_AUDIT_SINKS) until stopped. Runs alongside `wicket run` and `wicket serve`, which
+    /// feed the sinks too; each sink is fed by one process at a time. The only process that writes
+    /// to a `path: "-"` (stdout) sink.
+    Export {
+        /// One pass, then exit (non-zero if a sink failed).
+        #[arg(long)]
+        once: bool,
+        /// Send every sink a checkpoint now.
+        #[arg(long)]
+        checkpoint: bool,
+        /// Show each sink's position and last error.
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -466,6 +522,57 @@ pub fn data_dir() -> PathBuf {
     home.join(".local/share/wicket")
 }
 
+fn audit_export_cmd(once: bool, checkpoint: bool, status: bool) -> Result<()> {
+    let cfg = audit_export::SinksConfig::load()?
+        .with_context(|| format!("no audit sinks configured ({} does not exist)", audit_export::sinks_path().display()))?;
+    if status {
+        let l = Ledger::open(&ledger_path())?;
+        let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
+        for s in &cfg.sinks {
+            let c = l.export_cursor(&s.name)?;
+            let holder = if c.lease_until >= wicket_store::now() { c.holder.unwrap_or_default() } else { "-".into() };
+            println!(
+                "{:<16} at {} of {head}  last checkpoint {}  fed by {holder}{}",
+                s.name,
+                c.seq,
+                c.checkpoint_at,
+                c.error.map(|e| format!("  error: {e}")).unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+    let issuer = match issuer() {
+        Ok(i) => Some(i),
+        Err(e) => {
+            eprintln!("wicket: no issuer key ({e}): exporting records without checkpoints");
+            None
+        }
+    };
+    let mut x = audit_export::Exporter::new(&ledger_path(), cfg, issuer)?;
+    x.stdout = true;
+    let mut force = checkpoint;
+    loop {
+        let p = x.pass(force);
+        force = false;
+        for (sink, e) in &p.failures {
+            eprintln!("wicket: audit sink {sink}: {e}");
+        }
+        if once {
+            for sink in &p.busy {
+                eprintln!("wicket: audit sink {sink} is fed by another wicket process (see --status); left to it");
+            }
+        }
+        if once {
+            if !p.failures.is_empty() {
+                bail!("{} sink(s) failed", p.failures.len());
+            }
+            eprintln!("exported {} record(s) and {} checkpoint(s)", p.records, p.checkpoints);
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 pub fn ledger_path() -> PathBuf {
     data_dir().join("ledger.db")
 }
@@ -595,6 +702,7 @@ async fn main() -> Result<()> {
                 parent_run,
                 lease,
                 wrap: None,
+                wake: None,
             })
             .await
         }
@@ -611,6 +719,7 @@ async fn main() -> Result<()> {
                 parent_run: None,
                 lease: None,
                 wrap: Some(argv),
+                wake: None,
             })
             .await
         }
@@ -620,6 +729,36 @@ async fn main() -> Result<()> {
                 bail!("nothing to say");
             }
             let l = Ledger::open(&ledger_path())?;
+            // A long-lived agent is reached through its current run; a hibernated one is woken, and
+            // the message is its first turn.
+            let mut run = run;
+            if l.run_status(&run)?.as_deref() != Some("running") {
+                if let Ok(a) = hibernate::resolve(&l, &run) {
+                    match a.state.as_str() {
+                        "hibernated" if a.restorable => {
+                            if let Some(why) = hibernate::exhausted(&a) {
+                                bail!("agent {} is hibernated and can't be woken: {why}", a.id);
+                            }
+                            l.add_operator_message(&a.id, &text, &operator())?;
+                            l.audit(
+                                &TenantId::single(),
+                                None,
+                                "operator.message",
+                                &serde_json::json!({ "by": operator(), "chars": text.len(), "agent": a.id, "wakes": true }),
+                            )?;
+                            hibernate::trigger_wake(&a.id, &format!("wicket say by {}", operator()));
+                            println!(
+                                "agent {} is hibernated: waking it; the message is its first turn (log: {})",
+                                a.id,
+                                hibernate::agent_dir(&a.id).join("wake.log").display()
+                            );
+                            return Ok(());
+                        }
+                        "active" | "idle" | "waking" | "hibernating" => run = a.run,
+                        s => bail!("agent {} is {s}", a.id),
+                    }
+                }
+            }
             match l.run_status(&run)?.as_deref() {
                 Some("running") => {}
                 Some(s) => bail!("{run} is {s}, not running"),
@@ -635,6 +774,12 @@ async fn main() -> Result<()> {
             println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
             Ok(())
         }
+        Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
+        Cmd::Wake { agent, text, by } => {
+            let text = text.join(" ");
+            hibernate::wake(&agent, (!text.trim().is_empty()).then_some(text), by).await
+        }
+        Cmd::Agents { json } => hibernate::list(json),
         Cmd::Pending => {
             let l = Ledger::open(&ledger_path())?;
             let p = l.pending(&TenantId::single())?;
@@ -677,7 +822,8 @@ async fn main() -> Result<()> {
                 &id,
                 &Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() },
             )?;
-            l.audit(
+            // A grant exists only if its approval is on the record (fail closed).
+            if let Err(e) = l.audit(
                 &TenantId::single(),
                 None,
                 "decision",
@@ -688,7 +834,10 @@ async fn main() -> Result<()> {
                     "agent_identity": verified_identity(&l, &req.run, None),
                     "uses": if unlimited { None } else { Some(uses) }, "ttl_secs": ttl.as_secs(), "prefix": prefix,
                 }),
-            )?;
+            ) {
+                let _ = l.revoke_grant(&gid);
+                return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
+            }
             println!(
                 "approved {id} → grant {gid}: {} {}{} ({}, {})",
                 req.method,
@@ -809,7 +958,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Audit { tail, verify } => {
+        Cmd::Audit { tail, verify, against, issuer_jwk, cmd } => {
+            if let Some(AuditCmd::Export { once, checkpoint, status }) = cmd {
+                // The exporter blocks (its own runtime, file and HTTP writes): off the async runtime.
+                return std::thread::spawn(move || audit_export_cmd(once, checkpoint, status))
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the audit exporter panicked"))?;
+            }
             let l = Ledger::open(&ledger_path())?;
             if verify {
                 let n = l.verify_audit()?;
@@ -823,8 +978,31 @@ async fn main() -> Result<()> {
                         if n.restarts > 0 { format!(" ({} restart(s): the node's data was wiped)", n.restarts) } else { String::new() };
                     println!("node {} audit chain OK: {} records shipped{restarts}", n.node, n.records);
                 }
+                let mut against_bad = 0;
+                if !against.is_empty() {
+                    let key = match &issuer_jwk {
+                        Some(p) => wicket_identity::verifying_key_from_jwk(&serde_json::from_slice(&std::fs::read(p)?)?)?,
+                        None => issuer()?.verifying_key(),
+                    };
+                    let mut objs = Vec::new();
+                    for p in &against {
+                        objs.extend(audit_export::exported_objects(&std::fs::read_to_string(p).with_context(|| p.display().to_string())?));
+                    }
+                    let a = audit_export::verify_against(&l, &objs, &key)?;
+                    println!("against the exported copies: {} signed checkpoint(s) and {} record(s) match", a.checkpoints, a.records);
+                    for p in a.problems.iter().take(20) {
+                        println!("  MISMATCH: {p}");
+                    }
+                    if a.checkpoints == 0 && a.records > 0 {
+                        println!("  (no signed checkpoints found: only exported records were compared)");
+                    }
+                    against_bad = a.problems.len();
+                }
                 if bad + ibad > 0 {
                     bail!("{} record(s) failed verification", bad + ibad);
+                }
+                if against_bad > 0 {
+                    bail!("the local audit chain does not match its exported copies ({against_bad} problem(s)): it was rewritten or truncated here");
                 }
                 return Ok(());
             }

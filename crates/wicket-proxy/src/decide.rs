@@ -306,6 +306,8 @@ mod tests {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            fence: None,
+            waker: None,
         }
     }
 
@@ -393,5 +395,81 @@ mod tests {
         link.up.store(true, Ordering::SeqCst);
         assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Pending { .. }));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_use_is_on_disk_before_the_request_goes_ahead() {
+        use wicket_store::{AuditWriter, Ledger, WriterConfig};
+        let dir = std::env::temp_dir().join(format!("wicket-decide-durable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ledger.db");
+        let mut l = Ledger::open(&p).unwrap();
+        // A long linger, so a deferred record visibly waits in the queue (a durable one or a flush cuts it short).
+        let w = AuditWriter::start(&p, WriterConfig { max_batch: 512, linger: std::time::Duration::from_secs(30), retries: 5 }).unwrap();
+        l.start_audit_writer(Some(w)).unwrap();
+        let mut c = ctx(true);
+        c.ledger = Arc::new(Mutex::new(l));
+        let reader = Ledger::open(&p).unwrap();
+        let ev = |detail: &str| crate::Event::Egress {
+            method: "GET".into(),
+            host: "api.example.com".into(),
+            path: "/".into(),
+            risk: "Read".into(),
+            outcome: "allow".into(),
+            detail: detail.into(),
+        };
+        c.emit(ev("reach rule 0"));
+        c.emit(ev("grant g-1"));
+        assert_eq!(
+            reader.audit_tail(10).unwrap().len(),
+            2,
+            "the grant's use committed before emit returned, with what was queued before it"
+        );
+        c.emit(ev("reach rule 0"));
+        assert_eq!(reader.audit_tail(10).unwrap().len(), 2, "a reach-allowed request doesn't wait for its record");
+        c.ledger.lock().unwrap().flush_audit().unwrap();
+        assert_eq!(reader.verify_audit().unwrap(), 3);
+        drop(c);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_use_fails_closed_when_its_audit_record_cannot_be_written() {
+        use wicket_store::{AuditWriter, Ledger, WriterConfig};
+        let dir = std::env::temp_dir().join(format!("wicket-decide-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ledger.db");
+        let mut l = Ledger::open(&p).unwrap();
+        let w = AuditWriter::start(&p, WriterConfig { retries: 0, ..WriterConfig::default() }).unwrap();
+        l.start_audit_writer(Some(w)).unwrap();
+        // Every commit of an audit record fails from now on.
+        rusqlite_free_fail(&p);
+        let mut c = ctx(true);
+        c.ledger = Arc::new(Mutex::new(l));
+        let ev = |detail: &str| crate::Event::Egress {
+            method: "GET".into(),
+            host: "api.example.com".into(),
+            path: "/".into(),
+            risk: "Read".into(),
+            outcome: "allow".into(),
+            detail: detail.into(),
+        };
+        let r = c.record(ev("grant g-1"));
+        assert!(r.as_ref().is_err_and(|e| e.contains("audit")), "the grant's use is refused: {r:?}");
+        assert!(c.record(ev("reach rule 0")).is_ok(), "a reach-allowed request doesn't wait for its record");
+        // Without a writer (an inline ledger), the same.
+        let mut c2 = ctx(true);
+        let l2 = Ledger::open(&p).unwrap();
+        c2.ledger = Arc::new(Mutex::new(l2));
+        assert!(c2.record(ev("grant g-1")).is_err());
+        drop((c, c2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Makes every insert into the audit table fail (a trigger, through the ledger's own SQL).
+    fn rusqlite_free_fail(p: &std::path::Path) {
+        wicket_store::Ledger::open(p).unwrap().fail_audit_inserts_for_tests().unwrap();
     }
 }

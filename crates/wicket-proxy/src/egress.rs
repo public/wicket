@@ -150,6 +150,10 @@ impl Egress {
             if host.parse::<std::net::IpAddr>().is_ok() {
                 return Ok(self.refuse(&host, "CONNECT", "/", "IP literals are not proxied; use a hostname"));
             }
+            // A superseded activation (#70) gets no tunnel at all.
+            if let Some(why) = self.ctx.superseded() {
+                return Ok(self.refuse(&host, "CONNECT", "/", &why));
+            }
             if let Some(r) = self.judge_host(&host, "CONNECT") {
                 return Ok(r);
             }
@@ -362,6 +366,9 @@ impl Egress {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let method = req.method().as_str().to_string();
+        if let Some(why) = self.ctx.superseded() {
+            return self.refuse(&host, &method, "/", &why);
+        }
         // Authority pinning: a Host header that disagrees with the tunnel target is an attack.
         if let Some(h) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()) {
             let h = h.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
@@ -391,7 +398,30 @@ impl Egress {
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
         match self.decider.decide(ctx, &op, who.as_ref()).await {
-            Outcome::Allow(detail) => emit("allow", detail),
+            Outcome::Allow(detail) => {
+                // A grant's use must be on the record before the request goes ahead (fail closed).
+                let ev = Event::Egress {
+                    method: method.clone(),
+                    host: host.clone(),
+                    path: path.clone(),
+                    risk: risk.clone(),
+                    outcome: "allow".into(),
+                    detail: detail.clone(),
+                };
+                if let Err(e) = ctx.record(ev) {
+                    emit("unavailable", format!("{detail}; refused: the audit record could not be written ({e})"));
+                    return problem(
+                        503,
+                        "audit-unavailable",
+                        "Blocked by wicket sandbox: the audit log is unavailable",
+                        &format!(
+                            "wicket could not record this request in its audit log, so it was not sent; retry later. {}",
+                            crate::SANDBOX_FACT
+                        ),
+                        None,
+                    );
+                }
+            }
             Outcome::Forbidden(why) => {
                 emit("forbidden", why.clone());
                 let note = self.strike(&op.digest());

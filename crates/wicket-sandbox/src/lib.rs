@@ -8,6 +8,9 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use wicket_core::Isolation;
 
+/// The size of a box's /tmp, in MiB: the tmpfs's size, or the cap wicket keeps a host /tmp to.
+pub const TMP_CAP_MB: u64 = 512;
+
 #[derive(Clone, Debug)]
 pub struct Mount {
     pub host: PathBuf,
@@ -142,8 +145,6 @@ impl Docker {
             "--security-opt".into(),
             "no-new-privileges".into(),
             "--read-only".into(),
-            "--tmpfs".into(),
-            "/tmp:rw,nosuid,size=512m".into(),
             // wicket-entry starts as root with only the capabilities it needs to give wicket.internal its
             // address, then becomes `spec.user` with no capabilities (no-new-privileges throughout).
             "--user".into(),
@@ -166,6 +167,12 @@ impl Docker {
         for (k, v) in &spec.labels {
             a.push("--label".into());
             a.push(format!("{k}={v}"));
+        }
+        // /tmp: a tmpfs, unless wicket mounts a host directory there (a local box's /tmp is kept with
+        // the rest of its writable state, #70).
+        if !spec.mounts.iter().any(|m| m.target == "/tmp") {
+            a.push("--tmpfs".into());
+            a.push(format!("/tmp:rw,nosuid,size={TMP_CAP_MB}m"));
         }
         // wicket.internal's name, unless wicket mounts its own hosts file (which links add names to).
         if !spec.mounts.iter().any(|m| m.target == "/etc/hosts") {
@@ -250,6 +257,41 @@ impl Docker {
         Ok(parse_boxes(&String::from_utf8_lossy(&out.stdout)))
     }
 
+    /// Freezes every process in the box (Idle, #70). Memory stays held; sockets and stdin stay open.
+    pub async fn pause(&self, name: &str) -> Result<()> {
+        self.simple(&["pause", name]).await
+    }
+
+    pub async fn unpause(&self, name: &str) -> Result<()> {
+        self.simple(&["unpause", name]).await
+    }
+
+    async fn simple(&self, args: &[&str]) -> Result<()> {
+        let out = self.command_with(args.iter().map(|s| s.to_string())).stdout(Stdio::null()).stderr(Stdio::piped()).output().await?;
+        if !out.status.success() {
+            bail!("docker {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    /// The box's processes, read from its own /proc (`docker top` lists the host's under gVisor):
+    /// (pid, ppid, command line). The reader itself is left out.
+    pub async fn processes(&self, name: &str, user: &str) -> Result<Vec<(u32, u32, String)>> {
+        let script = r#"for d in /proc/[0-9]*; do p=${d#/proc/}; [ "$p" = "$$" ] && continue; [ -r "$d/stat" ] || continue; s=$(cat "$d/stat" 2>/dev/null) || continue; s=${s##*) }; set -- $s; c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null); printf '%s\t%s\t%s\n' "$p" "$2" "$c"; done"#;
+        let out = self
+            .exec(name, user, &[], &["sh".into(), "-c".into(), script.into()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker exec")?;
+        if !out.status.success() {
+            bail!("listing the box's processes failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(parse_processes(&String::from_utf8_lossy(&out.stdout)))
+    }
+
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
         Ok(())
@@ -267,6 +309,19 @@ impl Docker {
         }
         Ok(())
     }
+}
+
+/// Parses `pid<TAB>ppid<TAB>cmdline` lines; the reader's own children (`cat`, `tr`) have the reader
+/// as their parent and are dropped by [`Docker::processes`]'s caller, as is anything without a pid.
+fn parse_processes(out: &str) -> Vec<(u32, u32, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let pid = f.next()?.trim().parse().ok()?;
+            let ppid = f.next()?.trim().parse().ok()?;
+            Some((pid, ppid, f.next().unwrap_or("").trim().to_string()))
+        })
+        .collect()
 }
 
 /// Parses `docker ps` lines of `name<TAB>run<TAB>owner`.
@@ -311,17 +366,26 @@ mod tests {
         assert!(a.contains("--user 0:0") && a.contains("WICKET_AS_USER=1000:1000"), "starts as root only to set up, then drops");
         assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
         assert!(a.contains("--dns 198.18.0.1"));
+        assert!(a.contains("--tmpfs /tmp:rw,nosuid,size=512m"));
         assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));
         // With wicket's own hosts file mounted (links add names to it), no --add-host.
         let mut own = spec.clone();
         own.mounts.push(Mount { host: "/run/hosts".into(), target: "/etc/hosts".into(), read_only: true });
+        own.mounts.push(Mount { host: "/run/box/tmp".into(), target: "/tmp".into(), read_only: false });
         let a = d.build_args(&own).join(" ");
         assert!(!a.contains("--add-host") && a.contains("source=/run/hosts,target=/etc/hosts,readonly"));
+        assert!(!a.contains("--tmpfs") && a.contains("source=/run/box/tmp,target=/tmp"), "a host /tmp replaces the tmpfs");
         let e = d.exec_args("wicket-x", "1000:1000", &["-i"], &["socat".into(), "-".into()]).join(" ");
         assert_eq!(e, "exec --user 1000:1000 -i wicket-x socat -");
         assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));
+    }
+
+    #[test]
+    fn process_lines_parse() {
+        let p = parse_processes("1\t0\t/sbin/docker-init -- wicket-entry \n7\t1\tclaude -p \nx\t1\tbad\n");
+        assert_eq!(p, vec![(1, 0, "/sbin/docker-init -- wicket-entry".into()), (7, 1, "claude -p".into())]);
     }
 
     #[test]

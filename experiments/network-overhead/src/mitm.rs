@@ -92,10 +92,14 @@ pub async fn run() -> Result<()> {
         cb = cb.pool_max_idle_per_host(0);
     }
     let client = cb.build()?;
-    let ledger = match crate::need("--ledger")?.as_str() {
+    let mut ledger = match crate::need("--ledger")?.as_str() {
         ":memory:" => Ledger::open_in_memory()?,
         p => Ledger::open(std::path::Path::new(p))?,
     };
+    if crate::flag("--batched") {
+        // As `wicket run` opens it since #62's fix: the process's batched audit writer.
+        ledger.start_audit_writer(None)?;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     // The run drains events to its console; here they are dropped.
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -124,8 +128,17 @@ pub async fn run() -> Result<()> {
 
 impl Mitm {
     fn emit(&self, ev: serde_json::Value) {
-        if let Ok(l) = self.ledger.lock() {
-            let _ = l.audit(&self.tenant, Some(&self.run), "op", &ev);
+        // As `RunCtx::emit`: with a writer, the lock is held only to clone it, and an allowed-by-reach
+        // row is queued without waiting; without one, the row is written (and fsynced) here.
+        let writer = self.ledger.lock().ok().and_then(|l| match l.audit_writer() {
+            Some(w) => Some(w),
+            None => {
+                let _ = l.audit(&self.tenant, Some(&self.run), "op", &ev);
+                None
+            }
+        });
+        if let Some(w) = writer {
+            let _ = w.submit(&self.tenant, Some(&self.run), "op", &ev);
         }
         let _ = self.events.send(ev);
     }

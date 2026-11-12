@@ -49,6 +49,8 @@ pub const IDENTITY_TYP: &str = "wicket-id+jwt";
 /// Tolerated clock difference between signer and verifier, in seconds.
 pub const CLOCK_SKEW: i64 = 60;
 pub const MESSAGE_TYP: &str = "wicket-msg+jwt";
+/// The JWS `typ` of a signed audit chain-head checkpoint (#91).
+pub const CHECKPOINT_TYP: &str = "wicket-audit-checkpoint+jwt";
 
 /// `spiffe://<trust domain>/t/<tenant>/z/<zone>/a/<agent>`.
 pub fn spiffe_id(trust_domain: &str, tenant: &str, zone: &str, agent: &str) -> String {
@@ -373,6 +375,25 @@ pub fn verify_envelope(jws: &str, issuer: &VerifyingKey, at: i64) -> Result<(Age
     let agent_key = VerifyingKey::from_bytes(&kb).map_err(|_| IdError::Malformed("cnf key"))?;
     let (_, payload) = jws_verify(jws, &agent_key)?;
     Ok((sender, payload))
+}
+
+// ---- audit checkpoints (#91) ----
+
+impl Issuer {
+    /// Signs an audit chain-head checkpoint (`seq`, `head`, `ts`, `iss`): a statement, kept outside
+    /// the control host, of what the ledger's chain was at that point.
+    pub fn sign_checkpoint(&self, payload: &Value) -> String {
+        jws_sign(&self.key, json!({ "alg": "EdDSA", "typ": CHECKPOINT_TYP, "kid": key_id(&self.verifying_key()) }), payload)
+    }
+}
+
+/// Verifies a checkpoint signed by [`Issuer::sign_checkpoint`]; returns its payload.
+pub fn verify_checkpoint(jws: &str, issuer: &VerifyingKey) -> Result<Value> {
+    let (header, payload) = jws_verify(jws, issuer)?;
+    if header.get("typ").and_then(|t| t.as_str()) != Some(CHECKPOINT_TYP) {
+        return Err(IdError::WrongType(CHECKPOINT_TYP));
+    }
+    Ok(payload)
 }
 
 // ---- compact JWS (EdDSA) ----
