@@ -26,8 +26,8 @@
 //! Test hooks: `WICKET_FEED_TTL_MS`, `WICKET_FEED_REFRESH_MS` and `WICKET_FEED_NARROW_MS` override the
 //! feed's timings (within the certificate's caps, which follow them).
 
-use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, Tunnels, TUNNEL_BIT};
-use crate::node::Node;
+use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf};
+use crate::nodecall::{Calls, Via};
 use crate::nodeauth::HsError;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
@@ -231,12 +231,14 @@ pub struct NodeBox {
 /// Stops and revokes a run's box on its node, connected or not (sent on the next connect).
 pub struct NodeCtl {
     node: String,
-    run: String,
+    pub run: String,
     link: Mutex<Option<chan::Out>>,
     publisher: Arc<SharedFeed>,
     /// The box's token's block 0 revocation id (hex), and until when it matters (Unix ms).
     token_root: (String, i64),
     killed: AtomicBool,
+    /// Calls on the box (pause, processes, exec, link sockets) over the run's connection.
+    pub calls: Arc<Calls>,
 }
 
 impl NodeCtl {
@@ -274,8 +276,10 @@ impl NodeCtl {
 }
 
 /// Everything about the run the connection manager needs.
-pub struct Start<'a> {
-    pub node: &'a Node,
+pub struct Start {
+    /// The node's name, and how to reach it.
+    pub node: String,
+    pub via: Via,
     pub tenant: TenantId,
     pub run: RunId,
     pub zone: ZoneSpec,
@@ -294,9 +298,8 @@ struct Shared {
     ledger: Arc<Mutex<Ledger>>,
     events: mpsc::UnboundedSender<wicket_proxy::Event>,
     streams: [u64; 3],
-    argv: Vec<String>,
+    via: Via,
     ctl: Arc<NodeCtl>,
-    tunnels: Tunnels,
     cfg: PublisherConfig,
     issuer: Arc<wicket_identity::Issuer>,
     /// The box's base token (block 0), and the key that signs its grant blocks.
@@ -305,8 +308,8 @@ struct Shared {
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
-pub async fn start(s: Start<'_>) -> Result<NodeBox> {
-    let name = s.node.name.clone().context("only enrolled nodes run `wicket node serve`")?;
+pub async fn start(s: Start) -> Result<NodeBox> {
+    let name = s.node.clone();
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
     let feed = Arc::new(SharedFeed::open(&name, cfg.clone())?);
@@ -358,14 +361,8 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
         publisher: feed,
         token_root,
         killed: AtomicBool::new(false),
+        calls: Arc::new(Calls::default()),
     });
-    let mut argv = s.node.ssh_prefix();
-    if argv[0] == "ssh" {
-        // Notice a dead link in about 15 s rather than minutes (ssh takes an option's first value, so
-        // these go before the defaults).
-        argv.splice(1..1, ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"].map(String::from));
-    }
-    argv.push("\"$HOME/.local/bin/wicket\" node attach".into());
     let shared = Arc::new(Shared {
         node: name.clone(),
         tenant: s.tenant,
@@ -375,9 +372,8 @@ pub async fn start(s: Start<'_>) -> Result<NodeBox> {
         ledger: s.ledger,
         events: s.events,
         streams: s.start.streams,
-        argv,
+        via: s.via,
         ctl: ctl.clone(),
-        tunnels: Tunnels::default(),
         cfg,
         issuer,
         token_issuer,
@@ -464,7 +460,7 @@ async fn manage(
     loop {
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
-        sh.tunnels.clear();
+        sh.ctl.calls.set_out(None);
         if p.exited {
             return;
         }
@@ -505,32 +501,21 @@ async fn session(
         p.ever = false;
         bail!("{why}: not reconnecting");
     }
-    let mut child = tokio::process::Command::new(&sh.argv[0])
-        .args(&sh.argv[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("starting the node channel (ssh)")?;
-    let mut to = child.stdin.take().expect("stdin");
-    let mut from = child.stdout.take().expect("stdout");
-    let errlog = {
-        let mut e = child.stderr.take().expect("stderr");
-        tokio::spawn(async move {
-            let mut s = String::new();
-            let _ = e.read_to_string(&mut s).await;
-            s
-        })
-    };
+    let d = sh.via.dial().await?;
+    let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
     let build = crate::nodesrv::build_id()?;
     let hello =
         |nonce| Msg::Hello { node: sh.node.clone(), version: env!("CARGO_PKG_VERSION").into(), build, observer: false, nonce, scope: sh.run.0.clone() };
     let authed = match crate::nodeauth::control(&mut from, &mut to, &sh.node, &sh.ledger, &sh.issuer, hello).await {
         Ok(a) => a,
         Err(HsError::NoAnswer) => {
-            let _ = child.start_kill();
-            let err = errlog.await.unwrap_or_default();
+            if let Some(c) = child.as_mut() {
+                let _ = c.start_kill();
+            }
+            let err = match errlog {
+                Some(e) => e.await.unwrap_or_default(),
+                None => String::new(),
+            };
             let err = err.trim().lines().last().unwrap_or("no error output").to_string();
             bail!("no answer from `wicket node serve` ({err}): is it installed and running? (`wicket node install {}`)", sh.node);
         }
@@ -590,6 +575,7 @@ async fn session(
     let head = sh.ledger.lock().expect("ledger").node_audit_head(&sh.node)?.map(|h| h.0).unwrap_or(0);
     send(Frame::Msg(Msg::AuditFrom { seq: head }));
     *sh.ctl.link.lock().expect("link") = Some(out_tx.clone());
+    sh.ctl.calls.set_out(Some(out_tx.clone()));
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis((sh.cfg.refresh_ms / 2).clamp(50, 1000) as u64));
     let mut grants = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -645,7 +631,9 @@ async fn session(
     };
     writer.abort();
     reader.abort();
-    let _ = child.start_kill();
+    if let Some(c) = child.as_mut() {
+        let _ = c.start_kill();
+    }
     result
 }
 
@@ -663,10 +651,9 @@ async fn on_frame(
     let send = |f: Frame| {
         let _ = out.send(f);
     };
+    // Tunnel bytes, and the answers to calls on boxes (pause, exec, link sockets).
+    let Some(f) = sh.ctl.calls.handle(f) else { return Ok(()) };
     match f {
-        Frame::Data { stream, bytes, .. } if stream & TUNNEL_BIT != 0 => {
-            sh.tunnels.data(stream, bytes);
-        }
         Frame::Data { stream, offset, bytes } => {
             let Some(i) = [1usize, 2].into_iter().find(|&i| sh.streams[i] == stream) else { return Ok(()) };
             let (fresh, gap) = accept_at(&mut p.next[i - 1], offset, &bytes);
@@ -745,12 +732,11 @@ async fn on_frame(
                 match conn {
                     Ok(c) => {
                         send(Frame::Msg(Msg::TunnelOpened { stream, error: None }));
-                        sh.tunnels.attach(stream, c, out.clone());
+                        sh.ctl.calls.tunnels.attach(stream, c, out.clone());
                     }
                     Err(e) => send(Frame::Msg(Msg::TunnelOpened { stream, error: Some(e) })),
                 }
             }
-            Msg::Close { stream } => sh.tunnels.close(stream),
             Msg::Audit { records } => {
                 let n = records.len();
                 if let Err(e) = sh.ledger.lock().expect("ledger").append_node_audit(&sh.node, &sh.tenant, &records) {

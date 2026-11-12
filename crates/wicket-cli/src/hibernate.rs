@@ -91,12 +91,6 @@ pub fn quiet(procs: &[(u32, u32, String)]) -> std::result::Result<(), Vec<String
     }
 }
 
-/// Checks a running box for a quiet point (see [`quiet`]).
-pub async fn check_quiet(docker: &wicket_sandbox::Docker, name: &str, user: &str) -> std::result::Result<(), String> {
-    let procs = docker.processes(name, user).await.map_err(|e| format!("{e:#}"))?;
-    quiet(&procs).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
-}
-
 /// Pushes an activation's trees as the agent's next bundle and commits it in the ledger. Returns the
 /// manifest, or None if this activation was superseded (its push is refused; the objects it wrote
 /// are orphans for GC).

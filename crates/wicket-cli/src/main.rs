@@ -14,8 +14,10 @@ mod enrol;
 mod hibernate;
 mod image;
 mod links;
+mod localnode;
 mod mock;
 mod node;
+mod nodecall;
 mod nodeauth;
 mod noderun;
 mod nodesrv;
@@ -450,6 +452,10 @@ enum NodeCmd {
         /// The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Exit after this many seconds with no boxes and no control connections (the built-in
+        /// local node's `serve`, started on demand).
+        #[arg(long, hide = true)]
+        idle_exit: Option<u64>,
     },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).
@@ -1246,7 +1252,7 @@ async fn main() -> Result<()> {
                 enrol::renew_ca(&name, hosts, humantime::parse_duration(&ca_ttl)?, humantime::parse_duration(&cert_ttl)?).await
             }
             NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
-            NodeCmd::Serve { dir } => nodesrv::serve(dir).await,
+            NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
