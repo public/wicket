@@ -157,6 +157,9 @@ enum Cmd {
         /// Grant a path prefix of the requested path instead of the exact path.
         #[arg(long)]
         prefix: Option<String>,
+        /// Don't ask for confirmation at a terminal (the request is printed either way).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Deny a pending request.
     Deny { id: String },
@@ -678,6 +681,16 @@ pub fn show_request(l: &Ledger, r: &wicket_store::Request) -> String {
     out
 }
 
+/// Asks the operator at the terminal; anything but y or yes is no.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
 /// One line for terminals.
 pub fn identity_line(v: &serde_json::Value) -> String {
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_string();
@@ -874,13 +887,19 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Approve { id, uses, unlimited, ttl, prefix } => {
+        Cmd::Approve { id, uses, unlimited, ttl, prefix, yes } => {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
             if ttl > Duration::from_secs(24 * 3600) {
                 bail!("grants are capped at 24h in the PoC");
             }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
+            // What is approved is what wicket recorded, shown before the grant exists: a hint printed
+            // from a node's or an agent's text can name the wrong request (#121).
+            print!("{}", show_request(&l, &req));
+            if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
+                bail!("not approved");
+            }
             let lease = capacity::lease_of_request(&l, &req)?;
             let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
             let gid = l.approve(&id, &a)?;

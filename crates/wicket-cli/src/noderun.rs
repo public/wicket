@@ -716,11 +716,18 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 }
 
 /// Raises (or finds) the pending request for an op the node asks about, if it is this run's.
+///
+/// The node is not trusted with what the human sees (#121): the op is rebuilt here from its method,
+/// host and canonical path, its risk is the control host's own classification (raised, never
+/// lowered, by the node's, which saw the query), and only egress asks outside wicket's own approval
+/// namespace are taken (#117).
 fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_json::Value>) -> Msg {
     let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
-    if run != sh.run.0 || op.run != sh.run || op.tenant != sh.tenant || op.zone != sh.zone.name {
-        return reply(None, None, Some(format!("not an op of run {}", sh.run)));
-    }
+    let op = match node_op(sh, run, op) {
+        Ok(op) => op,
+        Err(e) => return reply(None, None, Some(e)),
+    };
+    let op = &op;
     let l = sh.ledger.lock().expect("ledger");
     if let Ok(Some(rid)) = l.denied_recently(op) {
         return reply(None, Some(rid), None);
@@ -729,6 +736,37 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, why: &str, who: Option<&serde_j
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
+}
+
+/// The op a node asks about, as the control host classifies it; refused if it isn't this run's, isn't
+/// egress, isn't canonical, or is in wicket's own namespace.
+fn node_op(sh: &Shared, run: &str, op: &Op) -> Result<Op, String> {
+    check_node_op(&sh.tenant, &sh.run, &sh.zone.name, run, op)
+}
+
+pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone: &str, run: &str, op: &Op) -> Result<Op, String> {
+    if run != own.0 || op.run != *own || op.tenant != *tenant || op.zone != zone {
+        return Err(format!("not an op of run {own}"));
+    }
+    if op.surface != wicket_core::Surface::Egress {
+        return Err("a node asks only about egress".into());
+    }
+    match wicket_core::canonical_path(&op.path) {
+        Ok(p) if p == op.path => {}
+        _ => return Err("not requested: the path is not canonical".into()),
+    }
+    let mut fresh = Op::egress(tenant, own, zone, &op.method, &op.host, &op.path);
+    if fresh.method != op.method || fresh.host != op.host {
+        return Err("not requested: the method or host is not canonical".into());
+    }
+    if let Some(why) = fresh.refused_for_agents() {
+        return Err(format!("not requested: {why}"));
+    }
+    if op.risk > fresh.risk {
+        fresh.risk = op.risk;
+        fresh.effects.extend(op.effects.iter().map(|e| wicket_core::text::clip(e, 120)));
+    }
+    Ok(fresh)
 }
 
 /// Publishes grants approved for this run's requests to hosts the node terminates (and hands them
@@ -870,4 +908,38 @@ pub fn tar_dir(dir: &Path) -> Result<Vec<u8>> {
         bail!("the workspace is too large to send to a node ({} bytes)", out.stdout.len());
     }
     Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wicket_core::RiskClass;
+
+    /// #121, #117: what a node asks about is rebuilt and classified on the control host.
+    #[test]
+    fn a_node_cannot_choose_what_its_ask_shows() {
+        let (t, run) = (TenantId::single(), RunId("run_a".into()));
+        let check = |op: &Op| check_node_op(&t, &run, "z", "run_a", op);
+        let egress = |m: &str, h: &str, p: &str| Op::egress(&t, &run, "z", m, h, p);
+
+        // An R4 push labelled R1 by the node is shown as R4.
+        let mut push = egress("POST", "github.com", "/acme/app.git/git-receive-pack");
+        assert_eq!(push.risk, RiskClass::R4ExecOrPrivilege);
+        push.risk = RiskClass::R1ReadScoped;
+        push.effects.clear();
+        assert_eq!(check(&push).unwrap().risk, RiskClass::R4ExecOrPrivilege);
+        // A node can raise the risk (it saw the query), never lower it.
+        let mut read = egress("GET", "api.example.com", "/x");
+        read.risk = RiskClass::R3ExternalOrIrreversible;
+        assert_eq!(check(&read).unwrap().risk, RiskClass::R3ExternalOrIrreversible);
+        // Not this run's, not egress, not canonical, or in wicket's own namespace: refused.
+        assert!(check(&Op { run: RunId("run_b".into()), ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&Op { surface: wicket_core::Surface::Llm, ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&egress("GET", "api.example.com", "/a/../admin")).is_err());
+        assert!(check(&Op { method: "get\u{1b}[2K".into(), ..egress("GET", "api.example.com", "/x") }).is_err());
+        assert!(check(&egress("SPAWN", "wicket.internal", "/zones/z.x/0123")).is_err());
+        assert!(check(&egress("CAPACITY", "api.example.com", "/capacity/l-1")).is_err());
+        assert!(check(&egress("PROPFIND", "api.example.com", "/x")).is_err());
+        assert!(check(&egress("GET", "x.wicket.internal", "/")).is_err());
+    }
 }
