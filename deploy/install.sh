@@ -84,8 +84,13 @@ if [ "$skip_gvisor" = 0 ]; then
         curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
         echo "deb [arch=$arch signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             >/etc/apt/sources.list.d/gvisor.list
-        apt-get update -q
-        apt-get install -y -q runsc >/dev/null
+        # gVisor's repository is sometimes caught mid-sync ("File has unexpected size"): retry.
+        for i in 1 2 3 4; do
+            if apt-get update -q && apt-get install -y -q runsc >/dev/null; then break; fi
+            [ "$i" = 4 ] && die "installing gVisor failed"
+            say "installing gVisor failed (attempt $i), retrying in $((i * 20)) s"
+            sleep $((i * 20))
+        done
     fi
     # Register runsc with --host-uds=open (boxes reach wicket only through unix sockets), keeping
     # whatever else daemon.json already says.

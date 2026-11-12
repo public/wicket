@@ -79,7 +79,16 @@ fn send_file(w: &mut impl Write, role: &str, rel: &str, path: &Path, mode: u32) 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn entry(w: &mut impl Write, role: &str, path: &str, kind: &str, mode: u32, target: Option<String>, data: &[u8], append: bool) -> Result<()> {
+fn entry(
+    w: &mut impl Write,
+    role: &str,
+    path: &str,
+    kind: &str,
+    mode: u32,
+    target: Option<String>,
+    data: &[u8],
+    append: bool,
+) -> Result<()> {
     let e = Entry { role: role.into(), path: path.into(), kind: kind.into(), mode, target, append };
     proto::write_frame(w, proto::kind::UPLOAD, &proto::upload_frame(&e, data)?)
 }
@@ -348,10 +357,7 @@ mod tests {
     #[test]
     fn a_manifest_keeps_its_program_beside_it() {
         assert_eq!(manifest_layout("task.yaml", None).unwrap(), (PathBuf::from("m/task.yaml"), None));
-        assert_eq!(
-            manifest_layout("task.yaml", Some("src")).unwrap(),
-            (PathBuf::from("m/task.yaml"), Some(PathBuf::from("m/src")))
-        );
+        assert_eq!(manifest_layout("task.yaml", Some("src")).unwrap(), (PathBuf::from("m/task.yaml"), Some(PathBuf::from("m/src"))));
         assert_eq!(
             manifest_layout("p.yaml", Some("../../programs/x")).unwrap(),
             (PathBuf::from("m/d0/d1/p.yaml"), Some(PathBuf::from("m/programs/x")))

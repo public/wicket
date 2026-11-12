@@ -352,7 +352,7 @@ refreshed, in case an agent's environment is compromised or a key is exfiltrated
 
   Revocation cascades to everything the run started, because children act on its authority.
 - **The installation's root key is the remaining long-lived secret.** In the PoC it's a 0600 file
-  readable by the operator's user. Production splits it: the root stays offline or in a TPM/KMS and only
+  owned by the `wicket` system user (#12), or by the operator's user in development mode. Production splits it: the root stays offline or in a TPM/KMS and only
   certifies short-lived *issuing* keys, rotated daily or faster. `wicket run` never sees the root.
 - **Agent keys never enter the box,** so compromising the box itself doesn't expose a key. Rotation
   covers the other paths: memory of the runner process, logs, a compromised host.
@@ -404,7 +404,27 @@ Also built since then:
 
 Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
 name-constrained node CA (see the README). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
-for an mTLS transport, the separate system user, root and issuing key separation, and federation with other installations.
+for an mTLS transport, root and issuing key separation, and federation with other installations.
+
+Built since (#12): **wicket as its own system user.** `wicketd` (`wicket daemon`) runs as `wicket`, which owns the
+data directory (ledger, vault, issuer key, CA, feed and authz keys, run directories and their sockets; 0700) and
+is the only member of the `docker` group. Other users reach wicket only through its socket, which:
+- names the caller by `SO_PEERCRED`/`SO_PEERGROUPS`;
+- parses the command line again with the CLI's own definition and sorts it into read, run, revoke or privileged
+  (an exhaustive match, so a new command doesn't compile until it is sorted);
+- lets the policy (`/etc/wicket/wicketd.yaml`, default the `wicket-operators` group) grant read, run and revoke,
+  and keeps privileged commands (approve, deny, secrets, passkey enrolment, nodes, spending, image builds) for
+  root over the socket, the host break-glass. Anyone else approves in the console with a passkey;
+- runs the command as `wicket` with the caller's stdin, stdout and stderr (passed as `SCM_RIGHTS`), and sets the
+  run's principal (`assurance: unix-peercred`) and the operator name in the ledger from the peer credentials.
+  Files the caller names (manifest, program source, `--workdir`) arrive as content, so the `wicket` user never
+  reads a path a caller merely names. A directory mounted in place must be the caller's own, passed open, and
+  neither inside nor above the data directory. Internal arguments (`--run-id`, `--parent-run`, `--lease`) are
+  refused, and refusals are audited.
+
+Without the daemon, the CLI keeps the single-user behaviour (development mode, labelled insecure by `wicket
+doctor`). The console runs as `wicket` too, under its own unit, with direct access to the ledger: it is not yet
+the untrusted front end of §14.1.3, which would talk to wicketd over this socket.
 
 **Node identity (#16, built).** Nodes get short-lived identity certificates, and the control channel
 authenticates both ends whatever carries it:

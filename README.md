@@ -233,7 +233,55 @@ a pass at once; everything else (lease ends, approvals on the console) waits for
 - So killing every control-plane process mid-run and restarting leaves no orphaned machine or box after one
   pass. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).
 
-## Requirements
+## Install
+
+A control host runs wicket as its own system user: `wicketd` (`wicket daemon`), the console and the reconciler
+run as `wicket`, which owns the data (`/var/lib/wicket`, mode 0700: ledger, vault, issuer key, runs and their
+sockets) and is the only user in the `docker` group. Operators run the usual `wicket` commands, which go to the
+daemon over `/run/wicket/wicketd.sock` (#12):
+
+- the daemon knows each caller from the kernel (`SO_PEERCRED`), not from anything the caller says, and lets the
+  `wicket-operators` group read state, start and steer runs, and revoke (`/etc/wicket/wicketd.yaml`);
+- **approving, denying, secrets, passkey enrolment, nodes and spending need root** (`sudo wicket approve ...`, the
+  host break-glass) **or a passkey in the console**. An agent session running as the operator's own user can't
+  reach a run's sockets, read the ledger or approve anything;
+- runs started through the daemon carry the caller as their principal (`<user>, via cli, assurance
+  unix-peercred`), and decisions record who made them.
+
+On a fresh Ubuntu 24.04 (or Debian 12) host, from a release (or a checkout with `cargo build --release -p
+wicket-cli`):
+
+```sh
+curl -fsSLO https://github.com/public/wicket/releases/download/v0.0.1/wicket-0.0.1-x86_64-linux.tar.gz
+curl -fsSLO https://github.com/public/wicket/releases/download/v0.0.1/wicket-0.0.1-x86_64-linux.tar.gz.sha256
+sha256sum -c wicket-0.0.1-x86_64-linux.tar.gz.sha256 && tar xzf wicket-0.0.1-x86_64-linux.tar.gz
+sudo wicket-0.0.1-x86_64-linux/deploy/install.sh        # --help for its options
+sudo wicket secret set claude-oauth                      # the one secret: a token from `claude setup-token`
+wicket doctor                                            # as yourself, after logging in again (new group)
+```
+
+`deploy/install.sh` installs Docker and gVisor (registered as `runsc` with `--host-uds=open`), creates the `wicket`
+user and the `wicket-operators` group (adding you, and taking you out of `docker`, which is root on the host),
+installs the binary, the policy, the console's options (`/etc/wicket/console.env`) and systemd units for
+`wicketd`, `wicket-console` and `wicket-reconcile`, sets up the identity issuer (`--trust-domain`) and builds the
+agent image. It can be run again safely. `wicket doctor` checks all of it: the daemon and its socket, that you
+can't read the data or reach Docker, the data's owner and mode, Docker and runsc's arguments, the image, the
+issuer, the vault, the console's origin and whether it is up, and the placement backend's credentials.
+
+- Enrol a passkey for the console: `sudo wicket operator enrol-link --origin http://localhost:8787` (the console
+  doesn't print one in its log, which operators may be able to read).
+- `--workspace-dir` (and `wrap`, which mounts its launcher's directory) mount a directory you own in place. The
+  `wicket` user needs to reach it: `setfacl -m u:wicket:x ~ && setfacl -R -m u:wicket:rwX,d:u:wicket:rwX DIR`.
+  Manifests, `--workdir` and programs' sources are sent to the daemon as content.
+- Restarting `wicketd` stops the runs started through it (each stops its box); console-started runs survive a
+  console restart.
+- Without the daemon (no socket), `wicket` works as one user, as below: **development mode**, which `wicket
+  doctor` reports as insecure (anything running as that user can reach run sockets, read the ledger and approve).
+
+Releases are built by `.github/workflows/release.yml` on a `v*` tag matching the workspace version (binary,
+`deploy/`, `images/`; SHA-256 alongside).
+
+## Requirements (development mode)
 
 Linux with Docker and gVisor (`runsc`) registered as a Docker runtime with `--host-uds=open`:
 

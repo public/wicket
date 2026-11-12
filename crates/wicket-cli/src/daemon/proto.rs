@@ -143,7 +143,7 @@ pub fn parse_upload(p: &[u8]) -> Result<(Entry, &[u8])> {
 
 /// Sends one byte with `fds` attached.
 pub fn send_fds(s: &UnixStream, fds: &[RawFd]) -> Result<()> {
-    let byte = [b'F'];
+    let byte = b"F";
     let mut iov = libc::iovec { iov_base: byte.as_ptr() as *mut libc::c_void, iov_len: 1 };
     let fd_bytes = std::mem::size_of_val(fds);
     // SAFETY: CMSG_SPACE is a pure computation.
@@ -230,9 +230,8 @@ pub fn peer(s: &UnixStream) -> Result<Peer> {
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: getsockopt writes at most `len` bytes into `cred`.
-    let r = unsafe {
-        libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len)
-    };
+    let r =
+        unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len) };
     if r != 0 {
         return Err(std::io::Error::last_os_error()).context("SO_PEERCRED");
     }
@@ -240,9 +239,8 @@ pub fn peer(s: &UnixStream) -> Result<Peer> {
     let mut buf = vec![0 as libc::gid_t; 256];
     let mut glen = std::mem::size_of_val(buf.as_slice()) as libc::socklen_t;
     // SAFETY: as above, into a gid_t buffer of `glen` bytes.
-    let r = unsafe {
-        libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERGROUPS, buf.as_mut_ptr() as *mut libc::c_void, &mut glen)
-    };
+    let r =
+        unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERGROUPS, buf.as_mut_ptr() as *mut libc::c_void, &mut glen) };
     if r == 0 {
         buf.truncate(glen as usize / std::mem::size_of::<libc::gid_t>());
         gids.extend(buf);

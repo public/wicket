@@ -112,10 +112,13 @@ fn system_checks(r: &mut Report, me: u32, socket: &Path) {
         }
     }
     match std::fs::metadata(socket) {
-        Ok(m) if m.file_type().is_socket() => r.good(format!("wicketd socket {}: ours, mode {:o}", socket.display(), m.permissions().mode() & 0o777)),
+        Ok(m) if m.file_type().is_socket() => {
+            r.good(format!("wicketd socket {}: ours, mode {:o}", socket.display(), m.permissions().mode() & 0o777))
+        }
         _ => r.bad(format!("wicketd socket {}: NOT OK: not a socket", socket.display())),
     }
-    match std::fs::read_to_string(daemon::policy::POLICY_PATH).map_err(anyhow::Error::from).and_then(|s| daemon::policy::Policy::parse(&s)) {
+    match std::fs::read_to_string(daemon::policy::POLICY_PATH).map_err(anyhow::Error::from).and_then(|s| daemon::policy::Policy::parse(&s))
+    {
         Ok(p) => r.good(format!(
             "policy {}: read [{}], run [{}], revoke [{}]; approving needs root or a passkey",
             daemon::policy::POLICY_PATH,
@@ -179,10 +182,9 @@ fn placement(r: &mut Report, v: &Vault) {
             (crate::capacity::Backend::Vultr, Some(vs)) if v.has(&vs.api_key_secret) => {
                 r.good(format!("placement: vultr, API key secret {:?} present (not called)", vs.api_key_secret))
             }
-            (crate::capacity::Backend::Vultr, Some(vs)) => r.bad(format!(
-                "placement: vultr, NOT OK: no secret {:?} (sudo wicket secret set {})",
-                vs.api_key_secret, vs.api_key_secret
-            )),
+            (crate::capacity::Backend::Vultr, Some(vs)) => {
+                r.bad(format!("placement: vultr, NOT OK: no secret {:?} (sudo wicket secret set {})", vs.api_key_secret, vs.api_key_secret))
+            }
             (crate::capacity::Backend::Vultr, None) => r.bad("placement: vultr, NOT OK: no vultr: settings"),
             (crate::capacity::Backend::Static, _) => r.good(format!("placement: static, {} host(s)", c.static_hosts.len())),
         },
@@ -211,8 +213,11 @@ async fn console(r: &mut Report, l: &Ledger, system: bool) {
     };
     match crate::serve::describe(&opts) {
         Ok((origin, rp_id, how, addr)) => {
-            let up = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await.is_ok_and(|c| c.is_ok());
-            let line = format!("console: {origin} (passkeys for {rp_id}; {how}; listening on {addr}: {})", if up { "up" } else { "not running" });
+            let up = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .is_ok_and(|c| c.is_ok());
+            let line =
+                format!("console: {origin} (passkeys for {rp_id}; {how}; listening on {addr}: {})", if up { "up" } else { "not running" });
             if system && !up {
                 r.bad(format!("{line}; sudo systemctl status wicket-console"));
             } else {
@@ -228,10 +233,9 @@ async fn console(r: &mut Report, l: &Ledger, system: bool) {
         Err(e) => r.bad(format!("console: NOT OK ({e:#})")),
     }
     match l.operator_credentials(&wicket_core::TenantId::single()) {
-        Ok(c) if c.is_empty() => r.good(format!(
-            "  no passkey enrolled yet: {}wicket operator enrol-link --origin ORIGIN",
-            if system { "sudo " } else { "" }
-        )),
+        Ok(c) if c.is_empty() => {
+            r.good(format!("  no passkey enrolled yet: {}wicket operator enrol-link --origin ORIGIN", if system { "sudo " } else { "" }))
+        }
         Ok(c) => r.good(format!("  {} passkey(s) enrolled", c.len())),
         Err(e) => r.bad(format!("  passkeys: NOT OK ({e})")),
     }

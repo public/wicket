@@ -189,7 +189,14 @@ impl Daemon {
                 return refuse(&mut w, &format!("{e:#}"));
             }
         }
-        eprintln!("wicketd: uid {} ({}) {}: {} [{}]", peer.uid, peer.user, class.name(), words(&hello.argv), plan.argv.first().map(String::as_str).unwrap_or(""));
+        eprintln!(
+            "wicketd: uid {} ({}) {}: {} [{}]",
+            peer.uid,
+            peer.user,
+            class.name(),
+            words(&hello.argv),
+            plan.argv.first().map(String::as_str).unwrap_or("")
+        );
         let code = self.run_child(&plan, fds, &hello, &mut r)?;
         drop(plan.stage.take());
         proto::write_frame(&mut w, kind::EXIT, &code.to_be_bytes())?;
@@ -285,7 +292,8 @@ impl Daemon {
             Cmd::Wrap { image, argv: agent, .. } => {
                 let (st, mp) = stage_for(false)?;
                 let cwd = dir.context("a wrapped agent works in its launcher's directory, which must be passed open")?;
-                let mut argv = vec!["wrap".to_string(), "--manifest".into(), mp.display().to_string(), "--image".into(), image.clone(), "--".into()];
+                let mut argv =
+                    vec!["wrap".to_string(), "--manifest".into(), mp.display().to_string(), "--image".into(), image.clone(), "--".into()];
                 argv.extend(agent.iter().cloned());
                 Plan { argv, cwd, stage: Some(st), caller }
             }
@@ -306,7 +314,12 @@ impl Daemon {
             bail!("the directory passed has no path ({})", path.display());
         }
         if *basis == Basis::Policy && m.uid() != peer.uid {
-            bail!("{} is owned by uid {}, not by you (uid {}): only your own directories can be mounted into a box", path.display(), m.uid(), peer.uid);
+            bail!(
+                "{} is owned by uid {}, not by you (uid {}): only your own directories can be mounted into a box",
+                path.display(),
+                m.uid(),
+                peer.uid
+            );
         }
         if path == Path::new("/") || path.starts_with(&self.data_dir) || self.data_dir.starts_with(&path) {
             bail!("{} can't be mounted into a box: it is, or holds, wicket's data", path.display());

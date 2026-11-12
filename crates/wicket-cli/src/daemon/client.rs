@@ -57,7 +57,8 @@ pub async fn forward(sock: &Path, cmd: &Cmd) -> Result<i32> {
 
 /// [`forward`], with the command line and the stdio fds given.
 pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32; 3]) -> Result<i32> {
-    let s = UnixStream::connect(sock).with_context(|| format!("connecting to wicketd at {} (sudo systemctl status wicketd)", sock.display()))?;
+    let s = UnixStream::connect(sock)
+        .with_context(|| format!("connecting to wicketd at {} (sudo systemctl status wicketd)", sock.display()))?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
     // stdin: a secret is read here, where the terminal is, and handed over through a pipe.
@@ -174,11 +175,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
 
 fn open_dir(d: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(d)
-        .with_context(|| format!("opening {}", d.display()))
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(d).with_context(|| format!("opening {}", d.display()))
 }
 
 /// `wicket doctor`'s checks from the caller's side: what the caller must *not* be able to do.

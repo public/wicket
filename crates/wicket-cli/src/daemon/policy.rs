@@ -93,11 +93,9 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List => Forward(Read),
-            NodeCmd::Token { .. }
-            | NodeCmd::Enrol { .. }
-            | NodeCmd::Revoke { .. }
-            | NodeCmd::RenewCa { .. }
-            | NodeCmd::Install { .. } => Forward(Privileged),
+            NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
+                Forward(Privileged)
+            }
             NodeCmd::Serve { .. } | NodeCmd::Attach { .. } => Local,
         },
         // Spends money after a terminal prompt.
@@ -207,9 +205,7 @@ pub fn authorize(peer: &Peer, class: Class, policy: &Policy, daemon_uid: u32) ->
         ));
     };
     let user_ok = g.users.iter().any(|u| *u == peer.user || u.parse::<u32>().ok() == Some(peer.uid));
-    let group_ok = g.groups.iter().any(|want| {
-        peer.groups.iter().any(|(gid, name)| want == name || want.parse::<u32>().ok() == Some(*gid))
-    });
+    let group_ok = g.groups.iter().any(|want| peer.groups.iter().any(|(gid, name)| want == name || want.parse::<u32>().ok() == Some(*gid)));
     if user_ok || group_ok {
         Ok(Basis::Policy)
     } else {
