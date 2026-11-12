@@ -43,6 +43,11 @@ fn zone() -> ZoneSpec {
 
 /// The origins: `h3.test` speaks HTTP/3 (UDP) and HTTP/1.1 (TCP) on one port, `h1only.test`
 /// HTTP/1.1 only. Each answers with how it was reached.
+/// `/allowed/bytes/N` asks an origin for N bytes.
+fn bytes_of(path: &str) -> Option<usize> {
+    path.strip_prefix("/allowed/bytes/")?.parse().ok()
+}
+
 async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
     let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
     let both = udp.local_addr().unwrap();
@@ -67,9 +72,21 @@ async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
                             n += b.remaining();
                         }
                         let auth = req.headers().get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
-                        let body = format!("h3 {} {} body={n} auth={auth}", req.method(), req.uri().path());
                         let _ = s.send_response(http::Response::builder().status(200).body(()).unwrap()).await;
-                        let _ = s.send_data(Bytes::from(body)).await;
+                        if let Some(size) = bytes_of(req.uri().path()) {
+                            let block = Bytes::from(vec![b'x'; 64 * 1024]);
+                            let mut left = size;
+                            while left > 0 {
+                                let k = left.min(block.len());
+                                if s.send_data(block.slice(..k)).await.is_err() {
+                                    return;
+                                }
+                                left -= k;
+                            }
+                        } else {
+                            let body = format!("h3 {} {} body={n} auth={auth}", req.method(), req.uri().path());
+                            let _ = s.send_data(Bytes::from(body)).await;
+                        }
                         let _ = s.finish().await;
                     });
                 }
@@ -90,9 +107,11 @@ async fn origins(ca: &RunCa) -> HashMap<String, SocketAddr> {
                         let m = req.method().clone();
                         let p = req.uri().path().to_string();
                         let n = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
-                        Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(Bytes::from(format!(
-                            "h1 {m} {p} body={n}"
-                        )))))
+                        let body = match bytes_of(&p) {
+                            Some(size) => Bytes::from(vec![b'x'; size]),
+                            None => Bytes::from(format!("h1 {m} {p} body={n}")),
+                        };
+                        Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(body)))
                     });
                     let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
                 });
@@ -111,6 +130,10 @@ struct World {
 
 impl World {
     async fn new(stream: bool, opts: Options) -> World {
+        World::with_relay(stream, opts, None).await
+    }
+
+    async fn with_relay(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Relay>>) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca).await;
@@ -132,7 +155,7 @@ impl World {
         };
         let run_ca = Arc::new(RunCa::generate("run_h3").unwrap());
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false };
-        let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(Central), None, up).unwrap();
+        let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(Central), relay, up).unwrap();
         let h3 = H3::new(egress, opts).unwrap();
         let sock = dir.join("udp.sock");
         let s2 = sock.clone();
@@ -294,6 +317,48 @@ impl FakeBox {
 }
 
 fn client(w: &World) -> quinn::Endpoint {
+    client_with(w, None, false)
+}
+
+/// A server certificate verifier that accepts anything (to test what wicket refuses by itself).
+#[derive(Debug)]
+struct AnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A client endpoint: `mtu` raises its MTU bound (and advertised datagram size) as the box would
+/// for `WICKET_H3_BOX_MTU`; `any_cert` skips certificate verification.
+fn client_with(w: &World, mtu: Option<u16>, any_cert: bool) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     for c in rustls::pki_types::pem::PemObject::pem_slice_iter(w.run_ca.cert_pem().as_bytes()) {
         roots.add(c.unwrap()).unwrap();
@@ -305,8 +370,24 @@ fn client(w: &World) -> quinn::Endpoint {
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.enable_early_data = true;
-    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap())));
+    if any_cert {
+        tls.dangerous().set_certificate_verifier(Arc::new(AnyCert));
+    }
+    let mut ep_cfg = quinn::EndpointConfig::default();
+    let mut t = quinn::TransportConfig::default();
+    if let Some(m) = mtu {
+        ep_cfg.max_udp_payload_size(m).unwrap();
+        let mut d = quinn::MtuDiscoveryConfig::default();
+        d.upper_bound(m);
+        t.mtu_discovery_config(Some(d));
+    }
+    t.stream_receive_window((8u32 << 20).into());
+    t.receive_window((16u32 << 20).into());
+    let mut cc = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap()));
+    cc.transport_config(Arc::new(t));
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut ep = quinn::Endpoint::new(ep_cfg, None, sock, Arc::new(quinn::TokioRuntime)).unwrap();
+    ep.set_default_client_config(cc);
     ep
 }
 
@@ -317,22 +398,36 @@ async fn get(ep: &quinn::Endpoint, to: SocketAddr, sni: &str, method: &str, url:
 }
 
 async fn request(conn: &quinn::Connection, method: &str, url: &str) -> anyhow::Result<(u16, String, Option<String>)> {
+    let (st, body, xw) = request_body(conn, method, url, if method == "POST" { 12 } else { 0 }).await?;
+    Ok((st, String::from_utf8_lossy(&body).into(), xw))
+}
+
+/// One request with `upload` bytes of body; (status, body, x-wicket).
+async fn request_body(conn: &quinn::Connection, method: &str, url: &str, upload: usize) -> anyhow::Result<(u16, Vec<u8>, Option<String>)> {
     let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await?;
     tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
     let mut s = send.send_request(http::Request::builder().method(method).uri(url).body(())?).await?;
-    if method == "POST" {
+    if upload == 12 {
         s.send_data(Bytes::from_static(b"twelve bytes")).await?;
+    } else if upload > 0 {
+        let block = Bytes::from(vec![b'u'; 64 * 1024]);
+        let mut left = upload;
+        while left > 0 {
+            let k = left.min(block.len());
+            s.send_data(block.slice(..k)).await?;
+            left -= k;
+        }
     }
     s.finish().await?;
-    let r = tokio::time::timeout(Duration::from_secs(10), s.recv_response()).await??;
+    let r = tokio::time::timeout(Duration::from_secs(30), s.recv_response()).await??;
     let mut body = Vec::new();
     while let Some(mut b) = s.recv_data().await? {
         body.extend_from_slice(&b.copy_to_bytes(b.remaining()));
     }
     let xw = r.headers().get("x-wicket").map(|v| v.to_str().unwrap().to_string());
-    Ok((r.status().as_u16(), String::from_utf8_lossy(&body).into(), xw))
+    Ok((r.status().as_u16(), body, xw))
 }
 
 fn egress_events(w: &World) -> Vec<(String, String, String, String)> {
@@ -460,4 +555,131 @@ async fn quic_to_an_address_wicket_never_handed_out_is_refused() {
     let to = b.relay_to(Ipv4Addr::new(198, 19, 200, 1));
     let ep = client(&w);
     assert!(get(&ep, to, "h3.test", "GET", "https://h3.test/allowed/a").await.is_err());
+}
+
+/// Several MB each way, so quinn's batches (GSO frames to the box) and the stream link's framing
+/// carry real traffic; with the box MTU raised, the path MTU climbs past 1452 and nothing is lost.
+async fn bulk(stream: bool, mtu: Option<u16>) {
+    let w = World::new(stream, Options { box_mtu: mtu, ..Options::default() }).await;
+    let b = FakeBox::connect(&w, stream);
+    let (b, ip) = tokio::task::spawn_blocking(move || {
+        let ip = b.resolve("h3.test").unwrap();
+        (b, ip)
+    })
+    .await
+    .unwrap();
+    let to = b.relay_to(ip);
+    let ep = client_with(&w, mtu, false);
+    // One connection per request: `request_body` opens an HTTP/3 session and ends it.
+    let size = 6 << 20;
+    for _ in 0..2 {
+        let conn = ep.connect(to, "h3.test").unwrap().await.unwrap();
+        let (st, body, _) = request_body(&conn, "GET", &format!("https://h3.test/allowed/bytes/{size}"), 0).await.unwrap();
+        assert_eq!(st, 200);
+        assert_eq!(body.len(), size, "the whole download arrives");
+        assert!(body.iter().all(|&c| c == b'x'));
+    }
+    let up = 3 << 20;
+    let conn = ep.connect(to, "h3.test").unwrap().await.unwrap();
+    let (st, body, _) = request_body(&conn, "POST", "https://h3.test/allowed/up", up).await.unwrap();
+    assert_eq!(st, 200);
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert!(body.contains(&format!("POST /allowed/up body={up}")), "{body}");
+    // The path MTU, read while a connection is open (a closed one reports the initial 1200): one
+    // more download, with the HTTP/3 session kept until after the reading.
+    let conn = ep.connect(to, "h3.test").unwrap().await.unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await.unwrap();
+    tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let mut s = send.send_request(http::Request::get(format!("https://h3.test/allowed/bytes/{size}")).body(()).unwrap()).await.unwrap();
+    s.finish().await.unwrap();
+    s.recv_response().await.unwrap();
+    let mut got = 0;
+    while let Some(b) = s.recv_data().await.unwrap() {
+        got += b.remaining();
+    }
+    assert_eq!(got, size);
+    let mtu_now = conn.stats().path.current_mtu;
+    match mtu {
+        Some(m) => assert!(mtu_now > 1452 && mtu_now <= m, "path MTU {mtu_now} with a {m} bound"),
+        None => assert!(mtu_now <= 1452, "path MTU {mtu_now}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn megabytes_each_way_over_seqpacket() {
+    bulk(false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn megabytes_each_way_over_a_stream_socket() {
+    bulk(true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn megabytes_each_way_with_the_box_mtu_raised() {
+    bulk(false, Some(16000)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_name_other_than_the_addresss_host_is_refused_even_unverified() {
+    let w = World::new(false, Options::default()).await;
+    let b = FakeBox::connect(&w, false);
+    let (b, ip) = tokio::task::spawn_blocking(move || {
+        let ip = b.resolve("h3.test").unwrap();
+        let _ = b.resolve("h1only.test").unwrap();
+        (b, ip)
+    })
+    .await
+    .unwrap();
+    let to = b.relay_to(ip);
+    let ep = client_with(&w, None, true);
+    // Without wicket's check this would reach the request stage (and get a 421); with it, the
+    // connection is closed before any request.
+    assert!(get(&ep, to, "h1only.test", "GET", "https://h1only.test/x").await.is_err());
+    let ev = egress_events(&w);
+    assert!(ev.iter().any(|(m, h, _, d)| m == "QUIC" && h == "h3.test" && d.contains("server name (h1only.test)")), "{ev:?}");
+    // The right name still works with the same unverifying client.
+    assert_eq!(get(&ep, to, "h3.test", "GET", "https://h3.test/allowed/a").await.unwrap().0, 200);
+}
+
+/// A node's relay that forwards `h1only.test` to the control host and terminates the rest.
+struct NodeRelay;
+
+impl wicket_proxy::egress::Relay for NodeRelay {
+    fn route(&self, host: &str) -> wicket_proxy::decide::Route {
+        if host == "h1only.test" {
+            wicket_proxy::decide::Route::Forward("the zone injects a credential for this host".into())
+        } else {
+            wicket_proxy::decide::Route::Terminate
+        }
+    }
+    fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn wicket_proxy::egress::RelayStream>>> {
+        Box::pin(async { Err(std::io::Error::other("no control host in this test")) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_node_forwarded_hosts_refuse_http3_and_say_why() {
+    let w = World::with_relay(false, Options::default(), Some(Arc::new(NodeRelay))).await;
+    let b = FakeBox::connect(&w, false);
+    let b1 = FakeBox::connect(&w, false);
+    let (b, b1, ip, ip1) = tokio::task::spawn_blocking(move || {
+        let ip = b.resolve("h3.test").unwrap();
+        let ip1 = b.resolve("h1only.test").expect("forwarded hosts still resolve (TCP through the proxy reaches them)");
+        (b, b1, ip, ip1)
+    })
+    .await
+    .unwrap();
+    let to = b.relay_to(ip);
+    let to1 = b1.relay_to(ip1);
+    let ep = client(&w);
+    assert_eq!(get(&ep, to, "h3.test", "GET", "https://h3.test/allowed/a").await.unwrap().0, 200);
+    assert!(get(&ep, to1, "h1only.test", "GET", "https://h1only.test/x").await.is_err());
+    let ev = egress_events(&w);
+    assert!(
+        ev.iter().any(|(m, h, o, d)| m == "QUIC" && h == "h1only.test" && o == "forbidden" && d.contains("isn't served on this node")),
+        "{ev:?}"
+    );
 }

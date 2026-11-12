@@ -26,8 +26,10 @@
 //!   up measured faster still (545–573 Mbit/s at 60000) but added ~60 ms to the first request on a
 //!   new connection, unexplained; 16000 is the value to use.
 //!
-//! On a remote node, hosts the node forwards to the control host (`decide::route`) aren't served
-//! over HTTP/3: their requests get a 403 that says to use the proxy (CONNECT), which forwards them.
+//! On a remote node, hosts the node forwards to the control host (`decide::route`: credentials to
+//! inject, or outside what the node's CA may mint) aren't served over HTTP/3: the QUIC handshake is
+//! refused (audited once, with the reason), so clients fall back to TCP through the proxy, which
+//! forwards them. Should a host's route change mid-connection, its requests get a 403 that says so.
 
 use crate::dns::{self, Answered, Names};
 use crate::egress::{Egress, Outgoing, Upstream, Via};
@@ -60,6 +62,11 @@ const QUIC_PORT: u16 = 443;
 const DNS_PORT: u16 = 53;
 /// Datagrams from the box waiting for quinn, per relay connection; more are dropped (UDP).
 const INBOUND_QUEUE: usize = 4096;
+/// Frames waiting to go to the box, per relay connection; more are dropped (UDP), so a box that
+/// stops reading its socket can't grow the host's memory.
+const OUTBOUND_QUEUE: usize = 4096;
+/// Unknown addresses whose refusal is audited (once each); beyond that, refusals aren't logged.
+const MAX_REFUSAL_NOTES: usize = 1024;
 /// How long a request waits for a new HTTP/3 upstream connection before going over HTTP/2.
 const RACE: Duration = Duration::from_millis(250);
 /// How long an origin that didn't answer HTTP/3 is left on HTTP/2 before trying again.
@@ -105,6 +112,8 @@ pub struct H3 {
     opts: Options,
     transport: Arc<quinn::TransportConfig>,
     per_host: Mutex<HashMap<String, quinn::ServerConfig>>,
+    /// What has been refused and audited already (each once, up to [`MAX_REFUSAL_NOTES`]).
+    noted: Mutex<std::collections::HashSet<String>>,
 }
 
 impl H3 {
@@ -121,7 +130,14 @@ impl H3 {
         t.stream_receive_window((8u32 << 20).into());
         t.receive_window((16u32 << 20).into());
         t.send_window(16 << 20);
-        Ok(Arc::new(H3 { egress, names: Arc::new(Names::new()), opts, transport: Arc::new(t), per_host: Default::default() }))
+        Ok(Arc::new(H3 {
+            egress,
+            names: Arc::new(Names::new()),
+            opts,
+            transport: Arc::new(t),
+            per_host: Default::default(),
+            noted: Default::default(),
+        }))
     }
 
     /// The run's host <-> synthetic address map.
@@ -170,7 +186,7 @@ impl H3 {
 
     /// One forwarder connection: DNS answered here, QUIC handed to a quinn endpoint of its own.
     async fn relay(self: Arc<Self>, link: Link) -> Result<()> {
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
         let (in_tx, in_rx) = mpsc::channel::<Datagram>(INBOUND_QUEUE);
         let socket = Arc::new(RelaySocket {
             inbound: Mutex::new((in_rx, VecDeque::new())),
@@ -200,7 +216,7 @@ impl H3 {
     }
 
     /// Box -> host: DNS answered at once, QUIC datagrams queued for quinn.
-    async fn read_frames(&self, mut reader: Reader, in_tx: mpsc::Sender<Datagram>, out: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {
+    async fn read_frames(&self, mut reader: Reader, in_tx: mpsc::Sender<Datagram>, out: mpsc::Sender<Vec<u8>>) -> Result<()> {
         let mut buf = vec![0u8; MAX_FRAME + 4];
         loop {
             let n = reader.recv(&mut buf).await?;
@@ -215,7 +231,7 @@ impl H3 {
                         let mut f = Vec::with_capacity(HDR + reply.len());
                         f.extend_from_slice(&Head { seg: 0, ..head }.encode());
                         f.extend_from_slice(&reply);
-                        let _ = out.send(f);
+                        let _ = out.try_send(f);
                     }
                 }
                 QUIC_PORT => {
@@ -284,7 +300,15 @@ impl H3 {
         Ok(sc)
     }
 
+    /// Audits a refused connection, once per host and reason: a box retrying (or flooding) gets
+    /// no more log lines than it has distinct targets, up to a cap.
     fn refused(&self, host: &str, why: String) {
+        {
+            let mut n = self.noted.lock().expect("noted");
+            if n.len() >= MAX_REFUSAL_NOTES || !n.insert(format!("{host} {why}")) {
+                return;
+            }
+        }
         self.egress.ctx.emit(Event::Egress {
             method: "QUIC".into(),
             host: host.into(),
@@ -309,6 +333,16 @@ impl H3 {
         if self.egress.decider.host_verdict(&self.egress.ctx, &host) != HostVerdict::Open {
             inc.refuse();
             return;
+        }
+        // On a node, a host it forwards to the control host isn't served over HTTP/3 (the node
+        // usually can't mint a leaf for it, and the control host isn't reached over UDP): the
+        // handshake is refused, and HTTP/3 clients fall back to TCP through the proxy, which forwards it.
+        if let Some(relay) = &self.egress.relay {
+            if let crate::decide::Route::Forward(why) = relay.route(&host) {
+                self.refused(&host, format!("HTTP/3 to {host} isn't served on this node ({why}); HTTPS through the proxy reaches it"));
+                inc.refuse();
+                return;
+            }
         }
         let cfg = match self.server_config(&host) {
             Ok(c) => c,
@@ -464,7 +498,7 @@ struct Datagram {
 /// quinn's socket: datagrams to and from the box, through the relay connection's tasks.
 struct RelaySocket {
     inbound: Mutex<(mpsc::Receiver<Datagram>, VecDeque<Datagram>)>,
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
     /// Datagrams per frame towards the box (quinn's GSO batches).
     gso: usize,
 }
@@ -487,7 +521,10 @@ impl AsyncUdpSocket for RelaySocket {
         let mut f = Vec::with_capacity(HDR + t.contents.len());
         f.extend_from_slice(&Head { seg, src: to, dst: SocketAddrV4::new(from, QUIC_PORT) }.encode());
         f.extend_from_slice(t.contents);
-        self.out.send(f).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "box relay closed"))
+        match self.out.try_send(f) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()), // full: dropped, as UDP would
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "box relay closed")),
+        }
     }
 
     fn poll_recv(&self, cx: &mut Context, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> Poll<io::Result<usize>> {
@@ -616,7 +653,7 @@ impl Reader {
 }
 
 /// Host -> box: frames written as they come.
-async fn write_frames(mut w: Writer, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) -> io::Result<()> {
+async fn write_frames(mut w: Writer, mut rx: mpsc::Receiver<Vec<u8>>) -> io::Result<()> {
     while let Some(f) = rx.recv().await {
         match &mut w {
             Writer::Seqpacket(fd) => loop {
@@ -679,8 +716,8 @@ fn set_bufs(fd: RawFd) {
     }
 }
 
-/// A nonblocking `SOCK_SEQPACKET` listener at `path` (replacing a stale socket), open to the box's
-/// user (the socket's directory is what's private).
+/// A nonblocking `SOCK_SEQPACKET` listener at `path` (replacing a stale socket), with the same mode
+/// as the proxies' sockets beside it.
 fn seqpacket_listen(path: &Path) -> Result<AsyncFd<OwnedFd>> {
     let _ = std::fs::remove_file(path);
     // SAFETY: plain socket(2); checked before use.
@@ -693,8 +730,6 @@ fn seqpacket_listen(path: &Path) -> Result<AsyncFd<OwnedFd>> {
         .with_context(|| format!("binding {}", path.display()))?;
     // SAFETY: listen on a bound socket.
     cvt(unsafe { libc::listen(fd.as_raw_fd(), 16) } as isize)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
     Ok(register(fd)?)
 }
 
@@ -727,7 +762,8 @@ pub(crate) struct Up {
 #[derive(Clone)]
 enum State {
     Ready(h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>),
-    Connecting(tokio::sync::watch::Receiver<bool>),
+    /// Connecting since then: requests wait for it only within [`RACE`] of the start.
+    Connecting(tokio::sync::watch::Receiver<bool>, Instant),
     NoH3(Instant),
 }
 
@@ -811,13 +847,17 @@ impl Up {
     /// The host's HTTP/3 connection if it is up, or comes up within [`RACE`].
     async fn ready(&self, host: &str) -> Option<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>> {
         let st = self.state.lock().expect("state").get(host).cloned();
-        let mut watch = match st {
+        let (mut watch, since) = match st {
             Some(State::Ready(s)) => return Some(s),
             Some(State::NoH3(since)) if since.elapsed() < NO_H3_FOR => return None,
-            Some(State::Connecting(w)) => w,
-            _ => self.connect(host),
+            Some(State::Connecting(w, since)) => (w, since),
+            _ => (self.connect(host), Instant::now()),
         };
-        let _ = tokio::time::timeout(RACE, watch.wait_for(|done| *done)).await;
+        let left = RACE.saturating_sub(since.elapsed());
+        if left.is_zero() {
+            return None;
+        }
+        let _ = tokio::time::timeout(left, watch.wait_for(|done| *done)).await;
         match self.state.lock().expect("state").get(host) {
             Some(State::Ready(s)) => Some(s.clone()),
             _ => None,
@@ -827,7 +867,7 @@ impl Up {
     /// Starts connecting to `host` in the background; the watch turns true when it's settled.
     fn connect(&self, host: &str) -> tokio::sync::watch::Receiver<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        self.state.lock().expect("state").insert(host.to_string(), State::Connecting(rx.clone()));
+        self.state.lock().expect("state").insert(host.to_string(), State::Connecting(rx.clone(), Instant::now()));
         let (ep, state, host, fixed) = (self.ep.clone(), self.state.clone(), host.to_string(), self.resolve.get(host).copied());
         tokio::spawn(async move {
             let r = tokio::time::timeout(Duration::from_secs(5), async {

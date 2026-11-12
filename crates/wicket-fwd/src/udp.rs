@@ -5,7 +5,7 @@
 //!   destination is known even on a wildcard socket (`0.0.0.0:443` catches every synthetic address
 //!   on `lo`). Replies leave from that same address (`IP_PKTINFO`'s `ipi_spec_dst` on send).
 //! - **To the host**, one connection per listener: `SOCK_SEQPACKET` (boundaries kept, one message
-//!   per frame), or, if the host's socket is a stream socket (`EPROTOTYPE`: an SSH-forwarded socket
+//!   per frame), or, if that connect fails, a stream socket (an SSH-forwarded socket
 //!   on a remote node), the same frames each after a 4-byte big-endian length. Unix `SOCK_DGRAM` is
 //!   not used: under gVisor the host can't answer a box's datagram socket (experiment #92).
 //! - **Stateless.** Every frame names the client and the address it used, both ways, so there is no
@@ -51,8 +51,8 @@ impl Link {
                 net::set_bufs(fd.as_raw_fd(), SOCK_BUF);
                 Ok(Link::Seqpacket(fd))
             }
-            Err(e) if e.raw_os_error() == Some(net::EPROTOTYPE) => Ok(Link::Stream(UnixStream::connect(path)?)),
-            Err(e) => Err(e),
+            // EPROTOTYPE on Linux; whatever a sandbox's kernel says, a stream socket gets a try.
+            Err(e) => UnixStream::connect(path).map(Link::Stream).map_err(|_| e),
         }
     }
 

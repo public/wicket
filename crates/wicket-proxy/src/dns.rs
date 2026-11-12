@@ -82,8 +82,11 @@ impl Names {
         self.inner.lock().expect("names").by_ip.get(&ip).cloned()
     }
 
+    /// Whether this is the first refusal of `name` (audited once; past 4096 distinct names, none are,
+    /// so a box can't grow this set without bound).
     fn refused_first(&self, name: &str) -> bool {
-        self.inner.lock().expect("names").refused.insert(name.to_string())
+        let mut g = self.inner.lock().expect("names");
+        g.refused.len() < 4096 && g.refused.insert(name.to_string())
     }
 }
 

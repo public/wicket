@@ -66,7 +66,6 @@ pub mod net {
     const IP_PKTINFO: c_int = 8;
     pub const MSG_DONTWAIT: c_int = 0x40;
     pub const MSG_NOSIGNAL: c_int = 0x4000;
-    pub const EPROTOTYPE: i32 = 91;
 
     #[repr(C)]
     pub struct IoVec {

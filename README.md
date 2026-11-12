@@ -387,6 +387,8 @@ each UDP datagram is costly (about 110 µs of CPU in the box), so HTTP/3 downloa
 the usual 1452-byte packets. `WICKET_H3_BOX_MTU=16000` lets the box's leg (loopback and a unix socket, no
 real link) use 16000-byte packets for clients that accept them: 430–460 Mbit/s in #92's measurements.
 `WICKET_H3_HTTPS_RECORDS=0` stops wicket answering HTTPS (`alpn=h3`) DNS records.
+The forwarder holds UDP port 443 on every address in the box (it catches QUIC to any synthetic address),
+so a server in the box can't take UDP 443, even on 127.0.0.1; TCP 443 and every other port stay the agent's.
 
 ### Agents launched by something else, e.g. Remote Control
 
