@@ -922,6 +922,11 @@ fn list_manifests(state: &State) -> Vec<Value> {
                     "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
                     "program": m.as_ref().and_then(|m| m.program.as_ref().map(|p| p.name.clone())),
                     "zone": m.as_ref().map(|m| m.zone.name.clone()),
+                    // The zone view (#62): which hosts the egress proxy inspects, which it splices.
+                    "hosts": m.as_ref().map(|m| wicket_core::splice::view(&m.zone).into_iter().map(|(h, i)| match i {
+                        wicket_core::splice::Inspection::Spliced { rule } => json!({ "host": h, "mode": "spliced", "rule": rule }),
+                        wicket_core::splice::Inspection::Inspected(why) => json!({ "host": h, "mode": "inspected", "why": why }),
+                    }).collect::<Vec<_>>()),
                     "valid": m.is_some(),
                 }));
             }

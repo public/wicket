@@ -22,6 +22,8 @@ enum Proxy {
     Mitm { mem: bool, nopool: bool, batched: bool },
     /// CONNECT, host decision, SNI check, then copy.
     Pass { splice: bool },
+    /// wicket's real egress proxy, splicing `origin.test` through (or, `splice: false`, inspecting it).
+    Egress { splice: bool },
     /// SNI only (no CONNECT), then copy.
     Sni { splice: bool },
 }
@@ -58,6 +60,11 @@ fn setups() -> Vec<Setup> {
         s("mitm-batched/unix", Mitm { mem: false, nopool: false, batched: true }, Direct, false),
         s("mitm-batched/fwd", Mitm { mem: false, nopool: false, batched: true }, Fwd { splice: false }, false),
         s("mitm-nopool/unix", Mitm { mem: false, nopool: true, batched: false }, Direct, false),
+        s("egress-inspect/unix", Egress { splice: false }, Direct, false),
+        s("egress-splice/unix", Egress { splice: true }, Direct, false),
+        s("egress-splice-h2/unix", Egress { splice: true }, Direct, true),
+        s("egress-inspect/fwd", Egress { splice: false }, Fwd { splice: true }, false),
+        s("egress-splice/fwd", Egress { splice: true }, Fwd { splice: true }, false),
         s("pass/unix", Pass { splice: false }, Direct, false),
         s("pass/socat", Pass { splice: false }, Socat { nodelay: false }, false),
         s("pass-splice/unix", Pass { splice: true }, Direct, false),
@@ -186,6 +193,24 @@ async fn start(s: &Setup, work: &Path, stamps: &Path) -> Result<(Procs, Target)>
             wait_for(&Endpoint::Unix(sock.clone())).await?;
             let pem = std::fs::read_to_string(work.join("run-ca.pem"))?;
             tls_ca = pem_to_der(&pem)?;
+        }
+        Proxy::Egress { splice } => {
+            let ledger = work.join("ledger.db");
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", ledger.display()));
+            }
+            let _ = std::fs::remove_file(work.join("run-ca.pem"));
+            let mut c = Command::new(&exe);
+            c.args(["egress", "--listen", &format!("unix:{}", sock.display()), "--dir", &work.display().to_string(), "--upstream-port", port]);
+            c.args(["--ledger", &ledger.display().to_string()]);
+            if !splice {
+                c.arg("--inspect");
+            }
+            named.push(("proxy", c.spawn()?));
+            wait_for(&Endpoint::Unix(sock.clone())).await?;
+            if !splice {
+                tls_ca = pem_to_der(&std::fs::read_to_string(work.join("run-ca.pem"))?)?;
+            }
         }
         Proxy::Pass { splice } | Proxy::Sni { splice } => {
             let sni = matches!(s.proxy, Proxy::Sni { .. });

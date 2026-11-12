@@ -9,6 +9,7 @@ pub mod canon;
 pub mod link;
 pub mod manifest;
 pub mod op;
+pub mod splice;
 pub mod subset;
 pub mod text;
 

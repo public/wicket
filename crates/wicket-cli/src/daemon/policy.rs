@@ -78,6 +78,8 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Serve { .. } => Refuse("the console runs as the wicket user under systemd: systemctl status wicket-console"),
         Cmd::Daemon { .. } => Refuse("the daemon runs as the wicket user under systemd: systemctl status wicketd"),
         Cmd::Program { cmd: ProgramCmd::Digest { .. } } => Local,
+        // Reads a manifest the caller names, in the caller's own process.
+        Cmd::Zone { .. } => Local,
         Cmd::Operator { cmd } => match cmd {
             OperatorCmd::List | OperatorCmd::Sessions => Forward(Read),
             // A passkey enrolled by the operator's uid could approve in the console.

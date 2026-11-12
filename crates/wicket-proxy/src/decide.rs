@@ -44,6 +44,12 @@ pub trait Decider: Send + Sync {
     fn host_verdict(&self, ctx: &RunCtx, host: &str) -> HostVerdict;
     /// The outcome for one request.
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome>;
+    /// The reach rule that allows `host` wholesale, if connections to it may be spliced through
+    /// without inspection (#62): every request to it would be allowed, with no credential. None
+    /// (the default) means every request is decided on its own.
+    fn splice(&self, _ctx: &RunCtx, _host: &str) -> Option<usize> {
+        None
+    }
 }
 
 /// The control host's ledger: the decision every local run gets.
@@ -56,6 +62,16 @@ impl Decider for Central {
 
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome> {
         Box::pin(async move { central(ctx, op, who) })
+    }
+
+    /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
+    /// A node's decider keeps the default: its decisions depend on the feed's freshness (narrow
+    /// and closed modes), which a hostname can't carry.
+    fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
+        match wicket_core::splice::inspection(ctx.zone.spec(), host) {
+            wicket_core::splice::Inspection::Spliced { rule } => Some(rule),
+            wicket_core::splice::Inspection::Inspected(_) => None,
+        }
     }
 }
 

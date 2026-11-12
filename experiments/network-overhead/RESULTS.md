@@ -358,3 +358,34 @@ python3 summarize.py logs/results.json > logs/summary.md
 - `perf-{mitm,pass}.txt` and the client throughput during each profile.
 
 Each run used one heavy job at a time with a 1-hour timeout, on a shared 4 vCPU Vultr VPS.
+
+## 9. Splice-through in the real proxy (2026-11-12)
+
+Splice-through is now in `wicket_proxy::egress` (`splice.rs`; which hosts: `wicket_core::splice`). The
+bench has a role, `netbench egress`, that runs the real `Egress` as `wicket run` starts it: a file
+ledger with the batched writer, the run's CA and the `Central` decider. The upstream is pinned to the
+local origin through `Upstream::resolve` and `roots_pem`. The bench zone allows `origin.test`
+wholesale, so the proxy splices it. `--inspect` adds a forbid rule on `/never/**`, which makes the
+same zone inspected.
+
+The run was `netbench bench --only direct,egress- --rounds 3 --secs 4 --out logs/splice-through`, at
+load 7–9. Each figure is the median over the 3 rounds.
+
+| setup | new conn p50 (ms) | kept-alive p50 / p99 (µs) | req/s, 16 kept | proxy CPU-ms / 1,000 kept requests | 100 MB MB/s median (min–max) | proxy CPU-s/GB |
+|---|---|---|---|---|---|---|
+| direct | 1.33 | 126 / 1,378 | 25,702 | – | 555 (420–871) | – |
+| egress-inspect/unix | 1.99 | 409 / 2,673 | 7,789 | 162 | 275 (201–379) | 2.67 |
+| egress-splice/unix | 2.33 | 208 / 898 | 16,414 | 32 | 523 (343–650) | 0.33 |
+| egress-splice-h2/unix | 2.65 | 288 / 2,000 | 9,781 | 37 | 362 (236–421) | 0.47 |
+| egress-inspect/fwd | 2.52 | 477 / 1,998 | 5,183 | 178 | 310 (259–468) | 2.50 (hop 0.60) |
+| egress-splice/fwd | 2.41 | 278 / 960 | 15,583 | 47 | 608 (465–753) | 0.37 (hop 0.27) |
+
+The prototype (`pass-splice`) measured 0.17 CPU-s/GB, with two blocking threads per connection. The
+production version drives splice(2) from the event loop: it pays for readiness wakeups, but doesn't
+use a thread per connection. A new spliced connection costs about 0.3 ms more than an intercepted one,
+because the upstream is dialled (and its address checked) before the `CONNECT` is answered.
+
+`workloads/` holds real workloads in a gVisor box: `cargo fetch` of wicket's own workspace,
+`npm install` of 168 packages, and a 1 GiB download. Each ran once per arm, and the results are in
+`docs/performance.md`. They also found that npm scoped packages fail through an inspected registry
+(#143).

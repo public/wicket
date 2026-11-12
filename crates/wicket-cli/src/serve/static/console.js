@@ -190,7 +190,7 @@ function renderRows(id, rows, f, emptyText) {
 function line(op) {
   const b = op.body || {};
   if (op.kind === "op" && b.kind === "egress") {
-    const cls = b.outcome === "allow" ? "ok" : b.outcome === "pending" ? "pend" : "blocked";
+    const cls = b.outcome === "allow" || b.outcome === "spliced" ? "ok" : b.outcome === "pending" ? "pend" : "blocked";
     const d = el("div"); d.append(el("span", cls, b.outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(b.method + " " + b.host + b.path)));
     return d;
   }
@@ -262,11 +262,25 @@ function renderStart(s) {
     const o = el("option", "", strip(m.root + "/" + m.name) + (m.valid ? " · " + strip(m.agent ? "agent " + m.agent : "program " + m.program) + " · zone " + strip(m.zone) : " · invalid"));
     o.value = JSON.stringify([m.root, m.name]); o.disabled = !m.valid; sel.append(o);
   }
+  // The zone view (#62): which hosts the egress proxy inspects and which it splices through.
+  const hosts = el("div", "meta");
+  const showHosts = () => {
+    const [root, name] = JSON.parse(sel.value || "[]");
+    const m = ms.find((x) => x.root === root && x.name === name);
+    hosts.replaceChildren();
+    for (const h of (m && m.hosts) || []) {
+      const d = el("div");
+      d.append(el("span", h.mode === "spliced" ? "pend" : "ok", (h.mode === "spliced" ? "spliced" : "inspected").padEnd(10)),
+        document.createTextNode(strip(h.host) + (h.mode === "spliced" ? " (every method and path; not inspected)" : " (" + strip(h.why) + ")")));
+      hosts.append(d);
+    }
+  };
+  sel.onchange = showHosts; showHosts();
   const task = el("textarea"); task.placeholder = "Task (optional; replaces the manifest's task, agents only)";
   const b = el("div", "buttons"); const go = el("button", "approve", "Start run");
   go.onclick = () => { const [root, manifest] = JSON.parse(sel.value); signed({ action: "start_run", root, manifest, task: task.value }); task.value = ""; };
   b.append(go);
-  box.append(sel, task, b, el("div", "meta", "The run's principal is you (this passkey), not the host user."));
+  box.append(sel, hosts, task, b, el("div", "meta", "The run's principal is you (this passkey), not the host user."));
 }
 
 function renderOperator(s) {
