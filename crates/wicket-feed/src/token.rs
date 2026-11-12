@@ -269,7 +269,8 @@ impl Replica<BoxAuthority> {
     pub fn splice(&self, tenant: &wicket_core::TenantId, run: &str, host: &str, now: i64) -> Option<usize> {
         let entry = self.state()?.zones.get(run)?;
         let c = entry.compiled.as_ref().ok()?;
-        if entry.spec.box_path != entry.spec.run {
+        // Under an org policy (#51) a rule can depend on any path: probes can't vouch for a host.
+        if entry.spec.box_path != entry.spec.run || c.loaded.has_org_layer() {
             return None;
         }
         let rule = match wicket_core::splice::inspection(&entry.spec.zone, host) {

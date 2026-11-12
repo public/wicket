@@ -75,7 +75,11 @@ impl Decider for Central {
     }
 
     /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
+    /// Not under an org policy (#51): its rules can depend on any path.
     fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
+        if ctx.org.is_some() {
+            return None;
+        }
         match wicket_core::splice::inspection(ctx.zone.spec(), host) {
             wicket_core::splice::Inspection::Spliced { rule } => Some(rule),
             wicket_core::splice::Inspection::Inspected(_) => None,
@@ -84,6 +88,10 @@ impl Decider for Central {
 }
 
 fn central(ctx: &RunCtx, op: &Op, who: Option<&(serde_json::Value, String)>) -> Outcome {
+    // The org layer first: hard, no grant lifts it (#51; on a node the token's org checks do this).
+    if let Some(why) = ctx.org.as_ref().and_then(|o| o.refuses_http(&op.host, &op.method, &op.path, op.risk.rank())) {
+        return Outcome::Forbidden(why);
+    }
     let why = match ctx.zone.evaluate(op) {
         Verdict::AllowByReach(i) => return Outcome::Allow(format!("reach rule {i}")),
         Verdict::Forbidden(why) => return Outcome::Forbidden(why),
@@ -352,6 +360,7 @@ mod tests {
             tenant: TenantId::single(),
             run: RunId("run_a".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
             vault: crate::vault::Vault::new(std::env::temp_dir().join("wicket-decide-no-vault")),
             events: tx,

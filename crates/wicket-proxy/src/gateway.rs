@@ -230,12 +230,18 @@ impl Gateway {
                             Some(f) => l.agent_runs(&f.agent).unwrap_or_default().into_iter().map(|(r, _)| r).collect(),
                             None => vec![],
                         };
-                        (m, revoked, earlier)
+                        let from_zone = l.identity(&m.from_run).ok().flatten().map(|i| i.zone);
+                        (m, revoked, earlier, from_zone)
                     })
                 })
             };
             match m {
-                Ok(Some((m, sender_revoked, earlier))) => return deliver(&cell.current(), &self.ctx.run.0, &earlier, &m, sender_revoked),
+                // The org policy decides which zones' boxes this one hears from (#51), parent and
+                // children included: refused, the message is dropped, and the agent told.
+                Ok(Some((m, _, _, Some(z)))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z)) => {
+                    return (format!("a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone", m.from_run), false);
+                }
+                Ok(Some((m, sender_revoked, earlier, _))) => return deliver(&cell.current(), &self.ctx.run.0, &earlier, &m, sender_revoked),
                 Ok(None) => {}
                 Err(e) => return (e.to_string(), true),
             }
@@ -755,6 +761,7 @@ mod tests {
         fn agent(&self, tenant: &str, zone: &str, name: &str, run: &str, parent: Option<&str>, accept_from: &[&str]) -> RunCtx {
             let yaml = format!(
                 "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
+                org: None,
             );
             let m = Manifest::from_yaml(&yaml).unwrap();
             let key = AgentKey::generate();
@@ -793,6 +800,7 @@ mod tests {
                 tenant: TenantId(tenant.into()),
                 run: RunId(run.into()),
                 zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
+                org: None,
                 ledger: self.ledger.clone(),
                 vault: crate::vault::Vault::new(std::env::temp_dir()),
                 events: tx,

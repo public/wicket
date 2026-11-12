@@ -752,6 +752,13 @@ impl Egress {
         let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
+                // The org policy may refuse a credential the zone names (#51): the request is refused.
+                if let Some(org) = &self.ctx.org {
+                    let key = format!("{}|{}|{}", rule.host.to_ascii_lowercase(), rule.header, rule.secret);
+                    if !org.allows_inject(&key) {
+                        anyhow::bail!("refused: the org policy ({}) doesn't allow injecting {} into {} for {host}", org.version, rule.secret, rule.header);
+                    }
+                }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
                 self.ctx.vault.check(&rule.secret, host)?;
                 let secret = match self.ctx.vault.get(&rule.secret) {
@@ -864,6 +871,7 @@ mod tests {
             tenant: wicket_core::TenantId::single(),
             run: wicket_core::RunId("run_x".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
             vault,
             events: tx,

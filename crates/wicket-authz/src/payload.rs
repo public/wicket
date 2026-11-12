@@ -157,6 +157,69 @@ pub struct OrgLayer {
     pub inject: Option<Vec<String>>,
 }
 
+impl HttpMatch {
+    /// Whether this conjunction matches a request, as the token's checks would (the same regexes).
+    pub fn matches(&self, host: &str, method: &str, path: &str, risk: i64) -> bool {
+        let host_ok = self.hosts.iter().all(|h| match h {
+            HostPat::Exact(x) => host == x,
+            HostPat::Suffix(x) => host.ends_with(x.as_str()),
+        }) && !self.not_hosts.iter().any(|x| host == x);
+        let method_ok = self.methods.as_ref().is_none_or(|ms| ms.iter().any(|m| m == method));
+        let path_ok = self.paths.iter().all(|p| {
+            let re = match p {
+                PathPat::Glob(g) => crate::generator::path_regex(g),
+                PathPat::GlobAnyCase(g) => crate::generator::path_regex(&wicket_core::manifest::fold_case_glob(g)),
+                PathPat::Like(l) => Ok(crate::generator::like_regex(l)),
+            };
+            // A pattern that doesn't compile matches nothing: in a forbid that would fail open,
+            // which minting already refuses (the token's own check).
+            re.ok().and_then(|r| regex::Regex::new(&r).ok()).is_some_and(|r| r.is_match(&crate::generator::path_term(path)))
+        });
+        let risk_ok = self.max_risk.is_none_or(|n| risk <= n) && self.min_risk.is_none_or(|n| risk >= n);
+        host_ok && method_ok && path_ok && risk_ok
+    }
+}
+
+impl OrgLayer {
+    /// Why the org layer refuses an HTTP request (None: it allows it): the decision the token's org
+    /// checks make, for the control host's own proxies (hosts it forwards for, and local boxes).
+    pub fn refuses_http(&self, host: &str, method: &str, path: &str, risk: i64) -> Option<String> {
+        if let Some(f) = self.forbid.iter().position(|f| f.matches(host, method, path, risk)) {
+            return Some(format!("the org policy ({}) forbids it (forbid {f})", self.version));
+        }
+        match &self.http {
+            Some(alts) if !alts.iter().any(|a| a.matches(host, method, path, risk)) => {
+                Some(format!("the org policy ({}) doesn't allow it", self.version))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether it allows a spawn.
+    pub fn allows_spawn(&self, image: &str, isolation: i64, mem: i64, cpus_milli: i64, pids: i64, timeout_s: i64) -> bool {
+        self.spawn.as_ref().is_none_or(|alts| {
+            alts.iter().any(|a| {
+                a.images.as_ref().is_none_or(|i| i.iter().any(|x| x == image))
+                    && a.min_isolation.is_none_or(|n| isolation >= n)
+                    && a.max_mem_bytes.is_none_or(|n| mem <= n)
+                    && a.max_cpus_milli.is_none_or(|n| cpus_milli <= n)
+                    && a.max_pids.is_none_or(|n| pids <= n)
+                    && a.max_timeout_s.is_none_or(|n| timeout_s <= n)
+            })
+        })
+    }
+
+    /// Whether boxes under it may receive messages from boxes of `zone`.
+    pub fn allows_message_from(&self, zone: &str) -> bool {
+        self.msg_from.as_ref().is_none_or(|z| z.iter().any(|x| x == zone))
+    }
+
+    /// Whether it allows an injection (`host|header|secret`).
+    pub fn allows_inject(&self, key: &str) -> bool {
+        self.inject.as_ref().is_none_or(|k| k.iter().any(|x| x == key))
+    }
+}
+
 /// A host pattern: exact, or every name ending in a suffix (`.example.com`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostPat {

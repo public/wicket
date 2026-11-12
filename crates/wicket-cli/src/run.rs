@@ -609,6 +609,39 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
 
+    // Who the run acts for, and its spawn depth: what the org policy decides at mint (#51).
+    let principal = identity
+        .as_ref()
+        .map(|c| {
+            let p = c.current().claims.principal.clone();
+            format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
+        })
+        .unwrap_or_else(|| {
+            let p = crate::cli_principal();
+            format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
+        });
+    let depth = {
+        let l = ledger.lock().expect("ledger");
+        let (mut d, mut at) = (0i64, parent_run.clone());
+        while let Some(p) = at.take() {
+            d += 1;
+            at = l.identity(&p).ok().flatten().and_then(|i| i.parent_run);
+            if d > 64 {
+                break;
+            }
+        }
+        d
+    };
+    // The installation's org policy for this box (#51): compiled once, into its token at mint and
+    // for the control host's own checks (forwarded hosts, injections, spawns, messages).
+    let org_layer: Option<Arc<wicket_authz::OrgLayer>> = match crate::policy::org()? {
+        Some(o) => {
+            let mint = crate::policy::mint_ctx(&o, &m.zone.name, &m.tenant.0, &principal, depth);
+            Some(Arc::new(o.layer(&mint).with_context(|| format!("the org policy {} for zone {}", o.version(), m.zone.name))?))
+        }
+        None => None,
+    };
+
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -628,6 +661,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             children: children.clone(),
             llm: llm_slot.clone(),
             deadline: std::time::Instant::now() + m.zone.limits.timeout()?,
+            org: org_layer.clone(),
         })),
         _ => None,
     };
@@ -702,6 +736,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         tenant: m.tenant.clone(),
         run: run.clone(),
         zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone())?),
+        org: org_layer.clone(),
         ledger: ledger.clone(),
         vault,
         events: tx,
@@ -960,35 +995,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 crate::nodecall::Via::Unix(crate::localnode::socket()?)
             }
         };
-        // Who the run acts for, and its spawn depth: what the org policy decides at mint (#51).
-        let principal = identity
-            .as_ref()
-            .map(|c| {
-                let p = c.current().claims.principal.clone();
-                format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
-            })
-            .unwrap_or_else(|| {
-                let p = crate::cli_principal();
-                format!("{}:{}", p["type"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("?"))
-            });
-        let depth = {
-            let l = ledger.lock().expect("ledger");
-            let (mut d, mut at) = (0i64, parent_run.clone());
-            while let Some(p) = at.take() {
-                d += 1;
-                at = l.identity(&p).ok().flatten().and_then(|i| i.parent_run);
-                if d > 64 {
-                    break;
-                }
-            }
-            d
-        };
         let nb = crate::noderun::start(crate::noderun::Start {
             node: node_name.clone(),
             via,
             tenant: m.tenant.clone(),
-            principal,
-            depth,
+            org: org_layer.clone(),
             run: run.clone(),
             zone: m.zone.clone(),
             dir: dir.clone(),

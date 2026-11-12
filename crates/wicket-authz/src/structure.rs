@@ -107,6 +107,8 @@ pub enum CheckClass {
 pub struct Vetted {
     /// Per block, per check.
     pub classes: Vec<Vec<CheckClass>>,
+    /// Block 0 carries an org layer (its `policy` fact, #51).
+    pub org: bool,
 }
 
 fn has(list: &[(&str, usize)], p: &Predicate) -> bool {
@@ -313,6 +315,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
     if n > p.max_blocks {
         return Err(format!("{n} blocks (cap {})", p.max_blocks));
     }
+    let mut org = false;
     let mut trusted: Vec<PublicKeyData> = Vec::new();
     let mut third_party = Vec::new();
     let mut classes = Vec::with_capacity(n);
@@ -337,6 +340,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
         for f in &b.facts {
             let name = f.predicate.name.as_str();
             zones += usize::from(name == "zone");
+            org |= i == 0 && name == "policy";
             // `policy`: the org policy's version, block 0 only (#51).
             let ok_name = name == "zone" || (i == 0 && (name == "tenant" || name == "principal" || name == "policy"));
             let ok_terms = matches!(f.predicate.terms.as_slice(), [Term::Str(s)] if s.len() <= p.max_str_len);
@@ -393,5 +397,5 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
             grant_rule(r, p).map_err(at)?;
         }
     }
-    Ok(Vetted { classes })
+    Ok(Vetted { classes, org })
 }

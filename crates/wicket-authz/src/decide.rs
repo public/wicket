@@ -149,6 +149,12 @@ impl Loaded {
         &self.token
     }
 
+    /// Whether block 0 carries an org layer (#51): its checks can depend on any path, so a node
+    /// mustn't decide a whole host from a probe (no splicing).
+    pub fn has_org_layer(&self) -> bool {
+        self.vetted.org
+    }
+
     /// Whether the compiled evaluator handles this token (otherwise every request uses the generic
     /// engine, with the same results).
     pub fn is_compiled(&self) -> bool {

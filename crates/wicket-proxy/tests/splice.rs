@@ -119,6 +119,7 @@ impl World {
             tenant: TenantId::single(),
             run: RunId("run_splice".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: ledger.clone(),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,

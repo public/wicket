@@ -28,6 +28,8 @@ pub struct SpawnCtx {
     pub children: Arc<Mutex<Vec<(String, std::process::Child)>>>,
     pub llm: Arc<OnceLock<Arc<Llm>>>,
     pub deadline: Instant,
+    /// The parent's org layer (#51): what spawns the org policy allows it, whatever it is approved.
+    pub org: Option<Arc<wicket_authz::OrgLayer>>,
 }
 
 /// The slots a run's children already hold (#125), from the children it has started (their spawn
@@ -172,6 +174,16 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         });
     }
     cm.validate().map_err(|e| format!("the new manifest is invalid: {e}"))?;
+    // The org policy's spawn rule is hard: no approval lifts it (#51).
+    if let Some(org) = &c.org {
+        let s = wicket_authz::Ceiling::from_zone(&cm.zone, "child", 0, vec![]).map_err(|e| e.to_string())?.spawn;
+        if !org.allows_spawn(&image, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s) {
+            return Err(format!(
+                "the org policy ({}) doesn't allow this spawn (image {image}, isolation {}, {} bytes of memory, {} millicpus, {} pids, {} s): narrow it",
+                org.version, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s
+            ));
+        }
+    }
     let yaml = serde_yaml::to_string(&cm).map_err(|e| e.to_string())?;
     // An approval binds to the request as the agent stated it (defaults derived at call time, such
     // as the time left, would change between the ask and the retry).

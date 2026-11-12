@@ -497,15 +497,16 @@ pub fn compile(set: &cedar_policy::PolicySet, mint: &MintCtx) -> Result<Layer, C
         inject: BTreeSet<String>,
         inject_all: bool,
     }
-    let mut acc = Acc::default();
+    let (mut acc, mut scratch) = (Acc::default(), Acc::default());
     for p in set.policies() {
         let id = p.annotation("id").map(String::from).unwrap_or_else(|| p.id().to_string());
         let cx = Cx { id, mint };
         let j = p.to_json().map_err(|e| CompileError::Cedar(e.to_string()))?;
         let permit = j.get("effect").and_then(Value::as_str) == Some("permit");
-        if !scope_principal(&cx, &j["principal"])? {
-            continue;
-        }
+        // A policy whose principal scope doesn't hold for this box is still compiled (and refused
+        // if it can't be), so a construct outside the fragment fails at check, not at some box's mint.
+        let applies = scope_principal(&cx, &j["principal"])?;
+        let a: &mut Acc = if applies { &mut acc } else { &mut scratch };
         let actions = scope_actions(&cx, &j["action"])?;
         let res_scope = scope_resource(&cx, &j["resource"])?;
         let mut f = F::Const(true);
@@ -524,11 +525,11 @@ pub fn compile(set: &cedar_policy::PolicySet, mint: &MintCtx) -> Result<Layer, C
                 let m = http_match(&cx, ms.clone(), c)?;
                 if permit {
                     if m == HttpMatch::default() {
-                        acc.http_all = true;
+                        a.http_all = true;
                     }
-                    acc.http.push(m);
+                    a.http.push(m);
                 } else {
-                    acc.forbid.push(m);
+                    a.forbid.push(m);
                 }
             }
         }
@@ -543,12 +544,12 @@ pub fn compile(set: &cedar_policy::PolicySet, mint: &MintCtx) -> Result<Layer, C
                 match kind {
                     Kind::Spawn => {
                         let m = spawn_match(&cx, res_scope.clone(), c)?;
-                        acc.spawn_all |= m == SpawnMatch::default();
-                        acc.spawn.push(m);
+                        a.spawn_all |= m == SpawnMatch::default();
+                        a.spawn.push(m);
                     }
                     Kind::Message => match names(&cx, res_scope.clone(), c, "message")? {
-                        Some(z) => acc.msg.extend(z),
-                        None => acc.msg_all = true,
+                        Some(z) => a.msg.extend(z),
+                        None => a.msg_all = true,
                     },
                     Kind::Inject => {
                         let secret = names(&cx, res_scope.clone(), c, "inject")?;
@@ -559,10 +560,10 @@ pub fn compile(set: &cedar_policy::PolicySet, mint: &MintCtx) -> Result<Layer, C
                             })
                         };
                         match (secret, ctx("host"), ctx("header")) {
-                            (None, None, None) => acc.inject_all = true,
+                            (None, None, None) => a.inject_all = true,
                             (Some(ss), Some(h), Some(hd)) => {
                                 for s in ss {
-                                    acc.inject.insert(format!("{}|{hd}|{s}", h.to_ascii_lowercase()));
+                                    a.inject.insert(format!("{}|{hd}|{s}", h.to_ascii_lowercase()));
                                 }
                             }
                             _ => {

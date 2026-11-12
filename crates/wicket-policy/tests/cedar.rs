@@ -458,7 +458,7 @@ fn cedar_and_the_compiled_token_agree() {
                 depth: 0,
                 groups: org.groups_of(&z.name),
             };
-            let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], &[], Some((&org, &m))).unwrap();
+            let c = wicket_policy::ceiling(z, "b0", T0 + 3600, vec![keys.approver.public()], &[], Some(org.layer(&m).unwrap())).unwrap();
             let token = wicket_authz::mint(&keys.root, TENANT, "human:alex", &c).unwrap();
             let loaded = load(&token.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap_or_else(|e| panic!("{e}\n{text}"));
             let cedar = Cedar {

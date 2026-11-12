@@ -1825,6 +1825,7 @@ async fn serve_box(
         tenant: wicket_core::TenantId(bs.tenant.clone()),
         run: wicket_core::RunId(bs.run.clone()),
         zone: compiled.clone(),
+        org: None,
         ledger: node.audit.clone(),
         // Secrets never reach a node: hosts that need one are forwarded, so this vault stays empty.
         vault: wicket_proxy::vault::Vault::new(node.paths.root.join("no-secrets")),

@@ -322,10 +322,8 @@ pub struct Start {
     pub node: String,
     pub via: Via,
     pub tenant: TenantId,
-    /// Who the run acts for (`<type>:<id>` of its identity's principal), and how many spawn links are
-    /// above it: what the org policy's conditions on the principal are decided with at mint (#51).
-    pub principal: String,
-    pub depth: i64,
+    /// The installation's org policy, compiled for this box (#51): block 0's org layer.
+    pub org: Option<Arc<wicket_authz::OrgLayer>>,
     pub run: RunId,
     pub zone: ZoneSpec,
     pub dir: PathBuf,
@@ -384,21 +382,19 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.start.timeout_secs + 3600;
     // Block 0 is compiled from Cedar (#51): the zone's policy and, if the installation has one, the
     // org policy, for this box as it is now (its zone's groups, its principal, its spawn depth).
-    let org = crate::policy::org()?;
-    let mint = org.as_ref().map(|o| crate::policy::mint_ctx(o, &s.zone.name, &s.tenant.0, &s.principal, s.depth));
     let ceiling = wicket_policy::ceiling(
         &s.zone,
         &s.run.0,
         not_after,
         vec![approver.public()],
         std::slice::from_ref(&s.start.image),
-        org.as_ref().zip(mint.as_ref()),
+        s.org.as_deref().cloned(),
     )
     .context("compiling the box's policy")?;
     let token_issuer =
         wicket_feed::Issuer::from_ceiling(&authz_root, &s.tenant.0, &format!("run:{}", s.run), &s.run.0, 0, &s.zone, &ceiling)
             .context("minting the box's token")?;
-    s.ledger.lock().expect("ledger").set_run_policy(&s.run.0, org.as_ref().map(|o| o.version()).as_deref())?;
+    s.ledger.lock().expect("ledger").set_run_policy(&s.run.0, s.org.as_ref().map(|o| o.version.as_str()))?;
     // A re-attached run's token carries the grants the ledger already handed this node for it, so
     // nothing a human approved is lost with the supervisor that published them.
     let carried: Vec<LiveGrant> = match s.attach {

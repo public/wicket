@@ -609,6 +609,7 @@ mod tests {
             let spec = wicket_identity::IdentitySpec {
                 tenant: "t0".into(),
                 zone: zone.name.clone(),
+                org: None,
                 agent: name.into(),
                 run: run.into(),
                 parent_run: parent.map(String::from),
@@ -647,6 +648,7 @@ mod tests {
                 tenant: TenantId::single(),
                 run: RunId(run.into()),
                 zone: Arc::new(wicket_core::CompiledZone::new(zone).unwrap()),
+                org: None,
                 ledger: self.ledger.clone(),
                 vault: crate::vault::Vault::new(std::env::temp_dir()),
                 events: tx,

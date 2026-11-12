@@ -104,16 +104,13 @@ pub fn ceiling(
     not_after: u64,
     grant_keys: Vec<PublicKey>,
     images: &[String],
-    org: Option<(&OrgPolicy, &MintCtx)>,
+    org: Option<OrgLayer>,
 ) -> Result<Ceiling, CompileError> {
     let mut base = Ceiling::from_zone(zone, box_prefix, not_after, grant_keys).map_err(|e| CompileError::Cedar(e.to_string()))?;
     base.spawn.images.extend(images.iter().cloned());
     let (_, layer) = zone_layer(zone, &base)?;
     let mut c = zone::ceiling_fields(&layer, &base)?;
-    c.org = match org {
-        Some((p, mint)) => Some(p.layer(mint)?),
-        None => None,
-    };
+    c.org = org;
     c.validate().map_err(|e| CompileError::Cedar(e.to_string()))?;
     Ok(c)
 }
