@@ -221,7 +221,18 @@ offline_flow() {
   local t_cut; t_cut=$(date +%s%3N)
   kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
   local c; for c in $(pgrep -P "$run_pid"); do kill_tree "$c"; done
-  sleep 90
+  # Decisions at the edge (#164): cut off, the agent calls its gateway (drive.sh's edge_calls).
+  sleep 5
+  touch "$nd/runs/$r/workspace/edge.go"
+  local elog=$nd/runs/$r/workspace/out/edge.log
+  wait_for 60 'grep -q "^pending=" "$elog" 2>/dev/null' || true
+  cp "$elog" "$work/edge.log" 2>/dev/null || true
+  local kid; kid=$(grep -o 'spawn=started program edgekid as run run_[a-z0-9]*' "$elog" 2>/dev/null | grep -o 'run_[a-z0-9]*' || true)
+  check "  cut off, its node answers whoami from the box's token" 'grep -q "^whoami=$r|node $NODE" "$elog"'
+  check "  cut off, request_access is queued on the node (q-…) for a human" 'grep -q "^access=queued: q-" "$elog" && grep -q "^pending=[1-9]" "$elog"'
+  check "  cut off, a narrower child starts on the node, its token attenuated there" \
+    '[ -n "$kid" ] && grep -q "within your own" "$elog" && [ -n "$(box_of "$kid")" ] && grep -q "\"run\":\"$kid\".*\"box_path\":\"$r/$kid\"" "$nd/runs/$kid/derived.json"'
+  sleep 80
   log "restarting acc-n1's serve while cut off: its secret cache goes with it"
   kill "$node_serve_pid" 2>/dev/null || true
   wait "$node_serve_pid" 2>/dev/null || true
@@ -253,6 +264,14 @@ offline_flow() {
   check "  and the miss while cut off is in the node's audit, shipped on reconnect" 'w audit --tail 3000 | grep node.secret_unavailable | grep -q "$r"'
   wait_for 20 '! grep -q "q-" "$nd/asks.json" 2>/dev/null' || true
   check "  and the queued ask was delivered to the control host" '! grep -q "q-" "$nd/asks.json" && w pending | grep -q "example.com/out-of-reach"'
+  check "  and so was request_access's, in the agent's words" 'w pending | grep "example.com/ahead" | grep -q "asked by the agent"'
+  check "  the child kept running through the serve restart (its derived authority kept on the node)" '[ -n "$kid" ] && [ -n "$(box_of "$kid")" ]'
+  wait_for 60 'w audit --tail 3000 | grep spawn.adopted | grep -q "${kid:-none}"' || true
+  check "  reconnected, the control host checks the child again and takes it over" \
+    '[ -n "$kid" ] && w audit --tail 3000 | grep spawn.adopted | grep -q "$kid" && w audit --tail 3000 | grep node.spawned | grep -q "$kid"'
+  wait_for 60 '! grep -q "\"${kid:-none}\"" "$nd/edge.json"' || true
+  check "  and its run is in the ledger, supervised here, its token now from the feed" \
+    '[ -n "$kid" ] && data_ls "runs/$kid/ctl" | grep -qx run.json && ! grep -q "\"$kid\"" "$nd/edge.json"'
   wroot secret rm mock-offline >/dev/null
   local t_rm; t_rm=$(date +%s%3N)
   sleep 20

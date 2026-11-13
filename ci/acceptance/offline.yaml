@@ -2,11 +2,13 @@
 # runs drive.sh, which calls the model and the zone's egress every 5 s for as long as its box runs.
 # Its control channel is cut for longer than the old 150 s offline window; the box keeps working,
 # model calls included (the model credential, `mock-offline`, is sealed to the node), and its node
-# stops it when its authority (`limits.authority`, counted from the run's start) expires.
+# stops it when its authority (`limits.authority`, counted from the run's start) expires. While cut
+# off, its gateway tools and a narrower spawn are decided on its node (#164).
 task: Run the command you are given and stop.
 agent:
   name: offline
   max_turns: 4
+  max_children: 2
   idle_timeout: 20m
 zone:
   name: acc-offline

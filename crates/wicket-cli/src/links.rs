@@ -159,6 +159,20 @@ impl BoxOps for NodeBoxes {
         })
     }
 
+    fn accept_direct<'a>(&'a self, run: &'a str, sock: &'a str, to: &'a str, port: u16) -> Fut<'a, Result<bool, String>> {
+        Box::pin(async move {
+            // Both boxes on one node that decides links itself (#164): it carries the bytes.
+            if self.node_of(run)? != self.node_of(to)? {
+                return Ok(false);
+            }
+            let c = self.calls(run).await?;
+            if c.proto() < crate::chan::EDGE_DECISIONS {
+                return Ok(false);
+            }
+            c.listen_direct(run, sock, to, port).await.map(|_| true).map_err(|e| format!("{e:#}"))
+        })
+    }
+
     fn dial<'a>(&'a self, run: &'a str, port: u16) -> Fut<'a, Result<Stream, String>> {
         Box::pin(async move {
             let c = self.calls(run).await?;

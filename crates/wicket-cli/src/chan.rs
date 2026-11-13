@@ -381,6 +381,12 @@ pub enum Msg {
         id: u64,
         run: String,
         sock: String,
+        /// A link between two boxes on this node (#164): the node dials each connection into
+        /// box `.0` at port `.1` itself, while both boxes' authority holds, instead of offering
+        /// it as a tunnel; the link outlives the control connection. Sent only on connections
+        /// talking [`EDGE_DECISIONS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dial: Option<(String, u16)>,
     },
     Unlisten {
         run: String,

@@ -760,6 +760,7 @@ async fn session(
         Msg::Welcome { feed, runs, proto, .. } => {
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
+            sh.ctl.calls.set_proto(proto);
             (feed, runs)
         }
         _ => unreachable!("nodeauth::control returns a welcome"),

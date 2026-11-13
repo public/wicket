@@ -1210,8 +1210,13 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             }
             Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
             Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),
-            Msg::Listen { id, run, sock } => {
-                let error = listen(node, gen, &run, &sock).err().map(|e| format!("{e:#}"));
+            Msg::Listen { id, run, sock, dial } => {
+                let error = match dial {
+                    None => listen(node, gen, &run, &sock),
+                    Some((to, port)) => listen_direct(node, &run, &sock, &to, port),
+                }
+                .err()
+                .map(|e| format!("{e:#}"));
                 node.send_to(gen, Frame::Msg(Msg::BoxCtlDone { id, out: None, error }));
             }
             Msg::Unlisten { run, sock } => {
@@ -1432,18 +1437,7 @@ fn tree_dir(paths: &NodePaths, run: &str, tree: &str) -> Result<PathBuf> {
 /// `Msg::Listen`: a link's relay socket in a run's socket directory; each connection to it is offered
 /// to connection `gen` as a tunnel.
 fn listen(node: &Arc<Node>, gen: u64, run: &str, sock: &str) -> Result<()> {
-    let ok = sock
-        .strip_prefix("link-")
-        .and_then(|s| s.strip_suffix(".sock"))
-        .is_some_and(|id| !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-    if !ok {
-        bail!("bad link socket name {sock:?}");
-    }
-    let mut boxes = node.boxes.lock().expect("boxes");
-    let b = boxes.get_mut(run).filter(|b| b.exited.is_none()).with_context(|| format!("run {run} has no running box on this node"))?;
-    let path = b.dir.join("sock").join(sock);
-    let _ = std::fs::remove_file(&path);
-    let l = wicket_proxy::sockpath::bind(&path).with_context(|| format!("listening on {sock}"))?;
+    let l = bind_link_socket(node, run, sock)?;
     let (n, run2, target) = (node.clone(), run.to_string(), format!("link:{sock}"));
     let task = tokio::spawn(async move {
         while let Ok((c, _)) = l.accept().await {
@@ -1466,10 +1460,104 @@ fn listen(node: &Arc<Node>, gen: u64, run: &str, sock: &str) -> Result<()> {
             });
         }
     });
-    if let Some(old) = b.listeners.insert(sock.to_string(), task) {
-        old.abort();
+    if let Some(b) = node.boxes.lock().expect("boxes").get_mut(run) {
+        if let Some(old) = b.listeners.insert(sock.to_string(), task) {
+            old.abort();
+        }
     }
     Ok(())
+}
+
+/// A link between two boxes on this node (#164): each connection to `sock` in `run`'s box is dialed
+/// into box `to` at `port` here, and the bytes never leave the node, so the link outlives the
+/// control connection. Decided here from both boxes' tokens: a connection is taken only while both
+/// hold authority on this node (unexpired, unrevoked), and the link closes, its connections with
+/// it, as soon as either doesn't (checked every 2 s), or when the control host unlinks it.
+fn listen_direct(node: &Arc<Node>, run: &str, sock: &str, to: &str, port: u16) -> Result<()> {
+    crate::run::check_run_id(to)?;
+    if port == 0 {
+        bail!("port 0");
+    }
+    if !node.boxes.lock().expect("boxes").get(to).is_some_and(|b| b.exited.is_none()) {
+        bail!("run {to} has no running box on this node");
+    }
+    let l = bind_link_socket(node, run, sock)?;
+    let (n, from, to2) = (node.clone(), run.to_string(), to.to_string());
+    let to_held = to2.clone();
+    let held = move |n: &Node| {
+        let now = (n.clock)();
+        let r = n.replica.lock().expect("replica");
+        [&from, &to_held].iter().all(|x| r.authority_until(x).is_some_and(|u| u > now))
+    };
+    let (run2, sock2) = (run.to_string(), sock.to_string());
+    let task = tokio::spawn(async move {
+        // Dropped with this task (unlinked, or closed here): every connection ends with it.
+        let mut conns = tokio::task::JoinSet::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                a = l.accept() => {
+                    let Ok((c, _)) = a else { break };
+                    if !held(&n) {
+                        break;
+                    }
+                    let found = n.boxes.lock().expect("boxes").get(&to2).filter(|b| b.exited.is_none()).map(|b| (b.name.clone(), b.user.clone()));
+                    let Some((name, user)) = found else { break };
+                    let child = n
+                        .docker
+                        .exec(&name, &user, &["-i"], &["wicket-fwd".to_string(), "--dial".into(), format!("127.0.0.1:{port}")])
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn();
+                    let Ok(mut child) = child else { continue };
+                    conns.spawn(async move {
+                        let (Some(mut w), Some(mut r)) = (child.stdin.take(), child.stdout.take()) else { return };
+                        let (mut cr, mut cw) = c.into_split();
+                        let up = async {
+                            let _ = tokio::io::copy(&mut cr, &mut w).await;
+                            drop(w);
+                        };
+                        let down = async {
+                            let _ = tokio::io::copy(&mut r, &mut cw).await;
+                            let _ = cw.shutdown().await;
+                        };
+                        tokio::join!(up, down);
+                        let _ = child.wait().await;
+                    });
+                }
+                _ = tick.tick() => if !held(&n) {
+                    break;
+                },
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            }
+        }
+        conns.abort_all();
+        eprintln!("[node] {run2}: link socket {sock2} to {to2} closed on this node (a box's authority ended)");
+    });
+    if let Some(b) = node.boxes.lock().expect("boxes").get_mut(run) {
+        if let Some(old) = b.listeners.insert(sock.to_string(), task) {
+            old.abort();
+        }
+    }
+    Ok(())
+}
+
+/// Binds a link's relay socket in `run`'s socket directory.
+fn bind_link_socket(node: &Node, run: &str, sock: &str) -> Result<tokio::net::UnixListener> {
+    let ok = sock
+        .strip_prefix("link-")
+        .and_then(|s| s.strip_suffix(".sock"))
+        .is_some_and(|id| !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    if !ok {
+        bail!("bad link socket name {sock:?}");
+    }
+    let boxes = node.boxes.lock().expect("boxes");
+    let b = boxes.get(run).filter(|b| b.exited.is_none()).with_context(|| format!("run {run} has no running box on this node"))?;
+    let path = b.dir.join("sock").join(sock);
+    let _ = std::fs::remove_file(&path);
+    wicket_proxy::sockpath::bind(&path).with_context(|| format!("listening on {sock}"))
 }
 
 fn ids() -> String {
@@ -2942,6 +3030,11 @@ mod tests {
     /// A box on this node whose token the replica holds: `zone` (YAML), minted for `run` until an
     /// hour from now, with the node's #164 edge start.
     fn fed_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
+        fed_boxes(node, inst, &[(run, zone)]);
+    }
+
+    /// [`fed_box`] for several boxes on this node.
+    fn fed_boxes(node: &Arc<Node>, inst: &Install, boxes: &[(&str, &str)]) {
         use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig};
         let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
@@ -2954,14 +3047,26 @@ mod tests {
             Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
         let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
         let now = (node.clock)();
-        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
         let not_after = u64::try_from(now / 1000 + 3600).unwrap();
-        let issuer = Issuer::root(&authz_root, "t0", &format!("run:{run}"), run, 0, &z, &[], not_after, vec![approver.public()]).unwrap();
-        p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], now).unwrap();
+        let mut changes = vec![];
+        for (run, zone) in boxes {
+            let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+            let issuer =
+                Issuer::root(&authz_root, "t0", &format!("run:{run}"), run, 0, &z, &[], not_after, vec![approver.public()]).unwrap();
+            changes.push(Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() });
+        }
+        p.commit(changes, now).unwrap();
         for f in p.catch_up(&r.hello(), now).unwrap() {
             r.accept(&f, now).unwrap();
         }
         *node.replica.lock().unwrap() = r;
+        for (run, zone) in boxes {
+            add_box(node, inst, run, zone);
+        }
+    }
+
+    fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
+        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
         let mut rec = fake_record(run);
         rec.start.zone = z.name.clone();
         rec.start.edge = Some(Box::new(chan::EdgeStart {
@@ -3091,5 +3196,36 @@ mod tests {
         assert!(node.queue.of(RUN).is_empty());
         // Tools the node doesn't decide are the control host's.
         assert!(gw::tool(&node, RUN, "send_message", &serde_json::json!({})).await.is_none());
+    }
+
+    /// #164: cut off, a message between two boxes on one node is decided there from both tokens
+    /// (a zone that accepts the sender's, else refused), delivered there, attested by the node, and
+    /// recorded in its audit log; one to a box elsewhere waits for the control host.
+    #[tokio::test]
+    async fn the_node_delivers_messages_between_its_boxes_while_cut_off() {
+        const A: &str = "run_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const B: &str = "run_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const C: &str = "run_cccccccccccccccccccccccccc";
+        let inst = Install::new("nodesrv-msg");
+        let node = test_node(&inst);
+        fed_boxes(&node, &inst, &[(A, "name: za\n"), (B, "name: zb\naccept_from: [za]\n"), (C, "name: zc\n")]);
+        let call = |run: &'static str, name: &'static str, args: serde_json::Value| {
+            let node = node.clone();
+            async move { gw::tool(&node, run, name, &args).await.expect("decided on the node") }
+        };
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": B, "body": { "hello": 1 } })).await;
+        assert!(!err && t.starts_with("sent m-node-") && t.contains("attested by the node"), "{t}");
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": C, "body": {} })).await;
+        assert!(err && t.contains("does not accept messages from zone za"), "{t}");
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": "run_zzzzzzzzzzzzzzzzzzzzzzzzzz", "body": {} })).await;
+        assert!(err && t.contains("isn't on your node"), "{t}");
+        let (t, _) = call(B, "await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!((v["from"]["run"].as_str(), v["body"]["hello"].as_i64()), (Some(A), Some(1)), "{t}");
+        assert_eq!(v["from"]["verified_by"], "node n1");
+        let (t, _) = call(B, "await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
+        assert!(t.starts_with("no message"), "taken once: {t}");
+        let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
+        assert!(audit.iter().any(|r| r.2 == "node.message"), "{audit:?}");
     }
 }

@@ -63,6 +63,12 @@ pub trait BoxOps: Send + Sync {
     fn unlisten<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, ()>;
     /// A byte stream to 127.0.0.1:`port` inside `run`'s box.
     fn dial<'a>(&'a self, run: &'a str, port: u16) -> Fut<'a, Result<Stream, String>>;
+    /// Listens on `sock` in `run`'s box with the node itself dialing `to`'s `port` for each
+    /// connection, when both boxes are on one node that does (#164): the bytes never leave it, and
+    /// the link outlives the control connection. Ok(false): relay it here instead.
+    fn accept_direct<'a>(&'a self, _run: &'a str, _sock: &'a str, _to: &'a str, _port: u16) -> Fut<'a, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 type Reply = (String, bool);
@@ -341,7 +347,11 @@ async fn open(
     let id = wicket_core::new_link_id();
     let sock = format!("link-{id}.sock");
     let box_sock = format!("/wicket/sock/{sock}");
-    let incoming = ops.accept(&from.run, &sock).await.map_err(|e| format!("relay socket: {e}"))?;
+    // On one node, the node carries it (#164); else this host relays each connection.
+    let incoming = match ops.accept_direct(&from.run, &sock, &to.run, port).await {
+        Ok(true) => None,
+        _ => Some(ops.accept(&from.run, &sock).await.map_err(|e| format!("relay socket: {e}"))?),
+    };
     let row = LinkRow {
         id: id.clone(),
         tenant: ctx.tenant.0.clone(),
@@ -389,10 +399,19 @@ async fn open(
         return Err(format!("link not opened: the audit record could not be written ({e})"));
     }
     ctx.emit(Event::Tool { name: "link".into(), detail: format!("opened {id}: {} → {address} ({}, port {port})", from.agent, to.agent) });
-    tokio::spawn(relay(ctx.clone(), ops, row, incoming));
+    let carried = match incoming {
+        Some(incoming) => {
+            tokio::spawn(relay(ctx.clone(), ops, row, incoming));
+            "Relayed by wicket"
+        }
+        None => {
+            tokio::spawn(watch_direct(ctx.clone(), ops, row));
+            "Carried by your node, so it holds while wicket's control host is unreachable"
+        }
+    };
     let who = if from.run == ctx.run.0 { "this box".to_string() } else { format!("box {} ({})", from.agent, from.run) };
     Ok(format!(
-        "linked {id}: {who} reaches port {port} of box {} ({}) at {address} ({basis}). Relayed by wicket; it closes when either box ends or is revoked, or on unlink {id}.",
+        "linked {id}: {who} reaches port {port} of box {} ({}) at {address} ({basis}). {carried}; it closes when either box ends or is revoked, or on unlink {id}.",
         to.agent, to.run
     ))
 }
@@ -414,6 +433,42 @@ fn must_close(ctx: &RunCtx, row: &LinkRow) -> Option<String> {
         }
     }
     None
+}
+
+/// A link its node carries (#164): this host keeps its record and closes it (unlink, revocation, a
+/// run ending), telling the node once it can be reached; the node itself closes it when either
+/// box's authority ends there.
+async fn watch_direct(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow) {
+    let mut tick = tokio::time::interval(POLL);
+    let reason = loop {
+        tick.tick().await;
+        if let Some(r) = must_close(&ctx, &row) {
+            break r;
+        }
+    };
+    let closed_now = ctx.ledger.lock().ok().and_then(|l| l.close_link(&row.id, "wicket", &reason).ok()).unwrap_or(false);
+    // The node may be out of reach: told when it is back, unless the box is gone by then.
+    for _ in 0..900 {
+        if ops.reachable(&row.from_run).await.is_ok() {
+            break;
+        }
+        if ctx.ledger.lock().ok().and_then(|l| l.run_status(&row.from_run).ok().flatten()).as_deref() != Some("running") {
+            break;
+        }
+        tick.tick().await;
+    }
+    ops.close_accept(&row.from_run, &format!("link-{}.sock", row.id)).await;
+    write_hosts(&ctx, &*ops, &row.from_run).await;
+    ops.unlisten(&row.from_run, &format!("/wicket/sock/link-{}.sock", row.id)).await;
+    if let Ok(l) = ctx.ledger.lock() {
+        let _ = l.audit(
+            &ctx.tenant,
+            Some(&ctx.run),
+            "link.close",
+            &serde_json::json!({ "id": row.id, "reason": reason, "carried_by_node": true, "closed_by_relay": closed_now }),
+        );
+    }
+    ctx.emit(Event::Tool { name: "link".into(), detail: format!("closed {}: {reason}", row.id) });
 }
 
 async fn relay(ctx: RunCtx, ops: Arc<dyn BoxOps>, row: LinkRow, mut incoming: tokio::sync::mpsc::UnboundedReceiver<Stream>) {
