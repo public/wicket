@@ -18,18 +18,26 @@ class Node {
   get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
   addEventListener(k, f) { this.listeners[k] = f; }
   focus() {}
+  scrollIntoView() {}
   click() { if (!this.disabled && this.onclick) return this.onclick({ preventDefault() {} }); }
   all(pred, out = []) { for (const c of this.children) { if (pred(c)) out.push(c); if (c.all) c.all(pred, out); } return out; }
 }
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
 const calls = [];
 let state = null;
+// A hostile string an agent chose (a grant's path): it must stay text.
+const HOSTILE = "/x<img src=x onerror=alert(1)>";
+const authority = { status: "running", node: "local", policy: { version: null }, token: { held: true, box_path: "run_a", epoch: 0, zone: "z", issued_by: "the authority root", loads: true,
+  blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
+  grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
+const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
+  against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null;
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
@@ -38,6 +46,9 @@ const fetch = async (path, opts) => {
   if (path === "/api/state") return reply(state);
   if (path === "/api/action/begin") return reply({ action: nextAction, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
   if (path === "/api/action/finish") return reply({ ok: "done" });
+  if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
+  if (path.endsWith("/authority")) return reply(authority);
+  if (path.startsWith("/api/explain/")) return reply(explained);
   return reply({}, false);
 };
 let ceremonies = 0;
@@ -51,7 +62,7 @@ const sandbox = {
   setInterval: () => 0,
   btoa: s => Buffer.from(s, "binary").toString("base64"),
   atob: s => Buffer.from(s, "base64").toString("binary"),
-  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error,
+  Uint8Array, ArrayBuffer, JSON, Math, String, Object, Array, Set, Map, Promise, Error, Date,
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), sandbox);
@@ -131,4 +142,18 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
   console.log("console approval flow: ok");
+
+  // #173: a run's authority and an explained decision open read-only in the detail card, and an
+  // agent's strings in them stay text (the fake DOM has no innerHTML: only textContent exists).
+  run("showAuthority('run_a')"); await flush(); await flush();
+  assert.strictEqual(ids.detail.hidden, false);
+  const text = ids["detail-body"].textContent;
+  assert.ok(text.includes(HOSTILE) && text.includes("block 0 · zone") && text.includes("approved by passkey:laptop"), text);
+  assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
+  run("showExplain(7)"); await flush(); await flush();
+  assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
+  assert.ok(calls.some(c => c.path === "/api/explain/7"));
+  ids["detail-close"].listeners.click();
+  assert.strictEqual(ids.detail.hidden, true);
+  console.log("console authority views: ok");
 })().catch(e => { console.error(e); process.exit(1); });

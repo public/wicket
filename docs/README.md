@@ -31,6 +31,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Run an ACP agent](how-to/run-an-acp-agent.md)
 - [Use HTTP/3](how-to/use-http3.md)
 - [Export audit](how-to/export-audit.md)
+- [Inspect a run's authority in the console](how-to/inspect-authority-in-the-console.md), and explain a decision
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
 - [Update from CI-signed builds](how-to/update-from-ci.md), and follow main
@@ -52,7 +53,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [The box](reference/box.md): what a workload sees from inside
 - [Agents](reference/agents.md): identity, children, messages, sessions, hibernation
 - [Nodes](reference/nodes.md): enrolment, `node serve`, placement, leases, the reconciler
-- [Console](reference/console.md): passkeys, signed actions, what it enforces on the internet
+- [Console](reference/console.md): passkeys, signed actions, authority views, what it enforces on the internet
 - [Audit](reference/audit.md): the writer, export, checkpoints, record kinds
 
 ## Explanation

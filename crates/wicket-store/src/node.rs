@@ -116,6 +116,17 @@ impl Ledger {
         Ok(())
     }
 
+    /// Who approved grant `id` and when (Unix seconds), and whether it is still on its way to the
+    /// node it was handed to (published, not yet confirmed there): for the console's views (#173).
+    pub fn grant_provenance(&self, id: &str) -> Result<Option<(String, i64, bool)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT decided_by, created_at, node_epoch IS NOT NULL FROM grants WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
+    }
+
     /// Node `node` reports its feed at `epoch`: grants published up to it have reached it.
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;

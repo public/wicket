@@ -204,6 +204,45 @@ fn reason(c: &CompiledAuthority, op: &Op, forbidden: bool, token: String) -> Str
     }
 }
 
+/// What a box's token decides for one op, and why (#173): for people asking after the fact. It
+/// records nothing (no grant use is spent) and asks no node: a grant listed in the record that the
+/// token accepts for the op is reported as allowing it if it has uses left (the node counts them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Explained {
+    /// `allow`, `needs grant` or `forbidden`.
+    pub decision: String,
+    /// What decided: `the token's ceilings (block 0)`, `grant <id>`, or the failed checks, each
+    /// naming its block (`block 2: check if …`).
+    pub why: String,
+}
+
+/// [`Explained`] for `op` at `at_ms`, against a token as `entry` holds it and `c` loaded it.
+pub fn explain(entry: &BoxAuthority, c: &CompiledAuthority, op: &Op, at_ms: i64) -> Explained {
+    let e = |d: &str, w: String| Explained { decision: d.into(), why: w };
+    if c.issuer_until.is_some_and(|u| at_ms >= u) {
+        return e("forbidden", "the issuing key that minted block 0 was no longer certified then".into());
+    }
+    let mut req = request(entry, op, at_ms);
+    match c.loaded.decide(&req) {
+        authz::Decision::Allow => e("allow", "the token's ceilings (block 0 and the spawn blocks under it)".into()),
+        authz::Decision::Forbidden(r) => e("forbidden", r),
+        authz::Decision::NeedsGrant(r) => {
+            for g in entry
+                .grants
+                .iter()
+                .filter(|g| g.host.eq_ignore_ascii_case(&op.host) && g.method.eq_ignore_ascii_case(&op.method) && g.path == op.path)
+            {
+                req.uses_left = vec![(g.id.clone(), i64::from(g.uses.unwrap_or(u32::MAX)).max(1))];
+                if c.loaded.decide(&req) == authz::Decision::Allow {
+                    let uses = g.uses.map(|u| format!(" (at most {u} uses, counted on the node)")).unwrap_or_default();
+                    return e("allow", format!("grant {}{uses}", g.id));
+                }
+            }
+            e("needs grant", r)
+        }
+    }
+}
+
 /// The paths a node probes a box's token at before it splices a host (#141): the root, and a deep
 /// path no rule names.
 const SPLICE_PROBES: [&str; 2] = ["/", "/.wicket-splice-probe/a/b.c"];
