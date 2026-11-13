@@ -102,7 +102,7 @@ fn grants(state: &State, m: &Manifest) -> Value {
         "program": m.program.as_ref().map(|p| json!({ "name": p.name, "command": p.command })),
         "image": crate::run::manifest_image(m).map_err(|e| format!("{e:#}")),
         "isolation": format!("{:?}", z.isolation),
-        "unlisted_hosts": serde_json::to_value(&z.unlisted_hosts).unwrap_or(Value::Null),
+        "unlisted_hosts": serde_json::to_value(z.unlisted_hosts).unwrap_or(Value::Null),
         "reach": z.reach.iter().map(|r| serde_json::to_value(r).unwrap_or(Value::Null)).collect::<Vec<_>>(),
         "forbid": z.forbid.iter().map(|r| serde_json::to_value(r).unwrap_or(Value::Null)).collect::<Vec<_>>(),
         "hosts": hosts,
@@ -196,8 +196,8 @@ pub fn diff(old: Option<&Manifest>, new: &Manifest) -> Value {
     before_after("isolation", json!(format!("{:?}", o.isolation)), json!(format!("{:?}", n.isolation)));
     before_after(
         "unlisted_hosts",
-        serde_json::to_value(&o.unlisted_hosts).unwrap_or_default(),
-        serde_json::to_value(&n.unlisted_hosts).unwrap_or_default(),
+        serde_json::to_value(o.unlisted_hosts).unwrap_or_default(),
+        serde_json::to_value(n.unlisted_hosts).unwrap_or_default(),
     );
     before_after("llm", serde_json::to_value(&o.llm).unwrap_or_default(), serde_json::to_value(&n.llm).unwrap_or_default());
     before_after("limits", serde_json::to_value(&o.limits).unwrap_or_default(), serde_json::to_value(&n.limits).unwrap_or_default());
