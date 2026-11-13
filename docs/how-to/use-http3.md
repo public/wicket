@@ -43,3 +43,4 @@ WICKET_H3_HTTPS_RECORDS=0 wicket run task.yaml
 
 `ci/acceptance.sh` fetches a page over HTTP/3, in reach and out of it, with `ci/h3get`, a small
 static HTTP/3 client. HTTP/3 hasn't been checked with `curl --http3` or a browser yet.
+
