@@ -201,7 +201,9 @@ function line(op) {
   if (op.kind === "operator.message") return el("div", "", "say    " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "identity.revoked") return el("div", "blocked", "revoke " + op.run + " by " + strip(b.by) + ": " + strip(b.reason) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "run.console_start") return el("div", "", "launch " + op.run + " " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
-  if (op.kind === "run.end") return el("div", "", "end    " + op.run + " " + strip(b.status) + " · " + b.model_requests + " model calls");
+  if (op.kind === "op" && b.kind === "box") return el("div", "pend", "box    " + strip(b.what) + ": " + strip(b.detail));
+  if (op.kind === "run.exit_cause") return el("div", "blocked", "ended  " + op.run + " (exit status " + b.code + "): " + strip(b.cause));
+  if (op.kind === "run.end") return el("div", b.cause ? "blocked" : "", "end    " + op.run + " " + strip(b.status) + " · " + b.model_requests + " model calls");
   return el("div", "", op.kind);
 }
 

@@ -1,0 +1,10 @@
+# Acceptance (ci/acceptance.sh): a box that outgrows its memory limit (#185). It holds ever more
+# memory in a shell variable; the kernel's OOM killer ends the box, and the run must say so.
+task: Use more memory than the zone allows.
+program:
+  name: oom
+  command: [sh, -c, "echo acc-oom-start; x=; while :; do x=\"$x$(head -c 1048576 /dev/zero | tr '\\0' a)\"; done"]
+zone:
+  name: acc-oom
+  isolation: gvisor
+  limits: { memory: 128m, cpus: 1, timeout: 3m }

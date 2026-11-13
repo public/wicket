@@ -58,6 +58,14 @@ pub struct Docker {
 }
 
 /// Quotes one argument for a POSIX shell.
+/// How a box ended, as its runtime saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitInfo {
+    pub code: i32,
+    pub oom_killed: bool,
+    pub error: Option<String>,
+}
+
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,@%+".contains(c)) {
         s.to_string()
@@ -317,6 +325,38 @@ impl Docker {
             bail!("docker wait failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         String::from_utf8_lossy(&out.stdout).trim().parse().context("docker wait's exit code")
+    }
+
+    /// How a box that has exited ended, as the runtime saw it (#185): its exit code, whether the
+    /// kernel's OOM killer ended it (Docker's `State.OOMKilled`, which runsc reports too), and the
+    /// runtime's own error, if any. None if the box doesn't exist.
+    pub async fn exit_info(&self, name: &str) -> Result<Option<ExitInfo>> {
+        let out = self
+            .command_with(["inspect".to_string(), "-f".into(), "{{json .State}}".into(), name.into()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("docker inspect's state")?;
+        Ok(Some(ExitInfo {
+            code: v["ExitCode"].as_i64().unwrap_or(-1) as i32,
+            oom_killed: v["OOMKilled"].as_bool().unwrap_or(false),
+            error: v["Error"].as_str().filter(|e| !e.is_empty()).map(String::from),
+        }))
+    }
+
+    /// The host pid of a running box's init process (0 if it isn't running).
+    pub async fn pid(&self, name: &str) -> Result<u32> {
+        let out = self
+            .command_with(["inspect".to_string(), "-f".into(), "{{.State.Pid}}".into(), name.into()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0))
     }
 
     /// Whether a box exists, and if so whether it runs and its exit code.

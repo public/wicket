@@ -39,6 +39,7 @@
 #     on this host's own node and (--nodes local) on the other node survive, reconcile adopts their
 #     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
 #     killed and restarted, and the same boxes take one more turn each;
+#   - a box over its memory limit is killed by the kernel, and its run says so (#185);
 #   - `wicket audit --verify`, and audit export to a JSON-lines sink checked with `--against` (a
 #     tampered copy of the export is refused).
 #
@@ -392,6 +393,13 @@ HOME=$HOMEW "$W" run "$(manifest flood-stop)" --image "$IMAGE_TAG" >"$work/flood
 flood_stop=$(run_id_of "$work/flood-stop.log")
 our_runs+=("$flood_stop")
 check "with on_output_full: stop, the box is stopped, saying why, and its run ends" 'grep -q "on_output_full: stop" "$work/flood-stop.log" && [ -z "$(box_of "$flood_stop")" ] && w audit --tail 300 | grep -E "run\.end" | grep -q "$flood_stop"'
+# A box that outgrows its memory limit (#185): the kernel kills it, and the run says why.
+HOME=$HOMEW "$W" run "$(manifest oom)" --image "$IMAGE_TAG" >"$work/oom.log" 2>&1 || true
+oom_run=$(run_id_of "$work/oom.log")
+our_runs+=("$oom_run")
+grep -E "box ended|run $oom_run" "$work/oom.log" | sed 's/^/   /' || true
+check "a box over its memory limit ends saying so: out of memory, with its limit" 'grep -q "out of memory (limit 128 MiB" "$work/oom.log" && grep -q "failed (exit status: 137; killed: out of memory" "$work/oom.log"'
+check "  and the audit's run.end and the node's record carry the cause" 'w audit --tail 400 | grep run.end | grep "$oom_run" | grep -q "out of memory" && w audit --tail 400 | grep "$oom_run" | grep -q "box.exit_cause"'
 
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
