@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UnixListener;
 
 pub struct Gateway {
     ctx: RunCtx,
@@ -39,7 +38,7 @@ impl Gateway {
 
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();
