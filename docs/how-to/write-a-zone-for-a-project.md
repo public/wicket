@@ -120,3 +120,21 @@ zones that may message or connect to this one. The [second tutorial](../tutorial
 shows it.
 
 `examples/self-hosting/manifest.yaml` is a whole zone written this way, for wicket's own source.
+
+## 9. Pin its images by digest
+
+A tag (`wicket-self:dev`) means whatever it points to now. Pin the images a zone may start, so what it
+allows is exactly what you reviewed:
+
+```
+wicket zone pin manifest.yaml --dry-run   # what would change
+wicket zone pin manifest.yaml             # rewrites zone.images, agent.image, program.image
+```
+
+Each tag becomes `name@sha256:…`, the digest this installation's Docker has for it. A pinned box
+starts as that digest on its node, whatever the tag points to later, and the node refuses it if it
+doesn't have that image. `wicket image` prints the digest of what it built.
+[Image pins](../reference/manifest.md#image-pins) has the rules.
+
+To require pins for every run on the installation, put `require_digests: true` in
+`<data dir>/images.yaml`.

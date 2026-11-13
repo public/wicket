@@ -4,6 +4,17 @@ User-facing changes, grouped by area. Numbers link to the pull requests.
 
 ## 0.0.2 (unreleased)
 
+### Images
+
+- Zones pin their images by digest: `name@sha256:…` in `zone.images`, `agent.image` and
+  `program.image`. A pinned box starts on its node as exactly that digest (by the image's id), whatever
+  the tag points to later. A child's default image is its parent's, pinned to the digest the parent
+  started as. Spawns are checked by digest on the node, and every box's digest is in its run record and
+  the audit (`run.image`).
+- `wicket zone pin MANIFEST` rewrites tags to digests, `wicket image digest` prints them, and
+  `images.yaml`'s `require_digests` makes pins mandatory. Protocol 6
+  ([#192](https://github.com/public/wicket/issues/192)).
+
 ### Updates
 
 - CI-signed builds: every push to `main` is built and tested (`.github/workflows/build.yml`); after a
