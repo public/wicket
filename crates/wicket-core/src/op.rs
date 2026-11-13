@@ -290,6 +290,7 @@ impl CompiledZone {
     /// Compiles every glob. A glob that doesn't compile is an error, never "doesn't match", so a broken
     /// forbid rule can't silently allow.
     pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
+        spec.check_wildcards()?;
         let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
         // Forbid globs ignore ASCII case (see `ForbidRule::paths`). A glob that doesn't compile is
         // reported as written.

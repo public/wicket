@@ -677,7 +677,7 @@ fn tools() -> Value {
                     "image": { "type": "string", "description": "default: your own image" },
                     "zone": {
                         "type": "object",
-                        "description": "manifest-style zone: reach [{host, methods, paths}], forbid, unlisted_hosts, inject, volumes [{name, path}], llm {max_requests, max_output_tokens}, limits {memory, cpus, timeout, pids}, isolation, images, accept_from. Omitted: reach and credentials none; limits, isolation and unlisted_hosts yours; an agent's model budget half of what you have left."
+                        "description": "manifest-style zone: reach [{host, methods, paths}], forbid, unlisted_hosts, wildcards {forbid, max_names}, inject, volumes [{name, path}], llm {max_requests, max_output_tokens}, limits {memory, cpus, timeout, pids}, isolation, images, accept_from. Omitted: reach and credentials none; limits, isolation, unlisted_hosts and wildcards yours; an agent's model budget half of what you have left."
                     },
                     "max_children": { "type": "integer", "minimum": 0, "default": 0 },
                     "ask_human": { "type": "boolean", "default": false },
