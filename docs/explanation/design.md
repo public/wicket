@@ -1596,11 +1596,25 @@ approval. It didn't probe.
 
 **DNS.** The box has no resolver and no network. Names are resolved only on the host, and only for requests
 a rule allows. So DNS isn't an exfiltration route, and blocked or pending names are never looked up.
-- **Wildcard reach rules are the residual channel:** any name under them is resolved on the host. Prefer
-  exact hosts in sensitive zones.
-- **Showing "no such domain" in `escalate` mode needs an existence check.** A safe one asks only whether the
-  *registered* domain exists (public suffix list), so agent-chosen subdomains are never queried. It's not
-  built; `unlisted_hosts: hide` is the strict alternative.
+- **Wildcard reach rules are the residual channel:** a name under one is the agent's to choose, and it is
+  resolved on the host. Three things narrow it (#20), all decided on the node that runs the box:
+  - a name under a wildcard is resolved only after a request to it has been decided and allowed. Until
+    then its connections are inspected, never spliced (splicing dials at connect);
+  - each wildcard rule reaches at most `wildcards.max_names` distinct names per run (default 32). Past
+    that a new name is refused before it's resolved, while names already reached keep working;
+  - a zone can set `wildcards: { forbid: true }`, and then no reach rule may be a wildcard. A child
+    zone inherits that, and never gets a higher `max_names`.
+
+  `wicket zone` warns about every wildcard reach rule. Prefer exact hosts in sensitive zones.
+- **"No such domain" in `escalate` mode** (#19): for a host no reach or inject rule names, the node asks
+  its own resolver whether the host's *registered* domain exists. The registered domain comes from the
+  public suffix list, compiled in so it works offline. If the answer is NXDOMAIN, the agent gets
+  "unknown host" instead of a pending request. Agent-chosen subdomains are never queried, only
+  `example.com` for `a.b.example.com`. The check reads only the response code. Any other answer, or none
+  (offline, a timeout, SERVFAIL), escalates as before, so a human still decides. Each domain is asked
+  once per run, and at most 256 per run. Domains under the reserved TLDs `.test`, `.example` and
+  `.invalid` are unknown without any query. `unlisted_hosts: hide` is still the strict alternative, with no
+  lookup at all.
 - **An in-box resolver, when one is needed,** is wicket's own synthetic one: zone names only, "no such
   domain" otherwise, and never forwarding an agent-chosen name (§7).
 
