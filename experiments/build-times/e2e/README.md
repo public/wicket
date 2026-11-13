@@ -43,7 +43,7 @@ Two checks fail on main, independently of these changes:
 |---|---|---|---|
 | `update.sh` | 926 s | 476 s | builds are copies of the binary with its debug info stripped (`objcopy --strip-debug`: 115 MB instead of 500 MB), so packaging, hashing and sending them is 3–4× faster |
 | `node-e2e.sh --local` | 334 s | 131 s | #235: a 30 s cut and a 100 s authority by default (the nightly run keeps 165 s and 300 s: 356 s, all checks ok); fixed sleeps replaced by waits on the box's own probe lines |
-| `acceptance.sh --nodes local` | 943 s | about 740 s (expected) | runs `node-e2e.sh` inside its multi-host flow, so it saves the same ~200 s |
+| `acceptance.sh --nodes local` | 943 s | about 740 s (expected) | #235; runs `node-e2e.sh` inside its multi-host flow, so it saves the same ~200 s |
 
 Evaluated and left as they are:
 
