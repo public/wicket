@@ -126,6 +126,7 @@ pub fn route(cmd: &Cmd) -> Route {
             // Changes the code that holds every key: root's alone, and never the daemon's own uid
             // (`root_only`).
             SelfCmd::Update { .. }
+            | SelfCmd::Follow
             | SelfCmd::Rollback { .. }
             | SelfCmd::Prune { .. }
             | SelfCmd::TrustKey { .. }
@@ -144,7 +145,12 @@ pub fn route(cmd: &Cmd) -> Route {
 /// supervisors, gateways and proxies (#162). Updating wicket, or changing which keys may sign an
 /// update, is a human's act on the host; an agent can only ask (`request_update`).
 pub fn root_only(cmd: &Cmd) -> bool {
-    matches!(cmd, Cmd::Itself { cmd: SelfCmd::Update { .. } | SelfCmd::Rollback { .. } | SelfCmd::Prune { .. } | SelfCmd::TrustKey { .. } })
+    matches!(
+        cmd,
+        Cmd::Itself {
+            cmd: SelfCmd::Update { .. } | SelfCmd::Follow | SelfCmd::Rollback { .. } | SelfCmd::Prune { .. } | SelfCmd::TrustKey { .. }
+        }
+    )
 }
 
 /// Arguments only wicket itself passes (a parent starting a child, the console starting a run): a

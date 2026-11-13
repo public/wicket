@@ -8,6 +8,7 @@
 mod audit_export;
 mod capacity;
 mod chan;
+mod ci_update;
 mod daemon;
 mod doctor;
 mod enrol;
@@ -528,7 +529,14 @@ enum SelfCmd {
     /// control host to it, hand its processes over, and watch it; then the nodes, a canary first.
     /// Any failed health check switches back.
     Update {
-        artifact: PathBuf,
+        /// The artifact: a wicket binary, or a release archive.
+        #[arg(required_unless_present = "from_ci", conflicts_with = "from_ci")]
+        artifact: Option<PathBuf>,
+        /// A build CI signed instead (#190): a commit on main, or `latest`. Downloaded here and
+        /// taken only if signed in the release environment by a trusted key, for this
+        /// installation's repository (`<data dir>/ci-builds.yaml`) and that commit, on main.
+        #[arg(long, value_name = "COMMIT|latest")]
+        from_ci: Option<String>,
         /// The detached signature (default: <artifact>.sig).
         #[arg(long)]
         sig: Option<PathBuf>,
@@ -560,6 +568,10 @@ enum SelfCmd {
         #[arg(long)]
         no_prune: bool,
     },
+    /// Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow
+    /// policy lets it now (its window, soak time, only forward along main, never across a schema
+    /// contract step or a failed build). Run by the wicket-follow timer.
+    Follow,
     /// Switch back to the previous version: the control host (unless --only-nodes) and these nodes.
     Rollback {
         /// `all`, or node names (comma-separated).
@@ -1564,7 +1576,8 @@ async fn main() -> Result<()> {
         Cmd::Place { cmd } => place::run(cmd).await,
         Cmd::Itself { cmd } => match cmd {
             SelfCmd::Status => update::status(),
-            SelfCmd::Update { artifact, sig, nodes, only_nodes, window, interval, check, canary, image, no_prune } => {
+            SelfCmd::Follow => ci_update::follow().await,
+            SelfCmd::Update { artifact, from_ci, sig, nodes, only_nodes, window, interval, check, canary, image, no_prune } => {
                 let gate = update::Gate {
                     window: humantime::parse_duration(&window).context("bad --window")?,
                     interval: humantime::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
@@ -1572,7 +1585,13 @@ async fn main() -> Result<()> {
                     canary,
                     image,
                 };
-                update::update(update::UpdateOpts { artifact, sig, nodes, only_nodes, gate, prune: !no_prune }).await
+                match (from_ci, artifact) {
+                    (Some(target), _) => ci_update::update_from_ci(&target, nodes, only_nodes, gate, !no_prune).await,
+                    (None, Some(artifact)) => {
+                        update::update(update::UpdateOpts { artifact, sig, nodes, only_nodes, gate, prune: !no_prune, ci: None }).await
+                    }
+                    (None, None) => unreachable!("clap requires one"),
+                }
             }
             SelfCmd::Rollback { nodes, only_nodes } => update::rollback(nodes, only_nodes).await,
             SelfCmd::Prune { nodes, only_nodes, keep_snapshots, dry_run } => {
