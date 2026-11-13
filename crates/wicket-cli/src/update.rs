@@ -245,6 +245,14 @@ pub fn reexec_on_hangup(pidfile: PathBuf, versions: PathBuf, before: impl FnOnce
     if std::fs::write(&tmp, format!("{}\n", std::process::id())).is_ok() {
         let _ = std::fs::rename(&tmp, &pidfile);
     }
+    // What this process runs, for checks that can't read `/proc/<pid>/exe`: a `node serve` makes
+    // itself non-dumpable (it holds secrets in memory, #152), which hides that from its own user.
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        let tmp = pidfile.with_extension(format!("{}.exe-new", std::process::id()));
+        if std::fs::write(&tmp, format!("{}\n{}\n", std::process::id(), exe.display())).is_ok() {
+            let _ = std::fs::rename(&tmp, pidfile.with_extension("exe"));
+        }
+    }
     let Ok(mut hup) = signal(SignalKind::hangup()) else { return };
     tokio::spawn(async move {
         hup.recv().await;
@@ -276,9 +284,15 @@ fn hangup(pidfile: &Path, expect: &str) -> Option<u32> {
 }
 
 /// Whether process `pid` now runs `bin`.
-fn runs(pid: u32, bin: &Path) -> bool {
+fn runs(pid: u32, bin: &Path, pidfile: &Path) -> bool {
     let want = std::fs::canonicalize(bin).ok();
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok().is_some_and(|e| Some(e) == want)
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok().or_else(|| {
+        // A non-dumpable process: what it wrote beside its pid file, if it is this pid's.
+        let s = std::fs::read_to_string(pidfile.with_extension("exe")).ok()?;
+        let mut l = s.lines();
+        (l.next()?.trim().parse::<u32>().ok()? == pid).then(|| PathBuf::from(l.next().unwrap_or_default()))
+    });
+    exe.is_some_and(|e| Some(e) == want)
 }
 
 fn sha256_file(p: &Path) -> Result<String> {
@@ -923,12 +937,12 @@ async fn handover(bin: &Path) -> Result<()> {
     let local = crate::localnode::pidfile()?;
     if let Some(pid) = hangup(&local, "node serve") {
         for _ in 0..200 {
-            if runs(pid, bin) {
+            if runs(pid, bin, &local) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        say(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin) { "the new build" } else { "?" }));
+        say(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin, &local) { "the new build" } else { "?" }));
     }
     for role in ["console", "reconcile"] {
         if let Some(pid) = hangup(&pidfile(role), role) {

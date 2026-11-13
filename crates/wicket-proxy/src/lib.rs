@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod h3;
 pub mod link;
 pub mod llm;
+pub mod provider;
 mod splice;
 pub mod vault;
 

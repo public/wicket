@@ -463,6 +463,23 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     let (agent, generation, run, first, last_node) = {
         let mut l = Ledger::open(&ledger_path())?;
         let a = resolve(&l, who)?;
+        // The wake fence (#153): its last activation's box may still be running on a node cut off
+        // from this host, until that box's authority ends. Not woken elsewhere until then, unless
+        // the node has confirmed the box stopped.
+        if let Some((node, until)) = crate::noderun::fenced_until(&a.run, wicket_feed::now_ms()) {
+            let why = format!(
+                "its last activation (run {}) may still be running on node {node}, which this host can't confirm stopped, until its authority ends: it can be woken from {}, or as soon as node {node} reports the box stopped",
+                a.run,
+                crate::noderun::fmt_ms(until)
+            );
+            l.audit(
+                &TenantId(a.tenant.clone()),
+                None,
+                "agent.wake_refused",
+                &serde_json::json!({ "agent": a.id, "by": by, "why": why, "until_ms": until }),
+            )?;
+            bail!("agent {} can't be woken yet: {why}", a.id);
+        }
         // Where it last ran (its run before this wake): only a tie-break when placing it.
         let last_node = l.run_node(&a.run)?;
         for (r, _) in l.agent_runs(&a.id)? {

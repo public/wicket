@@ -5,14 +5,15 @@
 //!   by reach, else a live ledger grant is consumed, else a pending request is raised (or a recent
 //!   denial repeated).
 //! - [`NodeDecider`]: a remote node's verified feed replica (`wicket_feed::Replica::decide`), so a box
-//!   keeps working while the control host is unreachable, failing narrow: fresh, everything the box's
-//!   token and its live grants allow; narrow, plain reads (R1) only; closed, nothing. The feed
-//!   carries each box's authority as a Biscuit token chain (`wicket_feed::token`), loaded once. A request that needs a
-//!   grant is put to the control host (which raises the pending request, so `wicket pending` and
-//!   `wicket approve` work as usual) when the node is connected; when it isn't, it fails with a clear
-//!   403 and no request id. Grant uses are counted on the node, for its boxes only. Hosts the box's
-//!   token allows wholesale are spliced through while the replica is fresh, and inspected otherwise
-//!   (#141).
+//!   keeps working while the control host is unreachable (#153): connected or not, everything the
+//!   box's token and its live grants allow, each until its own expiry; nothing while the replica is
+//!   lagging or closed. The feed carries each box's authority as a Biscuit token chain
+//!   (`wicket_feed::token`), loaded once. A request that needs a grant is put to the control host
+//!   (which raises the pending request, so `wicket pending` and `wicket approve` work as usual) when
+//!   the node is connected; when it isn't, the ask is queued on the node and raised when the
+//!   control host is back (no approvals on the node alone). Grant uses are counted on the node, for
+//!   its boxes only. Hosts the box's token allows wholesale are spliced through unless the replica
+//!   is lagging or closed, and inspected otherwise (#141).
 
 use crate::RunCtx;
 use futures_util::future::BoxFuture;
@@ -33,7 +34,10 @@ pub enum Outcome {
     Denied { request: String },
     /// Waiting for a human: `request` is the pending request's id; `fresh` if this ask created it.
     Pending { request: String, fresh: bool, why: String },
-    /// The node can't decide this now (stale or closed policy, or the control host is unreachable).
+    /// Queued on the node while the control host is unreachable (#153): `id` is node-local, and the
+    /// ask is raised when the control host is back.
+    Queued { id: String, why: String },
+    /// The node can't decide this now (lagging or closed policy, or the control host is unreachable).
     Unavailable(String),
     /// The decision itself failed (a ledger error).
     Error(String),
@@ -137,6 +141,11 @@ pub trait ControlLink: Send + Sync {
     fn connected(&self) -> bool;
     /// Asks the control host to raise (or find) the pending request for `op`.
     fn ask<'a>(&'a self, op: &'a Op, why: &'a str, who: Option<&'a serde_json::Value>) -> BoxFuture<'a, Result<Asked, String>>;
+    /// Queues the ask on the node while the control host is unreachable (#153), to be raised when it
+    /// is back: the ask's node-local id. The default queues nothing.
+    fn queue(&self, _op: &Op, _why: &str, _who: Option<&serde_json::Value>) -> Result<String, String> {
+        Err("no ask queue".into())
+    }
 }
 
 /// The node's clock for feed decisions (Unix ms, see `wicket-cli`'s node clock: wall time anchored
@@ -163,11 +172,9 @@ impl NodeDecider {
 /// The text for a refusal in a mode that isn't fresh.
 pub fn stale_text(mode: Mode, why: &str) -> String {
     match mode {
-        Mode::Narrow => format!(
-            "wicket's control plane has been unreachable for longer than its freshness lease, so this node allows only plain reads in the zone's reach until it returns ({why}); retry later"
-        ),
-        Mode::Closed => format!("wicket's control plane has been unreachable too long: this node allows nothing until it returns ({why}); retry later"),
-        Mode::Fresh => why.to_string(),
+        Mode::Lagging => format!("this node is catching up with wicket's policy feed ({why}); retry in a moment"),
+        Mode::Closed => format!("this node holds no valid policy from wicket's control plane ({why}); retry later"),
+        Mode::Fresh | Mode::Offline => why.to_string(),
     }
 }
 
@@ -188,11 +195,19 @@ impl Decider for NodeDecider {
                 Decision::Forbidden(why) => Outcome::Forbidden(why),
                 Decision::Refused { mode, why } => Outcome::Unavailable(stale_text(mode, &why)),
                 Decision::NeedsGrant(why) if !ctx.escalate => Outcome::NoEscalation(why),
-                Decision::NeedsGrant(_) if !self.control.connected() => Outcome::Unavailable(UNREACHABLE.into()),
+                Decision::NeedsGrant(why) if !self.control.connected() => match self.control.queue(op, &why, who.map(|(v, _)| v)) {
+                    Ok(id) => Outcome::Queued { id, why },
+                    Err(_) => Outcome::Unavailable(UNREACHABLE.into()),
+                },
                 Decision::NeedsGrant(why) => match self.control.ask(op, &why, who.map(|(v, _)| v)).await {
                     Ok(Asked::Pending { request, fresh }) => Outcome::Pending { request, fresh, why },
                     Ok(Asked::Denied { request }) => Outcome::Denied { request },
-                    Err(_) => Outcome::Unavailable(UNREACHABLE.into()),
+                    // The link looked up but the control host didn't answer (a partition the node
+                    // hasn't noticed yet): queued, as when it is known to be down (#153).
+                    Err(_) => match self.control.queue(op, &why, who.map(|(v, _)| v)) {
+                        Ok(id) => Outcome::Queued { id, why },
+                        Err(_) => Outcome::Unavailable(UNREACHABLE.into()),
+                    },
                 },
             }
         })
@@ -205,14 +220,14 @@ impl Decider for NodeDecider {
     fn splice_lost(&self, _ctx: &RunCtx, _host: &str) -> String {
         let mode = self.replica.lock().expect("replica").mode((self.clock)());
         match mode {
-            Mode::Fresh => "the box's authority on this node no longer allows the host wholesale".into(),
-            Mode::Narrow => "this node's policy is no longer fresh (narrow: plain reads only, decided per request)".into(),
+            Mode::Fresh | Mode::Offline => "the box's authority on this node no longer allows the host wholesale".into(),
+            Mode::Lagging => "this node is catching up with its policy feed (nothing is allowed until it has)".into(),
             Mode::Closed => "this node's policy is closed (nothing is allowed until the control host returns)".into(),
         }
     }
 
     fn splice_note(&self) -> &'static str {
-        " (on the node, while its policy is fresh)"
+        " (on the node)"
     }
 }
 
@@ -253,13 +268,28 @@ pub fn subtree_permits(subtree: &str, host: &str) -> bool {
 }
 
 /// The node's forwarding rule. It never terminates TLS for:
-/// - a host with an `inject` rule or a credential swap (secrets stay on the control host);
+/// - a host with an `inject` rule whose secret isn't sealed to the node ([`route_sealed`]), or a
+///   credential swap;
 /// - a host outside the node CA's name constraints (e.g. one approved later under
 ///   `unlisted_hosts: escalate`): a leaf for it wouldn't verify anyway;
 /// - anything at all once the node CA has expired, or without one: never mint.
 pub fn route(host: &str, zone: &ZoneSpec, swaps: &[crate::CredentialSwap], ca: Option<(&[String], i64)>, now_secs: i64) -> Route {
+    route_sealed(host, zone, swaps, ca, now_secs, &|_| false)
+}
+
+/// [`route`] on a node that holds some secrets sealed to it (#152): a host whose `inject` rules all
+/// name a secret the node holds (`held`) is terminated and injected on the node, within the CA's
+/// constraints like any other.
+pub fn route_sealed(
+    host: &str,
+    zone: &ZoneSpec,
+    swaps: &[crate::CredentialSwap],
+    ca: Option<(&[String], i64)>,
+    now_secs: i64,
+    held: &dyn Fn(&str) -> bool,
+) -> Route {
     use wicket_core::manifest::host_matches;
-    if zone.inject.iter().any(|r| host_matches(&r.host, host)) {
+    if zone.inject.iter().any(|r| host_matches(&r.host, host) && !held(&r.secret)) {
         return Route::Forward("the zone injects a credential for this host".into());
     }
     if swaps.iter().any(|s| host_matches(&s.host, host)) {
@@ -330,6 +360,11 @@ mod tests {
         assert!(matches!(route("later.example.net", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("name constraints")));
         assert!(matches!(route("api.example.com", &z, &[], ca, 2_000), Route::Forward(r) if r.contains("expired")));
         assert!(matches!(route("api.example.com", &z, &[], None, 0), Route::Forward(_)));
+        // #152: a node holding the injected secret sealed to it terminates and injects itself.
+        let held = |n: &str| n == "s";
+        let wide = Some((&[".example.com".to_string()][..], 1_500));
+        assert_eq!(route_sealed("secret.example.com", &z, &[], wide, 1_000, &held), Route::Terminate);
+        assert!(matches!(route_sealed("secret.example.com", &z, &[], wide, 1_000, &|_| false), Route::Forward(r) if r.contains("injects")));
     }
 
     struct Link {
@@ -344,6 +379,9 @@ mod tests {
         fn ask<'a>(&'a self, _op: &'a Op, _why: &'a str, _who: Option<&'a serde_json::Value>) -> BoxFuture<'a, Result<Asked, String>> {
             let n = self.asks.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(Asked::Pending { request: format!("r-{n}"), fresh: true }) })
+        }
+        fn queue(&self, _op: &Op, _why: &str, _who: Option<&serde_json::Value>) -> Result<String, String> {
+            Ok("q-1".into())
         }
     }
 
@@ -376,9 +414,9 @@ mod tests {
         let root = SigningKey::from_bytes(&[7; 32]);
         let key = SigningKey::from_bytes(&[8; 32]);
         let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
-        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000, 120_000);
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
         let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
-        let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, narrow_ms: 2_000, retain: 100 };
+        let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, retain: 100 };
         let p = Publisher::open_with(&dir, "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
         let r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
         (p, Arc::new(Mutex::new(r)), dir, authz_root)
@@ -389,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_node_decider_fails_narrow_and_escalates_only_when_connected() {
+    async fn the_node_decider_works_offline_until_the_token_expires_and_queues_asks() {
         let (mut p, replica, dir, authz_root) = feed();
         let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
         let now = Arc::new(AtomicI64::new(1_000_000));
@@ -417,15 +455,18 @@ mod tests {
         assert!(matches!(d.decide(&ctx(false), &op("GET", "/other"), None).await, Outcome::NoEscalation(_)));
         assert_eq!(d.host_verdict(&c, "169.254.169.254"), wicket_core::CompiledZone::new(zone()).unwrap().host_verdict("169.254.169.254"));
         link.up.store(false, Ordering::SeqCst);
-        assert_eq!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Unavailable(UNREACHABLE.into()));
-        assert_eq!(link.asks.load(Ordering::SeqCst), 1, "no ask while disconnected");
-        // Past the TTL: narrow, reads only.
-        now.store(t0 + 1_500, Ordering::SeqCst);
-        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(_)));
-        assert!(matches!(d.decide(&c, &op("POST", "/v1/a"), None).await, Outcome::Unavailable(t) if t.contains("plain reads")));
-        // Past the narrow window: closed.
-        now.store(t0 + 3_500, Ordering::SeqCst);
-        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Unavailable(t) if t.contains("allows nothing")));
+        assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Queued { id, .. } if id == "q-1"));
+        assert_eq!(link.asks.load(Ordering::SeqCst), 1, "queued, not asked, while disconnected");
+        // Past the TTL, and long after (#153): offline, the token's authority holds, writes included,
+        // until the token itself expires (block 0's not_after: 3600 s).
+        for t in [t0 + 1_500, t0 + 150_000, 3_599_000] {
+            now.store(t, Ordering::SeqCst);
+            assert_eq!(replica.lock().unwrap().mode(t), Mode::Offline);
+            assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(_)), "{t}");
+            assert!(matches!(d.decide(&c, &op("POST", "/v1/a"), None).await, Outcome::Allow(_)), "{t}");
+        }
+        now.store(3_601_000, Ordering::SeqCst);
+        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Forbidden(_)), "expired with its token");
         // A grant: a block appended to the box's token on the control host, its uses counted on the
         // node; a revocation applies at once.
         let t1 = t0 + 4_000;

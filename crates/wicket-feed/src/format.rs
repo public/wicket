@@ -5,7 +5,7 @@
 //! | [`KeyCert`] | `wicket-feed-key+jws` | root key (pinned on the node) | feed key, `version`, `not_after`, caps |
 //! | [`Snapshot`] | `wicket-feed-snapshot+jws` | feed key | the whole state at an epoch |
 //! | [`Delta`] | `wicket-feed-delta+jws` | feed key | epoch n−1 → n, a batch of [`Change`]s |
-//! | [`Fresh`] | `wicket-feed-fresh+jws` | feed key | latest epoch and head, `fresh_until`, `narrow_until` |
+//! | [`Fresh`] | `wicket-feed-fresh+jws` | feed key | latest epoch and head, `fresh_until` |
 //!
 //! Every snapshot, delta and statement names the certificate `version` it was made under and the
 //! node it is for (`feed`), so artifacts from another generation (before a re-genesis) or from
@@ -39,13 +39,19 @@ pub struct KeyCert {
     pub not_after: i64,
     /// Longest `fresh_until − issued_at` the key may sign.
     pub max_ttl_ms: i64,
-    /// Longest `narrow_until − fresh_until` the key may sign.
+    /// Legacy (before #153): the longest read-only window after `fresh_until` the key could sign.
+    /// Accepted from older certificates and ignored: a node now works on its tokens' own lifetimes.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub max_narrow_ms: i64,
 }
 
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
 impl KeyCert {
-    pub fn new(feed_key: &VerifyingKey, version: u64, not_after: i64, max_ttl_ms: i64, max_narrow_ms: i64) -> KeyCert {
-        KeyCert { kid: crate::kid(feed_key), x: B64.encode(feed_key.as_bytes()), version, not_after, max_ttl_ms, max_narrow_ms }
+    pub fn new(feed_key: &VerifyingKey, version: u64, not_after: i64, max_ttl_ms: i64) -> KeyCert {
+        KeyCert { kid: crate::kid(feed_key), x: B64.encode(feed_key.as_bytes()), version, not_after, max_ttl_ms, max_narrow_ms: 0 }
     }
 
     /// The certified key, checked against its `kid`.
@@ -53,7 +59,7 @@ impl KeyCert {
         let bad = || Refusal::Malformed("certificate key".into());
         let x: [u8; 32] = B64.decode(&self.x).ok().and_then(|b| b.try_into().ok()).ok_or_else(bad)?;
         let k = VerifyingKey::from_bytes(&x).map_err(|_| bad())?;
-        if crate::kid(&k) != self.kid || self.max_ttl_ms <= 0 || self.max_narrow_ms < 0 {
+        if crate::kid(&k) != self.kid || self.max_ttl_ms <= 0 {
             return Err(bad());
         }
         Ok(k)
@@ -156,8 +162,9 @@ pub struct Delta<P> {
     pub changes: Vec<Change<P>>,
 }
 
-/// A freshness statement: "the latest epoch is `epoch` with head `head`; decide normally until
-/// `fresh_until`, reads only until `narrow_until`". Re-signed every few seconds.
+/// A freshness statement: "the latest epoch is `epoch` with head `head`; the node is connected and
+/// caught up until `fresh_until`". Re-signed every few seconds. Past it, the node is offline and
+/// decides on the lifetimes of the tokens and grants it holds (#153).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fresh {
@@ -167,6 +174,8 @@ pub struct Fresh {
     pub head: String,
     pub issued_at: i64,
     pub fresh_until: i64,
+    /// Legacy (before #153), accepted and ignored.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub narrow_until: i64,
 }
 

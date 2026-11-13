@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end check of `wicket node serve` (#57): a box on a node keeps working for allowed requests
-# while the control host is unreachable, fails narrow, and comes back when the channel does.
+# End-to-end check of `wicket node serve` (#57, #153): a box on a node keeps working while the control
+# host is unreachable, for as long as its authority lasts, and its node stops it when that ends.
 #
 #   ci/node-e2e.sh --local        localhost as the node: two data directories, `node serve` run directly,
 #                                 the ssh hop replaced by WICKET_NODE_SSH (everything but ssh is real)
@@ -14,21 +14,23 @@
 #
 # The program (ci/node-e2e/probe.sh) probes once a second: an allowed read and write on example.com,
 # an out-of-reach path there (decided on the node), and www.example.org (forwarded to the control
-# host). The script then:
+# host). Its zone's authority lasts AUTH seconds from the run's start (default 300). The script:
 #   1. lets it run connected;
-#   2. cuts the control channel: the node's control socket is moved aside (so reconnects fail) and the
-#      channel's forwarder (`... wicket node attach`) is killed;
-#   3. restores it after TTL + narrow window + margin;
-#   4. approves the out-of-reach request (a grant pushed to the node), then revokes the grant;
+#   2. cuts the control channel for CUT seconds (default 165, longer than the old 150 s offline
+#      window): the node's control socket is moved aside (so reconnects fail) and the channel's
+#      forwarder (`... wicket node attach`) is killed;
+#   3. restores it; the out-of-reach request queued on the node meanwhile is raised;
+#   4. approves it (a grant pushed to the node), then revokes the grant;
 #   5. sends the node a tampered and a replayed freshness statement;
-# and reports, from the box's own timestamps, how long writes and reads kept working after the cut.
-# Short feed timings (TTL 6 s, refresh 1 s, narrow 10 s) through the WICKET_FEED_* test overrides.
+#   6. cuts the channel again, past the authority's end: the node stops the box on its own; restores it;
+# and reports, from the box's own timestamps, how the box fared while cut off.
+# Short feed timings (TTL 6 s, refresh 1 s) through the WICKET_FEED_* test overrides.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WICKET=$(realpath "${WICKET:-target/debug/wicket}")
 MODE=${1:?usage: ci/node-e2e.sh --local | <enrolled node>}
-export WICKET_FEED_TTL_MS=${WICKET_FEED_TTL_MS:-6000} WICKET_FEED_REFRESH_MS=${WICKET_FEED_REFRESH_MS:-1000} WICKET_FEED_NARROW_MS=${WICKET_FEED_NARROW_MS:-10000}
-TTL=$((WICKET_FEED_TTL_MS / 1000)) NARROW=$((WICKET_FEED_NARROW_MS / 1000))
+export WICKET_FEED_TTL_MS=${WICKET_FEED_TTL_MS:-6000} WICKET_FEED_REFRESH_MS=${WICKET_FEED_REFRESH_MS:-1000}
+TTL=$((WICKET_FEED_TTL_MS / 1000)) CUT=${CUT:-165} AUTH=${AUTH:-300}
 work=$(mktemp -d)
 pids=()
 cleanup() {
@@ -56,7 +58,9 @@ if [ "$MODE" = --local ]; then
   "$WICKET" node install "$NODE" --no-service
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >"$work/node.log" 2>&1 &
   pids+=($!)
-  for _ in $(seq 50); do [ -S "$nodedir/ctl/ctl.sock" ] && break; sleep 0.2; done
+  # `serve` hashes its binary as it starts, which takes a while on a busy machine.
+  for _ in $(seq 450); do [ -S "$nodedir/ctl/ctl.sock" ] && break; sleep 0.2; done
+  [ -S "$nodedir/ctl/ctl.sock" ] || { echo "node serve did not start within 90 s"; cat "$work/node.log"; exit 1; }
   node_sh() { env HOME="$nodehome" sh -c "$1"; }
 else
   NODE=$MODE
@@ -76,11 +80,11 @@ else
 fi
 
 log "wicket run --node $NODE"
-# The probe must outlast the cut (TTL + narrow window) and the steps after it; 110 s fits the test
-# timings, and longer timings stretch it. The copy sits next to the original so `source: .` still works.
-probe_secs=$(( TTL + NARROW + 70 > 110 ? TTL + NARROW + 70 : 110 ))
+# The probe runs until its node stops it at the authority's end. The copy sits next to the original so
+# `source: .` still works.
 manifest=ci/node-e2e/.e2e-run.yaml
-sed "s/\"110\"/\"$probe_secs\"/" ci/node-e2e/e2e.yaml > "$manifest"
+sed "s/\"110\"/\"$((AUTH + 300))\"/; s/timeout: 5m/timeout: $((AUTH + 300))s, authority: ${AUTH}s/" ci/node-e2e/e2e.yaml > "$manifest"
+t_start=$(now_ms)
 "$WICKET" run "$manifest" --image "${IMAGE:-wicket/claude-code:poc}" --node "$NODE" >"$work/run.log" 2>&1 &
 run_pid=$!
 pids+=($run_pid)
@@ -89,21 +93,26 @@ grep -q ' read=' "$work/run.log" || { cat "$work/run.log"; exit 1; }
 run=$(sed -n 's/^wicket run \(run_[a-z0-9]*\).*/\1/p' "$work/run.log" | head -1)
 sleep 8
 
-log "cutting the control channel"
-node_sh "mv $nodedir/ctl/ctl.sock $nodedir/ctl/ctl.sock.off"
-t_cut=$(now_ms)
 # The channel's forwarder: the run's child (ssh, or the local stand-in) and everything under it.
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
-for c in $(pgrep -P "$run_pid"); do kill_tree "$c"; done
-sleep $((TTL + NARROW + 8))
+cut() {
+  node_sh "mv $nodedir/ctl/ctl.sock $nodedir/ctl/ctl.sock.off"
+  for c in $(pgrep -P "$run_pid"); do kill_tree "$c"; done
+}
+restore() { node_sh "mv $nodedir/ctl/ctl.sock.off $nodedir/ctl/ctl.sock"; }
+
+log "cutting the control channel for ${CUT}s"
+cut
+t_cut=$(now_ms)
+sleep "$CUT"
 log "restoring it"
-node_sh "mv $nodedir/ctl/ctl.sock.off $nodedir/ctl/ctl.sock"
+restore
 t_restore=$(now_ms)
 for _ in $(seq 30); do grep -q 'reconnected' "$work/run.log" && break; sleep 0.5; done
 t_reconnected=$(now_ms)
 sleep 6
 
-log "approving the out-of-reach request"
+log "approving the out-of-reach request (queued on the node while cut off, raised on reconnect)"
 "$WICKET" pending
 rid=$("$WICKET" pending | grep 'example.com/out-of-reach' | grep -o '^r-[a-z0-9]*' | head -1)
 gid=$("$WICKET" approve "$rid" --yes --unlimited --ttl 10m | grep -o '→ grant g-[a-z0-9]*' | grep -o 'g-[a-z0-9]*' | head -1)
@@ -121,14 +130,39 @@ else
   node_sh '"$HOME/.local/bin/wicket" dev node-feed-probe' | tee "$work/probe.out"
 fi
 sleep 4
-log "stopping the run"
-kill -INT "$run_pid" 2>/dev/null || true
-for _ in $(seq 60); do kill -0 "$run_pid" 2>/dev/null || break; sleep 1; done
+
+log "cutting the channel again, past the end of the box's authority (${AUTH}s from the run's start)"
+cut
+t_cut2=$(now_ms)
+while [ "$(now_ms)" -lt $((t_start + AUTH * 1000 + 20000)) ]; do sleep 2; done
+log "restoring it"
+restore
+t_restore2=$(now_ms)
+for _ in $(seq 90); do kill -0 "$run_pid" 2>/dev/null || break; sleep 1; done
+if kill -0 "$run_pid" 2>/dev/null; then
+  echo "FAIL the run did not end after its box's authority expired"
+  kill -INT "$run_pid" 2>/dev/null || true
+  exit 1
+fi
+# The node's log: NODE_LOG if the caller has it (a node run by hand), else its journal.
+if [ -n "${NODE_LOG:-}" ]; then cp "$NODE_LOG" "$work/node.log"
+elif [ "$MODE" != --local ]; then node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
+fi
+# When the node stopped the box: what the run printed from the node's exit (#153), or the node's log.
+t_expired=$(grep -o "stopped the box: its authority expired at [0-9]* ms" "$work/run.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
+[ -n "$t_expired" ] || t_expired=$(grep -o "$run: its authority expired at [0-9]* ms" "$work/node.log" 2>/dev/null | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
+# Else from the node's audit, shipped to the control host on reconnect.
+for _ in $(seq 20); do
+  [ -z "$t_expired" ] || break
+  t_expired=$("$WICKET" audit --tail 5000 | grep node.authority_expired | grep "$run" | grep -o '"until_ms":[0-9]*' | grep -o '[0-9]*' | tail -1 || true)
+  [ -n "$t_expired" ] || sleep 1
+done
+[ -n "$t_expired" ] || { echo "no authority expiry found; the run's last lines:"; tail -5 "$work/run.log"; grep -i authority "$work/node.log" 2>/dev/null | tail -3; }
 
 transcript="${WICKET_HOME:-$HOME/.local/share/wicket}/runs/$run/transcript.jsonl"
-python3 -I - "$transcript" "$t_cut" "$t_restore" "$t_reconnected" "$t_approve" "$t_revoke" "$TTL" "$NARROW" <<'PY' | tee "$work/summary.txt"
+python3 -I - "$transcript" "$t_cut" "$t_restore" "$t_reconnected" "$t_approve" "$t_revoke" "$t_cut2" "$t_restore2" "${t_expired:-0}" "$CUT" <<'PY' | tee "$work/summary.txt"
 import sys
-path, cut, restore, reconnected, approve, revoke, ttl, narrow = sys.argv[1], *map(int, sys.argv[2:])
+path, cut, restore, reconnected, approve, revoke, cut2, restore2, expired, cut_s = sys.argv[1], *map(int, sys.argv[2:])
 rows = {}
 for line in open(path):
     f = line.split()
@@ -136,36 +170,36 @@ for line in open(path):
         continue
     rows[int(f[0])] = dict(kv.split("=", 1) for kv in f[1:])
 ts = sorted(rows)
-ok = lambda v: not v.endswith(":unavailable") and not v.startswith("000")
-def last(key, a, b):
-    t = [x for x in ts if a <= x < b and ok(rows[x][key])]
-    return max(t) if t else None
-def first_bad(key, a, b):
-    t = [x for x in ts if a <= x < b and not ok(rows[x][key])]
-    return min(t) if t else None
-s = lambda t: "-" if t is None else f"{(t - cut) / 1000:+.1f}s"
-print(f"lines: {len(ts)} ({len([t for t in ts if cut <= t < restore])} while cut; replayed after reconnect)")
-print(f"after the cut (TTL {ttl}s, narrow window {narrow}s; times from the cut, box clock):")
-print(f"  writes allowed until {s(last('write', cut, restore))}, first refused {s(first_bad('write', cut, restore))}")
-print(f"  reads  allowed until {s(last('read', cut, restore))}, first refused {s(first_bad('read', cut, restore))}")
-print(f"  out-of-reach (node decides): {sorted({rows[t]['out'] for t in ts if cut <= t < restore})}")
-print(f"  forwarded host:              {sorted({rows[t]['fwd'] for t in ts if cut <= t < restore})}")
+# Let through by wicket (no x-wicket kind), whatever the upstream answered.
+ok = lambda v: not v.startswith("000") and v.rsplit(":", 1)[-1] == "-"
+within = lambda a, b: [t for t in ts if a <= t < b]
+s = lambda t, at: "-" if t is None else f"{(t - at) / 1000:+.1f}s"
+c1 = within(cut, restore)
+w_ok = [t for t in c1 if ok(rows[t]['write'])]
+r_ok = [t for t in c1 if ok(rows[t]['read'])]
+print(f"lines: {len(ts)} ({len(c1)} during the {cut_s}s cut; replayed after reconnect)")
+print(f"  during the cut: {len(w_ok)} writes and {len(r_ok)} reads allowed of {len(c1)}; last write {s(max(w_ok) if w_ok else None, cut)}")
+print(f"  out-of-reach (node decides): {sorted({rows[t]['out'] for t in c1})}")
+print(f"  forwarded host:              {sorted({rows[t]['fwd'] for t in c1})}")
 back = [t for t in ts if t >= restore and ok(rows[t]['write'])]
-print(f"  restored: socket back at {s(restore)}, reconnected {s(reconnected)}, first write allowed {s(min(back) if back else None)}")
+print(f"  restored: socket back at {s(restore, cut)}, reconnected {s(reconnected, cut)}, first write after {s(min(back) if back else None, cut)}")
 before = sorted({rows[t]['out'] for t in ts if t < cut})
 print(f"connected, before the cut: read {sorted({rows[t]['read'] for t in ts if t < cut})} write {sorted({rows[t]['write'] for t in ts if t < cut})} out {before} fwd {sorted({rows[t]['fwd'] for t in ts if t < cut})}")
 g = [t for t in ts if approve <= t < revoke and not rows[t]['out'].startswith("403")]
-print(f"after approval: out-of-reach allowed from {s(min(g)) if g else '-'} (approved at {s(approve)})")
+print(f"after approval: out-of-reach allowed from {s(min(g), approve) if g else '-'} after the approval")
 r = [t for t in ts if t >= revoke and rows[t]['out'].startswith("403")]
-print(f"after revocation: refused again from {s(min(r)) if r else '-'} (revoked at {s(revoke)})")
-w_last, r_last, r_bad = last('write', cut, restore), last('read', cut, restore), first_bad('read', cut, restore)
+print(f"after revocation: refused again from {s(min(r), revoke) if r else '-'} after the revocation")
+c2 = within(cut2, restore2)
+last = max(c2) if c2 else None
+print(f"second cut: {len(c2)} lines; the node stopped the box at its authority's end, {expired} ms; last line {s(last, expired) if expired else '-'}")
 checks = [
-    ("writes kept working after the cut, then stopped before TTL+1s", w_last is not None and w_last - cut >= 0 and w_last - cut <= (ttl + 1) * 1000),
-    ("reads outlived writes, and stopped by TTL+narrow+1s", r_last is not None and w_last is not None and r_last > w_last and r_last - cut <= (ttl + narrow + 1) * 1000),
-    ("everything refused after that", r_bad is not None and all(not ok(rows[t]['write']) and not ok(rows[t]['read']) for t in ts if r_bad <= t < restore)),
+    (f"writes and reads kept working through the {cut_s}s cut, past 155 s", len(c1) > 0 and len(w_ok) >= 0.9 * len(c1) and len(r_ok) >= 0.9 * len(c1) and w_ok and max(w_ok) - cut >= 155_000),
+    ("an out-of-reach request was queued on the node while cut off", any(rows[t]['out'] == "403:queued" for t in c1)),
+    ("the forwarded host was refused while cut off", all(not ok(rows[t]['fwd']) for t in c1)),
     ("restored after reconnect", bool(back)),
     ("approval reached the node", bool(g)),
     ("revocation reached the node", bool(r)),
+    ("cut off again, the box kept working until its authority's end, and stopped then", expired > 0 and last is not None and expired - 15_000 <= last <= expired + 3_000),
 ]
 bad = 0
 for name, c in checks:
@@ -175,7 +209,6 @@ sys.exit(1 if bad else 0)
 PY
 # Push latency of the revocation: ledger → published (the run polls the ledger every 250 ms) → applied
 # on the node (after the node fsyncs it). Remote: the two clocks differ by their skew.
-[ "$MODE" = --local ] || node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
 pub=$(grep -o 'token with [0-9]* live grant(s) to node [a-z0-9-]*, epoch [0-9]* (at [0-9]* ms)' "$work/run.log" | tail -1 || true)
 if [ -n "$pub" ]; then
   ep=$(sed -E 's/.*epoch ([0-9]+).*/\1/' <<<"$pub"); tp=$(sed -E 's/.*at ([0-9]+) ms.*/\1/' <<<"$pub")

@@ -35,14 +35,14 @@ fn reload_resumes_in_the_mode_the_signed_deadlines_allow() {
     let (cp, dir) = persisted();
     let mut r = open(&cp, &dir).unwrap();
     assert_eq!(r.state().unwrap().epoch, 3);
-    assert_eq!(r.deadlines().unwrap(), (T0 + 10 + TTL, T0 + 10 + TTL + WINDOW));
+    assert_eq!(r.fresh_until().unwrap(), T0 + 10 + TTL);
     assert_eq!(r.mode(T0 + 20), Mode::Fresh);
     assert!(allowed(&mut r, &granted(), T0 + 20));
     assert_eq!(r.uses("g-0"), 1, "use counts survive");
-    // Rebooted during an outage: narrow, then closed, on the signed schedule.
-    let r = open(&cp, &dir).unwrap();
-    assert_eq!(r.mode(T0 + 10 + TTL), Mode::Narrow);
-    assert_eq!(r.mode(T0 + 10 + TTL + WINDOW), Mode::Closed);
+    // Rebooted during an outage: offline on what it holds, until the feed key's certificate ends.
+    let mut r = open(&cp, &dir).unwrap();
+    assert_eq!(r.mode(T0 + 10 + TTL), Mode::Offline);
+    assert!(allowed(&mut r, &granted(), T0 + 10 + TTL + 60_000), "grants held survive the reboot offline");
 }
 
 #[test]
@@ -175,10 +175,10 @@ fn publisher_log_survives_restarts_and_torn_writes() {
 #[test]
 fn publisher_refuses_settings_beyond_its_certificate() {
     let (root, k, dir) = (key(), key(), TempDir::new());
-    let c = sign(&root, TYP_KEY, &KeyCert::new(&k.verifying_key(), 1, T0 + 86_400_000, 10_000, 60_000));
+    let c = sign(&root, TYP_KEY, &KeyCert::new(&k.verifying_key(), 1, T0 + 86_400_000, 10_000));
     let open = |cfg: PublisherConfig| Publisher::<ZoneSpec>::open(dir.path(), NODE, &root.verifying_key(), k.clone(), &c, cfg);
     assert!(open(PublisherConfig::default()).is_err(), "30 s TTL > certified 10 s");
-    assert!(open(PublisherConfig { ttl_ms: 10_000, narrow_ms: 60_000, ..PublisherConfig::default() }).is_ok());
+    assert!(open(PublisherConfig { ttl_ms: 10_000, ..PublisherConfig::default() }).is_ok());
     let other = key();
     assert!(Publisher::<ZoneSpec>::open(dir.path(), NODE, &root.verifying_key(), other, &c, cfg()).is_err(), "certificate for another key");
 }
@@ -215,7 +215,8 @@ fn a_crash_while_installing_a_snapshot_loads_closed_not_corrupt() {
     std::fs::write(dir.path().join("deltas.jsonl"), "").unwrap();
     let mut r = open(&cp, &dir).unwrap();
     assert_eq!(r.state().unwrap().epoch, 1);
-    assert_eq!(r.mode(T0 + 20), Mode::Closed, "lagging, and nothing vouches for epoch 1 any more");
+    assert_eq!(r.mode(T0 + 20), Mode::Lagging, "the live statement names epoch 3: nothing is allowed");
+    assert_eq!(r.mode(T0 + 10 + TTL), Mode::Closed, "and nothing vouches for epoch 1 any more");
     let frames = cp.p.catch_up(&r.hello(), T0 + 20).unwrap();
     feed(&mut r, frames, T0 + 20);
     assert_eq!((r.state().unwrap().epoch, r.mode(T0 + 20)), (3, Mode::Fresh));
