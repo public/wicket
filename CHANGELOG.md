@@ -91,6 +91,9 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   and re-verified offline by `wicket audit --verify` ([#1](https://github.com/public/wicket/pull/1)).
 - The console can start runs from allowlisted manifests, send follow-ups, revoke identities and answer
   `request_access` asks, each action passkey-signed ([#87](https://github.com/public/wicket/pull/87)).
+- `agent.image` names the image an agent's box starts from (default: the installation's agent image),
+  checked against `zone.images` like `spawn`. `wicket run` and console starts use it, `--image`
+  overrides it, and the console's start card shows it ([#171](https://github.com/public/wicket/issues/171)).
 - The console is built to face the internet: TLS from files or ACME, passkeys only, enrolment only through
   one-time links from the host (`wicket operator enrol-link`), rate limits and lockouts, strict browser
   headers, bounded HTTP ([#99](https://github.com/public/wicket/pull/99)).

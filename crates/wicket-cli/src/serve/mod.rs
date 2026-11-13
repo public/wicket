@@ -122,10 +122,31 @@ enum SessionKind {
 /// over its canonical JSON.
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
-    Decide { request: String, approve: bool, uses: Option<u32>, ttl_secs: u64 },
-    Say { run: String, text: String },
-    Revoke { run: String, reason: String },
-    Start { root: String, name: String, path: PathBuf, manifest_sha256: String, task: Option<String>, run: String, principal: Value },
+    Decide {
+        request: String,
+        approve: bool,
+        uses: Option<u32>,
+        ttl_secs: u64,
+    },
+    Say {
+        run: String,
+        text: String,
+    },
+    Revoke {
+        run: String,
+        reason: String,
+    },
+    Start {
+        root: String,
+        name: String,
+        path: PathBuf,
+        manifest_sha256: String,
+        task: Option<String>,
+        run: String,
+        principal: Value,
+        /// An agent's image, passed to its run (a program's comes from its manifest).
+        image: Option<String>,
+    },
 }
 
 enum Purpose {
@@ -160,6 +181,9 @@ pub struct Launch {
     pub task: Option<String>,
     pub principal: Value,
     pub log: PathBuf,
+    /// The image the box starts from (#171): the manifest's, as shown on the start card and signed.
+    /// None for a program, whose image is its manifest's `program.image`.
+    pub image: Option<String>,
 }
 
 struct State {
@@ -316,6 +340,9 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
     cmd.args(["run", "--run-id", &l.run]);
     if let Some(t) = &l.task {
         cmd.arg("--task").arg(t);
+    }
+    if let Some(i) = &l.image {
+        cmd.arg("--image").arg(i);
     }
     cmd.arg(&l.manifest)
         .env("WICKET_PRINCIPAL", l.principal.to_string())
@@ -925,6 +952,9 @@ fn list_manifests(state: &State) -> Vec<Value> {
                     "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
                     "program": m.as_ref().and_then(|m| m.program.as_ref().map(|p| p.name.clone())),
                     "zone": m.as_ref().map(|m| m.zone.name.clone()),
+                    // The image its box starts from (#171), or why it can't start.
+                    "image": m.as_ref().and_then(|m| crate::run::manifest_image(m).ok()),
+                    "image_error": m.as_ref().and_then(|m| crate::run::manifest_image(m).err().map(|e| format!("{e:#}"))),
                     // The zone view (#62): which hosts the egress proxy inspects, which it splices.
                     "hosts": m.as_ref().map(|m| wicket_core::splice::view(&m.zone).into_iter().map(|(h, i)| match i {
                         wicket_core::splice::Inspection::Spliced { rule } => json!({ "host": h, "mode": "spliced", "rule": rule }),
@@ -1038,6 +1068,8 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             if m.tenant != state.tenant {
                 return Err(err(StatusCode::FORBIDDEN, "the manifest is for another tenant"));
             }
+            // The image is the manifest's (#171), checked against zone.images before anything is signed.
+            let image = crate::run::manifest_image(&m).map_err(|e| err(StatusCode::FORBIDDEN, format!("{root}/{name}: {e:#}")))?;
             let manifest_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
             let run = RunId::new().0;
             let principal = console_principal(oc);
@@ -1045,9 +1077,10 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "v": 1, "action": "start_run", "tenant": state.tenant.0, "root": root, "manifest": name,
                 "manifest_sha256": manifest_sha256, "task": task, "run": run,
                 "agent": m.agent.as_ref().map(|a| a.name.clone()), "program": m.program.as_ref().map(|p| p.name.clone()),
-                "zone": m.zone.name, "principal": principal,
+                "zone": m.zone.name, "image": image, "principal": principal,
             });
-            Ok((Action::Start { root: root.into(), name: name.into(), path, manifest_sha256, task, run, principal }, v))
+            let image = m.agent.is_some().then_some(image);
+            Ok((Action::Start { root: root.into(), name: name.into(), path, manifest_sha256, task, run, principal, image }, v))
         }
         _ => Err(bad("action must be decide, say, revoke or start_run")),
     }
@@ -1186,7 +1219,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 oc.name
             ))
         }
-        Action::Start { root, name, path, manifest_sha256, task, run, principal } => {
+        Action::Start { root, name, path, manifest_sha256, task, run, principal, image } => {
             // Start exactly what was signed: the same allowlisted file with the same bytes.
             let (now_path, bytes) = resolve_manifest(state, root, name)?;
             if now_path != *path || hex::encode(sha2::Sha256::digest(&bytes)) != *manifest_sha256 {
@@ -1200,7 +1233,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 Some(&rid(run)),
                 "run.console_start",
                 &json!({ "action": "start_run", "run": run, "root": root, "manifest": name, "manifest_sha256": manifest_sha256,
-                         "task": task, "principal": principal, "by": by, "signed": signed }),
+                         "task": task, "image": image, "principal": principal, "by": by, "signed": signed }),
             )?;
             drop(l);
             (state.launcher)(&Launch {
@@ -1209,6 +1242,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 task: task.clone(),
                 principal: principal.clone(),
                 log: log.clone(),
+                image: image.clone(),
             })?;
             Ok(format!("started {run} from {root}/{name} as {} (log: runs/{run}/console.log)", wicket_identity::principal_label(principal)))
         }
@@ -1645,6 +1679,40 @@ mod tests {
         );
     }
 
+    /// #171: a console start uses the manifest's agent.image: listed, signed, audited and passed to
+    /// the run; one outside zone.images is refused before anything is signed.
+    #[test]
+    fn start_run_uses_the_manifests_agent_image() {
+        let mut t = setup("image");
+        let rust = MANIFEST
+            .replace("  name: greeter\n", "  name: greeter\n  image: img:rust\n")
+            .replace("    secret: mock\n", "    secret: mock\n  images: [img:rust]\n");
+        std::fs::write(t.dir.join("manifests/rust.yaml"), &rust).unwrap();
+        std::fs::write(t.dir.join("manifests/plain.yaml"), MANIFEST).unwrap();
+        std::fs::write(t.dir.join("manifests/stray.yaml"), rust.replace("images: [img:rust]", "images: []")).unwrap();
+        let listed = list_manifests(&t.state);
+        let by = |n: &str| listed.iter().find(|m| m["name"] == n).unwrap().clone();
+        assert_eq!(by("rust.yaml")["image"], "img:rust");
+        assert_eq!(by("plain.yaml")["image"].as_str(), Some(crate::image::effective(crate::image::DEFAULT).as_str()));
+        assert!(by("stray.yaml")["image"].is_null() && by("stray.yaml")["image_error"].as_str().unwrap().contains("zone.images"));
+
+        let b = t.begin(json!({ "action": "start_run", "root": "manifests", "manifest": "rust.yaml" }));
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        assert_eq!(b.body["action"]["image"], "img:rust", "the start card shows (and the passkey signs) the image");
+        let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        assert_eq!(t.post("/api/action/finish", a).status, StatusCode::OK);
+        assert_eq!(t.launched.lock().unwrap()[0].image.as_deref(), Some("img:rust"));
+        let (kind, body) = t.audit_kinds().pop().unwrap();
+        assert_eq!((kind.as_str(), body["image"].as_str()), ("run.console_start", Some("img:rust")));
+
+        assert_refused(
+            &t.begin(json!({ "action": "start_run", "root": "manifests", "manifest": "stray.yaml" })),
+            StatusCode::FORBIDDEN,
+            "zone.images",
+        );
+        assert_eq!(t.launched.lock().unwrap().len(), 1, "nothing more was started");
+    }
+
     #[test]
     fn start_run_refuses_paths_outside_the_allowlist_and_changed_manifests() {
         let mut t = setup("allowlist");
@@ -1681,14 +1749,20 @@ mod tests {
         let t = setup("launch");
         let log = t.dir.join("console.log");
         let principal = json!({ "type": "human", "id": "passkey:laptop", "via": "console" });
-        let l =
-            Launch { run: "run_x".into(), manifest: t.dir.join("m.yaml"), task: Some("say goodbye".into()), principal, log: log.clone() };
+        let l = Launch {
+            run: "run_x".into(),
+            manifest: t.dir.join("m.yaml"),
+            task: Some("say goodbye".into()),
+            principal,
+            log: log.clone(),
+            image: Some("img:rust".into()),
+        };
         // A stand-in for the wicket binary that prints its arguments and principal.
         let exe = t.dir.join("fake-wicket");
         std::fs::write(&exe, "#!/bin/sh\necho \"$@\"\necho \"$WICKET_PRINCIPAL\"\n").unwrap();
         std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         launch_detached(&exe, &l).unwrap();
-        let want = format!("run --run-id run_x --task say goodbye {}\n{}\n", l.manifest.display(), l.principal);
+        let want = format!("run --run-id run_x --task say goodbye --image img:rust {}\n{}\n", l.manifest.display(), l.principal);
         for _ in 0..100 {
             if std::fs::read_to_string(&log).unwrap_or_default() == want {
                 return;

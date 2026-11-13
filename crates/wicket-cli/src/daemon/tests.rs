@@ -174,7 +174,7 @@ async fn a_run_gets_its_manifest_program_and_workdir_as_content() {
     assert_eq!(code, 0, "{out}{err}");
     let stage = f.dir.0.join("data/daemon/stage");
     assert!(out.contains(&format!("argv: run {}", stage.display())), "staged, not the caller's path: {out}");
-    assert!(out.contains("--task count --image wicket/claude-code:poc"), "{out}");
+    assert!(out.contains("--task count\n") && !out.contains("--image"), "no --image unless one is named (#171): {out}");
     assert!(out.contains("manifest: # A deterministic program"), "{out}");
     assert!(out.contains("workdir: .hidden sub"), "{out}");
     assert!(out.contains("program: stats.sh"), "the program's source sits where the manifest says: {out}");

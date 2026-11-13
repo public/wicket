@@ -95,7 +95,9 @@ pub struct RunOpts<'a> {
     pub workspace_dir: Option<&'a Path>,
     /// Replaces the manifest's task text.
     pub task: Option<String>,
-    pub image: &'a str,
+    /// The agent image, overriding the manifest's `agent.image` (None: the manifest's, see
+    /// [`manifest_image`]).
+    pub image: Option<&'a str>,
     pub node: Option<&'a str>,
     pub ssh_key: Option<&'a Path>,
     pub run_id: Option<String>,
@@ -199,6 +201,36 @@ pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<
     Ok(())
 }
 
+/// The image a new box for `m` starts from when the operator names none (#171). An agent's is its
+/// `agent.image`: the installation's current agent image when unset, and otherwise that image or one
+/// of `zone.images`, the images the zone may start boxes from (as for `spawn`). A program's is its
+/// `program.image`, or the agent image.
+pub fn manifest_image(m: &Manifest) -> Result<String> {
+    let default = crate::image::effective(crate::image::DEFAULT);
+    let named = match (&m.agent, &m.program) {
+        (Some(a), _) => a.image.as_deref(),
+        (_, Some(p)) => return Ok(p.image.clone().unwrap_or(default)),
+        _ => None,
+    };
+    match named {
+        None => Ok(default),
+        Some(i) if i == crate::image::DEFAULT || i == default || m.zone.images.iter().any(|z| z == i) => Ok(crate::image::effective(i)),
+        Some(i) => bail!(
+            "agent.image {i:?} is not one zone {} may start: it must be the installation's agent image ({default}) or listed in zone.images",
+            m.zone.name
+        ),
+    }
+}
+
+/// The image a new box for `m` starts from: `named` (`--image`, or the image `spawn` checked) if
+/// given, else the manifest's ([`manifest_image`]). The default image means this build's own (#162).
+pub fn box_image(named: Option<&str>, m: &Manifest) -> Result<String> {
+    match named {
+        Some(i) => Ok(crate::image::effective(i)),
+        None => manifest_image(m),
+    }
+}
+
 pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let RunOpts {
         manifest: manifest_path,
@@ -229,12 +261,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, true) => bail!("re-attaching needs a run id"),
         _ => None,
     };
-    let (image_owned, node_owned, parent_owned, lease_owned, wsd_owned) = match &record {
-        Some(r) => (r.image.clone(), r.node.clone(), r.parent_run.clone(), r.lease.clone(), r.workspace_dir.clone()),
-        // A new box: the default image means this build's own (#162); a re-attached one keeps its.
-        None => (crate::image::effective(image), node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
+    let (node_owned, parent_owned, lease_owned, wsd_owned) = match &record {
+        Some(r) => (r.node.clone(), r.parent_run.clone(), r.lease.clone(), r.workspace_dir.clone()),
+        None => (node.map(String::from), parent_run, lease, workspace_dir.map(Path::to_path_buf)),
     };
-    let (image, node, parent_run, lease) = (image_owned.as_str(), node_owned.as_deref(), parent_owned, lease_owned);
+    let (node, parent_run, lease) = (node_owned.as_deref(), parent_owned, lease_owned);
     let workspace_dir = wsd_owned.as_deref();
     // `--node local` is this host's own node: the same as no --node.
     let node = node.filter(|n| *n != crate::localnode::NAME);
@@ -337,7 +368,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         None => None,
     };
-    let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or_else(|| image.to_string());
+    // A re-attached box keeps its image; a new one gets the named one or the manifest's.
+    let image = match &record {
+        Some(r) => r.image.clone(),
+        None => box_image(image, &m)?,
+    };
+    let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or(image);
     let image = image.as_str();
     let (workload, workload_kind) = match (&m.agent, &m.program) {
         (Some(a), _) => (a.name.clone(), a.kind.clone()),
@@ -1836,4 +1872,51 @@ fn write_secret(p: &Path, body: &str) -> Result<()> {
 /// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGENT: &str =
+        "task: build\nagent:\n  name: builder\n  image: img:rust\nzone:\n  name: dev\n  images: [img:rust]\n  llm:\n    secret: mock\n";
+
+    /// #171: an agent's box starts from its manifest's agent.image.
+    #[test]
+    fn a_manifests_agent_image_is_used() {
+        let m = Manifest::from_yaml(AGENT).unwrap();
+        assert_eq!(box_image(None, &m).unwrap(), "img:rust");
+        // Unset: the installation's current agent image.
+        let plain = Manifest::from_yaml(&AGENT.replace("  image: img:rust\n", "")).unwrap();
+        assert_eq!(box_image(None, &plain).unwrap(), crate::image::effective(crate::image::DEFAULT));
+        // Naming the default image needs no zone.images entry.
+        let dflt =
+            Manifest::from_yaml(&AGENT.replace("img:rust\n", &format!("{}\n", crate::image::DEFAULT)).replace("[img:rust]", "[]")).unwrap();
+        assert_eq!(box_image(None, &dflt).unwrap(), crate::image::effective(crate::image::DEFAULT));
+        // It round-trips through the effective manifest (what the identity's digest covers).
+        let again = Manifest::from_yaml(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        assert_eq!(again.agent.unwrap().image.as_deref(), Some("img:rust"));
+    }
+
+    /// `wicket run --image` overrides agent.image, and without it nothing is named.
+    #[test]
+    fn the_image_flag_overrides_agent_image() {
+        let m = Manifest::from_yaml(AGENT).unwrap();
+        assert_eq!(box_image(Some("img:other"), &m).unwrap(), "img:other");
+        let parse = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
+            crate::Cmd::Run { image, .. } => image,
+            _ => unreachable!(),
+        };
+        assert_eq!(parse(&["wicket", "run", "m.yaml"]), None, "no default that would hide the manifest's");
+        assert_eq!(parse(&["wicket", "run", "--image", "img:other", "m.yaml"]).as_deref(), Some("img:other"));
+    }
+
+    /// An agent.image outside zone.images is refused, like a spawn of it.
+    #[test]
+    fn an_agent_image_outside_zone_images_is_refused() {
+        let m = Manifest::from_yaml(&AGENT.replace("[img:rust]", "[img:python]")).unwrap();
+        let e = format!("{:#}", box_image(None, &m).unwrap_err());
+        assert!(e.contains("img:rust") && e.contains("zone.images"), "{e}");
+        assert!(Manifest::from_yaml(&AGENT.replace("image: img:rust", "image: \"\"")).is_err(), "an empty image is invalid");
+    }
 }

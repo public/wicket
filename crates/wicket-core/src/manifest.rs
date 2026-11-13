@@ -78,6 +78,10 @@ pub struct AgentSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// The image the agent's box starts from (default: the installation's current agent image). Any
+    /// other image must be listed in `zone.images`, as for `spawn`. `wicket run --image` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// How many child agents this agent may start with `spawn_agent`, each in its own sandbox with
     /// its own identity (design §3.2, §5.1). 0 = none.
     #[serde(default)]
@@ -471,6 +475,9 @@ impl Manifest {
                     Some(l) if l.provider == "anthropic" => {}
                     Some(_) => return Err(ManifestError::Invalid("only the anthropic LLM provider is supported in the PoC".into())),
                     None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
+                }
+                if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
+                    return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
                 a.idle()?;
                 match &a.remote {
