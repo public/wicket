@@ -20,14 +20,14 @@ fn refused_in(d: Decision, mode: Mode) {
 }
 
 #[test]
-fn fresh_then_narrow_at_ttl_then_closed_at_ttl_plus_window() {
+fn fresh_then_offline_at_ttl_and_offline_until_each_grant_expires() {
     let (mut cp, mut r) = setup();
     cp.p.commit(vec![Change::PutZone { zone: zone("z2") }], T0).unwrap();
     let frames = cp.p.catch_up(&r.hello(), T0 + 1).unwrap();
     feed(&mut r, frames, T0 + 1);
     let i = r.last_statement().unwrap().issued_at;
-    let fresh_until = r.deadlines().unwrap().0;
-    assert_eq!(r.deadlines().unwrap(), (i + TTL, i + TTL + WINDOW));
+    let fresh_until = r.fresh_until().unwrap();
+    assert_eq!(fresh_until, i + TTL);
 
     // Fresh: everything the zone and the grants allow.
     let t = fresh_until - 1;
@@ -41,37 +41,32 @@ fn fresh_then_narrow_at_ttl_then_closed_at_ttl_plus_window() {
     assert_eq!(r.escalate(&spawn(), t), Decision::Allow(Allowed::Spawn));
     assert_eq!(r.escalate(&approval(), t), Decision::Allow(Allowed::Approval));
 
-    // Narrow from fresh_until: plain reads only.
-    let t = fresh_until;
-    assert_eq!(r.mode(t), Mode::Narrow);
-    assert_eq!(r.decide(&read(), t), Decision::Allow(Allowed::Reach(0)));
-    refused_in(r.decide(&write(), t), Mode::Narrow);
-    refused_in(r.decide(&granted(), t), Mode::Narrow);
-    refused_in(r.decide(&evil(), t), Mode::Narrow);
-    assert!(matches!(r.decide(&forbidden(), t), Decision::Forbidden(_)), "forbidden stays forbidden");
-    refused_in(r.escalate(&lease(), t), Mode::Narrow);
-    refused_in(r.escalate(&spawn(), t), Mode::Narrow);
-    refused_in(r.escalate(&approval(), t), Mode::Narrow);
-    assert_eq!(r.mode(i + TTL + WINDOW - 1), Mode::Narrow);
-
-    // Closed from narrow_until: nothing.
-    let t = i + TTL + WINDOW;
-    assert_eq!(r.mode(t), Mode::Closed);
-    for o in [read(), write(), granted(), evil(), forbidden()] {
-        refused_in(r.decide(&o, t), Mode::Closed);
+    // Offline from fresh_until (#153): the same decisions, for as long as what is held is valid,
+    // hours after the last statement; nothing new is leased, spawned or approved.
+    for t in [fresh_until, fresh_until + 150_000, T0 + 3_599_999] {
+        assert_eq!(r.mode(t), Mode::Offline, "{t}");
+        assert_eq!(r.decide(&read(), t), Decision::Allow(Allowed::Reach(0)));
+        assert_eq!(r.decide(&write(), t), Decision::Allow(Allowed::Reach(0)));
+        assert_eq!(r.decide(&granted(), t), Decision::Allow(Allowed::Grant("keep-1".into())));
+        assert!(matches!(r.decide(&evil(), t), Decision::NeedsGrant(_)), "the caller queues it");
+        assert!(matches!(r.decide(&forbidden(), t), Decision::Forbidden(_)), "forbidden stays forbidden");
+        refused_in(r.escalate(&lease(), t), Mode::Offline);
+        refused_in(r.escalate(&spawn(), t), Mode::Offline);
+        refused_in(r.escalate(&approval(), t), Mode::Offline);
     }
-    refused_in(r.escalate(&spawn(), t), Mode::Closed);
+    // The grant ends at its own expiry, offline too.
+    assert!(matches!(r.decide(&granted(), T0 + 3_600_000), Decision::NeedsGrant(_)));
 
-    // A new statement brings it straight back.
+    // A new statement brings it straight back to fresh.
+    let t = T0 + 3_600_000;
     let f = cp.p.statement(t + 10);
     r.accept(&f, t + 10).unwrap();
     assert_eq!(r.mode(t + 10), Mode::Fresh);
-    assert!(allowed(&mut r, &granted(), t + 10));
 }
 
 #[test]
 fn production_defaults() {
-    assert_eq!((DEFAULT_TTL_MS, DEFAULT_REFRESH_MS, DEFAULT_NARROW_MS), (30_000, 5_000, 120_000));
+    assert_eq!((DEFAULT_TTL_MS, DEFAULT_REFRESH_MS), (30_000, 5_000));
     let mut cp = Cp::with(PublisherConfig::default(), T0 + 86_400_000);
     cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0).unwrap();
     let mut r = cp.replica();
@@ -81,9 +76,10 @@ fn production_defaults() {
     let f = cp.p.tick(T0 + 5_000).expect("a statement every 5 s");
     r.accept(&f, T0 + 5_000).unwrap();
     assert_eq!(r.mode(T0 + 5_000 + 29_999), Mode::Fresh);
-    assert_eq!(r.mode(T0 + 5_000 + 30_000), Mode::Narrow);
-    assert_eq!(r.mode(T0 + 5_000 + 149_999), Mode::Narrow);
-    assert_eq!(r.mode(T0 + 5_000 + 150_000), Mode::Closed);
+    assert_eq!(r.mode(T0 + 5_000 + 30_000), Mode::Offline);
+    // Offline until the feed key's certificate ends (it bounds everything the node holds).
+    assert_eq!(r.mode(T0 + 86_399_999), Mode::Offline);
+    assert_eq!(r.mode(T0 + 86_400_000), Mode::Closed);
 }
 
 #[test]
@@ -100,17 +96,17 @@ fn a_snapshot_alone_vouches_for_nothing() {
 }
 
 #[test]
-fn lagging_counts_as_stale() {
+fn lagging_refuses_until_caught_up() {
     let (mut cp, mut r) = setup();
     let d = cp.p.commit(vec![Change::Revoke { kind: RevokeKind::Grant, id: "keep-1".into(), until: T0 + 3_600_000 }], T0 + 100).unwrap();
     // The statement naming the new epoch arrives before the delta (which may hold a revocation).
     r.accept(&cp.p.statement(T0 + 200), T0 + 200).unwrap();
-    assert_eq!(r.mode(T0 + 200), Mode::Narrow);
-    refused_in(r.decide(&granted(), T0 + 200), Mode::Narrow);
-    assert!(allowed(&mut r, &read(), T0 + 200));
-    // It is narrow until the last statement that vouched for its state ends.
-    assert_eq!(r.mode(T0 + TTL + WINDOW - 1), Mode::Narrow);
-    assert_eq!(r.mode(T0 + TTL + WINDOW), Mode::Closed);
+    assert_eq!(r.mode(T0 + 200), Mode::Lagging);
+    refused_in(r.decide(&granted(), T0 + 200), Mode::Lagging);
+    refused_in(r.decide(&read(), T0 + 200), Mode::Lagging);
+    // Lagging while that statement is live; then offline on what it holds, like any cut-off node.
+    assert_eq!(r.mode(T0 + 200 + TTL - 1), Mode::Lagging);
+    assert_eq!(r.mode(T0 + 200 + TTL), Mode::Offline);
     r.accept(&d, T0 + 300).unwrap();
     assert_eq!(r.mode(T0 + 300), Mode::Fresh);
     assert!(matches!(r.decide(&granted(), T0 + 300), Decision::NeedsGrant(_)));

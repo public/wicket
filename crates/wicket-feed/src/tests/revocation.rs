@@ -1,4 +1,4 @@
-//! Revocation: immediate once the delta applies; at worst one TTL when the node hears nothing.
+//! Revocation: immediate once the delta applies; a cut-off node keeps what it holds until it expires (#153).
 
 use super::*;
 
@@ -29,7 +29,7 @@ fn a_revoked_run_is_refused_everything_at_once() {
         assert!(matches!(r.decide(&o, T0 + 2), Decision::Forbidden(_)), "{o:?}");
     }
     assert!(allowed(&mut r, &op("z", "r2", "GET", "api.github.com", "/repos/acme/app"), T0 + 2), "other runs carry on");
-    // Still refused while narrow.
+    // Still refused while offline.
     assert!(matches!(r.decide(&read(), T0 + TTL + 1), Decision::Forbidden(_)));
     // Token revocation ids are held for the capability layer.
     let d = cp.p.commit(vec![revoke(RevokeKind::Token, "link-abc", T0 + 3_600_000)], T0 + 3).unwrap();
@@ -39,7 +39,7 @@ fn a_revoked_run_is_refused_everything_at_once() {
 }
 
 #[test]
-fn a_partitioned_node_stops_honouring_grants_within_one_ttl_of_the_revocation() {
+fn a_partitioned_node_keeps_a_revoked_grant_only_until_it_expires() {
     let (mut cp, mut r) = setup();
     // Statements keep arriving until t_r, then the link is cut, and the revocation is committed.
     for t in [500, 1_000, 1_500] {
@@ -52,15 +52,16 @@ fn a_partitioned_node_stops_honouring_grants_within_one_ttl_of_the_revocation() 
     // fresh without it; the last one the node has expires within one TTL of t_r.
     let after = cp.p.statement(t_r + 1);
     assert_eq!(crate::jws::payload_unverified::<Fresh>(&after.jws).unwrap().epoch, 2);
-    let (fresh_until, _) = r.deadlines().unwrap();
+    let fresh_until = r.fresh_until().unwrap();
     assert!(fresh_until <= t_r + TTL);
     assert!(allowed(&mut r, &granted(), fresh_until - 1), "the node never learned of it");
-    assert!(!allowed(&mut r, &granted(), fresh_until), "but stops at fresh_until");
-    assert!(allowed(&mut r, &read(), fresh_until), "plain reads continue, narrow");
-    // Had the node received a later statement without the delta, it would be lagging: stale at once.
+    // Cut off (#153): it keeps what it holds until it expires, which bounds revocation latency.
+    assert!(allowed(&mut r, &granted(), fresh_until), "offline: held grants last their lifetime");
+    assert!(!allowed(&mut r, &granted(), T0 + 3_600_000), "and end with it");
+    // Had the node received a later statement without the delta, it would be lagging: nothing at once.
     assert_eq!(r.mode(fresh_until - 100), Mode::Fresh);
     r.accept(&after, fresh_until - 100).unwrap();
-    assert_eq!(r.mode(fresh_until - 100), Mode::Narrow);
+    assert_eq!(r.mode(fresh_until - 100), Mode::Lagging);
     assert!(!allowed(&mut r, &granted(), fresh_until - 100));
 }
 

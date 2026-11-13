@@ -6,8 +6,8 @@
 //!   `wicket-fwd --stdin-from` reads), stdout and stderr (from `docker logs`) over the control channel.
 //!   When the channel drops, the box keeps running and its output is kept (up to [`OUTPUT_CAP`] bytes
 //!   per stream, oldest dropped first; the control host reports a gap) and replayed when the control
-//!   host reconnects. The node also enforces the run's timeout itself, and holds the control host's
-//!   lease of the run ([`Msg::RunLease`], #151).
+//!   host reconnects. The node also enforces the run's timeout itself, and stops the box when its
+//!   authority (its token's block 0) expires, connected or not (#153).
 //! - **Its boxes outlive it** (#151). A record of each box (`node-box.json`) lets a restarted `serve`
 //!   adopt the boxes the last one started (`adopt_previous`).
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
@@ -172,8 +172,6 @@ struct BoxState {
     memory_mib: u64,
     /// Link relay sockets listened on in its socket directory, by name.
     listeners: HashMap<String, tokio::task::JoinHandle<()>>,
-    /// The control host's lease of the run (Unix ms; 0: none yet).
-    lease_until: i64,
     /// What a restarted `serve` adopts it from.
     record: BoxRecord,
     /// The control connection that started or last resumed it: its stdio, events, asks and
@@ -216,6 +214,17 @@ struct Node {
     shipped: AtomicI64,
     /// One audit shipment at a time (the timer and a reconnect's watermark would send the same batch).
     shipping: Mutex<()>,
+    /// The secrets this node's runs have used, in memory only (#152), and their budget slices.
+    secrets: Arc<crate::nodesecrets::Cache>,
+    slices: crate::nodesecrets::Slices,
+    /// Asks raised while a run's control host was unreachable (#153), and the resent ones awaiting
+    /// an answer (by message id).
+    queue: crate::nodesecrets::Asks,
+    requeued: Mutex<HashMap<u64, String>>,
+    /// Why this node stopped a box itself, by run (#153), for its exit.
+    stopped: Mutex<HashMap<String, String>>,
+    /// Each box's model proxy, for its budget slice and spend reports (#152).
+    llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
 }
 
 impl Node {
@@ -248,6 +257,12 @@ impl Node {
             c.boxes += 1;
         }
         c
+    }
+
+    /// The protocol version of the connection that owns `run`'s box (0: none up).
+    fn proto_of(&self, run: &str) -> u32 {
+        let Some(g) = self.owner(run) else { return 0 };
+        self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto)
     }
 
     /// Sends to the connection that owns `run`'s box.
@@ -323,6 +338,48 @@ impl Node {
         })
     }
 
+    /// How this node fetches a secret for a run (#152): over the run's own connection, when it is
+    /// up; else it fails clearly, and the miss is audited.
+    fn fetcher(self: &Arc<Self>) -> crate::nodesecrets::Fetcher {
+        let n = self.clone();
+        Arc::new(move |run: String, name: String| {
+            let n = n.clone();
+            Box::pin(async move {
+                // A control host before protocol 3 doesn't release secrets: its node relays instead.
+                if (1..chan::NODE_LEASES).contains(&n.proto_of(&run)) {
+                    return Err(format!("{OLD_CONTROL}: credential {name} stays on the control host"));
+                }
+                let id = n.id();
+                let (tx, rx) = oneshot::channel();
+                n.asks.lock().expect("asks").insert(id, tx);
+                let sent = n.send_run(&run, Frame::Msg(Msg::SecretFetch { id, run: run.clone(), name: name.clone() }));
+                let reply = match sent {
+                    true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
+                    false => None,
+                };
+                n.asks.lock().expect("asks").remove(&id);
+                let why = match reply {
+                    Some(Msg::SecretFetched { secret: Some(f), .. }) => {
+                        n.audit_note(&run, "node.secret_fetched", serde_json::json!({ "secret": name }));
+                        return Ok(*f);
+                    }
+                    Some(Msg::SecretFetched { error: Some(e), .. }) => format!("credential {name} refused by the control host: {e}"),
+                    _ => format!("credential {name} not cached on this node; control host unreachable"),
+                };
+                n.audit_note(&run, "node.secret_unavailable", serde_json::json!({ "secret": name, "why": why }));
+                Err(why)
+            })
+        })
+    }
+
+    /// Records `kind` for `run`'s box in this node's audit log (under the box's tenant), and ships it.
+    fn audit_note(&self, run: &str, kind: &str, body: serde_json::Value) {
+        let tenant = self.boxes.lock().expect("boxes").get(run).map(|b| b.record.start.tenant.clone());
+        let tenant = tenant.map(wicket_core::TenantId).unwrap_or_else(wicket_core::TenantId::single);
+        let _ = self.audit.lock().expect("audit").audit(&tenant, Some(&wicket_core::RunId(run.to_string())), kind, &body);
+        self.ship_audit();
+    }
+
     fn ship_audit(&self) {
         let _one = self.shipping.lock().expect("shipping");
         let from = self.shipped.load(Ordering::SeqCst);
@@ -359,7 +416,14 @@ impl ControlLink for Control {
             self.0.asks.lock().expect("asks").insert(id, tx);
             let sent = self.0.send_run(
                 &self.1,
-                Frame::Msg(Msg::Ask { id, run: self.1.clone(), op: Box::new(op.clone()), why: why.into(), who: who.cloned() }),
+                Frame::Msg(Msg::Ask {
+                    id,
+                    run: self.1.clone(),
+                    op: Box::new(op.clone()),
+                    why: why.into(),
+                    who: who.cloned(),
+                    queued: None,
+                }),
             );
             let reply = match sent {
                 true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
@@ -374,6 +438,20 @@ impl ControlLink for Control {
             }
         })
     }
+
+    /// Queued on this node's disk (#153) and raised, with its original time, when the run's
+    /// control connection is back.
+    fn queue(&self, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>) -> std::result::Result<String, String> {
+        let (id, new) = self.0.queue.push(&self.1, op, why, who, (self.0.clock)());
+        if new {
+            self.0.audit_note(
+                &self.1,
+                "node.ask_queued",
+                serde_json::json!({ "id": id, "host": op.host, "method": op.method, "path": op.path }),
+            );
+        }
+        Ok(id)
+    }
 }
 
 /// Where a run's CONNECTs go, and the way to the control host's egress proxy for it.
@@ -382,6 +460,8 @@ struct NodeRelay {
     run: String,
     zone: Arc<wicket_core::CompiledZone>,
     ca: Option<Arc<NodeCa>>,
+    /// Hosts the control host swaps a credential in for (routing only): always forwarded.
+    swaps: Vec<wicket_proxy::CredentialSwap>,
 }
 
 impl Relay for NodeRelay {
@@ -393,7 +473,18 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        wicket_proxy::decide::route(host, &spec, &[], self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
+        // Injected hosts are decided here too, their secret fetched on first use (#152); with a
+        // control host before protocol 3 they are forwarded to it, as before. Hosts the control host
+        // swaps a credential in for (#169) are always forwarded: swaps stay there.
+        let v1 = (1..chan::NODE_LEASES).contains(&self.node.proto_of(&self.run));
+        wicket_proxy::decide::route_sealed(
+            host,
+            &spec,
+            &self.swaps,
+            self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
+            now,
+            &|_| !v1,
+        )
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {
@@ -449,12 +540,24 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     std::fs::set_permissions(ctl_dir, std::fs::Permissions::from_mode(0o700))?;
     let _ = std::fs::remove_file(&ctl);
     let listener = wicket_proxy::sockpath::bind(&ctl).with_context(|| format!("listening on {}", ctl.display()))?;
+    let clock = node_clock();
+    let node_root = paths.root.clone();
+    // Secrets live in this process's memory only (#152): keep it out of core dumps and others' ptrace,
+    // and take the cache a self-update's re-exec handed over, if any.
+    crate::nodesecrets::Cache::harden_process();
+    let secrets = crate::nodesecrets::Cache::new(clock.clone());
+    match secrets.import_handover() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[node] {n} cached secret(s) handed over from the previous process"),
+        Err(e) => eprintln!("[node] the secret cache handed over is refused: {e:#}"),
+    }
+    let slices = crate::nodesecrets::Slices::new(&node_root)?;
     let node = Arc::new(Node {
         name: name.clone(),
         paths,
         ident,
         build: build_id()?,
-        clock: node_clock(),
+        clock,
         replica: Arc::new(Mutex::new(replica)),
         audit: Arc::new(Mutex::new(audit)),
         root_pem,
@@ -467,6 +570,12 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         audit_link: Mutex::new(None),
         shipped: AtomicI64::new(-1),
         shipping: Mutex::new(()),
+        secrets,
+        slices,
+        queue: crate::nodesecrets::Asks::open(&node_root),
+        requeued: Mutex::new(HashMap::new()),
+        stopped: Mutex::new(HashMap::new()),
+        llms: Mutex::new(HashMap::new()),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -494,37 +603,57 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 let _ = l.flush_audit();
             }
             n.ship_audit();
+            // The secret cache goes to the new process in a sealed memfd, never a file (#152): the
+            // descriptor is left open across the exec only, and named in the environment.
+            match n.secrets.export() {
+                Ok(fd) => {
+                    use std::os::fd::IntoRawFd;
+                    std::env::set_var(crate::nodesecrets::HANDOVER_ENV, fd.into_raw_fd().to_string());
+                }
+                Err(e) => eprintln!("[node] the secret cache can't be handed over ({e:#}); it is fetched again"),
+            }
         });
     }
     {
-        // A run whose lease has lapsed (its control host gone longer than the feed window): kept
-        // running by default, as before run leases; `WICKET_NODE_LEASE_EXPIRY=stop` stops it instead.
+        // A box whose authority has expired (#153): its token's block 0 ends at the run's
+        // `limits.authority` (default its timeout). The workload's grants decide, not this node:
+        // connected or not, the box is stopped then. One with no authority on this node at all
+        // (its run dropped from the feed) is left to its run, or to adoption's own check.
         let n = node.clone();
-        let stop = std::env::var("WICKET_NODE_LEASE_EXPIRY").is_ok_and(|v| v == "stop");
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+            // Stopped once each: the kill is in flight until the box's exit is read.
+            let mut stopped: std::collections::HashSet<String> = std::collections::HashSet::new();
             loop {
                 t.tick().await;
-                let now = wicket_feed::now_ms();
-                let lapsed: Vec<(String, String)> = n
+                let now = (n.clock)();
+                let running: Vec<(String, String)> = n
                     .boxes
                     .lock()
                     .expect("boxes")
-                    .iter_mut()
-                    .filter(|(_, b)| b.exited.is_none() && b.lease_until > 0 && b.lease_until < now)
-                    .map(|(r, b)| {
-                        b.lease_until = 0;
-                        (r.clone(), b.name.clone())
-                    })
+                    .iter()
+                    .filter(|(_, b)| b.exited.is_none())
+                    .map(|(r, b)| (r.clone(), b.name.clone()))
                     .collect();
-                for (run, name) in lapsed {
-                    if stop {
-                        eprintln!("[node] {run}: its control host's lease lapsed; stopping the box (WICKET_NODE_LEASE_EXPIRY=stop)");
-                        let _ = n.docker.unpause(&name).await;
-                        let _ = n.docker.kill(&name).await;
-                    } else {
-                        eprintln!("[node] {run}: its control host's lease lapsed; the box keeps running on the feed held");
+                let expired: Vec<(String, String, i64)> = {
+                    let r = n.replica.lock().expect("replica");
+                    running
+                        .into_iter()
+                        .filter_map(|(run, name)| r.authority_until(&run).filter(|u| *u <= now).map(|u| (run, name, u)))
+                        .collect()
+                };
+                // Secrets past their expiry are dropped (#152); their use already ended.
+                n.secrets.sweep();
+                stopped.retain(|r| n.boxes.lock().expect("boxes").get(r).is_some_and(|b| b.exited.is_none()));
+                for (run, name, until) in expired {
+                    if !stopped.insert(run.clone()) {
+                        continue;
                     }
+                    eprintln!("[node] {run}: its authority expired at {until} ms; stopping the box");
+                    n.audit_note(&run, "node.authority_expired", serde_json::json!({ "until_ms": until }));
+                    n.stopped.lock().expect("stopped").insert(run.clone(), format!("its authority expired at {until} ms"));
+                    let _ = n.docker.unpause(&name).await;
+                    let _ = n.docker.kill(&name).await;
                 }
             }
         });
@@ -738,7 +867,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) -> Result<()>
             exited: b.exited.clone(),
             stdout_start: b.out[0].start(),
             stderr_start: b.out[1].start(),
-            lease_until: b.lease_until,
+            authority_until: node.replica.lock().expect("replica").authority_until(run).unwrap_or(0),
         })
         .collect();
     let feed = node.replica.lock().expect("replica").hello();
@@ -859,8 +988,18 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 for f in frames {
                     node.send_to(gen, f);
                 }
+                // Asks raised while it was away (#153), with their original time.
+                for q in node.queue.of(&run) {
+                    let id = node.id();
+                    node.requeued.lock().expect("requeued").insert(id, q.id.clone());
+                    node.send_to(
+                        gen,
+                        Frame::Msg(Msg::Ask { id, run: q.run, op: Box::new(q.op), why: q.why, who: q.who, queued: Some((q.id, q.at)) }),
+                    );
+                }
                 if let Some((code, result)) = exited {
-                    node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result }));
+                    let reason = node.stopped.lock().expect("stopped").get(&run).cloned();
+                    node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result, reason }));
                 }
             }
             Msg::Ack { stream, upto } => {
@@ -882,22 +1021,30 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     }
                 }
             }
-            Msg::RunLease { run, until } => {
-                if let Some(b) = node.boxes.lock().expect("boxes").get_mut(&run) {
-                    b.lease_until = until;
-                    // Kept on disk (every 10 s at most) for a restarted `serve`.
-                    if until > b.record.lease_until + 10_000 {
-                        b.record.lease_until = until;
-                        let _ = b.record.save(&b.dir);
-                    }
-                }
-            }
             Msg::Kill { run } => {
                 let name = node.boxes.lock().expect("boxes").get(&run).map(|b| b.name.clone());
                 if let Some(name) = name {
                     // A paused (idle) box is unpaused first, so it can be killed.
                     let _ = node.docker.unpause(&name).await;
                     let _ = node.docker.kill(&name).await;
+                }
+            }
+            Msg::RunLease { .. } => {}
+            Msg::Lease { run, lease } => {
+                if let Some(sl) = &lease.slice {
+                    if let Err(e) = node.slices.put(&run, sl) {
+                        eprintln!("[node] {run}: keeping its budget slice: {e:#}");
+                    }
+                }
+                if let Some(l) = node.llms.lock().expect("llms").get(&run) {
+                    l.set_slice(lease.slice);
+                }
+            }
+            Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),
+            m @ Msg::SecretFetched { .. } => {
+                let Msg::SecretFetched { id, .. } = &m else { unreachable!() };
+                if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
+                    let _ = tx.send(m);
                 }
             }
             Msg::Forget { run } => {
@@ -912,6 +1059,11 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             }
             m @ Msg::Asked { .. } => {
                 let Msg::Asked { id, .. } = &m else { unreachable!() };
+                // A queued ask the control host has now taken (raised, found denied, or refused):
+                // off the queue. It is idempotent there, so a resend after a flap is harmless.
+                if let Some(q) = node.requeued.lock().expect("requeued").remove(id) {
+                    node.queue.remove(&q);
+                }
                 if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
                     let _ = tx.send(m);
                 }
@@ -1376,7 +1528,6 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         started_ms: wicket_feed::now_ms(),
         stdin_received: 0,
         stdin_closed: false,
-        lease_until: 0,
         out_end: [0, 0],
         out_tail: [String::new(), String::new()],
         out_saved_ms: 0,
@@ -1398,8 +1549,6 @@ struct BoxRecord {
     stdin_received: u64,
     #[serde(default)]
     stdin_closed: bool,
-    /// The control host's lease of the run (Unix ms; 0: none yet).
-    lease_until: i64,
     /// How far into its stdout and stderr this node has read (bytes read, whatever Docker has rotated
     /// away since), the last bytes read of each (base64; to line a replay up again), and when.
     #[serde(default)]
@@ -1567,7 +1716,6 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             memory_mib: bs.memory.parse::<u64>().map(|b| b >> 20).unwrap_or(0),
             listeners: HashMap::new(),
             owner,
-            lease_until: rec.lease_until,
             record: rec.clone(),
         },
     );
@@ -1807,8 +1955,14 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
+    // What was leased to the run goes with its box (#152, #153).
+    n.secrets.release(run);
+    n.slices.drop_run(run);
+    n.queue.drop_run(run);
+    n.llms.lock().expect("llms").remove(run);
     eprintln!("[node] {run}: box exited ({code})");
-    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result }));
+    let reason = n.stopped.lock().expect("stopped").get(run).cloned();
+    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason }));
 }
 
 /// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
@@ -1826,14 +1980,27 @@ async fn serve_box(
         run: wicket_core::RunId(bs.run.clone()),
         zone: compiled.clone(),
         ledger: node.audit.clone(),
-        // Secrets never reach a node: hosts that need one are forwarded, so this vault stays empty.
-        vault: wicket_proxy::vault::Vault::new(node.paths.root.join("no-secrets")),
+        // The secrets the run uses, fetched from the control host on first use and kept in memory
+        // only (#152).
+        vault: wicket_proxy::vault::Vault::from_source(node.secrets.source(&bs.run, node.fetcher())),
         events: ev_tx,
         escalate: bs.escalate,
         attribute: None,
         identity: None,
         spawner: None,
-        swaps: vec![],
+        // Routing only: hosts the control host swaps a credential in for are forwarded to it (no
+        // placeholder or value here, so nothing is ever swapped on the node).
+        swaps: bs
+            .swap_hosts
+            .iter()
+            .map(|h| wicket_proxy::CredentialSwap {
+                box_bearers: false,
+                name: "the control host's".into(),
+                host: h.clone(),
+                placeholder: String::new(),
+                real: wicket_proxy::SwapSource::Value(String::new()),
+            })
+            .collect(),
         boxes: None,
         capacity: None,
         fence: None,
@@ -1849,14 +2016,17 @@ async fn serve_box(
         clock: node.clock.clone(),
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
-    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
-    // The model proxy (#151): the run's checks here (allowed routes and models, server tools, the
-    // budget), then on to the run's own proxy on the control host, which adds the credential, checks
-    // again and is the one that counts the call. Its events stay here (the control host's are shown).
+    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, swaps: ctx.swaps.clone() });
+    let mut tasks = vec![];
+    // The model proxy (#151, #152): the run's checks here (allowed routes and models, server tools,
+    // the budget and this node's slice of it). With the model credential in this node's cache, it
+    // calls the model itself, the control host isn't asked, and this node is the counter of record
+    // (its spend persisted beside the box, and reported). Otherwise the call is relayed to the
+    // run's own proxy on the control host, which adds the credential and counts it there too.
     let llm = {
-        let (quiet, _) = mpsc::unbounded_channel::<wicket_proxy::Event>();
+        let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
         let mut c = ctx.clone();
-        c.events = quiet;
+        c.events = quiet_tx;
         let (n, run) = (node.clone(), bs.run.clone());
         let relay: wicket_proxy::llm::LlmRelay = Arc::new(move || {
             let (n, run) = (n.clone(), run.clone());
@@ -1864,6 +2034,42 @@ async fn serve_box(
         });
         let l = wicket_proxy::llm::Llm::relayed(c, relay)?;
         l.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
+        // What this node already counted for the box, before a restart of `serve`.
+        if let Some(sp) = std::fs::read(dir.join(SPEND_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            l.merge_spent(sp);
+        }
+        l.set_slice(node.slices.get(&bs.run));
+        node.llms.lock().expect("llms").insert(bs.run.clone(), l.clone());
+        // Its events are the console's only when the call went from here (else the control host's
+        // proxy shows the same call).
+        let (vault, secret, fwd) = (ctx.vault.clone(), ctx.zone.llm.as_ref().map(|x| x.secret.clone()), ctx.events.clone());
+        tasks.push(tokio::spawn(async move {
+            while let Some(ev) = quiet_rx.recv().await {
+                if secret.as_deref().is_some_and(|s| vault.has(s)) {
+                    let _ = fwd.send(ev);
+                }
+            }
+        }));
+        // Spend: persisted and reported when it moves, and every 10 s anyway (a new connection
+        // learns it without waiting for the next call).
+        let (n, run, l2, path) = (node.clone(), bs.run.clone(), l.clone(), dir.join(SPEND_FILE));
+        tasks.push(tokio::spawn(async move {
+            let mut last = wicket_proxy::llm::Spent::default();
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut i = 0u64;
+            loop {
+                t.tick().await;
+                i += 1;
+                let now = l2.spent();
+                if now != last {
+                    let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
+                }
+                if (now != last || i.is_multiple_of(10)) && n.proto_of(&run) >= chan::NODE_LEASES {
+                    n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
+                }
+                last = now;
+            }
+        }));
         l
     };
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
@@ -1872,7 +2078,6 @@ async fn serve_box(
     // the proxy, which forwards them.
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
-    let mut tasks = vec![];
     tasks.push(tokio::spawn({
         let us = sock.join("udp.sock");
         async move {
@@ -1938,6 +2143,12 @@ async fn serve_box(
 
     Ok(tasks)
 }
+
+/// How a fetch for a version-1 control host fails: the model proxy relays on it.
+pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
+
+/// A box's model spend as its node counted it (#152), beside its record.
+const SPEND_FILE: &str = "node-spend.json";
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
 fn box_name_ok(name: &str, run: &str) -> bool {
@@ -2038,6 +2249,12 @@ mod tests {
             audit_link: Mutex::new(None),
             shipped: AtomicI64::new(-1),
             shipping: Mutex::new(()),
+            secrets: crate::nodesecrets::Cache::new(node_clock()),
+            slices: crate::nodesecrets::Slices::new(&i.dir).unwrap(),
+            queue: crate::nodesecrets::Asks::open(&i.dir),
+            requeued: Mutex::new(HashMap::new()),
+            stopped: Mutex::new(HashMap::new()),
+            llms: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2109,12 +2326,12 @@ mod tests {
                 llm_prior: (0, 0, 0),
                 output_cap: 64 << 20,
                 output_stop: false,
+                swap_hosts: vec![],
             },
             name: format!("wicket-{run}"),
             started_ms: 0,
             stdin_received: 0,
             stdin_closed: false,
-            lease_until: 0,
             out_end: [0, 0],
             out_tail: [String::new(), String::new()],
             out_saved_ms: 0,
@@ -2227,7 +2444,6 @@ mod tests {
                 memory_mib: 0,
                 listeners: HashMap::new(),
                 owner: Some(2),
-                lease_until: 0,
                 record: fake_record("run_a"),
             },
         );
@@ -2280,6 +2496,69 @@ mod tests {
         // A newer connection replaces this one.
         let _c2 = connect(&node, 4, &inst).await;
         assert!(tokio::time::timeout(std::time::Duration::from_secs(5), chan::read_frame(&mut c)).await.unwrap().unwrap().is_none());
+    }
+
+    /// #152, #153: an ask queued while the run's control host was away is raised when it resumes the
+    /// box, with its node-local id and time, and leaves the queue once answered; a lease's budget
+    /// slice is kept on disk; a protocol-1 control host gets none of the version-2 messages.
+    #[tokio::test]
+    async fn a_queued_ask_is_raised_on_resume_and_a_lease_keeps_its_slice() {
+        const RUN: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
+        let inst = Install::new("nodesrv-queued");
+        let node = test_node(&inst);
+        let mut st = BoxState {
+            streams: [1, 2, 3],
+            name: format!("wicket-{RUN}"),
+            dir: inst.dir.join("runs").join(RUN),
+            stdin: None,
+            stdin_next: 0,
+            out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+            exited: None,
+            tasks: vec![],
+            user: String::new(),
+            cpus: 0.0,
+            memory_mib: 0,
+            listeners: HashMap::new(),
+            owner: None,
+            record: fake_record(RUN),
+        };
+        st.record.start.run = RUN.into();
+        node.boxes.lock().unwrap().insert(RUN.into(), st);
+        let op =
+            wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", "GET", "x.example", "/a");
+        // Cut off: the decider's ask is queued, once.
+        let ctl = Control(node.clone(), RUN.into());
+        let id = ctl.queue(&op, "out of reach", None).unwrap();
+        assert_eq!(ctl.queue(&op, "out of reach", None).unwrap(), id);
+        let (mut c, r) = handshake(&node, 2, chan::PROTOCOL, &inst, &inst.issuer).await;
+        assert!(r.is_ok(), "{:?}", r.err());
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        let (mid, queued) = match next_msg(&mut c).await {
+            Frame::Msg(Msg::Ask { id, run, op: o, queued, .. }) if run == RUN && *o == op => (id, queued),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(queued.as_ref().map(|q| q.0.as_str()), Some(id.as_str()));
+        assert_eq!(node.queue.of(RUN).len(), 1, "kept until answered");
+        c.write_all(&Frame::Msg(Msg::Asked { id: mid, pending: Some(("r-1".into(), true)), denied: None, error: None }).encode())
+            .await
+            .unwrap();
+        // A lease's slice: kept on disk for a restarted `serve`.
+        let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
+        c.write_all(
+            &Frame::Msg(Msg::Lease { run: RUN.into(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }).encode(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            if node.queue.of(RUN).is_empty() && node.slices.get(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(node.queue.of(RUN).is_empty(), "answered: off the queue");
+        assert_eq!(node.slices.get(RUN), Some(slice));
+        assert!(crate::nodesecrets::Asks::open(&inst.dir).of(RUN).is_empty(), "and off the disk");
+        assert_eq!(node.proto_of(RUN), chan::PROTOCOL);
     }
 
     /// Done-when for #16: a node with an unexpected certificate is refused (wrong installation, wrong
@@ -2414,7 +2693,6 @@ mod tests {
                     memory_mib: 0,
                     listeners: HashMap::new(),
                     owner: Some(gen),
-                    lease_until: 0,
                     record: fake_record(run),
                 },
             );

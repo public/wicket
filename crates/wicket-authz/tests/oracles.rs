@@ -11,52 +11,151 @@ use std::time::Instant;
 use wicket_authz::*;
 use wicket_core::{CompiledZone, RiskClass, ZoneSpec};
 
+/// What oracle 1 saw on some zones.
+#[derive(Default)]
+struct Oracle1 {
+    checked: usize,
+    kinds: [usize; 3],
+    max_steps: u64,
+    max_generic: u64,
+}
+
+/// Oracle 1 on one zone: minted as a single block, it runs compiled; every probe is decided by the
+/// compiled evaluator, never its generic fallback (#183), and as `CompiledZone::evaluate` decides it;
+/// on a sample, the generic engine decides alike, within the mint-time cost estimate and the budget.
+fn oracle1_zone(z: &ZoneSpec, keys: &Keys, seen: &mut Oracle1) {
+    let c = Ceiling::from_zone(z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap_or_else(|e| panic!("{}: {e}", z.name));
+    let tok = mint(&keys.root, TENANT, "trigger:t", &c).unwrap_or_else(|e| panic!("{}: {e}", z.name));
+    let bound = estimated_steps(&tok);
+    assert!(bound <= STEP_BUDGET, "zone {}: minted with an estimate of {bound} steps", z.name);
+    let l = load_ok(&tok, keys);
+    assert!(l.is_compiled(), "zone {} isn't compiled", z.name);
+    let cz = CompiledZone::new(z.clone()).unwrap();
+    let mut generic = l.generic_session();
+    let (hosts, paths) = probes(&[z]);
+    for h in &hosts {
+        for p in &paths {
+            for m in METHODS {
+                let o = op(&z.name, m, h, p);
+                let want = kind_of_verdict(&cz.evaluate(&o));
+                let got = decide_compiled(&l, &http_request("b0", &o));
+                seen.max_steps = seen.max_steps.max(l.last_steps());
+                if seen.checked.is_multiple_of(8) && wicket_core::never_reachable(h).is_none() {
+                    // The generic engine (the compiled evaluator's fallback) on a sample.
+                    let (res, steps) = generic.authorize(&http_request("b0", &o));
+                    assert_eq!(l.classify(res), got);
+                    assert!(steps <= bound, "zone {}: {m} {h}{p} took {steps} generic steps, over the estimate {bound}", z.name);
+                    seen.max_generic = seen.max_generic.max(steps);
+                }
+                assert_eq!(
+                    kind_of(&got),
+                    want,
+                    "zone {}: {m} {h}{p} (risk {:?}): token {got:?}, zone {:?}",
+                    z.name,
+                    o.risk,
+                    cz.evaluate(&o)
+                );
+                seen.kinds[want as usize] += 1;
+                seen.checked += 1;
+            }
+        }
+    }
+}
+
 #[test]
 fn oracle1_single_block_equals_compiled_zone() {
     let keys = Keys::new(0);
     let zones = all_zones();
     assert_eq!(zones.len(), example_zones().len() + 7 + 32);
-    let (mut checked, mut kinds, mut max_steps, mut max_generic) = (0usize, [0usize; 3], 0u64, 0u64);
+    let mut seen = Oracle1::default();
     let start = Instant::now();
     for z in &zones {
-        let c = Ceiling::from_zone(z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap_or_else(|e| panic!("{}: {e}", z.name));
-        let tok = mint(&keys.root, TENANT, "trigger:t", &c).unwrap();
-        let l = load_ok(&tok, &keys);
-        assert!(l.is_compiled(), "zone {} isn't compiled", z.name);
-        let cz = CompiledZone::new(z.clone()).unwrap();
-        let mut generic = l.generic_session();
-        let (hosts, paths) = probes(&[z]);
-        for h in &hosts {
-            for p in &paths {
-                for m in METHODS {
-                    let o = op(&z.name, m, h, p);
-                    let want = kind_of_verdict(&cz.evaluate(&o));
-                    let got = l.decide(&http_request("b0", &o));
-                    assert!(wicket_core::never_reachable(h).is_some() || !l.last_fell_back());
-                    max_steps = max_steps.max(l.last_steps());
-                    if checked % 8 == 0 && wicket_core::never_reachable(h).is_none() {
-                        // The generic engine (the compiled evaluator's fallback) on a sample.
-                        let (res, steps) = generic.authorize(&http_request("b0", &o));
-                        assert_eq!(l.classify(res), got);
-                        max_generic = max_generic.max(steps);
-                    }
-                    assert_eq!(
-                        kind_of(&got),
-                        want,
-                        "zone {}: {m} {h}{p} (risk {:?}): token {got:?}, zone {:?}",
-                        z.name,
-                        o.risk,
-                        cz.evaluate(&o)
-                    );
-                    kinds[want as usize] += 1;
-                    checked += 1;
-                }
-            }
-        }
+        oracle1_zone(z, &keys, &mut seen);
     }
+    let Oracle1 { checked, kinds, max_steps, max_generic } = seen;
     println!("oracle 1: {checked} decisions on {} zones in {:?}: {kinds:?} (allow, forbidden, needs grant); max steps: compiled {max_steps}, generic {max_generic}", zones.len(), start.elapsed());
-    assert!(max_generic <= MEASURED_MAX_STEPS, "a legitimate request took {max_generic} steps (measured max {MEASURED_MAX_STEPS})");
     assert!(kinds.iter().all(|&k| k > 1000), "too few of some kind: {kinds:?}");
+}
+
+/// #183: the remote-control-box zone as first written (5 reach rules, 9 globs on api.anthropic.com;
+/// 6 forbid rules) took 9,497 steps in the generic engine, over the bound measured on the examples
+/// then. It mints (its estimate is within the budget), runs compiled, and decides as its zone.
+#[test]
+fn the_zone_of_183_runs_compiled() {
+    let keys = Keys::new(0);
+    let yaml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zone-183.yaml")).unwrap();
+    let z = wicket_core::Manifest::from_yaml(&yaml).unwrap().zone;
+    assert_eq!((z.reach.len(), z.forbid.len()), (5, 6));
+    let mut seen = Oracle1::default();
+    oracle1_zone(&z, &keys, &mut seen);
+    let c = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    let e = cost::estimate(mint(&keys.root, TENANT, "trigger:t", &c).unwrap().biscuit()).unwrap();
+    println!("zone of #183: estimate {e:?} ({} steps); max steps: compiled {}, generic {}", e.steps(), seen.max_steps, seen.max_generic);
+    assert_eq!(e.host, "api.anthropic.com");
+    assert!(seen.max_generic > MEASURED_MAX_STEPS, "the zone no longer shows #183: {} generic steps", seen.max_generic);
+    assert!(seen.max_steps <= 1_000, "{} compiled steps", seen.max_steps);
+}
+
+/// #183: a zone whose globs on one host could cost more than the step budget in the generic engine
+/// is refused at mint, naming the zone, the host and its pattern bytes; the same globs spread over
+/// hosts mint. A spawn link that brings a chain's host over the budget is refused at `attenuate`.
+#[test]
+fn an_oversized_zone_is_refused_at_mint() {
+    let keys = Keys::new(1);
+    let mut cs = ceilings(1, &keys);
+    let globs: Vec<String> = (0..30).map(|i| format!("/v1/organizations/*/projects/*/environments/{i}/sessions/*/worker/**")).collect();
+    cs[0].reach.push(Reach { host: "big.example".into(), methods: vec!["GET".into()], paths: globs.clone(), allow_dangerous: false });
+    let err = match mint(&keys.root, TENANT, "trigger:t", &cs[0]) {
+        Err(AuthzError::Cost(e)) => e,
+        Err(e) => panic!("refused, but not for cost: {e}"),
+        Ok(_) => panic!("an oversized zone was minted"),
+    };
+    println!("refused: {err}");
+    let want = format!("zone {}: host big.example: its 30 path globs compile to ", cs[0].zone);
+    assert!(err.starts_with(&want), "{err}");
+    assert!(err.contains("pattern bytes") && err.contains(&format!("budget {STEP_BUDGET}")), "{err}");
+    // The same globs, a few per host: each host is well within the budget.
+    let mut spread = cs[0].clone();
+    spread.reach.pop();
+    for (i, chunk) in globs.chunks(5).enumerate() {
+        spread.reach.push(Reach {
+            host: format!("h{i}.example"),
+            methods: vec!["GET".into()],
+            paths: chunk.to_vec(),
+            allow_dangerous: false,
+        });
+    }
+    let t = mint(&keys.root, TENANT, "trigger:t", &spread).unwrap();
+    assert!(estimated_steps(&t) <= STEP_BUDGET);
+    // Over a chain: block 0 with half the globs on one host, a spawn link with the other half there
+    // (by a wildcard). Each block alone is within the budget; together they are not.
+    let mut parent = cs[0].clone();
+    parent.reach.pop();
+    parent.reach.push(Reach {
+        host: "big.example".into(),
+        methods: vec!["GET".into()],
+        paths: globs[..15].to_vec(),
+        allow_dangerous: false,
+    });
+    let mut child = cs[1].clone();
+    child.reach.push(Reach { host: "*.example".into(), methods: vec!["GET".into()], paths: globs[15..].to_vec(), allow_dangerous: false });
+    let t = mint(&keys.root, TENANT, "trigger:t", &parent).unwrap();
+    match t.attenuate(&child) {
+        Err(AuthzError::Cost(e)) => assert!(e.starts_with(&format!("zone {}: host big.example: ", child.zone)), "{e}"),
+        Err(e) => panic!("refused, but not for cost: {e}"),
+        Ok(_) => panic!("an oversized chain was attenuated"),
+    }
+    // The refusal isn't spurious: the same block appended by other means (a node's `load` doesn't
+    // estimate cost) runs compiled, but in the generic engine a request to that host that matches
+    // none of its globs is cut off by the budget, and would decide `Forbidden` (fail closed).
+    let raw = Token::from_biscuit(t.biscuit().append(wicket_authz::generator::ceiling_block(&child).unwrap()).unwrap());
+    let l = load_ok(&raw, &keys);
+    assert!(l.is_compiled());
+    let o = op(&child.zone, "GET", "big.example", "/v1/organizations/a/projects/b/environments/none");
+    let r = http_request(&box_id(1), &o);
+    assert!(matches!(decide_compiled(&l, &r), Decision::NeedsGrant(_)));
+    let (res, steps) = l.generic_session().authorize(&r);
+    assert!(matches!(l.classify(res), Decision::Forbidden(why) if why.contains("evaluation failed")), "generic: {steps} steps");
 }
 
 /// #111: a child `subset::check` proves within its parent adds no authority, as Biscuit decides it:
@@ -89,8 +188,10 @@ fn proved_subsets_decide_as_their_chain() {
             for path in &paths {
                 for m in METHODS {
                     let o = op(&c.zone.name, m, h, path);
-                    let (a, b) =
-                        (kind_of(&alone.decide(&http_request(&box_id(1), &o))), kind_of(&chain.decide(&http_request(&box_id(1), &o))));
+                    let (a, b) = (
+                        kind_of(&decide_compiled(&alone, &http_request(&box_id(1), &o))),
+                        kind_of(&decide_compiled(&chain, &http_request(&box_id(1), &o))),
+                    );
                     checked += 1;
                     if a != b && differs.is_none() {
                         differs = Some(format!("{m} {h}{path}: alone {a}, chain {b}"));
@@ -210,7 +311,7 @@ fn oracle2_chain_equals_intersection_of_zones() {
                 _ => op("z", rng.pick(&METHODS), rng.pick(&hosts), rng.pick(&paths)),
             };
             let want = intersect(&compiled, &o);
-            let got = l.decide(&http_request(&box_id(depth), &o));
+            let got = decide_compiled(&l, &http_request(&box_id(depth), &o));
             assert_eq!(
                 kind_of(&got),
                 want,
@@ -338,6 +439,7 @@ fn same(
 fn differential(n: usize, stock_every: usize) {
     let tokens = oracle3_tokens();
     let mut sessions: Vec<_> = tokens.iter().map(|(_, l)| l.generic_session()).collect();
+    let bounds: Vec<u64> = tokens.iter().map(|(_, l)| estimated_steps(l.token())).collect();
     let mut rng = Rng(3);
     let start = Instant::now();
     let (mut allowed, mut stock, mut max_generic, mut max_compiled, mut max_stock) = (0usize, 0usize, 0u64, 0u64, 0u64);
@@ -349,10 +451,12 @@ fn differential(n: usize, stock_every: usize) {
         assert!(!l.last_fell_back(), "request {i} ran in the generic engine: the comparison would be generic vs generic");
         max_compiled = max_compiled.max(l.last_steps());
         let (slow, steps) = sessions[k].authorize(&r);
+        assert!(steps <= bounds[k], "request {i}: {steps} generic steps, over the estimate {}", bounds[k]);
         max_generic = max_generic.max(steps);
         same(i, l, &r, &fast, slow);
         if i % stock_every == 0 {
             let (slow, steps) = l.authorize_generic(&r);
+            assert!(steps <= bounds[k], "request {i}: {steps} AuthorizerBuilder steps, over the estimate {}", bounds[k]);
             max_stock = max_stock.max(steps);
             same(i, l, &r, &fast, slow);
             stock += 1;
@@ -420,7 +524,7 @@ fn npm_scoped_paths_decide_alike_in_every_oracle() {
                     let o = op(&z.name, m, h, &decoded);
                     let want = kind_of_verdict(&cz.evaluate(&o));
                     assert_eq!(want, kind_of_verdict(&cz.evaluate(&op(&z.name, m, h, &plain))), "{m} {h}{raw}");
-                    let got = l.decide(&http_request("b0", &o));
+                    let got = decide_compiled(&l, &http_request("b0", &o));
                     assert_eq!(kind_of(&got), want, "{m} {h}{raw}: token {got:?}");
                     let (res, _) = generic.authorize(&http_request("b0", &o));
                     assert_eq!(l.classify(res), got, "{m} {h}{raw}: generic engine");

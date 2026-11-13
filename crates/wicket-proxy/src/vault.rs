@@ -15,14 +15,66 @@ use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Vault {
     dir: PathBuf,
+    /// Instead of the directory: secrets held elsewhere, e.g. sealed to a node (#152).
+    source: Option<std::sync::Arc<dyn SecretSource>>,
+}
+
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault").field("dir", &self.dir).field("sealed", &self.source.is_some()).finish()
+    }
+}
+
+/// Where a vault reads secrets other than its own directory: a node's in-memory cache of the secrets
+/// its runs have used (#152). Bindings travel with each secret and are enforced the same way.
+pub trait SecretSource: Send + Sync {
+    /// The secret's current value, if held and not expired.
+    fn get(&self, name: &str) -> Result<String>;
+    /// The hosts it may be sent to.
+    fn hosts(&self, name: &str) -> Vec<String>;
+    /// Whether it is held (and not expired).
+    fn has(&self, name: &str) -> bool;
+    /// Makes `name` available if it isn't: a node fetches it from its control host on first use.
+    fn fetch<'a>(&'a self, _name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl Vault {
     pub fn new(dir: PathBuf) -> Vault {
-        Vault { dir }
+        Vault { dir, source: None }
+    }
+
+    /// Makes `name` available before use: a source fetches it if it doesn't hold it (#152). A
+    /// directory vault has nothing to fetch.
+    pub async fn ensure(&self, name: &str) -> Result<()> {
+        match &self.source {
+            Some(s) if !s.has(name) => s.fetch(name).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether this vault's secrets come from a source (a node's cache) rather than a directory.
+    pub fn is_sourced(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// A vault whose secrets come from `source` only (a node's cache, #152).
+    pub fn from_source(source: std::sync::Arc<dyn SecretSource>) -> Vault {
+        Vault { dir: PathBuf::from("/nonexistent/wicket-sealed-vault"), source: Some(source) }
+    }
+
+    /// When a reference's current value expires upstream (Unix ms), if its file says so (e.g. the
+    /// Claude login's access token): a node holding a copy drops it then (#152).
+    pub fn expires_at(&self, name: &str) -> Option<i64> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        let (file, ep) = (spec.get("file")?.as_str()?, spec.get("expires_pointer")?.as_str()?);
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+        doc.pointer(ep)?.as_i64()
     }
 
     pub fn default_dir() -> PathBuf {
@@ -38,6 +90,9 @@ impl Vault {
     }
 
     pub fn get(&self, name: &str) -> Result<String> {
+        if let Some(s) = &self.source {
+            return s.get(name);
+        }
         let p = self.path(name)?;
         let r = p.with_extension("ref");
         if r.exists() {
@@ -87,6 +142,26 @@ impl Vault {
         Ok(v.trim().to_string())
     }
 
+    /// The file a linked secret refers to (None for a stored secret).
+    pub fn linked_file(&self, name: &str) -> Option<PathBuf> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        spec.get("file")?.as_str().map(PathBuf::from)
+    }
+
+    /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
+    /// the Claude login's `claudeAiOauth`, for its non-secret fields: scopes, subscription type).
+    /// None for a stored secret or a whole-file link.
+    pub fn linked_object(&self, name: &str) -> Option<serde_json::Value> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        let file = spec.get("file")?.as_str()?;
+        let pointer = spec.get("pointer")?.as_str()?;
+        let parent = &pointer[..pointer.rfind('/')?];
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+        doc.pointer(parent).filter(|v| v.is_object()).cloned()
+    }
+
     /// Makes `name` a reference to another file (never copied into the vault): a JSON field in it,
     /// or with no `pointer`, the whole file, trimmed.
     pub fn link(&self, name: &str, file: &str, pointer: Option<&str>, expires_pointer: Option<&str>) -> Result<()> {
@@ -107,6 +182,9 @@ impl Vault {
     /// The hosts `name` may be sent to: its `.hosts` list, else the default for well-known names,
     /// else none.
     pub fn hosts(&self, name: &str) -> Vec<String> {
+        if let Some(s) = &self.source {
+            return s.hosts(name);
+        }
         let Ok(p) = self.path(name) else { return vec![] };
         match std::fs::read(p.with_extension("hosts")) {
             Ok(b) => serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default(),
@@ -160,6 +238,9 @@ impl Vault {
     }
 
     pub fn has(&self, name: &str) -> bool {
+        if let Some(s) = &self.source {
+            return s.has(name);
+        }
         self.path(name).map(|p| p.exists() || p.with_extension("ref").exists()).unwrap_or(false)
     }
 
@@ -171,6 +252,18 @@ impl Vault {
         std::fs::write(&tmp, value.trim())?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, &p)?;
+        Ok(())
+    }
+
+    /// Removes `name` (its value or reference, and its host binding).
+    pub fn remove(&self, name: &str) -> Result<()> {
+        let p = self.path(name)?;
+        for f in [p.clone(), p.with_extension("ref"), p.with_extension("hosts")] {
+            match std::fs::remove_file(&f) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
         Ok(())
     }
 

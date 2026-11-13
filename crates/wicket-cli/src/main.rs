@@ -20,6 +20,7 @@ mod node;
 mod nodeauth;
 mod nodecall;
 mod noderun;
+mod nodesecrets;
 mod nodesrv;
 mod place;
 mod program;
@@ -517,6 +518,10 @@ enum SelfCmd {
         /// The canary's image (default: the new build's own, wicket/claude-code:<build id>).
         #[arg(long)]
         image: Option<String>,
+        /// Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does,
+        /// where it updated).
+        #[arg(long)]
+        no_prune: bool,
     },
     /// Switch back to the previous version: the control host (unless --only-nodes) and these nodes.
     Rollback {
@@ -525,6 +530,22 @@ enum SelfCmd {
         nodes: Option<String>,
         #[arg(long, requires = "nodes")]
         only_nodes: bool,
+    },
+    /// Remove what no rollback or running box needs: versions other than current and previous that
+    /// no process runs, their agent images unless a container uses them, and ledger snapshots
+    /// beyond the newest few (always keeping the newest of the current and previous versions').
+    Prune {
+        /// Also these nodes: `all`, or names (comma-separated).
+        #[arg(long)]
+        nodes: Option<String>,
+        #[arg(long, requires = "nodes")]
+        only_nodes: bool,
+        /// How many snapshots to keep.
+        #[arg(long, default_value_t = update::KEEP_SNAPSHOTS)]
+        keep_snapshots: usize,
+        /// Say what would go; remove nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Trust a release public key (from `wicket self keygen`) for updates.
     TrustKey { public: PathBuf },
@@ -690,6 +711,9 @@ enum SecretCmd {
     },
     /// List secret names and the hosts each may be sent to (never values).
     List,
+    /// Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their
+    /// run's lease next reaches them, within seconds while connected (#152).
+    Rm { name: String },
     /// Bind a secret to the only hosts it may be sent to, replacing its list.
     Hosts {
         name: String,
@@ -1349,6 +1373,13 @@ async fn main() -> Result<()> {
                     v.set_hosts(&name, &hosts)?;
                     println!("secret {name}: {}", secret_hosts_line(&v, &name));
                 }
+                SecretCmd::Rm { name } => {
+                    if !v.has(&name) {
+                        bail!("no secret {name}");
+                    }
+                    v.remove(&name)?;
+                    println!("secret {name} removed");
+                }
                 SecretCmd::List => {
                     for n in v.list() {
                         let base = n.strip_suffix(" (reference)").unwrap_or(&n);
@@ -1474,7 +1505,7 @@ async fn main() -> Result<()> {
         Cmd::Place { cmd } => place::run(cmd).await,
         Cmd::Itself { cmd } => match cmd {
             SelfCmd::Status => update::status(),
-            SelfCmd::Update { artifact, sig, nodes, only_nodes, window, interval, check, canary, image } => {
+            SelfCmd::Update { artifact, sig, nodes, only_nodes, window, interval, check, canary, image, no_prune } => {
                 let gate = update::Gate {
                     window: humantime::parse_duration(&window).context("bad --window")?,
                     interval: humantime::parse_duration(&interval).context("bad --interval")?.max(Duration::from_secs(1)),
@@ -1482,9 +1513,12 @@ async fn main() -> Result<()> {
                     canary,
                     image,
                 };
-                update::update(update::UpdateOpts { artifact, sig, nodes, only_nodes, gate }).await
+                update::update(update::UpdateOpts { artifact, sig, nodes, only_nodes, gate, prune: !no_prune }).await
             }
             SelfCmd::Rollback { nodes, only_nodes } => update::rollback(nodes, only_nodes).await,
+            SelfCmd::Prune { nodes, only_nodes, keep_snapshots, dry_run } => {
+                update::prune(nodes, only_nodes, keep_snapshots, dry_run).await
+            }
             SelfCmd::TrustKey { public } => update::trust_key(&public),
             SelfCmd::Keygen { key } => update::keygen(&key),
             SelfCmd::Sign { key, artifact } => update::sign(&key, &artifact),

@@ -21,7 +21,9 @@
 #      image;
 #   4. an automatic rollback: the agent's build C, approved by a human, fails an injected health
 #      check on the control host and is switched back to A; the approval is used up;
-#   5. the audit chain verifies and has every step.
+#   5. pruning (#166): a dry run removes nothing; then B, now neither current nor previous on the
+#      control host, goes with its image, while A and C stay (and the nodes, A and B, keep both);
+#   6. the audit chain verifies and has every step.
 #
 # Needs Docker with runsc and the agent image. Env: WICKET, IMAGE (an existing agent image: not
 # built, not removed; default: built as wicket/claude-code:upd-$$ and removed), WICKET_DOCKER (e.g.
@@ -83,7 +85,14 @@ box_of() { $DOCKER ps -q --filter "label=wicket.run=$1" 2>/dev/null; }
 id_of() { sha256sum "$1" | cut -c1-12; }
 current() { basename "$(readlink "$1/current")"; }
 node_dir() { echo "$work/$1/.local/share/wicket-node"; }
-serve_runs() { basename "$(dirname "$(readlink "/proc/$1/exe")")"; }   # the version a process runs
+# The version a process runs: from /proc, or for a non-dumpable `node serve` (#152) what it wrote beside
+# its pid file (the pid on the first line, the binary on the second).
+serve_runs() {
+  local e
+  e=$(readlink "/proc/$1/exe" 2>/dev/null) || e=$(cat "$WICKET_HOME/local-node/serve/serve.exe" "$work"/n*/.local/share/wicket-node/serve.exe 2>/dev/null \
+    | awk -v p="$1" 'NR%2==1 {m=($1==p)} NR%2==0 && m {print; exit}')
+  basename "$(dirname "$e")"
+}
 # A new box with the default image: which image its run got.
 new_box_image() {
   local log=$work/newbox-$1.log r
@@ -204,6 +213,9 @@ check "while the request is pending, its artifact is still refused" '! w self up
 
 # ---- 2. A -> B ----
 log "2. update to B: control host, then n1 (canary) and n2"
+# The node agent's model credential, fetched by n1 on its first use (#152): kept in n1's memory.
+fetched() { w audit --tail 3000 | grep node.secret_fetch | grep "$r_node" | grep -c '"released":true'; }
+fetched_before=$(fetched)
 set +e
 w self update "$B_ART" --nodes n1,n2 --window 10s --interval 5s --canary ci/update/canary.yaml 2>&1 | tee "$work/u-b.log"
 st=${PIPESTATUS[0]}
@@ -218,6 +230,9 @@ check "  the runs were handed over and adopted by B" 'grep -qE "runs: ([0-9]+) h
 check "  B's own image was built while staging, and the canary ran on it" '$DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && w audit --tail 300 | grep run.start | grep -q "wicket/claude-code:$B_ID"'
 check "  a new box with the default image gets B's" '[ "$(new_box_image b)" = "wicket/claude-code:$B_ID" ]'
 another_turn "the update to B"
+check "  n1's secret cache was handed to its new serve through a memfd, and not fetched again (#152)" \
+  'grep -q "cached secret(s) handed over from the previous process" "$work/n1.log" && [ "$fetched_before" -ge 1 ] && [ "$(fetched)" = "$fetched_before" ]'
+check "  and n1's data dir holds no copy of it" '! grep -rlsF mock-model-credential "$(node_dir n1)"'
 
 # ---- 3. manual rollback ----
 log "3. rollback by hand"
@@ -242,11 +257,25 @@ check "  the control host and its node run A" '[ "$(current "$WICKET_HOME/versio
 check "  the approval was used up: C is refused again" '! w self update "$work/C" >"$work/u-c2.log" 2>&1 && grep -q "no human has approved" "$work/u-c2.log"'
 another_turn "the automatic rollback"
 
-# ---- 5. audit ----
-log "5. audit"
+# ---- 5. prune ----
+log "5. prune"
+w self prune --nodes n1,n2 --dry-run >"$work/prune-dry.log" 2>&1 || cat "$work/prune-dry.log"
+cat "$work/prune-dry.log"
+check "a dry run says B would go, keeps its image while a container uses it, and removes nothing" \
+  'grep -q "control: would remove 1 version(s) \[$B_ID\]" "$work/prune-dry.log" && grep -q "kept wicket/claude-code:$B_ID (a container uses it)" "$work/prune-dry.log" && [ -d "$WICKET_HOME/versions/$B_ID" ]'
+# That container is the stopped box which checked that new boxes get B's image: once it is gone,
+# B's image can go too.
+for c in $($DOCKER ps -aq --filter "ancestor=wicket/claude-code:$B_ID"); do $DOCKER rm -f "$c" >/dev/null; done
+w self prune --nodes n1,n2 >"$work/prune.log" 2>&1 || cat "$work/prune.log"
+cat "$work/prune.log"
+check "  prune removes B and its image; A (current) and C (previous) stay" '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ]'
+check "  the nodes keep their current and previous" '[ -d "$(node_dir n1)/versions/$A_ID" ] && [ -d "$(node_dir n1)/versions/$B_ID" ] && grep -q "node:n1: removed 0 version" "$work/prune.log"'
+
+# ---- 6. audit ----
+log "6. audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
 w audit --tail 1000 | grep -oE '"?self\.[a-z_]+' | tr -d '"' | uniq -c | tee "$work/self-audit.txt"
-for k in self.update_refused self.staged self.snapshot self.switched self.health self.committed self.rolled_back; do
+for k in self.update_refused self.staged self.snapshot self.switched self.health self.committed self.rolled_back self.pruned; do
   check "  the audit records $k" 'grep -q " $k$" "$work/self-audit.txt"'
 done
 check "  an automatic rollback is recorded as one" 'w audit --tail 1000 | grep self.rolled_back | grep -q "\"automatic\":true"'

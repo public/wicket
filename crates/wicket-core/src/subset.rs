@@ -88,6 +88,16 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             v.push(format!("timeout {}: more than the {}s this zone has left (or zero)", c.limits.timeout, parent.time_remaining.as_secs()))
         }
     }
+    // A child's authority (#153) is its own token's block, attenuated from its parent's: it can't
+    // outlast the parent's, whatever it says, but one that asks for more is refused here too.
+    match (c.limits.authority(), p.limits.authority()) {
+        (Ok(ca), Ok(pa)) if ca <= pa => {}
+        _ => v.push(format!(
+            "authority {}: longer than this zone's {} (or unreadable)",
+            c.limits.authority.as_deref().unwrap_or(&c.limits.timeout),
+            p.limits.authority.as_deref().unwrap_or(&p.limits.timeout)
+        )),
+    }
     if !parent.images.iter().any(|i| i == ask.image) {
         v.push(format!("image {}: not one this zone may start (allowed: {})", ask.image, parent.images.join(", ")));
     }
@@ -514,6 +524,21 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{} unsound proofs, e.g.:\n{}", wrong.len(), wrong[..wrong.len().min(10)].join("\n"));
         assert!(proved > 2_000, "only {proved} proofs: the check got too weak");
+    }
+
+    /// #153: a child's authority (default its timeout) is never longer than its parent's; an
+    /// authority longer than the timeout is the timeout; zero is refused.
+    #[test]
+    fn authority_narrows() {
+        let p = parent();
+        let child =
+            |l: &str| zone(&format!("  llm: {{ max_requests: 10, max_output_tokens: 1000 }}\n  limits: {{ memory: 1g, cpus: 1, {l} }}\n"));
+        assert_eq!(check(&ask(&child("timeout: 10m")), &bounds(&p)), Ok(()));
+        assert_eq!(check(&ask(&child("timeout: 10m, authority: 5m")), &bounds(&p)), Ok(()));
+        assert_eq!(child("timeout: 10m, authority: 2h").limits.authority().unwrap(), std::time::Duration::from_secs(600));
+        let short = zone("  limits: { memory: 2g, cpus: 2, timeout: 1h, authority: 1m }\n");
+        let v = check(&ask(&child("timeout: 10m")), &bounds(&short)).unwrap_err();
+        assert!(v.iter().any(|v| v.contains("authority 10m: longer than this zone's 1m")), "{v:?}");
     }
 
     /// #28: input budgets count cached tokens too; a capped zone can only start capped children,

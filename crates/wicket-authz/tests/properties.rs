@@ -35,7 +35,7 @@ fn req(i: usize) -> Request {
 }
 
 fn decide(t: &Token, k: &Keys, r: &Request) -> Decision {
-    load_ok(t, k).decide(r)
+    decide_compiled(&load_ok(t, k), r)
 }
 
 fn is_grant(d: &Decision) -> bool {
@@ -74,10 +74,10 @@ fn baseline() {
     let f = fixture();
     let l = load_ok(&f.tok, &f.keys);
     assert!(l.is_compiled());
-    assert_eq!(l.decide(&req(0)), Decision::Allow, "A: in reach");
-    assert!(is_grant(&l.decide(&req(1))), "B: outside reach needs a grant");
-    assert_eq!(l.decide(&req(2)), Decision::Allow, "C: granted");
-    assert_eq!(l.decide(&req(3)), Decision::Allow, "D: spawn within limits");
+    assert_eq!(decide_compiled(&l, &req(0)), Decision::Allow, "A: in reach");
+    assert!(is_grant(&decide_compiled(&l, &req(1))), "B: outside reach needs a grant");
+    assert_eq!(decide_compiled(&l, &req(2)), Decision::Allow, "C: granted");
+    assert_eq!(decide_compiled(&l, &req(3)), Decision::Allow, "D: spawn within limits");
     assert!(is_grant(&decide(&f.parent_only, &f.keys, &req(2))), "C without the grant");
 }
 
@@ -143,14 +143,14 @@ fn a_node_can_narrow() {
     c.grant_keys.clear();
     let t = f.tok.attenuate(&c).unwrap();
     let l = load_ok(&t, k);
-    assert_eq!(l.decide(&req(0)), Decision::Allow, "A still allowed");
-    assert!(is_grant(&l.decide(&req(2))), "C (granted PUT) no longer allowed: the new block trusts no grant");
+    assert_eq!(decide_compiled(&l, &req(0)), Decision::Allow, "A still allowed");
+    assert!(is_grant(&decide_compiled(&l, &req(2))), "C (granted PUT) no longer allowed: the new block trusts no grant");
     // Hand-written narrowing within the vocabulary passes the structural check. It has no grant
     // escape, so nothing can lift it: C is now forbidden.
     let t = append_raw(&f.tok, r#"check if op($o), $o != "http" or method("GET");"#);
     let l = load_ok(&t, k);
-    assert_eq!(l.decide(&req(0)), Decision::Allow);
-    assert!(is_forbidden(&l.decide(&req(2))));
+    assert_eq!(decide_compiled(&l, &req(0)), Decision::Allow);
+    assert!(is_forbidden(&decide_compiled(&l, &req(2))));
     let mut c = f.cs[5].clone();
     c.ops.retain(|o| *o != OpKind::Spawn);
     assert!(is_forbidden(&decide(&f.tok.attenuate(&c).unwrap(), k, &req(3))), "no spawn");
@@ -164,36 +164,36 @@ fn expiry_and_leases() {
     let leaf_exp = f.cs[5].not_after;
     let g = leaf_grant(5);
     let at = |i: usize, time: u64| Request { time, ..req(i) };
-    assert_eq!(l.decide(&at(0, leaf_exp)), Decision::Allow, "A at the leaf's expiry");
-    assert!(is_forbidden(&l.decide(&at(0, leaf_exp + 1))), "A after it");
-    assert!(is_grant(&l.decide(&at(2, g.not_after + 1))), "C after the grant's expiry");
-    assert_eq!(l.decide(&at(0, g.not_after + 1)), Decision::Allow, "an expired lease doesn't end the chain");
-    assert_eq!(l.decide(&at(2, g.not_after)), Decision::Allow, "C at the grant's expiry");
+    assert_eq!(decide_compiled(&l, &at(0, leaf_exp)), Decision::Allow, "A at the leaf's expiry");
+    assert!(is_forbidden(&decide_compiled(&l, &at(0, leaf_exp + 1))), "A after it");
+    assert!(is_grant(&decide_compiled(&l, &at(2, g.not_after + 1))), "C after the grant's expiry");
+    assert_eq!(decide_compiled(&l, &at(0, g.not_after + 1)), Decision::Allow, "an expired lease doesn't end the chain");
+    assert_eq!(decide_compiled(&l, &at(2, g.not_after)), Decision::Allow, "C at the grant's expiry");
     let mut r = req(2);
     r.uses_left = vec![("g-7f3a".into(), 0)];
-    assert!(is_grant(&l.decide(&r)), "C with no uses left");
+    assert!(is_grant(&decide_compiled(&l, &r)), "C with no uses left");
     r.uses_left.clear();
-    assert!(is_grant(&l.decide(&r)), "C with no ledger entry");
+    assert!(is_grant(&decide_compiled(&l, &r)), "C with no ledger entry");
     r.uses_left = vec![("g-other".into(), 5)];
-    assert!(is_grant(&l.decide(&r)), "C with another grant's uses");
+    assert!(is_grant(&decide_compiled(&l, &r)), "C with another grant's uses");
     let mut r = req(2);
     r.epoch = 4;
-    assert!(is_grant(&l.decide(&r)), "C in a later box epoch");
+    assert!(is_grant(&decide_compiled(&l, &r)), "C in a later box epoch");
     // The leaf spawns b6: its chain carries the leaf's grant, which isn't b6's.
     let mut c = f.cs[5].clone();
     c.box_prefix = format!("{}/b6", box_id(5));
     let child = load_ok(&f.tok.attenuate(&c).unwrap(), k);
     let mut r = req(2);
     r.box_id = format!("{}/b6", box_id(5));
-    assert!(is_grant(&child.decide(&r)), "C from b6");
+    assert!(is_grant(&decide_compiled(&child, &r)), "C from b6");
     r.action = req(0).action;
-    assert_eq!(child.decide(&r), Decision::Allow, "A from b6");
+    assert_eq!(decide_compiled(&child, &r), Decision::Allow, "A from b6");
     let mut r = req(0);
     r.box_id = "b0/b1/b9".into();
-    assert!(is_forbidden(&l.decide(&r)), "a box outside the chain's subtree");
+    assert!(is_forbidden(&decide_compiled(&l, &r)), "a box outside the chain's subtree");
     let mut r = req(0);
     r.box_id = format!("{}x", box_id(5));
-    assert!(is_forbidden(&l.decide(&r)), "a box whose id only starts with the leaf's");
+    assert!(is_forbidden(&decide_compiled(&l, &r)), "a box whose id only starts with the leaf's");
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn empty_lists_encode_as_empty_sets() {
         let t = mint_chain(&cs, &keys);
         let l = load_ok(&t, &keys);
         let b = base_request(0);
-        let d = |a: Action| l.decide(&Request { action: a, ..b.clone() });
+        let d = |a: Action| decide_compiled(&l, &Request { action: a, ..b.clone() });
         let docs =
             Action::Http { host: "docs.rs".into(), method: "GET".into(), path: "/x".into(), risk: RiskClass::R1ReadScoped, inject: None };
         if cs.len() == 1 {
@@ -413,6 +413,19 @@ fn non_ascii_paths_match_byte_for_byte() {
     for p in ["/ab/x", "/a\u{e9}/x", "/a\u{e9}\u{e9}/x", "/caf\u{e9}/y", "/cafe/y", "/caf\u{e8}/y"] {
         let o = op("z", "GET", "h.example", p);
         let r = Request { box_id: "b0".into(), action: Action::from_op(&o, None), ..base_request(0) };
-        assert_eq!(kind_of(&l.decide(&r)), kind_of_verdict(&cz.evaluate(&o)), "{p}");
+        assert_eq!(kind_of(&decide_compiled(&l, &r)), kind_of_verdict(&cz.evaluate(&o)), "{p}");
     }
+}
+
+/// #153: a node stops a box when its token expires, so a loaded token says when: the earliest
+/// expiry of its first-party blocks, whichever block sets it. Grants (third-party) don't shorten it.
+#[test]
+fn a_loaded_token_reports_its_earliest_block_expiry() {
+    let keys = Keys::new(3);
+    let mut cs = ceilings(2, &keys);
+    cs[0].not_after = 5_000;
+    cs[1].not_after = 4_000;
+    cs[2].not_after = 4_500;
+    assert_eq!(load_ok(&mint_chain(&cs[..1], &keys), &keys).not_after(), Some(5_000));
+    assert_eq!(load_ok(&mint_chain(&cs, &keys), &keys).not_after(), Some(4_000));
 }

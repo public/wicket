@@ -122,10 +122,36 @@ not a permanent decision.
 - **A node is trusted with the boxes it serves.** It runs their Docker, terminates their TLS with its
   node CA, and makes their upstream requests. So root on a node can read those boxes' workspaces and
   their decrypted traffic, and can send any request to hosts within its CA's name constraints,
-  ignoring the zone's reach, until the CA expires (24 h by default). What it never gets: injected
-  credentials, the model token, and the hosts that use them. Those are tunnelled to the control host and
-  decided there ([#88](https://github.com/public/wicket/pull/88)). Enrol nodes with `--hosts` as narrow as
-  their boxes need.
+  ignoring the zone's reach, until the CA expires (24 h by default). Enrol nodes with `--hosts` as narrow
+  as their boxes need.
+- **A node holds the secrets its runs have used** (#152), in `node serve`'s memory: the model credential
+  (the Claude login's current access token: never the refresh token, never an API key) and each injected
+  secret a run used there. A stolen disk, a backup or a VM snapshot of a node gets none of them: they are
+  never written to disk (only a sealed memfd carries them across a self-update's re-exec). **Root on a
+  running node can still read the process's memory**, and so every secret held there, and use them for
+  anything until they expire: the Claude subscription (at the owner's quota and reputational risk) until
+  the access token's upstream expiry, whatever wicket's own expiry says, since wicket can't revoke a
+  subscription token short of signing the login out; each injected secret until it is rotated upstream.
+  Swap, core dumps and other users' `ptrace` are kept out (locked memory, a non-dumpable process), but a
+  hibernating VM's memory image isn't. The channel frames that carry a secret aren't zeroed. On a rooted
+  node the model proxy's checks (models, server tools, the budget and its slice) and the reach rules are
+  advisory: it can call the upstream directly. Budget slices bound an honest node offline; only a
+  credential's own lifetime bounds a compromised one.
+- **A node works alone for as long as its grants last** (#153), and so does a node cut off on purpose.
+  Revoking a grant, a run or a node reaches a connected node within seconds; a node that hears nothing
+  keeps what it holds until it expires: the box's authority (`limits.authority`, default the run's
+  timeout, plus 30 s), each grant's TTL (at most 24 h), each secret it fetched (the run's authority, or
+  its upstream expiry if earlier). Then it stops the box. A secret first needed while it is cut off isn't
+  there: that request fails until the control host is back, and a restart of `serve` while cut off
+  empties the cache. The node certificate and node CA (24 h, renewed over the
+  channel or with `wicket node renew-ca`) and the feed key's certificate (7 days) cap how long a node can
+  work alone, and reconnect, without an operator. Model calls offline end at the earlier of the run's
+  authority and the access token's upstream expiry (a few hours, observed; not documented), and at the
+  node's budget slice.
+- **Asks raised offline wait.** Nothing new is approved while a node can't reach the control host: an
+  out-of-reach request is queued on the node and put to a human when it is back. Only egress asks are
+  queued; the gateway's `request_access`, `spawn` and the other tools that need the ledger fail while it
+  is away.
 - **Name constraints are subtrees.** A node CA for `api.example.com` can also mint `x.api.example.com`.
   The reach rules stay the exact gate; the constraint only bounds a stolen CA.
 - **Revoked node CA serials are recorded but not distributed.** Revoking a node removes its pinned key
@@ -141,8 +167,8 @@ not a permanent decision.
   list of children to stop when it ends isn't (each child is adopted as its own run), and the grants re-minted into its box's token get the use
   counts the ledger had at handover. A wrapped session can't be taken over (its launcher was the dead
   process): it ends as `lost` and its box is stopped. A node that can't be reached leaves its runs
-  running until it can, it is revoked, or they pass their timeout. By default a node keeps running a
-  box whose run lease lapses (`WICKET_NODE_LEASE_EXPIRY=stop` stops it).
+  running until it can, it is revoked, or they pass their timeout plus 3 minutes; the node stops each box
+  when its authority expires (#153).
 - **A box's output on its node's host is capped, and a burst can outrun it** (#151). The node's host
   keeps at most the zone's `limits.output` of a box's output (Docker's log, rotated). The node reads it
   from Docker as it comes, but a box writing faster than that (megabytes a second) loses what Docker
@@ -159,10 +185,9 @@ not a permanent decision.
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's
   own node), plain `http://` to a host the
-  node forwards, and tool decisions on the node: the gateway and the model proxy run on the node (#151)
-  but relay every call to the control host, which decides the tools, holds the model credential and
-  re-checks and counts each model call (its count is the authoritative one); while it is away only MCP's
-  own handshake answers, and model calls stop (#152 moves credentials). Egress events from a disconnected period reach the audit log, not the live console
+  node forwards, credential swaps (forwarded to the control host), and tool decisions on the node: the
+  gateway runs on the node (#151) but relays every call to the control host, which decides the tools;
+  while it is away only MCP's own handshake answers. Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
   [#103](https://github.com/public/wicket/pull/103)). A link to a box on a remote node passes through the
   control host, and each connection into the target box costs a `docker exec` there.
