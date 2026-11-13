@@ -50,6 +50,7 @@
 //! remains a break-glass path and is audited as such.
 
 mod acme;
+mod authority;
 mod limits;
 mod net;
 mod tls;
@@ -204,6 +205,8 @@ struct State {
     hsts: bool,
     /// Requests that reached a handler needing a session (the fuzz test watches it).
     authed: AtomicU64,
+    /// The authority root's public key, which runs' tokens load against (`authority.rs`).
+    authz_root: Option<wicket_authz::PublicKey>,
 }
 
 impl State {
@@ -236,6 +239,7 @@ impl State {
             authority,
             hsts,
             authed: AtomicU64::new(0),
+            authz_root: crate::roots::authz_root_public().ok(),
         }
     }
 }
@@ -658,7 +662,15 @@ where
                 },
                 _ => denied(),
             },
-            _ => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
+            // Read-only views of authority (#173): an operator's session only.
+            p => match (authority::get(state, p), &sess) {
+                (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
+                    Ok(v) => to_response(ok(v)),
+                    Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
+                },
+                (Some(_), _) => denied(),
+                (None, _) => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
+            },
         };
     }
     if method != Method::POST {
@@ -1456,6 +1468,7 @@ mod tests {
         }
     }
 
+    mod authority;
     mod http;
     mod https;
 

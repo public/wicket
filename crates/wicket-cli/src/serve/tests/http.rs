@@ -30,7 +30,13 @@ async fn call_from(
     (parts.status, parts.headers, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-async fn call(state: &State, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (StatusCode, HeaderMap, String) {
+pub(super) async fn call(
+    state: &State,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (StatusCode, HeaderMap, String) {
     call_from(state, PEER, method, path, headers, body).await
 }
 
@@ -64,6 +70,9 @@ const ROUTES: &[&str] = &[
     "/api/decide/finish",
     "/api/logout",
     "/api/runs",
+    "/api/policy",
+    "/api/runs/run_01authz0000000000000000000/authority",
+    "/api/explain/1",
     "/api",
     "/admin",
     "/.env",

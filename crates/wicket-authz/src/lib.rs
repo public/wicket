@@ -23,6 +23,7 @@
 
 pub mod cost;
 pub mod decide;
+pub mod describe;
 pub mod generator;
 pub mod payload;
 pub mod structure;
@@ -30,6 +31,7 @@ pub mod token;
 
 pub use cost::Estimate;
 pub use decide::{limits, load, load_with, Decision, Loaded, MEASURED_MAX_STEPS, STEP_BUDGET};
+pub use describe::{describe, BlockView};
 pub use payload::{
     isolation_level, risk_level, Action, Ceiling, Forbid, Grant, HostPat, HttpMatch, Inject, LlmBudget, OpKind, OrgLayer, PathPat,
     PublicKey, Reach, Request, SpawnLimits, SpawnMatch, MAX_REACH_RISK,
