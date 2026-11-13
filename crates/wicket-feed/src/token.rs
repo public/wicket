@@ -228,6 +228,16 @@ impl Replica<BoxAuthority> {
     /// caller queues a NeedsGrant raised offline. Closed and lagging refuse everything; a revoked run, a box with no record, a token that didn't load or
     /// was revoked, and an op for another zone are forbidden.
     pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
+        self.decide_inner(op, now, true)
+    }
+
+    /// What [`Self::decide`] would say, without recording a use of a counted grant: for asking
+    /// ahead (`request_access`, #164), which must not spend one.
+    pub fn peek(&mut self, op: &Op, now: i64) -> Decision {
+        self.decide_inner(op, now, false)
+    }
+
+    fn decide_inner(&mut self, op: &Op, now: i64, record: bool) -> Decision {
         let found = match self.gate(op, now) {
             Err(d) => Found::Done(d),
             Ok((_, st)) => match st.zones.get(&op.run.0) {
@@ -274,7 +284,7 @@ impl Replica<BoxAuthority> {
         match found {
             Found::Done(d) => d,
             Found::Grant { id, counted } => {
-                if counted {
+                if counted && record {
                     if let Err(e) = self.record_use(&id) {
                         return Decision::Refused { mode: Mode::Fresh, why: e };
                     }

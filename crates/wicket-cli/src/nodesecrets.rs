@@ -411,7 +411,7 @@ impl Slices {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
@@ -434,6 +434,9 @@ pub struct QueuedAsk {
     pub who: Option<serde_json::Value>,
     /// When it was raised (Unix ms, node clock).
     pub at: i64,
+    /// For every path under the op's directory (`request_access`'s `scope: prefix`, #164).
+    #[serde(default)]
+    pub prefix: bool,
 }
 
 /// The node's queue of asks, on its disk (`asks.json`), deduplicated by run and op.
@@ -455,14 +458,29 @@ impl Asks {
 
     /// Queues an ask (or finds the one already queued for the same run and op): its id, and
     /// whether it is new.
-    pub fn push(&self, run: &str, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>, at: i64) -> (String, bool) {
+    pub fn push(
+        &self,
+        run: &str,
+        op: &wicket_core::Op,
+        why: &str,
+        who: Option<&serde_json::Value>,
+        at: i64,
+        prefix: bool,
+    ) -> (String, bool) {
         let mut held = self.held.lock().expect("asks");
         let digest = hex::encode(op.digest());
-        if let Some(q) = held.values().find(|q| q.run == run && hex::encode(q.op.digest()) == digest) {
+        if let Some(q) = held.values().find(|q| q.run == run && q.prefix == prefix && hex::encode(q.op.digest()) == digest) {
             return (q.id.clone(), false);
         }
-        let id = format!("q-{}", &digest[..12]);
-        held.insert(id.clone(), QueuedAsk { id: id.clone(), run: run.into(), op: op.clone(), why: why.into(), who: who.cloned(), at });
+        // A prefix ask is another request than the one path's (as in the ledger).
+        let id = match prefix {
+            false => format!("q-{}", &digest[..12]),
+            true => format!("q-{}p", &digest[..11]),
+        };
+        held.insert(
+            id.clone(),
+            QueuedAsk { id: id.clone(), run: run.into(), op: op.clone(), why: why.into(), who: who.cloned(), at, prefix },
+        );
         self.save(&held);
         (id, true)
     }
@@ -470,6 +488,10 @@ impl Asks {
     /// The queued asks of `run`.
     pub fn of(&self, run: &str) -> Vec<QueuedAsk> {
         self.held.lock().expect("asks").values().filter(|q| q.run == run).cloned().collect()
+    }
+
+    pub fn get(&self, id: &str) -> Option<QueuedAsk> {
+        self.held.lock().expect("asks").get(id).cloned()
     }
 
     /// Done with an ask (the control host raised it, or the run has ended).
@@ -643,9 +665,9 @@ mod tests {
         let d = tmp("asks");
         let op = wicket_core::Op::egress(&wicket_core::TenantId::single(), &wicket_core::RunId(RA.into()), "z", "GET", "x.example", "/a");
         let a = Asks::open(&d);
-        let (id, new) = a.push(RA, &op, "out of reach", None, 5);
+        let (id, new) = a.push(RA, &op, "out of reach", None, 5, false);
         assert!(new);
-        assert_eq!(a.push(RA, &op, "out of reach", None, 9), (id.clone(), false), "deduplicated");
+        assert_eq!(a.push(RA, &op, "out of reach", None, 9, false), (id.clone(), false), "deduplicated");
         let a = Asks::open(&d);
         assert_eq!(a.of(RA).len(), 1);
         assert_eq!(a.of(RA)[0].at, 5, "keeps its original time");

@@ -59,13 +59,19 @@ use serde::{Deserialize, Serialize};
 /// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51): a `policy` fact
 ///   and checks reading it, which an older node's structural check refuses: sent only to nodes
 ///   talking [`ORG_POLICY`] or later.
-pub const PROTOCOL: u32 = 4;
+/// - 5: decisions at the edge (#164): a node answers the MCP gateway's tools itself from the box's
+///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
+///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
+///   control host talks [`EDGE_DECISIONS`] or later; with an older one it relays every tool call.
+pub const PROTOCOL: u32 = 5;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
 /// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
 pub const NODE_LEASES: u32 = 3;
 /// The first protocol version whose nodes take tokens with an org layer (#51).
 pub const ORG_POLICY: u32 = 4;
+/// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
+pub const EDGE_DECISIONS: u32 = 5;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -172,6 +178,19 @@ pub struct BoxStart {
     /// them, so the box's placeholder never reaches the host and the request fails, closed.
     #[serde(default)]
     pub swap_hosts: Vec<String>,
+    /// What the node needs to decide the box's gateway tools itself (#164). Sent only to nodes
+    /// talking [`EDGE_DECISIONS`]; without it the node relays every tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<Box<EdgeStart>>,
+}
+
+/// What a node decides a box's gateway tools from (#164), beyond its token in the feed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeStart {
+    /// Who the box is, as `whoami` shows it: its identity's stable claims (subject, agent, zone,
+    /// tenant, run, parent run, principal, the chain it acts for). The identity itself (its key and
+    /// signed token) stays on the control host.
+    pub who: serde_json::Value,
 }
 
 fn default_output_cap() -> u64 {
@@ -425,6 +444,10 @@ pub enum Msg {
         who: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queued: Option<(String, i64)>,
+        /// Every path under the op's directory, not the one path (`request_access`'s `scope:
+        /// prefix`, #164). Sent only on connections talking [`EDGE_DECISIONS`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prefix: bool,
     },
     /// A secret `run` needs now, on its first use on this node (#152): its model credential, or an
     /// injected secret. Never prefetched.
@@ -704,6 +727,7 @@ mod tests {
                 why: "out of reach".into(),
                 who: None,
                 queued: Some(("q-1".into(), 5)),
+                prefix: true,
             }),
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),

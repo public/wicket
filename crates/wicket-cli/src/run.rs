@@ -1088,6 +1088,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     .collect(),
                 false => vec![],
             },
+            // What the node decides the box's gateway tools from (#164).
+            edge: Some(Box::new(crate::chan::EdgeStart {
+                who: identity.as_ref().map_or(serde_json::Value::Null, |i| {
+                    let c = i.current().claims.clone();
+                    serde_json::json!({
+                        "id": c.sub, "agent": c.agent, "zone": c.zone, "tenant": c.tenant, "run": c.run,
+                        "parent_run": c.parent_run, "acting_for": c.chain(), "principal": c.principal,
+                    })
+                }),
+            })),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),

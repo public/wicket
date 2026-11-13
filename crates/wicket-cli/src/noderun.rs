@@ -280,6 +280,8 @@ pub struct NodeCtl {
     done: tokio::sync::Notify,
     /// How far into the box's stdout and stderr this supervisor got.
     next: [std::sync::atomic::AtomicU64; 2],
+    /// The protocol version the current connection talks (0: none yet).
+    proto: std::sync::atomic::AtomicU32,
 }
 
 impl NodeCtl {
@@ -494,6 +496,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         forgotten: AtomicBool::new(false),
         done: tokio::sync::Notify::new(),
         next: [std::sync::atomic::AtomicU64::new(s.resume_from[0]), std::sync::atomic::AtomicU64::new(s.resume_from[1])],
+        proto: std::sync::atomic::AtomicU32::new(0),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -543,7 +546,12 @@ pub async fn start(s: Start) -> Result<NodeBox> {
             let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
             ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
         }
-        if !ctl.send(Frame::Msg(Msg::Start(Box::new(s.start)))) {
+        let mut start = s.start;
+        // A node before #164 relays every gateway tool: nothing to decide them from.
+        if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
+            start.edge = None;
+        }
+        if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
             bail!("lost node {name} while starting the box");
         }
         match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
@@ -726,6 +734,7 @@ async fn session(
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, .. } => {
             p.proto = proto;
+            sh.ctl.proto.store(proto, Ordering::SeqCst);
             (feed, runs)
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
@@ -964,7 +973,9 @@ async fn on_frame(
                     let _ = sh.events.send(ev);
                 }
             }
-            Msg::Ask { id, run, op, why, who, queued } => send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref()))),
+            Msg::Ask { id, run, op, why, who, queued, prefix } => {
+                send(Frame::Msg(ask(sh, id, &run, &op, &why, who.as_ref(), queued.as_ref(), prefix)))
+            }
             Msg::SecretFetch { id, run, name } => {
                 // Only for this run, over its own connection: another run's ask is refused.
                 let reply = match run == sh.run.0 {
@@ -1067,9 +1078,21 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 /// lowered, by the node's, which saw the query), only egress asks outside wicket's own approval
 /// namespace are taken (#117), and the reason on the card is this zone's own verdict, never the
 /// node's text. The node's attribution is kept, shown as reported by the agent.
-fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_json::Value>, queued: Option<&(String, i64)>) -> Msg {
+#[allow(clippy::too_many_arguments)]
+fn ask(
+    sh: &Shared,
+    id: u64,
+    run: &str,
+    op: &Op,
+    why_node: &str,
+    who: Option<&serde_json::Value>,
+    queued: Option<&(String, i64)>,
+    prefix: bool,
+) -> Msg {
     let reply = |pending, denied, error| Msg::Asked { id, pending, denied, error };
-    let (op, mut why) = match check_node_op(&sh.tenant, &sh.run, &sh.zone, run, op) {
+    // An agent asking ahead (`request_access`, decided on its node, #164) gives its own reason.
+    let agent = why_node.strip_prefix(AGENT_ASKS).map(|r| wicket_core::text::clip(r, 300));
+    let (op, mut why) = match check_node_ask(&sh.tenant, &sh.run, &sh.zone, run, op, prefix && agent.is_some()) {
         Ok(x) => x,
         Err(e) => return reply(None, None, Some(e)),
     };
@@ -1090,7 +1113,16 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_
     if let Ok(Some(rid)) = l.denied_recently(op) {
         return reply(None, Some(rid), None);
     }
-    match l.pending_for(op, &why, who) {
+    // As this host's gateway asks for it: in the agent's words, and for a prefix, every path
+    // under the op's directory.
+    let asked = match agent {
+        Some(reason) => {
+            let old = why.split_once(" (asked ").map(|(_, q)| format!(" (asked {q}")).unwrap_or_default();
+            l.ask(op, &format!("{AGENT_ASKS}{reason}{old}"), prefix, who)
+        }
+        None => l.pending_for(op, &why, who),
+    };
+    match asked {
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
@@ -1347,10 +1379,20 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     out
 }
 
+/// How a node marks an ask the agent made itself (`request_access`), its reason following.
+pub(crate) const AGENT_ASKS: &str = "asked by the agent: ";
+
 /// The op a node asks about, as the control host classifies it, and why it needs a grant, as this
 /// zone decides it; refused if it isn't this run's, isn't egress, isn't canonical, is in wicket's
 /// own namespace, or doesn't need a grant (forbidden, or already allowed).
-pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &str, op: &Op) -> Result<(Op, String), String> {
+#[cfg(test)]
+fn check_node_op(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &str, op: &Op) -> Result<(Op, String), String> {
+    check_node_ask(tenant, own, zone_spec, run, op, false)
+}
+
+/// [`check_node_op`], and with `prefix` (an agent asking ahead for every path under a directory,
+/// #164) a path the zone already allows may be the one asked about, as on this host's gateway.
+fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &str, op: &Op, prefix: bool) -> Result<(Op, String), String> {
     let zone = zone_spec.name.as_str();
     if run != own.0 || op.run != *own || op.tenant != *tenant || op.zone != zone {
         return Err(format!("not an op of run {own}"));
@@ -1376,6 +1418,9 @@ pub(crate) fn check_node_op(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec
     match wicket_core::evaluate(zone_spec, &fresh) {
         wicket_core::Verdict::NeedsGrant(why) => Ok((fresh, why)),
         wicket_core::Verdict::Forbidden(why) => Err(format!("not requested: {why}")),
+        wicket_core::Verdict::AllowByReach(i) if prefix => {
+            Ok((fresh, format!("reach rule {i} allows this path; asked for every path under it")))
+        }
         wicket_core::Verdict::AllowByReach(_) => Err("not requested: this zone already allows it".into()),
     }
 }

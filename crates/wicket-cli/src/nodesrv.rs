@@ -49,6 +49,9 @@ use wicket_proxy::egress::{Egress, Relay, RelayStream};
 use wicket_sandbox::{Docker, Mount, SandboxSpec};
 use wicket_store::Ledger;
 
+#[path = "nodegw.rs"]
+mod gw;
+
 /// Output kept per stream (stdout, stderr) while the control host is unreachable.
 pub const OUTPUT_CAP: usize = 4 << 20;
 
@@ -221,6 +224,9 @@ struct Node {
     /// an answer (by message id).
     queue: crate::nodesecrets::Asks,
     requeued: Mutex<HashMap<u64, String>>,
+    /// Gateway tool calls queued while a run's control host was unreachable, and queued asks it has
+    /// since raised (#164).
+    edge: gw::EdgeQueue,
     /// Why this node stopped a box itself, by run (#153), for its exit.
     stopped: Mutex<HashMap<String, String>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
@@ -257,6 +263,50 @@ impl Node {
             c.boxes += 1;
         }
         c
+    }
+
+    /// What this node decides `run`'s gateway tools from (#164): None, they are all relayed (a
+    /// control host before protocol 5 started it, or one of those is connected now).
+    fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
+        let e = self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone())?;
+        match self.proto_of(run) {
+            p if (1..chan::EDGE_DECISIONS).contains(&p) => None,
+            _ => Some(*e),
+        }
+    }
+
+    /// The tenant `run`'s box runs for, and the zone its token holds.
+    fn tenant_zone(&self, run: &str) -> Option<(wicket_core::TenantId, String)> {
+        let tenant = self.boxes.lock().expect("boxes").get(run).map(|b| b.record.start.tenant.clone())?;
+        let zone = self.replica.lock().expect("replica").zone_of(run).map(|z| z.name.clone())?;
+        Some((wicket_core::TenantId(tenant), zone))
+    }
+
+    /// Asks `run`'s control host to raise (or find) the pending request for `op`; `prefix`: for
+    /// every path under its directory (an agent asking ahead, #164).
+    async fn ask_control(
+        &self,
+        run: &str,
+        op: &wicket_core::Op,
+        why: &str,
+        who: Option<&serde_json::Value>,
+        prefix: bool,
+    ) -> std::result::Result<Asked, String> {
+        let id = self.id();
+        let (tx, rx) = oneshot::channel();
+        self.asks.lock().expect("asks").insert(id, tx);
+        let ask = Msg::Ask { id, run: run.into(), op: Box::new(op.clone()), why: why.into(), who: who.cloned(), queued: None, prefix };
+        let reply = match self.send_run(run, Frame::Msg(ask)) {
+            true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
+            false => None,
+        };
+        self.asks.lock().expect("asks").remove(&id);
+        match reply {
+            Some(Msg::Asked { pending: Some((request, fresh)), .. }) => Ok(Asked::Pending { request, fresh }),
+            Some(Msg::Asked { denied: Some(request), .. }) => Ok(Asked::Denied { request }),
+            Some(Msg::Asked { error: Some(e), .. }) => Err(e),
+            _ => Err(NO_ANSWER.into()),
+        }
     }
 
     /// The protocol version of the connection that owns `run`'s box (0: none up).
@@ -410,39 +460,13 @@ impl ControlLink for Control {
         why: &'a str,
         who: Option<&'a serde_json::Value>,
     ) -> futures_util::future::BoxFuture<'a, std::result::Result<Asked, String>> {
-        Box::pin(async move {
-            let id = self.0.id();
-            let (tx, rx) = oneshot::channel();
-            self.0.asks.lock().expect("asks").insert(id, tx);
-            let sent = self.0.send_run(
-                &self.1,
-                Frame::Msg(Msg::Ask {
-                    id,
-                    run: self.1.clone(),
-                    op: Box::new(op.clone()),
-                    why: why.into(),
-                    who: who.cloned(),
-                    queued: None,
-                }),
-            );
-            let reply = match sent {
-                true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
-                false => None,
-            };
-            self.0.asks.lock().expect("asks").remove(&id);
-            match reply {
-                Some(Msg::Asked { pending: Some((request, fresh)), .. }) => Ok(Asked::Pending { request, fresh }),
-                Some(Msg::Asked { denied: Some(request), .. }) => Ok(Asked::Denied { request }),
-                Some(Msg::Asked { error: Some(e), .. }) => Err(e),
-                _ => Err("the control host did not answer".into()),
-            }
-        })
+        Box::pin(self.0.ask_control(&self.1, op, why, who, false))
     }
 
     /// Queued on this node's disk (#153) and raised, with its original time, when the run's
     /// control connection is back.
     fn queue(&self, op: &wicket_core::Op, why: &str, who: Option<&serde_json::Value>) -> std::result::Result<String, String> {
-        let (id, new) = self.0.queue.push(&self.1, op, why, who, (self.0.clock)());
+        let (id, new) = self.0.queue.push(&self.1, op, why, who, (self.0.clock)(), false);
         if new {
             self.0.audit_note(
                 &self.1,
@@ -573,6 +597,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         secrets,
         slices,
         queue: crate::nodesecrets::Asks::open(&node_root),
+        edge: gw::EdgeQueue::open(&node_root),
         requeued: Mutex::new(HashMap::new()),
         stopped: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
@@ -994,9 +1019,19 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     node.requeued.lock().expect("requeued").insert(id, q.id.clone());
                     node.send_to(
                         gen,
-                        Frame::Msg(Msg::Ask { id, run: q.run, op: Box::new(q.op), why: q.why, who: q.who, queued: Some((q.id, q.at)) }),
+                        Frame::Msg(Msg::Ask {
+                            id,
+                            run: q.run,
+                            op: Box::new(q.op),
+                            why: q.why,
+                            who: q.who,
+                            queued: Some((q.id, q.at)),
+                            prefix: q.prefix,
+                        }),
                     );
                 }
+                // Tool calls that needed a human while it was away (#164): made now.
+                gw::replay(&node, &run);
                 if let Some((code, result)) = exited {
                     let reason = node.stopped.lock().expect("stopped").get(&run).cloned();
                     node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result, reason }));
@@ -1062,6 +1097,14 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 // A queued ask the control host has now taken (raised, found denied, or refused):
                 // off the queue. It is idempotent there, so a resend after a flap is harmless.
                 if let Some(q) = node.requeued.lock().expect("requeued").remove(id) {
+                    // Its request, for `await_grant` on the node-local id (#164).
+                    let request = match &m {
+                        Msg::Asked { pending: Some((r, _)), .. } | Msg::Asked { denied: Some(r), .. } => Some(r.clone()),
+                        _ => None,
+                    };
+                    if let (Some(r), Some(qa)) = (request, node.queue.get(&q)) {
+                        node.edge.raised(&q, &qa.run, &r);
+                    }
                     node.queue.remove(&q);
                 }
                 if let Some(tx) = node.asks.lock().expect("asks").remove(id) {
@@ -1247,9 +1290,10 @@ fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u64, run: &st
 
 type GwBody = http_body_util::Full<bytes::Bytes>;
 
-/// One MCP gateway call from a box: relayed to the run's gateway on the control host, whole (the
-/// answers are small), so a call cut short by the control host going away gets a clear, retryable
-/// tool error instead of a broken response.
+/// One MCP gateway call from a box. A tool this node decides (#164) is answered here from the
+/// box's token, connected or not ([`gw`]); every other call is relayed to the run's gateway on the
+/// control host, whole (the answers are small), so a call cut short by the control host going
+/// away gets a clear, retryable tool error instead of a broken response.
 async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<GwBody> {
     use http_body_util::BodyExt;
     let (parts, body) = req.into_parts();
@@ -1263,28 +1307,55 @@ async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::bo
         }
     };
     let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let relayed = async {
-        let io = node.open_tunnel(run, "gateway").await?;
-        let (mut send, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.map_err(std::io::Error::other)?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        let mut rb = hyper::Request::builder().method(parts.method.clone()).uri(parts.uri.clone());
-        for (k, v) in parts.headers.iter() {
-            rb = rb.header(k, v);
+    if rpc.get("method").and_then(|m| m.as_str()) == Some("tools/call") && rpc.get("id").is_some() && node.edge_start(run).is_some() {
+        let name = rpc["params"]["name"].as_str().unwrap_or("").to_string();
+        let args = rpc["params"].get("arguments").cloned().unwrap_or(serde_json::json!({}));
+        if let Some((text, is_error)) = gw::tool(node, run, &name, &args).await {
+            gw::record(node, run, &name, &text);
+            return gw_reply(
+                200,
+                serde_json::json!({ "jsonrpc": "2.0", "id": rpc["id"], "result": {
+                    "content": [{ "type": "text", "text": text }], "isError": is_error,
+                } }),
+            );
         }
-        let resp =
-            send.send_request(rb.body(GwBody::new(body.clone())).map_err(std::io::Error::other)?).await.map_err(std::io::Error::other)?;
-        let (rp, rb) = resp.into_parts();
-        let bytes = rb.collect().await.map_err(std::io::Error::other)?.to_bytes();
-        Ok::<_, std::io::Error>(hyper::Response::from_parts(rp, GwBody::new(bytes)))
     }
-    .await;
-    match relayed {
+    match relay_rpc(node, run, Some(&parts), body).await {
         Ok(r) => r,
         Err(e) => gateway_offline(&rpc, &e.to_string()),
     }
+}
+
+/// Relays one JSON-RPC request to the run's gateway on the control host, and reads its answer.
+async fn relay_rpc(
+    node: &Arc<Node>,
+    run: &str,
+    parts: Option<&http::request::Parts>,
+    body: bytes::Bytes,
+) -> std::io::Result<hyper::Response<GwBody>> {
+    use http_body_util::BodyExt;
+    let io = node.open_tunnel(run, "gateway").await?;
+    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.map_err(std::io::Error::other)?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut rb = match parts {
+        Some(p) => {
+            let mut rb = hyper::Request::builder().method(p.method.clone()).uri(p.uri.clone());
+            for (k, v) in p.headers.iter() {
+                rb = rb.header(k, v);
+            }
+            rb
+        }
+        None => hyper::Request::builder().method("POST").uri("/mcp").header("content-type", "application/json"),
+    };
+    if parts.is_none() {
+        rb = rb.header("accept", "application/json");
+    }
+    let resp = send.send_request(rb.body(GwBody::new(body)).map_err(std::io::Error::other)?).await.map_err(std::io::Error::other)?;
+    let (rp, rb) = resp.into_parts();
+    let bytes = rb.collect().await.map_err(std::io::Error::other)?.to_bytes();
+    Ok(hyper::Response::from_parts(rp, GwBody::new(bytes)))
 }
 
 /// What the gateway answers while the control host can't be reached: MCP's own handshake, and a
@@ -1959,6 +2030,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.secrets.release(run);
     n.slices.drop_run(run);
     n.queue.drop_run(run);
+    n.edge.drop_run(run);
     n.llms.lock().expect("llms").remove(run);
     eprintln!("[node] {run}: box exited ({code})");
     let reason = n.stopped.lock().expect("stopped").get(run).cloned();
@@ -2147,6 +2219,8 @@ async fn serve_box(
 
 /// How a fetch for a version-1 control host fails: the model proxy relays on it.
 pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
+/// An ask the control host didn't answer (cut off mid-ask).
+const NO_ANSWER: &str = "the control host did not answer";
 
 /// A box's model spend as its node counted it (#152), beside its record.
 const SPEND_FILE: &str = "node-spend.json";
@@ -2253,6 +2327,7 @@ mod tests {
             secrets: crate::nodesecrets::Cache::new(node_clock()),
             slices: crate::nodesecrets::Slices::new(&i.dir).unwrap(),
             queue: crate::nodesecrets::Asks::open(&i.dir),
+            edge: gw::EdgeQueue::open(&i.dir),
             requeued: Mutex::new(HashMap::new()),
             stopped: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
@@ -2328,6 +2403,7 @@ mod tests {
                 output_cap: 64 << 20,
                 output_stop: false,
                 swap_hosts: vec![],
+                edge: None,
             },
             name: format!("wicket-{run}"),
             started_ms: 0,
@@ -2724,5 +2800,158 @@ mod tests {
         assert_eq!(next_msg(&mut a).await, Frame::Data { stream: 2, offset: 6, bytes: b"still a\n".to_vec() });
         // Until it resumes, run_b's output waits on the node.
         assert!(!out("run_b", b"later\n"));
+    }
+
+    /// A box on this node whose token the replica holds: `zone` (YAML), minted for `run` until an
+    /// hour from now, with the node's #164 edge start.
+    fn fed_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
+        use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig};
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
+        let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
+        let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 100, retain: 100 };
+        let mut p =
+            Publisher::open_with(&inst.dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
+        let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
+        let now = (node.clock)();
+        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+        let not_after = u64::try_from(now / 1000 + 3600).unwrap();
+        let issuer = Issuer::root(&authz_root, "t0", &format!("run:{run}"), run, 0, &z, &[], not_after, vec![approver.public()]).unwrap();
+        p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], now).unwrap();
+        for f in p.catch_up(&r.hello(), now).unwrap() {
+            r.accept(&f, now).unwrap();
+        }
+        *node.replica.lock().unwrap() = r;
+        let mut rec = fake_record(run);
+        rec.start.zone = z.name.clone();
+        rec.start.edge = Some(Box::new(chan::EdgeStart {
+            who: serde_json::json!({ "id": format!("spiffe://wicket.test/t0/{run}"), "run": run, "zone": z.name }),
+        }));
+        let st = BoxState {
+            streams: [1, 2, 3],
+            name: format!("wicket-{run}"),
+            dir: inst.dir.join("runs").join(run),
+            stdin: None,
+            stdin_next: 0,
+            out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+            exited: None,
+            tasks: vec![],
+            user: String::new(),
+            cpus: 0.0,
+            memory_mib: 0,
+            listeners: HashMap::new(),
+            owner: None,
+            record: rec,
+        };
+        node.boxes.lock().unwrap().insert(run.into(), st);
+    }
+
+    /// Plays the run's gateway on the control host for one tunnelled tool call: answers the
+    /// tunnel's open, reads the HTTP request off its data frames, and answers `text`. Returns the
+    /// tool call's name and arguments.
+    async fn answer_tool(c: &mut UnixStream, stream: u64, text: &str) -> (String, serde_json::Value) {
+        c.write_all(&Frame::Msg(Msg::TunnelOpened { stream, error: None }).encode()).await.unwrap();
+        let mut req = vec![];
+        let call = loop {
+            match next_msg(c).await {
+                Frame::Data { stream: s, bytes, .. } if s == stream => req.extend_from_slice(&bytes),
+                _ => continue,
+            }
+            let text = String::from_utf8_lossy(&req).to_string();
+            if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                    break v;
+                }
+            }
+        };
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": call["id"], "result": { "content": [{ "type": "text", "text": text }], "isError": false } })
+            .to_string();
+        let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+        c.write_all(&Frame::Data { stream, offset: 0, bytes: resp.into_bytes() }.encode()).await.unwrap();
+        (call["params"]["name"].as_str().unwrap_or("").to_string(), call["params"]["arguments"].clone())
+    }
+
+    /// #164: with its control host unreachable, the node decides the box's gateway tools from its
+    /// token: who it is, what it may already do and what it never may, and queues what needs a
+    /// human (an ask, a prefix ask, a capacity request) under node-local ids, spending no grant.
+    /// When the control host is back, the queued asks are raised and the queued call made, and
+    /// await_grant on a node-local id follows the request it became.
+    #[tokio::test]
+    async fn the_node_decides_gateway_tools_and_queues_what_needs_a_human() {
+        const RUN: &str = "run_eeeeeeeeeeeeeeeeeeeeeeeeee";
+        let inst = Install::new("nodesrv-edge");
+        let node = test_node(&inst);
+        fed_box(
+            &node,
+            &inst,
+            RUN,
+            "name: z\nreach: [{ host: api.example, methods: [GET], paths: ['/ok/**'] }]\nforbid: [{ host: api.example, paths: ['/secret/**'] }]\n",
+        );
+        let call = |name: &str, args: serde_json::Value| {
+            let (node, name) = (node.clone(), name.to_string());
+            async move { gw::tool(&node, RUN, &name, &args).await.expect("decided on the node") }
+        };
+        let (who, err) = call("whoami", serde_json::json!({})).await;
+        assert!(!err && who.contains(&format!("spiffe://wicket.test/t0/{RUN}")) && who.contains("node n1"), "{who}");
+        let access = |path: &str, scope: &str| serde_json::json!({ "url": format!("https://api.example{path}"), "reason": "to read the docs", "scope": scope });
+        let (t, _) = call("request_access", access("/ok/a", "exact")).await;
+        assert!(t.contains("already allowed"), "{t}");
+        let (t, _) = call("request_access", access("/secret/x", "exact")).await;
+        assert!(t.starts_with("not requested") && t.contains("never be allowed"), "{t}");
+        let (t, _) = call("request_access", access("/other/a", "exact")).await;
+        let exact = t.split_whitespace().nth(1).unwrap().trim_end_matches(':').to_string();
+        assert!(t.starts_with("queued: q-"), "{t}");
+        let (t, _) = call("request_access", access("/ok/a", "prefix")).await;
+        let prefix = t.split_whitespace().nth(1).unwrap().trim_end_matches(':').to_string();
+        assert!(t.starts_with("queued: q-") && prefix != exact, "a prefix ask is its own request: {t}");
+        assert!(node.queue.get(&prefix).unwrap().prefix);
+        let (t, _) = call("request_capacity", serde_json::json!({ "vcpus": 2 })).await;
+        let cap = t.split(" as ").nth(1).unwrap().split(' ').next().unwrap().trim_end_matches(';').to_string();
+        assert!(cap.starts_with("q-"), "{t}");
+        let (t, _) = call("await_grant", serde_json::json!({ "request_id": exact, "timeout_seconds": 5 })).await;
+        assert!(t.starts_with("pending:") && t.contains("unreachable"), "{t}");
+        let (t, _) = call("pending_requests", serde_json::json!({})).await;
+        assert!(t.contains(&exact) && t.contains(&prefix) && t.contains(&cap), "{t}");
+        // Back: the asks are raised (the prefix one as such, in the agent's words), and the call made.
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        let (mut asks, mut made) = (vec![], None);
+        while asks.len() < 2 || made.is_none() {
+            match next_msg(&mut c).await {
+                Frame::Msg(Msg::Ask { id, queued: Some((q, _)), prefix: p, why, .. }) => {
+                    assert!(why.starts_with(crate::noderun::AGENT_ASKS), "{why}");
+                    assert_eq!(p, q == prefix);
+                    let rid = format!("r-{}", asks.len() + 1);
+                    c.write_all(&Frame::Msg(Msg::Asked { id, pending: Some((rid.clone(), true)), denied: None, error: None }).encode())
+                        .await
+                        .unwrap();
+                    asks.push((q, rid));
+                }
+                Frame::Msg(Msg::TunnelOpen { stream, target, .. }) if target == "gateway" => {
+                    made = Some(answer_tool(&mut c, stream, "requested: r-cap for 2 vcpus").await);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(made.unwrap().0, "request_capacity");
+        let rid = asks.iter().find(|(q, _)| *q == exact).unwrap().1.clone();
+        // await_grant on the node-local id follows the request it became, read on the control host.
+        let waiting = tokio::spawn(call("await_grant", serde_json::json!({ "request_id": exact, "timeout_seconds": 5 })));
+        let (name, args) = loop {
+            if let Frame::Msg(Msg::TunnelOpen { stream, .. }) = next_msg(&mut c).await {
+                break answer_tool(&mut c, stream, "granted: it was approved").await;
+            }
+        };
+        assert_eq!((name.as_str(), args["request_id"].as_str()), ("await_grant", Some(rid.as_str())));
+        let (t, _) = waiting.await.unwrap();
+        assert!(t.contains(&format!("{exact} became {rid}")) && t.contains("granted"), "{t}");
+        let (t, _) = call("await_grant", serde_json::json!({ "request_id": cap, "timeout_seconds": 5 })).await;
+        assert!(t.contains("r-cap"), "{t}");
+        assert!(node.queue.of(RUN).is_empty());
+        // Tools the node doesn't decide are the control host's.
+        assert!(gw::tool(&node, RUN, "send_message", &serde_json::json!({})).await.is_none());
     }
 }
