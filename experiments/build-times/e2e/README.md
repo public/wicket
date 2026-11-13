@@ -42,3 +42,16 @@ Two checks fail on main, independently of these changes:
 | script | before | after | change |
 |---|---|---|---|
 | `update.sh` | 926 s | 476 s | builds are copies of the binary with its debug info stripped (`objcopy --strip-debug`: 115 MB instead of 500 MB), so packaging, hashing and sending them is 3–4× faster |
+| `node-e2e.sh --local` | 334 s | 131 s | #235: a 30 s cut and a 100 s authority by default (the nightly run keeps 165 s and 300 s: 356 s, all checks ok); fixed sleeps replaced by waits on the box's own probe lines |
+| `acceptance.sh --nodes local` | 943 s | about 740 s (expected) | #235; runs `node-e2e.sh` inside its multi-host flow, so it saves the same ~200 s |
+
+Evaluated and left as they are:
+
+- `restore.sh`'s fixed sleeps (12 s). Two of them separate the point-in-time restore's timestamps,
+  which have one-second resolution, and the rest let the stream catch up. Readiness checks there
+  would save under 8 s, and add a way to flake.
+- The 1 s polls in `hibernate.sh` and `acceptance.sh`. They wait on real work (runs, wakes, a lead's
+  steps), so a shorter interval would save little.
+- The offline flow in `acceptance.sh --nodes local` (fixed waits of 80, 75 and 20 s within a 5 min
+  authority). Its checks are timed against a 165 s cut, and two of them fail on main. Left until
+  that is understood.
