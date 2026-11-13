@@ -32,6 +32,8 @@ jobs:
           persist-credentials: false
       - name: wicket's own checks (tokens, home paths, public IPs)
         run: ci/check-public.py
+      - name: relative links in Markdown files
+        run: ci/check-doc-links.sh
       - name: gitleaks, every commit
         run: |
           f=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
