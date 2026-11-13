@@ -555,3 +555,23 @@ fn a_node_derives_a_child_only_from_its_parents_own_base_token() {
     assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app"), T0)), "allow");
     assert_eq!(kind(&r.decide(&gh("zc", "c", "POST", "/repos/acme/app/hooks"), T0)), "needs-grant", "the parent's grant isn't the child's");
 }
+
+/// #192: a zone's pinned images are in block 0 as written (within the node's structural caps, many
+/// of them), and a node decides a spawn by the entry that allows it, read-only.
+#[test]
+fn pinned_images_are_decided_by_the_token_on_the_node() {
+    let mut cp = Cp::new();
+    let pins: Vec<String> = (0..32).map(|i| format!("tool{i}@sha256:{}", format!("{i:02x}").repeat(32))).collect();
+    let mut z = zone("zp", &["/repos/acme/**"]);
+    z.images = pins.clone();
+    let parent = cp.issue("p", &z);
+    cp.put(parent.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    let peek = |image: &str| r.peek_spawn("p", TENANT, image, 2, 128 << 20, 500, 64, 300, T0);
+    assert!(peek(&pins[7]).is_ok(), "{:?}", peek(&pins[7]));
+    assert!(peek(&pins[31]).is_ok());
+    assert!(peek(&format!("tool7@sha256:{}", "ff".repeat(32))).is_err(), "another digest");
+    assert!(peek("tool7:latest").is_err(), "a tag isn't the pinned entry");
+    assert!(r.peek_spawn("nobody", TENANT, &pins[0], 2, 1, 1, 1, 1, T0).is_err());
+}
