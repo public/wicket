@@ -276,7 +276,7 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         "child"
     } else if my_path.rsplit_once('/').is_some_and(|(p, _)| p == to_path) {
         "parent"
-    } else if to_zone.accept_from.iter().any(|z| *z == my_zone) {
+    } else if to_zone.accept_from.contains(&my_zone) {
         "peer"
     } else {
         return (

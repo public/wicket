@@ -1042,7 +1042,7 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     );
                 }
                 // Tool calls that needed a human while it was away (#164): made now.
-                gw::replay(&node, &run);
+                gw::replay(node, &run);
                 if let Some((code, result)) = exited {
                     let reason = node.stopped.lock().expect("stopped").get(&run).cloned();
                     node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result, reason }));

@@ -264,7 +264,7 @@ offline_flow() {
   check "  and the miss while cut off is in the node's audit, shipped on reconnect" 'w audit --tail 3000 | grep node.secret_unavailable | grep -q "$r"'
   wait_for 20 '! grep -q "q-" "$nd/asks.json" 2>/dev/null' || true
   check "  and the queued ask was delivered to the control host" '! grep -q "q-" "$nd/asks.json" && w pending | grep -q "example.com/out-of-reach"'
-  check "  and so was request_access's, in the agent's words" 'w pending | grep "example.com/ahead" | grep -q "asked by the agent"'
+  check "  and so was request_access's, in the agent's words" 'w pending | grep -A1 "example.com/ahead" | grep -q "asked by the agent"'
   check "  the child kept running through the serve restart (its derived authority kept on the node)" '[ -n "$kid" ] && [ -n "$(box_of "$kid")" ]'
   wait_for 60 'w audit --tail 3000 | grep spawn.adopted | grep -q "${kid:-none}"' || true
   check "  reconnected, the control host checks the child again and takes it over" \
