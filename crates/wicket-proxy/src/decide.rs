@@ -75,9 +75,9 @@ impl Decider for Central {
     }
 
     /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
-    /// Not under an org policy (#51): its rules can depend on any path.
+    /// Under an org policy (#51), only a host it allows wholesale (its rules can depend on any path).
     fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
-        if ctx.org.is_some() {
+        if ctx.org.as_ref().is_some_and(|o| !o.allows_host_wholesale(host)) {
             return None;
         }
         match wicket_core::splice::inspection(ctx.zone.spec(), host) {
@@ -328,7 +328,7 @@ mod tests {
         );
         // The host the zone injects into, forwarded to the control host: refused, not a grant away.
         assert!(matches!(central(&c, &op("GET", "secret.example.com", "/"), None), Outcome::Forbidden(w) if w.contains("org policy")));
-        assert_eq!(Central.splice(&c, "api.example.com"), None, "no splicing under an org policy");
+        assert_eq!(Central.splice(&c, "api.example.com"), None, "not a host the org layer allows wholesale");
     }
 
     #[test]

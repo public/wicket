@@ -14,8 +14,9 @@ A request is allowed when:
 - **no forbid** in either matches it.
 
 **Where it's enforced.** The org layer is enforced at every point that decides:
-- **On a node**, the box's token decides egress. Under an org policy a node doesn't splice a host
-  through: a rule can depend on any path, and a probe can't vouch for the whole host.
+- **On a node**, the box's token decides egress. Under an org policy a node splices a host through
+  (without inspecting it, #144) only if the org layer allows that host wholesale: no forbid can match
+  it, and no permit conditions it on a method, path or risk. Its probes can't vouch for a path rule.
 - **On the control host**, the same compiled layer is checked by:
   - the egress proxy, for hosts the node forwards (credentialed ones) and local boxes;
   - injections, before a credential goes in;

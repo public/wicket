@@ -179,3 +179,27 @@ fn the_org_layer_is_compiled_and_agrees_with_the_generic_engine() {
         }
     }
 }
+
+/// What a node may splice under an org layer: a host no forbid can match, and (HTTP constrained)
+/// that a permit names with nothing else.
+#[test]
+fn a_host_is_allowed_wholesale_only_without_any_condition_on_it() {
+    let forbid_a =
+        HttpMatch { hosts: vec![HostPat::Exact("a.test".into())], paths: vec![PathPat::Glob("/x/**".into())], ..Default::default() };
+    let o = org(None, vec![forbid_a.clone()]);
+    assert!(o.allows_host_wholesale("b.test"));
+    assert!(!o.allows_host_wholesale("a.test"));
+    // A forbid on no host matches every host.
+    let o = org(None, vec![HttpMatch { min_risk: Some(4), ..Default::default() }]);
+    assert!(!o.allows_host_wholesale("b.test"));
+    // HTTP constrained: a permit naming the host alone, or a suffix covering it.
+    let o = org(Some(vec![host("b.test"), HttpMatch { methods: Some(vec!["GET".into()]), ..host("c.test") }]), vec![]);
+    assert!(o.allows_host_wholesale("b.test"));
+    assert!(!o.allows_host_wholesale("c.test"), "GET only");
+    assert!(!o.allows_host_wholesale("d.test"), "not permitted");
+    let o = org(
+        Some(vec![HttpMatch { hosts: vec![HostPat::Suffix(".test".into())], not_hosts: vec!["e.test".into()], ..Default::default() }]),
+        vec![],
+    );
+    assert!(o.allows_host_wholesale("b.test") && !o.allows_host_wholesale("e.test"));
+}

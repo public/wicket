@@ -440,12 +440,16 @@ fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync
     let mut issuer =
         Issuer::root(&authz_root, &tenant, "run:run_splice", "run_splice", 0, zone, &[], 3_600, vec![approver.public()]).unwrap();
     if box_run == "run_org" {
-        // A top-level box under an org policy (#51) that forbids one path on every host.
+        // A top-level box under an org policy (#51) that forbids one path on private.test.
         let mut c = wicket_authz::Ceiling::from_zone(zone, "run_org", 3_600, vec![approver.public()]).unwrap();
         c.org = Some(wicket_authz::OrgLayer {
             version: "v1".into(),
             http: None,
-            forbid: vec![wicket_authz::HttpMatch { paths: vec![wicket_authz::PathPat::Glob("/admin/**".into())], ..Default::default() }],
+            forbid: vec![wicket_authz::HttpMatch {
+                hosts: vec![wicket_authz::HostPat::Exact("private.test".into())],
+                paths: vec![wicket_authz::PathPat::Glob("/x/**".into())],
+                ..Default::default()
+            }],
             spawn: None,
             msg_from: None,
             inject: None,
@@ -558,13 +562,19 @@ async fn a_node_splices_only_top_level_boxes_and_only_wholesale_hosts() {
         assert_eq!(r.splice(&TenantId::single(), "run_other", "open.test", 1_000_000), None, "no authority for the box");
         assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_001_000), None, "narrow");
     }
-    // Under an org policy (#51) a rule can depend on any path: the probes can't vouch for a host.
+    // Under an org policy (#51), a host it allows wholesale splices; one it has any rule on doesn't.
     let (d, _, org_dir) = node_feed(&zone(), "run_org");
     {
         let r = d.replica.lock().unwrap();
-        assert_eq!(r.splice(&TenantId::single(), "run_org", "open.test", 1_000_000), None, "an org layer");
+        assert_eq!(r.splice(&TenantId::single(), "run_org", "open.test", 1_000_000), Some(0), "the org layer allows it wholesale");
+        assert_eq!(r.splice(&TenantId::single(), "run_org", "private.test", 1_000_000), None, "an org forbid on one of its paths");
     }
-    for d in [child_dir, top_dir, org_dir] {
+    let (d, _, base_dir) = node_feed(&zone(), "run_splice");
+    {
+        let r = d.replica.lock().unwrap();
+        assert!(r.splice(&TenantId::single(), "run_splice", "private.test", 1_000_000).is_some(), "without the org layer it would");
+    }
+    for d in [child_dir, top_dir, org_dir, base_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

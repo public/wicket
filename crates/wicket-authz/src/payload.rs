@@ -214,6 +214,23 @@ impl OrgLayer {
         self.msg_from.as_ref().is_none_or(|z| z.iter().any(|x| x == zone))
     }
 
+    /// Whether it allows every request to `host` whatever its method, path and risk: no forbid can
+    /// match the host, and (if HTTP is constrained) some permit names the host with nothing else.
+    /// Only then may a node splice the host through without inspecting it (#141, #51).
+    pub fn allows_host_wholesale(&self, host: &str) -> bool {
+        let names = |m: &HttpMatch| {
+            m.hosts.iter().all(|h| match h {
+                HostPat::Exact(x) => host == x,
+                HostPat::Suffix(x) => host.ends_with(x.as_str()),
+            }) && !m.not_hosts.iter().any(|x| host == x)
+        };
+        let no_forbid = !self.forbid.iter().any(names);
+        let permitted = self.http.as_ref().is_none_or(|alts| {
+            alts.iter().any(|a| names(a) && a.methods.is_none() && a.paths.is_empty() && a.max_risk.is_none() && a.min_risk.is_none())
+        });
+        no_forbid && permitted
+    }
+
     /// Whether it allows an injection (`host|header|secret`).
     pub fn allows_inject(&self, key: &str) -> bool {
         self.inject.as_ref().is_none_or(|k| k.iter().any(|x| x == key))
