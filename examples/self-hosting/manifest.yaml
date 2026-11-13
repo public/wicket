@@ -3,6 +3,9 @@
 task: Describe the repository in /workspace briefly.
 agent:
   name: maintainer
+  # The project's own toolchain image (Rust and a C compiler; see README.md), so `wicket run` and the
+  # console start the same box without --image. It must be listed in zone.images below.
+  image: wicket-self:dev
   max_turns: 150
   # Keep the session open between turns for follow-ups (wicket say <run> "...").
   idle_timeout: 30m
@@ -31,6 +34,8 @@ zone:
     # A fine-grained token for this repository only, if the operator has stored one; anonymous otherwise.
     - { host: github.com, header: Authorization, format: "Basic {basic:x-access-token}", secret: github-wicket, optional: true }
     - { host: api.github.com, header: Authorization, format: "Bearer {secret}", secret: github-wicket, optional: true }
+  # The images boxes in this zone may start from: here, the agent's own (agent.image).
+  images: [wicket-self:dev]
   volumes:
     - { name: cargo, path: /volumes/cargo }
     - { name: target, path: /volumes/target }

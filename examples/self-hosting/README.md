@@ -5,6 +5,8 @@ source, inside a wicket sandbox. Nothing here is part of wicket; any project wou
 image and manifest the same way.
 
 What the manifest gives the agent:
+- **Its own image** (`agent.image: wicket-self:dev`, listed in `zone.images`), with Rust and a C
+  compiler, so a run started from the console gets it too. `wicket run --image` still overrides it.
 - **The checkout, mounted in place** (`--workspace-dir`), so commits land in a real clone on the host.
 - **Two volumes** that persist between runs: cargo's registry cache and the build directory.
 - **Reads** of crates.io, this repository over git, and its issues and pull requests on GitHub.
@@ -31,7 +33,7 @@ wicket secret set github-wicket --hosts github.com,api.github.com
 Each session:
 
 ```sh
-wicket run examples/self-hosting/manifest.yaml --image wicket-self:dev \
+wicket run examples/self-hosting/manifest.yaml \
   --workspace-dir ../wicket-self --task "Fix …, run the tests, and commit on a new branch."
 wicket say <run> "Also …"          # follow-ups while it runs; it stays open 30 minutes after each turn
 ```

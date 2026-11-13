@@ -42,7 +42,7 @@ fn example(path: &str) -> ZoneSpec {
 }
 
 pub fn parents() -> Vec<Parent> {
-    vec![
+    let mut v = vec![
         Parent {
             key: "self-hosting",
             zone: example("self-hosting/manifest.yaml"),
@@ -99,7 +99,13 @@ pub fn parents() -> Vec<Parent> {
             time_remaining: Duration::from_secs(1800),
             child_slots: 3,
         },
-    ]
+    ];
+    // A box may start its own image and its zone's `images`, as `spawn` bounds it.
+    for p in &mut v {
+        let extra: Vec<String> = p.zone.images.iter().filter(|i| !p.images.contains(i)).cloned().collect();
+        p.images.extend(extra);
+    }
+    v
 }
 
 const SH_LLM: &str = "  llm: { secret: claude-oauth, max_requests: 50, max_output_tokens: 100000 }\n";

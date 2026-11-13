@@ -344,7 +344,9 @@ impl Daemon {
                 if let Some(t) = task {
                     argv.extend(["--task".into(), t.clone()]);
                 }
-                argv.extend(["--image".into(), image.clone()]);
+                if let Some(i) = image {
+                    argv.extend(["--image".into(), i.clone()]);
+                }
                 if let Some(n) = node {
                     argv.extend(["--node".into(), n.clone()]);
                 }
@@ -353,8 +355,11 @@ impl Daemon {
             Cmd::Wrap { image, argv: agent, .. } => {
                 let (st, mp) = stage_for(false)?;
                 let cwd = dir.context("a wrapped agent works in its launcher's directory, which must be passed open")?;
-                let mut argv =
-                    vec!["wrap".to_string(), "--manifest".into(), mp.display().to_string(), "--image".into(), image.clone(), "--".into()];
+                let mut argv = vec!["wrap".to_string(), "--manifest".into(), mp.display().to_string()];
+                if let Some(i) = image {
+                    argv.extend(["--image".into(), i.clone()]);
+                }
+                argv.push("--".into());
                 argv.extend(agent.iter().cloned());
                 Plan { argv, cwd, stage: Some(st), caller }
             }
