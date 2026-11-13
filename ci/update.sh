@@ -5,7 +5,7 @@
 #
 #   ci/update.sh
 #
-# Build A is this checkout's binary (WICKET, default target/debug/wicket); B and C are A with bytes
+# Build A is this checkout's binary (WICKET, default target/debug/wicket), its debug info stripped; B and C are A with bytes
 # appended (another sha256, the same code), so no second build is needed. Agents are driven by
 # `wicket dev mock-llm`: no model credential is used. The nodes are this machine (`wicket node
 # serve` run directly, each with its own HOME; the ssh hop replaced by WICKET_NODE_SSH, as
@@ -34,7 +34,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-A=$(realpath "${WICKET:-target/debug/wicket}")
+bin=$(realpath "${WICKET:-target/debug/wicket}")
 DOCKER=${WICKET_DOCKER:-docker}
 export WICKET_DOCKER=$DOCKER
 # Short: runs' unix sockets live under it.
@@ -43,6 +43,11 @@ chmod 755 "$work"
 export WICKET_HOME=$work/h WICKET_BOX_PREFIX=upd
 HOMEW=$work/u
 mkdir -p "$WICKET_HOME" "$HOMEW"
+# Build A: the binary under test without its debug info (#219). Every build here is a copy of it, and
+# each is copied, hashed, packaged with gzip -9 and sent to two nodes: a debug build is ~500 MB, about
+# 115 MB stripped, and packaging it takes a third of the time. What runs is the same code.
+A=$work/wicket-a
+objcopy --strip-debug "$bin" "$A" 2>/dev/null || cp "$bin" "$A"
 # The control host's binary: A until the first update, then whatever `current` is.
 W=$A
 w() { HOME=$HOMEW "$W" "$@"; }
