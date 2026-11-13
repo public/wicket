@@ -12,7 +12,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `/etc/docker/daemon.json` | Docker | gVisor registered as `runsc` with `--host-uds=open`. | [install](../how-to/install-on-a-host.md) |
 | `<data dir>/audit-sinks.yaml` (or `$WICKET_AUDIT_SINKS`) | `wicket run`, `wicket serve`, `wicket audit export` | Where audit records are exported, and how often checkpoints are signed. | [audit](audit.md#the-sinks-file) |
 | `<data dir>/state-store.yaml` | `wicket state …`, hibernation, `type: store` sinks | The S3-compatible state store, where bundles go, the ledger's stream. | [state off the host](../how-to/state-off-host-and-restore.md) |
-| `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile` | The placement backend (static hosts or Vultr) and the money envelope for leases. Without it `request_capacity` is off. | [place nodes on Vultr](../how-to/place-nodes-on-vultr.md#leases-for-agents) |
+| `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile` | The placement backend (static hosts or Vultr) and the money envelope for leases. Without it `request_capacity` is off. | [place nodes on Vultr](../how-to/place-nodes-on-vultr.md#3-leases-for-agents) |
 | `<data dir>/manifests/*.yaml` | `wicket serve` | Manifests the console may start, besides `examples/` of the directory `wicket serve` started in. | [console](console.md#actions) |
 | `<data dir>/release-keys/*.pub` | `wicket self update` | Release keys whose signatures an update accepts. | [update and roll back](../how-to/update-and-roll-back.md) |
 

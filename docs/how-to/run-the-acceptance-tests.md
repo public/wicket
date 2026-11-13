@@ -28,7 +28,20 @@ fetches a page across the link.
 You need Linux with Docker and gVisor registered as `runsc` with `--host-uds=open`. Each script's
 header lists its environment variables (`WICKET`, `IMAGE` and the like).
 
-Narrower checks:
+## Run without a model
+
+`wicket dev mock-llm` is a scripted stand-in for the Messages API: its first turn asks the agent to
+run one Bash command, its second ends the conversation. With `examples/mock-github.yaml`, whose
+`llm.upstream` points at it, it drives the whole path with no model credential:
+
+```sh
+printf 'mock-model-credential' | wicket secret set mock --hosts 127.0.0.1   # its stand-in secret
+wicket dev mock-llm --listen 127.0.0.1:9999 --command 'curl -sS https://example.com/' &
+wicket run examples/mock-github.yaml
+```
+
+## Narrower checks
+
 
 | script | checks |
 |---|---|
