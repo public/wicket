@@ -93,8 +93,8 @@ enum Cmd {
         /// Agent image.
         #[arg(long, default_value = "wicket/claude-code:poc")]
         image: String,
-        /// Run the box on a remote node over ssh: an enrolled node's name (its host key pinned), or an
-        /// ssh target (e.g. wicket@203.0.113.7; not pinned, with a warning). The node gets no secrets.
+        /// Run the box on an enrolled node (its name; its host key is pinned), through its `wicket
+        /// node serve`. Default: this host's own node, `local`.
         #[arg(long)]
         node: Option<String>,
         /// ssh identity for --node (default: the one it was enrolled with).
@@ -137,13 +137,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
-    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
-    /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
     /// Supervise a run again whose supervisor died (#151): what `wicket reconcile` starts for a run
     /// still running on its node.
     #[command(hide = true)]
     Attach { run: String },
+    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
+    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
+    /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
     Wrap {
         #[arg(long)]
         manifest: PathBuf,
