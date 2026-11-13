@@ -74,6 +74,7 @@ if [ ${#work} -gt 24 ]; then echo "$work: too long a path for the runs' sockets 
 pids=()
 our_runs=()
 built_image=
+pin_images=()
 
 if [ "$mode" = dev ]; then
   W=$(realpath "${WICKET:-target/debug/wicket}")
@@ -149,6 +150,7 @@ teardown() {
   for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
   wait 2>/dev/null
   for c in $(our_boxes); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
+  for i in "${pin_images[@]}"; do $DOCKER rmi "$i" >/dev/null 2>&1; done
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   if [ "$nodes" = local ]; then node_local_teardown; fi
   if [ -n "${sinks_file:-}" ]; then sudo -n rm -f "$sinks_file"; fi
@@ -293,6 +295,54 @@ check "revoking the lead stopped its whole subtree (no box left)" gone
 wait_for 30 '! kill -0 "$lead_pid" 2>/dev/null' || true
 check "  and its wicket run ended" '! kill -0 "$lead_pid" 2>/dev/null'
 check "  and its identity is revoked" 'w identity show "$lead" 2>&1 | grep -qi revoked'
+
+# ---- 1b. images pinned by digest (#192) ----
+# A private name for the agent image (`:a`) and for another image (`:b`, one more label: another
+# digest). The zone pins the name to `:a`'s digest; the agent spawns `:a` by its tag, then the tag is
+# moved to `:b`: by the tag it still gets `:a`'s digest, and `:b`'s digest is refused. Removed in
+# teardown.
+log "images pinned by digest: the run's digest, a spawn decided by digest on its node, a retag changes nothing"
+pin_name=acc-pin-$$
+$DOCKER tag "$IMAGE_TAG" "$pin_name:a"
+printf 'FROM %s\nLABEL wicket.acc.retag=%s\n' "$IMAGE_TAG" "$$" | $DOCKER build -q -t "$pin_name:b" - >/dev/null
+pin_images+=("$pin_name:a" "$pin_name:b")
+pin_a=$($DOCKER image inspect "$pin_name:a" --format '{{.Id}}')
+pin_b=$($DOCKER image inspect "$pin_name:b" --format '{{.Id}}')
+w image digest "$pin_name:a" >"$work/pin-digest.log" 2>&1 || cat "$work/pin-digest.log"
+check "wicket image digest reports what Docker has" 'grep -qx "$pin_name:a $pin_a" "$work/pin-digest.log"'
+pin_ws=$(workdir pin)
+echo "$pin_name" >"$pin_ws/pin-name"
+pin_manifest=$(manifest pin)
+sed -i "s#PIN_IMAGE#$pin_name@$pin_a#" "$pin_manifest"
+HOME=$HOMEW "$W" run "$pin_manifest" --workdir "$pin_ws" --image "$IMAGE_TAG" >"$work/pin.log" 2>&1 &
+pin_pid=$!
+pids+=("$pin_pid")
+wait_for 60 '[ -n "$(run_id_of "$work/pin.log")" ]' || true
+pin_run=$(run_id_of "$work/pin.log")
+our_runs+=("$pin_run")
+plog() { data "runs/$pin_run/workspace/out/pin.log" 2>/dev/null; }
+wait_for 120 'plog | grep -q "^first="' || true
+pin_kid=$(plog | sed -n 's/^first=started program first as run \(run_[a-z0-9]*\).*/\1/p')
+echo "   $(plog | head -1)"
+check "the run's audit and record carry its image's digest" \
+  'w audit --tail 3000 | grep run.image | grep "$pin_run" | grep -q "\"digest\":\"sha256:" && data "runs/$pin_run/ctl/run.json" | jq -e ".image_digest | startswith(\"sha256:\")" >/dev/null'
+check "a spawn of a pinned image's tag starts on the node as the pinned digest" \
+  '[ -n "$pin_kid" ] && [ "$($DOCKER inspect "$(box_of "$pin_kid")" --format "{{.Image}}" 2>/dev/null)" = "$pin_a" ]'
+wait_for 60 'data "runs/$pin_kid/ctl/run.json" 2>/dev/null | jq -e .image_digest >/dev/null' || true
+check "  and its run's record carries that digest" '[ "$(data "runs/$pin_kid/ctl/run.json" | jq -r .image_digest)" = "$pin_a" ]'
+$DOCKER tag "$pin_name:b" "$pin_name:a"
+if [ "$mode" = dev ]; then pin_dir=$WICKET_HOME/runs/$pin_run/workspace; put() { printf '%s' "$2" >"$pin_dir/$1"; }
+else pin_dir=$datadir/runs/$pin_run/workspace; put() { printf '%s' "$2" | sudo -n tee "$pin_dir/$1" >/dev/null; }; fi
+put pin-other "$pin_b"
+put retagged 1
+wait_for 120 'plog | grep -q "^third="' || true
+plog | sed -n '2,3p' | sed 's/^/   /'
+pin_kid2=$(plog | sed -n 's/^second=started program second as run \(run_[a-z0-9]*\).*/\1/p')
+check "once its tag points to another image, a spawn by the tag still starts the pinned digest, never the other" \
+  '[ -n "$pin_kid2" ] && [ "$($DOCKER inspect "$(box_of "$pin_kid2")" --format "{{.Image}}" 2>/dev/null)" = "$pin_a" ] && [ "$pin_b" != "$pin_a" ]'
+check "  and the other image, asked for by its digest, is refused" 'plog | grep "^third=" | grep -q "not within yours"'
+w identity revoke "$pin_run" --reason "acceptance: pins done" >/dev/null 2>&1 || true
+wait_for 60 '[ -z "$(box_of "$pin_run")" ]' || true
 
 # ---- 2. hibernate and wake ----
 log "hibernate and wake"

@@ -1,0 +1,18 @@
+# Acceptance: images pinned by digest (#192). The zone allows one image, pinned (PIN_IMAGE, written
+# by ci/acceptance.sh: a private name for the agent image, @ its digest). The agent's one turn runs
+# drive.sh: it spawns a program from that image by its tag (decided on its node by digest), then,
+# once the test has moved the tag to another image, asks for the same spawn again.
+task: Run the command you are given and stop.
+agent:
+  name: pinner
+  max_turns: 4
+  max_children: 2
+zone:
+  name: acc-pin
+  isolation: gvisor
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:MOCK_PORT
+    max_requests: 40
+  images: [PIN_IMAGE]
+  limits: { memory: 1500m, cpus: 1, timeout: 10m }

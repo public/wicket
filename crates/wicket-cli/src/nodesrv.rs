@@ -1629,20 +1629,23 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     if zone.name != bs.zone {
         bail!("run {}'s authority is for zone {}, not {}", bs.run, zone.name, bs.zone);
     }
-    // What the image is here (#192): pinned, it must be that digest (a retagged name is refused,
-    // whatever else this Docker has); the box is then started by its id, so nothing swaps it.
-    let found = node.docker.image_identity(&bs.image).await?;
-    let ident = match (&bs.image_pin, found) {
-        (Some(pin), Some(i)) if i.is(pin) => i,
-        (Some(pin), Some(i)) => bail!(
-            "image {} is {} on node {}, not {pin} as pinned: it was retagged, or this node has another build of it",
-            bs.image,
-            i.id,
-            node.name
-        ),
-        (Some(pin), None) => bail!("image {} ({pin}) not found on node {}", bs.image, node.name),
-        (None, Some(i)) => i,
-        (None, None) => bail!("image {} not found on node {} (run: wicket image there)", bs.image, node.name),
+    // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
+    // reference, or the digest alone; a tag moved to another image since changes nothing, and a
+    // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
+    let ident = match &bs.image_pin {
+        Some(pin) => {
+            let by_ref = node.docker.image_identity(&bs.image).await?.filter(|i| i.is(pin));
+            let by_digest = match by_ref {
+                Some(i) => Some(i),
+                None => node.docker.image_identity(pin).await?.filter(|i| i.is(pin)),
+            };
+            by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?
+        }
+        None => node
+            .docker
+            .image_identity(&bs.image)
+            .await?
+            .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
     };
     if !bs.binds.is_empty() && !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it can't mount the control host's directories");

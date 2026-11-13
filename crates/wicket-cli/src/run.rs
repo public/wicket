@@ -388,11 +388,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or(image);
     let image = image.as_str();
-    // The image by name, and the digest it must be (#192): checked where the box starts, which then
+    // The digest the image must be, if pinned (#192): checked where the box starts, which then
     // starts it by its id.
-    let image_ref = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?;
-    let image_name = if image_ref.name.is_empty() { image.to_string() } else { image_ref.name.clone() };
-    let image_pin = image_ref.pin.clone();
+    let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
+    let image_name = image.to_string();
     if record.is_none() && wake.is_none() {
         crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
     }
@@ -989,7 +988,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let name = crate::links::box_name(&run.0);
     let spec = SandboxSpec {
         name: name.clone(),
-        image: image_name.clone(),
+        image: image.to_string(),
         isolation: m.zone.isolation,
         mounts: vec![],
         env: plan.env,
