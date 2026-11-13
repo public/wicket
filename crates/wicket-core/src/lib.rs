@@ -1,6 +1,6 @@
 //! wicket-core: the types every other crate shares, and the pure decision function.
 //!
-//! Proof-of-concept scope (see docs/design.md): a single tenant (`t0`) with tenant ids carried
+//! Proof-of-concept scope (see docs/explanation/design.md): a single tenant (`t0`) with tenant ids carried
 //! everywhere so multi-tenant mode can be added without changing identifiers; one zone per run;
 //! HTTP reach rules; a small GitHub dangerous-pattern list; and a decision that is either allowed by
 //! a reach rule, forbidden outright, or needs a grant from the ledger.

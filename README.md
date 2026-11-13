@@ -13,18 +13,18 @@ polices the environment the agent runs in.
   **MCP gateway** (wicket's own tools for the agent).
 - Every decision is in a hash-chained audit log that `wicket audit --verify` checks offline.
 
-wicket 0.0.1 is the first release, for Linux. Read [docs/limits.md](docs/limits.md), "what wicket
+wicket 0.0.1 is the first release, for Linux. Read [docs/explanation/limits.md](docs/explanation/limits.md), "what wicket
 doesn't protect", before you trust it with anything.
 
-- Concepts: [docs/concepts.md](docs/concepts.md). Changes: [CHANGELOG.md](CHANGELOG.md).
-- Reference: [agents](docs/agents.md) (identity, children, links, sessions, hibernation),
-  [console](docs/console.md), [nodes](docs/nodes.md) (enrolment, `node serve`, placement, leases),
-  [audit export](docs/audit-export.md), [state off the host and restore](docs/state.md),
-  [performance](docs/performance.md).
-- Design: [docs/design.md](docs/design.md), [research](docs/research/), [prior art](docs/prior-art.md),
-  [test record](docs/poc-results.md).
+- Concepts: [docs/explanation/concepts.md](docs/explanation/concepts.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+- Reference: [agents](docs/reference/agents.md) (identity, children, links, sessions, hibernation),
+  [console](docs/reference/console.md), [nodes](docs/reference/nodes.md) (enrolment, `node serve`, placement, leases),
+  [audit export](docs/reference/audit.md), [state off the host and restore](docs/how-to/state-off-host-and-restore.md),
+  [performance](docs/explanation/performance.md).
+- Design: [docs/explanation/design.md](docs/explanation/design.md), [research](docs/explanation/research/), [prior art](docs/explanation/prior-art.md),
+  [test record](docs/explanation/poc-results.md).
 
-![Architecture: the control host, nodes and boxes, their trust boundaries and what runs where](docs/architecture.svg)
+![Architecture: the control host, nodes and boxes, their trust boundaries and what runs where](docs/images/architecture.svg)
 
 ## Install
 
@@ -169,7 +169,7 @@ wicket serve --listen 0.0.0.0:443 --acme-domain console.example.com --acme-agree
 ```
 
 Grants are single-use and expire after 10 minutes unless you say otherwise
-(`wicket approve ID --uses 3 --ttl 1h`, or `--prefix` for a path prefix). See [docs/console.md](docs/console.md).
+(`wicket approve ID --uses 3 --ttl 1h`, or `--prefix` for a path prefix). See [docs/reference/console.md](docs/reference/console.md).
 
 ### Nodes: enrol, serve, placement
 
@@ -196,7 +196,7 @@ wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetim
 wicket place release <instance-id>
 ```
 
-See [docs/nodes.md](docs/nodes.md).
+See [docs/reference/nodes.md](docs/reference/nodes.md).
 
 ### Links
 
@@ -256,7 +256,7 @@ wicket audit export --status
 wicket audit --verify --against /var/log/wicket/audit.jsonl
 ```
 
-See [docs/audit-export.md](docs/audit-export.md).
+See [docs/reference/audit.md](docs/reference/audit.md).
 
 ### Updates
 
@@ -264,7 +264,7 @@ See [docs/audit-export.md](docs/audit-export.md).
 nodes (a canary first), each watched by a health gate and switched back if it fails; boxes keep running
 throughout. Only artifacts signed by a release key the installation trusts are accepted, or a build an
 agent made in a box once a human approves its hash (`request_update`). See
-[docs/operations.md](docs/operations.md).
+[docs/explanation/updates.md](docs/explanation/updates.md).
 
 ```sh
 sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all

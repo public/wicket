@@ -261,7 +261,7 @@ runs predate the exception.
 
 Every allowed request is an audit row. Until #62's first fix, each row was written inline with an
 fsync, under the ledger lock, on a tokio worker. That was the largest per-request cost. Now one writer
-per process commits rows in batches (`docs/audit-export.md`). Rows for requests allowed by a grant
+per process commits rows in batches (`docs/reference/audit.md`). Rows for requests allowed by a grant
 are the exception: they still wait for their commit, to fail closed.
 
 | | kept-alive p50 / p99 (µs) | req/s, 16 kept connections | audit row, p50 (µs) |

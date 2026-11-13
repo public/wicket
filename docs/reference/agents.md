@@ -1,6 +1,6 @@
 # Agents: identity, children, links, sessions and hibernation
 
-Reference for what an agent can do inside wicket. The README has the short version; [concepts.md](concepts.md) explains the ideas.
+Reference for what an agent can do inside wicket. The README has the short version; [concepts.md](../explanation/concepts.md) explains the ideas.
 
 ## Agent identity and child agents
 

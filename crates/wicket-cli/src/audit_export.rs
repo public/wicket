@@ -1,5 +1,5 @@
 //! Audit export (#91): the ledger's audit records, and signed checkpoints of its chain head, streamed
-//! to the sinks an installation configures (`audit-sinks.yaml`, see `docs/audit-export.md`).
+//! to the sinks an installation configures (`audit-sinks.yaml`, see `docs/reference/audit.md`).
 //!
 //! - The ledger is the source of truth and the buffer. Each sink has a cursor in the ledger (the
 //!   last sequence number it acknowledged); delivery reads past it. A sink that is down holds its

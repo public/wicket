@@ -1,6 +1,6 @@
 # Remote nodes, placement and leases
 
-Reference for running boxes on other machines. The README has the short version; [concepts.md](concepts.md) explains the feed and leases.
+Reference for running boxes on other machines. The README has the short version; [concepts.md](../explanation/concepts.md) explains the feed and leases.
 
 ## Enrolment
 
@@ -95,7 +95,7 @@ wicket node revoke n1
   a link to its `current`), checks its sha256 there, and installs a `systemd --user` unit, `wicket-node`, that
   runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the unit runs without a
   login. `serve` talks to a control host whose protocol version is at most one away from its own (#162), so the
-  control host and its nodes are updated one at a time: `wicket self update --nodes` ([operations.md](operations.md)).
+  control host and its nodes are updated one at a time: `wicket self update --nodes` ([operations.md](../explanation/updates.md)).
 - **The node owns the box.** It starts the box detached (`docker run -d`) and relays its stdin, stdout and
   stderr over one multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which
   joins the ssh session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700).
@@ -144,7 +144,7 @@ wicket node revoke n1
   restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,
   while plain egress the token allows goes on. A self-update's re-exec (`wicket self update`, #162) hands
   the cache to the new process through a sealed memfd, never a file. What this protects, and what it
-  doesn't: [limits.md](limits.md).
+  doesn't: [limits.md](../explanation/limits.md).
 - **What a node holds** shows in `wicket node list`, one line per run this host supervises there: when
   the box's authority ends (or that the node confirmed it stopped), the secrets released to the node for
   it (by name, never values) and its budget slice. It is this host's record of what it released and

@@ -139,7 +139,7 @@ grants last: every grant has a lifetime, the box's own authority (its token's bl
 `limits.authority`, by default the run's timeout) included, and the node stops the box when that ends.
 The node also keeps, in memory only, the secrets its runs have used (their model credential and
 injected secrets, fetched on first use) and a slice of each run's model budget, so model calls go on
-too ([nodes.md](nodes.md)). Revocations are pushed to the
+too ([nodes.md](../reference/nodes.md)). Revocations are pushed to the
 node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node that hears nothing
 keeps what it holds until it expires. Tampered, replayed and rolled-back frames are refused.
 
@@ -200,7 +200,7 @@ what is left, and a spent agent isn't woken.
   grant use or an approval, is committed before the action happens; if it can't be, the action fails.
 - **Export** sends the records to JSON lines files or OTLP collectors, with signed chain-head checkpoints.
   `wicket audit --verify --against FILE` checks the ledger against what was exported
-  ([audit-export.md](audit-export.md)).
+  ([audit-export.md](../reference/audit.md)).
 
 ## Designed, not built
 

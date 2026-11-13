@@ -107,4 +107,4 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   and it starts runs through one launch callback (a detached `wicket run`), so moving launching behind a
   separate, more privileged process later changes only that callback.
 
-![console](console-passkey.png)
+![console](../images/console-passkey.png)

@@ -367,7 +367,7 @@ enum Cmd {
     /// Update this installation to another wicket build (#162): blue/green, with a health gate and
     /// automatic rollback, on the control host and then its nodes. Only artifacts signed by a
     /// release key this installation trusts, or whose sha256 a human approved (an agent's
-    /// `request_update`), are accepted. See docs/operations.md.
+    /// `request_update`), are accepted. See docs/explanation/updates.md.
     #[command(name = "self")]
     Itself {
         #[command(subcommand)]

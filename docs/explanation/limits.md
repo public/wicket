@@ -34,7 +34,7 @@ not a permanent decision.
   nothing injected, nothing forbidden, and not the model host. Such a host gets one audit row per
   connection, no per-request decisions, no header filtering and no Host pinning, so behind a shared
   CDN it can reach other sites on the same CDN. `wicket zone MANIFEST` lists spliced hosts. A forbid
-  rule on the host keeps it inspected (`docs/performance.md`).
+  rule on the host keeps it inspected (`docs/explanation/performance.md`).
 - **Request bodies over 4 GiB fail.** Uploads stream upstream as they arrive, and a declared
   `content-length` goes upstream as declared. Bodies are read whole in three cases: GET and HEAD,
   which must have none; requests that arrive over HTTP/3, up to 64 MiB; and model calls through the
@@ -69,7 +69,7 @@ not a permanent decision.
   the approver and the issuing key), and while the roots are offline, enrolling a node, a feed's new
   generation and renewing certificates need them back (`WICKET_ROOTS`). The identity issuer and the
   installation CA have no offline root yet.
-- **Losing the host is a manual restore** (#154, `docs/state.md`). With the state store set up, the
+- **Losing the host is a manual restore** (#154, `docs/how-to/state-off-host-and-restore.md`). With the state store set up, the
   ledger streams to it (Litestream, at most its sync interval behind), bundles and audit segments are in
   it, and `wicket state restore` rebuilds a standby from it and the recovery kit. A standby isn't
   promoted on its own; runs that were running end as `lost` (their run directories were on the host);
@@ -83,7 +83,7 @@ not a permanent decision.
   as you would the roots.
 - **The audit log is only as safe as the host.** The hash chain shows tampering after the fact, but
   someone with write access to the ledger can rewrite the whole chain. Export with signed checkpoints
-  (`docs/audit-export.md`) to a system they can't reach, and verify against it with
+  (`docs/reference/audit.md`) to a system they can't reach, and verify against it with
   `wicket audit --verify --against`. A SIGKILL or power cut can lose the last batch of records that
   nothing waited on, a few milliseconds' worth ([#107](https://github.com/public/wicket/pull/107)).
 
@@ -225,7 +225,7 @@ not a permanent decision.
 ## Performance
 
 Measured numbers for the network path, and how they were measured, are in
-[docs/performance.md](performance.md).
+[docs/explanation/performance.md](performance.md).
 
 - **HTTP/3 under gVisor is slow.** gVisor spends about 110 µs of CPU per UDP datagram, so downloads run at
   40–100 Mbit/s with standard 1452-byte packets. `WICKET_H3_BOX_MTU=16000` reaches 430–460 Mbit/s, but only
