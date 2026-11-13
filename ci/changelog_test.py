@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Tests for ci/changelog.py (run: python3 -I ci/changelog_test.py)."""
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("changelog", Path(__file__).with_name("changelog.py"))
 cl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cl)
