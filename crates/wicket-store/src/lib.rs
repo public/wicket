@@ -765,6 +765,13 @@ impl Ledger {
         // The grant covers nothing riskier than what the human was shown (#119): a prefix approved
         // for an R2 write doesn't also cover the R4 operations under it.
         let max_risk = wicket_core::RiskClass::from_name(&req.risk).map(|r| r.rank()).unwrap_or(0);
+        // A push is one request in two (#26): its ref discovery and its upload, and git's retries and
+        // probes between them. Its grant covers them all for a short window, not a number of uses.
+        let (uses, ttl) = if wicket_core::git::is_push(&req.method, &path) {
+            (None, a.ttl.as_secs().min(wicket_core::git::PUSH_WINDOW_SECS))
+        } else {
+            (a.uses, a.ttl.as_secs())
+        };
         let gid = new_grant_id();
         let t = now();
         tx.execute(
@@ -778,8 +785,8 @@ impl Ledger {
                 req.host,
                 path,
                 prefix,
-                a.uses,
-                t + a.ttl.as_secs() as i64,
+                uses,
+                t + ttl as i64,
                 req.id,
                 a.decided_by,
                 t,
@@ -1960,7 +1967,7 @@ mod tests {
     #[test]
     fn pending_is_deduplicated_and_single_use_grant_is_consumed_once() {
         let mut l = Ledger::open_in_memory().unwrap();
-        let o = op("/o/r.git/git-receive-pack");
+        let o = op("/o/r/issues");
         let (id, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh);
         assert_eq!(l.pending_for(&o, "push", None).unwrap(), (id.clone(), false));
@@ -1969,6 +1976,37 @@ mod tests {
         assert!(l.consume_grant(&o).unwrap().is_some());
         assert_eq!(l.consume_grant(&o).unwrap(), None, "single use");
         assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
+    }
+
+    /// #26: one approval of a push covers its requests for a short window, whatever uses the human
+    /// picked, and the window ends: after it the push is asked about afresh.
+    #[test]
+    fn a_push_grant_covers_a_window_not_a_number_of_uses() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let o = op("/o/r.git/git-receive-pack");
+        let (id, _) = l.pending_for(&o, "push", None).unwrap();
+        let gid =
+            l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(3600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let (uses, expires, created): (Option<i64>, i64, i64) = l
+            .conn
+            .query_row("SELECT uses_left, expires_at, created_at FROM grants WHERE id = ?1", params![gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(uses, None, "not counted");
+        assert_eq!(expires - created, wicket_core::git::PUSH_WINDOW_SECS as i64, "the window, not the hour asked for");
+        // Discovery, a probe, the upload, a retry: all within the window.
+        for _ in 0..4 {
+            assert_eq!(l.consume_grant(&o).unwrap().as_deref(), Some(gid.as_str()));
+        }
+        // A shorter ttl than the window is kept.
+        let (id2, _) = l.pending_for(&op("/o/s.git/git-receive-pack"), "push", None).unwrap();
+        let g2 = l.approve(&id2, &Approval { uses: Some(1), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let e2: i64 = l.conn.query_row("SELECT expires_at - created_at FROM grants WHERE id = ?1", params![g2], |r| r.get(0)).unwrap();
+        assert_eq!(e2, 60);
+        // The window passes: nothing covers the push, and it is asked about again (a new request).
+        l.conn.execute("UPDATE grants SET expires_at = ?2 WHERE id = ?1", params![gid, now() - 1]).unwrap();
+        assert_eq!(l.consume_grant(&o).unwrap(), None);
+        let (again, fresh) = l.pending_for(&o, "push", None).unwrap();
+        assert!(fresh && again != id);
     }
 
     /// #119: a prefix grant covers whole segments, and nothing riskier than what was approved.

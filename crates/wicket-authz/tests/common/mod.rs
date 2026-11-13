@@ -290,6 +290,9 @@ pub fn probes(zones: &[&ZoneSpec]) -> (Vec<String>, Vec<String>) {
             "/",
             "/x",
             "/octocat/Hello-World.git/git-receive-pack",
+            // A push's ref paths (#26), checked against forbid rules.
+            "/octocat/Hello-World.git/git-receive-pack/refs/heads/main",
+            "/octocat/Hello-World/git-receive-pack/refs/heads/MAIN",
             "/octocat/Hello-World.git/git-upload-pack",
             "/octocat/Hello-World/GIT-UPLOAD-PACK",
             "/caf\u{e9}/x",

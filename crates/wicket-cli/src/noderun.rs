@@ -1493,8 +1493,16 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
         fresh.risk = op.risk;
         fresh.effects.extend(op.effects.iter().map(|e| wicket_core::text::clip(e, 120)));
     }
+    // A push's refs, as the node's proxy read them from its commands (#26): shown, never decided on.
+    if wicket_core::git::is_push(&fresh.method, &fresh.path) {
+        let refs = op.effects.iter().find(|e| e.starts_with(wicket_core::git::REFS_EFFECT));
+        fresh.effects.extend(refs.map(|e| wicket_core::text::clip(e, 240)));
+    }
     match wicket_core::evaluate(zone_spec, &fresh) {
-        wicket_core::Verdict::NeedsGrant(why) => Ok((fresh, why)),
+        wicket_core::Verdict::NeedsGrant(why) => {
+            let why = wicket_core::git::ask_reason(&fresh, &why);
+            Ok((fresh, why))
+        }
         wicket_core::Verdict::Forbidden(why) => Err(format!("not requested: {why}")),
         wicket_core::Verdict::AllowByReach(i) if prefix => {
             Ok((fresh, format!("reach rule {i} allows this path; asked for every path under it")))

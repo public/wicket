@@ -347,9 +347,88 @@ impl Egress {
             Ok(p) => p.to_string(),
             Err(e) => return self.refuse(&host, &method, &pq, &format!("ambiguous path: {e}")),
         };
-        let ctx = &self.ctx;
         let query = pq.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let op = Op::egress_with_query(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
+        let Some(repo) = wicket_core::git::push_repo(&method, &path, query).map(str::to_string) else {
+            let ctx = &self.ctx;
+            let op = Op::egress_with_query(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
+            return self.decide_and_forward(req, host, scheme, via, method, path, pq, op, None).await;
+        };
+        // A push (#26): its ref discovery and its upload are decided as one op, the push of `repo`.
+        let ctx = &self.ctx;
+        let mut op = Op::egress(&ctx.tenant, &ctx.run, &ctx.zone.name, "POST", &host, &wicket_core::git::push_op_path(&repo));
+        if method != "POST" {
+            return self.decide_and_forward(req, host, scheme, via, method, path, pq, op, None).await;
+        }
+        // The upload names the refs it updates before its pack: read them (the body still goes
+        // upstream whole), and refuse a push to a protected ref before it is decided or asked about.
+        if req.headers().get(http::header::CONTENT_ENCODING).is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity")) {
+            return self.refuse(&host, &method, &path, "a push's ref updates are read by wicket, so its body must not be content-encoded");
+        }
+        let (parts, body) = req.into_parts();
+        let (updates, body) = match read_commands(body).await {
+            Ok(x) => x,
+            Err(e) => return self.refuse(&host, &method, &path, &format!("the push's ref updates can't be read: {e}")),
+        };
+        let req = Request::from_parts(parts, body);
+        let refused = updates.iter().find_map(|u| self.refuses_ref(&host, &repo, &u.name));
+        op.effects.extend(wicket_core::git::refs_effect(&updates));
+        self.decide_and_forward(req, host, scheme, via, method, path, pq, op, refused).await
+    }
+
+    /// Why a push to ref `name` of `repo` on `host` is refused, if it is: a name git wouldn't accept,
+    /// a ref the forge never accepts a push to, or one a forbid rule protects (its ref paths, as
+    /// the zone, the org policy or the box's token decide them; see `wicket_core::git`).
+    fn refuses_ref(&self, host: &str, repo: &str, name: &str) -> Option<String> {
+        if let Some(why) = wicket_core::git::bad_ref_name(name).or_else(|| wicket_core::git::forge_refuses(host, name)) {
+            return Some(format!("a push to {name}: {why}"));
+        }
+        let ctx = &self.ctx;
+        wicket_core::git::ref_paths(repo, name).iter().find_map(|p| {
+            let op = Op::egress(&ctx.tenant, &ctx.run, &ctx.zone.name, "POST", host, p);
+            self.decider.refuses(ctx, &op).map(|why| format!("a push to protected ref {name}: {why}"))
+        })
+    }
+
+    /// Decides `op` (the request's own, or its push's) and, if allowed, forwards the request.
+    /// `refused`: already found never allowed, so it isn't decided (or asked about) at all.
+    #[allow(clippy::too_many_arguments)]
+    fn decide_and_forward<'a, B>(
+        self: Arc<Self>,
+        req: Request<B>,
+        host: String,
+        scheme: &'a str,
+        via: Via,
+        method: String,
+        path: String,
+        pq: String,
+        op: Op,
+        refused: Option<String>,
+    ) -> futures_util::future::BoxFuture<'a, Response<BoxBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Box::pin(self.decide_and_forward_inner(req, host, scheme, via, method, path, pq, op, refused))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_and_forward_inner<B>(
+        self: Arc<Self>,
+        req: Request<B>,
+        host: String,
+        scheme: &str,
+        via: Via,
+        method: String,
+        path: String,
+        pq: String,
+        op: Op,
+        refused: Option<String>,
+    ) -> Response<BoxBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let ctx = &self.ctx;
         let risk = format!("{:?}", op.risk);
         let emit = |outcome: &str, detail: String| {
             ctx.emit(Event::Egress {
@@ -368,7 +447,11 @@ impl Egress {
         }
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
-        match self.decider.decide(ctx, &op, who.as_ref()).await {
+        let outcome = match refused {
+            Some(why) => Outcome::Forbidden(why),
+            None => self.decider.decide(ctx, &op, who.as_ref()).await,
+        };
+        match outcome {
             Outcome::Allow(detail) => {
                 // A name under a wildcard counts against the rule's limit before it is resolved (#20).
                 if let Some((w, why)) = self.admit_wildcard(&host) {
