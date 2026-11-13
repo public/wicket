@@ -59,13 +59,19 @@ use serde::{Deserialize, Serialize};
 /// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51): a `policy` fact
 ///   and checks reading it, which an older node's structural check refuses: sent only to nodes
 ///   talking [`ORG_POLICY`] or later.
-pub const PROTOCOL: u32 = 4;
+/// - 5: decisions at the edge (#164): a node answers the MCP gateway's tools itself from the box's
+///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
+///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
+///   control host talks [`EDGE_DECISIONS`] or later; with an older one it relays every tool call.
+pub const PROTOCOL: u32 = 5;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
 /// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
 pub const NODE_LEASES: u32 = 3;
 /// The first protocol version whose nodes take tokens with an org layer (#51).
 pub const ORG_POLICY: u32 = 4;
+/// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
+pub const EDGE_DECISIONS: u32 = 5;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -172,6 +178,44 @@ pub struct BoxStart {
     /// them, so the box's placeholder never reaches the host and the request fails, closed.
     #[serde(default)]
     pub swap_hosts: Vec<String>,
+    /// What the node needs to decide the box's gateway tools itself (#164). Sent only to nodes
+    /// talking [`EDGE_DECISIONS`]; without it the node relays every tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<Box<EdgeStart>>,
+}
+
+/// What a node decides a box's gateway tools from (#164), beyond its token in the feed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeStart {
+    /// Who the box is, as `whoami` shows it: its identity's stable claims (subject, agent, zone,
+    /// tenant, run, parent run, principal, the chain it acts for). The identity itself (its key and
+    /// signed token) stays on the control host.
+    pub who: serde_json::Value,
+    /// What the node decides the box's spawns from: None, they are the control host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<EdgeSpawn>,
+}
+
+/// What a node decides a box's spawns from (#164): a child within the box's authority starts on
+/// the node, its token attenuated from the box's, and the control host records it when it can.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeSpawn {
+    /// The box's effective manifest (YAML): what a child's is planned from.
+    pub manifest: String,
+    /// Its base token (block 0 and its spawn links, without grants), base64url: what a child's is
+    /// attenuated from.
+    #[serde(default)]
+    pub base: String,
+    /// The keys whose grants a child's token accepts.
+    #[serde(default)]
+    pub grant_keys: Vec<wicket_authz::PublicKey>,
+    /// Its time left when it started (seconds): a child gets no more than what is left of it.
+    pub time_left_secs: u64,
+    /// The box slots its children already hold (#125).
+    pub slots_used: u32,
+    /// Whether the org policy decides for its children as for it (#51): it reads neither the
+    /// spawn depth nor the zone or its groups. Else its spawns are the control host's.
+    pub org_alike: bool,
 }
 
 fn default_output_cap() -> u64 {
@@ -337,6 +381,12 @@ pub enum Msg {
         id: u64,
         run: String,
         sock: String,
+        /// A link between two boxes on this node (#164): the node dials each connection into
+        /// box `.0` at port `.1` itself, while both boxes' authority holds, instead of offering
+        /// it as a tunnel; the link outlives the control connection. Sent only on connections
+        /// talking [`EDGE_DECISIONS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dial: Option<(String, u16)>,
     },
     Unlisten {
         run: String,
@@ -415,6 +465,26 @@ pub enum Msg {
         run: String,
         event: serde_json::Value,
     },
+    /// A child box this node started for `run`'s box while deciding its spawn (#164): what the
+    /// control host needs to check it again and take it over (adopt it as a run of its own).
+    /// Sent on `run`'s connection, at once or when it is back, until answered by
+    /// [`Msg::Adopted`]. Sent only on connections talking [`EDGE_DECISIONS`].
+    Spawned {
+        run: String,
+        child: String,
+        /// The child's manifest (YAML), as the node planned it.
+        manifest: String,
+        image: String,
+        /// The child agent's session id.
+        session: String,
+        /// When the node started it (Unix ms, node clock).
+        started_ms: i64,
+    },
+    /// The control host took `child` over (`error`: it refused it, and stops it).
+    Adopted {
+        child: String,
+        error: Option<String>,
+    },
     /// Raise (or find) the pending request for this op. `queued`: raised while the control host
     /// was unreachable (#153), with its node-local id and when (Unix ms, node clock).
     Ask {
@@ -425,6 +495,10 @@ pub enum Msg {
         who: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queued: Option<(String, i64)>,
+        /// Every path under the op's directory, not the one path (`request_access`'s `scope:
+        /// prefix`, #164). Sent only on connections talking [`EDGE_DECISIONS`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prefix: bool,
     },
     /// A secret `run` needs now, on its first use on this node (#152): its model credential, or an
     /// injected secret. Never prefetched.
@@ -704,6 +778,7 @@ mod tests {
                 why: "out of reach".into(),
                 who: None,
                 queued: Some(("q-1".into(), 5)),
+                prefix: true,
             }),
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),

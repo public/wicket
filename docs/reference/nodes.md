@@ -11,9 +11,10 @@ the node also needs the agent image, `~/.local/bin/wicket image` there).
 On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress, its model
 calls and its injected credentials locally, from a signed policy feed and the secrets it fetched, so the
 box keeps working while the control host is unreachable, for exactly as long as its grants last (#57, #152,
-#153; below). The ledger, the keys that matter and the MCP gateway's tools stay on the control host, which
-issues authority (tokens, grants, leases, secrets), takes human approvals, and reconciles counts and audit
-afterwards; it isn't asked during a request. A
+#153; below), and the MCP gateway's tools too (#164): it answers them from the box's token, starts
+narrower children itself and carries links between its own boxes. The ledger and the keys that matter
+stay on the control host, which issues authority (tokens, grants, leases, secrets, identities), takes
+human approvals, and reconciles counts and audit afterwards; it isn't asked during a request. A
 `--node` target must be enrolled: there is no other way to run a box.
 
 ## The control host is a node too
@@ -185,7 +186,23 @@ wicket node revoke n1
   connected once less than half of it is left: offline, a node spends what is left of its slice and nothing
   more. With a control host on protocol 1 (#162's skew), the call is relayed to the run's own proxy there
   as in #151, which adds the credential and counts it.
-- **The MCP gateway runs on the node** (#151), relaying each call whole to the run's gateway on the control
+- **Decisions at the edge** (#164; protocol 5, the list of what a node still asks the control host and why:
+  [design §9.2.1](../explanation/design.md)). The node answers `whoami`, `request_access`, `await_grant` and
+  `pending_requests` from the box's token, connected or not. Cut off, what needs a human
+  (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the box's
+  zone) is queued on the node (`edge.json`, `q-…` ids, like #153's asks) and made when the control host
+  is back; `await_grant` on a `q-…` id then follows the request it became.
+  - **Spawn.** A child within the box's authority starts on the node: its token attenuated there from
+    the box's base token (`derived.json` beside it, so a restarted `serve` keeps it), never wider or
+    longer-lived than its parent's and revoked with it, its budget carved from the parent's slice. The
+    node reports it (`Spawned`, until answered); the control host checks it again, records it and
+    supervises it (`wicket run --adopt`), or refuses it and the node stops it. Spawns elsewhere
+    (placement), beyond the zone, or under an org policy that decides differently a level down go to the
+    control host.
+  - **Same node.** Messages between boxes on the node are decided there from both tokens and, cut off,
+    delivered there (attested by the node, not signed); links between them are carried by the node and
+    outlive the control channel, closed when either box's authority ends.
+- **The MCP gateway runs on the node** (#151); calls it doesn't decide (#164) are relayed whole to the run's gateway on the control
   host, which decides every tool (they read or write the ledger); while the control host can't be reached
   the node answers MCP's own handshake (`initialize`, `ping`) and refuses each tool call with a clear,
   retryable error.
@@ -235,7 +252,7 @@ wicket node revoke n1
   connection into the target box are execs on that box's node; its hosts file is rewritten there. A box on
   another node than the relaying run's is reached over a connection of the relay's own (scope
   `links:<run>`), so the bytes pass through the control host. Reach, approval and audit are those of any link.
-- **For now.** Plain `http://` to a forwarded host is refused, and every gateway tool is still decided on the
+- **For now.** Plain `http://` to a forwarded host is refused, and gateway tools beyond #164's are still decided on the
   control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 

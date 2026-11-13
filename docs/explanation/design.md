@@ -1479,6 +1479,50 @@ Detail: [04 §7].
 
   Sink tools accept **handles as arguments**, and the gateway substitutes the content at dispatch (§4.2).
 
+### 9.2.1 Decided at the edge: what a node still asks the control host (owner, 2026-11-12, #164)
+
+Every authorization decision is made as close to the action as it can be: on the box's node, from its
+token in the signed feed (the org, zone and forbid layers compiled from Cedar, #51), its grants and its
+leases. The control plane issues authority (tokens, grants, identities, leases, secrets) and takes human
+approvals; it isn't asked per action. With the control host unreachable, a box calls every gateway tool
+its token covers, spawns a narrower child and uses an existing link on its node; only what needs a
+human queues on the node (#153), and what needs new authority waits.
+
+Decided on the node (protocol 5, `EDGE_DECISIONS`; an older node relays every tool call as before):
+- egress, grants, splicing, the model proxy and its budget slice, injected credentials (#57, #141,
+  #152, #153);
+- `whoami` (the identity's stable claims, handed to the node at start), `request_access` (from the
+  token, spending no grant), `await_grant` and `pending_requests` for what the node queued;
+- `spawn` within the box's authority: the child's token is the parent's base token (block 0 and spawn
+  links, never its grants) attenuated on the node, held as node-derived authority that chains to the
+  parent's feed entry, bounded to `<parent path>/<child>`, never past the parent's authority, and revoked
+  with any of the parent's blocks. Its model budget is carved from the parent's slice, its slots from
+  the parent's, its secrets shared from what the parent holds there. Its identity until adoption is the
+  parent's box path plus the child (provisional, node-attested, signing nothing). The node reports it
+  (`Spawned`); the control host checks it again (`subset`, the org policy, slots), records it and
+  supervises it (`wicket run --adopt`), whose token then comes from the feed. Where the org policy reads
+  the spawn depth, the zone or its groups, a node can't fold it for the child: those spawns are the
+  control host's;
+- messages and links between two boxes on one node: decided from both tokens (`accept_from`, the
+  parent/child box paths, the receiver's org layer). A link's connections are carried by the node,
+  which closes it when either box's authority ends; while cut off, messages are delivered by the node
+  and attested by it, not signed (identity keys stay on the control host).
+
+What a node still sends the control host, and why:
+
+| call | why it stays |
+|---|---|
+| `Ask` | a human decides (raised at once, or queued on the node and raised on reconnect) |
+| tool calls that need a human: `request_capacity`, `request_update`, a spawn or link beyond the box's zone | a human decides; queued on the node while unreachable, made on reconnect, their answers kept for `await_grant` |
+| `SecretFetch` | new authority: a secret released to the node on first use (#152) |
+| the `llm` tunnel | only without the model credential cached on the node, or a protocol-1 control host |
+| the `egress` tunnel | hosts the control host swaps a credential in for (the secret stays there), or outside the node CA |
+| `send_message` / `await_message` while connected, and to boxes on other nodes | signed with the agent's identity, whose key never leaves the control host; delivered through the ledger |
+| links between boxes on different nodes | relayed by the control host: nodes don't hold each other's certificates or reach each other (a direct node-to-node transport with mutual TLS is a follow-up) |
+| identity re-issue (every 5 min) | new authority: the issuer key stays on the control host |
+| `Spawned` | a record: the ledger, identity and supervision of a child the node started |
+| `Spent`, `Event`, `Audit`, `Started`, `Exited`, `FeedStatus` | records, after the fact |
+
 ### 9.3 LLM proxy (`wicket-llm`)
 - Holds the model credential (the owner's Claude subscription token, never an API key) and routes per zone (model allowlist, token and cost budget).
 - Wire APIs: Anthropic Messages, OpenAI Responses, Google, Chat (§6). `codex responses-api-proxy` is

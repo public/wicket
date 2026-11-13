@@ -104,6 +104,8 @@ pub struct Calls {
     /// Link sockets listened on: where their connections go.
     incoming: Mutex<HashMap<(String, String), mpsc::UnboundedSender<BoxStream>>>,
     next: AtomicU64,
+    /// The protocol version the connection talks (0: none up yet).
+    proto: std::sync::atomic::AtomicU32,
 }
 
 impl Calls {
@@ -121,6 +123,14 @@ impl Calls {
 
     pub fn connected(&self) -> bool {
         self.out.lock().expect("out").is_some()
+    }
+
+    pub fn set_proto(&self, p: u32) {
+        self.proto.store(p, Ordering::SeqCst);
+    }
+
+    pub fn proto(&self) -> u32 {
+        self.proto.load(Ordering::SeqCst)
     }
 
     fn send(&self, f: Frame) -> bool {
@@ -326,7 +336,7 @@ impl Calls {
         let (tx, rx) = mpsc::unbounded_channel();
         self.incoming.lock().expect("incoming").insert((run.into(), sock.into()), tx);
         let id = self.id();
-        let r = self.answer(id, Frame::Msg(Msg::Listen { id, run: run.into(), sock: sock.into() }), "a listen").await;
+        let r = self.answer(id, Frame::Msg(Msg::Listen { id, run: run.into(), sock: sock.into(), dial: None }), "a listen").await;
         match r {
             Ok(Msg::BoxCtlDone { error: None, .. }) => Ok(rx),
             r => {
@@ -337,6 +347,22 @@ impl Calls {
                     _ => bail!("an unexpected answer to a listen"),
                 }
             }
+        }
+    }
+
+    /// A link between two boxes on the node (#164): it dials `to`'s `port` for each connection to
+    /// `sock` in `run`'s box itself, so the bytes never leave the node and the link outlives this
+    /// connection.
+    pub async fn listen_direct(&self, run: &str, sock: &str, to: &str, port: u16) -> Result<()> {
+        if self.proto() < crate::chan::EDGE_DECISIONS {
+            bail!("the node talks protocol {}: links are relayed here", self.proto());
+        }
+        let id = self.id();
+        let msg = Msg::Listen { id, run: run.into(), sock: sock.into(), dial: Some((to.into(), port)) };
+        match self.answer(id, Frame::Msg(msg), "a listen").await? {
+            Msg::BoxCtlDone { error: None, .. } => Ok(()),
+            Msg::BoxCtlDone { error: Some(e), .. } => bail!("{e}"),
+            _ => bail!("an unexpected answer to a listen"),
         }
     }
 
@@ -393,6 +419,7 @@ impl Link {
         let calls = Arc::new(Calls::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
+        calls.set_proto(proto);
         let c = calls.clone();
         let task = tokio::spawn(async move {
             let _child = child;

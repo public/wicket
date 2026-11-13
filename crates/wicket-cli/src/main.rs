@@ -111,6 +111,9 @@ enum Cmd {
         /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).
         #[arg(long, hide = true)]
         lease: Option<String>,
+        /// Internal: take over a child its node started (#164): `<started ms>:<session id>`.
+        #[arg(long, hide = true)]
+        adopt: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
     /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A
@@ -1027,7 +1030,14 @@ async fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::Daemon { socket, policy } => daemon::serve(&socket, policy),
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease } => {
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, adopt } => {
+            let adopt = match adopt {
+                Some(a) => {
+                    let (at, session) = a.split_once(':').context("--adopt <started ms>:<session id>")?;
+                    Some((at.parse::<i64>().context("--adopt: started ms")?, session.to_string()))
+                }
+                None => None,
+            };
             run::run(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
@@ -1042,6 +1052,7 @@ async fn main() -> Result<()> {
                 wrap: None,
                 wake: None,
                 attach: false,
+                adopt,
             })
             .await
         }
@@ -1060,6 +1071,7 @@ async fn main() -> Result<()> {
                 wrap: Some(argv),
                 wake: None,
                 attach: false,
+                adopt: None,
             })
             .await
         }
@@ -1077,6 +1089,7 @@ async fn main() -> Result<()> {
             wrap: None,
             wake: None,
             attach: true,
+            adopt: None,
         })
         .await
         .inspect_err(|e| run::attach_failed(&run, e)),

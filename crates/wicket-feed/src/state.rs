@@ -100,6 +100,11 @@ impl<P: Policy> State<P> {
         self.revoked.contains_key(&(kind, id.to_string()))
     }
 
+    /// The revocations held.
+    pub(crate) fn revoked_keys(&self) -> impl Iterator<Item = &(RevokeKind, String)> {
+        self.revoked.keys()
+    }
+
     /// Number of revocations held.
     pub fn revoked_len(&self) -> usize {
         self.revoked.len()

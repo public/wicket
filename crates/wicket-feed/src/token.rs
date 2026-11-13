@@ -34,7 +34,7 @@
 
 use crate::format::RevokeKind;
 use crate::replica::{Allowed, Decision, Mode, Replica};
-use crate::state::Policy;
+use crate::state::{Policy, Zone};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -228,9 +228,19 @@ impl Replica<BoxAuthority> {
     /// caller queues a NeedsGrant raised offline. Closed and lagging refuse everything; a revoked run, a box with no record, a token that didn't load or
     /// was revoked, and an op for another zone are forbidden.
     pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
+        self.decide_inner(op, now, true)
+    }
+
+    /// What [`Self::decide`] would say, without recording a use of a counted grant: for asking
+    /// ahead (`request_access`, #164), which must not spend one.
+    pub fn peek(&mut self, op: &Op, now: i64) -> Decision {
+        self.decide_inner(op, now, false)
+    }
+
+    fn decide_inner(&mut self, op: &Op, now: i64, record: bool) -> Decision {
         let found = match self.gate(op, now) {
             Err(d) => Found::Done(d),
-            Ok((_, st)) => match st.zones.get(&op.run.0) {
+            Ok((_, st)) => match self.entry(&op.run.0) {
                 None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
                 Some(entry) => match &entry.compiled {
                     Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
@@ -274,7 +284,7 @@ impl Replica<BoxAuthority> {
         match found {
             Found::Done(d) => d,
             Found::Grant { id, counted } => {
-                if counted {
+                if counted && record {
                     if let Err(e) = self.record_use(&id) {
                         return Decision::Refused { mode: Mode::Fresh, why: e };
                     }
@@ -289,7 +299,7 @@ impl Replica<BoxAuthority> {
     /// whose token didn't load, gets `Open`: its requests are then refused one by one by
     /// [`Self::decide`].
     pub fn host_verdict(&self, run: &str, host: &str) -> HostVerdict {
-        match self.state().and_then(|s| s.zones.get(run)).map(|z| &z.compiled) {
+        match self.state().and_then(|_| self.entry(run)).map(|z| &z.compiled) {
             Some(Ok(c)) => c.zone.host_verdict(host),
             _ => HostVerdict::Open,
         }
@@ -306,7 +316,8 @@ impl Replica<BoxAuthority> {
     /// - the token itself allows every method the proxy forwards, at the root and at a deep path,
     ///   by its ceiling alone (the allow comes from the token, as for every request).
     pub fn splice(&self, tenant: &wicket_core::TenantId, run: &str, host: &str, now: i64) -> Option<usize> {
-        let entry = self.state()?.zones.get(run)?;
+        self.state()?;
+        let entry = self.entry(run)?;
         let c = entry.compiled.as_ref().ok()?;
         if entry.spec.box_path != entry.spec.run {
             return None;
@@ -340,14 +351,71 @@ impl Replica<BoxAuthority> {
     /// When box `run`'s authority ends (Unix ms), read from its verified token: the earliest expiry
     /// of its first-party blocks (#153). None if the node holds no valid token for it.
     pub fn authority_until(&self, run: &str) -> Option<i64> {
-        let c = self.state()?.zones.get(run)?.compiled.as_ref().ok()?;
+        let c = self.entry(run)?.compiled.as_ref().ok()?;
         // The token's check is `time <= not_after` in whole seconds: it allows through that second.
         c.loaded.not_after().map(|s| i64::try_from(s).unwrap_or(i64::MAX / 1000).saturating_add(1).saturating_mul(1000))
     }
 
+    /// Derives box `child`'s authority on this node (#164), from box `parent`'s base token (its
+    /// block 0 and spawn links, without grants, as its control host handed it to the node): the
+    /// base must verify against the authority root (or the issuing key that minted it), and be the
+    /// start of the token the feed holds for `parent`, unrevoked. The child's token is the base
+    /// with a spawn block bounded to `<parent's box path>/<child>`, so it holds at most what its
+    /// parent's token does, and goes when any of its parent's blocks is revoked. Held as an entry
+    /// of this node's own until the feed holds `child`.
+    pub fn derive_child(
+        &mut self,
+        parent: &str,
+        base: &str,
+        child: &str,
+        zone: &ZoneSpec,
+        ceiling: &authz::Ceiling,
+    ) -> Result<BoxAuthority, String> {
+        let (spec, ids) = match self.entry(parent) {
+            Some(Zone { spec, compiled: Ok(c) }) => (spec.clone(), c.ids.clone()),
+            Some(Zone { compiled: Err(e), .. }) => return Err(format!("box {parent}'s authority is invalid: {e}")),
+            None => return Err(format!("no authority for box {parent} on this node")),
+        };
+        let key = match &spec.issuer_cert {
+            Some(c) => AuthzKeyCert::open(c, self.ctx())?.0,
+            None => *self.ctx(),
+        };
+        let bytes = B64.decode(base).map_err(|e| format!("base token encoding: {e}"))?;
+        let base = authz::Token::from_bytes(&bytes, &key).map_err(|e| e.to_string())?;
+        let base_ids: Vec<String> = base.revocation_ids().iter().map(|i| revocation_id(i)).collect();
+        // Exactly the token without its grant blocks (appended last): a child never inherits its
+        // parent's grants.
+        let first_party = ids.len().saturating_sub(spec.grants.len());
+        if base_ids.is_empty() || base_ids.len() != first_party || base_ids[..] != ids[..first_party] {
+            return Err(format!("the base token isn't box {parent}'s, without its grants"));
+        }
+        let issuer = Issuer {
+            base,
+            run: spec.run.clone(),
+            box_path: spec.box_path.clone(),
+            epoch: spec.epoch,
+            zone: spec.zone.clone(),
+            issuer_cert: spec.issuer_cert.clone(),
+            org: spec.org.clone(),
+        };
+        let record = issuer.child(child, 0, zone, ceiling).map_err(|e| e.to_string())?.record().map_err(|e| e.to_string())?;
+        self.put_local(record.clone())?;
+        Ok(record)
+    }
+
+    /// Box `run`'s path in its spawn tree, if the node holds its authority.
+    pub fn box_path_of(&self, run: &str) -> Option<String> {
+        self.entry(run).map(|z| z.spec.box_path.clone())
+    }
+
+    /// The org layer box `run`'s block 0 carries (#51), as data.
+    pub fn org_of(&self, run: &str) -> Option<authz::OrgLayer> {
+        self.entry(run).and_then(|z| z.spec.org.clone())
+    }
+
     /// The zone a box's authority was minted from, if the node holds it.
     pub fn zone_of(&self, run: &str) -> Option<&ZoneSpec> {
-        self.state().and_then(|s| s.zones.get(run)).map(|z| &z.spec.zone)
+        self.entry(run).map(|z| &z.spec.zone)
     }
 }
 
@@ -437,6 +505,20 @@ impl Issuer {
     /// revoking it revokes this box and every box below it.
     pub fn block_ids(&self) -> Vec<String> {
         self.base.revocation_ids().iter().map(|i| revocation_id(i)).collect()
+    }
+
+    /// The record of the base token alone, without grants.
+    pub fn record(&self) -> Result<BoxAuthority, authz::AuthzError> {
+        Ok(BoxAuthority {
+            run: self.run.clone(),
+            box_path: self.box_path.clone(),
+            epoch: self.epoch,
+            zone: self.zone.clone(),
+            token: B64.encode(self.base.to_bytes()?),
+            grants: vec![],
+            issuer_cert: self.issuer_cert.clone(),
+            org: self.org.clone(),
+        })
     }
 
     /// The record to publish: the base token with one grant block per live grant, signed by

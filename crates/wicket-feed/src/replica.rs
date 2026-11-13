@@ -38,7 +38,7 @@
 
 use crate::format::{Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, RevokeKind, Snapshot};
 use crate::jws::{kid, open, sha, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
-use crate::state::{Policy, State};
+use crate::state::{Policy, State, Zone};
 use crate::store::{append_line, lines, read_opt, write_atomic};
 use crate::{Refusal, DEFAULT_FUTURE_TOLERANCE_MS, HEADS_KEPT};
 use ed25519_dalek::VerifyingKey;
@@ -205,6 +205,10 @@ pub struct Replica<P: Policy> {
     issued_floor: i64,
     /// Uses of counted grants on this node.
     used: HashMap<String, u32>,
+    /// Entries this node derived itself, not from the feed (#164: a child's token, attenuated from
+    /// its parent's on the node): decided from as feed entries are, until the feed holds the same
+    /// name. Never part of the feed's state, its snapshots or its chain.
+    local: BTreeMap<String, Zone<P>>,
     dir: Option<PathBuf>,
     pub stats: Stats,
 }
@@ -254,6 +258,7 @@ impl<P: Policy> Replica<P> {
             vouched: None,
             issued_floor: i64::MIN,
             used: HashMap::new(),
+            local: BTreeMap::new(),
             dir: None,
             stats: Stats::default(),
         }
@@ -650,6 +655,7 @@ impl<P: Policy> Replica<P> {
                     self.vouched = None;
                 }
                 self.state = Some(State::from_snapshot(&s, self.ctx.clone()));
+                self.recheck_local();
                 self.revouch();
                 self.persist_statements().map_err(io)
             }
@@ -658,6 +664,7 @@ impl<P: Policy> Replica<P> {
                     append_line(&dir.join(DELTAS), &jws).map_err(io)?;
                 }
                 self.apply_delta(&d, head);
+                self.recheck_local();
                 self.revouch();
                 self.persist_statements().map_err(io)
             }
@@ -719,6 +726,52 @@ impl<P: Policy> Replica<P> {
             return Err(Decision::Forbidden(format!("run {} is revoked", op.run)));
         }
         Ok((mode, st))
+    }
+
+    /// Adds an entry this node derived itself (#164), compiled as a feed entry is, against the
+    /// revocations the feed holds: refused if it doesn't compile (a token that doesn't verify
+    /// against the root, or contains a revoked block). A later revocation invalidates it as it does
+    /// a feed entry.
+    pub fn put_local(&mut self, spec: P) -> Result<(), String> {
+        let compiled = {
+            let st = self.state.as_ref();
+            let revoked = |k: RevokeKind, id: &str| st.is_some_and(|s| s.is_revoked(k, id));
+            spec.compile(&self.ctx, &revoked)?
+        };
+        self.local.insert(spec.zone_name().to_string(), Zone { spec, compiled: Ok(compiled) });
+        Ok(())
+    }
+
+    /// What compiling an entry needs (for tokens, their root key).
+    pub fn ctx(&self) -> &P::Ctx {
+        &self.ctx
+    }
+
+    /// Drops an entry this node derived (its box ended, or the feed now holds it).
+    pub fn drop_local(&mut self, name: &str) {
+        self.local.remove(name);
+    }
+
+    /// An entry this node derived, if it holds one by that name.
+    pub fn local(&self, name: &str) -> Option<&P> {
+        self.local.get(name).map(|z| &z.spec)
+    }
+
+    /// The entry decisions use for `name`: the feed's, else one this node derived.
+    pub(crate) fn entry(&self, name: &str) -> Option<&Zone<P>> {
+        self.state.as_ref().and_then(|s| s.zones.get(name)).or_else(|| self.local.get(name))
+    }
+
+    /// Applies the feed's revocations to the entries this node derived.
+    fn recheck_local(&mut self) {
+        let Some(st) = &self.state else { return };
+        for z in self.local.values_mut() {
+            if let Ok(c) = &z.compiled {
+                if let Some((k, id)) = st.revoked_keys().find(|(k, id)| P::revoked_by(c, *k, id)) {
+                    z.compiled = Err(format!("revoked ({k:?} {id})").to_lowercase());
+                }
+            }
+        }
     }
 
     /// Records one use of a counted grant, durably before it is honoured.

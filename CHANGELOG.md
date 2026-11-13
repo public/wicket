@@ -144,6 +144,11 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   and the reconciler provisions, places children and destroys nodes at the lease's end
   ([#98](https://github.com/public/wicket/pull/98)).
 
+- Decisions at the edge: a node answers the MCP gateway's tools from the box's token, starts narrower
+  children itself (their tokens attenuated there, taken over by the control host when it can be
+  reached), and carries messages and links between its own boxes; cut off, what needs a human is
+  queued on the node. Protocol 5 ([#164](https://github.com/public/wicket/issues/164)).
+
 ### Long-lived agents
 
 - Volumes that persist between runs of a zone, follow-ups (`wicket say`), idle sessions, and in-place
