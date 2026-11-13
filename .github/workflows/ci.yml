@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # GitHub's merge queue (#220): each queued PR is tested on top of the latest main, and of the PRs
+  # ahead of it, before it lands. The queue itself is a repository setting the owner turns on; its
+  # required checks must run on this event, which these jobs do as they are.
+  merge_group:
 
 permissions:
   contents: read
