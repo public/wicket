@@ -1,10 +1,13 @@
 # Remote nodes, placement and leases
 
-Reference for running boxes on other machines. The README has the short version; [concepts.md](../explanation/concepts.md) explains the feed and leases.
+What happens when boxes run on other machines: enrolment, `wicket node serve`, placement and leases.
+[Concepts](../explanation/concepts.md) explains the feed and leases. To set a node up, see [add a
+remote node](../how-to/add-a-remote-node.md) and [place nodes on Vultr](../how-to/place-nodes-on-vultr.md).
 
 ## Enrolment
 
-`wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`).
+`wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`;
+the node also needs the agent image, `~/.local/bin/wicket image` there).
 On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress, its model
 calls and its injected credentials locally, from a signed policy feed and the secrets it fetched, so the
 box keeps working while the control host is unreachable, for exactly as long as its grants last (#57, #152,
@@ -41,9 +44,11 @@ Sharing the filesystem is used only as transport:
 - it can mount a directory of the control host's in a box: an in-place `--workspace-dir`, and a wrapped
   session's directory. Wrapped sessions (`wicket wrap`, which hands the box its launcher's own stdio
   protocol) are the one thing only the local node runs. Long-lived agents hibernate and wake on any
-  node, their state moved over the channel (`PutTree`/`GetTree`; [agents.md](agents.md)), and an in-place
+  node, their state moved over the channel (`PutTree`/`GetTree`; [agents](agents.md#hibernate-and-wake)), and an in-place
   `--workspace-dir` on a remote node is copied there before the box starts and synced back into the
   operator's directory when it ends (deletions included; its `out/` stays the operator's).
+
+The commands, in order ([add a remote node](../how-to/add-a-remote-node.md) has the walk-through):
 
 ```sh
 wicket node token --name n1 --ttl 1h        # prints a one-time join token (stored hashed)
@@ -95,7 +100,7 @@ wicket node revoke n1
   a link to its `current`), checks its sha256 there, and installs a `systemd --user` unit, `wicket-node`, that
   runs `wicket node serve`. `node-setup.sh` enables lingering for the `wicket` user so the unit runs without a
   login. `serve` talks to a control host whose protocol version is at most one away from its own (#162), so the
-  control host and its nodes are updated one at a time: `wicket self update --nodes` ([operations.md](../explanation/updates.md)).
+  control host and its nodes are updated one at a time: `wicket self update --nodes` ([update and roll back](../how-to/update-and-roll-back.md); [protocol](protocol.md#versions-and-skew)).
 - **The node owns the box.** It starts the box detached (`docker run -d`) and relays its stdin, stdout and
   stderr over one multiplexed, length-prefixed control channel: `ssh <pinned> <node> wicket node attach`, which
   joins the ssh session to `serve`'s unix socket (`~/.local/share/wicket-node/ctl/ctl.sock`, directory 0700).
@@ -144,7 +149,7 @@ wicket node revoke n1
   restart of `serve` while cut off loses the cache: model calls and injected hosts stop until reconnect,
   while plain egress the token allows goes on. A self-update's re-exec (`wicket self update`, #162) hands
   the cache to the new process through a sealed memfd, never a file. What this protects, and what it
-  doesn't: [limits.md](../explanation/limits.md).
+  doesn't: [limits](../explanation/limits.md#remote-nodes).
 - **What a node holds** shows in `wicket node list`, one line per run this host supervises there: when
   the box's authority ends (or that the node confirmed it stopped), the secrets released to the node for
   it (by name, never values) and its budget slice. It is this host's record of what it released and
@@ -285,7 +290,7 @@ region, duration, an hourly price cap, a reason). Capacity is a **lease**, never
 ```sh
 wicket reconcile --dry-run        # what one pass would change
 wicket reconcile                  # one pass
-wicket reconcile --every 30s      # the daemon: run it beside `wicket serve`, e.g. as a systemd user service
+wicket reconcile --every 30s      # the daemon: installed, the wicket-reconcile unit runs it (--every 1m)
 wicket lease list                 # status, holder run, node, reserved, end, billed
 wicket lease release <lease>      # end it now (one pass)
 ```

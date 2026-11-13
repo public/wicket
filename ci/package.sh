@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The release archive (.github/workflows/release.yml): the binary, deploy/ and images/, so that
-# `sudo <archive>/deploy/install.sh` needs nothing else. Prints the archive's path.
+# The release archive (.github/workflows/release.yml): the binary, deploy/install.sh and
+# deploy/systemd/, images/, examples/, README.md and LICENSE, so that `sudo <archive>/deploy/install.sh`
+# needs nothing else. docs/ is not in it. Prints the archive's path.
 #   ci/package.sh BINARY OUTDIR
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
