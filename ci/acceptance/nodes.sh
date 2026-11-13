@@ -213,6 +213,9 @@ offline_flow() {
     '! grep -rlsF "$value" "$nd" && ! timeout 60 grep -rlsF --exclude-dir="$(basename "$work")" "$value" /tmp'
   check "  the node fetched it once, for this run, and the control host audited it" \
     '[ "$(w audit --tail 2000 | grep node.secret_fetch | grep -c "$r")" -ge 1 ] && [ "$(w audit --tail 2000 | grep node.secret_fetched | grep -c "$r")" -eq 1 ]'
+  w node list >"$work/node-list.log" 2>&1 || true
+  check "  wicket node list shows what $NODE holds for it: authority, secrets by name, budget slice" \
+    'grep -A20 "^$NODE " "$work/node-list.log" | grep "$r" | grep "authority until" | grep "secrets mock-offline" | grep -q "budget slice up to" && ! grep -q "$value" "$work/node-list.log"'
   log "cutting $r's control channel"
   mv "$nd/ctl/ctl.sock" "$nd/ctl/ctl.sock.off"
   local t_cut; t_cut=$(date +%s%3N)

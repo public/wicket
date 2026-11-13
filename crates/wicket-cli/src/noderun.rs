@@ -1144,6 +1144,72 @@ pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
     (!a.stopped && now_ms < until).then_some((a.node, until))
 }
 
+/// What this host has released and leased to a run's node (#152), kept beside the run
+/// (`ctl/holdings.json`) for `wicket node list`: the secrets the node fetched for the run (by name,
+/// never values) and its budget slice. An upper bound: the node may have dropped some already, never
+/// holds more.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Holdings {
+    pub secrets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice: Option<wicket_proxy::llm::Slice>,
+    /// When this was last written (Unix ms).
+    pub updated_ms: i64,
+}
+
+fn save_holdings(sh: &Shared, p: &Progress) {
+    let mut secrets: Vec<String> = p.fetched.keys().cloned().collect();
+    secrets.sort();
+    let h = Holdings { secrets, slice: p.slice, updated_ms: wicket_feed::now_ms() };
+    let f = sh.dir.join("ctl").join("holdings.json");
+    let tmp = f.with_extension("tmp");
+    if std::fs::write(&tmp, serde_json::to_vec(&h).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, &f);
+    }
+}
+
+pub fn read_holdings(run_dir: &Path) -> Option<Holdings> {
+    serde_json::from_slice(&std::fs::read(run_dir.join("ctl").join("holdings.json")).ok()?).ok()
+}
+
+/// What node `node` holds for the runs this host supervises there, as far as this host knows: each
+/// running run's authority, the secrets released to it and its budget slice.
+pub fn node_holdings(l: &Ledger, node: &str) -> Result<Vec<(String, Option<AuthorityRecord>, Holdings)>> {
+    let mut v = vec![];
+    for (run, _) in l.running_runs()? {
+        if l.run_node(&run)?.as_deref() != Some(node) || crate::run::check_run_id(&run).is_err() {
+            continue;
+        }
+        let dir = crate::data_dir().join("runs").join(&run);
+        v.push((run, read_authority(&dir), read_holdings(&dir).unwrap_or_default()));
+    }
+    Ok(v)
+}
+
+/// One line of a run's holdings on its node.
+pub fn holdings_line(run: &str, a: Option<&AuthorityRecord>, h: &Holdings, now_ms: i64) -> String {
+    let auth = match a {
+        Some(a) if a.stopped => "box stopped (confirmed by the node)".to_string(),
+        Some(a) if a.until_ms <= now_ms => format!("authority ended {}", fmt_ms(a.until_ms)),
+        Some(a) => format!("authority until {}", fmt_ms(a.until_ms)),
+        None => "authority: no record".to_string(),
+    };
+    let secrets = match h.secrets.is_empty() {
+        true => "no secrets".to_string(),
+        false => format!("secrets {}", h.secrets.join(",")),
+    };
+    let slice = match &h.slice {
+        Some(s) => format!(
+            "budget slice up to {} requests, {} output tokens{}",
+            s.requests,
+            s.output_tokens,
+            s.input_tokens.map(|i| format!(", {i} input tokens")).unwrap_or_default()
+        ),
+        None => "no budget slice".to_string(),
+    };
+    format!("  {run}  {auth}  {secrets}  {slice}")
+}
+
 /// When (Unix ms) as a readable UTC time.
 pub fn fmt_ms(ms: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp(ms / 1000)
@@ -1191,6 +1257,7 @@ fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     }
     p.lease_sent = true;
     p.slice = Some(slice);
+    save_holdings(sh, p);
     Some(Frame::Msg(Msg::Lease { run: sh.run.0.clone(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }))
 }
 
@@ -1201,6 +1268,7 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     let (ok, why) = match &r {
         Ok(f) => {
             p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
+            save_holdings(sh, p);
             (true, None)
         }
         Err(e) => (false, Some(e.clone())),
@@ -1229,6 +1297,7 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
         let now = crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.token_root.1).ok().map(|f| crate::nodesecrets::digest(&f));
         if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
             p.fetched.remove(&name);
+            save_holdings(sh, p);
             println!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
             out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
         }
@@ -1443,6 +1512,26 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #152: `wicket node list` shows, per run on a node, its authority, the secrets released to it
+    /// (by name) and its budget slice.
+    #[test]
+    fn a_runs_holdings_read_as_one_line() {
+        let h = Holdings {
+            secrets: vec!["claude-oauth".into(), "gh".into()],
+            slice: Some(wicket_proxy::llm::Slice { requests: 75, output_tokens: 100_000, input_tokens: None }),
+            updated_ms: 0,
+        };
+        let a = AuthorityRecord { node: "n1".into(), until_ms: 1_794_500_000_000, stopped: false };
+        let line = holdings_line("run_x", Some(&a), &h, 1_794_400_000_000);
+        assert!(line.contains("authority until 2026-"), "{line}");
+        assert!(line.contains("secrets claude-oauth,gh"), "{line}");
+        assert!(line.contains("budget slice up to 75 requests, 100000 output tokens"), "{line}");
+        assert!(holdings_line("run_x", Some(&a), &h, 1_794_600_000_000).contains("authority ended"));
+        let stopped = AuthorityRecord { stopped: true, ..a };
+        assert!(holdings_line("run_x", Some(&stopped), &Holdings::default(), 0).contains("box stopped"));
+        assert!(holdings_line("run_x", None, &Holdings::default(), 0).contains("no secrets  no budget slice"));
+    }
 
     /// #153, the wake fence: while a box's authority is live on a node this host can't hear, its
     /// agent isn't woken elsewhere; it can be once the authority (plus skew) has ended, or as soon
