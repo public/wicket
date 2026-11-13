@@ -1,6 +1,9 @@
 # Agents: identity, children, links, sessions and hibernation
 
-Reference for what an agent can do inside wicket. The README has the short version; [concepts.md](concepts.md) explains the ideas.
+What an agent is and can do inside wicket: its identity, its children and messages, links, sessions,
+and hibernation. [Concepts](../explanation/concepts.md) explains the ideas; the
+[manifest](manifest.md) and the [MCP tools](mcp-tools.md) have every field and argument; [the
+box](box.md) is what the agent sees from inside.
 
 ## Agent identity and child agents
 
@@ -41,7 +44,7 @@ These are general features for any workload:
   datasets, any state.
 - **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
   a follow-up, which becomes its next turn.
-- **Long-lived agents hibernate and wake** (see below).
+- **Long-lived agents hibernate and wake** (below; [how to](../how-to/hibernate-and-wake-an-agent.md)).
 - **`agent.image`** names the image the agent's box starts from (default: the installation's current agent
   image), e.g. a project's own toolchain image. Any other image must be listed in `zone.images`, as for
   `spawn`; a manifest naming one outside it is refused. `wicket run` and runs started from the console use
@@ -52,7 +55,8 @@ These are general features for any workload:
   there (requests go without the header, noted once per run in the audit log, and a host allowed
   wholesale is spliced). `{basic:USER}` renders an HTTP Basic credential (e.g. git over HTTPS with a token).
 
-`examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
+`examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README and
+[run wicket in wicket](../how-to/run-wicket-in-wicket.md).
 
 ## Hibernate and wake
 
@@ -114,72 +118,13 @@ Not yet: signing of bundles, an S3 backend, and the gVisor checkpoint fast path.
 and its working directory at the same path, and a node's channel may drop output while disconnected, which
 that protocol can't survive.
 
-## Inside the box
+## Remote sessions and wrapped agents
 
-wicket's proxy, model route and MCP gateway are at `wicket.internal` (198.18.0.1, set up by the box's entry
-script), so the agent has all of localhost for its own servers. Links to other boxes get addresses from
-198.18.1.1 onward and names in the box's hosts file, which wicket owns and the box can only read. The entry script adds that address as root
-with only the network-admin capability, then runs everything as the agent's user with no capabilities.
+Two ways for the owner to drive an agent in a box from the vendor's apps: `agent.remote`, which
+boots the harness's own remote-session feature in the box (#169), and `wicket wrap`, which boxes an
+agent process another program launches. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
+has both, with what each protects.
 
-The box's resolver is wicket.internal:53: wicket answers every query itself, so a lookup can't carry data
-out. Every host the zone can reach resolves to its own address in 198.19.0.0/16 (on the box's loopback);
-QUIC sent there is relayed to wicket over a bind-mounted unix socket and served as that host. Under gVisor
-each UDP datagram is costly (about 110 µs of CPU in the box), so HTTP/3 downloads run at 40–100 Mbit/s with
-the usual 1452-byte packets. `WICKET_H3_BOX_MTU=16000` lets the box's leg (loopback and a unix socket, no
-real link) use 16000-byte packets for clients that accept them: 430–460 Mbit/s in #92's measurements.
-`WICKET_H3_HTTPS_RECORDS=0` stops wicket answering HTTPS (`alpn=h3`) DNS records.
-The forwarder holds UDP port 443 on every address in the box (it catches QUIC to any synthetic address),
-so a server in the box can't take UDP 443, even on 127.0.0.1; TCP 443 and every other port stay the agent's.
-
-## Remote sessions: a box you drive from the vendor's app (#169)
-
-`agent.remote: { name: <session name> }` boots the harness in the box with its own remote-session
-feature on, so the box registers a session with the vendor and the owner drives it from the vendor's
-apps. The task is optional: the first message comes from the app. Harness adapters that have no such
-feature refuse the manifest, saying so. For `kind: claude-code` it is Remote Control:
-`claude remote-control --spawn session` in the box, which shows up in the Claude apps (desktop, web,
-phone); `examples/remote-control-box.yaml` is a whole zone for it.
-
-- **The account login never enters the box.** A remote session needs the owner's full login (for
-  Claude, the claude.ai OAuth login: it can list and drive the account's sessions), not an inference
-  token. Link it by reference, bound to the provider's hosts:
-
-  ```sh
-  wicket secret link claude-login --file ~/.claude/.credentials.json \
-      --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt --hosts api.anthropic.com
-  ```
-
-  and name it as the zone's `llm.secret`. The box gets a placeholder login (a credentials file whose
-  access token is a placeholder, expiring far ahead, and a refresh token that refreshes nothing).
-  The egress proxy swaps the placeholder for the real access token on the hosts the secret is bound
-  to, and only on the paths the zone's reach allows. The secret is read at each use, so the host's own
-  Claude Code keeps it fresh; the refresh token never leaves the host. The per-session tokens the API
-  hands the box for its session go up as the box sent them, since they aren't wicket's to hold.
-  Only the login's non-secret account fields reach the box (scopes, plan, and the account and
-  organization ids Claude Code checks before it starts Remote Control; not the holder's name).
-- **Reach is the authority.** Everything the zone reaches on the provider's host is reached with the
-  owner's login, so the example names only what a session needs (registering its environment, its
-  work and worker channel, model calls, the profile), forbids the account's connectors
-  (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`) and token refresh outright, and leaves everything
-  else (other sessions, triggers, memory) to a human's decision, as in any zone: deny those.
-- **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the
-  workspace is trusted, Remote Control's one-time prompt is answered, wicket's gateway is the only MCP
-  server, and the sandbox notice is the user memory. Claude Code asks in the app before it acts
-  (permission mode `default`); wicket decides what the box can reach either way.
-- **Where to open it.** `wicket run` prints `[wicket] remote session: <url>` when the session is up,
-  it is recorded as `run.remote_session`, and the console links it on the run's card.
-- **Nodes.** It runs on any node: the node forwards the provider's host to the control host, where the
-  login is swapped in, so the secret stays with the control host.
-- **Not with hibernation.** The session lives in the vendor's apps, so `hibernate_after` is refused;
-  the box ends with its session. A supervisor that is handed over (`wicket self update`, #151) rebuilds
-  the swap from the manifest.
-
-## Agents launched by something else, e.g. Remote Control
-
-`wicket wrap --manifest <m> -- <agent command line>` runs an agent that another program launches inside a box,
-with stdio connected through. `examples/remote-control/` uses it as Claude Code's `CLAUDE_CODE_PROCESS_WRAPPER`,
-so a session you drive from the Claude app runs in gVisor. It holds only placeholder credentials, which the
-proxy swaps for the real ones on `api.anthropic.com` alone. See its manifest for the reach a session needs.
-
-Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone doesn't name
-look like it doesn't exist. Agents ask ahead for reach with `request_access`.
+Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone
+doesn't name look like it doesn't exist ([manifest](manifest.md#zone)). Agents ask ahead for reach
+with `request_access`.

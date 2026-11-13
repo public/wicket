@@ -410,7 +410,7 @@ Also built since then:
 - the principal and delegation chain in every identity, shown with every request.
 
 Built since: minimal node enrolment (#16): a join token, a pinned host key, a node key and a short-lived,
-name-constrained node CA (see [nodes.md](nodes.md)). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
+name-constrained node CA (see [nodes.md](../reference/nodes.md)). Not built: signed result attestations, RFC 9421 egress signatures, X.509 node certificates
 for an mTLS transport, root and issuing key separation, and federation with other installations.
 
 Built since (#12): **wicket as its own system user.** `wicketd` (`wicket daemon`) runs as `wicket`, which owns the
@@ -2070,7 +2070,7 @@ own channels.
   - "Narrow and approve" is one tap: one file instead of the directory, one use instead of standing access.
   - *PoC status:* implemented. The challenge is `sha256(nonce || canonical decision JSON)`; each record
     stores (clientDataJSON, authenticatorData, signature) and is re-verified by `wicket audit --verify`.
-    Revoked passkeys keep their public keys for that check (`docs/poc-results.md`).
+    Revoked passkeys keep their public keys for that check (`docs/explanation/poc-results.md`).
 - **Auth and exposure:**
   - passkeys (WebAuthn) as the primary login, OIDC optional;
   - listens on localhost by default and is published through a tailnet or an authenticating reverse proxy,

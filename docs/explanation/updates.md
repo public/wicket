@@ -1,19 +1,15 @@
-# Operations: updating wicket
+# How updates work
 
 `wicket self` (#162) updates an installation to another wicket build: the control host first, then its
 nodes, a canary first, each switched blue/green, watched by a health gate, and switched back if the gate
 fails. A build an agent made in a box can be installed too, once a human approves it. This page is the
-design and the runbook; `ci/update.sh` is the test.
-
-```sh
-sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # signed by a trusted release key
-sudo wicket self status                                                # versions, current and previous, schema
-sudo wicket self rollback --nodes all                                  # everything back to previous
-```
+design; [update and roll back](../how-to/update-and-roll-back.md) is the runbook, and `ci/update.sh` is
+the test.
 
 ## Versions on disk
 
-Each build is a directory named by its **build id**, the first 12 hex digits of the binary's sha256:
+Each build is a directory named by its **build id**, the first 12 hex digits of the binary's sha256
+([files](../reference/files.md#versions)):
 
 ```
 /var/lib/wicket-versions/            (the versions root; the wicket user's, 0755)
@@ -71,31 +67,14 @@ that skips verification.
 the daemon's own uid either, which runs runs' supervisors, proxies and gateways. An agent can only ask:
 `request_update` files an R4 request and returns; nothing an agent can call updates wicket.
 
-### The release key (documented, not exercised by the project's own releases)
-
-```sh
-wicket self keygen release.key          # release.key (private: keep it offline) and release.key.pub
-wicket self sign --key release.key wicket-0.0.2-x86_64-linux.tar.gz    # writes ….tar.gz.sig
-sudo deploy/install.sh --release-key release.key.pub                   # or: sudo wicket self trust-key release.key.pub
-```
-
-The key never needs to be on a control host: sign where the release is built, ship the `.sig` beside the
-archive. Rotate by trusting the new key, signing with it, and deleting the old `.pub` from
-`release-keys/`.
-
 ## Protocol versions and skew
 
 Nodes used to refuse any control host running another build, which made every update all-or-nothing.
-Now the control channel is versioned (`chan.rs`): `Hello` and `Welcome` carry the protocol version each
-end speaks; two ends talk if the versions are **at most one apart**, at the lower one. So:
-
-- a control host at N talks to nodes at N−1 and N (the rollout: control host first);
-- a node at N talks to a control host at N−1 (the control host rolled back) and N+1.
-
-`wicket self update` refuses a build more than one protocol version from the running one. A message
-added in version N is sent only on a connection that negotiated N or later, since an older peer drops a
-connection on a message it can't parse; a field added with a default needs no new version. The build
-(sha256) is still exchanged, for the logs and for the gate's checks.
+Now the control channel is versioned: two ends talk if their protocol versions are at most one apart,
+at the lower one. So the control host can go first, and its nodes follow one at a time; a node at N
+also talks to a control host rolled back to N−1. `wicket self update` refuses a build more than one
+protocol version from the running one. The rules for changing the protocol, and what each version
+added, are in [protocol](../reference/protocol.md#versions-and-skew).
 
 ## The rollout
 
@@ -156,48 +135,16 @@ newest that has opened it) and its **floor** (the oldest that may open it) in `s
   switch to it. A contract step ships only in a release after the one whose expand step stopped anything
   from reading the old shape.
 - **Never destructive on the way up**: the snapshot taken before every switch is the way back past a
-  contract step. To restore one: stop wicket's services (`sudo systemctl stop wicketd wicket-console
-  wicket-reconcile`), copy the snapshot over `/var/lib/wicket/ledger.db` (as the wicket user, removing
-  `ledger.db-wal` and `ledger.db-shm`), switch `current` back by hand (`ln -sfn <id> current.new && mv -T
-  current.new current` in the versions root), and start them again. Runs started after the snapshot
-  aren't in it, and reconcile leaves alone the boxes of runs its ledger doesn't know: stop those by hand
-  (their containers carry a `wicket.run` label).
+  contract step. [Update and roll back](../how-to/update-and-roll-back.md#restore-a-ledger-snapshot)
+  has the procedure.
 
-With #154's state store configured, the snapshot belongs there too; until that lands, snapshots are local.
-
-## An installed host, and development mode
-
-- **Installed** (`deploy/install.sh`): `sudo wicket self update …` is forwarded to wicketd and runs as the
-  wicket user, which owns the versions root, so no step needs root inside wicketd. The systemd units are
-  unchanged by an update (they run `/usr/local/bin/wicket`, which follows `current`); an update that needs
-  new units, or a new agent image, says so in its release notes: run `install.sh` from the new archive,
-  or `sudo wicket image`. The artifact must be readable by the wicket user (`/tmp` is). Root runs a binary
-  the wicket user could replace; that gives the wicket user nothing new, since it is in the docker group,
-  which is root on the host.
-- **Development mode**: the same commands as the data directory's owner. There is no service manager:
-  this host's node's `serve` and any console or `reconcile --every` started from a staged version
-  re-execute on SIGHUP as above; anything started from elsewhere keeps running its own build until
-  restarted.
-
-## Building wicket in a wicket box, and updating to that build
-
-1. A zone that can build: reach `github.com` (the checkout), `index.crates.io`, `static.crates.io`,
-   `crates.io` and `static.rust-lang.org` (GET only), memory for a release build (`limits: { memory: 6g,
-   cpus: 2, timeout: 2h }`), and an image with a Rust toolchain (`rustup` on the agent image, or one built
-   with `wicket image --dir`).
-2. The agent builds and packages: `cargo build --release --locked -p wicket-cli && ci/package.sh
-   target/release/wicket /workspace/out`, and runs the tests it should (`cargo test --workspace --locked`).
-3. It asks: the `request_update` tool with the archive's sha256 (`sha256sum`) and where it is. That files
-   an R4 request, `UPDATE wicket.internal/self/<sha256>`, and nothing else.
-4. A human reads the request (`wicket pending`), copies the archive out of the run's workspace
-   (`<data dir>/runs/<run>/workspace/out/`, or the node's run directory for a box on a node), checks its
-   sha256 against the request, and approves it: `sudo wicket approve <request>`.
-5. The operator updates: `sudo wicket self update /tmp/wicket-…tar.gz --nodes all`. The approval is used
-   up; a second update to the same artifact needs a second approval. Like every grant made for an agent's
-   request, it lapses if the agent's identity is revoked first, so update before ending the agent.
+The snapshots are local files (`<data dir>/snapshots/<unix time>-<old build id>.db`). The state store
+(#154) streams the ledger itself off the host, but doesn't hold these snapshots yet.
 
 ## Not yet
 
 - The control host's own wicketd re-executes only once no command runs through it, so a long `wicket
   attach` session delays it (it logs that it is waiting).
-- `self update` doesn't install new systemd units or rebuild the agent image (above).
+- `self update` doesn't install new systemd units or rebuild the agent image: an update that needs
+  either says so in its release notes ([update and roll back](../how-to/update-and-roll-back.md)).
+- Ledger snapshots aren't copied to the state store.

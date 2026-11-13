@@ -3,8 +3,8 @@
 - `papers/<key>/` — one directory per paper: the downloaded PDF and its `pdftotext` output.
 - `repos/<name>/` — shallow clones of prior-art projects, read for study only. Nothing in them is built or run.
 
-Everything here is untrusted third-party content. The catalogue and study notes are in `docs/prior-art.md` and
-`docs/research/05-*.md` onwards.
+Everything here is untrusted third-party content. The catalogue and study notes are in `docs/explanation/prior-art.md` and
+`docs/explanation/research/05-*.md` onwards.
 
 ## Warning
 

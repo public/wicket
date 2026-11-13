@@ -90,7 +90,7 @@ impl BillingModel {
     }
 }
 
-/// The paid-time pool rules (the broker's, in docs/research/10-infrastructure.md §2).
+/// The paid-time pool rules (the broker's, in docs/explanation/research/10-infrastructure.md §2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolRules {
     /// Keep a released node warm only if at least this much paid time is left.

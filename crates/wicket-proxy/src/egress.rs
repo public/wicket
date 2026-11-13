@@ -160,7 +160,7 @@ impl Egress {
             // per host carries many box connections' requests (#142). Fixed windows large enough for
             // a far upstream (8 MiB at 100 ms is 80 MB/s per stream) and 1 MiB frames: hyper's
             // adaptive window measured at less than half the download rate, and 16 KiB frames cost
-            // CPU on both ends (docs/performance.md).
+            // CPU on both ends (docs/explanation/performance.md).
             .http2_initial_stream_window_size(H2_STREAM_WINDOW)
             .http2_initial_connection_window_size(H2_CONN_WINDOW)
             .http2_max_frame_size(H2_MAX_FRAME)

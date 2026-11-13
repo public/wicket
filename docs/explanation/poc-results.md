@@ -28,7 +28,7 @@ The Vultr node lived 215 s and cost about $0.02.
   a non-loopback listen is refused.
 - Approving through the console's API unblocked a waiting agent: three pending retries, then allowed by the
   grant.
-- Screenshot: `docs/console-poc.png`.
+- Screenshot: `docs/images/console-poc.png`.
 
 **MCP gateway (`await_grant`):**
 - Claude Code connects to wicket's MCP server, its only one, through a third forwarded socket (`status:

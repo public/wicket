@@ -587,7 +587,7 @@ fn nodes_dont_depend_on_cedar() {
     }
 }
 
-/// The example org policy (docs/policy.md) compiles, and does what the docs say.
+/// The example org policy (docs/reference/policy.md) compiles, and does what the docs say.
 #[test]
 fn the_example_org_policy_compiles_as_documented() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/policy");

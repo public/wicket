@@ -1,9 +1,12 @@
 # The operator console
 
-Reference for `wicket serve`. The README has the short version.
-
 The console (`wicket serve`) shows what's waiting for you, runs, recent decisions and activity, and you approve
-or deny from a browser or phone. It uses **passkeys**:
+or deny from a browser or phone. Its options are in the [command line reference](cli.md#wicket-serve); [put the console on the
+internet](../how-to/put-the-console-on-the-internet.md) sets it up behind TLS.
+
+## Passkeys
+
+It uses **passkeys**:
 - passkeys are enrolled only through one-time links from the host: `wicket serve` prints one at start-up while no
   passkey exists, and `wicket operator enrol-link [--ttl 10m] [--origin URL]` prints a fresh one at any time
   (single use, 10 minutes by default and at most 1 hour; the session it opens can only enrol one passkey).
@@ -20,6 +23,8 @@ or deny from a browser or phone. It uses **passkeys**:
   nothing on the page is redrawn. Pending cards are kept by request id, and a tap within a moment of the cards
   moving is ignored, so an agent can't slide another request under your finger;
 - `wicket operator reset` (host only) revokes passkeys but keeps their public keys for verification.
+
+## Actions
 
 Signed in, the console can also do what was CLI-only, each action signed with a fresh passkey assertion over
 exactly its parameters, checked again when applied, audited with the passkey that signed it and re-verified by
@@ -44,34 +49,15 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
 
-## The console on the public internet
+## On the internet
 
-The console is built to be reachable directly from the internet, with no VPN or access proxy in front (#23).
-Passkeys stay the only authentication.
+The console is built to be reachable directly from the internet, with no VPN or access proxy in front
+(#23). Passkeys stay the only authentication. This is what it enforces; the setup is in [put the
+console on the internet](../how-to/put-the-console-on-the-internet.md).
 
-```sh
-# HTTPS from wicket itself, with a Let's Encrypt certificate validated over TLS-ALPN-01 on this listener:
-wicket serve --listen 0.0.0.0:443 --acme-domain console.example.com --acme-agree-tos \
-    --acme-contact mailto:ops@example.com          # --acme-staging to try it out first
-# ...or with certificate files (re-read when they change, e.g. after certbot renews them):
-wicket serve --listen 0.0.0.0:443 --origin https://console.example.com \
-    --tls-cert /etc/wicket/fullchain.pem --tls-key /etc/wicket/privkey.pem
-# ...or behind a TLS-terminating proxy (which then must be the only way in):
-wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://console.example.com \
-    --trusted-proxy 10.0.0.2
-```
-
-- **Behind a TLS terminator** (nginx, HAProxy, Caddy, a cloud load balancer), `--trusted-proxy` is required. It
-  takes the address or range the proxy connects from, and is repeatable. Without it, every client would
-  look like the proxy: one client's failed sign-ins would lock everyone out, and a few slow connections
-  would fill the per-client connection cap. `X-Forwarded-For` is read only on connections from a trusted
-  proxy. All of its header lines are read, in order, and the client is the right-most entry that isn't a
-  trusted proxy. Anything further left is whatever the client sent. Two rules for the proxy:
-  - **It must add the address it saw.** nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
-    HAProxy: `option forwardfor`, which adds a header line of its own; wicket reads every line, so that
-    is fine. Caddy's `reverse_proxy` does it by default.
-  - **It must be the only way in.** Listen on an address that only the proxy can reach, or firewall the
-    port to the proxy. If there are several proxies in a chain, trust each of them.
+- **Client addresses.** `X-Forwarded-For` is read only on connections from a `--trusted-proxy`. All
+  of its header lines are read, in order, and the client is the right-most entry that isn't a
+  trusted proxy. Anything further left is whatever the client sent.
 - **Transport.** A non-loopback listener refuses to start in plain HTTP unless `--behind-tls-terminator` is given
   with an `https://` `--origin`. TLS is rustls: TLS 1.3, and TLS 1.2 with ECDHE and AEAD suites only; HTTP/1.1
   only (no h2, so there is one HTTP implementation to bound). HTTPS responses carry
@@ -108,4 +94,4 @@ wicket serve --listen 10.0.0.5:8787 --behind-tls-terminator --origin https://con
   and it starts runs through one launch callback (a detached `wicket run`), so moving launching behind a
   separate, more privileged process later changes only that callback.
 
-![console](console-passkey.png)
+![The console: a pending request with its verified identity, and the approve and deny buttons](../images/console-passkey.png)

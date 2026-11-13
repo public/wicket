@@ -1,6 +1,6 @@
 //! `wicket self` (#162): updates an installation to another wicket build, blue/green, with health
 //! gates and rollback, on the control host and then on its nodes. The design is in
-//! docs/operations.md ("Updating wicket"); in short:
+//! docs/explanation/updates.md ("Updating wicket"); in short:
 //!
 //! - **Versions side by side.** Each build is a directory named by its build id (the first 12 hex
 //!   digits of the binary's sha256) under a versions root, holding `wicket` and `manifest.json` (its
@@ -722,7 +722,7 @@ async fn control_switch(
     let schema = Ledger::schema_of(&crate::ledger_path())?;
     if target.describe.schema < schema.floor {
         bail!(
-            "{to} has schema {}, but the ledger has been through a contract step to schema {} (floor {}): it can't go back past it. Roll forward, or restore the snapshot taken before that update (see docs/operations.md)",
+            "{to} has schema {}, but the ledger has been through a contract step to schema {} (floor {}): it can't go back past it. Roll forward, or restore the snapshot taken before that update (see docs/explanation/updates.md)",
             target.describe.schema,
             schema.version,
             schema.floor

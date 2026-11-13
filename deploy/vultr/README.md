@@ -1,25 +1,19 @@
 # Running wicket boxes on a Vultr node
 
-The node is a **sandbox node that holds no secrets**: it runs Docker + gVisor only. wicket's proxies, the
-Claude subscription token, the per-run CA key and the ledger stay on the control host, and each run's two unix
-sockets are forwarded to the node with `ssh -R`. Nothing on the node listens on its public IP.
-
-Create a small Vultr instance (any plan with 2 GB RAM is plenty; Ubuntu 24.04), with an SSH key you hold on the
-control host. `wicket place create` (see [docs/nodes.md](../../docs/nodes.md)) creates, sets up and enrols one in a single step, with
-its host key pinned at creation; the steps below do the same by hand.
+`node-setup.sh` prepares a fresh Ubuntu 24.04 machine (on Vultr or anywhere else) as a wicket node:
+Docker with no bridge or firewall rules of its own, gVisor registered as `runsc`, and an unprivileged
+`wicket` user that the control host logs in as, with lingering enabled so its `wicket-node` service
+runs without a login.
 
 ```sh
-IP=<the node's IP>; K=<path to the SSH private key>
-
-ssh -i $K root@$IP 'bash -s' < deploy/vultr/node-setup.sh  # Docker + gVisor + user wicket
-# the build context `wicket image` assembles: the image directory plus the in-box forwarder's crate
-tar -cf - -C images/claude-code . -C ../../crates wicket-fwd/Cargo.toml wicket-fwd/src | ssh -i $K wicket@$IP \
-  'mkdir -p img && tar -C img -xf - && docker build -q --network host -t wicket/claude-code:poc img'
-
-./target/release/wicket run examples/hello-github.yaml --node wicket@$IP --ssh-key $K
-
-# before destroying the node: confirm it holds no secrets (see docs/poc-results.md), then destroy it
+ssh root@NODE 'bash -s' < deploy/vultr/node-setup.sh
 ```
 
-SSH is the PoC's node transport. It isn't resumable: if the connection drops, the run loses its route out.
-Other transports are an open question (design §21, "Node transport").
+Then enrol the node, install wicket there and run boxes on it:
+[add a remote node](../../docs/how-to/add-a-remote-node.md). `wicket place create` does all of it on
+Vultr in one step, with the node's host key pinned at creation:
+[place nodes on Vultr](../../docs/how-to/place-nodes-on-vultr.md).
+
+A node is trusted with the boxes it serves: it terminates their TLS and holds, in memory only, the
+secrets its runs use ([limits](../../docs/explanation/limits.md#remote-nodes)). Before destroying a
+node by hand, revoke it (`wicket node revoke NAME`); `wicket place release` does both.

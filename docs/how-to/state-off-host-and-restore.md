@@ -3,7 +3,7 @@
 A control host holds the ledger, the keys, hibernated agents' bundles and the audit chain. With the
 state store set up, losing the control host costs a restore of minutes and, for the ledger, at most
 its stream's sync interval (one second by default). This is phase 4 of the control-plane plan
-(docs/research/24-control-plane-ha.md §6.2, #154).
+(docs/explanation/research/24-control-plane-ha.md §6.2, #154).
 
 ## Where each thing goes
 
@@ -141,5 +141,5 @@ Then:
   which is in the kit.
 - **The kit isn't encrypted by wicket.** It's a tar of 0600 files holding every key that stays on the
   host, `state.key` and the vault (and the roots, if they are still on the host): whoever has it owns
-  the installation. Keep it offline and encrypted (docs/limits.md).
+  the installation. Keep it offline and encrypted (docs/explanation/limits.md).
 - **Runs in flight are lost** with their run directories, as above.
