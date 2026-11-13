@@ -23,7 +23,9 @@
 # bundled, the node keeps nothing of it, and a wake is bin-packed onto the nodes available (here
 # the enrolled node wins the tie with this host's own, as where it last ran).
 # Boxes are named hib-*; everything is removed at the end.
-set -euo pipefail
+set -Eeuo pipefail
+# Whatever ends the script early says where and with what status (#158: an exit 5 once, unexplained).
+trap 'echo "hibernate.sh: line $LINENO: \"$BASH_COMMAND\" returned $?" >&2' ERR
 
 WICKET=${WICKET:-target/debug/wicket}
 WICKET=$(realpath "$WICKET")
@@ -35,12 +37,35 @@ DOCKER=${WICKET_DOCKER:-docker}
 export WICKET_HOME=${WICKET_HOME:-$(mktemp -d)}
 export WICKET_BOX_PREFIX=hib
 work=$(mktemp -d)
+# Teardown (#158): runs on every exit, keeps the script's own exit status, and can't change it. Each
+# step is idempotent and logged if it fails, so a failure here is visible but never becomes the result.
+# Under `set -e` a failing command in an EXIT trap used to end the script with that command's status
+# (after every check had passed).
+step() {
+  local what=$1 rc=0
+  shift
+  "$@" || rc=$?
+  [ "$rc" = 0 ] || echo "teardown: $what returned $rc (ignored)" >&2
+  return 0
+}
+stop_pid() { [ -n "${1:-}" ] || return 0; kill "$1" 2>/dev/null || return 0; for _ in $(seq 50); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done; kill -9 "$1" 2>/dev/null || true; }
+remove_boxes() { local c; for c in $($DOCKER ps -aq --filter name=^hib-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done; }
+# This host's own node's `serve` (started by wicket, detached) outlives the script otherwise, writing
+# into $WICKET_HOME while it is removed.
+stop_local_serve() { local p; p=$(head -1 "$WICKET_HOME/local-node/serve/serve.pid" 2>/dev/null) || return 0; tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q "node serve" || return 0; stop_pid "$p"; }
+remove_dirs() { local i; for i in 1 2 3; do chmod -R u+w "$work" "$WICKET_HOME" 2>/dev/null; rm -rf "$work" "$WICKET_HOME" 2>/dev/null && return 0; sleep 1; done; rm -rf "$work" "$WICKET_HOME"; }
 cleanup() {
-  kill "${mock_pid:-}" "${busy_pid:-}" "${serve_pid:-}" 2>/dev/null || true
-  wait 2>/dev/null || true
-  for c in $($DOCKER ps -aq --filter name=^hib-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
-  chmod -R u+w "$work" "$WICKET_HOME" 2>/dev/null || true
-  rm -rf "$work" "$WICKET_HOME"
+  local rc=$?
+  set +e
+  trap - EXIT
+  step "stopping the mock model" stop_pid "${mock_pid:-}"
+  step "stopping the busy run" stop_pid "${busy_pid:-}"
+  step "stopping the node's serve" stop_pid "${serve_pid:-}"
+  step "stopping this host's node's serve" stop_local_serve
+  step "reaping children" wait
+  step "removing boxes" remove_boxes
+  step "removing the work and data directories" remove_dirs
+  exit "$rc"
 }
 trap cleanup EXIT
 
