@@ -555,3 +555,30 @@ fn a_node_derives_a_child_only_from_its_parents_own_base_token() {
     assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app"), T0)), "allow");
     assert_eq!(kind(&r.decide(&gh("zc", "c", "POST", "/repos/acme/app/hooks"), T0)), "needs-grant", "the parent's grant isn't the child's");
 }
+
+/// #173: a view reads a feed's state from its delta log without writing anything: a torn last line
+/// (a publisher mid-write) is skipped, not truncated, and the record is there with its token.
+#[test]
+fn a_feed_is_read_without_writing_and_a_torn_tail_is_skipped() {
+    let mut cp = Cp::new();
+    let z = zone("z", &["/v1/**"]);
+    let a = cp.issue("r1", &z).publish(&cp.approver, &[]).unwrap();
+    cp.put(a.clone(), T0);
+    let log = cp._dir.path().join("deltas.jsonl");
+    let mut text = std::fs::read(&log).unwrap();
+    text.extend_from_slice(b"eyJhbGciOiJFZERTQSJ9.half-a-li");
+    std::fs::write(&log, &text).unwrap();
+    let st = read_state::<BoxAuthority>(cp._dir.path(), NODE, cp.authz_root.public()).unwrap();
+    assert_eq!(st.epoch, 1);
+    let e = st.zones.get("r1").expect("the run's record");
+    assert_eq!(e.spec.token, a.token);
+    assert!(e.compiled.is_ok(), "it loads against the authority root");
+    assert_eq!(std::fs::read(&log).unwrap(), text, "nothing written, the torn tail kept for its publisher");
+    // Another node's log is refused.
+    assert!(read_state::<BoxAuthority>(cp._dir.path(), "n2", cp.authz_root.public()).is_err());
+    // A token decoded: block 0, its Datalog and revocation id, no third-party signer.
+    let blocks = wicket_authz::describe(&a.token_bytes().unwrap()).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0].source.contains("/v1/"), "{}", blocks[0].source);
+    assert!(blocks[0].external_key.is_none() && blocks[0].revocation_id.len() == 128);
+}
