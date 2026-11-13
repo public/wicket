@@ -124,7 +124,9 @@ wicket node revoke n1
   box stopped (its exit, or it says it has no box for the run), and `wicket reconcile` reports the run as
   unreachable, "still authorized there until …", rather than lost, whatever the node's status. Two copies
   of an agent never act at once with separate budget slices and writes. The authority and the node's
-  confirmation are kept beside the run (`ctl/authority.json`).
+  confirmation are kept beside the run (`ctl/authority.json`, synced to disk before the node is asked
+  to start the box); a run without that record (lost, or from before #153) is fenced until its timeout,
+  from its run record.
 - **Secrets come to a node only when used, and stay in its memory** (#152). A secret reaches a node only
   when one of its runs first needs it: the run's model credential (`llm.secret`) on its first model call,
   an `inject` rule's secret on the first request to its host. The node asks over that run's own
