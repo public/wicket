@@ -108,3 +108,4 @@ fn splice<R: AsFd, W: Write + AsFd>(from: &R, to: &mut W, buf_size: usize) -> Sp
         total += n as u64;
     }
 }
+// #218 measurement only
