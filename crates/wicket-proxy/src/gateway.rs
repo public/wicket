@@ -142,6 +142,7 @@ impl Gateway {
         };
         let timeout = Duration::from_secs(args.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(5, 600));
         let start = Instant::now();
+        let mut granted_at: Option<Instant> = None;
         loop {
             let req = {
                 let l = self.ctx.ledger.lock().expect("ledger");
@@ -156,6 +157,15 @@ impl Gateway {
                 return (format!("request {id} does not belong to this run"), true);
             }
             match req.status.as_str() {
+                // Its grant was handed to the box's node: answer once the node has it (at most 15 s),
+                // or the box's retry would find no grant there and ask again.
+                "granted"
+                    if self.ctx.ledger.lock().expect("ledger").grant_in_flight(id).unwrap_or(false)
+                        && granted_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(15) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
                 "granted" => {
                     return (
                         format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path),

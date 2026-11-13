@@ -103,7 +103,37 @@ impl Ledger {
     /// Hands a grant to a node: from now on the node counts its uses, and the ledger never consumes
     /// it. Returns false if it was already handed to a node.
     pub fn hand_grant_to_node(&self, id: &str, node: &str) -> Result<bool> {
-        Ok(self.conn.execute("UPDATE grants SET node = ?2 WHERE id = ?1 AND node IS NULL", params![id, node])? == 1)
+        // Not delivered yet: its epoch is set once it is published ([`Ledger::grants_published`]).
+        Ok(self.conn.execute("UPDATE grants SET node = ?2, node_epoch = ?3 WHERE id = ?1 AND node IS NULL", params![id, node, i64::MAX])?
+            == 1)
+    }
+
+    /// Grants handed to a node went out in feed epoch `epoch`.
+    pub fn grants_published(&self, ids: &[String], epoch: i64) -> Result<()> {
+        for id in ids {
+            self.conn.execute("UPDATE grants SET node_epoch = ?2 WHERE id = ?1 AND node_epoch IS NOT NULL", params![id, epoch])?;
+        }
+        Ok(())
+    }
+
+    /// Node `node` reports its feed at `epoch`: grants published up to it have reached it.
+    pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
+        self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
+        Ok(())
+    }
+
+    /// Whether a grant made for request `id` was handed to a node that hasn't got it yet: a box's
+    /// retry before then would find no grant there (#163's CI).
+    pub fn grant_in_flight(&self, request_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM grants WHERE request_id = ?1 AND node_epoch IS NOT NULL AND revoked = 0 LIMIT 1",
+                params![request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Revokes a grant. Grants handed to a node are revoked there through the feed by whoever
@@ -281,8 +311,20 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!((g[0].id.as_str(), g[0].uses_left, g[0].node.as_deref()), (gid.as_str(), Some(2), None));
         assert!(l.grants_for_run("run_b").unwrap().is_empty());
+        assert!(!l.grant_in_flight(&rid).unwrap(), "not handed: the ledger decides it");
         assert!(l.hand_grant_to_node(&gid, "n1").unwrap());
         assert!(!l.hand_grant_to_node(&gid, "n2").unwrap(), "handed once");
+        // In flight until the node reports the epoch that carries it.
+        assert!(l.grant_in_flight(&rid).unwrap(), "handed, not yet published");
+        l.node_feed_at("n1", 9).unwrap();
+        assert!(l.grant_in_flight(&rid).unwrap(), "not published yet: no epoch reaches it");
+        l.grants_published(std::slice::from_ref(&gid), 5).unwrap();
+        l.node_feed_at("n2", 9).unwrap();
+        assert!(l.grant_in_flight(&rid).unwrap(), "another node's feed says nothing about it");
+        l.node_feed_at("n1", 4).unwrap();
+        assert!(l.grant_in_flight(&rid).unwrap());
+        l.node_feed_at("n1", 5).unwrap();
+        assert!(!l.grant_in_flight(&rid).unwrap(), "the node has it");
         assert_eq!(l.consume_grant(&op).unwrap(), None, "the node counts it now");
         l.revoke_grant(&gid).unwrap();
         assert!(l.grant(&gid).unwrap().unwrap().revoked);

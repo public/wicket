@@ -41,7 +41,14 @@
 use serde::{Deserialize, Serialize};
 
 /// The control/node protocol version this build speaks.
-pub const PROTOCOL: u32 = 1;
+///
+/// - 1: versions (#162).
+/// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
+///   (`BoxAuthority::issuer_cert`, #154), which a version-1 node can't read: sent only to nodes
+///   talking [`ISSUER_CERT`] or later.
+pub const PROTOCOL: u32 = 2;
+/// The first protocol version whose nodes take issuing-key tokens (#154).
+pub const ISSUER_CERT: u32 = 2;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 

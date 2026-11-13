@@ -47,7 +47,7 @@ id -nG wicket | tr " " "\n" | grep -qx docker || fail "wicket is not in the dock
 id -nG alex | tr " " "\n" | grep -qx docker && fail "alex is still in the docker group"
 id -nG alex | tr " " "\n" | grep -qx wicket-operators || fail "alex is not an operator"
 [ "$(getent passwd wicket | cut -d: -f7)" = /usr/sbin/nologin ] || fail "wicket has a login shell"
-for u in wicketd wicket-console wicket-reconcile; do [ -f /etc/systemd/system/$u.service ] || fail "no $u unit"; done
+for u in wicketd wicket-console wicket-reconcile wicket-state; do [ -f /etc/systemd/system/$u.service ] || fail "no $u unit"; done
 [ -f /etc/wicket/wicketd.yaml ] && [ -f /etc/wicket/console.env ] || fail "no /etc/wicket config"
 [ -f /var/lib/wicket/identity/issuer.key ] || fail "no issuer key"
 [ "$(stat -c %U /var/lib/wicket/identity/issuer.key)" = wicket ] || fail "issuer key not the wicket user'"'"'s"

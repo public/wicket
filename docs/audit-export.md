@@ -57,6 +57,12 @@ sinks:
     headers: {}          # extra request headers, e.g. a tenant header the Collector routes on
     resource:            # extra resource attributes (service.name is always "wicket")
       deployment.environment: prod
+  # Objects in the installation's state store (state-store.yaml, docs/state.md): one per delivered
+  # batch or checkpoint, audit/<name>/…, never overwritten. `wicket audit --verify --against
+  # store:<name>` compares the local chain with them; a restore puts back records they have
+  # beyond a restored ledger.
+  - name: store
+    type: store
 ```
 
 **Who sends.** `wicket serve` and every `wicket run` start an exporter thread when the sinks file

@@ -1,0 +1,23 @@
+# The ledger's stream to the state store (#154): Litestream, as `state-store.yaml` says. Only with
+# a state-store.yaml that has a ledger: section. As the wicket user.
+[Unit]
+Description=wicket ledger stream to the state store
+Documentation=https://github.com/public/wicket
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/wicket/state-store.yaml
+
+[Service]
+User=wicket
+Group=wicket
+SupplementaryGroups=docker
+Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
+ExecStart=/usr/local/bin/wicket state replicate
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
