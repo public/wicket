@@ -53,8 +53,90 @@ pub fn reserved_slots(dir: &std::path::Path, max: u32) -> u32 {
     used.min(max)
 }
 
-pub fn spawner(c: SpawnCtx) -> wicket_proxy::Spawner {
+pub fn spawner(c: Arc<SpawnCtx>) -> wicket_proxy::Spawner {
     Arc::new(move |req| spawn(&c, req))
+}
+
+/// Takes over the children this run's node starts for its box (#164).
+pub fn adopter(c: Arc<SpawnCtx>) -> crate::noderun::Adopter {
+    Arc::new(move |s| adopt(&c, s))
+}
+
+/// Takes over a child the parent's node started for it while deciding its spawn (#164): checked
+/// again here, as of when it started (its zone within the parent's, what no human may approve,
+/// the org policy, the parent's slots), its slots and model budget reserved as `spawn` does, and
+/// recorded and supervised as a run of its own (`wicket run --adopt`), which publishes its token
+/// and takes over its box without starting another. The budget was checked on the node against
+/// what it was leased; here it is carved from the parent's. Idempotent: a resend is taken once.
+fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
+    crate::run::check_run_id(&s.child).map_err(|e| e.to_string())?;
+    let p = &c.parent;
+    let pa = p.agent.as_ref().ok_or("only agents start boxes")?;
+    let cdir = c.dir.join("children");
+    let yaml_path = cdir.join(format!("{}.yaml", s.child));
+    if yaml_path.exists() {
+        return Ok(());
+    }
+    let cm = Manifest::from_yaml(&s.manifest).map_err(|e| format!("its manifest: {e}"))?;
+    cm.validate().map_err(|e| format!("its manifest is invalid: {e}"))?;
+    let name = cm.agent.as_ref().map(|a| a.name.clone()).or_else(|| cm.program.as_ref().map(|p| p.name.clone())).unwrap_or_default();
+    let zone_name = format!("{}.{name}.{}", p.zone.name, c.run.0.strip_prefix("run_").unwrap_or(&c.run.0));
+    if cm.zone.name != zone_name || cm.tenant != p.tenant {
+        return Err(format!("its zone {} isn't one this run's spawns make", cm.zone.name));
+    }
+    let hard = subset::unapprovable(&cm.zone, &p.zone);
+    if !hard.is_empty() {
+        return Err(format!("it can't be started, with or without a human: {}", hard.join("; ")));
+    }
+    if let Some(org) = &c.org {
+        let sp = wicket_authz::Ceiling::from_zone(&cm.zone, "child", 0, vec![]).map_err(|e| e.to_string())?.spawn;
+        if !org.allows_spawn(&s.image, sp.min_isolation, sp.mem_bytes, sp.cpus_milli, sp.pids, sp.timeout_s) {
+            return Err(format!("the org policy ({}) doesn't allow it", org.version));
+        }
+    }
+    let mut reserved = c.slots.lock().map_err(|_| "slots lock")?;
+    let slots = pa.max_children.saturating_sub(*reserved);
+    let elapsed = std::time::Duration::from_millis(u64::try_from(wicket_feed::now_ms() - s.started_ms).unwrap_or(0));
+    let images: Vec<String> = std::iter::once(c.image.clone()).chain(p.zone.images.iter().cloned()).collect();
+    let max_children = cm.agent.as_ref().map_or(0, |a| a.max_children);
+    let bounds = subset::Bounds {
+        zone: &p.zone,
+        images,
+        llm_remaining: None,
+        llm_input_remaining: None,
+        // As of when it started (and the clocks a few seconds apart).
+        time_remaining: c.deadline.saturating_duration_since(Instant::now()) + elapsed + std::time::Duration::from_secs(5),
+        child_slots: slots,
+    };
+    if let Err(v) = subset::check(&subset::Ask { zone: &cm.zone, image: &s.image, max_children }, &bounds) {
+        return Err(format!("it isn't within its parent's authority: {}", v.join("; ")));
+    }
+    let weight = max_children.saturating_add(1).min(slots);
+    *reserved += weight;
+    if let (Some(cl), Some(llm)) = (&cm.zone.llm, c.llm.get()) {
+        use std::sync::atomic::Ordering;
+        llm.reserved_requests.fetch_add(cl.max_requests, Ordering::SeqCst);
+        llm.reserved_output_tokens.fetch_add(cl.max_output_tokens, Ordering::SeqCst);
+        llm.reserved_input_tokens.fetch_add(cl.max_input_tokens.unwrap_or(0), Ordering::SeqCst);
+    }
+    drop(reserved);
+    let _ = c.ledger.lock().map(|l| {
+        l.audit(
+            &p.tenant,
+            Some(&c.run),
+            "spawn.adopted",
+            &serde_json::json!({ "child": s.child, "zone": cm.zone.name, "image": s.image, "node": c.node, "started_ms": s.started_ms }),
+        )
+    });
+    let adopt = Adopt { child: s.child.clone(), started_ms: s.started_ms, session: s.session.clone() };
+    launch_as(c, &s.manifest, &s.image, None, Some(&adopt)).map(|_| ())
+}
+
+/// A child its node started (#164), to take over: `wicket run --adopt`.
+pub struct Adopt {
+    pub child: String,
+    pub started_ms: i64,
+    pub session: String,
 }
 
 /// What deciding a spawn needs to know of the parent, wherever it is decided: on the control host
@@ -449,7 +531,15 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
 /// Starts the child: another `wicket run`, with its own box, sockets, proxies and identity. Returns
 /// its run id once it has recorded its identity (or exited, or 10 s passed).
 fn launch(c: &SpawnCtx, yaml: &str, image: &str, placed: Option<&Placed>) -> Result<String, String> {
-    let child = RunId::new();
+    launch_as(c, yaml, image, placed, None)
+}
+
+/// [`launch`], or (`adopt`) the supervisor of a child its node started already.
+fn launch_as(c: &SpawnCtx, yaml: &str, image: &str, placed: Option<&Placed>, adopt: Option<&Adopt>) -> Result<String, String> {
+    let child = match adopt {
+        Some(a) => RunId(a.child.clone()),
+        None => RunId::new(),
+    };
     let cdir = c.dir.join("children");
     std::fs::create_dir_all(&cdir).map_err(|e| e.to_string())?;
     let yaml_path = cdir.join(format!("{}.yaml", child.0));
@@ -461,6 +551,9 @@ fn launch(c: &SpawnCtx, yaml: &str, image: &str, placed: Option<&Placed>) -> Res
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["run", "--run-id", &child.0, "--parent-run", &c.run.0, "--image", image]);
+    if let Some(a) = adopt {
+        cmd.arg("--adopt").arg(format!("{}:{}", a.started_ms, a.session));
+    }
     match placed {
         Some(p) => {
             cmd.args(["--node", &p.node]);

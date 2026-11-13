@@ -48,8 +48,38 @@ struct Raised {
     request: String,
 }
 
+/// A child this node started for a box (#164), until its control host has taken it over.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpawnedChild {
+    pub parent: String,
+    pub child: String,
+    pub manifest: String,
+    pub image: String,
+    pub session: String,
+    pub started_ms: i64,
+    /// The slots it takes of its parent's.
+    pub weight: u32,
+}
+
+impl SpawnedChild {
+    pub fn msg(&self) -> Msg {
+        Msg::Spawned {
+            run: self.parent.clone(),
+            child: self.child.clone(),
+            manifest: self.manifest.clone(),
+            image: self.image.clone(),
+            session: self.session.clone(),
+            started_ms: self.started_ms,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Held {
+    /// Children started here and not yet taken over, by child run: kept whatever happens to their
+    /// parent's box, so the control host always learns of them.
+    #[serde(default)]
+    spawned: BTreeMap<String, SpawnedChild>,
     #[serde(default)]
     calls: BTreeMap<String, QueuedCall>,
     /// Queued asks (#153's, and `request_access`'s) the control host has since raised: their
@@ -118,6 +148,32 @@ impl EdgeQueue {
         self.held.lock().expect("edge").raised.get(id).filter(|r| r.run == run).map(|r| r.request.clone())
     }
 
+    pub fn spawned(&self, c: SpawnedChild) {
+        let mut held = self.held.lock().expect("edge");
+        held.spawned.insert(c.child.clone(), c);
+        self.save(&held);
+    }
+
+    /// The children of `parent` its control host hasn't taken over yet.
+    pub fn unadopted(&self, parent: &str) -> Vec<SpawnedChild> {
+        self.held.lock().expect("edge").spawned.values().filter(|c| c.parent == parent).cloned().collect()
+    }
+
+    /// The slots `parent`'s children started here take.
+    fn slots_of(&self, parent: &str) -> u32 {
+        self.held.lock().expect("edge").spawned.values().filter(|c| c.parent == parent).map(|c| c.weight).sum()
+    }
+
+    /// Taken over (or refused) by the control host.
+    pub fn adopted(&self, child: &str) -> Option<SpawnedChild> {
+        let mut held = self.held.lock().expect("edge");
+        let c = held.spawned.remove(child);
+        if c.is_some() {
+            self.save(&held);
+        }
+        c
+    }
+
     pub fn drop_run(&self, run: &str) {
         let mut held = self.held.lock().expect("edge");
         let n = (held.calls.len(), held.raised.len());
@@ -143,8 +199,264 @@ pub(super) async fn tool(node: &Arc<Node>, run: &str, name: &str, args: &Value) 
         "await_grant" => Some(await_grant(node, run, args).await),
         "pending_requests" => Some(pending_requests(node, run).await),
         "request_capacity" | "request_update" if !connected(node, run) => Some(queue_call(node, run, name, args)),
+        "spawn" | "spawn_agent" => spawn(node, run, name, args).await,
         _ => None,
     }
+}
+
+/// The spawn request a tool call makes, as the control host's gateway reads it.
+fn spawn_request(tool: &str, args: &Value) -> wicket_proxy::SpawnRequest {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
+    match tool {
+        "spawn_agent" => wicket_proxy::SpawnRequest {
+            name: s("name").unwrap_or_default(),
+            kind: "agent".into(),
+            task: s("task"),
+            reach_hosts: args
+                .get("reach_hosts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect()),
+            ..Default::default()
+        },
+        _ => wicket_proxy::SpawnRequest {
+            name: s("name").unwrap_or_default(),
+            kind: s("kind").unwrap_or_else(|| "agent".into()),
+            task: s("task"),
+            command: args
+                .get("command")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            image: s("image"),
+            zone: args.get("zone").cloned().filter(|z| z.is_object()),
+            max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
+            ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
+            reach_hosts: None,
+            placement: args.get("placement").cloned().filter(|p| p.is_object()),
+        },
+    }
+}
+
+/// A spawn, decided here (#164): a child within the box's authority starts on this node, its token
+/// attenuated from the box's, its model budget carved from the box's slice, its slots from the
+/// box's; the control host is told (`Spawned`) at once or when it is back, checks it again and
+/// takes it over. None: the control host decides it (placement elsewhere, an org policy that
+/// decides differently a level down, a zone beyond the box's while it can be asked).
+async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<(String, bool)> {
+    let sp = node.edge_start(run)?.spawn?;
+    let req = spawn_request(tool, args);
+    let here = req
+        .placement
+        .as_ref()
+        .is_none_or(|p| p.get("node").and_then(|n| n.as_str()) == Some(node.name.as_str()) && p.get("lease").is_none());
+    let up = connected(node, run);
+    if !here || !sp.org_alike {
+        return match up {
+            true => None,
+            false => Some(queue_call(node, run, tool, args)),
+        };
+    }
+    let parent = match wicket_core::Manifest::from_yaml(&sp.manifest) {
+        Ok(m) => m,
+        Err(e) => return Some((format!("not started: the box's manifest is unreadable on its node ({e})"), true)),
+    };
+    let (start, started_ms) = {
+        let boxes = node.boxes.lock().expect("boxes");
+        let b = boxes.get(run)?;
+        (b.record.start.clone(), b.record.started_ms)
+    };
+    let now = wicket_feed::now_ms();
+    let deadline = started_ms + i64::try_from(sp.time_left_secs).unwrap_or(i64::MAX / 2000) * 1000;
+    let time_left = Duration::from_millis(u64::try_from(deadline - now).unwrap_or(0));
+    // What the box may still spend: its zone's budget left, within what this node was leased.
+    let llm = node.llms.lock().expect("llms").get(run).cloned();
+    let slice = llm.as_ref().and_then(|l| l.slice());
+    let (llm_left, llm_input_left) = match &llm {
+        Some(l) => {
+            let spent = l.spent();
+            let r = l.remaining().map(|(r, o)| match slice {
+                Some(sl) => {
+                    (r.min(sl.requests.saturating_sub(spent.requests)), o.min(sl.output_tokens.saturating_sub(spent.output_tokens)))
+                }
+                None => (r, o),
+            });
+            let i = match (l.remaining_input(), slice.and_then(|sl| sl.input_tokens)) {
+                (Some(a), Some(b)) => Some(a.min(b.saturating_sub(l.input_total()))),
+                (a, _) => a,
+            };
+            (r, i)
+        }
+        None => (None, None),
+    };
+    let max = parent.agent.as_ref().map_or(0, |a| a.max_children);
+    let used = sp.slots_used.saturating_add(node.edge.slots_of(run));
+    let org = node.replica.lock().expect("replica").org_of(run);
+    let plan = crate::spawn::plan_child(
+        &crate::spawn::PlanIn {
+            parent: &parent,
+            run: &wicket_core::RunId(run.into()),
+            image: &start.image,
+            time_left,
+            llm_left,
+            llm_input_left,
+            slots: max.saturating_sub(used),
+            org: org.as_ref(),
+        },
+        &req,
+    );
+    let plan = match plan {
+        Ok(p) => p,
+        Err(e) => return Some((format!("not started: {e}"), true)),
+    };
+    if !plan.violations.is_empty() {
+        // Beyond the box's authority: a human's, on the control host.
+        return match (up, req.ask_human) {
+            (true, _) => None,
+            (false, true) => Some(queue_call(node, run, tool, args)),
+            (false, false) => Some((
+                format!(
+                    "not started: this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask a human to approve exactly this zone (queued while wicket's control host is unreachable).",
+                    plan.violations.join("\n- ")
+                ),
+                true,
+            )),
+        };
+    }
+    match start_child(node, run, &start, &sp, plan, deadline).await {
+        Ok(text) => Some((text, false)),
+        Err(e) => Some((format!("not started: {e:#}"), true)),
+    }
+}
+
+/// Starts a child the box may start without anyone: its token, budget, secrets and box, here.
+async fn start_child(
+    node: &Arc<Node>,
+    run: &str,
+    parent: &crate::chan::BoxStart,
+    sp: &crate::chan::EdgeSpawn,
+    plan: crate::spawn::ChildPlan,
+    deadline: i64,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let child = wicket_core::RunId::new();
+    let m = &plan.cm;
+    let timeout = m.zone.limits.timeout()?.as_secs();
+    let now = wicket_feed::now_ms();
+    // Its authority: what is left of its time (plus the same 30 s a run gets), never past its
+    // parent's (the token's own blocks say so whatever this says).
+    let parent_until = node.replica.lock().expect("replica").authority_until(run).context("the box's authority")?;
+    let until = parent_until.min(now + i64::try_from(timeout + 30).unwrap_or(i64::MAX / 2000) * 1000).min(deadline + 30_000);
+    let box_path = node.replica.lock().expect("replica").box_path_of(run).context("the box's authority")?;
+    let mut ceiling = wicket_authz::Ceiling::from_zone(
+        &m.zone,
+        &format!("{box_path}/{}", child.0),
+        u64::try_from(until / 1000).unwrap_or(0),
+        sp.grant_keys.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ceiling.spawn.images.push(plan.image.clone());
+    let record =
+        node.replica.lock().expect("replica").derive_child(run, &sp.base, &child.0, &m.zone, &ceiling).map_err(anyhow::Error::msg)?;
+    let dir = node.paths.runs().join(&child.0);
+    std::fs::create_dir_all(&dir)?;
+    super::save_derived(&dir, &record)?;
+    // Its model budget, carved from what this node was leased for its parent: together they never
+    // spend more than that.
+    let llm = node.llms.lock().expect("llms").get(run).cloned();
+    if let (Some(cl), Some(pl)) = (&m.zone.llm, &llm) {
+        if let Some(sl) = pl.slice() {
+            let less = wicket_proxy::llm::Slice {
+                requests: sl.requests.saturating_sub(cl.max_requests),
+                output_tokens: sl.output_tokens.saturating_sub(cl.max_output_tokens),
+                input_tokens: sl.input_tokens.map(|i| i.saturating_sub(cl.max_input_tokens.unwrap_or(0))),
+            };
+            let _ = node.slices.put(run, &less);
+            pl.set_slice(Some(less));
+            let own = wicket_proxy::llm::Slice {
+                requests: cl.max_requests,
+                output_tokens: cl.max_output_tokens,
+                input_tokens: cl.max_input_tokens,
+            };
+            let _ = node.slices.put(&child.0, &own);
+        }
+    }
+    // The secrets its zone uses that its parent holds here: shared, never fetched for it.
+    let names: Vec<String> = m.zone.llm.iter().map(|l| l.secret.clone()).chain(m.zone.inject.iter().map(|i| i.secret.clone())).collect();
+    let shared = node.secrets.share(run, &child.0, &names, until);
+    let session = wicket_agent::AgentSession::new();
+    let who = {
+        let mut w = node.edge_start(run).map(|e| e.who).unwrap_or_default();
+        let parent_id = w.get("id").and_then(|v| v.as_str()).unwrap_or(run).to_string();
+        if let Some(o) = w.as_object_mut() {
+            o.insert("id".into(), json!(format!("{parent_id}/{}", child.0)));
+            o.insert("run".into(), json!(child.0));
+            o.insert("parent_run".into(), json!(run));
+            o.insert("zone".into(), json!(m.zone.name));
+            o.insert("agent".into(), json!(m.agent.as_ref().map(|a| a.name.clone()).or(m.program.as_ref().map(|p| p.name.clone()))));
+            o.insert("box_path".into(), json!(record.box_path));
+            o.insert(
+                "provisional".into(),
+                json!("started by your node while wicket's control host couldn't be asked: until it takes this box over, this identity is your parent's box path, attested by the node, and nothing is signed with it"),
+            );
+        }
+        w
+    };
+    let bs = super::child_start(parent, &plan, &child, &session, who, until)?;
+    let stdin_task = match wicket_agent::program_plan(m, &child) {
+        Some(_) => None,
+        None => wicket_agent::claude_code_plan(m, &child, &session).stdin_task,
+    };
+    if let Err(e) = super::start_box_boxed(node, None, bs).await {
+        node.replica.lock().expect("replica").drop_local(&child.0);
+        let _ = std::fs::remove_dir_all(&dir);
+        if let (Some(pl), Some(cl)) = (&llm, &m.zone.llm) {
+            // Nothing started: the parent's slice back.
+            if let Some(sl) = pl.slice() {
+                let back = wicket_proxy::llm::Slice {
+                    requests: sl.requests + cl.max_requests,
+                    output_tokens: sl.output_tokens + cl.max_output_tokens,
+                    input_tokens: sl.input_tokens.map(|i| i + cl.max_input_tokens.unwrap_or(0)),
+                };
+                let _ = node.slices.put(run, &back);
+                pl.set_slice(Some(back));
+            }
+        }
+        node.secrets.release(&child.0);
+        return Err(e);
+    }
+    if let Some(t) = &stdin_task {
+        super::feed_stdin(node, &child.0, t.as_bytes());
+    }
+    let c = SpawnedChild {
+        parent: run.into(),
+        child: child.0.clone(),
+        manifest: plan.yaml.clone(),
+        image: plan.image.clone(),
+        session: session.id.clone(),
+        started_ms: now,
+        weight: plan.weight,
+    };
+    node.edge.spawned(c.clone());
+    node.audit_note(
+        run,
+        "node.spawned",
+        json!({ "child": child.0, "zone": m.zone.name, "image": plan.image, "box_path": record.box_path, "secrets": shared, "authority_until": until }),
+    );
+    if connected(node, run) && node.proto_of(run) >= crate::chan::EDGE_DECISIONS {
+        node.send_run(run, Frame::Msg(c.msg()));
+    }
+    let kind = if plan.is_agent { "agent" } else { "program" };
+    let name = m.agent.as_ref().map(|a| a.name.clone()).or(m.program.as_ref().map(|p| p.name.clone())).unwrap_or_default();
+    let budget =
+        m.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
+    Ok(format!(
+        "started {kind} {name} as run {} on node {}: its own box, zone {}, within your own{budget}. Your node decided it from your token; wicket's control host records it {}. {}",
+        child.0,
+        node.name,
+        plan.zone_name,
+        if connected(node, run) { "now" } else { "when it can be reached" },
+        if plan.is_agent { "Use await_message for its messages and its final run_finished." } else { "It sends you run_finished when it exits." }
+    ))
 }
 
 fn whoami(node: &Arc<Node>, run: &str) -> (String, bool) {

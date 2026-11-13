@@ -114,6 +114,10 @@ pub struct RunOpts<'a> {
     /// Re-attach to run `run_id`, still running on its node after this run's supervisor died (#151):
     /// everything comes from the run's record (`ctl/run.json`), nothing from the options above.
     pub attach: bool,
+    /// Take over a child its node started already (#164): when it started there (Unix ms, the
+    /// node's clock) and its agent's session. A new run in every other way: its identity, ledger
+    /// rows and record are made here; its box isn't started again.
+    pub adopt: Option<(i64, String)>,
 }
 
 /// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
@@ -246,6 +250,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         wrap,
         wake,
         attach,
+        adopt,
     } = o;
     // Re-attaching (#151): the run's own record says what it is.
     let record: Option<RunRecord> = match (&run_id, attach) {
@@ -463,7 +468,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let session = match (&wake, &record) {
         (Some(w), _) => wicket_agent::AgentSession { id: w.agent.session_id.clone(), resume: true },
         (None, Some(r)) => wicket_agent::AgentSession { id: r.session_id.clone(), resume: true },
-        (None, None) => wicket_agent::AgentSession::new(),
+        (None, None) => match &adopt {
+            Some((_, id)) if wicket_agent::AgentSession::valid(id) => wicket_agent::AgentSession { id: id.clone(), resume: false },
+            Some(_) => bail!("--adopt: not a session id"),
+            None => wicket_agent::AgentSession::new(),
+        },
     };
     let mut fence: Option<wicket_proxy::Fence> =
         wake.as_ref().map(|w| wicket_proxy::Fence { agent: w.agent.id.clone(), generation: w.generation });
@@ -721,8 +730,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
-    let spawner: Option<wicket_proxy::Spawner> = match &m.agent {
-        Some(a) if a.max_children > 0 => Some(crate::spawn::spawner(crate::spawn::SpawnCtx {
+    let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
+        Some(a) if a.max_children > 0 => Some(Arc::new(crate::spawn::SpawnCtx {
             parent: m.clone(),
             // A re-attached run (#151) starts from the slots its children already hold.
             slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, a.max_children))),
@@ -740,6 +749,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         })),
         _ => None,
     };
+    let spawner: Option<wicket_proxy::Spawner> = spawn_ctx.clone().map(crate::spawn::spawner);
+    // Children its node starts for the box, deciding its spawns there (#164).
+    let adopter: Option<crate::noderun::Adopter> = spawn_ctx.map(crate::spawn::adopter);
 
     // Who inside the box made a request: read from the agent's event stream (outside the box).
     let tracker = Arc::new(Mutex::new(wicket_agent::attribution::Tracker::default()));
@@ -883,7 +895,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm.output_tokens.store(p.output_tokens, SeqCst);
             r.prior_secs + u64::try_from((wicket_feed::now_ms() - r.started_ms).max(0) / 1000).unwrap_or(0)
         }
-        (None, None, None) => 0,
+        // Taken over from its node (#164): its time counts from when it started there.
+        (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
     let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
     // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
@@ -1006,7 +1019,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 wrapped: wrap.is_some(),
                 parent_run: parent_run.clone(),
                 lease: lease.clone(),
-                started_ms: wicket_feed::now_ms(),
+                started_ms: adopt.as_ref().map_or_else(wicket_feed::now_ms, |(at, _)| *at),
                 prior_secs,
                 fence: fence.as_ref().map(|f| (f.agent.clone(), f.generation)),
                 session_id: session.id.clone(),
@@ -1110,6 +1123,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         "parent_run": c.parent_run, "acting_for": c.chain(), "principal": c.principal,
                     })
                 }),
+                // Its spawns, decided on the node within its authority (its base token and grant
+                // keys are added when it is minted, `noderun::start`).
+                spawn: match &m.agent {
+                    Some(a) if a.max_children > 0 => Some(crate::chan::EdgeSpawn {
+                        manifest: serde_yaml::to_string(&m)?,
+                        base: String::new(),
+                        grant_keys: vec![],
+                        time_left_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs(),
+                        slots_used: crate::spawn::reserved_slots(&dir, a.max_children),
+                        org_alike,
+                    }),
+                    _ => None,
+                },
             })),
         };
         let via = match &node {
@@ -1134,12 +1160,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             calls: node_calls.clone(),
             trees,
             keep: keep_on_node,
-            attach: record.is_some(),
+            // Re-attached, or taken over from the node that started it (#164): its box runs already.
+            attach: record.is_some() || adopt.is_some(),
             resume_from,
             attribute: ctx.attribute.clone(),
             llm: Some(llm.clone()),
             vault: ctx.vault.clone(),
             spent_counted: attach_agent.is_some(),
+            adopt: adopter.clone(),
         })
         .await?;
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));

@@ -403,6 +403,16 @@ impl Replica<BoxAuthority> {
         Ok(record)
     }
 
+    /// Box `run`'s path in its spawn tree, if the node holds its authority.
+    pub fn box_path_of(&self, run: &str) -> Option<String> {
+        self.entry(run).map(|z| z.spec.box_path.clone())
+    }
+
+    /// The org layer box `run`'s block 0 carries (#51), as data.
+    pub fn org_of(&self, run: &str) -> Option<authz::OrgLayer> {
+        self.entry(run).and_then(|z| z.spec.org.clone())
+    }
+
     /// The zone a box's authority was minted from, if the node holds it.
     pub fn zone_of(&self, run: &str) -> Option<&ZoneSpec> {
         self.entry(run).map(|z| &z.spec.zone)

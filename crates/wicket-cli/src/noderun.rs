@@ -341,6 +341,20 @@ impl NodeCtl {
 }
 
 /// Everything about the run the connection manager needs.
+/// A child the node started for this run's box (#164), as it reports it.
+#[derive(Clone, Debug)]
+pub struct Spawned {
+    pub child: String,
+    pub manifest: String,
+    pub image: String,
+    pub session: String,
+    pub started_ms: i64,
+}
+
+/// Takes over a child its node started for this run's box (#164): checks it again as `spawn` here
+/// would, records it, and supervises it as a run of its own. Err: refused, and the node stops it.
+pub type Adopter = Arc<dyn Fn(Spawned) -> std::result::Result<(), String> + Send + Sync>;
+
 pub struct Start {
     /// The node's name, and how to reach it.
     pub node: String,
@@ -379,6 +393,8 @@ pub struct Start {
     /// the model proxy's `prior` counters, so the node's first report is the base its later ones
     /// count from (#152).
     pub spent_counted: bool,
+    /// Takes over children the node starts for the box (#164): None, it may start none.
+    pub adopt: Option<Adopter>,
 }
 
 struct Shared {
@@ -412,6 +428,7 @@ struct Shared {
     /// Hosts this host swaps a credential in for (#169): the node forwards them here, so their
     /// grants stay here too.
     swap_hosts: Vec<String>,
+    adopt: Option<Adopter>,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
@@ -459,6 +476,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
     };
     let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    // What the node attenuates a child's token from, deciding its spawns (#164).
+    let mut s = s;
+    if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
+        use base64::Engine;
+        sp.base = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_issuer.base.to_bytes()?);
+        sp.grant_keys = vec![approver.public()];
+    }
     // Several runs share the node's feed. Tokens of runs that have ended (whose own exit didn't
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
@@ -519,6 +543,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
         swap_hosts: s.start.swap_hosts.clone(),
+        adopt: s.adopt.clone(),
         attach: s.attach,
         carried,
     });
@@ -983,6 +1008,22 @@ async fn on_frame(
                     false => Msg::SecretFetched { id, secret: None, error: Some(format!("not run {}'s connection", run)) },
                 };
                 send(Frame::Msg(reply));
+            }
+            // A child the node started for the box (#164): taken over (or refused) off this loop,
+            // since that starts its supervisor.
+            Msg::Spawned { run, child, manifest, image, session, started_ms } if run == sh.run.0 => {
+                let (adopt, out) = (sh.adopt.clone(), out.clone());
+                let s = Spawned { child: child.clone(), manifest, image, session, started_ms };
+                tokio::task::spawn_blocking(move || {
+                    let error = match adopt {
+                        Some(a) => a(s).err(),
+                        None => Some("this run may not start boxes".into()),
+                    };
+                    if let Some(e) = &error {
+                        println!("[wicket] refused child {child} its node started: {e}");
+                    }
+                    let _ = out.send(Frame::Msg(Msg::Adopted { child, error }));
+                });
             }
             Msg::Spent { run, spent } if run == sh.run.0 => {
                 // The node calls the model itself and is the counter of record (#152).

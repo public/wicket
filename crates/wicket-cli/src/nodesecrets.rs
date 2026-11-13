@@ -205,6 +205,24 @@ impl Cache {
         e.users.insert(run.into(), f.not_after);
     }
 
+    /// A child the node started for `from`'s box (#164) uses the secrets in `names` that `from`
+    /// holds, until `until` (Unix ms, at most the child's authority): never one its parent doesn't
+    /// hold, never longer than its parent's use. Until the control host takes the child over, it
+    /// fetches nothing of its own.
+    pub fn share(&self, from: &str, to: &str, names: &[String], until: i64) -> Vec<String> {
+        let mut m = self.entries.lock().expect("cache");
+        let mut shared = vec![];
+        for n in names {
+            if let Some(e) = m.get_mut(n) {
+                if let Some(u) = e.users.get(from).copied() {
+                    e.users.insert(to.into(), u.min(until));
+                    shared.push(n.clone());
+                }
+            }
+        }
+        shared
+    }
+
     /// Run `run` no longer uses `name` (the control host says it changed or was removed): dropped if
     /// no run uses it any more.
     pub fn revoke(&self, run: &str, name: &str) {

@@ -748,6 +748,9 @@ async fn adopt_previous(node: &Arc<Node>) {
         let dir = runs.join(run);
         match BoxRecord::load(&dir).filter(|r| r.name == b.name && r.start.run == run) {
             Some(rec) => {
+                // A child this node started (#164) holds the authority it derived for it, until the
+                // feed holds the child's own.
+                load_derived(node, &dir, run);
                 let zone = node.replica.lock().expect("replica").zone_of(run).cloned();
                 match zone {
                     Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z).await {
@@ -781,6 +784,7 @@ async fn adopt_previous(node: &Arc<Node>) {
     for (name, run) in node.docker.exited_boxes().await.unwrap_or_default() {
         let dir = runs.join(&run);
         let Some(rec) = BoxRecord::load(&dir).filter(|r| r.name == name && crate::run::check_run_id(&run).is_ok()) else { continue };
+        load_derived(node, &dir, &run);
         let code = node.docker.state(&name).await.ok().flatten().map(|s| s.1).unwrap_or(-1);
         wire_exited(node, rec, dir, code).await;
     }
@@ -988,7 +992,7 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 let n = node.clone();
                 tokio::spawn(async move {
                     let run = bs.run.clone();
-                    let error = start_box(&n, gen, *bs).await.err().map(|e| format!("{e:#}"));
+                    let error = start_box(&n, Some(gen), *bs).await.err().map(|e| format!("{e:#}"));
                     if let Some(e) = &error {
                         eprintln!("[node] starting {run} failed: {e}");
                     }
@@ -1012,6 +1016,13 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 };
                 for f in frames {
                     node.send_to(gen, f);
+                }
+                // Children this node started for it (#164) that its control host hasn't taken
+                // over: before its exit is replayed, so it learns of them whatever happens.
+                if node.proto_of(&run) >= chan::EDGE_DECISIONS {
+                    for c in node.edge.unadopted(&run) {
+                        node.send_to(gen, Frame::Msg(c.msg()));
+                    }
                 }
                 // Asks raised while it was away (#153), with their original time.
                 for q in node.queue.of(&run) {
@@ -1062,6 +1073,24 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     // A paused (idle) box is unpaused first, so it can be killed.
                     let _ = node.docker.unpause(&name).await;
                     let _ = node.docker.kill(&name).await;
+                }
+            }
+            // A child this node started (#164): taken over by its control host, or refused (and
+            // then stopped here).
+            Msg::Adopted { child, error } => {
+                if node.edge.adopted(&child).is_some() {
+                    match &error {
+                        None => node.audit_note(&child, "node.child_adopted", serde_json::json!({})),
+                        Some(e) => {
+                            eprintln!("[node] {child}: the control host refused the child this node started ({e}); stopping it");
+                            node.audit_note(&child, "node.child_refused", serde_json::json!({ "why": e }));
+                            node.stopped.lock().expect("stopped").insert(child.clone(), format!("refused by the control host: {e}"));
+                            let name = node.boxes.lock().expect("boxes").get(&child).map(|b| b.name.clone());
+                            if let Some(name) = name {
+                                let _ = node.docker.kill(&name).await;
+                            }
+                        }
+                    }
                 }
             }
             Msg::RunLease { .. } => {}
@@ -1448,7 +1477,19 @@ fn ids() -> String {
     unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
 }
 
-async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
+/// [`start_box`], boxed with a named type: a box's gateway starting a box (#164) is a cycle of
+/// futures whose types the compiler can't otherwise see through.
+fn start_box_boxed(
+    node: &Arc<Node>,
+    owner: Option<u64>,
+    bs: BoxStart,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    Box::pin(start_box(node, owner, bs))
+}
+
+/// Starts a box: for the control connection `owner`, or (a child this node started, #164) for
+/// none until its control host takes it over.
+async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result<()> {
     crate::run::check_run_id(&bs.run)?;
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
@@ -1604,9 +1645,104 @@ async fn start_box(node: &Arc<Node>, gen: u64, bs: BoxStart) -> Result<()> {
         out_saved_ms: 0,
     };
     rec.save(&dir)?;
-    wire(node, Some(gen), rec, dir, tasks, spec.user.clone());
+    wire(node, owner, rec, dir, tasks, spec.user.clone());
     eprintln!("[node] box {name} started");
     Ok(())
+}
+
+/// The authority this node derived for a child it started (#164), kept beside it so a restarted
+/// `serve` holds it again (`derived.json`).
+const DERIVED_FILE: &str = "derived.json";
+
+fn save_derived(dir: &std::path::Path, a: &BoxAuthority) -> Result<()> {
+    crate::nodesecrets::write_atomic(&dir.join(DERIVED_FILE), &serde_json::to_vec(a)?)
+}
+
+/// Holds a child's derived authority again (a restarted `serve`), unless the feed holds its own.
+fn load_derived(node: &Node, dir: &std::path::Path, run: &str) {
+    let Some(a) = std::fs::read(dir.join(DERIVED_FILE)).ok().and_then(|b| serde_json::from_slice::<BoxAuthority>(&b).ok()) else { return };
+    if a.run != run {
+        return;
+    }
+    let mut r = node.replica.lock().expect("replica");
+    if r.state().is_some_and(|s| s.zones.contains_key(run)) {
+        return;
+    }
+    if let Err(e) = r.put_local(a) {
+        eprintln!("[node] {run}: the authority this node derived for it no longer holds ({e})");
+    }
+}
+
+/// A child's box (#164), as its control host would start it: its parent's start with the child's
+/// own manifest, adapter plan, limits and name. A fresh workspace; no volumes, binds or swaps.
+fn child_start(
+    parent: &BoxStart,
+    plan: &crate::spawn::ChildPlan,
+    child: &wicket_core::RunId,
+    session: &wicket_agent::AgentSession,
+    who: serde_json::Value,
+    until_ms: i64,
+) -> Result<BoxStart> {
+    let m = &plan.cm;
+    let launch = match wicket_agent::program_plan(m, child) {
+        Some(p) => p,
+        None => wicket_agent::claude_code_plan(m, child, session),
+    };
+    let mut state_files = vec![];
+    if m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") {
+        let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(m))?;
+        state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
+    }
+    let suffix = format!("-{}", parent.run.replace('_', "-"));
+    let name = parent.name.as_deref().and_then(|n| n.strip_suffix(&suffix)).map(|p| format!("{p}-{}", child.0.replace('_', "-")));
+    let timeout = m.zone.limits.timeout()?.as_secs();
+    let left = u64::try_from((until_ms - wicket_feed::now_ms()) / 1000).unwrap_or(0);
+    Ok(BoxStart {
+        run: child.0.clone(),
+        tenant: parent.tenant.clone(),
+        zone: m.zone.name.clone(),
+        image: plan.image.clone(),
+        isolation: m.zone.isolation,
+        env: launch.env,
+        argv: launch.argv,
+        memory: m.zone.limits.memory_bytes().context("limits.memory is unreadable")?.to_string(),
+        cpus: m.zone.limits.cpus,
+        pids: m.zone.limits.pids,
+        interactive: launch.stdin_task.is_some(),
+        timeout_secs: timeout.min(left),
+        escalate: m.program.as_ref().is_none_or(|p| p.on_pending != wicket_core::OnPending::Fail),
+        ca_pem: parent.ca_pem.clone(),
+        workspace_tar: String::new(),
+        state_files,
+        volumes: vec![],
+        streams: [1, 2, 3],
+        binds: vec![],
+        workdir: None,
+        owner: parent.owner.clone(),
+        long_lived: false,
+        durable: vec![],
+        name,
+        llm_prior: (0, 0, 0),
+        output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
+        output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
+        swap_hosts: vec![],
+        edge: Some(Box::new(chan::EdgeStart { who, spawn: None })),
+    })
+}
+
+/// Writes `bytes` to a box's stdin as its control host would (a child's task, #164): at the
+/// stdin offset reached, so the same bytes from its control host later are dropped as a replay.
+fn feed_stdin(node: &Node, run: &str, bytes: &[u8]) {
+    let mut boxes = node.boxes.lock().expect("boxes");
+    if let Some(b) = boxes.get_mut(run) {
+        let at = b.stdin_next;
+        let (fresh, _) = accept_at(&mut b.stdin_next, at, bytes);
+        if let (Some(s), false) = (&b.stdin, fresh.is_empty()) {
+            s.push(&fresh);
+            b.record.stdin_received = b.stdin_next;
+            let _ = b.record.save(&b.dir);
+        }
+    }
 }
 
 /// What a node keeps of a box it started, in its run directory (`node-box.json`): enough for a
@@ -2031,6 +2167,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.slices.drop_run(run);
     n.queue.drop_run(run);
     n.edge.drop_run(run);
+    n.replica.lock().expect("replica").drop_local(run);
     n.llms.lock().expect("llms").remove(run);
     eprintln!("[node] {run}: box exited ({code})");
     let reason = n.stopped.lock().expect("stopped").get(run).cloned();
@@ -2829,6 +2966,7 @@ mod tests {
         rec.start.zone = z.name.clone();
         rec.start.edge = Some(Box::new(chan::EdgeStart {
             who: serde_json::json!({ "id": format!("spiffe://wicket.test/t0/{run}"), "run": run, "zone": z.name }),
+            spawn: None,
         }));
         let st = BoxState {
             streams: [1, 2, 3],

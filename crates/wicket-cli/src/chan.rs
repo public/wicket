@@ -191,6 +191,31 @@ pub struct EdgeStart {
     /// tenant, run, parent run, principal, the chain it acts for). The identity itself (its key and
     /// signed token) stays on the control host.
     pub who: serde_json::Value,
+    /// What the node decides the box's spawns from: None, they are the control host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<EdgeSpawn>,
+}
+
+/// What a node decides a box's spawns from (#164): a child within the box's authority starts on
+/// the node, its token attenuated from the box's, and the control host records it when it can.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeSpawn {
+    /// The box's effective manifest (YAML): what a child's is planned from.
+    pub manifest: String,
+    /// Its base token (block 0 and its spawn links, without grants), base64url: what a child's is
+    /// attenuated from.
+    #[serde(default)]
+    pub base: String,
+    /// The keys whose grants a child's token accepts.
+    #[serde(default)]
+    pub grant_keys: Vec<wicket_authz::PublicKey>,
+    /// Its time left when it started (seconds): a child gets no more than what is left of it.
+    pub time_left_secs: u64,
+    /// The box slots its children already hold (#125).
+    pub slots_used: u32,
+    /// Whether the org policy decides for its children as for it (#51): it reads neither the
+    /// spawn depth nor the zone or its groups. Else its spawns are the control host's.
+    pub org_alike: bool,
 }
 
 fn default_output_cap() -> u64 {
@@ -433,6 +458,26 @@ pub enum Msg {
     Event {
         run: String,
         event: serde_json::Value,
+    },
+    /// A child box this node started for `run`'s box while deciding its spawn (#164): what the
+    /// control host needs to check it again and take it over (adopt it as a run of its own).
+    /// Sent on `run`'s connection, at once or when it is back, until answered by
+    /// [`Msg::Adopted`]. Sent only on connections talking [`EDGE_DECISIONS`].
+    Spawned {
+        run: String,
+        child: String,
+        /// The child's manifest (YAML), as the node planned it.
+        manifest: String,
+        image: String,
+        /// The child agent's session id.
+        session: String,
+        /// When the node started it (Unix ms, node clock).
+        started_ms: i64,
+    },
+    /// The control host took `child` over (`error`: it refused it, and stops it).
+    Adopted {
+        child: String,
+        error: Option<String>,
     },
     /// Raise (or find) the pending request for this op. `queued`: raised while the control host
     /// was unreachable (#153), with its node-local id and when (Unix ms, node clock).
