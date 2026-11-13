@@ -420,8 +420,8 @@ impl wicket_proxy::decide::ControlLink for Offline {
     }
 }
 
-/// A node's feed for run_splice: its token minted from [`zone`], fresh for 1 s of the test's clock,
-/// then narrow for 2 s, then closed. Returns the decider, the clock and the feed's directory.
+/// A node's feed for run_splice: its token minted from [`zone`] until 3600 s (Unix), fresh for 1 s
+/// of the test's clock, then offline on the token until it expires. Returns the decider, the clock and the feed's directory.
 fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync::atomic::AtomicI64>, PathBuf) {
     use ed25519_dalek::SigningKey;
     use wicket_feed::{Change, Issuer, KeyCert, Publisher, PublisherConfig, Replica, ReplicaConfig};
@@ -430,9 +430,9 @@ fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync
     let key = SigningKey::from_bytes(&[8; 32]);
     let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
     let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
-    let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000, 120_000);
+    let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
     let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
-    let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, narrow_ms: 2_000, retain: 100 };
+    let cfg = PublisherConfig { ttl_ms: 1_000, refresh_ms: 100, retain: 100 };
     let mut p = Publisher::open_with(&dir.join("pub"), "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public()).unwrap();
     let mut r = Replica::new_with("n1", root.verifying_key(), ReplicaConfig::default(), authz_root.public());
     let t0 = 1_000_000;
@@ -474,11 +474,10 @@ fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync
     (d, now, dir)
 }
 
-/// #141: a node splices a host its box's token allows wholesale while its feed is fresh. When the
-/// feed narrows, the spliced connection is cut at the next check, and new connections are
-/// intercepted with the node's CA and decided per request (plain reads only).
+/// #141, #153: a node splices a host its box's token allows wholesale, connected or not. When the
+/// token expires, the spliced connection is cut at the next check, and new requests are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_splices_while_its_feed_is_fresh_and_stops_when_it_narrows() {
+async fn a_node_splices_while_the_token_holds_and_stops_when_it_expires() {
     let (d, now, feed_dir) = node_feed(&zone(), "run_splice");
     let w = World::with(Some(d)).await;
     // Fresh: spliced, the origin's own certificate; inspected hosts still get the node's leaf.
@@ -506,9 +505,13 @@ async fn a_node_splices_while_its_feed_is_fresh_and_stops_when_it_narrows() {
     let mut buf = vec![0u8; 4096];
     let n = tls.read(&mut buf).await.unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).contains("origin /a"));
-    // The feed narrows (the control host has been unreachable past the lease): the spliced
-    // connection is cut within a check or two.
+    // Offline (past the TTL, the control host unreachable): the splice holds.
     now.fetch_add(1_500, Ordering::SeqCst);
+    let (status, s2) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    drop(s2);
+    // The token expires: the spliced connection is cut within a check or two.
+    now.store(3_601_000, Ordering::SeqCst);
     let closed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             match tls.read(&mut buf).await {
@@ -518,28 +521,15 @@ async fn a_node_splices_while_its_feed_is_fresh_and_stops_when_it_narrows() {
         }
     })
     .await;
-    assert!(closed.is_ok(), "the spliced connection outlived the node's fresh policy");
+    assert!(closed.is_ok(), "the spliced connection outlived the box's token");
     settle().await;
     let ev = w.events();
     let row = ev.iter().find(|e| e.0 == "open.test" && e.1 == "spliced").expect("a row for the spliced connection");
-    assert!(row.2.contains("on the node") && row.2.contains("cut:") && row.2.contains("no longer fresh"), "{}", row.2);
-    // Narrow: a new connection is intercepted with the node's CA; reads go, writes are refused.
-    let (status, s) = w.connect("open.test").await;
-    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-    let (issuer, body) = get(s, "open.test", "/read").await;
-    assert_eq!(issuer, "wicket run CA node", "inspected once narrow");
-    assert!(String::from_utf8_lossy(&body).contains("origin /read"));
+    assert!(row.2.contains("on the node") && row.2.contains("cut:") && row.2.contains("no longer allows"), "{}", row.2);
+    // A new connection is inspected, and its requests refused: the authority has ended.
     let (_, s) = w.connect("open.test").await;
-    let body = request(s, "open.test", "POST /write HTTP/1.1\r\nHost: open.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-    assert!(body.contains("plain reads") && !body.contains("origin"), "{body}");
-    settle().await;
-    let ev = w.events();
-    assert!(!ev.iter().any(|e| e.1 == "spliced"), "{ev:?}");
-    // Closed: refused outright.
-    now.fetch_add(2_000, Ordering::SeqCst);
-    let (_, s) = w.connect("open.test").await;
-    let (_, body) = get(s, "open.test", "/read").await;
-    assert!(String::from_utf8_lossy(&body).contains("allows nothing"), "{}", String::from_utf8_lossy(&body));
+    let body = request(s, "open.test", "GET /read HTTP/1.1\r\nHost: open.test\r\nConnection: close\r\n\r\n").await;
+    assert!(!body.contains("origin /read") && body.contains("403"), "{body}");
     let _ = std::fs::remove_dir_all(feed_dir);
 }
 
@@ -560,7 +550,8 @@ async fn a_node_splices_only_top_level_boxes_and_only_wholesale_hosts() {
         assert_eq!(r.splice(&TenantId::single(), "run_splice", "fenced.test", 1_000_000), None, "a forbid rule");
         assert_eq!(r.splice(&TenantId::single(), "run_splice", "checked.test", 1_000_000), None, "GET only");
         assert_eq!(r.splice(&TenantId::single(), "run_other", "open.test", 1_000_000), None, "no authority for the box");
-        assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_001_000), None, "narrow");
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_001_000), Some(0), "offline");
+        assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 3_601_000), None, "expired");
     }
     // Under an org policy (#51), a host it allows wholesale splices; one it has any rule on doesn't.
     let (d, _, org_dir) = node_feed(&zone(), "run_org");

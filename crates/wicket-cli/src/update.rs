@@ -245,6 +245,14 @@ pub fn reexec_on_hangup(pidfile: PathBuf, versions: PathBuf, before: impl FnOnce
     if std::fs::write(&tmp, format!("{}\n", std::process::id())).is_ok() {
         let _ = std::fs::rename(&tmp, &pidfile);
     }
+    // What this process runs, for checks that can't read `/proc/<pid>/exe`: a `node serve` makes
+    // itself non-dumpable (it holds secrets in memory, #152), which hides that from its own user.
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        let tmp = pidfile.with_extension(format!("{}.exe-new", std::process::id()));
+        if std::fs::write(&tmp, format!("{}\n{}\n", std::process::id(), exe.display())).is_ok() {
+            let _ = std::fs::rename(&tmp, pidfile.with_extension("exe"));
+        }
+    }
     let Ok(mut hup) = signal(SignalKind::hangup()) else { return };
     tokio::spawn(async move {
         hup.recv().await;
@@ -276,9 +284,15 @@ fn hangup(pidfile: &Path, expect: &str) -> Option<u32> {
 }
 
 /// Whether process `pid` now runs `bin`.
-fn runs(pid: u32, bin: &Path) -> bool {
+fn runs(pid: u32, bin: &Path, pidfile: &Path) -> bool {
     let want = std::fs::canonicalize(bin).ok();
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok().is_some_and(|e| Some(e) == want)
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok().or_else(|| {
+        // A non-dumpable process: what it wrote beside its pid file, if it is this pid's.
+        let s = std::fs::read_to_string(pidfile.with_extension("exe")).ok()?;
+        let mut l = s.lines();
+        (l.next()?.trim().parse::<u32>().ok()? == pid).then(|| PathBuf::from(l.next().unwrap_or_default()))
+    });
+    exe.is_some_and(|e| Some(e) == want)
 }
 
 fn sha256_file(p: &Path) -> Result<String> {
@@ -519,6 +533,8 @@ pub struct UpdateOpts {
     /// The control host is already on this build: only the nodes.
     pub only_nodes: bool,
     pub gate: Gate,
+    /// Prune afterwards, where it updated (`wicket self prune`).
+    pub prune: bool,
 }
 
 /// The health gate's settings.
@@ -673,6 +689,13 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         "done: the control host{} run {green}; `wicket self rollback` goes back to {blue}",
         if nodes.is_empty() { "" } else { " and the nodes" }
     ));
+    if o.prune {
+        // Committed: what neither this version nor a rollback to the last one needs can go.
+        let names = (!nodes.is_empty()).then(|| nodes.join(","));
+        if let Err(e) = prune(names, o.only_nodes, KEEP_SNAPSHOTS, false).await {
+            say(format!("pruning old versions failed (the update stands): {e:#}"));
+        }
+    }
     Ok(())
 }
 
@@ -711,7 +734,8 @@ async fn control_switch(
     std::fs::set_permissions(&snaps, std::fs::Permissions::from_mode(0o700))?;
     let snap = snaps.join(format!("{}-{from}.db", wicket_store::now()));
     ledger.lock().expect("ledger").snapshot(&snap)?;
-    prune_snapshots(&snaps, 5);
+    let protect: Vec<String> = [Some(from.to_string()), v.pointer("previous")].into_iter().flatten().collect();
+    prune_snapshots(&snaps, KEEP_SNAPSHOTS, &protect, false);
     audit(ledger, "self.snapshot", serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema }));
     v.switch(to)?;
     let kind = if rollback { "self.rolled_back" } else { "self.switched" };
@@ -753,18 +777,136 @@ async fn control_switch(
     }
 }
 
-fn prune_snapshots(dir: &Path, keep: usize) {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "db"))
-        .collect();
-    v.sort();
-    while v.len() > keep {
-        let _ = std::fs::remove_file(v.remove(0));
+/// How many ledger snapshots are kept (besides those a rollback needs).
+pub const KEEP_SNAPSHOTS: usize = 5;
+
+/// The snapshots (`<time>-<version>.db`, the ledger before switching away from that version) to
+/// delete: all but the newest `keep`, and never the newest of a version in `protect` (the current
+/// and previous versions': a way back past a contract step).
+fn snapshots_to_prune(mut names: Vec<String>, keep: usize, protect: &[String]) -> Vec<String> {
+    names.retain(|n| n.ends_with(".db"));
+    // `<seconds>-<id>.db`: numeric order is time order.
+    names.sort_by_key(|n| (n.split('-').next().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0), n.clone()));
+    let mut kept_for: Vec<&str> = vec![];
+    let mut out = vec![];
+    let total = names.len();
+    for (i, n) in names.iter().enumerate().rev() {
+        let version = n.trim_end_matches(".db").split_once('-').map(|(_, v)| v).unwrap_or("");
+        let newest_of_protected = protect.iter().any(|p| p == version) && !kept_for.contains(&version);
+        if newest_of_protected {
+            kept_for.push(version);
+        }
+        if total - i > keep && !newest_of_protected {
+            out.push(n.clone());
+        }
     }
+    out.reverse();
+    out
+}
+
+/// Deletes the snapshots `snapshots_to_prune` picks; returns their names.
+fn prune_snapshots(dir: &Path, keep: usize, protect: &[String], dry_run: bool) -> Vec<String> {
+    let names = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect();
+    let gone = snapshots_to_prune(names, keep, protect);
+    if !dry_run {
+        for n in &gone {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+    }
+    gone
+}
+
+/// Shell (with `$vr`, the versions root, and `$D`, the docker command, set) that removes the
+/// versions that are neither `current` nor `previous` nor run by any process here (`/proc/*/exe`),
+/// and each one's agent image unless a container (running or not) was made from it. Prints
+/// `version <id>`, `image <tag>` and `kept <tag> (…)` lines; with `dry` set, removes nothing.
+fn prune_sh(dry: bool) -> String {
+    PRUNE_SH.replace("@DRY@", if dry { "true" } else { "false" }).replace("@REPO@", crate::image::REPO)
+}
+
+const PRUNE_SH: &str = r#"dry=@DRY@
+[ -d "$vr" ] || exit 0
+real=$(cd "$vr" && pwd -P)
+cur=$(readlink "$vr/current" 2>/dev/null || true)
+prev=$(readlink "$vr/previous" 2>/dev/null || true)
+used=$(for p in /proc/[0-9]*; do readlink "$p/exe" 2>/dev/null; done | sed -n "s|^$real/\([0-9a-f]\{12\}\)/wicket.*|\1|p" | sort -u)
+for d in "$real"/*/; do
+  id=$(basename "$d")
+  case "$id" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) continue ;; esac
+  if [ "$id" = "$cur" ] || [ "$id" = "$prev" ]; then continue; fi
+  if printf '%s\n' "$used" | grep -qx "$id"; then echo "kept-version $id (a process runs it)"; continue; fi
+  echo "version $id"
+  [ "$dry" = true ] || rm -rf "${real:?}/$id"
+  tag=@REPO@:$id
+  $D image inspect "$tag" >/dev/null 2>&1 || continue
+  if [ -n "$($D ps -aq --filter "ancestor=$tag" 2>/dev/null)" ]; then echo "kept $tag (a container uses it)"; continue; fi
+  echo "image $tag"
+  [ "$dry" = true ] || $D rmi "$tag" >/dev/null
+done
+"#;
+
+/// What one prune removed (or would): `version <id>`, `image <tag>` and `kept …` lines.
+fn prune_report(out: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let pick = |p: &str| out.lines().filter_map(|l| l.strip_prefix(p)).map(String::from).collect::<Vec<_>>();
+    let kept = out.lines().filter(|l| l.starts_with("kept")).map(|l| l.split_once(' ').map(|x| x.1).unwrap_or("").to_string()).collect();
+    (pick("version "), pick("image "), kept)
+}
+
+/// `wicket self prune`: on the control host (unless `only_nodes`) and the nodes named, removes the
+/// versions, and their agent images, that nothing needs: neither current nor previous, run by no
+/// process, and (for an image) used by no container; and ledger snapshots beyond the newest
+/// `keep`, except the newest of the current and previous versions. Each target is audited.
+pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run: bool) -> Result<()> {
+    let ledger = Arc::new(Mutex::new(Ledger::open(&crate::ledger_path())?));
+    let nodes = match &nodes {
+        Some(s) => node_list(&ledger.lock().expect("ledger"), s)?,
+        None => vec![],
+    };
+    let verb = if dry_run { "would remove" } else { "removed" };
+    let report = |target: &str, out: &str, snapshots: Vec<String>| {
+        let (versions, images, kept) = prune_report(out);
+        say(format!(
+            "{target}: {verb} {} version(s) [{}], {} image(s) [{}], {} snapshot(s){}",
+            versions.len(),
+            versions.join(", "),
+            images.len(),
+            images.join(", "),
+            snapshots.len(),
+            if kept.is_empty() { String::new() } else { format!("; kept {}", kept.join(", ")) }
+        ));
+        if !dry_run && (!versions.is_empty() || !images.is_empty() || !snapshots.is_empty()) {
+            audit(
+                &ledger,
+                "self.pruned",
+                serde_json::json!({ "target": target, "versions": versions, "images": images, "snapshots": snapshots, "kept": kept, "by": crate::operator() }),
+            );
+        }
+    };
+    if !only_nodes {
+        let v = Versions::control();
+        let docker = std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into());
+        let out = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(prune_sh(dry_run))
+            .env("vr", &v.root)
+            .env("D", &docker)
+            .output()
+            .await
+            .context("pruning versions")?;
+        if !out.status.success() {
+            bail!("pruning versions: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let protect: Vec<String> = [v.pointer("current"), v.pointer("previous")].into_iter().flatten().collect();
+        let snapshots = prune_snapshots(&crate::data_dir().join("snapshots"), keep, &protect, dry_run);
+        report("control", &String::from_utf8_lossy(&out.stdout), snapshots);
+    }
+    for n in &nodes {
+        let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
+        let node = crate::enrol::resolve_installed(&row.name, None)?;
+        let out = node.script("pruning versions", &format!("set -u\n{NODE_ROOT}\nD=docker\n{}", prune_sh(dry_run))).await?;
+        report(&format!("node:{n}"), &out, vec![]);
+    }
+    Ok(())
 }
 
 /// Moves the control host's processes to `bin` (the version just made current): this host's own
@@ -795,12 +937,12 @@ async fn handover(bin: &Path) -> Result<()> {
     let local = crate::localnode::pidfile()?;
     if let Some(pid) = hangup(&local, "node serve") {
         for _ in 0..200 {
-            if runs(pid, bin) {
+            if runs(pid, bin, &local) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        say(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin) { "the new build" } else { "?" }));
+        say(format!("this host's node: serve (pid {pid}) re-executed as {}", if runs(pid, bin, &local) { "the new build" } else { "?" }));
     }
     for role in ["console", "reconcile"] {
         if let Some(pid) = hangup(&pidfile(role), role) {
@@ -1212,6 +1354,85 @@ mod tests {
         let v = Versions { root: vr.clone() };
         assert_eq!((v.pointer("current").as_deref(), v.pointer("previous").as_deref()), (Some("bbbbbbbbbbbb"), Some("aaaaaaaaaaaa")));
         assert_eq!(std::fs::read_link(d.join(".local/bin/wicket")).unwrap(), vr.join("current/wicket"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn snapshots_keep_the_newest_and_whatever_a_rollback_needs() {
+        let names: Vec<String> = [
+            "100-aaaaaaaaaaaa.db",
+            "200-bbbbbbbbbbbb.db",
+            "300-cccccccccccc.db",
+            "400-dddddddddddd.db",
+            "1000-eeeeeeeeeeee.db",
+            "notes.txt",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Numeric, not lexical, order: 1000 is the newest.
+        assert_eq!(snapshots_to_prune(names.clone(), 2, &[]), ["100-aaaaaaaaaaaa.db", "200-bbbbbbbbbbbb.db", "300-cccccccccccc.db"]);
+        // The previous version's snapshot stays, however old.
+        assert_eq!(snapshots_to_prune(names.clone(), 2, &["aaaaaaaaaaaa".into()]), ["200-bbbbbbbbbbbb.db", "300-cccccccccccc.db"]);
+        assert!(snapshots_to_prune(names, 10, &[]).is_empty());
+        // Only the newest of a protected version is protected.
+        let two = vec!["1-aaaaaaaaaaaa.db".to_string(), "2-aaaaaaaaaaaa.db".to_string()];
+        assert_eq!(snapshots_to_prune(two, 0, &["aaaaaaaaaaaa".into()]), ["1-aaaaaaaaaaaa.db"]);
+    }
+
+    #[test]
+    fn prune_keeps_current_previous_running_versions_and_used_images() {
+        let d = tmp("prune");
+        let vr = d.join("versions");
+        let ids = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc", "dddddddddddd", "eeeeeeeeeeee"];
+        for id in ids {
+            std::fs::create_dir_all(vr.join(id)).unwrap();
+            std::fs::copy("/bin/sleep", vr.join(id).join("wicket")).unwrap();
+        }
+        std::fs::create_dir_all(vr.join("not-a-version")).unwrap();
+        let v = Versions { root: vr.clone() };
+        v.switch("aaaaaaaaaaaa").unwrap();
+        v.switch("bbbbbbbbbbbb").unwrap();
+        // A process runs dddddddddddd.
+        let mut running = std::process::Command::new(vr.join("dddddddddddd/wicket")).arg("30").spawn().unwrap();
+        // A docker stand-in: every version has an image, and a container uses eeeeeeeeeeee's.
+        let fake = d.join("docker");
+        let log = d.join("rmi.log");
+        std::fs::write(
+            &fake,
+            format!(
+                "case \"$1 $2\" in\n  'image inspect') exit 0 ;;\n  'ps -aq') case \"$4\" in *eeeeeeeeeeee) echo c1 ;; esac ;;\n  'rmi '*) echo \"$2\" >> {} ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let run = |dry: bool| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(prune_sh(dry))
+                .env("vr", &vr)
+                .env("D", format!("sh {}", fake.display()))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            prune_report(&String::from_utf8_lossy(&out.stdout))
+        };
+        let (versions, images, kept) = run(true);
+        assert_eq!(versions, ["cccccccccccc", "eeeeeeeeeeee"]);
+        assert_eq!(images, ["wicket/claude-code:cccccccccccc"]);
+        assert!(kept.iter().any(|k| k.starts_with("dddddddddddd")) && kept.iter().any(|k| k.contains("eeeeeeeeeeee")), "{kept:?}");
+        assert!(vr.join("cccccccccccc").exists() && !log.exists(), "a dry run removes nothing");
+        let (versions, _, _) = run(false);
+        assert_eq!(versions, ["cccccccccccc", "eeeeeeeeeeee"]);
+        for (id, there) in
+            [("aaaaaaaaaaaa", true), ("bbbbbbbbbbbb", true), ("cccccccccccc", false), ("dddddddddddd", true), ("eeeeeeeeeeee", false)]
+        {
+            assert_eq!(vr.join(id).exists(), there, "{id}");
+        }
+        assert!(vr.join("not-a-version").exists());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "wicket/claude-code:cccccccccccc\n");
+        let _ = running.kill();
+        let _ = running.wait();
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

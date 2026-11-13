@@ -29,8 +29,16 @@ A switch replaces `previous` and then `current` (each an atomic rename of a new 
 switch to `previous`, so the two trade places and a second rollback goes forward again. Every wicket
 process running from a staged version starts its children from `current` (the console's runs,
 wicketd's commands, a run's children, this host's node's `serve`, the reconciler's adopting supervisors),
-so after a switch everything new is the new build. Older versions stay until removed by hand (`rm -r` of a
-directory that is neither `current` nor `previous`, and that no process runs: `ls -l /proc/*/exe`).
+so after a switch everything new is the new build.
+
+**Pruning** (#166). `wicket self prune [--nodes all|n1,n2] [--dry-run] [--keep-snapshots 5]` removes what
+neither a running box nor a rollback needs: on the control host and each node named, every version that is
+neither `current` nor `previous` and that no process runs (`/proc/*/exe`), and that version's agent image
+unless a container, running or stopped, was made from it; and ledger snapshots beyond the newest five,
+always keeping the newest of the current and previous versions' (the way back past a contract step). A
+committed `wicket self update` prunes the same way where it updated (`--no-prune` to keep everything).
+Each target pruned is a `self.pruned` audit record. An image that also carries another tag (`install.sh` makes `wicket/claude-code:poc` an alias of
+the installed version's) keeps that tag.
 
 A node keeps the same layout under `~/.local/share/wicket-node/versions/`, with `~/.local/bin/wicket` a link
 to its `current`; `wicket node install` stages the control host's current build there.
@@ -193,4 +201,3 @@ With #154's state store configured, the snapshot belongs there too; until that l
 - The control host's own wicketd re-executes only once no command runs through it, so a long `wicket
   attach` session delays it (it logs that it is waiting).
 - `self update` doesn't install new systemd units or rebuild the agent image (above).
-- Old versions and snapshots beyond the last five are not pruned automatically.

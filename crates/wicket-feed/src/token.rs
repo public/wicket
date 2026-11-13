@@ -7,7 +7,7 @@
 //! signatures against the pinned authority root, every block's revocation id against the feed's
 //! revocation list, the strict structural check, then the fork's prepared and compiled evaluator
 //! with its step budget (`wicket_authz::load`). Requests are decided by `wicket_authz`'s decision
-//! (Allow / NeedsGrant / Forbidden), mapped onto the feed's fail-narrow modes
+//! (Allow / NeedsGrant / Forbidden), mapped onto the feed's modes
 //! ([`Replica::<BoxAuthority>::decide`]).
 //!
 //! - **What the token decides, and what it doesn't.** Every allow comes from the token. The record's
@@ -35,7 +35,6 @@
 use crate::format::RevokeKind;
 use crate::replica::{Allowed, Decision, Mode, Replica};
 use crate::state::Policy;
-use crate::NARROW_MAX_RISK;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -218,67 +217,59 @@ enum Found {
 impl Replica<BoxAuthority> {
     /// The decision for one op at `now`, from the box's token:
     ///
-    /// | token says | fresh | narrow |
-    /// |---|---|---|
-    /// | Allow (by its ceilings) | allow | allow at risk ≤ R1, else refused |
-    /// | NeedsGrant | try each live listed grant for this request; allow on the first the token accepts (one use consumed), else NeedsGrant | refused (grants aren't honoured while stale) |
-    /// | Forbidden | forbidden | forbidden |
+    /// | token says | fresh or offline |
+    /// |---|---|
+    /// | Allow (by its ceilings) | allow |
+    /// | NeedsGrant | try each live listed grant for this request; allow on the first the token accepts (one use consumed), else NeedsGrant |
+    /// | Forbidden | forbidden |
     ///
-    /// Closed refuses everything; a revoked run, a box with no record, a token that didn't load or
+    /// Offline (#153) decides exactly as fresh: the token and its grants carry their own expiries,
+    /// checked against the node's clock, and nothing else bounds how long a node works alone. The
+    /// caller queues a NeedsGrant raised offline. Closed and lagging refuse everything; a revoked run, a box with no record, a token that didn't load or
     /// was revoked, and an op for another zone are forbidden.
     pub fn decide(&mut self, op: &Op, now: i64) -> Decision {
         let found = match self.gate(op, now) {
             Err(d) => Found::Done(d),
-            Ok((mode, st)) => {
-                let refused = |why: String| Decision::Refused { mode, why };
-                match st.zones.get(&op.run.0) {
-                    None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
-                    Some(entry) => match &entry.compiled {
-                        Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
-                        Ok(_) if entry.spec.zone.name != op.zone => Found::Done(Decision::Forbidden(format!(
-                            "op for zone {}, but box {} holds authority for zone {}",
-                            op.zone, op.run, entry.spec.zone.name
-                        ))),
-                        Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => Found::Done(Decision::Forbidden(
-                            "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
-                        )),
-                        Ok(c) => {
-                            let mut req = request(&entry.spec, op, now);
-                            match c.loaded.decide(&req) {
-                                authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
-                                authz::Decision::Allow if mode == Mode::Fresh || op.risk <= NARROW_MAX_RISK => {
-                                    Found::Done(Decision::Allow(Allowed::Ceiling))
-                                }
-                                authz::Decision::Allow => Found::Done(refused(format!("narrow: {:?} needs fresh policy", op.risk))),
-                                authz::Decision::NeedsGrant(r) if mode != Mode::Fresh => {
-                                    let r = reason(c, op, false, r);
-                                    Found::Done(refused(format!("narrow: grants are not honoured while stale ({r})")))
-                                }
-                                authz::Decision::NeedsGrant(r) => {
-                                    let r = reason(c, op, false, r);
-                                    let candidates = entry.spec.grants.iter().filter(|g| {
-                                        g.host.eq_ignore_ascii_case(&op.host)
-                                            && g.method.eq_ignore_ascii_case(&op.method)
-                                            && g.path == op.path
-                                            && !st.is_revoked(RevokeKind::Grant, &g.id)
-                                            && g.uses.is_none_or(|max| self.uses(&g.id) < max)
-                                    });
-                                    let mut hit = None;
-                                    for g in candidates {
-                                        let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
-                                        req.uses_left = vec![(g.id.clone(), left)];
-                                        if c.loaded.decide(&req) == authz::Decision::Allow {
-                                            hit = Some(Found::Grant { id: g.id.clone(), counted: g.uses.is_some() });
-                                            break;
-                                        }
+            Ok((_, st)) => match st.zones.get(&op.run.0) {
+                None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
+                Some(entry) => match &entry.compiled {
+                    Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
+                    Ok(_) if entry.spec.zone.name != op.zone => Found::Done(Decision::Forbidden(format!(
+                        "op for zone {}, but box {} holds authority for zone {}",
+                        op.zone, op.run, entry.spec.zone.name
+                    ))),
+                    Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => Found::Done(Decision::Forbidden(
+                        "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
+                    )),
+                    Ok(c) => {
+                        let mut req = request(&entry.spec, op, now);
+                        match c.loaded.decide(&req) {
+                            authz::Decision::Forbidden(r) => Found::Done(Decision::Forbidden(reason(c, op, true, r))),
+                            authz::Decision::Allow => Found::Done(Decision::Allow(Allowed::Ceiling)),
+                            authz::Decision::NeedsGrant(r) => {
+                                let r = reason(c, op, false, r);
+                                let candidates = entry.spec.grants.iter().filter(|g| {
+                                    g.host.eq_ignore_ascii_case(&op.host)
+                                        && g.method.eq_ignore_ascii_case(&op.method)
+                                        && g.path == op.path
+                                        && !st.is_revoked(RevokeKind::Grant, &g.id)
+                                        && g.uses.is_none_or(|max| self.uses(&g.id) < max)
+                                });
+                                let mut hit = None;
+                                for g in candidates {
+                                    let left = g.uses.map_or(i64::MAX, |max| i64::from(max - self.uses(&g.id)));
+                                    req.uses_left = vec![(g.id.clone(), left)];
+                                    if c.loaded.decide(&req) == authz::Decision::Allow {
+                                        hit = Some(Found::Grant { id: g.id.clone(), counted: g.uses.is_some() });
+                                        break;
                                     }
-                                    hit.unwrap_or(Found::Done(Decision::NeedsGrant(r)))
                                 }
+                                hit.unwrap_or(Found::Done(Decision::NeedsGrant(r)))
                             }
                         }
-                    },
-                }
-            }
+                    }
+                },
+            },
         };
         match found {
             Found::Done(d) => d,
@@ -308,7 +299,7 @@ impl Replica<BoxAuthority> {
     /// without terminating TLS (#141; which hosts: [`wicket_core::splice`]), at `now`. Read-only: no
     /// grant is tried and no use is recorded. All of these must hold, else None (inspect):
     ///
-    /// - the replica is fresh (narrow and closed decide per request, which a hostname can't carry);
+    /// - the replica is fresh or offline (lagging and closed refuse per request);
     /// - the box is a top-level box: a child's token is narrowed by its ancestors' ceilings, which
     ///   the record's zone doesn't show;
     /// - the zone the box's token was minted from allows the host wholesale;
@@ -335,7 +326,7 @@ impl Replica<BoxAuthority> {
             for path in SPLICE_PROBES {
                 let op = Op::egress(tenant, &run_id, &entry.spec.zone.name, method, host, path);
                 match self.gate(&op, now) {
-                    Ok((Mode::Fresh, _)) => {}
+                    Ok((Mode::Fresh | Mode::Offline, _)) => {}
                     _ => return None,
                 }
                 if c.loaded.decide(&request(&entry.spec, &op, now)) != authz::Decision::Allow {
@@ -344,6 +335,14 @@ impl Replica<BoxAuthority> {
             }
         }
         Some(rule)
+    }
+
+    /// When box `run`'s authority ends (Unix ms), read from its verified token: the earliest expiry
+    /// of its first-party blocks (#153). None if the node holds no valid token for it.
+    pub fn authority_until(&self, run: &str) -> Option<i64> {
+        let c = self.state()?.zones.get(run)?.compiled.as_ref().ok()?;
+        // The token's check is `time <= not_after` in whole seconds: it allows through that second.
+        c.loaded.not_after().map(|s| i64::try_from(s).unwrap_or(i64::MAX / 1000).saturating_add(1).saturating_mul(1000))
     }
 
     /// The zone a box's authority was minted from, if the node holds it.

@@ -1096,6 +1096,14 @@ impl Ledger {
         Ok(v)
     }
 
+    /// The body of a run's newest audit record of `kind`, if any.
+    pub fn audit_latest(&self, run: &str, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT body FROM audit WHERE run = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1", params![run, kind], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Recomputes the whole chain. Returns the number of records verified.
     pub fn verify_audit(&self) -> Result<i64> {
         Ok(self.verify_audit_versions()?.total())

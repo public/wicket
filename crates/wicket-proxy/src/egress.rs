@@ -606,6 +606,15 @@ impl Egress {
                     crate::SANDBOX_FACT
                 ), Some(&rid));
             }
+            Outcome::Queued { id, why } => {
+                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
+                emit("queued", format!("{id}: {why}{for_line}"));
+                let note = self.strike(&op.digest());
+                return problem(403, "queued", "Blocked by wicket sandbox: needs human approval (queued offline)", &format!(
+                    "{why}. wicket's control plane is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
+                    crate::SANDBOX_FACT
+                ), None);
+            }
             Outcome::Unavailable(why) => {
                 emit("unavailable", why.clone());
                 return problem(
@@ -764,6 +773,13 @@ impl Egress {
                         );
                     }
                 }
+                // On a node, the secret is fetched from the control host on its first use (#152).
+                if let Err(e) = self.ctx.vault.ensure(&rule.secret).await {
+                    if rule.optional {
+                        break;
+                    }
+                    return Err(e);
+                }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
                 self.ctx.vault.check(&rule.secret, host)?;
                 let secret = match self.ctx.vault.get(&rule.secret) {
@@ -790,6 +806,10 @@ impl Egress {
                         headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {real}"))?);
                         injected.push(real);
                         tracing::debug!(host, swap = %sw.name, "credential swapped");
+                    }
+                    None if self.ctx.swaps.iter().any(|s| s.box_bearers && host_matches(&s.host, host)) && auth.starts_with("Bearer ") => {
+                        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(auth)?);
+                        tracing::debug!(host, "the box's own bearer passed (box_bearers)");
                     }
                     None => tracing::debug!(host, "box-supplied authorization dropped (not a known placeholder)"),
                 }
@@ -917,6 +937,7 @@ mod tests {
         assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
         // A swap from the vault is bound the same way, whatever host the swap names.
         let swap = |host: &str| crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: host.into(),
             placeholder: "ph-123".into(),
@@ -1032,6 +1053,7 @@ mod tests {
     async fn plain_http_to_a_credentialed_host_is_refused() {
         use http_body_util::BodyExt;
         let swap = crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: "api.github.com".into(),
             placeholder: "ph-123".into(),

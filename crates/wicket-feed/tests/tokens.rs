@@ -1,6 +1,6 @@
 //! The feed carrying boxes' authority as Biscuit token chains (#57 step 4):
 //! - decisions through tokens match `CompiledZone` (the `ZoneSpec` feed) on every example and
-//!   subset-test zone, fresh and narrow;
+//!   subset-test zone, fresh and offline;
 //! - revoking a spawn block revokes the subtree on the node;
 //! - a grant reaches the node, its use count is enforced there (and survives a restart), and
 //!   revoking it stops only that grant;
@@ -21,7 +21,6 @@ use wicket_feed::*;
 const T0: i64 = 1_800_000_000_000;
 const NODE: &str = "n1";
 const TTL: i64 = 3_000;
-const WINDOW: i64 = 6_000;
 
 fn secs(ms: i64) -> u64 {
     (ms / 1000) as u64
@@ -61,11 +60,11 @@ struct Cp {
 }
 
 fn cfg() -> PublisherConfig {
-    PublisherConfig { ttl_ms: TTL, refresh_ms: 500, narrow_ms: WINDOW, retain: 100 }
+    PublisherConfig { ttl_ms: TTL, refresh_ms: 500, retain: 100 }
 }
 
 fn cert(root: &FeedKey, feed: &FeedKey) -> String {
-    sign(root, TYP_KEY, &KeyCert::new(&feed.verifying_key(), 1, T0 + 86_400_000, 30_000, 300_000))
+    sign(root, TYP_KEY, &KeyCert::new(&feed.verifying_key(), 1, T0 + 86_400_000, 30_000))
 }
 
 impl Cp {
@@ -132,7 +131,7 @@ fn kind(d: &Decision) -> &'static str {
 }
 
 #[test]
-fn token_decisions_match_compiled_zones_fresh_and_narrow() {
+fn token_decisions_match_compiled_zones_fresh_and_offline() {
     let zones = all_zones();
     let mut cp = Cp::new();
     // The oracle: the same zones as `ZoneSpec` entries, decided by `CompiledZone` in the replica.
@@ -155,8 +154,8 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
     let (mut tr, mut zr) = (cp.replica(), Replica::<ZoneSpec>::new(NODE, cp.root.verifying_key(), ReplicaConfig::default()));
     sync(&mut cp.p, &mut tr, T0);
     sync(&mut zp, &mut zr, T0);
-    let narrow = T0 + TTL + 1;
-    assert_eq!(tr.mode(narrow), Mode::Narrow);
+    let offline = T0 + TTL + 1;
+    assert_eq!(tr.mode(offline), Mode::Offline);
     let mut counts = std::collections::BTreeMap::<(&str, &str), usize>::new();
     for (run, z) in &boxes {
         let (hosts, paths) = probes(&[z]);
@@ -164,7 +163,7 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
             for p in &paths {
                 for m in METHODS {
                     let o = op(&z.name, run, m, h, p);
-                    for (now, mode) in [(T0, "fresh"), (narrow, "narrow")] {
+                    for (now, mode) in [(T0, "fresh"), (offline, "offline")] {
                         let (want, got) = (zr.decide(&o, now), tr.decide(&o, now));
                         assert_eq!(
                             kind(&got),
@@ -180,7 +179,14 @@ fn token_decisions_match_compiled_zones_fresh_and_narrow() {
         }
     }
     println!("token vs CompiledZone on {} zones: {counts:?}", boxes.len());
-    for k in [("fresh", "allow"), ("fresh", "forbidden"), ("fresh", "needs-grant"), ("narrow", "allow"), ("narrow", "refused")] {
+    for k in [
+        ("fresh", "allow"),
+        ("fresh", "forbidden"),
+        ("fresh", "needs-grant"),
+        ("offline", "allow"),
+        ("offline", "forbidden"),
+        ("offline", "needs-grant"),
+    ] {
         assert!(counts.get(&k).copied().unwrap_or(0) > 500, "too few {k:?}: {counts:?}");
     }
     // A box's token decides only for its own zone and run.
@@ -298,14 +304,13 @@ fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
     assert_eq!(r.decide(&hook, T0 + 20), Decision::Allow(Allowed::Grant("g1".into())));
     assert_eq!(kind(&r.decide(&other, T0 + 20)), "needs-grant", "a grant is for exactly one request");
-    // Narrow: grants aren't honoured, and no use is consumed.
-    assert_eq!(kind(&r.decide(&hook, T0 + TTL + 100)), "refused");
+    // Offline (#153): the grant is honoured on the node, its uses counted there.
+    assert_eq!(r.decide(&hook, T0 + TTL + 100), Decision::Allow(Allowed::Grant("g1".into())));
     r.accept(&cp.p.statement(T0 + TTL + 200), T0 + TTL + 200).unwrap();
-    // The second use survives a node restart's count; the third is refused.
+    // The uses survive a node restart's count; the third is refused.
     drop(r);
     let mut r = open(&cp);
-    assert_eq!(r.uses("g1"), 1);
-    assert_eq!(r.decide(&hook, T0 + TTL + 300), Decision::Allow(Allowed::Grant("g1".into())));
+    assert_eq!(r.uses("g1"), 2);
     assert_eq!(kind(&r.decide(&hook, T0 + TTL + 400)), "needs-grant", "two uses, then none");
     assert_eq!(r.uses("g1"), 2);
 

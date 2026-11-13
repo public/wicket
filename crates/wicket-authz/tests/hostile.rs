@@ -11,6 +11,12 @@ fn chain() -> (Keys, Token) {
     let keys = Keys::new(5);
     let cs = ceilings(2, &keys);
     let t = mint_chain(&cs, &keys);
+    // The legitimate chain the hostile blocks are appended to runs compiled, every request (#183).
+    let l = load_ok(&t, &keys);
+    assert!(l.is_compiled());
+    for (_, r) in scenarios(2) {
+        decide_compiled(&l, &r);
+    }
     (keys, t)
 }
 
@@ -75,10 +81,15 @@ fn too_many_blocks_or_bytes() {
     let raw = Token::from_biscuit(t.biscuit().append(wicket_authz::generator::ceiling_block(&cs[5]).unwrap()).unwrap());
     assert!(load_err(&raw, &keys).contains("17 blocks"));
     // Token bytes: blocks with many long, distinct globs (Biscuit interns repeated strings), until
-    // the token is over the cap.
+    // the token is over the cap. One glob per host, so that no host's globs are over the cost
+    // estimate (`cost`, #183) before the token is over the byte cap.
     let mut t = mint_chain(&cs, &keys);
+    let base = cs[5].reach.clone();
     for j in 0.. {
-        cs[5].reach[0].paths = (0..60).map(|i| format!("/repos/acme/{}-{j}-{i}/**", "x".repeat(180))).collect();
+        cs[5].reach = base.clone();
+        cs[5].reach.extend(
+            (0..56).map(|i| r(&format!("h{j}-{i}.example"), &["GET"], &[&format!("/repos/acme/{}-{j}-{i}/**", "x".repeat(180))], false)),
+        );
         match t.attenuate(&cs[5]) {
             Ok(next) => t = next,
             Err(AuthzError::Structure(e)) => {
@@ -91,6 +102,7 @@ fn too_many_blocks_or_bytes() {
         }
     }
     // A child zone over a per-block cap is refused where it's made.
+    cs[5].reach = base;
     cs[5].reach[0].paths = (0..70).map(|i| format!("/repos/acme/p{i}/**")).collect();
     assert!(matches!(mint_chain(&cs[..5], &keys).attenuate(&cs[5]), Err(AuthzError::Structure(e)) if e.contains("alternatives")));
 }
@@ -110,7 +122,11 @@ fn hostile_third_party_blocks() {
     let t = t.attenuate(&c).unwrap();
     let ok =
         r#"approved("g", "h", "GET", "/") <- time($t), $t <= 2030-01-01T00:00:00Z, box("b0/b1/b2"), epoch(3), uses_left("g", $n), $n > 0;"#;
-    load_ok(&third_party_raw(&t, ok, &evil), &keys);
+    let l = load_ok(&third_party_raw(&t, ok, &evil), &keys);
+    assert!(l.is_compiled());
+    for (_, r) in scenarios(3) {
+        decide_compiled(&l, &r);
+    }
     let refused = |code: &str, why: &str| {
         let e = load_err(&third_party_raw(&t, code, &evil), &keys);
         assert!(e.contains(why), "{code}: {e}");

@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod h3;
 pub mod link;
 pub mod llm;
+pub mod provider;
 mod splice;
 pub mod vault;
 
@@ -109,6 +110,11 @@ pub struct CredentialSwap {
     pub host: String,
     pub placeholder: String,
     pub real: SwapSource,
+    /// Whether, on this host, a bearer the box presents that isn't the placeholder goes upstream as
+    /// the box sent it, rather than being dropped: for a harness that holds tokens of its own, which
+    /// it got from this host's answers (a remote session's per-session tokens, #169). Never wicket's
+    /// secret either way: only the placeholder is swapped.
+    pub box_bearers: bool,
 }
 
 #[derive(Clone)]

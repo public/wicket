@@ -192,7 +192,7 @@ fn recertify_feed(name: &str, root: &wicket_identity::SigningKey, ms: i64) -> Re
         .and_then(|b| b.try_into().ok())
         .context("cert.jws key")?;
     let vk = wicket_identity::VerifyingKey::from_bytes(&key)?;
-    let n = KeyCert::new(&vk, c.version, wicket_feed::now_ms() + ms, c.max_ttl_ms, c.max_narrow_ms);
+    let n = KeyCert::new(&vk, c.version, wicket_feed::now_ms() + ms, c.max_ttl_ms);
     write_replace(&p, wicket_feed::sign(root, wicket_feed::TYP_KEY, &n).as_bytes())
 }
 

@@ -109,6 +109,23 @@ pub struct Vetted {
     pub classes: Vec<Vec<CheckClass>>,
     /// Block 0 carries an org layer (its `policy` fact, #51).
     pub org: bool,
+    /// The earliest hard expiry any first-party block sets (`check if time($t), $t <= <date>`, Unix
+    /// seconds): the token allows nothing after it (#153). None if no block bounds time that way.
+    pub not_after: Option<u64>,
+}
+
+/// The date a check bounds time by, if it is exactly `check if time($t), $t <= <date>`.
+fn expiry(c: &biscuit_auth::builder::Check) -> Option<u64> {
+    let [q] = c.queries.as_slice() else { return None };
+    let ([pred], [e]) = (q.body.as_slice(), q.expressions.as_slice()) else { return None };
+    let [Term::Variable(v)] = pred.terms.as_slice() else { return None };
+    if pred.name != "time" || c.kind != CheckKind::One {
+        return None;
+    }
+    match e.ops.as_slice() {
+        [Op::Value(Term::Variable(a)), Op::Value(Term::Date(d)), Op::Binary(Binary::LessOrEqual)] if a == v => Some(*d),
+        _ => None,
+    }
 }
 
 fn has(list: &[(&str, usize)], p: &Predicate) -> bool {
@@ -319,6 +336,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
     let mut trusted: Vec<PublicKeyData> = Vec::new();
     let mut third_party = Vec::new();
     let mut classes = Vec::with_capacity(n);
+    let mut not_after: Option<u64> = None;
     for i in 0..n {
         let b = tok.block_datalog(i).map_err(|e| e.to_string())?;
         if b.external_key.is_some() {
@@ -367,6 +385,9 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
                 query(q, p, &mut trusted, &mut regexes).map_err(at)?;
             }
             cls.push(classify(&c.queries, &c.kind));
+            if let Some(d) = expiry(c) {
+                not_after = Some(not_after.map_or(d, |n| n.min(d)));
+            }
         }
         if regexes > p.max_regexes_per_block {
             return Err(at(format!("{regexes} regexes (cap {})", p.max_regexes_per_block)));
@@ -397,5 +418,5 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
             grant_rule(r, p).map_err(at)?;
         }
     }
-    Ok(Vetted { classes, org })
+    Ok(Vetted { classes, org, not_after })
 }

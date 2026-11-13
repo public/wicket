@@ -24,7 +24,7 @@ use crate::format::{Change, Delta, Frame, FrameKind, Fresh, Hello, KeyCert, GENE
 use crate::jws::{kid, open, payload_unverified, sha, sign, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 use crate::state::{Policy, State};
 use crate::store::{lines, read_opt};
-use crate::{DEFAULT_NARROW_MS, DEFAULT_REFRESH_MS, DEFAULT_TTL_MS};
+use crate::{DEFAULT_REFRESH_MS, DEFAULT_TTL_MS};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -34,14 +34,13 @@ use std::path::{Path, PathBuf};
 pub struct PublisherConfig {
     pub ttl_ms: i64,
     pub refresh_ms: i64,
-    pub narrow_ms: i64,
     /// Catch-up from deltas only if the node is at most this many epochs behind; else a snapshot.
     pub retain: u64,
 }
 
 impl Default for PublisherConfig {
     fn default() -> Self {
-        PublisherConfig { ttl_ms: DEFAULT_TTL_MS, refresh_ms: DEFAULT_REFRESH_MS, narrow_ms: DEFAULT_NARROW_MS, retain: 1000 }
+        PublisherConfig { ttl_ms: DEFAULT_TTL_MS, refresh_ms: DEFAULT_REFRESH_MS, retain: 1000 }
     }
 }
 
@@ -82,8 +81,8 @@ fn check_cert(root: &VerifyingKey, key: &SigningKey, cert_jws: &str, cfg: &Publi
     if certified != key.verifying_key() {
         return Err(PublishError::Invalid("the certificate is for another key".into()));
     }
-    if cfg.ttl_ms <= 0 || cfg.ttl_ms > cert.max_ttl_ms || cfg.narrow_ms < 0 || cfg.narrow_ms > cert.max_narrow_ms || cfg.refresh_ms <= 0 {
-        return Err(PublishError::Invalid("ttl or narrow window outside the certificate's caps".into()));
+    if cfg.ttl_ms <= 0 || cfg.ttl_ms > cert.max_ttl_ms || cfg.refresh_ms <= 0 {
+        return Err(PublishError::Invalid("ttl outside the certificate's cap".into()));
     }
     Ok(cert)
 }
@@ -281,7 +280,7 @@ impl<P: Policy> Publisher<P> {
             head: self.state.head.clone(),
             issued_at,
             fresh_until,
-            narrow_until: fresh_until + self.cfg.narrow_ms,
+            narrow_until: 0,
         };
         let jws = sign(&self.key, TYP_FRESH, &f);
         self.fresh = Some((f, jws.clone()));

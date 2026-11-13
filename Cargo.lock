@@ -4220,6 +4220,7 @@ dependencies = [
  "wicket-sandbox",
  "wicket-store",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]
