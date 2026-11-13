@@ -10,7 +10,9 @@ explains why it is built this way.
 - The entry script (`images/claude-code/wicket-entry`) starts as root with only the network-admin
   capability, adds wicket's addresses to the loopback, and then runs everything as the agent's user
   (`WICKET_AS_USER`) with no capabilities.
-- Memory, CPUs and PIDs from the zone's `limits`. `/tmp` is capped at 512 MiB, checked every 5 s.
+- Memory, CPUs and PIDs from the zone's `limits`. The memory limit includes swap (`--memory-swap` equals
+  `--memory`), so a box on a host with swap can't swap past it. `/tmp` is capped at 512 MiB, checked every
+  5 s.
 - **Memory** (#185): the node samples the box's cgroup every 5 s. When the box reaches 90% of its memory
   limit, its agent gets a message from wicket (at its next turn) saying so and asking it to reduce
   parallelism and save its work; it is warned again only after dropping below 75%. A box over its limit is

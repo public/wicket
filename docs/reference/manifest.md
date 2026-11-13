@@ -167,7 +167,7 @@ one reads.
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `memory` | size | `2g` | Memory. At least 1 byte. The agent is warned at 90% of it; a box over it is killed by the kernel, and its run says so ([the box](box.md#runtime)). |
+| `memory` | size | `2g` | Memory, swap included (a box never swaps past it). At least 1 byte. The agent is warned at 90% of it; a box over it is killed by the kernel, and its run says so ([the box](box.md#runtime)). |
 | `cpus` | number | `1` | CPUs. At least 0.01. |
 | `pids` | integer | `512` | Processes. At least 1. |
 | `timeout` | duration | `30m` | Total time in a box over the agent's life, idle time included. Not zero. |

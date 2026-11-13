@@ -194,6 +194,9 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 
 ### Fixed
 
+- On a host with swap, a box could use as much swap again as its memory limit, so it neither stayed
+  within `limits.memory` nor was killed at it (it slowed to its timeout instead). The limit now includes
+  swap (`--memory-swap`).
 - The audit hash chain could fork when two processes appended at once
   ([#103](https://github.com/public/wicket/pull/103)).
 - A run whose timeout fired kept re-firing it while its node was unreachable, writing gigabytes of log
