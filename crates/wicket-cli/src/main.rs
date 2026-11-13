@@ -91,9 +91,10 @@ enum Cmd {
         /// Use this task text instead of the manifest's.
         #[arg(long)]
         task: Option<String>,
-        /// Agent image.
-        #[arg(long, default_value = "wicket/claude-code:poc")]
-        image: String,
+        /// Agent image, overriding the manifest's agent.image (default: that, or the installation's
+        /// agent image).
+        #[arg(long)]
+        image: Option<String>,
         /// Run the box on a remote node over ssh: an enrolled node's name (its host key pinned), or an
         /// ssh target (e.g. wicket@203.0.113.7; not pinned, with a warning). The node gets no secrets.
         #[arg(long)]
@@ -148,8 +149,9 @@ enum Cmd {
     Wrap {
         #[arg(long)]
         manifest: PathBuf,
-        #[arg(long, default_value = "wicket/claude-code:poc")]
-        image: String,
+        /// Agent image, overriding the manifest's agent.image.
+        #[arg(long)]
+        image: Option<String>,
         /// The agent command line, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -1031,7 +1033,7 @@ async fn main() -> Result<()> {
                 workdir: workdir.as_deref(),
                 workspace_dir: workspace_dir.as_deref(),
                 task,
-                image: &image,
+                image: image.as_deref(),
                 node: node.as_deref(),
                 ssh_key: ssh_key.as_deref(),
                 run_id,
@@ -1049,7 +1051,7 @@ async fn main() -> Result<()> {
                 workdir: None,
                 workspace_dir: None,
                 task: None,
-                image: &image,
+                image: image.as_deref(),
                 node: None,
                 ssh_key: None,
                 run_id: None,
@@ -1066,7 +1068,7 @@ async fn main() -> Result<()> {
             workdir: None,
             workspace_dir: None,
             task: None,
-            image: "",
+            image: None,
             node: None,
             ssh_key: None,
             run_id: Some(run.clone()),

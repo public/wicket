@@ -563,7 +563,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         workdir: None,
         workspace_dir: None,
         task: None,
-        image: &image,
+        image: Some(&image),
         node: node.as_deref(),
         ssh_key: None,
         run_id: Some(run.0.clone()),

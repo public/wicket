@@ -156,6 +156,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         a.name = name.clone();
         a.max_children = req.max_children;
         a.idle_timeout = "0s".into(); // a child reports to its parent, not the operator
+        a.image = None; // the image checked above, passed to its run with --image
         cm.agent = Some(a);
         cm.program = None;
     } else {
