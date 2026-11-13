@@ -1,0 +1,39 @@
+{"kind": "restic_backup", "agent": "rust", "session": 0, "exit": 0, "wall_s": 2.552862346, "added_bytes": 130147061}
+{"kind": "restic_backup", "agent": "rust", "session": 0, "exit": 0, "wall_s": 1.3482645180000001, "added_bytes": 15763382}
+{"kind": "restic_restore", "agent": "rust", "session": 0, "exit": 0, "wall_s": 1.142767629}
+{"kind": "restic_backup", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.025989283, "added_bytes": 17859674}
+{"kind": "restic_backup", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.729083705, "added_bytes": 98148}
+{"kind": "restic_restore", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.168235441}
+{"kind": "restic_backup", "agent": "rust", "session": 2, "exit": 0, "wall_s": 1.119259623, "added_bytes": 19005358}
+{"kind": "restic_backup", "agent": "rust", "session": 2, "exit": 0, "wall_s": 0.736998931, "added_bytes": 155956}
+{"kind": "restic_backup", "agent": "rust", "session": 3, "exit": 0, "wall_s": 1.110636742, "added_bytes": 18861743}
+{"kind": "restic_backup", "agent": "rust", "session": 3, "exit": 0, "wall_s": 0.724932644, "added_bytes": 211738}
+{"kind": "restic_backup", "agent": "rust", "session": 4, "exit": 0, "wall_s": 1.100260213, "added_bytes": 18852265}
+{"kind": "restic_backup", "agent": "rust", "session": 4, "exit": 0, "wall_s": 0.752890716, "added_bytes": 264687}
+{"kind": "restic_backup", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.069030689, "added_bytes": 19450074}
+{"kind": "restic_backup", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.716566833, "added_bytes": 101029}
+{"kind": "restic_restore", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.183646535}
+{"kind": "restic_check_read", "agent": "rust", "exit": 0, "wall_s": 2.68972628}
+{"kind": "restic_forget_prune", "agent": "rust", "exit": 0, "wall_s": 2.742209586}
+{"kind": "restic_backup", "agent": "node", "session": 0, "exit": 0, "wall_s": 4.940791812, "added_bytes": 64050815}
+{"kind": "restic_restore", "agent": "node", "session": 0, "exit": 0, "wall_s": 6.987610395}
+{"kind": "restic_backup", "agent": "node", "session": 1, "exit": 0, "wall_s": 2.88780825, "added_bytes": 30597}
+{"kind": "restic_restore", "agent": "node", "session": 1, "exit": 0, "wall_s": 6.625970492}
+{"kind": "restic_backup", "agent": "node", "session": 2, "exit": 0, "wall_s": 2.776756749, "added_bytes": 33132}
+{"kind": "restic_backup", "agent": "node", "session": 3, "exit": 0, "wall_s": 2.793536882, "added_bytes": 34624}
+{"kind": "restic_backup", "agent": "node", "session": 4, "exit": 0, "wall_s": 2.830000607, "added_bytes": 35911}
+{"kind": "restic_backup", "agent": "node", "session": 5, "exit": 0, "wall_s": 2.9269018940000002, "added_bytes": 339169}
+{"kind": "restic_restore", "agent": "node", "session": 5, "exit": 0, "wall_s": 7.153318573}
+{"kind": "restic_check_read", "agent": "node", "exit": 0, "wall_s": 2.795537323}
+{"kind": "restic_forget_prune", "agent": "node", "exit": 0, "wall_s": 2.334306126}
+{"kind": "restic_backup", "agent": "small", "session": 0, "exit": 0, "wall_s": 6.949291496, "added_bytes": 39549316}
+{"kind": "restic_restore", "agent": "small", "session": 0, "exit": 0, "wall_s": 10.178957027}
+{"kind": "restic_backup", "agent": "small", "session": 1, "exit": 0, "wall_s": 3.724375973, "added_bytes": 1855003}
+{"kind": "restic_restore", "agent": "small", "session": 1, "exit": 0, "wall_s": 10.282107012}
+{"kind": "restic_backup", "agent": "small", "session": 2, "exit": 0, "wall_s": 3.936243388, "added_bytes": 1883704}
+{"kind": "restic_backup", "agent": "small", "session": 3, "exit": 0, "wall_s": 3.712704957, "added_bytes": 1880851}
+{"kind": "restic_backup", "agent": "small", "session": 4, "exit": 0, "wall_s": 3.665687792, "added_bytes": 1852069}
+{"kind": "restic_backup", "agent": "small", "session": 5, "exit": 0, "wall_s": 4.315743692, "added_bytes": 1841119}
+{"kind": "restic_restore", "agent": "small", "session": 5, "exit": 0, "wall_s": 10.654279856}
+{"kind": "restic_check_read", "agent": "small", "exit": 0, "wall_s": 4.090114157}
+{"kind": "restic_forget_prune", "agent": "small", "exit": 0, "wall_s": 3.58082921}

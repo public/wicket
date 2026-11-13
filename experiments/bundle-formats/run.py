@@ -312,6 +312,54 @@ def extras(args):
     shutil.rmtree(data, ignore_errors=True)
 
 
+def killtest(args):
+    """kill -9 mid-save, timed from a measured run of the same save: a full save into a fresh repository,
+    and an incremental one. After each: check, then the latest complete state restores, then the next
+    save and its restore work."""
+    LOGS.mkdir(exist_ok=True)
+    f = open(LOGS / "kill9.jsonl", "a")
+    data = SCRATCH / "data" / "rust"
+    for fmt in ("today", "age", "rustic"):
+        for phase in ("full", "incremental"):
+            for frac in (0.2, 0.5, 0.8):
+                gen_agent("rust", data)
+                repo = SCRATCH / "repo"
+                ref = SCRATCH / "ref"
+                shutil.rmtree(repo, ignore_errors=True)
+                shutil.rmtree(ref, ignore_errors=True)
+                spec = f"fs:{repo}"
+                if phase == "incremental":
+                    bf("save", fmt, spec, "rust", "agent", *trees("rust", data))
+                    shutil.copytree(repo, ref, symlinks=True)
+                    want = digests(data, "rust")
+                    session("rust", data, 1)
+                    t = bf("save", fmt, f"fs:{ref}", "rust", "agent", *trees("rust", data))["wall_s"]
+                else:
+                    want = None
+                    t = bf("save", fmt, f"fs:{ref}", "rust", "agent", *trees("rust", data))["wall_s"]
+                shutil.rmtree(ref, ignore_errors=True)
+                p = subprocess.Popen([BF, "save", fmt, spec, "rust", "agent", *trees("rust", data)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     env=dict(os.environ))
+                time.sleep(t * frac)
+                p.kill()
+                p.wait()
+                chk = bf("check", fmt, spec, "rust", "agent", "read")
+                dest = SCRATCH / "restore"
+                shutil.rmtree(dest, ignore_errors=True)
+                rr = bf("restore", fmt, spec, "rust", "agent", str(dest))
+                prev = (digests(dest, "rust") == want) if (want and rr.get("exit") == 0) else None
+                shutil.rmtree(dest, ignore_errors=True)
+                again = bf("save", fmt, spec, "rust", "agent", *trees("rust", data))
+                rr2 = bf("restore", fmt, spec, "rust", "agent", str(dest))
+                ok2 = digests(dest, "rust") == digests(data, "rust") if rr2.get("exit") == 0 else False
+                emit(f, {"kind": "kill9", "format": fmt, "phase": phase, "fraction": frac, "ref_wall_s": t, "killed_rc": p.returncode,
+                         "check_after_kill": chk, "restore_after_kill": rr, "previous_state_restored": prev,
+                         "next_save_exit": again.get("exit"), "next_restore_verified": ok2, "repo_bytes": du(repo)[0]})
+                shutil.rmtree(dest, ignore_errors=True)
+                shutil.rmtree(repo, ignore_errors=True)
+    shutil.rmtree(SCRATCH / "data", ignore_errors=True)
+
+
 def restic_ref(args):
     """The restic CLI on the same series (fs only, sessions 0, 1, 5): a reference for rustic_core."""
     LOGS.mkdir(exist_ok=True)
@@ -355,7 +403,7 @@ def restic_ref(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["series", "extras", "restic"])
+    ap.add_argument("what", choices=["series", "extras", "restic", "kill9"])
     ap.add_argument("--stores", default="fs,s3")
     ap.add_argument("--formats", default="today,age,rustic")
     ap.add_argument("--agents", default="rust,node,small")
@@ -363,7 +411,7 @@ def main():
     a = ap.parse_args()
     os.environ.setdefault("E5_SCRATCH", str(SCRATCH / "tmp"))
     (SCRATCH / "tmp").mkdir(parents=True, exist_ok=True)
-    {"series": series, "extras": extras, "restic": restic_ref}[a.what](a)
+    {"series": series, "extras": extras, "restic": restic_ref, "kill9": killtest}[a.what](a)
 
 
 if __name__ == "__main__":
