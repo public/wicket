@@ -57,8 +57,42 @@ pub fn spawner(c: SpawnCtx) -> wicket_proxy::Spawner {
     Arc::new(move |req| spawn(&c, req))
 }
 
-fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
-    let p = &c.parent;
+/// What deciding a spawn needs to know of the parent, wherever it is decided: on the control host
+/// ([`spawn`]), or on the parent's node from its token and slice (#164).
+pub struct PlanIn<'a> {
+    pub parent: &'a Manifest,
+    pub run: &'a RunId,
+    /// The parent's own image (a child may always start it).
+    pub image: &'a str,
+    pub time_left: std::time::Duration,
+    pub llm_left: Option<(u64, u64)>,
+    pub llm_input_left: Option<u64>,
+    /// Box slots the parent has free.
+    pub slots: u32,
+    /// The parent's org layer (#51).
+    pub org: Option<&'a wicket_authz::OrgLayer>,
+}
+
+/// A spawn, decided: the child's manifest and what it was checked against.
+pub struct ChildPlan {
+    pub cm: Manifest,
+    pub yaml: String,
+    pub image: String,
+    pub zone_name: String,
+    /// The digest of the request as the agent stated it (what an approval binds to).
+    pub digest: String,
+    /// What it exceeds of the parent's authority (empty: within it).
+    pub violations: Vec<String>,
+    /// The slots it takes: its own, and the boxes it may start.
+    pub weight: u32,
+    pub is_agent: bool,
+}
+
+/// Decides a spawn without side effects: the child's zone and manifest from the request (omitted
+/// fields from the parent, never wider), the org policy's spawn rule (hard), what no human may
+/// approve (refused), and what exceeds the parent's authority (`violations`, for a human).
+pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
+    let p = i.parent;
     let pa = p.agent.as_ref().ok_or("only agents start boxes")?;
     let name = &req.name;
     let ok_name = !name.is_empty()
@@ -68,16 +102,12 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     if !ok_name {
         return Err("name must match ^[a-z][a-z0-9-]{0,31}$".into());
     }
-    // Everything up to the launch happens under the slot lock: concurrent calls see each other's
-    // reservations, never the same free slots or the same budget (#125).
-    let mut reserved = c.slots.lock().map_err(|_| "slots lock")?;
-    let slots = pa.max_children.saturating_sub(*reserved);
+    let slots = i.slots;
     if slots == 0 {
-        return Err(format!("this agent may start at most {} boxes (theirs included), and has used {}", pa.max_children, *reserved));
+        return Err(format!("this agent may start at most {} boxes (theirs included), and has used them all", pa.max_children));
     }
-    let time_left = c.deadline.saturating_duration_since(Instant::now());
-    let llm_left = c.llm.get().and_then(|l| l.remaining());
-    let llm_input_left = c.llm.get().and_then(|l| l.remaining_input());
+    let time_left = i.time_left;
+    let (llm_left, llm_input_left) = (i.llm_left, i.llm_input_left);
     let is_agent = match req.kind.as_str() {
         "agent" => true,
         "program" => false,
@@ -89,7 +119,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     // other run can make (#127): `<parent zone>.<name>.<parent run>`. A name has no dots and a run
     // id a fixed length, so two different (parent zone, name, run) never give the same zone name,
     // and none collides with another zone's grants, accept_from entries or volumes.
-    let zone_name = format!("{}.{name}.{}", p.zone.name, c.run.0.strip_prefix("run_").unwrap_or(&c.run.0));
+    let zone_name = format!("{}.{name}.{}", p.zone.name, i.run.0.strip_prefix("run_").unwrap_or(&i.run.0));
     let mut z: ZoneSpec = match &req.zone {
         Some(v) => {
             let mut v = v.clone();
@@ -143,8 +173,8 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     } else if z.llm.is_some() {
         return Err("a program has no model route: remove zone.llm".into());
     }
-    let image = req.image.clone().unwrap_or_else(|| c.image.clone());
-    let images: Vec<String> = std::iter::once(c.image.clone()).chain(p.zone.images.iter().cloned()).collect();
+    let image = req.image.clone().unwrap_or_else(|| i.image.to_string());
+    let images: Vec<String> = std::iter::once(i.image.to_string()).chain(p.zone.images.iter().cloned()).collect();
 
     // The child manifest.
     let mut cm = p.clone();
@@ -176,7 +206,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     }
     cm.validate().map_err(|e| format!("the new manifest is invalid: {e}"))?;
     // The org policy's spawn rule is hard: no approval lifts it (#51).
-    if let Some(org) = &c.org {
+    if let Some(org) = i.org {
         let s = wicket_authz::Ceiling::from_zone(&cm.zone, "child", 0, vec![]).map_err(|e| e.to_string())?.spawn;
         if !org.allows_spawn(&image, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s) {
             return Err(format!(
@@ -195,11 +225,6 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     if let Some(p) = &req.placement {
         stated["placement"] = p.clone();
     }
-    // Where it runs: decided before anything is asked or carved, so a bad hint costs nothing.
-    let placed = {
-        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
-        placement(&l, &c.run.0, c.node.as_deref(), req.placement.as_ref(), wicket_store::now())?
-    };
     let digest = hex::encode(sha2::Sha256::digest(stated.to_string().as_bytes()));
 
     // Within the parent's authority, or approved by a human for exactly this zone. A different model
@@ -217,8 +242,42 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         child_slots: slots,
     };
     let ask = subset::Ask { zone: &cm.zone, image: &image, max_children: req.max_children };
+    let violations = subset::check(&ask, &bounds).err().unwrap_or_default();
+    let weight = req.max_children.saturating_add(1).min(slots);
+    Ok(ChildPlan { cm, yaml, image, zone_name, digest, violations, weight, is_agent })
+}
+
+fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
+    let pa = c.parent.agent.as_ref().ok_or("only agents start boxes")?;
+    // Everything up to the launch happens under the slot lock: concurrent calls see each other's
+    // reservations, never the same free slots or the same budget (#125).
+    let mut reserved = c.slots.lock().map_err(|_| "slots lock")?;
+    let slots = pa.max_children.saturating_sub(*reserved);
+    if slots == 0 {
+        return Err(format!("this agent may start at most {} boxes (theirs included), and has used {}", pa.max_children, *reserved));
+    }
+    let plan = plan_child(
+        &PlanIn {
+            parent: &c.parent,
+            run: &c.run,
+            image: &c.image,
+            time_left: c.deadline.saturating_duration_since(Instant::now()),
+            llm_left: c.llm.get().and_then(|l| l.remaining()),
+            llm_input_left: c.llm.get().and_then(|l| l.remaining_input()),
+            slots,
+            org: c.org.as_deref(),
+        },
+        &req,
+    )?;
+    let ChildPlan { cm, yaml, image, zone_name, digest, violations, weight, is_agent, .. } = plan;
+    let (p, name) = (&c.parent, &req.name);
+    // Where it runs: decided before anything is asked or carved, so a bad hint costs nothing.
+    let placed = {
+        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
+        placement(&l, &c.run.0, c.node.as_deref(), req.placement.as_ref(), wicket_store::now())?
+    };
     let mut beyond = false;
-    if let Err(violations) = subset::check(&ask, &bounds) {
+    if !violations.is_empty() {
         let mut op =
             Op::egress(&p.tenant, &c.run, &p.zone.name, "SPAWN", "wicket.internal", &format!("/zones/{zone_name}/{}", &digest[..16]));
         // Beyond the parent's authority is never a one-click "allow for an hour" (#118).
@@ -256,7 +315,6 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
 
     // Reserve: the child's slots (its own and its max_children, so descendants are bounded by this
     // agent's max_children, not 2^k) and its model budget, carved out of the parent's.
-    let weight = req.max_children.saturating_add(1).min(slots);
     *reserved += weight;
     let carve = match (&cm.zone.llm, c.llm.get()) {
         (Some(cl), Some(llm)) => {
