@@ -200,6 +200,10 @@ impl Docker {
             "198.18.0.1".into(),
             "--memory".into(),
             spec.memory.clone(),
+            // The limit is the box's memory, swap included: Docker's default lets a box swap as much
+            // again on a host with swap, so it neither stays within its limit nor is OOM-killed at it.
+            "--memory-swap".into(),
+            spec.memory.clone(),
             "--cpus".into(),
             format!("{}", spec.cpus),
             "--pids-limit".into(),
@@ -575,6 +579,7 @@ mod tests {
         assert!(a.contains("--user 0:0") && a.contains("WICKET_AS_USER=1000:1000"), "starts as root only to set up, then drops");
         assert!(a.contains("--add-host wicket.internal:198.18.0.1"));
         assert!(a.contains("--dns 198.18.0.1"));
+        assert!(a.contains("--memory 1g --memory-swap 1g"), "the limit includes swap: a box can't swap past it");
         assert!(a.contains("--tmpfs /tmp:rw,nosuid,size=512m"));
         assert!(!a.contains("SYS_ADMIN") && !a.contains("--privileged"));
         assert!(a.contains("type=bind,source=/x,target=/y,readonly"));

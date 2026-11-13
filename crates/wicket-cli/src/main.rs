@@ -35,6 +35,7 @@ mod roots;
 mod run;
 mod s3;
 mod serve;
+mod settings;
 mod spawn;
 mod state;
 mod statestore;
