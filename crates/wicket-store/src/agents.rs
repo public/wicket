@@ -176,6 +176,13 @@ impl Ledger {
     }
 
     /// The agent's current generation: the fencing token every proxy compares its own against.
+    /// The image an agent's next activation starts from (#192): pinned to the digest its box
+    /// started as, so a wake doesn't take whatever a tag points to then.
+    pub fn set_agent_image(&self, id: &str, image: &str) -> Result<()> {
+        self.conn.execute("UPDATE agents SET image = ?2 WHERE id = ?1", params![id, image])?;
+        Ok(())
+    }
+
     pub fn agent_generation(&self, id: &str) -> Result<Option<i64>> {
         Ok(self.conn.query_row("SELECT generation FROM agents WHERE id = ?1", params![id], |r| r.get(0)).optional()?)
     }

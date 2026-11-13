@@ -256,7 +256,13 @@ impl SharedFeed {
 }
 
 /// What the run loop gets: the box's stdio as streams, its exit, and a handle to stop it.
+/// What the node said when it started the box: the image's digest it started (#192), or why not.
+type StartedAs = std::result::Result<Option<String>, String>;
+
 pub struct NodeBox {
+    /// The image's digest as the node started it (#192); None when this host didn't start it now
+    /// (re-attached, or taken over).
+    pub image_digest: Option<String>,
     pub stdin: Option<tokio::io::DuplexStream>,
     pub stdout: tokio::io::DuplexStream,
     pub stderr: tokio::io::DuplexStream,
@@ -356,6 +362,8 @@ pub struct Spawned {
     pub image: String,
     pub session: String,
     pub started_ms: i64,
+    /// Its image's digest as the node started it (#192).
+    pub digest: Option<String>,
 }
 
 /// Takes over a child its node started for this run's box (#164): checks it again as `spawn` here
@@ -574,6 +582,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         Ok(Ok(Err(e))) => return Err(e),
         _ => bail!("node {name} did not come up fresh on the feed within 60 s"),
     }
+    let mut image_digest = None;
     if !s.attach {
         for (tree, src, exclude) in &s.trees {
             let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
@@ -584,16 +593,24 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
             start.edge = None;
         }
+        // A node before #192 wouldn't check a pin: a pinned box goes only where it is checked.
+        if start.image_pin.is_some() && ctl.proto.load(Ordering::SeqCst) < crate::chan::IMAGE_PINS {
+            bail!(
+                "node {name} talks protocol {}, and this box's image is pinned by digest, which needs {}: update the node (`wicket node install {name}`)",
+                ctl.proto.load(Ordering::SeqCst),
+                crate::chan::IMAGE_PINS
+            );
+        }
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
             bail!("lost node {name} while starting the box");
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
-            Ok(Ok(None)) => {}
-            Ok(Ok(Some(e))) => bail!("node {name} could not start the box: {e}"),
+        image_digest = match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
+            Ok(Ok(Ok(d))) => d,
+            Ok(Ok(Err(e))) => bail!("node {name} could not start the box: {e}"),
             _ => bail!("node {name} did not start the box within 120 s"),
-        }
+        };
     }
-    Ok(NodeBox { stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
+    Ok(NodeBox { image_digest, stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
 }
 
 /// The run loop's side of the box's stdio, held by the connection manager across reconnects.
@@ -636,7 +653,7 @@ async fn manage(
     sh: Arc<Shared>,
     mut io: Io,
     mut ready: Option<oneshot::Sender<Result<()>>>,
-    mut started: Option<oneshot::Sender<Option<String>>>,
+    mut started: Option<oneshot::Sender<StartedAs>>,
     target_epoch: u64,
 ) {
     let mut p = Progress {
@@ -693,7 +710,7 @@ async fn session(
     io: &mut Io,
     p: &mut Progress,
     ready: &mut Option<oneshot::Sender<Result<()>>>,
-    started: &mut Option<oneshot::Sender<Option<String>>>,
+    started: &mut Option<oneshot::Sender<StartedAs>>,
     target_epoch: u64,
 ) -> Result<()> {
     // Revoked while the channel was down: its pinned host key is gone too, so ssh would fail with
@@ -915,7 +932,7 @@ async fn on_frame(
     f: Frame,
     out: &chan::Out,
     ready: &mut Option<oneshot::Sender<Result<()>>>,
-    started: &mut Option<oneshot::Sender<Option<String>>>,
+    started: &mut Option<oneshot::Sender<StartedAs>>,
     target_epoch: u64,
 ) -> Result<()> {
     let send = |f: Frame| {
@@ -962,9 +979,12 @@ async fn on_frame(
                     }
                 }
             }
-            Msg::Started { run, error } if run == sh.run.0 => {
+            Msg::Started { run, error, digest } if run == sh.run.0 => {
                 if let Some(t) = started.take() {
-                    let _ = t.send(error);
+                    let _ = t.send(match error {
+                        Some(e) => Err(e),
+                        None => Ok(digest),
+                    });
                 }
             }
             Msg::Exited { run, code, result, reason } if run == sh.run.0 => {
@@ -1028,9 +1048,9 @@ async fn on_frame(
             }
             // A child the node started for the box (#164): taken over (or refused) off this loop,
             // since that starts its supervisor.
-            Msg::Spawned { run, child, manifest, image, session, started_ms } if run == sh.run.0 => {
+            Msg::Spawned { run, child, manifest, image, session, started_ms, digest } if run == sh.run.0 => {
                 let (adopt, out) = (sh.adopt.clone(), out.clone());
-                let s = Spawned { child: child.clone(), manifest, image, session, started_ms };
+                let s = Spawned { child: child.clone(), manifest, image, session, started_ms, digest };
                 tokio::task::spawn_blocking(move || {
                     let error = match adopt {
                         Some(a) => a(s).err(),

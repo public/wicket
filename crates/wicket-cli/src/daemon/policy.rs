@@ -11,7 +11,9 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, StateCmd};
+use crate::{
+    Cmd, DevCmd, GrantCmd, IdentityCmd, ImageCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, StateCmd,
+};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -74,6 +76,8 @@ pub fn route(cmd: &Cmd) -> Route {
             SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
         },
         // Reads a directory the caller names, as the wicket user.
+        // Reads Docker, as the wicket user: what `wicket zone pin` resolves tags through.
+        Cmd::Image { cmd: Some(ImageCmd::Digest { .. }), .. } => Forward(Read),
         Cmd::Image { .. } => Forward(Privileged),
         Cmd::Serve { .. } => Refuse("the console runs as the wicket user under systemd: systemctl status wicket-console"),
         Cmd::Daemon { .. } => Refuse("the daemon runs as the wicket user under systemd: systemctl status wicketd"),

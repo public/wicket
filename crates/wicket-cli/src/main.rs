@@ -15,6 +15,7 @@ mod enrol;
 mod exitcause;
 mod hibernate;
 mod image;
+mod images_policy;
 mod links;
 mod localnode;
 mod mock;
@@ -24,6 +25,7 @@ mod nodecall;
 mod noderun;
 mod nodesecrets;
 mod nodesrv;
+mod pin;
 mod place;
 mod policy;
 mod program;
@@ -225,7 +227,10 @@ enum Cmd {
     },
     /// Build the agent image (the image directory plus the in-box forwarder's source, compiled in the
     /// build). Without --dir, from the copy embedded in this binary, so the image matches it.
+    #[command(args_conflicts_with_subcommands = true)]
     Image {
+        #[command(subcommand)]
+        cmd: Option<ImageCmd>,
         #[arg(long, default_value = "wicket/claude-code:poc")]
         tag: String,
         /// An image directory to build instead (e.g. images/claude-code, while changing it).
@@ -349,9 +354,12 @@ enum Cmd {
     /// The zone view of a manifest: for each host its reach names, whether the egress proxy inspects
     /// it (terminates TLS and decides every request) or splices it through (decides on the hostname,
     /// relays the encrypted bytes), and why (#62).
+    #[command(args_conflicts_with_subcommands = true)]
     Zone {
+        #[command(subcommand)]
+        cmd: Option<ZoneCmd>,
         /// The manifest (YAML).
-        manifest: PathBuf,
+        manifest: Option<PathBuf>,
         /// JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -520,6 +528,28 @@ enum GrantCmd {
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum ImageCmd {
+    /// The digest each image is in this installation's Docker (#192): `<ref> sha256:…`, what a zone
+    /// pins it as (`name@sha256:…`).
+    Digest {
+        #[arg(required = true)]
+        refs: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZoneCmd {
+    /// Rewrite a manifest's image tags (zone.images, agent.image, program.image) to the digests they
+    /// point to now, in place, keeping the rest of the file (#192).
+    Pin {
+        manifest: PathBuf,
+        /// Say what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1449,17 +1479,33 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Image { tag, dir } => {
+        Cmd::Image { cmd: Some(ImageCmd::Digest { refs }), .. } => {
+            let d = wicket_sandbox::Docker::from_env();
+            for r in &refs {
+                wicket_core::image::parse(r).map_err(anyhow::Error::msg)?;
+                let i = d.image_identity(r).await?.with_context(|| format!("no image {r} here"))?;
+                println!("{r} {}", i.id);
+            }
+            Ok(())
+        }
+        Cmd::Image { tag, dir, .. } => {
             let ctx = match &dir {
                 Some(d) => image::context(d)?,
                 None => image::embedded_context()?,
             };
-            wicket_sandbox::Docker::from_env().build_image(&tag, &ctx.dir).await?;
-            println!("built {tag}");
+            let d = wicket_sandbox::Docker::from_env();
+            d.build_image(&tag, &ctx.dir).await?;
+            // Its digest: what a zone pins it as (#192).
+            match d.image_identity(&tag).await? {
+                Some(i) => println!("built {tag} ({}; pin it as {})", i.id, wicket_core::image::pinned(&tag, &i.id)),
+                None => println!("built {tag}"),
+            }
             Ok(())
         }
         Cmd::Doctor { image } => doctor::doctor(&image).await,
-        Cmd::Zone { manifest, json } => {
+        Cmd::Zone { cmd: Some(ZoneCmd::Pin { manifest, dry_run }), .. } => pin::pin(&manifest, dry_run),
+        Cmd::Zone { manifest, json, .. } => {
+            let manifest = manifest.context("a manifest: wicket zone MANIFEST, or wicket zone pin MANIFEST")?;
             let m = wicket_core::Manifest::from_yaml(
                 &std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?,
             )?;

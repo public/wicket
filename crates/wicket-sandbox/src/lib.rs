@@ -48,6 +48,24 @@ pub struct BoxInfo {
     pub owner: Option<String>,
 }
 
+/// An image as a Docker has it (#192).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageIdentity {
+    /// `sha256:…`: what a box is started as, so a retag can't swap it.
+    pub id: String,
+    /// `repository@sha256:…`.
+    pub repo_digests: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl ImageIdentity {
+    /// Whether this image is the one `digest` (`sha256:…`) names: its id, or one of its repository
+    /// digests.
+    pub fn is(&self, digest: &str) -> bool {
+        self.id == digest || self.repo_digests.iter().any(|r| r.rsplit_once('@').is_some_and(|(_, d)| d == digest))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Docker {
     /// Command prefix, e.g. ["docker"] or ["sudo", "docker"] (from WICKET_DOCKER), or an ssh
@@ -131,6 +149,24 @@ impl Docker {
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default()
         }))
+    }
+
+    /// What `image` is in this Docker (#192): its id and repository digests, as `docker image
+    /// inspect` reports them. None if it has no such image.
+    pub async fn image_identity(&self, image: &str) -> Result<Option<ImageIdentity>> {
+        let out = self
+            .command_with(["image".to_string(), "inspect".into(), "--format".into(), "{{json .}}".into(), "--".into(), image.into()])
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("docker image inspect")?;
+        let strings =
+            |k: &str| v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let id = v["Id"].as_str().context("docker image inspect: no Id")?.to_string();
+        Ok(Some(ImageIdentity { id, repo_digests: strings("RepoDigests"), tags: strings("RepoTags") }))
     }
 
     pub async fn image_exists(&self, image: &str) -> Result<bool> {
