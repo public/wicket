@@ -46,6 +46,11 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket identity list`](#wicket-identity-list)
   - [`wicket identity revoke`](#wicket-identity-revoke)
 - [`wicket reap`](#wicket-reap)
+- [`wicket policy`](#wicket-policy)
+  - [`wicket policy show`](#wicket-policy-show)
+  - [`wicket policy check`](#wicket-policy-check)
+  - [`wicket policy apply`](#wicket-policy-apply)
+  - [`wicket policy zone`](#wicket-policy-zone)
 - [`wicket state`](#wicket-state)
   - [`wicket state check`](#wicket-state-check)
   - [`wicket state replicate`](#wicket-state-replicate)
@@ -115,6 +120,7 @@ Commands:
   operator   Operator passkeys
   identity   Agent identities (design §3.2): the issuer's public key, and verified identity documents
   reap       Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and that Docker kept running with nothing behind them. Their runs end as "lost"
+  policy     The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted
   state      Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby
   keys       The installation's root keys (#154)
   reconcile  Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log
@@ -147,7 +153,7 @@ Options:
       --workdir <WORKDIR>              Copy this directory into the box's /workspace first
       --workspace-dir <WORKSPACE_DIR>  Mount this directory as the box's /workspace, read-write and in place (local runs only)
       --task <TASK>                    Use this task text instead of the manifest's
-      --image <IMAGE>                  Agent image [default: wicket/claude-code:poc]
+      --image <IMAGE>                  Agent image, overriding the manifest's agent.image (default: that, or the installation's agent image)
       --node <NODE>                    Run the box on an enrolled node (its name; its host key is pinned), through its `wicket node serve`. Default: this host's own node, `local`
       --ssh-key <SSH_KEY>              ssh identity for --node (default: the one it was enrolled with)
   -h, --help                           Print help
@@ -222,7 +228,7 @@ Arguments:
 
 Options:
       --manifest <MANIFEST>  
-      --image <IMAGE>        [default: wicket/claude-code:poc]
+      --image <IMAGE>        Agent image, overriding the manifest's agent.image
   -h, --help                 Print help
 ```
 
@@ -714,6 +720,80 @@ Options:
       --node <NODE>        Reap on a remote node over ssh instead (e.g. wicket@203.0.113.7)
       --ssh-key <SSH_KEY>  ssh identity for --node
   -h, --help               Print help
+```
+
+## `wicket policy`
+
+```text
+The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted
+
+Usage: wicket policy <COMMAND>
+
+Commands:
+  show   The org policy's version, and the running runs minted under another
+  check  Validate and compile an org policy without installing it
+  apply  Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+  zone   A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from)
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket policy show`
+
+```text
+The org policy's version, and the running runs minted under another
+
+Usage: wicket policy show
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket policy check`
+
+```text
+Validate and compile an org policy without installing it
+
+Usage: wicket policy check [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  
+
+Options:
+      --entities <ENTITIES>  The groups zones are in (Cedar entities JSON)
+  -h, --help                 Print help
+```
+
+### `wicket policy apply`
+
+```text
+Install an org policy, and revoke the running runs minted under an older version (their boxes stop; new runs get the new policy)
+
+Usage: wicket policy apply [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  
+
+Options:
+      --entities <ENTITIES>  
+      --keep-runs            Leave running runs on the policy they were minted under until they end
+  -h, --help                 Print help
+```
+
+### `wicket policy zone`
+
+```text
+A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from)
+
+Usage: wicket policy zone <MANIFEST>
+
+Arguments:
+  <MANIFEST>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket state`
