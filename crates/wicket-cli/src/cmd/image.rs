@@ -1,0 +1,47 @@
+//! `wicket image` and `doctor`: the agent image and the host's readiness.
+//!
+//! One module per command group, out of `main.rs` (#220): a PR that changes one group's flags or
+//! handling touches only its own file.
+
+use crate::*;
+
+/// Runs one of this group's commands.
+pub async fn dispatch(c: Cmd) -> Result<()> {
+    match c {
+        Cmd::Image { cmd: Some(ImageCmd::Digest { refs }), .. } => {
+            let d = wicket_sandbox::Docker::from_env();
+            for r in &refs {
+                wicket_core::image::parse(r).map_err(anyhow::Error::msg)?;
+                let i = d.image_identity(r).await?.with_context(|| format!("no image {r} here"))?;
+                println!("{r} {}", i.id);
+            }
+            Ok(())
+        }
+        Cmd::Image { tag, dir, .. } => {
+            let ctx = match &dir {
+                Some(d) => image::context(d)?,
+                None => image::embedded_context()?,
+            };
+            let d = wicket_sandbox::Docker::from_env();
+            d.build_image(&tag, &ctx.dir).await?;
+            // Its digest: what a zone pins it as (#192).
+            match d.image_identity(&tag).await? {
+                Some(i) => println!("built {tag} ({}; pin it as {})", i.id, wicket_core::image::pinned(&tag, &i.id)),
+                None => println!("built {tag}"),
+            }
+            Ok(())
+        }
+        Cmd::Doctor { image } => doctor::doctor(&image).await,
+        _ => unreachable!("dispatched to the wrong command group"),
+    }
+}
+
+#[derive(Subcommand)]
+pub enum ImageCmd {
+    /// The digest each image is in this installation's Docker (#192): `<ref> sha256:…`, what a zone
+    /// pins it as (`name@sha256:…`).
+    Digest {
+        #[arg(required = true)]
+        refs: Vec<String>,
+    },
+}
