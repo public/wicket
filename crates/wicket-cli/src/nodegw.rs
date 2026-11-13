@@ -445,6 +445,14 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         Ok(p) => p,
         Err(e) => return Some((format!("not started: {e}"), true)),
     };
+    if plan.cm.agent.as_ref().is_some_and(|a| a.kind == "acp") {
+        // An ACP agent's client is wicket's control host (#66): its children start there (queued
+        // while it is unreachable, as for a placement elsewhere).
+        return match up {
+            true => None,
+            false => Some(queue_call(node, run, tool, args)),
+        };
+    }
     if !plan.violations.is_empty() {
         // Beyond the box's authority: a human's, on the control host.
         return match (up, req.ask_human) {

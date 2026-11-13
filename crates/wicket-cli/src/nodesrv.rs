@@ -1807,6 +1807,10 @@ fn child_start(
     until_ms: i64,
 ) -> Result<BoxStart> {
     let m = &plan.cm;
+    if m.agent.as_ref().is_some_and(|a| a.kind == "acp") {
+        // wicket is an ACP agent's client from the control host (#66); a node doesn't drive one.
+        bail!("an ACP agent's child starts from wicket's control host, which this node can't reach now");
+    }
     let launch = match wicket_agent::program_plan(m, child) {
         Some(p) => p,
         None => wicket_agent::claude_code_plan(m, child, session),

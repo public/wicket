@@ -485,6 +485,14 @@ impl AcpClient {
         }
     }
 
+    /// Remembers a tool call's kind, for permission requests that leave it out. Bounded: an agent
+    /// can't grow wicket's state (kept in the run's ctl/acp.json) without limit.
+    fn note_tool(&mut self, id: &str, kind: &str) {
+        if id.len() <= 200 && kind.len() <= 40 && (self.tools.len() < MAX_TOOLS || self.tools.contains_key(id)) {
+            self.tools.insert(id.into(), kind.into());
+        }
+    }
+
     fn update(&mut self, u: &Value, st: &mut Step) {
         let kind = u.get("sessionUpdate").and_then(|k| k.as_str()).unwrap_or("");
         if self.replaying {
@@ -493,7 +501,7 @@ impl AcpClient {
             if let (Some("tool_call"), Some(id), Some(k)) =
                 (Some(kind), u.get("toolCallId").and_then(|s| s.as_str()), u.get("kind").and_then(|s| s.as_str()))
             {
-                self.tools.insert(id.into(), k.into());
+                self.note_tool(id, k);
             }
             return;
         }
@@ -504,17 +512,15 @@ impl AcpClient {
                     let t = std::mem::take(&mut self.thought);
                     st.events.push(SessionEvent::Thought { text: t });
                 }
-                self.message.push_str(&text());
+                push_capped(&mut self.message, &text());
             }
-            "agent_thought_chunk" => self.thought.push_str(&text()),
+            "agent_thought_chunk" => push_capped(&mut self.thought, &text()),
             "tool_call" => {
                 self.flush(st);
                 let s = |k: &str| u.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let id = s("toolCallId");
                 let kind = if s("kind").is_empty() { "other".into() } else { s("kind") };
-                if self.tools.len() < 10_000 {
-                    self.tools.insert(id.clone(), kind.clone());
-                }
+                self.note_tool(&id, &kind);
                 let detail = u.get("rawInput").map(crate::summarise_input).unwrap_or_default();
                 let status = if s("status").is_empty() { "pending".into() } else { s("status") };
                 st.events.push(SessionEvent::ToolCall { id, title: s("title"), kind, status, detail });
@@ -522,7 +528,7 @@ impl AcpClient {
             "tool_call_update" => {
                 let id = u.get("toolCallId").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if let Some(k) = u.get("kind").and_then(|x| x.as_str()) {
-                    self.tools.insert(id.clone(), k.into());
+                    self.note_tool(&id, k);
                 }
                 let diff = u.get("content").and_then(|c| c.as_array()).and_then(|c| {
                     c.iter().find(|x| x.get("type").and_then(|t| t.as_str()) == Some("diff")).map(|d| Diff {
@@ -628,6 +634,21 @@ fn paths(tc: &Value) -> Vec<String> {
         out.extend(c.iter().filter_map(|x| x.get("path").and_then(|p| p.as_str()).map(String::from)));
     }
     out
+}
+
+/// Tool calls whose kind wicket remembers per session.
+const MAX_TOOLS: usize = 10_000;
+/// How much of one agent message or thought wicket keeps before the rest is dropped.
+const MAX_TEXT: usize = 64 << 10;
+
+/// Appends a streamed chunk, up to [`MAX_TEXT`] (on a character boundary).
+fn push_capped(buf: &mut String, chunk: &str) {
+    let room = MAX_TEXT.saturating_sub(buf.len());
+    let mut n = chunk.len().min(room);
+    while !chunk.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf.push_str(&chunk[..n]);
 }
 
 /// A session id wicket keeps and sends back: printable, short.
@@ -921,6 +942,25 @@ mod tests {
         let st = c2.on_line(&json!({ "jsonrpc": "2.0", "id": 3, "result": { "stopReason": "cancelled" } }).to_string());
         assert_eq!(st.events, vec![SessionEvent::TurnDone { stop: "cancelled".into() }]);
         assert!(!c2.busy());
+    }
+
+    #[test]
+    fn a_hostile_agent_cannot_grow_the_client_state_without_bound() {
+        let mut c = open();
+        let up =
+            |u: Value| json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s1", "update": u } }).to_string();
+        let big = "é".repeat(10_000);
+        for _ in 0..20 {
+            c.on_line(&up(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": big } })));
+            c.on_line(&up(json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": big } })));
+        }
+        for i in 0..(MAX_TOOLS + 50) {
+            c.on_line(&up(json!({ "sessionUpdate": "tool_call_update", "toolCallId": format!("t{i}"), "kind": "read" })));
+        }
+        c.on_line(&up(json!({ "sessionUpdate": "tool_call", "toolCallId": "x".repeat(5000), "title": "t", "kind": "read" })));
+        assert!(c.message.len() <= MAX_TEXT && c.thought.len() <= MAX_TEXT);
+        assert_eq!(c.tools.len(), MAX_TOOLS);
+        assert!(serde_json::to_string(&c).unwrap().len() < 1 << 20);
     }
 
     #[test]
