@@ -50,7 +50,7 @@ wicket node token --name n1 --ttl 1h        # prints a one-time join token (stor
 wicket node enrol wicket@203.0.113.7 --token wkt_… --host-key 'SHA256:…' --hosts 'api.example.com,*.example.org'
 wicket node install n1                      # copies this wicket binary there, starts the wicket-node service
 wicket run task.yaml --node n1
-wicket node list
+wicket node list                            # each node, and what it holds for this host's runs (below)
 wicket node renew-ca n1                     # a fresh node CA and identity certificate (default 24 h each), over ssh
 wicket node revoke n1
 ```
@@ -145,6 +145,11 @@ wicket node revoke n1
   while plain egress the token allows goes on. A self-update's re-exec (`wicket self update`, #162) hands
   the cache to the new process through a sealed memfd, never a file. What this protects, and what it
   doesn't: [limits.md](limits.md).
+- **What a node holds** shows in `wicket node list`, one line per run this host supervises there: when
+  the box's authority ends (or that the node confirmed it stopped), the secrets released to the node for
+  it (by name, never values) and its budget slice. It is this host's record of what it released and
+  leased (`ctl/holdings.json` beside the run), so an upper bound: the node may have dropped a secret
+  already, and never holds more.
 - **Budget slices are leased to the node** (#152), per run: a quarter of the zone's model budget by
   default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while connected once less
   than half of it is left, and lowered at once when what is left shrinks (a spawn's carve-out). Offline, a
