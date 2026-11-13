@@ -52,7 +52,17 @@ pub struct Egress {
     model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
     /// Optional injections skipped for want of their secret, each noted once (#175).
     skipped: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Registered domains checked for existence this run, and what was found (#19): each is asked
+    /// about once, and at most [`MAX_DOMAIN_CHECKS`] are.
+    registered: std::sync::Mutex<std::collections::HashMap<String, crate::exists::Exists>>,
+    /// Per wildcard reach rule, the names under it that have had an allowed request this run (#20).
+    wild: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
+
+/// How many distinct registered domains one run may have checked (#19); past that, unnamed hosts
+/// escalate unchecked, as they did before the check existed, so the check can't be used as a channel
+/// of its own.
+pub(crate) const MAX_DOMAIN_CHECKS: usize = 256;
 
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
 /// use; tests point hosts at local origins with their own CA.
@@ -72,6 +82,8 @@ pub struct Upstream {
     /// HTTP/1.1 to every upstream, even one that offers HTTP/2 (benchmarks; an upstream whose
     /// HTTP/2 misbehaves). Default off: HTTP/2 where offered (#142).
     pub http1_only: bool,
+    /// Registered domain -> whether it exists, instead of asking DNS (tests, #19).
+    pub domains: std::collections::HashMap<String, bool>,
 }
 
 impl Upstream {
@@ -189,6 +201,8 @@ impl Egress {
             strikes: Default::default(),
             model_gate: Default::default(),
             skipped: Default::default(),
+            registered: Default::default(),
+            wild: Default::default(),
         }))
     }
 
@@ -233,6 +247,9 @@ impl Egress {
             if let Some(r) = self.judge_host(&host, "CONNECT") {
                 return Ok(r);
             }
+            if let Some(r) = self.judge_unlisted(&host, "CONNECT").await {
+                return Ok(r);
+            }
             if let Some(relay) = &self.relay {
                 if let Route::Forward(why) = relay.route(&host) {
                     return Ok(self.clone().forward_connect(req, host, why).await);
@@ -270,6 +287,9 @@ impl Egress {
                 if let Some(r) = self.judge_host(&h, req.method().as_str()) {
                     return Ok(r);
                 }
+                if let Some(r) = self.judge_unlisted(&h, req.method().as_str()).await {
+                    return Ok(r);
+                }
                 if let Some(Route::Forward(why)) = self.relay.as_ref().map(|r| r.route(&h)) {
                     let method = req.method().to_string();
                     return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP to {h} isn't served on this node ({why}); use https")));
@@ -289,6 +309,12 @@ impl Egress {
             return None;
         }
         if self.model_gate.get().is_some() && host == crate::llm::MODEL_HOST {
+            return None;
+        }
+        // A name under a wildcard is only dialled (so resolved) after a request to it has been
+        // decided and allowed (#20): until then its connections are inspected, never spliced, since
+        // splicing dials at CONNECT.
+        if !self.wildcard_reached(host) {
             return None;
         }
         self.decider.splice(&self.ctx, host)
@@ -456,6 +482,97 @@ impl Egress {
         }
     }
 
+    /// In an `escalate` zone, a host the zone doesn't name whose registered domain doesn't exist is an
+    /// unknown host, not a pending request (#19). Only the registered domain is ever looked up (see
+    /// [`crate::exists`]); when that can't be had, the host escalates as before.
+    pub(crate) async fn judge_unlisted(&self, host: &str, method: &str) -> Option<Response<BoxBody>> {
+        if !self.ctx.escalate || self.ctx.zone.spec().names_host(host) {
+            return None;
+        }
+        let domain = crate::exists::registered_domain(host)?;
+        if self.domain_exists(&domain).await != crate::exists::Exists::No {
+            return None;
+        }
+        self.ctx.emit(Event::Egress {
+            method: method.into(),
+            host: host.into(),
+            path: "/".into(),
+            risk: "-".into(),
+            outcome: "hidden".into(),
+            detail: format!("unknown host: its registered domain {domain} does not exist (NXDOMAIN)"),
+        });
+        let note = self.strike(&format!("host {host}"));
+        Some(problem(
+            502,
+            "unknown-host",
+            "wicket sandbox: unknown host",
+            &format!(
+                "{host} does not exist: there is no domain {domain}. Check the name for a typo. {} Do not retry it.{note}",
+                crate::SANDBOX_FACT
+            ),
+            None,
+        ))
+    }
+
+    /// Whether `domain` (a registered domain) exists, asked once per run.
+    async fn domain_exists(&self, domain: &str) -> crate::exists::Exists {
+        use crate::exists::Exists;
+        {
+            let g = self.registered.lock().expect("registered");
+            if let Some(e) = g.get(domain) {
+                return *e;
+            }
+            if g.len() >= MAX_DOMAIN_CHECKS {
+                return Exists::Unknown;
+            }
+        }
+        let found = match self.upstream.domains.get(domain) {
+            Some(true) => Exists::Yes,
+            Some(false) => Exists::No,
+            None => crate::exists::check(domain).await,
+        };
+        let mut g = self.registered.lock().expect("registered");
+        if g.len() < MAX_DOMAIN_CHECKS {
+            g.insert(domain.to_string(), found);
+        }
+        found
+    }
+
+    /// The registered domains this run has looked up, sorted (tests, #19).
+    pub fn domains_checked(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.registered.lock().expect("registered").keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Whether `host` may be dialled before a request to it is decided: true unless it is reached
+    /// through a wildcard reach rule and hasn't yet had an allowed request this run (#20).
+    pub(crate) fn wildcard_reached(&self, host: &str) -> bool {
+        match self.ctx.zone.spec().wildcard_for(host) {
+            None => true,
+            Some(w) => self.wild.lock().expect("wild").get(&w.to_ascii_lowercase()).is_some_and(|names| names.contains(host)),
+        }
+    }
+
+    /// Admits an allowed request's host under its wildcard reach rule (#20): a name already reached
+    /// passes; a new one counts against the zone's `wildcards.max_names` for that rule, and past it
+    /// the request is refused before anything is resolved. None to go ahead.
+    fn admit_wildcard(&self, host: &str) -> Option<(String, String)> {
+        let spec = self.ctx.zone.spec();
+        let w = spec.wildcard_for(host)?;
+        let max = spec.wildcards.max_names as usize;
+        let mut g = self.wild.lock().expect("wild");
+        let names = g.entry(w.to_ascii_lowercase()).or_default();
+        if names.contains(host) {
+            return None;
+        }
+        if names.len() >= max {
+            return Some((w.to_string(), format!("this run has already reached {max} distinct names under {w}, the zone's limit (wildcards.max_names); {host} would be one more")));
+        }
+        names.insert(host.to_string());
+        None
+    }
+
     /// Counts a blocked attempt and returns a note for the agent once it starts repeating itself: the
     /// point is that an agent at the edge of its sandbox stops and asks, rather than spinning.
     pub(crate) fn strike(&self, key: &str) -> String {
@@ -546,10 +663,24 @@ impl Egress {
                 detail,
             })
         };
+        // An unnamed host whose domain doesn't exist is unknown, not a pending request (#19). Over TCP
+        // this was answered at CONNECT; HTTP/3 requests are first seen here. Cached per run.
+        if let Some(r) = self.judge_unlisted(&host, &method).await {
+            return r;
+        }
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
         match self.decider.decide(ctx, &op, who.as_ref()).await {
             Outcome::Allow(detail) => {
+                // A name under a wildcard counts against the rule's limit before it is resolved (#20).
+                if let Some((w, why)) = self.admit_wildcard(&host) {
+                    emit("forbidden", why.clone());
+                    let note = self.strike(&format!("wildcard {w}"));
+                    return problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
+                        "{why}. No more new names under {w} are reached in this run, and no approval can change that; the names already reached keep working. {} Do not retry it; tell the user if you need it.{note}",
+                        crate::SANDBOX_FACT
+                    ), None);
+                }
                 // A grant's use must be on the record before the request goes ahead (fail closed).
                 let ev = Event::Egress {
                     method: method.clone(),
@@ -1199,6 +1330,108 @@ mod tests {
             assert_eq!(status, 502, "{body}");
             assert!(body.contains("non-public address"), "{body}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sends one GET to `host` through `e` (as a request inside a CONNECT tunnel), and returns the
+    /// status and body.
+    async fn get(e: &std::sync::Arc<super::Egress>, host: &str) -> (u16, String) {
+        use http_body_util::BodyExt;
+        let req = http::Request::get("/x").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+        let resp = e.clone().handle(req, host.into(), "https", super::Via::Tcp).await;
+        let status = resp.status().as_u16();
+        (status, String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned())
+    }
+
+    /// #19: in an escalate zone, a host no rule names whose registered domain doesn't exist is an
+    /// unknown host, with no pending request, and only the registered domain is looked up, never the
+    /// name the agent chose. One whose domain exists still escalates. Named hosts aren't checked.
+    #[tokio::test]
+    async fn an_unregistered_domain_is_an_unknown_host_and_only_it_is_looked_up() {
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET]}]", vec![], "nxdomain");
+        let ledger = c.ledger.clone();
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let mut up = super::Upstream::default();
+        up.domains.insert("no-such-domain-wkt.com".into(), false);
+        up.domains.insert("example.co.uk".into(), true);
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+
+        let (st, body) = get(&e, "c2vjcmv0.payload.no-such-domain-wkt.com").await;
+        assert_eq!(st, 502, "{body}");
+        assert!(body.contains("unknown host") && body.contains("there is no domain no-such-domain-wkt.com"), "{body}");
+        // Over CONNECT, it's answered before TLS.
+        let r = e.judge_unlisted("other.no-such-domain-wkt.com", "CONNECT").await.expect("refused at CONNECT");
+        assert_eq!(r.status(), 502);
+        assert_eq!(e.domains_checked(), ["no-such-domain-wkt.com"], "never the agent's subdomain");
+        assert!(ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty(), "nothing for a human");
+
+        let (st, body) = get(&e, "anything.example.co.uk").await;
+        assert_eq!(st, 403, "{body}");
+        assert!(body.contains("needs human approval"), "{body}");
+        assert_eq!(e.domains_checked(), ["example.co.uk", "no-such-domain-wkt.com"]);
+
+        // A host the zone names is never checked, and a run that doesn't escalate checks nothing.
+        assert!(e.judge_unlisted("api.github.com", "CONNECT").await.is_none());
+        assert_eq!(e.domains_checked().len(), 2);
+        let (mut c, _) = ctx("reach: []", vec![], "nxdomain-noesc");
+        c.escalate = false;
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c, ca).unwrap();
+        assert!(e.judge_unlisted("a.no-such-domain-wkt.com", "CONNECT").await.is_none());
+        assert!(e.domains_checked().is_empty());
+        for t in ["nxdomain", "nxdomain-noesc"] {
+            let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+        }
+    }
+
+    /// #20: a name under a wildcard reach rule is not dialled (so not resolved) before a request to it
+    /// has been allowed: its CONNECT is inspected, not spliced, until then; spliced after.
+    #[tokio::test]
+    async fn a_wildcard_name_is_not_resolved_before_an_allowed_request() {
+        let all = "methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]";
+        let (c, dir) = ctx(&format!("reach: [{{host: '*.cdn.example', {all}}}, {{host: exact.example, {all}}}]"), vec![], "wild-first");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let mut up = super::Upstream::default();
+        // Loopback answers: a dial is refused (and says so) instead of reaching anything.
+        up.dns.insert("a.cdn.example".into(), vec!["127.0.0.1".parse().unwrap()]);
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        assert!(e.splice_rule("exact.example").is_some(), "an exact host splices from the first connection");
+        assert!(e.splice_rule("a.cdn.example").is_none(), "inspected until a request is allowed");
+        assert!(!e.wildcard_reached("a.cdn.example"));
+        // The first request is decided, allowed, and only then resolved (here: refused at dial).
+        let (st, body) = get(&e, "a.cdn.example").await;
+        assert_eq!(st, 502, "{body}");
+        assert!(body.contains("non-public address"), "resolved after the allow: {body}");
+        assert!(e.wildcard_reached("a.cdn.example"));
+        assert_eq!(e.splice_rule("a.cdn.example"), Some(0), "spliced from now on");
+        assert!(e.splice_rule("b.cdn.example").is_none(), "per name, not per rule");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #20: each wildcard rule reaches at most `wildcards.max_names` distinct names per run. A new name
+    /// past it is refused before it is resolved; names already reached, and exact hosts, still work.
+    #[tokio::test]
+    async fn distinct_names_per_wildcard_are_limited_per_run() {
+        let zone = "wildcards: {max_names: 2}, reach: [{host: '*.cdn.example', methods: [GET]}, {host: '*.other.example', methods: [GET]}, {host: x.cdn.example, methods: [GET]}]";
+        let (c, dir) = ctx(zone, vec![], "wild-limit");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let mut up = super::Upstream::default();
+        for h in ["a.cdn.example", "b.cdn.example", "c.cdn.example", "x.cdn.example", "a.other.example"] {
+            up.dns.insert(h.into(), vec!["127.0.0.1".parse().unwrap()]);
+        }
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let resolved = |(st, body): (u16, String)| st == 502 && body.contains("non-public address");
+        assert!(resolved(get(&e, "a.cdn.example").await));
+        assert!(resolved(get(&e, "b.cdn.example").await));
+        let (st, body) = get(&e, "c.cdn.example").await;
+        assert_eq!(st, 403, "{body}");
+        assert!(
+            body.contains("never allowed") && body.contains("wildcards.max_names") && body.contains("2 distinct names under *.cdn.example"),
+            "{body}"
+        );
+        assert!(resolved(get(&e, "a.cdn.example").await), "a name already reached keeps working");
+        assert!(resolved(get(&e, "x.cdn.example").await), "an exact host isn't counted");
+        assert!(resolved(get(&e, "a.other.example").await), "the limit is per wildcard");
         let _ = std::fs::remove_dir_all(dir);
     }
 

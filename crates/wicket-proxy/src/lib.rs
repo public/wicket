@@ -7,6 +7,7 @@ pub mod decide;
 mod dial;
 pub mod dns;
 pub mod egress;
+pub mod exists;
 pub mod gateway;
 pub mod h3;
 pub mod link;
