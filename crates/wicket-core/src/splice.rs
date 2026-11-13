@@ -142,6 +142,22 @@ mod tests {
 
     const ALL: &str = "[GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]";
 
+    /// #175: an optional injection whose secret isn't set is dropped from the zone, so a host it was
+    /// the only injection for is spliced when reach allows it wholesale; a set or required one stays.
+    #[test]
+    fn a_host_whose_only_injection_is_unset_and_optional_is_spliced() {
+        let body = format!(
+            "  reach: [{{host: static.example, methods: {ALL}}}, {{host: other.example, methods: {ALL}}}]\n  inject:\n    - {{host: static.example, header: Authorization, secret: unset, optional: true}}\n    - {{host: other.example, header: Authorization, secret: set, optional: true}}\n    - {{host: other.example, header: X-Key, secret: required}}"
+        );
+        let mut z = zone(&body);
+        assert!(!inspection(&z, "static.example").is_spliced(), "inspected while the rule is there");
+        let dropped = z.drop_unset_optional_injections(|s| s == "set");
+        assert_eq!(dropped.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["unset"]);
+        assert_eq!(z.inject.iter().map(|i| i.secret.as_str()).collect::<Vec<_>>(), ["set", "required"]);
+        assert_eq!(inspection(&z, "static.example"), Inspection::Spliced { rule: 0 });
+        assert!(!inspection(&z, "other.example").is_spliced(), "still injected");
+    }
+
     #[test]
     fn which_rules_qualify() {
         let spliced = |body: &str, host: &str| inspection(&zone(body), host).is_spliced();
