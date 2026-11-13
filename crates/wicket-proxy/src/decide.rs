@@ -298,6 +298,39 @@ mod tests {
         .zone
     }
 
+    /// #51: the control host decides hosts it forwards for (credentials injected here) and its own
+    /// boxes' egress: the org layer refuses there too, hard, and nothing splices under it.
+    #[test]
+    fn the_org_layer_refuses_on_the_control_host_and_stops_splicing() {
+        use wicket_authz::{HostPat, HttpMatch, OrgLayer, PathPat};
+        let op = |m: &str, h: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", m, h, p);
+        let mut c = ctx(true);
+        // Without an org layer: the zone allows this.
+        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)));
+        c.org = Some(Arc::new(OrgLayer {
+            version: "v1".into(),
+            http: None,
+            forbid: vec![
+                HttpMatch {
+                    hosts: vec![HostPat::Exact("api.example.com".into())],
+                    paths: vec![PathPat::Glob("/v1/admin/**".into())],
+                    ..Default::default()
+                },
+                HttpMatch { hosts: vec![HostPat::Exact("secret.example.com".into())], ..Default::default() },
+            ],
+            spawn: None,
+            msg_from: None,
+            inject: None,
+        }));
+        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)), "other paths still allowed");
+        assert!(
+            matches!(central(&c, &op("GET", "api.example.com", "/v1/admin/users"), None), Outcome::Forbidden(w) if w.contains("org policy"))
+        );
+        // The host the zone injects into, forwarded to the control host: refused, not a grant away.
+        assert!(matches!(central(&c, &op("GET", "secret.example.com", "/"), None), Outcome::Forbidden(w) if w.contains("org policy")));
+        assert_eq!(Central.splice(&c, "api.example.com"), None, "no splicing under an org policy");
+    }
+
     #[test]
     fn subtrees_match_like_a_verifier() {
         // The same lists as ca.rs's verifier test, which checks these against webpki.

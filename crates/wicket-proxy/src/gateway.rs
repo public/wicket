@@ -142,6 +142,7 @@ impl Gateway {
         };
         let timeout = Duration::from_secs(args.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(5, 600));
         let start = Instant::now();
+        let mut granted_at: Option<Instant> = None;
         loop {
             let req = {
                 let l = self.ctx.ledger.lock().expect("ledger");
@@ -156,6 +157,15 @@ impl Gateway {
                 return (format!("request {id} does not belong to this run"), true);
             }
             match req.status.as_str() {
+                // Its grant was handed to the box's node: answer once the node has it (at most 15 s),
+                // or the box's retry would find no grant there and ask again.
+                "granted"
+                    if self.ctx.ledger.lock().expect("ledger").grant_in_flight(id).unwrap_or(false)
+                        && granted_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(15) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
                 "granted" => {
                     return (
                         format!("granted: {id} was approved. Retry the same request now ({} {}{}).", req.method, req.host, req.path),
@@ -239,9 +249,17 @@ impl Gateway {
                 // The org policy decides which zones' boxes this one hears from (#51), parent and
                 // children included: refused, the message is dropped, and the agent told.
                 Ok(Some((m, _, _, Some(z)))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z)) => {
-                    return (format!("a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone", m.from_run), false);
+                    return (
+                        format!(
+                            "a message from run {} (zone {z}) was refused: the org policy doesn't accept messages from that zone",
+                            m.from_run
+                        ),
+                        false,
+                    );
                 }
-                Ok(Some((m, sender_revoked, earlier, _))) => return deliver(&cell.current(), &self.ctx.run.0, &earlier, &m, sender_revoked),
+                Ok(Some((m, sender_revoked, earlier, _))) => {
+                    return deliver(&cell.current(), &self.ctx.run.0, &earlier, &m, sender_revoked)
+                }
                 Ok(None) => {}
                 Err(e) => return (e.to_string(), true),
             }
@@ -761,7 +779,6 @@ mod tests {
         fn agent(&self, tenant: &str, zone: &str, name: &str, run: &str, parent: Option<&str>, accept_from: &[&str]) -> RunCtx {
             let yaml = format!(
                 "tenant: {tenant}\ntask: t\nagent: {{ name: {name} }}\nzone: {{ name: {zone}, llm: {{}}, accept_from: {accept_from:?} }}\n"
-                org: None,
             );
             let m = Manifest::from_yaml(&yaml).unwrap();
             let key = AgentKey::generate();

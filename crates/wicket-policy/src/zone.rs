@@ -30,8 +30,15 @@ pub fn lit(s: &str) -> String {
     out
 }
 
+/// A method list as Cedar actions: methods outside wicket's seven are left out (no request with
+/// one is ever made: the proxies refuse them).
 fn actions(methods: &[String]) -> String {
-    let list: Vec<String> = methods.iter().map(|m| format!("Action::{}", lit(&m.to_ascii_uppercase()))).collect();
+    let list: Vec<String> = methods
+        .iter()
+        .map(|m| m.to_ascii_uppercase())
+        .filter(|m| METHODS.contains(&m.as_str()))
+        .map(|m| format!("Action::{}", lit(&m)))
+        .collect();
     format!("[{}]", list.join(", "))
 }
 
@@ -47,6 +54,10 @@ fn host_cond(h: &str) -> String {
 pub fn cedar(zone: &ZoneSpec, base: &Ceiling) -> String {
     let mut out = format!("// zone {}: generated from its manifest (#51). Every token minted in it is compiled from this.\n", zone.name);
     for (i, r) in base.reach.iter().enumerate() {
+        // A rule with none of the seven methods allows nothing (and Cedar refuses an empty list).
+        if !r.methods.iter().any(|m| METHODS.contains(&m.to_ascii_uppercase().as_str())) {
+            continue;
+        }
         for g in &r.paths {
             let risk = if r.allow_dangerous { String::new() } else { format!(" && context.risk <= {MAX_REACH_RISK}") };
             out.push_str(&format!(

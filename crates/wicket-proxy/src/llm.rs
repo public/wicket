@@ -770,7 +770,6 @@ mod tests {
     fn ctx(ledger: wicket_store::Ledger, fence: Option<crate::Fence>, llm: &str) -> crate::RunCtx {
         use std::sync::{Arc, Mutex};
         let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {llm}}}")).unwrap();
-        org: None,
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         crate::RunCtx {
             tenant: wicket_core::TenantId::single(),

@@ -497,7 +497,6 @@ mod fence_tests {
                 id: &agent,
                 tenant: "t0",
                 zone: "z",
-                org: None,
                 name: "a",
                 run: "run_old",
                 session_id: "s",

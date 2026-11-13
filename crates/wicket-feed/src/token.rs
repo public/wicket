@@ -63,6 +63,39 @@ pub struct BoxAuthority {
     /// The grants the token carries.
     #[serde(default)]
     pub grants: Vec<TokenGrant>,
+    /// With the authority root offline (#154): the certificate of the online issuing key that minted
+    /// block 0, signed by the root ([`AuthzKeyCert`]). None: the root minted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_cert: Option<String>,
+}
+
+/// An online authority issuing key, certified by the (offline) authority root (#154): tokens whose
+/// block 0 it minted load against it, until `not_after`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzKeyCert {
+    /// The issuing key's public bytes, hex.
+    pub x: String,
+    /// Refused from this time (Unix ms).
+    pub not_after: i64,
+}
+
+impl AuthzKeyCert {
+    /// Signs a certificate for `key` with the authority root's seed.
+    pub fn sign(root_seed: &[u8; 32], key: &authz::PublicKey, not_after: i64) -> String {
+        let root = ed25519_dalek::SigningKey::from_bytes(root_seed);
+        crate::jws::sign(&root, crate::jws::TYP_AUTHZ_KEY, &AuthzKeyCert { x: key.to_hex(), not_after })
+    }
+
+    /// The issuing key `cert` certifies under `root`, and until when (Unix ms), if it verifies.
+    /// Expiry is the caller's to check, by its own clock (a node's: [`Replica::decide`]).
+    pub fn open(cert: &str, root: &authz::PublicKey) -> Result<(authz::PublicKey, i64), String> {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&root.0).map_err(|_| "the authority root is not a key".to_string())?;
+        let c: AuthzKeyCert = crate::jws::open(cert, crate::jws::TYP_AUTHZ_KEY, &crate::jws::kid(&vk), &vk)
+            .map_err(|e| format!("issuing key certificate: {e}"))?;
+        let b: [u8; 32] = hex::decode(&c.x).ok().and_then(|b| b.try_into().ok()).ok_or("issuing key certificate: x")?;
+        Ok((authz::PublicKey(b), c.not_after))
+    }
 }
 
 /// What the node needs to know about one of a token's grants.
@@ -85,6 +118,9 @@ pub struct CompiledAuthority {
     pub zone: CompiledZone,
     /// Every block's revocation id, hex, in block order.
     pub ids: Vec<String>,
+    /// Until when the issuing key that minted block 0 is certified (Unix ms): the box is forbidden
+    /// everything from then, by the node's clock (#154). None: the root minted it.
+    pub issuer_until: Option<i64>,
 }
 
 /// A block revocation id as the feed names it.
@@ -125,10 +161,15 @@ impl Policy for BoxAuthority {
             return Err("a grant id is listed twice".into());
         }
         let bytes = self.token_bytes()?;
-        let loaded = authz::load(&bytes, root, &|id| revoked(RevokeKind::Token, &revocation_id(id))).map_err(|e| e.to_string())?;
+        // Minted by an issuing key the root certified (#154), or by the root itself.
+        let (key, issuer_until) = match &self.issuer_cert {
+            Some(c) => AuthzKeyCert::open(c, root).map(|(k, until)| (k, Some(until)))?,
+            None => (*root, None),
+        };
+        let loaded = authz::load(&bytes, &key, &|id| revoked(RevokeKind::Token, &revocation_id(id))).map_err(|e| e.to_string())?;
         let ids = loaded.revocation_ids().iter().map(|i| revocation_id(i)).collect();
         let zone = CompiledZone::new(self.zone.clone()).map_err(|e| format!("zone {}: {e}", self.zone.name))?;
-        Ok(CompiledAuthority { loaded, zone, ids })
+        Ok(CompiledAuthority { loaded, zone, ids, issuer_until })
     }
 
     fn revoked_by(c: &CompiledAuthority, kind: RevokeKind, id: &str) -> bool {
@@ -194,6 +235,9 @@ impl Replica<BoxAuthority> {
                             "op for zone {}, but box {} holds authority for zone {}",
                             op.zone, op.run, entry.spec.zone.name
                         ))),
+                        Ok(c) if c.issuer_until.is_some_and(|u| now >= u) => Found::Done(Decision::Forbidden(
+                            "the authority issuing key that minted this box's token is no longer certified (wicket keys certify)".into(),
+                        )),
                         Ok(c) => {
                             let mut req = request(&entry.spec, op, now);
                             match c.loaded.decide(&req) {
@@ -308,6 +352,8 @@ pub struct Issuer {
     pub box_path: String,
     pub epoch: i64,
     pub zone: ZoneSpec,
+    /// The minting key's certificate, when it isn't the root ([`BoxAuthority::issuer_cert`]).
+    pub issuer_cert: Option<String>,
 }
 
 /// One grant to publish: what the token says, and its use cap.
@@ -356,7 +402,7 @@ impl Issuer {
             )));
         }
         let base = authz::mint(root, tenant, principal, ceiling)?;
-        Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone() })
+        Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone(), issuer_cert: None })
     }
 
     /// A child box started by this one, in `zone`: this box's base token plus a spawn block with the
@@ -366,7 +412,14 @@ impl Issuer {
         if ceiling.box_prefix != box_path {
             return Err(authz::AuthzError::Ceiling(format!("a child of {} must be bounded to {box_path}", self.box_path)));
         }
-        Ok(Issuer { base: self.base.attenuate(ceiling)?, run: run.into(), box_path, epoch, zone: zone.clone() })
+        Ok(Issuer {
+            base: self.base.attenuate(ceiling)?,
+            run: run.into(),
+            box_path,
+            epoch,
+            zone: zone.clone(),
+            issuer_cert: self.issuer_cert.clone(),
+        })
     }
 
     /// The base token's revocation ids (hex), in block order. The last one is this box's own link:
@@ -403,6 +456,7 @@ impl Issuer {
             zone: self.zone.clone(),
             token: B64.encode(token.to_bytes()?),
             grants: listed,
+            issuer_cert: self.issuer_cert.clone(),
         })
     }
 }

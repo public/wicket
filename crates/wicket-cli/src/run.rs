@@ -634,7 +634,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // The installation's org policy for this box (#51): compiled once, into its token at mint and
     // for the control host's own checks (forwarded hosts, injections, spawns, messages).
-    let org_layer: Option<Arc<wicket_authz::OrgLayer>> = match crate::policy::org()? {
+    let org_layer: Option<Arc<wicket_authz::OrgLayer>> = match crate::policy::for_run(&run.0, record.is_some())? {
         Some(o) => {
             let mint = crate::policy::mint_ctx(&o, &m.zone.name, &m.tenant.0, &principal, depth);
             Some(Arc::new(o.layer(&mint).with_context(|| format!("the org policy {} for zone {}", o.version(), m.zone.name))?))

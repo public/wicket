@@ -13,6 +13,16 @@ A request is allowed when:
 - the **zone's policy** allows it, or a grant does;
 - **no forbid** in either matches it.
 
+**Where it's enforced.** The org layer is enforced at every point that decides:
+- **On a node**, the box's token decides egress. Under an org policy a node doesn't splice a host
+  through: a rule can depend on any path, and a probe can't vouch for the whole host.
+- **On the control host**, the same compiled layer is checked by:
+  - the egress proxy, for hosts the node forwards (credentialed ones) and local boxes;
+  - injections, before a credential goes in;
+  - `spawn`, before a child starts;
+  - message delivery, at the receiving box: a message from a zone it doesn't accept is dropped, and
+    the agent told.
+
 The two layers are separate Cedar policy sets, evaluated separately. Merged into one set, an org
 permit would OR with the zone's permits and widen every zone. A grant lifts the zone layer only: the
 org ceiling is hard, and a forbid beats every grant.
@@ -95,8 +105,20 @@ wicket policy zone manifest.yaml                             # a zone's own poli
 ```
 
 **Applying a version.**
+- **Checks before anything changes:**
+  - the policy must compile and mint a token a node loads, for every running run's zone, as a member
+    of no group, of every group and of each group alone (the node's caps on alternatives, regexes and
+    token size show here);
+  - every active node must talk control/node protocol 3 or later (`ORG_POLICY`): older nodes can't
+    read tokens with an org layer. `apply` names the nodes that don't.
 - `apply` keeps every version under `policy/versions/<version>.cedar` and records `policy.applied`
   in the audit log.
+- It records the installed version in `policy/installed`. A missing `org.cedar`, or one changed by
+  hand, then refuses every mint until it's applied: a deleted file mustn't silently remove the
+  ceiling.
+- A re-attached run is minted again under the version it was first minted under (kept in
+  `versions/`).
+- The recovery kit (`wicket state kit`) carries `policy/`.
 - It revokes the running runs minted under an older version: their boxes stop, and their tokens are
   revoked on their nodes. `--keep-runs` leaves them on the policy they were minted under until they
   end.

@@ -577,6 +577,7 @@ mod tests {
             children: Default::default(),
             llm: Default::default(),
             deadline: Instant::now() + std::time::Duration::from_secs(3600),
+            org: None,
         };
         Parent { ctx: Arc::new(ctx), dir }
     }
@@ -675,6 +676,7 @@ mod tests {
             children: Default::default(),
             llm: Default::default(),
             deadline: Instant::now() + std::time::Duration::from_secs(3600),
+            org: None,
         };
         let e = spawn(&ctx, program("c")).unwrap_err();
         assert!(e.contains("at most 3 boxes (theirs included), and has used 3"), "{e}");

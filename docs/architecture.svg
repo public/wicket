@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1140" viewBox="0 0 1500 1140" font-family="Inter, Helvetica, Arial, sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker><marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1a7f37"/></marker><marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b3261e"/></marker></defs>
+<rect x="0" y="0" width="1500" height="1140" rx="0" fill="#ffffff" stroke="#ffffff" stroke-width="1.5"/>
+<text x="30" y="38" font-size="22" font-weight="700" fill="#1f2328" text-anchor="start">wicket: what runs where, and where the trust boundaries are</text>
+<text x="30" y="62" font-size="13" font-weight="normal" fill="#57606a" text-anchor="start">Green: trusted, holds secrets and keys. Blue: a node, no long-lived secrets. Red dashed: a box, untrusted, no network, no secrets. Arrows: who talks to whom.</text>
+<rect x="30" y="85" width="660" height="705" rx="12" fill="#f0faf3" stroke="#1a7f37" stroke-width="2"/>
+<text x="48" y="113" font-size="17" font-weight="700" fill="#1a7f37" text-anchor="start">Control host</text>
+<text x="48" y="133" font-size="12.5" font-weight="normal" fill="#57606a" text-anchor="start">Runs as the wicket system user. Issues authority, takes human approvals, keeps the record.</text>
+<rect x="48" y="149" width="300" height="118" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="60" y="170" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">wicketd (wicket daemon)</text>
+<text x="60" y="190" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Operators&#x27; CLI over a unix socket.</text>
+<text x="60" y="207" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Callers named by the kernel (SO_PEERCRED);</text>
+<text x="60" y="224" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">policy grants read / run / revoke per group.</text>
+<text x="60" y="241" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Approving, update and keys: root or a passkey.</text>
+<rect x="364" y="149" width="308" height="118" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="376" y="170" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Console (wicket serve)</text>
+<text x="376" y="190" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Runs, approvals, activity, start a run.</text>
+<text x="376" y="207" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Passkeys only; every approval is a signed</text>
+<text x="376" y="224" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">WebAuthn action. HTTPS with ACME, or</text>
+<text x="376" y="241" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">loopback; minimal pre-auth surface.</text>
+<rect x="48" y="281" width="624" height="138" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="60" y="302" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Run supervisors: one per run</text>
+<text x="60" y="322" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Start the run&#x27;s box on a node, stream its events, enforce its budget and timeout.</text>
+<text x="60" y="339" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Hold what must stay central: credential injection and swaps for forwarded hosts,</text>
+<text x="60" y="356" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">the model credential and budget (the node&#x27;s model proxy relays here), the MCP</text>
+<text x="60" y="373" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">gateway&#x27;s ledger-backed tools, and the relay for links between boxes on any nodes.</text>
+<text x="60" y="390" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Survive a restart: a new build re-attaches to running runs (#151).</text>
+<rect x="48" y="433" width="300" height="150" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="60" y="454" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Authority</text>
+<text x="60" y="474" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Identity issuer (SPIFFE-style ids).</text>
+<text x="60" y="491" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Installation CA and per-node CAs.</text>
+<text x="60" y="508" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Feed signer: each box&#x27;s Biscuit token,</text>
+<text x="60" y="525" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">grants (with lifetimes) and revocations,</text>
+<text x="60" y="542" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">signed and streamed to nodes.</text>
+<text x="60" y="559" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Roots can be kept offline (#154).</text>
+<rect x="364" y="433" width="308" height="150" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="376" y="454" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Reconciler and placement</text>
+<text x="376" y="474" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Makes reality match the ledger: ends lost</text>
+<text x="376" y="491" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">runs, stops orphaned boxes, adopts boxes</text>
+<text x="376" y="508" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">that outlived a restart.</text>
+<text x="376" y="525" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Leases capacity; creates and destroys</text>
+<text x="376" y="542" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">provider nodes (Vultr) inside a money</text>
+<text x="376" y="559" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">envelope a human approved.</text>
+<rect x="48" y="597" width="196" height="118" rx="8" fill="#fffbe6" stroke="#bf8700" stroke-width="1"/>
+<text x="60" y="618" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Ledger</text>
+<text x="60" y="638" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">SQLite: runs, requests,</text>
+<text x="60" y="655" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">grants, leases, agents,</text>
+<text x="60" y="672" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">nodes, passkeys and the</text>
+<text x="60" y="689" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">hash-chained audit log.</text>
+<rect x="256" y="597" width="200" height="118" rx="8" fill="#fffbe6" stroke="#bf8700" stroke-width="1"/>
+<text x="268" y="618" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Vault</text>
+<text x="268" y="638" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Secrets, each bound to</text>
+<text x="268" y="655" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">the hosts it may go to.</text>
+<text x="268" y="672" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Values never enter a box</text>
+<text x="268" y="689" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">(nor, today, a node).</text>
+<rect x="468" y="597" width="204" height="118" rx="8" fill="#fffbe6" stroke="#bf8700" stroke-width="1"/>
+<text x="480" y="618" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Versions and state</text>
+<text x="480" y="638" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Self-update: builds side by</text>
+<text x="480" y="655" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">side, health gate, rollback.</text>
+<text x="480" y="672" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Hibernated agents sealed</text>
+<text x="480" y="689" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">(AES-GCM, state.key).</text>
+<rect x="48" y="729" width="624" height="48" rx="8" fill="#fffbe6" stroke="#bf8700" stroke-width="1"/>
+<text x="60" y="750" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">State service (optional)</text>
+<text x="60" y="770" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Streams the ledger, hibernation bundles and audit to an S3-compatible store; tested restore.</text>
+<rect x="730" y="85" width="740" height="705" rx="12" fill="#eef4fb" stroke="#0969da" stroke-width="2"/>
+<text x="748" y="113" font-size="17" font-weight="700" fill="#0969da" text-anchor="start">Nodes: where boxes run</text>
+<text x="748" y="133" font-size="12.5" font-weight="normal" fill="#57606a" text-anchor="start">The control host&#x27;s built-in node and every enrolled Linux host run the same runtime, wicket node serve, reached over a</text>
+<text x="748" y="149" font-size="12.5" font-weight="normal" fill="#57606a" text-anchor="start">control channel (unix socket, or ssh with a pinned host key) that carries the signed feed: the green arrow.</text>
+<rect x="748" y="161" width="704" height="180" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
+<text x="760" y="182" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">wicket node serve (one per node)</text>
+<text x="760" y="202" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Starts and owns its boxes; they outlive a serve restart and are adopted again.</text>
+<text x="760" y="219" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Egress proxy per box: decides each request at the edge, from the box&#x27;s Biscuit token and the node&#x27;s</text>
+<text x="760" y="236" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  verified replica of the signed feed. No call to the control host per request.</text>
+<text x="760" y="253" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  Inspected hosts: TLS terminated with the node&#x27;s name-constrained CA, every request decided and audited.</text>
+<text x="760" y="270" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  Spliced hosts (allowed wholesale, no credential): decided on the hostname, encrypted bytes relayed.</text>
+<text x="760" y="287" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Wicket DNS and the HTTP/3 (QUIC) relay. Model proxy and MCP gateway for each box (relaying to the run).</text>
+<text x="760" y="304" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Keeps its own hash-chained audit log and ships it. If the control host is unreachable, keeps deciding</text>
+<text x="760" y="321" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  from its feed while it is fresh, then reads only, then refuses (#152/#153: until grants expire).</text>
+<rect x="748" y="357" width="704" height="415" rx="10" fill="#fff5f5" stroke="#b3261e" stroke-width="2" stroke-dasharray="7 5"/>
+<text x="764" y="383" font-size="15.5" font-weight="700" fill="#b3261e" text-anchor="start">A box: one per run (gVisor; untrusted)</text>
+<text x="764" y="403" font-size="12.5" font-weight="normal" fill="#57606a" text-anchor="start">runsc · --network none · no capabilities · read-only root · resource limits · no secrets inside</text>
+<rect x="764" y="419" width="330" height="150" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="776" y="440" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">The agent</text>
+<text x="776" y="460" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Claude Code today; others through</text>
+<text x="776" y="477" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">adapters (agent.kind; Codex, opencode: #174).</text>
+<text x="776" y="494" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Or a pinned program without an agent.</text>
+<text x="776" y="511" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Sees only placeholders for credentials.</text>
+<text x="776" y="528" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Workspace: a copy, or a folder in place;</text>
+<text x="776" y="545" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">out/ for its typed result.</text>
+<rect x="1106" y="419" width="330" height="150" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="1118" y="440" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">wicket-fwd (in the box)</text>
+<text x="1118" y="460" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">wicket.internal = 198.18.0.1 on loopback:</text>
+<text x="1118" y="477" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  :3128 egress (HTTPS_PROXY)</text>
+<text x="1118" y="494" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  :8080 model route (ANTHROPIC_BASE_URL)</text>
+<text x="1118" y="511" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  :8081 MCP gateway (wicket tools)</text>
+<text x="1118" y="528" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  DNS and UDP for HTTP/3; the box&#x27;s stdin</text>
+<text x="1118" y="545" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Relays each to a unix socket bind-mounted in.</text>
+<rect x="764" y="583" width="672" height="170" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="776" y="604" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">What a box can do, and what decides it</text>
+<text x="776" y="624" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Reach: only hosts, methods and paths its zone allows; anything else becomes a request a human approves</text>
+<text x="776" y="641" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  or denies, as a grant with a lifetime. Forbid rules always win, even over a grant.</text>
+<text x="776" y="658" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Model: only the model endpoints, within its budget; the real credential is added outside the box.</text>
+<text x="776" y="675" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Children: spawn narrower boxes (their tokens attenuate the parent&#x27;s); wider ones need a human.</text>
+<text x="776" y="692" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Links: talk to another box, on any node, only where both zones allow it.</text>
+<text x="776" y="709" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Hibernate and wake: its whole filesystem and session, on any node.</text>
+<text x="776" y="726" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Nothing in the box can reach the host&#x27;s Docker, the node&#x27;s keys or another box&#x27;s sockets.</text>
+<line x1="690" y1="350" x2="730" y2="350" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#g)" marker-start="url(#g)"/>
+<line x1="1268" y1="419" x2="1268" y2="339" stroke="#b3261e" stroke-width="1.6" marker-end="url(#r)"/>
+<text x="1278" y="397" font-size="11.5" font-weight="normal" fill="#b3261e" text-anchor="start">unix sockets only</text>
+<rect x="30" y="815" width="1440" height="150" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="48" y="843" font-size="16" font-weight="700" fill="#1f2328" text-anchor="start">Outside</text>
+<rect x="48" y="857" width="330" height="92" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="60" y="878" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Operators</text>
+<text x="60" y="898" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Browser: the console, with a passkey.</text>
+<text x="60" y="915" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">CLI: wicket … through wicketd.</text>
+<text x="60" y="932" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Phone or desktop: Remote Control (#169).</text>
+<rect x="392" y="857" width="286" height="92" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="404" y="878" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Audit sinks and the state store</text>
+<text x="404" y="898" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">JSON lines, OTLP, an object store;</text>
+<text x="404" y="915" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">signed checkpoints, verifiable offline</text>
+<text x="404" y="932" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">(wicket audit --verify --against).</text>
+<rect x="692" y="857" width="380" height="92" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="704" y="878" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Model provider (api.anthropic.com today)</text>
+<text x="704" y="898" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Only POST /v1/messages and count_tokens.</text>
+<text x="704" y="915" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Credential added by the run (central) or,</text>
+<text x="704" y="932" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">later, by a lease on the node (#152).</text>
+<rect x="1086" y="857" width="368" height="92" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<text x="1098" y="878" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">The internet</text>
+<text x="1098" y="898" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Hosts in a zone&#x27;s reach, through the node&#x27;s</text>
+<text x="1098" y="915" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">egress proxy only. Private and metadata</text>
+<text x="1098" y="932" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">addresses are refused after DNS.</text>
+<line x1="213" y1="857" x2="213" y2="790" stroke="#57606a" stroke-width="1.6" marker-end="url(#a)"/>
+<text x="222" y="835" font-size="11.5" font-weight="normal" fill="#57606a" text-anchor="start">approve, start, revoke</text>
+<line x1="535" y1="790" x2="535" y2="857" stroke="#57606a" stroke-width="1.6" marker-end="url(#a)"/>
+<text x="544" y="835" font-size="11.5" font-weight="normal" fill="#57606a" text-anchor="start">audit, ledger stream</text>
+<line x1="680" y1="750" x2="760" y2="857" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#g)"/>
+<text x="742" y="810" font-size="11.5" font-weight="normal" fill="#1a7f37" text-anchor="start">model calls + credential</text>
+<line x1="1270" y1="790" x2="1270" y2="857" stroke="#57606a" stroke-width="1.6" marker-end="url(#a)"/>
+<text x="1279" y="835" font-size="11.5" font-weight="normal" fill="#57606a" text-anchor="start">allowed egress</text>
+<text x="30" y="1000" font-size="15" font-weight="700" fill="#1f2328" text-anchor="start">How a request is decided</text>
+<text x="30" y="1022" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">1. The agent&#x27;s HTTPS request goes to wicket.internal:3128, through wicket-fwd, to its node&#x27;s egress proxy over a unix socket.</text>
+<text x="30" y="1040" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">2. The node canonicalizes it (or refuses), classifies its risk, and checks it against the box&#x27;s token: block 0 from the zone&#x27;s policy</text>
+<text x="30" y="1058" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">   (Cedar compiled into Biscuit at issuance: #51), plus grant blocks a human approved, each with a lifetime. Forbids always win.</text>
+<text x="30" y="1076" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">3. Allowed: inspected or spliced to the host. Not allowed: a pending request in the console; the agent waits with await_grant.</text>
+<text x="30" y="1094" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">4. Every decision is in the node&#x27;s audit log, shipped to the control host&#x27;s hash-chained ledger and on to any sinks.</text>
+<text x="30" y="1126" font-size="11.5" font-weight="normal" fill="#57606a" text-anchor="start">Planned items are marked with their issue numbers. Source: docs/design.md; this diagram replaces docs/poc-architecture.svg.</text>
+</svg>

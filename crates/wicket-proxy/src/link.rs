@@ -609,7 +609,6 @@ mod tests {
             let spec = wicket_identity::IdentitySpec {
                 tenant: "t0".into(),
                 zone: zone.name.clone(),
-                org: None,
                 agent: name.into(),
                 run: run.into(),
                 parent_run: parent.map(String::from),

@@ -134,6 +134,31 @@ pub enum SinkKind {
         #[serde(default)]
         resource: BTreeMap<String, String>,
     },
+    /// Objects in the installation's state store (`state-store.yaml`, #154): one JSON-lines object
+    /// per delivered batch, `audit/<sink>/<first seq>-<last seq>-<hash>.jsonl` (a checkpoint's is
+    /// `<seq>-cp-<time>-<hash>.jsonl`). Never overwritten: what a lost control host exported stays,
+    /// and is what `audit --verify --against store:<sink>` compares a restored chain with.
+    Store {},
+}
+
+/// The state store's key prefix of a `store` sink's objects.
+pub fn store_prefix(sink: &str) -> String {
+    format!("audit/{sink}/")
+}
+
+/// Every object a `store` sink has written, as exported objects (records and checkpoints).
+pub fn stored_objects(sink: &str) -> Result<Vec<Value>> {
+    use wicket_store::objects::ObjectStore;
+    let st = crate::statestore::StateStore::load()?.context("no state-store.yaml: there is no state store")?.open_s3()?;
+    let mut out = vec![];
+    for k in st.list_prefix(&store_prefix(sink))? {
+        let mut text = String::new();
+        if let Some(mut r) = st.get(&k)? {
+            std::io::Read::read_to_string(&mut r, &mut text)?;
+        }
+        out.extend(exported_objects(&text));
+    }
+    Ok(out)
 }
 
 impl SinksConfig {
@@ -143,6 +168,9 @@ impl SinksConfig {
         for s in &c.sinks {
             if s.name.is_empty() || !seen.insert(s.name.clone()) {
                 bail!("audit sink names must be present and distinct ({:?})", s.name);
+            }
+            if matches!(s.kind, SinkKind::Store {}) && !wicket_store::objects::valid_key(&s.name) {
+                bail!("a store sink's name is part of its objects' keys: lowercase letters, digits, '_', '.' and '-' ({:?})", s.name);
             }
         }
         if c.batch == 0 {
@@ -249,6 +277,8 @@ pub struct Exporter {
     issuer: Option<wicket_identity::Issuer>,
     http: reqwest::Client,
     rt: tokio::runtime::Runtime,
+    /// The state store, opened on first use by a `store` sink.
+    store: Option<crate::s3::S3Store>,
     /// Whether this process may write to standard output (only `wicket audit export`).
     pub stdout: bool,
 }
@@ -281,6 +311,7 @@ impl Exporter {
             issuer,
             http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
             rt: tokio::runtime::Builder::new_current_thread().enable_all().build()?,
+            store: None,
             stdout: false,
         })
     }
@@ -359,20 +390,44 @@ impl Exporter {
         let at = wicket_store::now();
         let due = force_checkpoint || at - cur.checkpoint_at >= self.cfg.checkpoint_every.as_secs() as i64;
         let mut cps = 0;
-        if due && cur.seq > 0 {
-            if let Some(issuer) = &self.issuer {
-                let head = self.ledger.audit_hash_at(cur.seq)?.context("the sink's cursor is past the local chain")?;
-                let cp = checkpoint_json(issuer, cur.seq, &head, at);
-                self.deliver(i, &[cp])?;
-                self.ledger.export_checkpointed(&name, at)?;
-                cps = 1;
-            }
+        if due && cur.seq > 0 && self.issuer.is_some() {
+            let head = self.ledger.audit_hash_at(cur.seq)?.context("the sink's cursor is past the local chain")?;
+            let cp = checkpoint_json(self.issuer.as_ref().expect("checked"), cur.seq, &head, at);
+            self.deliver(i, &[cp])?;
+            self.ledger.export_checkpointed(&name, at)?;
+            cps = 1;
         }
         Ok((sent, cps))
     }
 
-    fn deliver(&self, i: usize, items: &[Value]) -> Result<()> {
+    fn deliver(&mut self, i: usize, items: &[Value]) -> Result<()> {
         match &self.sinks[i].spec.kind {
+            SinkKind::Store {} => {
+                use wicket_store::objects::ObjectStore;
+                if self.store.is_none() {
+                    let s = crate::statestore::StateStore::load()?.context("an audit sink of type store needs state-store.yaml")?;
+                    self.store = Some(s.open_s3()?);
+                }
+                let (Some(first), Some(last)) = (items.first(), items.last()) else { return Ok(()) };
+                let h = |v: &Value| {
+                    v["hash"].as_str().or(v["head"].as_str()).unwrap_or("").trim_start_matches("v2:").chars().take(16).collect::<String>()
+                };
+                let name = match first["type"].as_str() {
+                    Some("wicket.audit.checkpoint") => {
+                        format!("{:020}-cp-{}-{}", first["seq"].as_i64().unwrap_or(0), first["ts"].as_i64().unwrap_or(0), h(first))
+                    }
+                    _ => format!("{:020}-{:020}-{}", first["seq"].as_i64().unwrap_or(0), last["seq"].as_i64().unwrap_or(0), h(last)),
+                };
+                let mut buf = String::new();
+                for it in items {
+                    buf.push_str(&it.to_string());
+                    buf.push('\n');
+                }
+                let key = format!("{}{name}.jsonl", store_prefix(&self.sinks[i].spec.name));
+                // Already there (a batch delivered before its cursor was saved): the same records.
+                self.store.as_ref().expect("opened").put_if_absent(&key, &mut buf.as_bytes())?;
+                Ok(())
+            }
             SinkKind::Jsonl { path } => {
                 let mut buf = String::new();
                 for it in items {
@@ -506,6 +561,9 @@ pub fn stop_background(wait: Duration) {
 pub struct Against {
     pub checkpoints: usize,
     pub records: usize,
+    /// Exported before a restore that went back to an earlier point (`state.restored` with
+    /// `rolled_back_after`): history the restore declared discarded, not compared (#154).
+    pub superseded: usize,
     pub problems: Vec<String>,
 }
 
@@ -540,6 +598,15 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
     let mut a = Against::default();
     let head = l.audit_head()?.map(|h| h.0).unwrap_or(0);
     let mut newest = 0;
+    // Restores that went back to an earlier point: (the last record kept, when the restore was).
+    let rollbacks: Vec<(i64, i64)> = l
+        .audit_of_kind("state.restored")?
+        .iter()
+        .filter_map(|r| Some((serde_json::from_str::<Value>(&r.body).ok()?["rolled_back_after"].as_i64()?, r.ts)))
+        .collect();
+    // An exported copy that doesn't match is discarded history if a restore went back before it and
+    // it was made before that restore (the same second counts: records carry whole seconds).
+    let discarded = |seq: i64, ts: i64| rollbacks.iter().any(|&(after, at)| seq > after && ts <= at);
     for o in objects {
         match o["type"].as_str() {
             Some("wicket.audit.checkpoint") => {
@@ -558,8 +625,13 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                     a.problems.push("a signed checkpoint without seq and head".into());
                     continue;
                 };
+                let local = l.audit_hash_at(seq)?;
+                if local.as_deref() != Some(want) && discarded(seq, p["ts"].as_i64().unwrap_or(i64::MAX)) {
+                    a.superseded += 1;
+                    continue;
+                }
                 newest = newest.max(seq);
-                match l.audit_hash_at(seq)? {
+                match local {
                     Some(h) if h == want => a.checkpoints += 1,
                     Some(h) => a.problems.push(format!("checkpoint at seq {seq} (signed at {}): exported head {want}, local {h}", p["ts"])),
                     None => a.problems.push(format!("checkpoint at seq {seq}: the local chain ends at {head}")),
@@ -567,6 +639,7 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
             }
             Some("wicket.audit.record") => {
                 let Some(seq) = o["seq"].as_i64() else { continue };
+                let gone = discarded(seq, o["ts"].as_i64().unwrap_or(i64::MAX));
                 // Every exported field, not only the hash: a v1 hash covers neither ts, tenant nor
                 // run, so a record moved to another run must be caught here (#120).
                 match l.audit_record_at(seq)? {
@@ -578,10 +651,13 @@ pub fn verify_against(l: &Ledger, objects: &[Value], issuer: &wicket_identity::V
                             .collect();
                         if differ.is_empty() {
                             a.records += 1;
+                        } else if gone {
+                            a.superseded += 1;
                         } else {
                             a.problems.push(format!("record {seq}: the exported copy's {} differs from the local one", differ.join(", ")));
                         }
                     }
+                    None if gone => a.superseded += 1,
                     None => a.problems.push(format!("record {seq}: exported, but missing locally")),
                 }
             }
@@ -668,6 +744,40 @@ mod tests {
 
     fn rusqlite_conn(path: &Path) -> rusqlite::Connection {
         rusqlite::Connection::open(path).unwrap()
+    }
+
+    #[test]
+    fn exported_copies_a_restore_discarded_are_not_mismatches_and_others_still_are() {
+        let d = TmpDir::new("rollback");
+        let (lp, out) = (d.0.join("ledger.db"), d.0.join("out/audit.jsonl"));
+        let issuer = wicket_identity::Issuer::generate("test.local");
+        let key = issuer.verifying_key();
+        let l = open_batched(&lp).unwrap();
+        write_records(&l, 0, 10);
+        let mut x = Exporter::new(&lp, jsonl_cfg(&out), Some(issuer)).unwrap();
+        x.pass(true);
+        drop(x);
+        let objs = exported_objects(&std::fs::read_to_string(&out).unwrap());
+        // The restored ledger has the first 6 records, then goes on differently.
+        let all = l.audit_records_after(0, 100).unwrap();
+        let r = Ledger::open_in_memory().unwrap();
+        assert_eq!(r.import_exported_audit(&all[..6]).unwrap(), 6);
+        write_records(&r, 100, 3);
+        let mismatched = verify_against(&r, &objs, &key).unwrap();
+        assert!(!mismatched.problems.is_empty(), "without a restore record the divergence is a mismatch");
+        // Declared by the restore: the copies of 7.. and the checkpoint at 10 are discarded history.
+        let r = Ledger::open_in_memory().unwrap();
+        r.import_exported_audit(&all[..6]).unwrap();
+        r.audit(&TenantId::single(), None, "state.restored", &json!({ "rolled_back_after": 6 })).unwrap();
+        write_records(&r, 100, 3);
+        let a = verify_against(&r, &objs, &key).unwrap();
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert_eq!((a.records, a.superseded), (6, 5), "{a:?}");
+        // A copy of a record the restore kept must still match.
+        let mut forged = objs.clone();
+        let i = forged.iter().position(|o| o["seq"] == 3 && o["type"] == "wicket.audit.record").unwrap();
+        forged[i]["kind"] = json!("forged");
+        assert!(verify_against(&r, &forged, &key).unwrap().problems.iter().any(|p| p.starts_with("record 3:")));
     }
 
     #[test]

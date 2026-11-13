@@ -26,11 +26,16 @@ fn canon(c: &Ceiling) -> Ceiling {
     let mut reach: Vec<Reach> = c
         .reach
         .iter()
-        .filter(|r| !r.methods.is_empty())
+        .filter(|r| r.methods.iter().any(|m| wicket_policy::schema::METHODS.contains(&m.to_ascii_uppercase().as_str())))
         .flat_map(|r| {
             r.paths.iter().map(move |p| Reach {
                 host: r.host.clone(),
-                methods: r.methods.iter().map(|m| m.to_ascii_uppercase()).collect(),
+                methods: r
+                    .methods
+                    .iter()
+                    .map(|m| m.to_ascii_uppercase())
+                    .filter(|m| wicket_policy::schema::METHODS.contains(&m.as_str()))
+                    .collect(),
                 paths: vec![p.clone()],
                 allow_dangerous: r.allow_dangerous,
             })
@@ -184,7 +189,7 @@ fn random_org(rng: &mut Rng) -> String {
         format!(" {} {{ {joined} }}", if rng.chance(15) { "unless" } else { "when" })
     };
     // HTTP permits (or all), and forbids.
-    if rng.chance(30) {
+    if rng.chance(55) {
         out.push("permit(principal, action, resource);".to_string());
     } else {
         for _ in 0..1 + rng.below(3) {
@@ -222,7 +227,20 @@ enum Req {
     Msg { from: String },
 }
 
-fn random_req(rng: &mut Rng, zone_globs: &[String]) -> Req {
+fn random_req(rng: &mut Rng, zone_globs: &[String], zone: &ZoneSpec) -> Req {
+    // Half the HTTP requests hit one of the zone's own reach rules: its host, a method and a path it
+    // allows (so allows, and the org layer's narrowing of them, are well sampled).
+    if rng.chance(45) && !zone.reach.is_empty() {
+        let r = rng.pick(&zone.reach);
+        let host = r.host.replace("*.", "a.");
+        let method = if r.methods.is_empty() { "GET".to_string() } else { rng.pick(&r.methods).to_ascii_uppercase() };
+        let path = match r.paths.as_slice() {
+            [] => "/".to_string(),
+            ps => rng.pick(ps).replace("**", "q/r").replace('*', "w").replace(['{', '}'], ""),
+        };
+        let risks = [RiskClass::R0Read, RiskClass::R1ReadScoped, RiskClass::R2WriteReversible, RiskClass::R4ExecOrPrivilege];
+        return Req::Http { method, host, path, risk: *rng.pick(&risks), inject: None };
+    }
     match rng.below(10) {
         0 => Req::Spawn { image: rng.pick(&IMAGES).to_string(), isolation: [1, 2][rng.below(2)], mem: [256 << 20, 2 << 30][rng.below(2)] },
         1 => Req::Msg { from: rng.pick(&ZONES).to_string() },
@@ -284,9 +302,9 @@ impl Cedar {
         EntityUid::from_str(&format!("{t}::{}", s(id))).unwrap()
     }
 
-    /// The expected decision kind: hard org or zone denials are Forbidden; a zone that only lacks a
-    /// permit for an HTTP request needs a grant.
-    fn decide(&self, zone: &str, r: &Req) -> u8 {
+    /// The expected decision kind (hard org or zone denials are Forbidden; a zone that only lacks a
+    /// permit for an HTTP request needs a grant), and whether the org layer alone allows the request.
+    fn decide_with_org(&self, zone: &str, r: &Req) -> (u8, bool) {
         let principal = Self::uid("Box", "b0");
         let mut ents = self.ents.clone();
         let box_attrs: HashMap<String, RestrictedExpression> = [
@@ -311,7 +329,7 @@ impl Cedar {
             } else {
                 NEEDS_GRANT
             };
-            (k, true)
+            (k, org_ok)
         };
         match r {
             Req::Http { method, host, path, risk, inject } => {
@@ -337,7 +355,7 @@ impl Cedar {
                 .into();
                 let mut e = ents.clone();
                 e.push(Entity::new(url.clone(), attrs, HashSet::new()).unwrap());
-                let (k, _) = one(method, url, vec![("risk", RestrictedExpression::new_long(risk_level(*risk)))], e);
+                let (k, org_http) = one(method, url, vec![("risk", RestrictedExpression::new_long(risk_level(*risk)))], e);
                 match inject {
                     // The injection is a second decision; refusing it is hard.
                     Some((h, hd, sec)) => {
@@ -347,14 +365,10 @@ impl Cedar {
                             ("host", RestrictedExpression::new_string(h.clone())),
                             ("header", RestrictedExpression::new_string(hd.clone())),
                         ];
-                        let (ik, _) = one("inject", Self::uid("Secret", sec), ctx, e);
-                        if ik != ALLOW {
-                            FORBIDDEN
-                        } else {
-                            k
-                        }
+                        let (ik, org_inject) = one("inject", Self::uid("Secret", sec), ctx, e);
+                        (if ik != ALLOW { FORBIDDEN } else { k }, org_http && org_inject)
                     }
-                    None => k,
+                    None => (k, org_http),
                 }
             }
             Req::Spawn { image, isolation, mem } => {
@@ -367,24 +381,16 @@ impl Cedar {
                     ("pids", RestrictedExpression::new_long(64)),
                     ("timeout_s", RestrictedExpression::new_long(900)),
                 ];
-                let (k, _) = one("spawn", Self::uid("Image", image), ctx, e);
-                if k == NEEDS_GRANT {
-                    FORBIDDEN
-                } else {
-                    k
-                }
+                let (k, org) = one("spawn", Self::uid("Image", image), ctx, e);
+                (if k == NEEDS_GRANT { FORBIDDEN } else { k }, org)
             }
             Req::Msg { from } => {
                 let mut e = ents.clone();
                 if !e.iter().any(|x| x.uid() == Self::uid("Zone", from)) {
                     e.push(Entity::new_no_attrs(Self::uid("Zone", from), HashSet::new()));
                 }
-                let (k, _) = one("message", Self::uid("Zone", from), vec![], e);
-                if k == NEEDS_GRANT {
-                    FORBIDDEN
-                } else {
-                    k
-                }
+                let (k, org) = one("message", Self::uid("Zone", from), vec![], e);
+                (if k == NEEDS_GRANT { FORBIDDEN } else { k }, org)
             }
         }
     }
@@ -432,7 +438,7 @@ fn cedar_and_the_compiled_token_agree() {
         .unwrap(),
     );
     let mut rng = Rng(51);
-    let (mut checked, mut kinds, mut refused) = (0usize, [0usize; 3], 0usize);
+    let (mut checked, mut kinds, mut refused, mut granted) = (0usize, [0usize; 3], 0usize, 0usize);
     for round in 0..160 {
         let text = random_org(&mut rng);
         let org = OrgPolicy::parse(&text, ents).unwrap_or_else(|e| panic!("round {round}: {e}\n{text}"));
@@ -469,12 +475,68 @@ fn cedar_and_the_compiled_token_agree() {
             };
             let zone_globs: Vec<String> = z.reach.iter().flat_map(|r| r.paths.clone()).collect();
             for _ in 0..12 {
-                let r = random_req(&mut rng, &zone_globs);
-                let want = cedar.decide(&z.name, &r);
+                let r = random_req(&mut rng, &zone_globs, z);
+                let (want, org_ok) = cedar.decide_with_org(&z.name, &r);
                 let got = kind(&loaded.decide(&token_request(&r)));
                 assert_eq!(got, want, "zone {}, {r:?}\norg policy:\n{text}\ndecision: {:?}", z.name, loaded.decide(&token_request(&r)));
+                // The control host's own evaluator of the org layer agrees with Cedar too.
+                let layer = c.org.as_ref().expect("an org layer");
+                let ir_ok = match &r {
+                    Req::Http { method, host, path, risk, inject } => {
+                        layer.refuses_http(host, method, path, risk_level(*risk)).is_none()
+                            && inject.as_ref().is_none_or(|(h, hd, s)| layer.allows_inject(&format!("{h}|{hd}|{s}")))
+                    }
+                    Req::Spawn { image, isolation, mem } => layer.allows_spawn(image, *isolation, *mem, 250, 64, 900),
+                    Req::Msg { from } => layer.allows_message_from(from),
+                };
+                assert_eq!(ir_ok, org_ok, "the org IR evaluator: zone {}, {r:?}\norg policy:\n{text}", z.name);
                 kinds[want as usize] += 1;
                 checked += 1;
+                // A grant for exactly a request that needs one: then it's allowed, unless the org
+                // layer or a forbid refuses it (Forbidden whatever the grant).
+                if let (NEEDS_GRANT, Req::Http { method, host, path, risk, inject: None }) = (want, &r) {
+                    if rng.chance(50) {
+                        let g = Grant {
+                            gid: format!("g-{checked}"),
+                            box_id: "b0".into(),
+                            epoch: 1,
+                            host: host.clone(),
+                            method: method.clone(),
+                            path: path.clone(),
+                            not_after: T0 + 3600,
+                            approver: "human:alex".into(),
+                            digest: vec![1, 2, 3, 4],
+                        };
+                        let gt = wicket_authz::grant(&token, &keys.approver, &g).unwrap();
+                        let gl = load(&gt.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap();
+                        let mut req = token_request(&r);
+                        req.uses_left = vec![(g.gid.clone(), 1)];
+                        let _ = risk;
+                        assert_eq!(kind(&gl.decide(&req)), ALLOW, "a grant lifts the zone layer: zone {}, {r:?}\n{text}", z.name);
+                        granted += 1;
+                    }
+                }
+                if let (FORBIDDEN, Req::Http { method, host, path, inject: None, .. }) = (want, &r) {
+                    if rng.chance(30) {
+                        let g = Grant {
+                            gid: format!("g-{checked}"),
+                            box_id: "b0".into(),
+                            epoch: 1,
+                            host: host.clone(),
+                            method: method.clone(),
+                            path: path.clone(),
+                            not_after: T0 + 3600,
+                            approver: "human:alex".into(),
+                            digest: vec![1, 2, 3, 4],
+                        };
+                        let gt = wicket_authz::grant(&token, &keys.approver, &g).unwrap();
+                        let gl = load(&gt.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap();
+                        let mut req = token_request(&r);
+                        req.uses_left = vec![(g.gid.clone(), 1)];
+                        assert_eq!(kind(&gl.decide(&req)), FORBIDDEN, "no grant lifts a hard refusal: zone {}, {r:?}\n{text}", z.name);
+                        granted += 1;
+                    }
+                }
             }
         }
     }
@@ -483,7 +545,9 @@ fn cedar_and_the_compiled_token_agree() {
         kinds[0], kinds[1], kinds[2]
     );
     assert!(refused < 40, "most generated policies compile ({refused} refused)");
-    assert!(kinds.iter().all(|&k| k > 100), "every outcome exercised: {kinds:?}");
+    eprintln!("{granted} granted requests checked");
+    assert!(kinds.iter().all(|&k| k > 400), "every outcome well exercised: {kinds:?}");
+    assert!(granted > 200, "grants exercised: {granted}");
 }
 
 /// Nothing on a node evaluates Cedar: the crates a node runs on don't depend on it (Cargo.lock).

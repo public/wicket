@@ -1,14 +1,20 @@
 //! `wicket policy` (#51): the installation's org policy in Cedar, and each zone's.
 //!
 //! The org policy is `<data dir>/policy/org.cedar`, with the groups zones are in in
-//! `org-entities.json` (Cedar entities JSON). With none, tokens carry no org layer. Every token is
-//! compiled at mint from the policy current then, and records its version (block 0's `policy`
-//! fact, and the run's ledger row). `wicket policy apply` installs a new version and revokes the
-//! runs minted under older ones, so no box goes on under a policy that's no longer the
-//! installation's.
+//! `org-entities.json` (Cedar entities JSON). `wicket policy apply` installs it and records its
+//! version in `policy/installed`; from then on a missing or changed `org.cedar` refuses every mint
+//! (a deleted file must not silently remove the ceiling, nor a hand edit bypass `apply`). With no
+//! policy ever applied, tokens carry no org layer.
+//!
+//! Every token is compiled at mint from the policy current then, and records its version (block 0's
+//! `policy` fact, and the run's ledger row). `apply` checks first that the new version compiles and
+//! mints a token that loads for every running run's zone, and that every node talks a protocol that
+//! reads it; then it installs it and revokes the runs minted under older versions. Every version is
+//! kept in `policy/versions/`, so a re-attached run is minted under its own.
 
 use crate::{data_dir, ledger_path};
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use wicket_policy::{MintCtx, OrgPolicy};
 
@@ -16,16 +22,62 @@ fn dir() -> PathBuf {
     data_dir().join("policy")
 }
 
-/// The installation's org policy, if it has one.
+fn installed() -> Option<String> {
+    std::fs::read_to_string(dir().join("installed")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The installation's org policy, if one was applied. Refused if it isn't what was applied.
 pub fn org() -> Result<Option<OrgPolicy>> {
     let p = dir().join("org.cedar");
+    let want = installed();
     let text = match std::fs::read_to_string(&p) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match want {
+            None => return Ok(None),
+            Some(v) => bail!("the org policy {v} was applied, but {} is gone: apply it again (`wicket policy apply`)", p.display()),
+        },
         Err(e) => return Err(e).with_context(|| p.display().to_string()),
     };
     let ents = std::fs::read_to_string(dir().join("org-entities.json")).unwrap_or_else(|_| "[]".into());
-    Ok(Some(OrgPolicy::parse(&text, &ents).with_context(|| p.display().to_string())?))
+    let o = OrgPolicy::parse(&text, &ents).with_context(|| p.display().to_string())?;
+    match want {
+        Some(v) if v == o.version() => Ok(Some(o)),
+        Some(v) => bail!(
+            "{} is version {}, not the applied {v}: it was changed by hand; apply it (`wicket policy apply`) to make it the installation's",
+            p.display(),
+            o.version()
+        ),
+        None => bail!("{} exists but was never applied: apply it (`wicket policy apply`)", p.display()),
+    }
+}
+
+/// A version kept by `apply` (for a run minted under it).
+pub fn version(v: &str) -> Result<Option<OrgPolicy>> {
+    if !v.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("policy version {v:?}");
+    }
+    let d = dir().join("versions");
+    let Ok(text) = std::fs::read_to_string(d.join(format!("{v}.cedar"))) else { return Ok(None) };
+    let ents = std::fs::read_to_string(d.join(format!("{v}.entities.json"))).unwrap_or_else(|_| "[]".into());
+    let o = OrgPolicy::parse(&text, &ents)?;
+    if o.version() != v {
+        bail!("the kept policy {v} hashes to {}", o.version());
+    }
+    Ok(Some(o))
+}
+
+/// The org policy a run's token is minted under: for a re-attached run, the version its first
+/// supervisor minted it under (`--keep-runs` holds across a control-host restart); else the
+/// installation's.
+pub fn for_run(run: &str, attach: bool) -> Result<Option<OrgPolicy>> {
+    if attach {
+        let recorded = wicket_store::Ledger::open(&ledger_path())?.run_policy(run)?;
+        return match recorded {
+            None => Ok(None),
+            Some(v) => version(&v)?.map(Some).with_context(|| format!("run {run} was minted under org policy {v}, which isn't kept here")),
+        };
+    }
+    org()
 }
 
 /// What a box is at mint, for its org layer.
@@ -40,6 +92,62 @@ fn load(file: &Path, entities: Option<&Path>) -> Result<OrgPolicy> {
         None => "[]".into(),
     };
     OrgPolicy::parse(&text, &ents).with_context(|| file.display().to_string())
+}
+
+/// A token minted for `zone` under `org`, then loaded as a node would: what minting would refuse
+/// (the node's structural caps: alternatives, regexes, token size) shows here.
+fn mints(org: &OrgPolicy, zone: &wicket_core::ZoneSpec, groups: BTreeSet<String>) -> Result<()> {
+    let mint = MintCtx { zone: zone.name.clone(), tenant: "t".into(), principal: "human:check".into(), depth: 0, groups };
+    let layer = org.layer(&mint)?;
+    let key = wicket_authz::SigningKey::generate();
+    let c = wicket_policy::ceiling(zone, "run_check", 4_102_444_800, vec![key.public()], &["img:check".into()], Some(layer))?;
+    let t = wicket_authz::mint(&key, "t", "human:check", &c)?;
+    wicket_authz::load(&t.to_bytes()?, &key.public(), &|_| false).map_err(|e| anyhow::anyhow!("a node would refuse its token: {e}"))?;
+    Ok(())
+}
+
+/// The zones the check mints for: every running run's (from its record), and a bare one.
+fn zones_to_check() -> Vec<(String, wicket_core::ZoneSpec)> {
+    let bare: wicket_core::ZoneSpec = serde_yaml::from_str("name: policy-check\n").expect("a bare zone");
+    let mut out = vec![("a zone with no rules".to_string(), bare)];
+    if let Ok(l) = wicket_store::Ledger::open(&ledger_path()) {
+        for (run, _, _) in l.running_policies().unwrap_or_default() {
+            let rec = data_dir().join("runs").join(&run).join("ctl/run.json");
+            let m = std::fs::read(&rec)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v["manifest"].as_str().and_then(|y| wicket_core::Manifest::from_yaml(y).ok()));
+            if let Some(m) = m {
+                out.push((format!("run {run}'s zone {}", m.zone.name), m.zone));
+            }
+        }
+    }
+    out
+}
+
+/// Compiles and mints `org` for each zone to check, as a member of no group, of every group, and of
+/// each group alone. Returns what failed.
+fn trial(org: &OrgPolicy) -> Vec<String> {
+    let all: BTreeSet<String> = org
+        .entities()
+        .iter()
+        .filter(|e| e.uid().type_name().to_string() == "Group")
+        .map(|e| e.uid().id().unescaped().to_string())
+        .collect();
+    let mut sets = vec![BTreeSet::new(), all.clone()];
+    sets.extend(all.iter().map(|g| BTreeSet::from([g.clone()])));
+    let mut bad = vec![];
+    for (what, z) in zones_to_check() {
+        let mut ss = sets.clone();
+        ss.push(org.groups_of(&z.name));
+        for groups in ss {
+            if let Err(e) = mints(org, &z, groups.clone()) {
+                bad.push(format!("{what} (groups {groups:?}): {e:#}"));
+                break;
+            }
+        }
+    }
+    bad
 }
 
 /// What a compiled org layer holds, in a line.
@@ -60,23 +168,28 @@ fn summary(org: &OrgPolicy) -> Result<String> {
 /// `wicket policy check FILE [--entities F]`.
 pub fn check(file: &Path, entities: Option<&Path>) -> Result<()> {
     let p = load(file, entities)?;
-    println!("{}: version {}, validates against wicket's schema and compiles", file.display(), p.version());
+    let bad = trial(&p);
+    if !bad.is_empty() {
+        bail!("{}: version {} doesn't mint:\n  - {}", file.display(), p.version(), bad.join("\n  - "));
+    }
+    println!("{}: version {}, validates against wicket's schema, compiles and mints", file.display(), p.version());
     println!("  {}", summary(&p)?);
     Ok(())
 }
 
 /// `wicket policy show`.
 pub fn show() -> Result<()> {
-    let cur = org()?;
+    let cur = org();
     match &cur {
-        Some(p) => {
+        Ok(Some(p)) => {
             println!("org policy {} ({})", p.version(), dir().join("org.cedar").display());
             println!("  {}", summary(p)?);
         }
-        None => println!("no org policy ({} doesn't exist): tokens carry zone policy only", dir().join("org.cedar").display()),
+        Ok(None) => println!("no org policy ({} doesn't exist): tokens carry zone policy only", dir().join("org.cedar").display()),
+        Err(e) => println!("the org policy can't be used, and every mint is refused: {e:#}"),
     }
     let l = wicket_store::Ledger::open(&ledger_path())?;
-    let want = cur.as_ref().map(|p| p.version());
+    let want = cur.ok().flatten().map(|p| p.version());
     let runs = l.running_policies()?;
     let old: Vec<_> = runs.iter().filter(|(_, _, v)| *v != want).collect();
     println!("{} running run(s), {} minted under another version", runs.len(), old.len());
@@ -94,20 +207,33 @@ fn write_replace(p: &Path, body: &str) -> Result<()> {
 }
 
 /// `wicket policy apply FILE [--entities F] [--keep-runs]`.
-pub fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool) -> Result<()> {
+pub async fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool) -> Result<()> {
     let p = load(file, entities)?;
     let v = p.version();
-    let prev = org()?.map(|o| o.version());
-    if prev.as_deref() == Some(v.as_str()) {
+    // Nothing changes unless it mints for every running run's zone, and every node reads it.
+    let bad = trial(&p);
+    if !bad.is_empty() {
+        bail!("org policy {v} doesn't mint, so nothing changed:\n  - {}", bad.join("\n  - "));
+    }
+    let lacking = crate::roots::nodes_below(crate::chan::ORG_POLICY).await?;
+    if !lacking.is_empty() {
+        bail!(
+            "not every node can read tokens with an org layer; nothing changed:\n{}\n(update them, or revoke the ones you no longer use)",
+            lacking.iter().map(|(n, why)| format!("  - node {n}: {why}")).collect::<Vec<_>>().join("\n")
+        );
+    }
+    let prev = installed();
+    if prev.as_deref() == Some(v.as_str()) && dir().join("org.cedar").exists() {
         println!("org policy {v} is already the installation's");
     } else {
         let d = dir();
         std::fs::create_dir_all(d.join("versions"))?;
-        // Every version is kept, by its hash, for review and rollback.
+        // Every version is kept, by its hash, for review and for runs minted under it.
         std::fs::write(d.join("versions").join(format!("{v}.cedar")), &p.text)?;
         std::fs::write(d.join("versions").join(format!("{v}.entities.json")), &p.entities)?;
         write_replace(&d.join("org-entities.json"), &p.entities)?;
         write_replace(&d.join("org.cedar"), &p.text)?;
+        write_replace(&d.join("installed"), &v)?;
         let l = wicket_store::Ledger::open(&ledger_path())?;
         l.audit(
             &wicket_core::TenantId::single(),
@@ -153,9 +279,7 @@ pub fn zone(manifest: &Path) -> Result<()> {
     let base = wicket_authz::Ceiling::from_zone(&m.zone, "run", 0, vec![])?;
     let (text, _) = wicket_policy::zone_layer(&m.zone, &base).context("the zone's policy doesn't compile")?;
     print!("{text}");
-    if base.spawn.images.is_empty() {
-        println!("// (a box may also start children from its own image: its token's spawn permit names it)");
-    }
+    println!("// (a box may also start children from its own image: its token's spawn permit names it)");
     Ok(())
 }
 

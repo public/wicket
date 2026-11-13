@@ -11,7 +11,7 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd};
+use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, StateCmd};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -112,6 +112,15 @@ pub fn route(cmd: &Cmd) -> Route {
             // Read files the caller names, in the caller's own process.
             PolicyCmd::Check { .. } | PolicyCmd::Zone { .. } => Local,
         },
+        // The kit holds every key and secret; a restore replaces the ledger; the roots are the roots.
+        Cmd::State { cmd } => match cmd {
+            StateCmd::Check { probe: false } => Forward(Read),
+            // Writes (and deletes) an object in the store.
+            StateCmd::Check { probe: true } => Forward(Privileged),
+            StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
+            StateCmd::Kit { .. } | StateCmd::Restore { .. } => Forward(Privileged),
+        },
+        Cmd::Keys { .. } => Forward(Privileged),
         Cmd::Itself { cmd } => match cmd {
             SelfCmd::Status => Forward(Read),
             // Changes the code that holds every key: root's alone, and never the daemon's own uid

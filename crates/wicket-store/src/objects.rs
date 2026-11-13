@@ -17,6 +17,22 @@ pub trait ObjectStore: Send + Sync {
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
+/// Any store behind a box (the installation's choice of backend, #154).
+impl ObjectStore for Box<dyn ObjectStore> {
+    fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
+        (**self).put_if_absent(key, data)
+    }
+    fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
+        (**self).get(key)
+    }
+    fn delete(&self, key: &str) -> io::Result<()> {
+        (**self).delete(key)
+    }
+    fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+        (**self).list_prefix(prefix)
+    }
+}
+
 /// Object keys: relative, `/`-separated, of `[a-z0-9_.-]` segments, no `.` or `..` segment.
 pub fn valid_key(key: &str) -> bool {
     !key.is_empty()

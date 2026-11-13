@@ -756,7 +756,12 @@ impl Egress {
                 if let Some(org) = &self.ctx.org {
                     let key = format!("{}|{}|{}", rule.host.to_ascii_lowercase(), rule.header, rule.secret);
                     if !org.allows_inject(&key) {
-                        anyhow::bail!("refused: the org policy ({}) doesn't allow injecting {} into {} for {host}", org.version, rule.secret, rule.header);
+                        anyhow::bail!(
+                            "refused: the org policy ({}) doesn't allow injecting {} into {} for {host}",
+                            org.version,
+                            rule.secret,
+                            rule.header
+                        );
                     }
                 }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
