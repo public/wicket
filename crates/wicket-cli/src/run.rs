@@ -139,6 +139,9 @@ struct RunRecord {
     fence: Option<(String, i64)>,
     session_id: String,
     escalate: bool,
+    /// The image's digest as its node started it (#192).
+    #[serde(default)]
+    image_digest: Option<String>,
 }
 
 /// What a supervisor saves as it goes (`ctl/progress.json`), every few seconds: the model spend and
@@ -218,11 +221,16 @@ pub fn manifest_image(m: &Manifest) -> Result<String> {
     };
     match named {
         None => Ok(default),
-        Some(i) if i == crate::image::DEFAULT || i == default || m.zone.images.iter().any(|z| z == i) => Ok(crate::image::effective(i)),
-        Some(i) => bail!(
-            "agent.image {i:?} is not one zone {} may start: it must be the installation's agent image ({default}) or listed in zone.images",
-            m.zone.name
-        ),
+        Some(i) if i == crate::image::DEFAULT || i == default => Ok(crate::image::effective(i)),
+        // One of the zone's: pinned where the entry that allows it is (#192).
+        Some(i) => match wicket_core::image::matching(i, &m.zone.images) {
+            Some((_, Some(pin))) => Ok(wicket_core::image::pinned(i, &pin)),
+            Some((_, None)) => Ok(i.to_string()),
+            None => bail!(
+                "agent.image {i:?} is not one zone {} may start: it must be the installation's agent image ({default}) or listed in zone.images",
+                m.zone.name
+            ),
+        },
     }
 }
 
@@ -386,6 +394,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or(image);
     let image = image.as_str();
+    // The digest the image must be, if pinned (#192): checked where the box starts, which then
+    // starts it by its id.
+    let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
+    let image_name = image.to_string();
+    if record.is_none() && wake.is_none() {
+        crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
+    }
     let (workload, workload_kind) = match (&m.agent, &m.program) {
         (Some(a), _) => (a.name.clone(), a.kind.clone()),
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
@@ -746,6 +761,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             run: run.clone(),
             dir: dir.clone(),
             image: image.to_string(),
+            own_digest: Default::default(),
             node: node.as_ref().map(|n| n.target.clone()),
             ssh_key: ssh_key.map(|k| k.to_path_buf()),
             ledger: ledger.clone(),
@@ -756,6 +772,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         })),
         _ => None,
     };
+    let own_digest = spawn_ctx.as_ref().map(|c| c.own_digest.clone());
     let spawner: Option<wicket_proxy::Spawner> = spawn_ctx.clone().map(crate::spawn::spawner);
     // Children its node starts for the box, deciding its spawns there (#164).
     let adopter: Option<crate::noderun::Adopter> = spawn_ctx.map(crate::spawn::adopter);
@@ -1042,6 +1059,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 fence: fence.as_ref().map(|f| (f.agent.clone(), f.generation)),
                 session_id: session.id.clone(),
                 escalate,
+                image_digest: image_pin.clone(),
             },
         )?;
     }
@@ -1155,6 +1173,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     _ => None,
                 },
             })),
+            image_pin: image_pin.clone(),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -1188,6 +1207,33 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             adopt: adopter.clone(),
         })
         .await?;
+        // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
+        // or recorded: in the run's record and the audit, the parent's pin for children that name
+        // no image, and a long-lived agent's next activation.
+        let digest = nb.image_digest.clone().or_else(|| record.as_ref().and_then(|r| r.image_digest.clone())).or_else(|| image_pin.clone());
+        if let Some(d) = &digest {
+            if let Some(mut r) = read_json::<RunRecord>(&dir.join("ctl/run.json")) {
+                if r.image_digest.as_deref() != Some(d.as_str()) {
+                    r.image_digest = Some(d.clone());
+                    write_json(&dir.join("ctl/run.json"), &r)?;
+                }
+            }
+            if nb.image_digest.is_some() {
+                ledger.lock().expect("ledger").audit(
+                    &m.tenant,
+                    Some(&run),
+                    "run.image",
+                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                )?;
+                println!("  image {image_name} started as {d}");
+            }
+            if let Some(slot) = &own_digest {
+                let _ = slot.set(d.clone());
+            }
+            if let Some(f) = &fence {
+                ledger.lock().expect("ledger").set_agent_image(&f.agent, &wicket_core::image::pinned(&image_name, d))?;
+            }
+        }
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
         // A wrapped agent's stdin and stdout are its launcher's: joined to the box's, not read here.
         if let Some(fd) = agent_stdout.take() {

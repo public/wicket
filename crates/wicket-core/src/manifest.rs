@@ -517,6 +517,15 @@ impl Manifest {
 
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.zone.limits.authority()?;
+        // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
+        let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
+        let own = self.agent.as_ref().and_then(|a| a.image.as_deref()).map(|i| ("agent.image", i));
+        let prog = self.program.as_ref().and_then(|p| p.image.as_deref()).map(|i| ("program.image", i));
+        for (field, i) in named.chain(own).chain(prog) {
+            if !i.trim().is_empty() {
+                crate::image::parse(i).map_err(|e| ManifestError::Invalid(format!("{field}: {e}")))?;
+            }
+        }
         match (&self.agent, &self.program) {
             (Some(a), None) => {
                 match (a.kind.as_str(), &a.acp) {

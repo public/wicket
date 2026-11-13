@@ -1005,11 +1005,14 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 let n = node.clone();
                 tokio::spawn(async move {
                     let run = bs.run.clone();
-                    let error = start_box(&n, Some(gen), *bs).await.err().map(|e| format!("{e:#}"));
+                    let (digest, error) = match start_box(&n, Some(gen), *bs).await {
+                        Ok(d) => (Some(d), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    };
                     if let Some(e) = &error {
                         eprintln!("[node] starting {run} failed: {e}");
                     }
-                    n.send_to(gen, Frame::Msg(Msg::Started { run, error }));
+                    n.send_to(gen, Frame::Msg(Msg::Started { run, error, digest }));
                 });
             }
             Msg::Resume { run, stdout_from, stderr_from } => {
@@ -1606,13 +1609,13 @@ fn start_box_boxed(
     node: &Arc<Node>,
     owner: Option<u64>,
     bs: BoxStart,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
     Box::pin(start_box(node, owner, bs))
 }
 
 /// Starts a box: for the control connection `owner`, or (a child this node started, #164) for
 /// none until its control host takes it over.
-async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result<()> {
+async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result<String> {
     crate::run::check_run_id(&bs.run)?;
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
@@ -1626,9 +1629,24 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     if zone.name != bs.zone {
         bail!("run {}'s authority is for zone {}, not {}", bs.run, zone.name, bs.zone);
     }
-    if !node.docker.image_exists(&bs.image).await? {
-        bail!("image {} not found on node {} (run: wicket image there)", bs.image, node.name);
-    }
+    // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
+    // reference, or the digest alone; a tag moved to another image since changes nothing, and a
+    // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
+    let ident = match &bs.image_pin {
+        Some(pin) => {
+            let by_ref = node.docker.image_identity(&bs.image).await?.filter(|i| i.is(pin));
+            let by_digest = match by_ref {
+                Some(i) => Some(i),
+                None => node.docker.image_identity(pin).await?.filter(|i| i.is(pin)),
+            };
+            by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?
+        }
+        None => node
+            .docker
+            .image_identity(&bs.image)
+            .await?
+            .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
+    };
     if !bs.binds.is_empty() && !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it can't mount the control host's directories");
     }
@@ -1700,7 +1718,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     let spec = SandboxSpec {
         // The name the control host gives it (its box prefix), else wicket's own.
         name: bs.name.clone().filter(|n| box_name_ok(n, &bs.run)).unwrap_or_else(|| format!("wicket-{}", bs.run.replace('_', "-"))),
-        image: bs.image.clone(),
+        image: ident.id.clone(),
         isolation: bs.isolation,
         mounts: vec![
             Mount { host: sock, target: wicket_agent::SOCK_DIR.into(), read_only: false },
@@ -1759,6 +1777,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     node.docker.start_detached(&spec, cap).await?;
     let rec = BoxRecord {
         start: bs,
+        image_digest: Some(ident.id.clone()),
         name: name.clone(),
         started_ms: wicket_feed::now_ms(),
         stdin_received: 0,
@@ -1769,8 +1788,8 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     };
     rec.save(&dir)?;
     wire(node, owner, rec, dir, tasks, spec.user.clone());
-    eprintln!("[node] box {name} started");
-    Ok(())
+    eprintln!("[node] box {name} started ({})", ident.id);
+    Ok(ident.id)
 }
 
 /// The authority this node derived for a child it started (#164), kept beside it so a restarted
@@ -1854,6 +1873,7 @@ fn child_start(
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swap_hosts: vec![],
         edge: Some(Box::new(chan::EdgeStart { who, spawn: None })),
+        image_pin: plan.image_pin.clone(),
     })
 }
 
@@ -1877,6 +1897,9 @@ fn feed_stdin(node: &Node, run: &str, bytes: &[u8]) {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct BoxRecord {
     start: BoxStart,
+    /// The image's digest as this node started it (#192).
+    #[serde(default)]
+    image_digest: Option<String>,
     name: String,
     started_ms: i64,
     /// Bytes of stdin taken from the control host, and whether it closed it.
@@ -2726,7 +2749,9 @@ mod tests {
                 output_stop: false,
                 swap_hosts: vec![],
                 edge: None,
+                image_pin: None,
             },
+            image_digest: None,
             name: format!("wicket-{run}"),
             started_ms: 0,
             stdin_received: 0,

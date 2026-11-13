@@ -403,6 +403,48 @@ impl Replica<BoxAuthority> {
         Ok(record)
     }
 
+    /// Whether box `run`'s token allows it to start a box from `image` with these limits (#164,
+    /// #192), at `now`: read-only, as a node decides a spawn it starts itself. `image` is the entry
+    /// that allows it (pinned by digest where the zone pins it). Err: why not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peek_spawn(
+        &self,
+        run: &str,
+        tenant: &str,
+        image: &str,
+        isolation: i64,
+        mem_bytes: i64,
+        cpus_milli: i64,
+        pids: i64,
+        timeout_s: i64,
+        now: i64,
+    ) -> Result<(), String> {
+        match self.mode(now) {
+            Mode::Fresh | Mode::Offline => {}
+            m => return Err(format!("this node's policy is {m:?}")),
+        }
+        if self.state().is_some_and(|s| s.is_revoked(RevokeKind::Run, run)) {
+            return Err(format!("run {run} is revoked"));
+        }
+        let z = self.entry(run).ok_or_else(|| format!("no authority for box {run} on this node"))?;
+        let c = z.compiled.as_ref().map_err(|e| format!("this box's authority is invalid: {e}"))?;
+        if c.issuer_until.is_some_and(|u| now >= u) {
+            return Err("the authority issuing key that minted this box's token is no longer certified".into());
+        }
+        let req = authz::Request {
+            time: u64::try_from(now.div_euclid(1000)).unwrap_or(0),
+            tenant: tenant.into(),
+            box_id: z.spec.box_path.clone(),
+            epoch: z.spec.epoch,
+            action: authz::Action::Spawn { image: image.into(), isolation, mem_bytes, cpus_milli, pids, timeout_s },
+            uses_left: vec![],
+        };
+        match c.loaded.decide(&req) {
+            authz::Decision::Allow => Ok(()),
+            authz::Decision::Forbidden(r) | authz::Decision::NeedsGrant(r) => Err(r),
+        }
+    }
+
     /// Box `run`'s path in its spawn tree, if the node holds its authority.
     pub fn box_path_of(&self, run: &str) -> Option<String> {
         self.entry(run).map(|z| z.spec.box_path.clone())

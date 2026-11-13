@@ -150,7 +150,7 @@ for a kind to see its body):
 | area | kinds |
 |---|---|
 | requests | `op` (an egress or model decision), `decision` (an approve or deny), `grant.revoked`, `daemon.refused` |
-| runs | `run.start`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.reaped`, `box.exit_cause`, `box.memory_pressure` |
+| runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.reaped`, `box.exit_cause`, `box.memory_pressure` |
 | agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `spawn.beyond_parent`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
 | links | `link.expose`, `link.open`, `link.close`, `link.cut` |
 | operators | `operator.signed_in`, `operator.lockout`, `operator.passkey_added`, `operator.enrol_link_issued`, `operator.enrol_link_used`, `operator.reset`, `operator.sessions_revoked`, `operator.message` |

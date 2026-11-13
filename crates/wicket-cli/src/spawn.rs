@@ -22,6 +22,9 @@ pub struct SpawnCtx {
     pub run: RunId,
     pub dir: PathBuf,
     pub image: String,
+    /// The digest the parent's box started as (#192), once its node reports it: a child that names
+    /// no image is pinned to it, so a retag between the two can't change what it starts.
+    pub own_digest: Arc<OnceLock<String>>,
     pub node: Option<String>,
     pub ssh_key: Option<PathBuf>,
     pub ledger: Arc<Mutex<Ledger>>,
@@ -36,6 +39,16 @@ pub struct SpawnCtx {
 /// records in `<run dir>/children/`): one each plus their own `max_children`, as `spawn` charged them,
 /// at most `max`. A re-attached run (#151) starts from this, so a restart doesn't reset its bound.
 /// Like a run that never restarted, a child that has ended still counts.
+impl SpawnCtx {
+    /// The parent's own image: pinned to the digest its box started as, once known (#192).
+    pub fn own_image(&self) -> String {
+        match self.own_digest.get() {
+            Some(d) => wicket_core::image::pinned(&self.image, d),
+            None => self.image.clone(),
+        }
+    }
+}
+
 pub fn reserved_slots(dir: &std::path::Path, max: u32) -> u32 {
     let Ok(rd) = std::fs::read_dir(dir.join("children")) else { return 0 };
     let used = rd
@@ -97,7 +110,7 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
     let mut reserved = c.slots.lock().map_err(|_| "slots lock")?;
     let slots = pa.max_children.saturating_sub(*reserved);
     let elapsed = std::time::Duration::from_millis(u64::try_from(wicket_feed::now_ms() - s.started_ms).unwrap_or(0));
-    let images: Vec<String> = std::iter::once(c.image.clone()).chain(p.zone.images.iter().cloned()).collect();
+    let images: Vec<String> = std::iter::once(c.own_image()).chain(p.zone.images.iter().cloned()).collect();
     let max_children = cm.agent.as_ref().map_or(0, |a| a.max_children);
     let bounds = subset::Bounds {
         zone: &p.zone,
@@ -129,7 +142,14 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
         )
     });
     let adopt = Adopt { child: s.child.clone(), started_ms: s.started_ms, session: s.session.clone() };
-    launch_as(c, &s.manifest, &s.image, None, Some(&adopt)).map(|_| ())
+    // Supervised as the image it started as (#192): pinned to the digest its node reported.
+    let image = match &s.digest {
+        Some(d) if wicket_core::image::parse(d).is_ok_and(|r| r.pin.is_some() && r.name.is_empty()) => {
+            wicket_core::image::pinned(&s.image, d)
+        }
+        _ => s.image.clone(),
+    };
+    launch_as(c, &s.manifest, &image, None, Some(&adopt)).map(|_| ())
 }
 
 /// A child its node started (#164), to take over: `wicket run --adopt`.
@@ -159,7 +179,13 @@ pub struct PlanIn<'a> {
 pub struct ChildPlan {
     pub cm: Manifest,
     pub yaml: String,
+    /// The image the child starts as: pinned (`name@sha256:…`) when what allows it is (#192).
     pub image: String,
+    /// The allowed entry that lets it start (a zone's `images`, or the parent's own image): what the
+    /// org policy and the parent's token decide on.
+    pub image_entry: String,
+    /// The digest the child's image must be where it starts, if pinned.
+    pub image_pin: Option<String>,
     pub zone_name: String,
     /// The digest of the request as the agent stated it (what an approval binds to).
     pub digest: String,
@@ -257,6 +283,10 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     }
     let image = req.image.clone().unwrap_or_else(|| i.image.to_string());
     let images: Vec<String> = std::iter::once(i.image.to_string()).chain(p.zone.images.iter().cloned()).collect();
+    // By digest where pinned (#192): the entry that allows it, and the digest the box must be.
+    let matched = wicket_core::image::matching(&image, &images);
+    let image_entry = matched.as_ref().map(|m| m.0.clone()).unwrap_or_else(|| image.clone());
+    let image_pin = matched.and_then(|m| m.1);
 
     // The child manifest.
     let mut cm = p.clone();
@@ -290,7 +320,7 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     // The org policy's spawn rule is hard: no approval lifts it (#51).
     if let Some(org) = i.org {
         let s = wicket_authz::Ceiling::from_zone(&cm.zone, "child", 0, vec![]).map_err(|e| e.to_string())?.spawn;
-        if !org.allows_spawn(&image, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s) {
+        if !org.allows_spawn(&image_entry, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s) {
             return Err(format!(
                 "the org policy ({}) doesn't allow this spawn (image {image}, isolation {}, {} bytes of memory, {} millicpus, {} pids, {} s): narrow it",
                 org.version, s.min_isolation, s.mem_bytes, s.cpus_milli, s.pids, s.timeout_s
@@ -326,7 +356,11 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     let ask = subset::Ask { zone: &cm.zone, image: &image, max_children: req.max_children };
     let violations = subset::check(&ask, &bounds).err().unwrap_or_default();
     let weight = req.max_children.saturating_add(1).min(slots);
-    Ok(ChildPlan { cm, yaml, image, zone_name, digest, violations, weight, is_agent })
+    let image = match &image_pin {
+        Some(pin) => wicket_core::image::pinned(&image, pin),
+        None => image,
+    };
+    Ok(ChildPlan { cm, yaml, image, image_entry, image_pin, zone_name, digest, violations, weight, is_agent })
 }
 
 fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
@@ -342,7 +376,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         &PlanIn {
             parent: &c.parent,
             run: &c.run,
-            image: &c.image,
+            image: &c.own_image(),
             time_left: c.deadline.saturating_duration_since(Instant::now()),
             llm_left: c.llm.get().and_then(|l| l.remaining()),
             llm_input_left: c.llm.get().and_then(|l| l.remaining_input()),
@@ -664,6 +698,63 @@ mod tests {
     use serde_json::json;
     use wicket_store::{LeaseBudget, LeaseRow};
 
+    /// #192: a spawn's image is decided by digest where pinned: a tag of a pinned repository is that
+    /// pin; a child naming no image is its parent's image as it started (pinned to its digest); a
+    /// pinned request needs a pinned entry of the same digest; and the org policy decides on the
+    /// entry that allows it.
+    #[test]
+    fn a_spawn_is_pinned_by_the_entry_that_allows_its_image() {
+        let (a, b) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
+        let p = Manifest::from_yaml(&format!(
+            "task: t\nagent: {{ name: lead, max_children: 4 }}\nzone:\n  name: z\n  llm: {{ secret: m }}\n  images: [tool@{a}, 'other:1']\n  limits: {{ memory: 1g, cpus: 1, timeout: 1h }}\n"
+        ))
+        .unwrap();
+        let own = wicket_core::image::pinned("wicket/claude-code:dev", &b);
+        let plan = |image: Option<&str>, org: Option<&wicket_authz::OrgLayer>| {
+            let req = SpawnRequest {
+                name: "kid".into(),
+                kind: "program".into(),
+                command: vec!["true".into()],
+                image: image.map(String::from),
+                zone: Some(json!({ "limits": { "memory": "128m", "cpus": 1, "timeout": "5m" } })),
+                ..Default::default()
+            };
+            plan_child(
+                &PlanIn {
+                    parent: &p,
+                    run: &RunId("run_x".into()),
+                    image: &own,
+                    time_left: std::time::Duration::from_secs(3600),
+                    llm_left: None,
+                    llm_input_left: None,
+                    slots: 4,
+                    org,
+                },
+                &req,
+            )
+        };
+        let tag = plan(Some("tool:latest"), None).unwrap();
+        assert!(tag.violations.is_empty(), "{:?}", tag.violations);
+        assert_eq!((tag.image.as_str(), tag.image_pin.as_deref()), (format!("tool@{a}").as_str(), Some(a.as_str())));
+        let dflt = plan(None, None).unwrap();
+        assert_eq!((dflt.image, dflt.image_pin.as_deref(), dflt.image_entry), (own.clone(), Some(b.as_str()), own.clone()));
+        let other = plan(Some("other:1"), None).unwrap();
+        assert_eq!((other.image.as_str(), other.image_pin), ("other:1", None), "a tag entry: resolved where it starts");
+        assert!(!plan(Some(&format!("tool@{b}")), None).unwrap().violations.is_empty(), "another digest of a pinned repository");
+        assert!(!plan(Some(&format!("other@{a}")), None).unwrap().violations.is_empty(), "a pin a tag entry can't vouch for");
+        // The org policy sees the entry: one that allows `tool@a` lets a tag of it start.
+        let org = wicket_authz::OrgLayer {
+            version: "v1".into(),
+            http: None,
+            forbid: vec![],
+            spawn: Some(vec![wicket_authz::SpawnMatch { images: Some(vec![format!("tool@{a}")]), ..Default::default() }]),
+            msg_from: None,
+            inject: None,
+        };
+        assert!(plan(Some("tool:latest"), Some(&org)).is_ok());
+        assert!(plan(Some("other:1"), Some(&org)).err().unwrap_or_default().contains("org policy"));
+    }
+
     const NOW: i64 = 1_000_000;
 
     /// A lease held by `run` in `status` (`active` ones on node `node`, ending at `not_after`).
@@ -723,6 +814,7 @@ mod tests {
             run: RunId("run_01parent".into()),
             dir: dir.clone(),
             image: "img:a".into(),
+            own_digest: Default::default(),
             node: None,
             ssh_key: None,
             ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())),
@@ -822,6 +914,7 @@ mod tests {
             run: p.ctx.run.clone(),
             dir: p.dir.clone(),
             image: "img:a".into(),
+            own_digest: Default::default(),
             node: None,
             ssh_key: None,
             ledger: p.ctx.ledger.clone(),

@@ -6,6 +6,7 @@
 //! a reach rule, forbidden outright, or needs a grant from the ledger.
 
 pub mod canon;
+pub mod image;
 pub mod link;
 pub mod manifest;
 pub mod op;
