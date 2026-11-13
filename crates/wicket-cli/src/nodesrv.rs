@@ -1354,10 +1354,31 @@ async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::bo
             );
         }
     }
-    match relay_rpc(node, run, Some(&parts), body).await {
-        Ok(r) => r,
-        Err(e) => gateway_offline(&rpc, &e.to_string()),
+    let mut tries = 0;
+    loop {
+        match relay_rpc(node, run, Some(&parts), body.clone()).await {
+            Ok(r) => return r,
+            // A child this node started (#164) is relayed to once its control host has taken it
+            // over and supervises it: a call before that waits for it (while its parent's control
+            // connection is up, so its supervisor is on the way), for up to a minute.
+            Err(_) if tries < 60 && started_here(node, run) && parent_connected(node, run) => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return gateway_offline(&rpc, &e.to_string()),
+        }
     }
+}
+
+/// A box this node started itself (#164).
+fn started_here(node: &Node, run: &str) -> bool {
+    node.replica.lock().expect("replica").local(run).is_some()
+}
+
+/// Whether the control connection of the box that started `run` here is up.
+fn parent_connected(node: &Node, run: &str) -> bool {
+    let path = node.replica.lock().expect("replica").box_path_of(run);
+    path.and_then(|p| p.rsplit('/').nth(1).map(String::from)).is_some_and(|parent| node.owner(&parent).is_some())
 }
 
 /// Relays one JSON-RPC request to the run's gateway on the control host, and reads its answer.

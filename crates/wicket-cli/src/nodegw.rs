@@ -562,7 +562,8 @@ async fn start_child(
         return Err(e);
     }
     if let Some(t) = &stdin_task {
-        super::feed_stdin(node, &child.0, t.as_bytes());
+        // As its control host would send it: one line.
+        super::feed_stdin(node, &child.0, format!("{t}\n").as_bytes());
     }
     let c = SpawnedChild {
         parent: run.into(),

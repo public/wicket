@@ -1267,7 +1267,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
     // written the same way while the session is open; closing stdin ends it.
     let mut stdin = stdin;
-    if let (Some(si), Some(t), None) = (stdin.as_mut(), &stdin_task, &record) {
+    // A child its node started (#164) has its task from the node already.
+    if let (Some(si), Some(t), None, None) = (stdin.as_mut(), &stdin_task, &record, &adopt) {
         use tokio::io::AsyncWriteExt;
         si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
     }
