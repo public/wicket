@@ -1,0 +1,345 @@
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 5.821195872, "added_bytes": 124667502}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 4.537397464}
+{"kind": "restore_one", "store": "fs", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.772417488}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 6.9012638630000005, "added_bytes": 124766665}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 4.404912722}
+{"kind": "restore_one", "store": "fs", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.806437264}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 2, "exit": 0, "wall_s": 5.768362806, "added_bytes": 124914557}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 3, "exit": 0, "wall_s": 5.948387647, "added_bytes": 124586412}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 4, "exit": 0, "wall_s": 5.561913089, "added_bytes": 124440987}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 5.593498228, "added_bytes": 124440353}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 3.979347772}
+{"kind": "restore_one", "store": "fs", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.850685031}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 6, "exit": 0, "wall_s": 5.615093149, "added_bytes": 124497015}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 7, "exit": 0, "wall_s": 6.358076393, "added_bytes": 124225699}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 8, "exit": 0, "wall_s": 5.796084948, "added_bytes": 124652118}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 9, "exit": 0, "wall_s": 5.69265309, "added_bytes": 124934074}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 10, "exit": 0, "wall_s": 5.90694635, "added_bytes": 124578240}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 11, "exit": 0, "wall_s": 5.781247983, "added_bytes": 124769233}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 12, "exit": 0, "wall_s": 5.936501262, "added_bytes": 124972266}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 13, "exit": 0, "wall_s": 6.805456346, "added_bytes": 124898667}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 14, "exit": 0, "wall_s": 6.076992596, "added_bytes": 124804773}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 15, "exit": 0, "wall_s": 6.094043319, "added_bytes": 124969647}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 16, "exit": 0, "wall_s": 6.776031995, "added_bytes": 124755996}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 17, "exit": 0, "wall_s": 7.404871979, "added_bytes": 124768662}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 18, "exit": 0, "wall_s": 6.429051607, "added_bytes": 124961728}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 19, "exit": 0, "wall_s": 6.338627842, "added_bytes": 124967999}
+{"kind": "save", "store": "fs", "format": "today", "agent": "rust", "session": 20, "exit": 0, "wall_s": 6.220484556, "added_bytes": 124774017}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "rust", "session": 20, "exit": 0, "wall_s": 4.466650564}
+{"kind": "restore_one", "store": "fs", "format": "today", "agent": "rust", "session": 20, "exit": 0, "wall_s": 0.840752465}
+{"kind": "check_read", "store": "fs", "format": "today", "agent": "rust", "session": 20, "exit": 0, "wall_s": 24.397064235}
+{"kind": "prune", "store": "fs", "format": "today", "agent": "rust", "session": 20, "exit": 0, "wall_s": 0.33932577}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 7.27445635, "added_bytes": 124660955}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 4.267879707}
+{"kind": "restore_one", "store": "fs", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.74885549}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 6.69280592, "added_bytes": 124760375}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 4.541929908}
+{"kind": "restore_one", "store": "fs", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.784999284}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 2, "exit": 0, "wall_s": 6.50716128, "added_bytes": 124907776}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 3, "exit": 0, "wall_s": 6.845940578, "added_bytes": 124579844}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 4, "exit": 0, "wall_s": 6.7666021, "added_bytes": 124433785}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 6.656683121, "added_bytes": 124432510}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 4.514891238}
+{"kind": "restore_one", "store": "fs", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.783207012}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 6, "exit": 0, "wall_s": 6.752028506, "added_bytes": 124491954}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 7, "exit": 0, "wall_s": 6.784680169, "added_bytes": 124220555}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 8, "exit": 0, "wall_s": 6.736070617, "added_bytes": 124646161}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 9, "exit": 0, "wall_s": 6.790917744, "added_bytes": 124927584}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 10, "exit": 0, "wall_s": 7.054421947, "added_bytes": 124570915}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 11, "exit": 0, "wall_s": 7.227157826, "added_bytes": 124763662}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 12, "exit": 0, "wall_s": 7.37851887, "added_bytes": 124966330}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 13, "exit": 0, "wall_s": 6.915339322, "added_bytes": 124892448}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 14, "exit": 0, "wall_s": 6.614843298, "added_bytes": 124799141}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 15, "exit": 0, "wall_s": 6.886130462, "added_bytes": 124962902}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 16, "exit": 0, "wall_s": 6.657498096, "added_bytes": 124749059}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 17, "exit": 0, "wall_s": 7.05543972, "added_bytes": 124760912}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 18, "exit": 0, "wall_s": 7.020543889, "added_bytes": 124953386}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 19, "exit": 0, "wall_s": 6.618664008, "added_bytes": 124961235}
+{"kind": "save", "store": "fs", "format": "age", "agent": "rust", "session": 20, "exit": 0, "wall_s": 6.6556193409999995, "added_bytes": 124766826}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "rust", "session": 20, "exit": 0, "wall_s": 4.781198823}
+{"kind": "restore_one", "store": "fs", "format": "age", "agent": "rust", "session": 20, "exit": 0, "wall_s": 0.887159712}
+{"kind": "check_read", "store": "fs", "format": "age", "agent": "rust", "session": 20, "exit": 0, "wall_s": 27.833410769}
+{"kind": "prune", "store": "fs", "format": "age", "agent": "rust", "session": 20, "exit": 0, "wall_s": 0.133190243}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 4.891282547, "added_bytes": 144586701}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 1.233836201}
+{"kind": "restore_one", "store": "fs", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.744468583}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.137760381, "added_bytes": 17899626}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 2.199081879}
+{"kind": "restore_one", "store": "fs", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.834335522}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 2, "exit": 0, "wall_s": 1.3775491770000001, "added_bytes": 19069917}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 3, "exit": 0, "wall_s": 1.235178707, "added_bytes": 19001619}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 4, "exit": 0, "wall_s": 1.3259238070000001, "added_bytes": 19032333}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.298751119, "added_bytes": 19476286}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.5192111769999999}
+{"kind": "restore_one", "store": "fs", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.772797447}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 6, "exit": 0, "wall_s": 1.252309898, "added_bytes": 19558022}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 7, "exit": 0, "wall_s": 1.5480191460000001, "added_bytes": 19466604}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 8, "exit": 0, "wall_s": 1.203983077, "added_bytes": 18511213}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 9, "exit": 0, "wall_s": 1.198902085, "added_bytes": 18317137}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 10, "exit": 0, "wall_s": 1.416482136, "added_bytes": 18419716}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 11, "exit": 0, "wall_s": 1.3941583849999999, "added_bytes": 19223042}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 12, "exit": 0, "wall_s": 1.387513528, "added_bytes": 18997152}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 13, "exit": 0, "wall_s": 1.32888055, "added_bytes": 18008935}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 14, "exit": 0, "wall_s": 1.348853995, "added_bytes": 18772991}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 15, "exit": 0, "wall_s": 1.404587425, "added_bytes": 18499391}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 16, "exit": 0, "wall_s": 1.442495093, "added_bytes": 19640006}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 17, "exit": 0, "wall_s": 1.580078826, "added_bytes": 18485687}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 18, "exit": 0, "wall_s": 1.5219880730000002, "added_bytes": 20844908}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 19, "exit": 0, "wall_s": 1.530086244, "added_bytes": 18633991}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "rust", "session": 20, "exit": 0, "wall_s": 1.410260295, "added_bytes": 19808823}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "rust", "session": 20, "exit": 0, "wall_s": 2.05634331}
+{"kind": "restore_one", "store": "fs", "format": "rustic", "agent": "rust", "session": 20, "exit": 0, "wall_s": 0.755787296}
+{"kind": "check_read", "store": "fs", "format": "rustic", "agent": "rust", "session": 20, "exit": 0, "wall_s": 6.307339095}
+{"kind": "prune", "store": "fs", "format": "rustic", "agent": "rust", "session": 20, "exit": 0, "wall_s": 1.8956219060000001}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 0, "exit": 0, "wall_s": 5.695427117, "added_bytes": 55798826}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "node", "session": 0, "exit": 0, "wall_s": 7.247350418}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 1, "exit": 0, "wall_s": 14.179011993, "added_bytes": 55799379}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "node", "session": 1, "exit": 0, "wall_s": 7.339119078}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 2, "exit": 0, "wall_s": 5.105619579, "added_bytes": 55800396}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 3, "exit": 0, "wall_s": 5.708093364, "added_bytes": 55801192}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 4, "exit": 0, "wall_s": 4.666010771, "added_bytes": 55802016}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 5, "exit": 0, "wall_s": 4.703267794, "added_bytes": 55861227}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "node", "session": 5, "exit": 0, "wall_s": 6.073320172}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 6, "exit": 0, "wall_s": 4.569754254, "added_bytes": 55861941}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 7, "exit": 0, "wall_s": 5.044028751, "added_bytes": 55862741}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 8, "exit": 0, "wall_s": 4.715113189, "added_bytes": 55863734}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 9, "exit": 0, "wall_s": 4.811809145, "added_bytes": 55864572}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 10, "exit": 0, "wall_s": 4.55098928, "added_bytes": 55857109}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 11, "exit": 0, "wall_s": 4.987736939, "added_bytes": 55857967}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 12, "exit": 0, "wall_s": 4.687891677, "added_bytes": 55858835}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 13, "exit": 0, "wall_s": 4.866460632, "added_bytes": 55859567}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 14, "exit": 0, "wall_s": 4.61270091, "added_bytes": 55860370}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 15, "exit": 0, "wall_s": 4.525923138, "added_bytes": 55817968}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 16, "exit": 0, "wall_s": 4.6509254890000005, "added_bytes": 55818601}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 17, "exit": 0, "wall_s": 4.786910159, "added_bytes": 55819521}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 18, "exit": 0, "wall_s": 5.1914579419999995, "added_bytes": 55820203}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 19, "exit": 0, "wall_s": 4.978530773, "added_bytes": 55821015}
+{"kind": "save", "store": "fs", "format": "today", "agent": "node", "session": 20, "exit": 0, "wall_s": 4.7358573, "added_bytes": 55824725}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "node", "session": 20, "exit": 0, "wall_s": 6.342277482}
+{"kind": "check_read", "store": "fs", "format": "today", "agent": "node", "session": 20, "exit": 0, "wall_s": 9.476744997}
+{"kind": "prune", "store": "fs", "format": "today", "agent": "node", "session": 20, "exit": 0, "wall_s": 0.234193445}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 0, "exit": 0, "wall_s": 4.904139724, "added_bytes": 55799110}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "node", "session": 0, "exit": 0, "wall_s": 6.127566761}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 1, "exit": 0, "wall_s": 4.963772767, "added_bytes": 55799695}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "node", "session": 1, "exit": 0, "wall_s": 6.339343364}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 2, "exit": 0, "wall_s": 4.6938726410000005, "added_bytes": 55800604}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 3, "exit": 0, "wall_s": 5.059911967, "added_bytes": 55801512}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 4, "exit": 0, "wall_s": 5.082170603, "added_bytes": 55802368}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 5, "exit": 0, "wall_s": 5.014510791, "added_bytes": 55859880}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "node", "session": 5, "exit": 0, "wall_s": 6.726170946}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 6, "exit": 0, "wall_s": 4.671058392, "added_bytes": 55860898}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 7, "exit": 0, "wall_s": 4.795399678, "added_bytes": 55861501}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 8, "exit": 0, "wall_s": 6.149884793, "added_bytes": 55862520}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 9, "exit": 0, "wall_s": 5.170634337, "added_bytes": 55863369}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 10, "exit": 0, "wall_s": 4.848497959, "added_bytes": 55854451}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 11, "exit": 0, "wall_s": 5.125480176, "added_bytes": 55855314}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 12, "exit": 0, "wall_s": 4.944604503, "added_bytes": 55856098}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 13, "exit": 0, "wall_s": 4.945161248, "added_bytes": 55856964}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 14, "exit": 0, "wall_s": 5.089866534, "added_bytes": 55857497}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 15, "exit": 0, "wall_s": 5.099921491, "added_bytes": 55816217}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 16, "exit": 0, "wall_s": 5.138077666, "added_bytes": 55816884}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 17, "exit": 0, "wall_s": 4.881037593, "added_bytes": 55817803}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 18, "exit": 0, "wall_s": 4.867280701, "added_bytes": 55818870}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 19, "exit": 0, "wall_s": 5.106013637, "added_bytes": 55819562}
+{"kind": "save", "store": "fs", "format": "age", "agent": "node", "session": 20, "exit": 0, "wall_s": 5.488176988, "added_bytes": 55821762}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "node", "session": 20, "exit": 0, "wall_s": 6.474425611}
+{"kind": "check_read", "store": "fs", "format": "age", "agent": "node", "session": 20, "exit": 0, "wall_s": 11.266885908}
+{"kind": "prune", "store": "fs", "format": "age", "agent": "node", "session": 20, "exit": 0, "wall_s": 0.130839779}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 0, "exit": 0, "wall_s": 9.872374925, "added_bytes": 64416961}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "node", "session": 0, "exit": 0, "wall_s": 4.760872342}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 1, "exit": 0, "wall_s": 2.147583197, "added_bytes": 27824}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "node", "session": 1, "exit": 0, "wall_s": 4.385915477}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 2, "exit": 0, "wall_s": 2.453110069, "added_bytes": 30220}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 3, "exit": 0, "wall_s": 2.089766316, "added_bytes": 31776}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 4, "exit": 0, "wall_s": 2.127368436, "added_bytes": 33028}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 5, "exit": 0, "wall_s": 2.074376193, "added_bytes": 334212}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "node", "session": 5, "exit": 0, "wall_s": 4.658088279}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 6, "exit": 0, "wall_s": 2.088044724, "added_bytes": 34149}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 7, "exit": 0, "wall_s": 2.017044615, "added_bytes": 30197}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 8, "exit": 0, "wall_s": 2.097021876, "added_bytes": 30553}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 9, "exit": 0, "wall_s": 1.97635207, "added_bytes": 30498}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 10, "exit": 0, "wall_s": 2.077061439, "added_bytes": 308685}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 11, "exit": 0, "wall_s": 2.054180936, "added_bytes": 27631}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 12, "exit": 0, "wall_s": 2.049012818, "added_bytes": 28918}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 13, "exit": 0, "wall_s": 2.072527783, "added_bytes": 32213}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 14, "exit": 0, "wall_s": 2.260134881, "added_bytes": 30278}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 15, "exit": 0, "wall_s": 2.098865881, "added_bytes": 219050}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 16, "exit": 0, "wall_s": 2.135490898, "added_bytes": 28327}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 17, "exit": 0, "wall_s": 2.298641851, "added_bytes": 30015}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 18, "exit": 0, "wall_s": 2.258795622, "added_bytes": 33833}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 19, "exit": 0, "wall_s": 2.341909823, "added_bytes": 29190}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "node", "session": 20, "exit": 0, "wall_s": 2.317510653, "added_bytes": 316016}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "node", "session": 20, "exit": 0, "wall_s": 4.823719742}
+{"kind": "check_read", "store": "fs", "format": "rustic", "agent": "node", "session": 20, "exit": 0, "wall_s": 1.979642723}
+{"kind": "prune", "store": "fs", "format": "rustic", "agent": "node", "session": 20, "exit": 0, "wall_s": 1.40749554}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 0, "exit": 0, "wall_s": 3.379462193, "added_bytes": 19196452}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "small", "session": 0, "exit": 0, "wall_s": 7.415977819}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 1, "exit": 0, "wall_s": 2.469308431, "added_bytes": 19253649}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.324701449}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 2, "exit": 0, "wall_s": 2.848994982, "added_bytes": 19313422}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 3, "exit": 0, "wall_s": 2.9723909600000002, "added_bytes": 19379620}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 4, "exit": 0, "wall_s": 2.708125324, "added_bytes": 19441543}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 5, "exit": 0, "wall_s": 2.950165633, "added_bytes": 19508747}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "small", "session": 5, "exit": 0, "wall_s": 7.217898544}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 6, "exit": 0, "wall_s": 2.646698476, "added_bytes": 19568694}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 7, "exit": 0, "wall_s": 2.6296044739999997, "added_bytes": 19631085}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 8, "exit": 0, "wall_s": 2.615647601, "added_bytes": 19691332}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 9, "exit": 0, "wall_s": 2.54872589, "added_bytes": 19751668}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 10, "exit": 0, "wall_s": 2.655399523, "added_bytes": 19820843}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 11, "exit": 0, "wall_s": 2.490341574, "added_bytes": 19880928}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 12, "exit": 0, "wall_s": 2.910725342, "added_bytes": 19945318}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 13, "exit": 0, "wall_s": 2.608621598, "added_bytes": 20011387}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 14, "exit": 0, "wall_s": 2.596576152, "added_bytes": 20078012}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 15, "exit": 0, "wall_s": 2.825966251, "added_bytes": 20139257}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 16, "exit": 0, "wall_s": 2.752527882, "added_bytes": 20210755}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 17, "exit": 0, "wall_s": 3.488154902, "added_bytes": 20274292}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 18, "exit": 0, "wall_s": 2.851143655, "added_bytes": 20343205}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 19, "exit": 0, "wall_s": 2.747420636, "added_bytes": 20409175}
+{"kind": "save", "store": "fs", "format": "today", "agent": "small", "session": 20, "exit": 0, "wall_s": 3.444625338, "added_bytes": 20473363}
+{"kind": "restore", "store": "fs", "format": "today", "agent": "small", "session": 20, "exit": 0, "wall_s": 8.712955332}
+{"kind": "check_read", "store": "fs", "format": "today", "agent": "small", "session": 20, "exit": 0, "wall_s": 3.687616437}
+{"kind": "prune", "store": "fs", "format": "today", "agent": "small", "session": 20, "exit": 0, "wall_s": 0.072207404}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 0, "exit": 0, "wall_s": 3.056177604, "added_bytes": 19202883}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "small", "session": 0, "exit": 0, "wall_s": 7.718269176}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 1, "exit": 0, "wall_s": 8.725289353, "added_bytes": 19260235}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.844772309}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 2, "exit": 0, "wall_s": 2.944714421, "added_bytes": 19320110}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 3, "exit": 0, "wall_s": 2.866766376, "added_bytes": 19386722}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 4, "exit": 0, "wall_s": 3.024363182, "added_bytes": 19448551}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 5, "exit": 0, "wall_s": 2.790746924, "added_bytes": 19516426}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "small", "session": 5, "exit": 0, "wall_s": 7.899187939}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 6, "exit": 0, "wall_s": 4.069305183, "added_bytes": 19573711}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 7, "exit": 0, "wall_s": 2.674157888, "added_bytes": 19636411}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 8, "exit": 0, "wall_s": 2.957320799, "added_bytes": 19697178}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 9, "exit": 0, "wall_s": 2.952751369, "added_bytes": 19756748}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 10, "exit": 0, "wall_s": 3.103548604, "added_bytes": 19823869}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 11, "exit": 0, "wall_s": 2.90373029, "added_bytes": 19886138}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 12, "exit": 0, "wall_s": 3.031421707, "added_bytes": 19948639}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 13, "exit": 0, "wall_s": 2.70779225, "added_bytes": 20013291}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 14, "exit": 0, "wall_s": 2.919601863, "added_bytes": 20079514}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 15, "exit": 0, "wall_s": 3.084600171, "added_bytes": 20142469}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 16, "exit": 0, "wall_s": 3.608698558, "added_bytes": 20213010}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 17, "exit": 0, "wall_s": 3.056129692, "added_bytes": 20276013}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 18, "exit": 0, "wall_s": 3.011607362, "added_bytes": 20345594}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 19, "exit": 0, "wall_s": 3.205302503, "added_bytes": 20410691}
+{"kind": "save", "store": "fs", "format": "age", "agent": "small", "session": 20, "exit": 0, "wall_s": 2.995245045, "added_bytes": 20474555}
+{"kind": "restore", "store": "fs", "format": "age", "agent": "small", "session": 20, "exit": 0, "wall_s": 11.411422691}
+{"kind": "check_read", "store": "fs", "format": "age", "agent": "small", "session": 20, "exit": 0, "wall_s": 4.018801613}
+{"kind": "prune", "store": "fs", "format": "age", "agent": "small", "session": 20, "exit": 0, "wall_s": 0.068126388}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 0, "exit": 0, "wall_s": 20.605716986, "added_bytes": 39870726}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "small", "session": 0, "exit": 0, "wall_s": 7.089364994}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 1, "exit": 0, "wall_s": 3.845915177, "added_bytes": 1862489}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.660088125}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 2, "exit": 0, "wall_s": 3.663224666, "added_bytes": 1892674}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 3, "exit": 0, "wall_s": 3.580274397, "added_bytes": 1888758}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 4, "exit": 0, "wall_s": 3.770102121, "added_bytes": 1861147}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 5, "exit": 0, "wall_s": 3.742257775, "added_bytes": 1850047}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "small", "session": 5, "exit": 0, "wall_s": 8.036422711}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 6, "exit": 0, "wall_s": 3.641193597, "added_bytes": 1876942}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 7, "exit": 0, "wall_s": 3.779807316, "added_bytes": 1900717}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 8, "exit": 0, "wall_s": 3.694758502, "added_bytes": 1921631}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 9, "exit": 0, "wall_s": 4.24001498, "added_bytes": 1873037}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 10, "exit": 0, "wall_s": 5.155184538, "added_bytes": 1924511}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 11, "exit": 0, "wall_s": 4.33647486, "added_bytes": 1869388}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 12, "exit": 0, "wall_s": 3.998236297, "added_bytes": 1898897}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 13, "exit": 0, "wall_s": 3.7025219959999998, "added_bytes": 1895195}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 14, "exit": 0, "wall_s": 4.550680534, "added_bytes": 1864346}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 15, "exit": 0, "wall_s": 4.447190518, "added_bytes": 1866523}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 16, "exit": 0, "wall_s": 4.979671054, "added_bytes": 1914528}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 17, "exit": 0, "wall_s": 4.652355544, "added_bytes": 1890425}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 18, "exit": 0, "wall_s": 4.700705612, "added_bytes": 1876922}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 19, "exit": 0, "wall_s": 4.122334576, "added_bytes": 1916190}
+{"kind": "save", "store": "fs", "format": "rustic", "agent": "small", "session": 20, "exit": 0, "wall_s": 4.564660611, "added_bytes": 1876656}
+{"kind": "restore", "store": "fs", "format": "rustic", "agent": "small", "session": 20, "exit": 0, "wall_s": 8.687796317}
+{"kind": "check_read", "store": "fs", "format": "rustic", "agent": "small", "session": 20, "exit": 0, "wall_s": 6.897263758}
+{"kind": "prune", "store": "fs", "format": "rustic", "agent": "small", "session": 20, "exit": 0, "wall_s": 2.626779286}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 7.658922233, "added_bytes": 124667762, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 4.842216924, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "today", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.794446907, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 7.510230708, "added_bytes": 124766036, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 4.491846189, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "today", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.839996169, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 2, "exit": 0, "wall_s": 8.189648533, "added_bytes": 124916402, "puts": 3}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 3, "exit": 0, "wall_s": 7.320628787, "added_bytes": 124587230, "puts": 3}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 4, "exit": 0, "wall_s": 7.766648676, "added_bytes": 124440418, "puts": 3}
+{"kind": "save", "store": "s3", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 7.635459502, "added_bytes": 124439498, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 4.498713401, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "today", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.760568997, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 8.009311615, "added_bytes": 124661390, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 4.385905409, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "age", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.832519589, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 9.56126981, "added_bytes": 124759265, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 4.946388092, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "age", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.012717188, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 2, "exit": 0, "wall_s": 8.647840123, "added_bytes": 124907788, "puts": 3}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 3, "exit": 0, "wall_s": 8.263177172, "added_bytes": 124579452, "puts": 3}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 4, "exit": 0, "wall_s": 8.09658303, "added_bytes": 124434677, "puts": 3}
+{"kind": "save", "store": "s3", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 8.334314736, "added_bytes": 124432474, "puts": 3}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 4.522213481, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "age", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.930776639, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 6.09813559, "added_bytes": 144597247, "puts": 273}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 1.753666789, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "rustic", "agent": "rust", "session": 0, "exit": 0, "wall_s": 0.770577473, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.162064596, "added_bytes": 17899635, "puts": 8}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 1.303063747, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "rustic", "agent": "rust", "session": 1, "exit": 0, "wall_s": 0.6857355, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 2, "exit": 0, "wall_s": 1.129084574, "added_bytes": 19070057, "puts": 8}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 3, "exit": 0, "wall_s": 1.076998484, "added_bytes": 19001591, "puts": 8}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 4, "exit": 0, "wall_s": 1.151763178, "added_bytes": 19033625, "puts": 8}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.122708723, "added_bytes": 19476345, "puts": 8}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 1.540708105, "puts": 0}
+{"kind": "restore_one", "store": "s3", "format": "rustic", "agent": "rust", "session": 5, "exit": 0, "wall_s": 0.729297366, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 0, "exit": 0, "wall_s": 6.19720258, "added_bytes": 55800031, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "node", "session": 0, "exit": 0, "wall_s": 7.0703800470000004, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 1, "exit": 0, "wall_s": 11.957170813, "added_bytes": 55800918, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "node", "session": 1, "exit": 0, "wall_s": 7.418052693, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 2, "exit": 0, "wall_s": 5.675976899, "added_bytes": 55801824, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 3, "exit": 0, "wall_s": 5.740963938, "added_bytes": 55802628, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 4, "exit": 0, "wall_s": 5.9043558, "added_bytes": 55803542, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "node", "session": 5, "exit": 0, "wall_s": 5.655878605, "added_bytes": 55861469, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "node", "session": 5, "exit": 0, "wall_s": 6.443796642, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 0, "exit": 0, "wall_s": 5.930447658, "added_bytes": 55797641, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "node", "session": 0, "exit": 0, "wall_s": 6.863538668, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 1, "exit": 0, "wall_s": 5.8414265279999995, "added_bytes": 55798551, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "node", "session": 1, "exit": 0, "wall_s": 7.216163915, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 2, "exit": 0, "wall_s": 5.824606081, "added_bytes": 55799383, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 3, "exit": 0, "wall_s": 5.702064043, "added_bytes": 55800358, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 4, "exit": 0, "wall_s": 5.991187583, "added_bytes": 55800907, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "node", "session": 5, "exit": 0, "wall_s": 5.574118731, "added_bytes": 55860421, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "node", "session": 5, "exit": 0, "wall_s": 6.768796776, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 0, "exit": 0, "wall_s": 13.388725933, "added_bytes": 64254095, "puts": 268}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "node", "session": 0, "exit": 0, "wall_s": 5.012817506, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 1, "exit": 0, "wall_s": 2.213755929, "added_bytes": 27697, "puts": 4}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "node", "session": 1, "exit": 0, "wall_s": 4.684796035, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 2, "exit": 0, "wall_s": 2.162503418, "added_bytes": 30167, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 3, "exit": 0, "wall_s": 2.006240393, "added_bytes": 31700, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 4, "exit": 0, "wall_s": 2.040298005, "added_bytes": 32956, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "node", "session": 5, "exit": 0, "wall_s": 2.139293474, "added_bytes": 334205, "puts": 4}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "node", "session": 5, "exit": 0, "wall_s": 4.7192540229999995, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 0, "exit": 0, "wall_s": 3.583039078, "added_bytes": 19204149, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "small", "session": 0, "exit": 0, "wall_s": 7.65795917, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 1, "exit": 0, "wall_s": 10.328598541, "added_bytes": 19261694, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.168525559, "puts": 0}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 2, "exit": 0, "wall_s": 2.9168676749999998, "added_bytes": 19319336, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 3, "exit": 0, "wall_s": 3.161337211, "added_bytes": 19386778, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 4, "exit": 0, "wall_s": 2.9470312, "added_bytes": 19447643, "puts": 2}
+{"kind": "save", "store": "s3", "format": "today", "agent": "small", "session": 5, "exit": 0, "wall_s": 2.981122262, "added_bytes": 19517505, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "today", "agent": "small", "session": 5, "exit": 0, "wall_s": 6.815286199, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 0, "exit": 0, "wall_s": 3.4060206109999998, "added_bytes": 19200110, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "small", "session": 0, "exit": 0, "wall_s": 8.187834095, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 1, "exit": 0, "wall_s": 3.026488896, "added_bytes": 19257329, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.115167376, "puts": 0}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 2, "exit": 0, "wall_s": 2.973070588, "added_bytes": 19315481, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 3, "exit": 0, "wall_s": 2.792786692, "added_bytes": 19381989, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 4, "exit": 0, "wall_s": 2.954360856, "added_bytes": 19444271, "puts": 2}
+{"kind": "save", "store": "s3", "format": "age", "agent": "small", "session": 5, "exit": 0, "wall_s": 2.822676664, "added_bytes": 19511288, "puts": 2}
+{"kind": "restore", "store": "s3", "format": "age", "agent": "small", "session": 5, "exit": 0, "wall_s": 7.086181362, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 0, "exit": 0, "wall_s": 12.427710267, "added_bytes": 39874307, "puts": 272}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "small", "session": 0, "exit": 0, "wall_s": 7.4860056870000005, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 1, "exit": 0, "wall_s": 3.233246542, "added_bytes": 1863141, "puts": 4}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "small", "session": 1, "exit": 0, "wall_s": 7.306061136, "puts": 0}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 2, "exit": 0, "wall_s": 3.226529403, "added_bytes": 1893255, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 3, "exit": 0, "wall_s": 3.588867788, "added_bytes": 1889981, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 4, "exit": 0, "wall_s": 3.414663893, "added_bytes": 1861929, "puts": 4}
+{"kind": "save", "store": "s3", "format": "rustic", "agent": "small", "session": 5, "exit": 0, "wall_s": 3.403293058, "added_bytes": 1851137, "puts": 4}
+{"kind": "restore", "store": "s3", "format": "rustic", "agent": "small", "session": 5, "exit": 0, "wall_s": 7.6319263710000005, "puts": 0}
