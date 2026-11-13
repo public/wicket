@@ -1288,6 +1288,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // one's client state; otherwise `initialize`, with the task (or a wake's message) queued as the
     // first prompt.
     let acp_state = dir.join("ctl/acp.json");
+    let mut acp_audits: u32 = 0;
     let mut acp: Option<wicket_agent::acp::AcpClient> = None;
     if let Some(cfg) = acp_cfg {
         if record.is_some() {
@@ -1428,6 +1429,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         }
                     } else if let Some(c) = acp.as_mut() {
                         let st = c.on_line(&l);
+                        // What the agent asked and what wicket answered, audited up to a cap per run:
+                        // an agent can't flood the ledger with prompts or refused calls.
+                        let mut audit = |kind: &str, body: serde_json::Value| {
+                            acp_audits += 1;
+                            if acp_audits <= ACP_AUDIT_CAP {
+                                if let Ok(lg) = ledger.lock() {
+                                    let _ = lg.audit(&m.tenant, Some(&run), kind, &body);
+                                }
+                            } else if acp_audits == ACP_AUDIT_CAP + 1 {
+                                println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+                            }
+                        };
                         if let Some(si) = stdin.as_mut() {
                             use tokio::io::AsyncWriteExt;
                             for w in &st.write {
@@ -1449,15 +1462,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     }
                                 }
                                 E::Permission { tool, kind, answer, why } => {
-                                    if let Ok(lg) = ledger.lock() {
-                                        let _ = lg.audit(&m.tenant, Some(&run), "run.agent_prompt", &serde_json::json!({ "tool": tool, "kind": kind, "answer": answer, "why": why }));
-                                    }
+                                    audit("run.agent_prompt", serde_json::json!({ "tool": tool, "kind": kind, "answer": answer, "why": why }))
                                 }
-                                E::Refused { method } => {
-                                    if let Ok(lg) = ledger.lock() {
-                                        let _ = lg.audit(&m.tenant, Some(&run), "run.agent_call_refused", &serde_json::json!({ "method": method }));
-                                    }
-                                }
+                                E::Refused { method } => audit("run.agent_call_refused", serde_json::json!({ "method": method })),
                                 E::TurnDone { .. } if !c.busy() => {
                                     turn_running = false;
                                     last_result = std::time::Instant::now();
@@ -2088,6 +2095,9 @@ fn write_secret(p: &Path, body: &str) -> Result<()> {
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
 }
+
+/// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
+const ACP_AUDIT_CAP: u32 = 1000;
 
 /// What to write to an agent's stdin for a new user turn: a stream-json user message, or for an ACP
 /// agent the `session/prompt` (nothing yet if a turn is running: it is queued until that ends).
