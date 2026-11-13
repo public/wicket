@@ -28,6 +28,13 @@
     <textarea id="runform-text"></textarea>
     <div class="buttons"><button type="submit" id="runform-go"></button><button type="button" id="runform-cancel">Cancel</button></div>
   </form>
+  <h2>Manifests</h2>
+  <div class="card" id="manifests"></div>
+  <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->
+  <div class="card" id="mfedit" hidden>
+    <div class="buttons"><span id="mfedit-title" class="mono"></span><button type="button" id="mfedit-close">Close</button></div>
+    <div id="mfedit-body"></div>
+  </div>
   <h2>Start a run</h2>
   <div class="card" id="start"></div>
   <h2>Recent decisions</h2>

@@ -75,3 +75,9 @@ textarea { min-height:76px; resize:vertical; }
 #confirm-what { font:600 16px/1.45 var(--sans); margin-top:8px; word-break:break-word; }
 #confirm .buttons { margin-top:16px; }
 #confirm-go { flex:1 1 auto; }
+
+/* The manifest viewer and editor (#172). */
+pre.src { font:12px/1.5 var(--mono); white-space:pre-wrap; word-break:break-all; background:color-mix(in srgb, var(--line) 35%, transparent); border-radius:8px; padding:8px 10px; margin:4px 0 10px; max-height:320px; overflow:auto; }
+button.link { background:none; border:none; padding:0 2px; color:var(--accent); font:inherit; text-decoration:underline; cursor:pointer; min-height:0; }
+textarea.yaml { font:13px/1.45 var(--mono); min-height:260px; }
+#mfedit .buttons { justify-content:space-between; align-items:center; margin:0 0 8px; }

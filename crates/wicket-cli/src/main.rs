@@ -1814,6 +1814,7 @@ fn verify_signed_decisions(l: &Ledger) -> Result<(usize, usize)> {
                     && same("run")
                     && run.as_deref() == decided.get("run").and_then(|r| r.as_str())
                     && (kind != "run.console_start" || (same("manifest_sha256") && same("principal") && same("task")))
+                    && (kind != "manifest.saved" || (same("name") && same("sha256") && same("previous_sha256")))
             };
             if !matches {
                 bail!("record does not match the signed {}", if kind == "decision" { "decision" } else { "action" });
