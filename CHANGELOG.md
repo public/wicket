@@ -4,6 +4,17 @@ User-facing changes, grouped by area. Numbers link to the pull requests.
 
 ## 0.0.2 (unreleased)
 
+### DNS
+
+- In `escalate` zones, a request to a host no rule names whose registered domain doesn't exist gets
+  "unknown host" instead of becoming a pending request. Only the registered domain is looked up (public
+  suffix list, compiled in), never the name the agent chose
+  ([#19](https://github.com/public/wicket/issues/19)).
+- Wildcard reach rules: a name under one is resolved only after a request to it is allowed, each rule
+  reaches at most `wildcards.max_names` (32) names per run, and `wildcards: { forbid: true }` keeps
+  them out of a zone. `wicket zone` warns about each one
+  ([#20](https://github.com/public/wicket/issues/20)).
+
 ### Images
 
 - Zones pin their images by digest: `name@sha256:…` in `zone.images`, `agent.image` and

@@ -209,6 +209,11 @@ pub struct ZoneSpec {
     /// should never learn or ask about anything beyond their reach.
     #[serde(default)]
     pub unlisted_hosts: UnlistedHosts,
+    /// Wildcard reach rules (`*.cdn.example`) and the DNS channel they open (#20): every name under one
+    /// is resolved on the host, so a zone may forbid them, and bounds how many distinct names under
+    /// each one a run may reach.
+    #[serde(default)]
+    pub wildcards: WildcardSpec,
     /// Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked
     /// before `reach`.
     #[serde(default)]
@@ -244,6 +249,77 @@ impl ZoneSpec {
         let (dropped, kept) = std::mem::take(&mut self.inject).into_iter().partition(|i| i.optional && !is_set(&i.secret));
         self.inject = kept;
         dropped
+    }
+}
+
+/// What a zone allows of wildcard reach rules (#20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WildcardSpec {
+    /// No reach rule may be a wildcard: every host the zone reaches is named exactly. For sensitive
+    /// zones, where even a narrow DNS channel matters.
+    #[serde(default)]
+    pub forbid: bool,
+    /// How many distinct names under each wildcard reach rule one run may reach; past that, a new
+    /// name is refused (names already reached keep working). At least 1.
+    #[serde(default = "default_wildcard_names")]
+    pub max_names: u32,
+}
+
+/// The default bound on distinct names per wildcard per run: enough for a CDN's or a cloud
+/// provider's handful of hostnames, too few to carry much in the names themselves.
+pub const DEFAULT_WILDCARD_NAMES: u32 = 32;
+
+fn default_wildcard_names() -> u32 {
+    DEFAULT_WILDCARD_NAMES
+}
+
+impl Default for WildcardSpec {
+    fn default() -> Self {
+        WildcardSpec { forbid: false, max_names: DEFAULT_WILDCARD_NAMES }
+    }
+}
+
+impl ZoneSpec {
+    /// The wildcard reach rules' patterns (`*.cdn.example`), each once, in rule order.
+    pub fn wildcard_reach(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for r in &self.reach {
+            if r.host.starts_with("*.") && !out.iter().any(|h| h.eq_ignore_ascii_case(&r.host)) {
+                out.push(&r.host);
+            }
+        }
+        out
+    }
+
+    /// Whether the zone's wildcard settings hold: `max_names` is at least 1, and with `forbid`, no
+    /// reach rule is a wildcard.
+    pub fn check_wildcards(&self) -> Result<(), ManifestError> {
+        if self.wildcards.max_names == 0 {
+            return Err(ManifestError::Invalid("zone.wildcards.max_names must be at least 1".into()));
+        }
+        if self.wildcards.forbid {
+            if let Some(w) = self.wildcard_reach().first() {
+                return Err(ManifestError::Invalid(format!(
+                    "zone.wildcards.forbid: reach rule host {w} is a wildcard; name each host exactly"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The wildcard reach rule `host` is reached through, if no exact reach rule names it: the
+    /// first wildcard pattern that matches. None for a host named exactly, or not reached at all.
+    pub fn wildcard_for(&self, host: &str) -> Option<&str> {
+        if self.reach.iter().any(|r| !r.host.starts_with("*.") && host_matches(&r.host, host)) {
+            return None;
+        }
+        self.reach.iter().find(|r| r.host.starts_with("*.") && host_matches(&r.host, host)).map(|r| r.host.as_str())
+    }
+
+    /// Whether any reach or inject rule names `host` (exactly or by wildcard).
+    pub fn names_host(&self, host: &str) -> bool {
+        self.reach.iter().any(|r| host_matches(&r.host, host)) || self.inject.iter().any(|r| host_matches(&r.host, host))
     }
 }
 
@@ -517,6 +593,7 @@ impl Manifest {
 
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.zone.limits.authority()?;
+        self.zone.check_wildcards()?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
         let own = self.agent.as_ref().and_then(|a| a.image.as_deref()).map(|i| ("agent.image", i));
@@ -777,6 +854,27 @@ mod tests {
         for bad in ["memory: \"0\"", "memory: 0g", "memory: lots", "cpus: 0", "cpus: -1", "cpus: .nan", "pids: 0", "timeout: 0s"] {
             assert!(with(bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    /// #20: a zone may forbid wildcard reach rules; one that does and has one is refused, at load
+    /// and when compiled (a spawned zone is compiled, not loaded from a manifest).
+    #[test]
+    fn a_zone_forbidding_wildcards_refuses_wildcard_reach() {
+        let with = |z: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, {z} }}\n"));
+        let wild = "reach: [{ host: api.example.com }, { host: '*.cdn.example' }]";
+        let e = with(&format!("wildcards: {{ forbid: true }}, {wild}")).unwrap_err().to_string();
+        assert!(e.contains("*.cdn.example is a wildcard"), "{e}");
+        // Forbid rules may still use wildcards: they only narrow.
+        assert!(with("wildcards: { forbid: true }, reach: [{ host: api.example.com }], forbid: [{ host: '*.example.com' }]").is_ok());
+        let m = with(wild).unwrap();
+        assert_eq!(m.zone.wildcards, WildcardSpec::default());
+        assert_eq!(m.zone.wildcard_reach(), ["*.cdn.example"]);
+        assert_eq!(m.zone.wildcard_for("a.b.cdn.example"), Some("*.cdn.example"));
+        assert_eq!(m.zone.wildcard_for("api.example.com"), None);
+        assert!(with("wildcards: { max_names: 0 }").is_err());
+        let mut z = m.zone;
+        z.wildcards.forbid = true;
+        assert!(crate::CompiledZone::new(z).is_err(), "compiled zones are checked too");
     }
 
     const EXAMPLE: &str = r#"

@@ -124,13 +124,13 @@ Returns the new run id.
 | `task` | string | | for agents |
 | `command` | list of strings | | for programs |
 | `image` | string | the caller's | from the caller's image or its zone's `images` |
-| `zone` | object | see below | a [manifest zone](manifest.md#zone): `reach`, `forbid`, `unlisted_hosts`, `inject`, `volumes`, `llm` (`max_requests`, `max_output_tokens`), `limits`, `isolation`, `images`, `accept_from` |
+| `zone` | object | see below | a [manifest zone](manifest.md#zone): `reach`, `forbid`, `unlisted_hosts`, `wildcards`, `inject`, `volumes`, `llm` (`max_requests`, `max_output_tokens`), `limits`, `isolation`, `images`, `accept_from` |
 | `max_children` | integer ≥ 0 | 0 | at most 64; counts against the caller's |
 | `ask_human` | boolean | false | put a zone beyond the caller's to a human |
 | `placement` | `{"lease": "l-…"}` or `{"node": "<name>"}` | where the caller runs | an active lease from `request_capacity`, or the node the caller runs on |
 
-What `zone` leaves out: no reach and no credentials; the caller's limits, isolation and
-`unlisted_hosts`; for an agent, half the model budget the caller has left. The spawned zone is named
+What `zone` leaves out: no reach and no credentials; the caller's limits, isolation,
+`unlisted_hosts` and `wildcards`; for an agent, half the model budget the caller has left. The spawned zone is named
 `<caller's zone>.<name>.<caller's run>`.
 
 ## `request_capacity`
