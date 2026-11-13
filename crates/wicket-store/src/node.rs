@@ -216,6 +216,21 @@ impl Ledger {
     /// on `node` for `tenant`. Returns how many were appended; nothing is appended if any record
     /// doesn't check.
     pub fn append_node_audit(&self, node: &str, tenant: &wicket_core::TenantId, recs: &[AuditRecord]) -> Result<usize> {
+        // One write lock from reading the node's head to the last record: several processes take a
+        // node's shipments (its runs' supervisors, a takeover), and two appending from the same head
+        // would break its chain.
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let r = self.append_node_audit_locked(node, tenant, recs);
+        if own {
+            let _ = self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        }
+        r
+    }
+
+    fn append_node_audit_locked(&self, node: &str, tenant: &wicket_core::TenantId, recs: &[AuditRecord]) -> Result<usize> {
         let refuse = || StoreError::Node(node.into(), "shipped audit records do not continue the node's chain");
         let head = self.node_audit_head(node)?;
         let (mut seq, mut prev) = head.clone().unwrap_or((0, ZERO.to_string()));
