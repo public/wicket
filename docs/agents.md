@@ -154,9 +154,9 @@ phone); `examples/remote-control-box.yaml` is a whole zone for it.
   organization ids Claude Code checks before it starts Remote Control; not the holder's name).
 - **Reach is the authority.** Everything the zone reaches on the provider's host is reached with the
   owner's login, so the example names only what a session needs (registering its environment, its
-  work and worker channel, model calls, the profile) and forbids the rest outright: the account's
-  connectors (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`), token refresh, other sessions, triggers
-  and memory. Anything else becomes a request for a human, as in any zone.
+  work and worker channel, model calls, the profile), forbids the account's connectors
+  (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`) and token refresh outright, and leaves everything
+  else (other sessions, triggers, memory) to a human's decision, as in any zone: deny those.
 - **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the
   workspace is trusted, Remote Control's one-time prompt is answered, wicket's gateway is the only MCP
   server, and the sandbox notice is the user memory. Claude Code asks in the app before it acts

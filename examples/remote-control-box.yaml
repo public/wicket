@@ -18,25 +18,21 @@ zone:
   name: remote-control-box
   isolation: gvisor
   reach:
-    # Model calls.
+    # Model calls; and Remote Control: the session's own environment and its work, the session's
+    # worker channel.
     - { host: api.anthropic.com, methods: [POST], paths: ["/v1/messages", "/v1/messages/count_tokens"] }
-    # Remote Control: the session's own environment and its work, and the session's worker channel.
-    - { host: api.anthropic.com, methods: [GET, POST, PUT], paths: ["/v1/environments/bridge", "/v1/environments/*/work/**", "/v1/environments/bridge/*/offline"] }
-    - { host: api.anthropic.com, methods: [GET, POST, PUT], paths: ["/v1/code/sessions/*/worker", "/v1/code/sessions/*/worker/**"] }
+    - { host: api.anthropic.com, methods: [GET, POST, PUT], paths: ["/v1/environments/bridge", "/v1/environments/bridge/*/offline", "/v1/environments/*/work/**", "/v1/code/sessions/*/worker", "/v1/code/sessions/*/worker/**"] }
     # The account's profile and Claude Code's start-up settings.
     - { host: api.anthropic.com, methods: [GET], paths: ["/api/oauth/profile", "/api/claude_cli/bootstrap"] }
     # Something to try: reads here are allowed; anything else waits for your approval.
     - { host: example.com }
   forbid:
-    # Your claude.ai connectors would hand the box your account-wide tools: never.
+    # Your claude.ai connectors would hand the box your account-wide tools, and refreshing the login
+    # is the host's job (the box has no refresh token to offer): never. Anything else outside reach
+    # (other sessions, triggers, memory) waits for your approval, so deny those.
     - { host: mcp-proxy.anthropic.com }
-    - { host: api.anthropic.com, paths: ["/v1/mcp_servers", "/v1/mcp_servers/**", "/mcp-registry/**"] }
-    # Refreshing the login is the host's job: the box has no refresh token to offer.
-    - { host: console.anthropic.com, paths: ["/v1/oauth/token"] }
-    - { host: api.anthropic.com, paths: ["/v1/oauth/token"] }
+    - { host: api.anthropic.com, paths: ["/v1/mcp_servers/**", "/mcp-registry/**"] }
     - { host: platform.claude.com, paths: ["/v1/oauth/token"] }
-    # Other sessions, triggers and memory of the account.
-    - { host: api.anthropic.com, paths: ["/v1/code/triggers", "/v1/code/triggers/**", "/v1/code/memory/**"] }
   llm:
     secret: claude-login
     max_requests: 3000
