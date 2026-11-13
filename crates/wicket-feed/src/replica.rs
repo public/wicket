@@ -1,4 +1,4 @@
-//! The node side: a verified replica of one node's feed, the fail-narrow [`Mode`], [`Replica::decide`],
+//! The node side: a verified replica of one node's feed, its [`Mode`], [`Replica::decide`],
 //! and persistence of what was verified.
 //!
 //! # Acceptance rules
@@ -14,8 +14,7 @@
 //!   and the same version as the state.
 //! - **Freshness statement**: `issued_at` strictly after the last statement's (`replay`), epoch not
 //!   below the last statement's under the same version (`rollback`), not issued more than
-//!   [`ReplicaConfig::future_tolerance_ms`] in the future, not already expired, TTL and narrow window
-//!   within the certificate's caps (`too_long`). A statement naming an epoch the node already holds
+//!   [`ReplicaConfig::future_tolerance_ms`] in the future, not already expired, TTL within the certificate's cap (`too_long`). A statement naming an epoch the node already holds
 //!   (deltas committed after it was signed arrived first) is accepted only if its head equals the
 //!   node's recorded head at that epoch (a ring of [`crate::HEADS_KEPT`]): a different head is a
 //!   `fork`, an epoch older than the ring a `rollback`.
@@ -23,8 +22,7 @@
 //! # Effective deadlines (clock-skew guard)
 //!
 //! A statement keeps the node fresh until `min(fresh_until, receipt + (fresh_until − issued_at))`,
-//! and narrow until `min(narrow_until, receipt + (narrow_until − issued_at))`, both capped at the
-//! certificate's `not_after`. A node whose clock runs behind the control plane can't stretch
+//! capped at the certificate's `not_after`. A node whose clock runs behind the control plane can't stretch
 //! freshness past the signed TTL as measured on its own clock.
 //!
 //! # Persistence
@@ -42,7 +40,7 @@ use crate::format::{Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, Revok
 use crate::jws::{kid, open, sha, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 use crate::state::{Policy, State};
 use crate::store::{append_line, lines, read_opt, write_atomic};
-use crate::{Refusal, DEFAULT_FUTURE_TOLERANCE_MS, HEADS_KEPT, NARROW_MAX_RISK};
+use crate::{Refusal, DEFAULT_FUTURE_TOLERANCE_MS, HEADS_KEPT};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -55,8 +53,13 @@ use wicket_core::{Op, Verdict, ZoneSpec};
 pub enum Mode {
     /// A live statement vouches for the state held: decide normally.
     Fresh,
-    /// Stale, but the last statement that vouched for this state allows plain reads still.
-    Narrow,
+    /// No live statement (the control host is unreachable, #153): the node decides from the
+    /// tokens and grants it holds, each until its own expiry. Nothing new can be granted; asks are
+    /// queued by the caller.
+    Offline,
+    /// A live statement names an epoch the node doesn't hold yet: the missing deltas may hold a
+    /// revocation, so nothing is allowed until they arrive (catch-up takes milliseconds).
+    Lagging,
     /// Nothing vouches for the state: refuse everything.
     Closed,
 }
@@ -147,14 +150,12 @@ struct Statement {
     jws: String,
     received_at: i64,
     fresh_until: i64,
-    narrow_until: i64,
 }
 
 impl Statement {
     fn new(f: Fresh, jws: String, received_at: i64, cert: &KeyCert) -> Statement {
         let fresh_until = f.fresh_until.min(received_at.saturating_add(f.fresh_until.saturating_sub(f.issued_at))).min(cert.not_after);
-        let narrow_until = f.narrow_until.min(received_at.saturating_add(f.narrow_until.saturating_sub(f.issued_at))).min(cert.not_after);
-        Statement { f, jws, received_at, fresh_until, narrow_until }
+        Statement { f, jws, received_at, fresh_until }
     }
 }
 
@@ -393,9 +394,9 @@ impl<P: Policy> Replica<P> {
         self.fresh.as_ref().map(|s| &s.f)
     }
 
-    /// Effective (fresh_until, narrow_until) of the statement that vouches for the state held.
-    pub fn deadlines(&self) -> Option<(i64, i64)> {
-        self.vouched.as_ref().map(|s| (s.fresh_until, s.narrow_until))
+    /// Effective `fresh_until` of the statement that vouches for the state held.
+    pub fn fresh_until(&self) -> Option<i64> {
+        self.vouched.as_ref().map(|s| s.fresh_until)
     }
 
     /// What to tell the publisher when connecting.
@@ -410,13 +411,11 @@ impl<P: Policy> Replica<P> {
         if now >= cert.c.not_after || st.version != cert.c.version {
             return Mode::Closed;
         }
-        if let Some(f) = &self.fresh {
-            if f.f.version == st.version && st.epoch >= f.f.epoch && now < f.fresh_until {
-                return Mode::Fresh;
-            }
-        }
-        match &self.vouched {
-            Some(v) if v.f.version == st.version && now < v.narrow_until => Mode::Narrow,
+        match &self.fresh {
+            Some(f) if f.f.version == st.version && now < f.fresh_until && st.epoch >= f.f.epoch => Mode::Fresh,
+            Some(f) if f.f.version == st.version && now < f.fresh_until => Mode::Lagging,
+            // A statement once vouched for this state (a snapshot alone, maybe replayed, never does).
+            _ if self.vouched.as_ref().is_some_and(|v| v.f.version == st.version && v.f.epoch <= st.epoch) => Mode::Offline,
             _ => Mode::Closed,
         }
     }
@@ -566,15 +565,11 @@ impl<P: Policy> Replica<P> {
     fn check_caps(&self, f: &Fresh) -> Result<(), Refusal> {
         let cert = self.cert_ref();
         let ttl = f.fresh_until.checked_sub(f.issued_at).ok_or(Refusal::Malformed("ttl".into()))?;
-        let narrow = f.narrow_until.checked_sub(f.fresh_until).ok_or(Refusal::Malformed("narrow window".into()))?;
-        if ttl <= 0 || narrow < 0 {
+        if ttl <= 0 {
             return Err(Refusal::Malformed("deadlines out of order".into()));
         }
         if ttl > cert.max_ttl_ms {
             return Err(Refusal::TooLong(format!("ttl {ttl} ms > certified {}", cert.max_ttl_ms)));
-        }
-        if narrow > cert.max_narrow_ms {
-            return Err(Refusal::TooLong(format!("narrow window {narrow} ms > certified {}", cert.max_narrow_ms)));
         }
         Ok(())
     }
@@ -712,8 +707,12 @@ impl<P: Policy> Replica<P> {
     /// The checks every decision starts with: the mode (closed refuses), and run revocation.
     pub(crate) fn gate(&self, op: &Op, now: i64) -> Result<(Mode, &State<P>), Decision> {
         let mode = self.mode(now);
-        if mode == Mode::Closed {
-            return Err(Decision::Refused { mode, why: "closed: no state vouched for by a live freshness statement".into() });
+        match mode {
+            Mode::Closed => {
+                return Err(Decision::Refused { mode, why: "closed: no verified state, or the feed key's certificate has expired".into() })
+            }
+            Mode::Lagging => return Err(Decision::Refused { mode, why: "catching up with the feed".into() }),
+            Mode::Fresh | Mode::Offline => {}
         }
         let st = self.state.as_ref().expect("not closed");
         if st.is_revoked(RevokeKind::Run, &op.run.0) {
@@ -755,9 +754,7 @@ impl Replica<ZoneSpec> {
         let Some(zone) = st.zones.get(&op.zone) else { return Decision::Forbidden(format!("unknown zone {}", op.zone)) };
         match zone.evaluate(op) {
             Verdict::Forbidden(r) => Decision::Forbidden(r),
-            Verdict::AllowByReach(i) if mode == Mode::Fresh || op.risk <= NARROW_MAX_RISK => Decision::Allow(Allowed::Reach(i)),
-            Verdict::AllowByReach(_) => refused(format!("narrow: {:?} needs fresh policy", op.risk)),
-            Verdict::NeedsGrant(r) if mode != Mode::Fresh => refused(format!("narrow: grants are not honoured while stale ({r})")),
+            Verdict::AllowByReach(i) => Decision::Allow(Allowed::Reach(i)),
             Verdict::NeedsGrant(r) => {
                 let digest = op.digest();
                 let found = st

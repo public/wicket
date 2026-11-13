@@ -13,17 +13,22 @@
 //! - **Load once, decide many** ([`load`], [`Loaded::decide`]): signatures, revocation ids of every
 //!   block, a strict structural check (`structure`), then the fork's prepared + compiled evaluator
 //!   with a deterministic step budget ([`STEP_BUDGET`]).
+//! - **Cost at mint** (`cost`, #183): [`mint`] and [`Token::attenuate`] refuse a token whose
+//!   costliest host could exceed the step budget in the generic engine (the compiled evaluator's
+//!   fallback), naming the host and its pattern bytes, instead of failing closed per request there.
 //!
 //! Everything is behind wicket's own types ([`Ceiling`], [`Grant`], [`Request`], [`Decision`],
 //! [`Token`]), so the format can change without touching callers. Block layout and encoding rules
 //! are in `generator`; the structural rules in `structure`; how denials are classified in `decide`.
 
+pub mod cost;
 pub mod decide;
 pub mod generator;
 pub mod payload;
 pub mod structure;
 pub mod token;
 
+pub use cost::Estimate;
 pub use decide::{limits, load, load_with, Decision, Loaded, MEASURED_MAX_STEPS, STEP_BUDGET};
 pub use payload::{
     isolation_level, risk_level, Action, Ceiling, Forbid, Grant, Inject, LlmBudget, OpKind, PublicKey, Reach, Request, SpawnLimits,
@@ -52,6 +57,10 @@ pub enum AuthzError {
     /// The token isn't shaped like what wicket generates.
     #[error("structure: {0}")]
     Structure(String),
+    /// A token `mint` or `attenuate` would make, refused because a request to one of its hosts
+    /// could cost more than [`STEP_BUDGET`] in the generic engine (`cost`, #183).
+    #[error("cost: {0}")]
+    Cost(String),
 }
 
 /// The revocation ids of a token's blocks, in block order (without loading it for decisions).

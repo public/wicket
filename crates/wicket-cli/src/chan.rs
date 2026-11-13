@@ -37,6 +37,13 @@
 //! - A message added in version N is sent only on a connection that negotiated N or later, since an
 //!   older peer drops the connection on a message it can't parse.
 //! - Support for version N−1 is removed only after a release that spoke N everywhere.
+//!
+//! Version 3 (#152, #153) adds [`Msg::Lease`] (budget slices), [`Msg::SecretFetch`],
+//! [`Msg::SecretFetched`], [`Msg::SecretRevoke`] (secrets fetched by a node on first use) and
+//! [`Msg::Spent`] (the node's model spend), sent only on connections that negotiated 3; a
+//! version-3 control host no longer sends [`Msg::RunLease`], which a version-3 node accepts and
+//! ignores (a box's authority decides when it stops). With an older peer, a node relays model calls
+//! and forwards injected hosts to the control host, as before.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,9 +53,14 @@ use serde::{Deserialize, Serialize};
 /// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
 ///   (`BoxAuthority::issuer_cert`, #154), which a version-1 node can't read: sent only to nodes
 ///   talking [`ISSUER_CERT`] or later.
-pub const PROTOCOL: u32 = 2;
+/// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
+///   [`Msg::Lease`], [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
+///   [`Msg::Spent`], sent only on connections talking [`NODE_LEASES`] or later.
+pub const PROTOCOL: u32 = 3;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
+/// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
+pub const NODE_LEASES: u32 = 3;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -149,6 +161,12 @@ pub struct BoxStart {
     pub output_cap: u64,
     #[serde(default)]
     pub output_stop: bool,
+    /// Hosts whose credential the control host swaps in for the box (a remote session's login,
+    /// #169): the node forwards them to the run's egress proxy, never terminating them itself, so
+    /// the swap happens where the secret is. Names only. An older node ignores it and terminates
+    /// them, so the box's placeholder never reaches the host and the request fails, closed.
+    #[serde(default)]
+    pub swap_hosts: Vec<String>,
 }
 
 fn default_output_cap() -> u64 {
@@ -182,9 +200,10 @@ pub struct RunState {
     pub stdout_start: u64,
     #[serde(default)]
     pub stderr_start: u64,
-    /// The control host's lease of the run, as the node holds it (Unix ms; 0: none).
+    /// When the box's authority ends (#153), as the node reads it from the box's token (Unix ms;
+    /// 0: the node holds none). The node stops the box then.
     #[serde(default)]
-    pub lease_until: i64,
+    pub authority_until: i64,
 }
 
 /// Control messages.
@@ -235,11 +254,28 @@ pub enum Msg {
     StdinClose {
         run: String,
     },
-    /// The control host's lease of a run it supervises (#151), renewed with every freshness
-    /// statement, until `until` (Unix ms). The node keeps the run's box while it is live.
+    /// Version 1 only: the control host's lease of a run. Accepted from a version-1 control host and
+    /// ignored (#153: the box's authority decides when it stops).
     RunLease {
         run: String,
         until: i64,
+    },
+    /// A run's model budget slice (#152).
+    Lease {
+        run: String,
+        lease: Box<crate::nodesecrets::Lease>,
+    },
+    /// The answer to a [`Msg::SecretFetch`]: the secret, released for that run, or why not.
+    SecretFetched {
+        id: u64,
+        secret: Option<Box<crate::nodesecrets::Fetched>>,
+        error: Option<String>,
+    },
+    /// A secret the node fetched for `run` changed or was removed on the control host: the node
+    /// drops the run's use of it (the next use fetches it again).
+    SecretRevoke {
+        run: String,
+        name: String,
     },
     Kill {
         run: String,
@@ -365,19 +401,38 @@ pub enum Msg {
         run: String,
         code: i32,
         result: Option<String>,
+        /// Why the node stopped it, if it did (#153: its authority expired).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// An enforcement event (`wicket_proxy::Event`), for the operator's console.
     Event {
         run: String,
         event: serde_json::Value,
     },
-    /// Raise (or find) the pending request for this op.
+    /// Raise (or find) the pending request for this op. `queued`: raised while the control host
+    /// was unreachable (#153), with its node-local id and when (Unix ms, node clock).
     Ask {
         id: u64,
         run: String,
         op: Box<wicket_core::Op>,
         why: String,
         who: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued: Option<(String, i64)>,
+    },
+    /// A secret `run` needs now, on its first use on this node (#152): its model credential, or an
+    /// injected secret. Never prefetched.
+    SecretFetch {
+        id: u64,
+        run: String,
+        name: String,
+    },
+    /// What the run's model proxy on the node has counted (#152): the node calls the model itself
+    /// and is the counter of record; the control host takes its totals.
+    Spent {
+        run: String,
+        spent: wicket_proxy::llm::Spent,
     },
     /// Open a tunnel to the run's `target` socket on the control host: `egress`, `llm` or `gateway`.
     TunnelOpen {
@@ -637,7 +692,14 @@ mod tests {
             Frame::Msg(Msg::Challenge {
                 proof: wicket_identity::node::NodeProof { nonce: "B".repeat(43), cert: "a.b.c".into(), proof: "d.e.f".into() },
             }),
-            Frame::Msg(Msg::Ask { id: 7, run: "run_a".into(), op: Box::new(op), why: "out of reach".into(), who: None }),
+            Frame::Msg(Msg::Ask {
+                id: 7,
+                run: "run_a".into(),
+                op: Box::new(op),
+                why: "out of reach".into(),
+                who: None,
+                queued: Some(("q-1".into(), 5)),
+            }),
             Frame::Msg(Msg::Welcome {
                 node: "n1".into(),
                 build: "x".into(),
@@ -652,7 +714,7 @@ mod tests {
                     exited: Some((0, None)),
                     stdout_start: 2,
                     stderr_start: 0,
-                    lease_until: 1,
+                    authority_until: 1,
                 }],
                 capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
             }),

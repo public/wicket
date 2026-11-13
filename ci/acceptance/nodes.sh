@@ -31,7 +31,7 @@ node_local_setup() {
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >"$work/node-serve.log" 2>&1 &
   node_serve_pid=$!
   pids+=("$node_serve_pid")
-  wait_for 20 '[ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ]'
+  wait_for 90 '[ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ]'
   cat >"$WICKET_HOME/placement.yaml" <<EOF
 owner: acc.wicket.test
 backend: static
@@ -161,7 +161,7 @@ multihost() {
   if [ "${ACC_NODE_E2E:-1}" = 1 ] && [ -n "${node_name:-}" ]; then
     log "node e2e flow on $node_name"
     if TMPDIR=$work HOME=$HOMEW WICKET="$W" IMAGE="$IMAGE_TAG" WICKET_E2E_SSH_KEY="${ACC_VULTR_SSH_KEY:-}" \
-      timeout 600 ci/node-e2e.sh "$node_name" >"$work/node-e2e.log" 2>&1; then e2e=0; else e2e=$?; fi
+      NODE_LOG=$( [ "$nodes" = local ] && echo "$work/node-serve.log" ) timeout 600 ci/node-e2e.sh "$node_name" >"$work/node-e2e.log" 2>&1; then e2e=0; else e2e=$?; fi
     grep -E '^(ok|FAIL) ' "$work/node-e2e.log" | sed 's/^/   node-e2e: /' || true
     if [ "$e2e" != 0 ]; then tail -n 25 "$work/node-e2e.log" | sed 's/^/   node-e2e log: /'; fi
     check "the node e2e flow passed (ci/node-e2e.sh $node_name)" '[ "$e2e" = 0 ]'
@@ -184,4 +184,93 @@ multihost() {
     check "  no box remains on the node" '[ -z "$(for r in $(all_descendants); do box_of "$r"; done)" ]'
   fi
   results+=("info lease ${lease:-?} on node ${node_name:-?}: ${billed:-billed ?}")
+}
+
+# A node on its own (#152, #153), --nodes local: an agent's box on acc-n1 calls the model (its node
+# fetches the credential on first use and keeps it in memory only) and its egress every 5 s. Its
+# control channel is cut for 165 s, longer than the old 150 s offline window: the box keeps working,
+# model calls included, and an out-of-reach request is queued on the node. 90 s in, the node's
+# `serve` restarts: its cache is gone, so model calls fail clearly while plain egress goes on; on
+# reconnect the credential is fetched again. Then its secret is removed from the vault: the node
+# drops it within seconds and model calls stop. At its authority's end (5 min from the run's start)
+# the node stops the box.
+offline_flow() {
+  log "a node on its own: a 165 s partition, a serve restart in it, the box stopped at its authority's end"
+  local value=mock-model-credential
+  printf '%s' "$value" | wroot secret set mock-offline --hosts 127.0.0.1 >/dev/null
+  local ws; ws=$(workdir offline)
+  HOME=$HOMEW "$W" run "$(manifest offline)" --workdir "$ws" --image "$IMAGE_TAG" --node "$NODE" >"$work/offline.log" 2>&1 &
+  local run_pid=$!
+  pids+=("$run_pid")
+  wait_for 90 '[ -n "$(run_id_of "$work/offline.log")" ]' || true
+  local r; r=$(run_id_of "$work/offline.log")
+  our_runs+=("$r")
+  local nd=$nodehome/.local/share/wicket-node
+  local olog=$nd/runs/$r/workspace/out/offline.log
+  wait_for 120 'grep -q "model=200" "$olog" 2>/dev/null' || true
+  check "  the box on $NODE calls the model from its node" 'grep -q "model=200" "$olog"'
+  check "  the credential is on no disk: not in the node's data dir, nor under /tmp" \
+    '! grep -rlsF "$value" "$nd" && ! timeout 60 grep -rlsF --exclude-dir="$(basename "$work")" "$value" /tmp'
+  check "  the node fetched it once, for this run, and the control host audited it" \
+    '[ "$(w audit --tail 2000 | grep node.secret_fetch | grep -c "$r")" -ge 1 ] && [ "$(w audit --tail 2000 | grep node.secret_fetched | grep -c "$r")" -eq 1 ]'
+  w node list >"$work/node-list.log" 2>&1 || true
+  check "  wicket node list shows what $NODE holds for it: authority, secrets by name, budget slice" \
+    'grep -A20 "^$NODE " "$work/node-list.log" | grep "$r" | grep "authority until" | grep "secrets mock-offline" | grep -q "budget slice up to" && ! grep -q "$value" "$work/node-list.log"'
+  log "cutting $r's control channel"
+  mv "$nd/ctl/ctl.sock" "$nd/ctl/ctl.sock.off"
+  local t_cut; t_cut=$(date +%s%3N)
+  kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
+  local c; for c in $(pgrep -P "$run_pid"); do kill_tree "$c"; done
+  sleep 90
+  log "restarting acc-n1's serve while cut off: its secret cache goes with it"
+  kill "$node_serve_pid" 2>/dev/null || true
+  wait "$node_serve_pid" 2>/dev/null || true
+  HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >>"$work/node-serve.log" 2>&1 &
+  node_serve_pid=$!
+  pids+=("$node_serve_pid")
+  local t_rs; t_rs=$(date +%s%3N)
+  wait_for 90 '[ -S "$nd/ctl/ctl.sock" ]' || true
+  # The new serve made a fresh socket: keep the box's control host out until the cut ends.
+  mv "$nd/ctl/ctl.sock" "$nd/ctl/ctl.sock.off" 2>/dev/null || true
+  # The wake fence (#153): its box may still run on the cut-off node, so it isn't woken elsewhere.
+  w wake "$r" >"$work/wake-cut.log" 2>&1 || true
+  sleep 75
+  local t_restore; t_restore=$(date +%s%3N)
+  mv "$nd/ctl/ctl.sock.off" "$nd/ctl/ctl.sock"
+  log "restored after $(( (t_restore - t_cut) / 1000 )) s"
+  span() { awk -v a="$1" -v b="$2" -v k="$3" '$1>=a && $1<b && $0 ~ k' "$olog" | wc -l; }
+  echo "   before the restart: $(span "$t_cut" "$t_rs" model=200:) model calls ok, $(span "$t_cut" "$t_rs" ' write=') lines;" \
+    "after it: $(span $((t_rs + 5000)) "$t_restore" model=503:credential) refused for want of the credential, $(span $((t_rs + 5000)) "$t_restore" 'write=') lines"
+  check "  cut off, the box kept calling the model and writing (until the restart)" \
+    '[ "$(span "$t_cut" "$t_rs" model=200:)" -ge 12 ] && [ "$(span "$t_cut" "$t_rs" " write=[0-9]+:- ")" -ge 12 ]'
+  check "  after the restart, still cut off: model calls fail clearly, plain egress goes on past 155 s" \
+    '[ "$(span $((t_rs + 5000)) "$t_restore" model=503:credential)" -ge 5 ] && [ "$(span $((t_cut + 155000)) "$t_restore" " write=[0-9]+:- ")" -ge 1 ]'
+  check "  a wake while cut off is refused: the box may still run there, until its authority ends" \
+    'grep -q "can.t be woken yet" "$work/wake-cut.log" && grep -q "may still be running on node $NODE" "$work/wake-cut.log" && grep -q "can be woken from" "$work/wake-cut.log"'
+  check "  an out-of-reach request was queued on the node while it was cut off" '[ "$(span "$t_cut" "$t_restore" ":queued")" -ge 1 ]'
+  wait_for 40 '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]' || true
+  check "  reconnected, the credential is fetched again and model calls work" '[ "$(span "$t_restore" 99999999999999 model=200:)" -ge 1 ]'
+  check "  and the miss while cut off is in the node's audit, shipped on reconnect" 'w audit --tail 3000 | grep node.secret_unavailable | grep -q "$r"'
+  wait_for 20 '! grep -q "q-" "$nd/asks.json" 2>/dev/null' || true
+  check "  and the queued ask was delivered to the control host" '! grep -q "q-" "$nd/asks.json" && w pending | grep -q "example.com/out-of-reach"'
+  wroot secret rm mock-offline >/dev/null
+  local t_rm; t_rm=$(date +%s%3N)
+  sleep 20
+  check "  a secret removed on the control host is dropped by the node within seconds" \
+    '[ "$(span $((t_rm + 10000)) 99999999999999 model=200:)" -eq 0 ] && [ "$(span $((t_rm + 10000)) 99999999999999 model=)" -ge 1 ]'
+  # Its authority ends 5 min after the run started: its node stops it then.
+  # The node removes the run's directory once the box has ended: keep a copy of its log as it goes.
+  local kept=$work/offline-box.log
+  wait_for 240 'cp "$olog" "$kept" 2>/dev/null; [ -z "$(box_of "$r")" ]' || true
+  local until; until=$(grep -o "$r: its authority expired at [0-9]* ms" "$work/node-serve.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
+  local last; last=$(tail -1 "$kept" 2>/dev/null | awk '{print $1}' || true)
+  echo "   authority ended at ${until:-?} ms; the box's last line $(( (${last:-0} - ${until:-0}) / 1000 )) s from it"
+  check "  its node stopped the box when its authority expired" '[ -n "$until" ] && [ -n "$last" ] && [ -z "$(box_of "$r")" ] && [ "$last" -le $((until + 7000)) ]'
+  check "  the node's audit records it" 'w audit --tail 2000 | grep -q "node.authority_expired"'
+  wait_for 60 '! kill -0 "$run_pid" 2>/dev/null' || true
+  check "  and its run ended" '! kill -0 "$run_pid" 2>/dev/null'
+  # The node reported the box stopped: the fence is down (what wake says next is about the agent).
+  w wake "$r" >"$work/wake-after.log" 2>&1 || true
+  check "  once the node reported the box stopped, a wake is no longer fenced" '! grep -q "can.t be woken yet" "$work/wake-after.log" && w audit --tail 3000 | grep agent.wake_refused | grep -q "$r"'
+  check "  and still nothing of the credential on disk" '! grep -rlsF "$value" "$nd"'
 }

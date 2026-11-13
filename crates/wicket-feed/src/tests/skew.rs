@@ -17,12 +17,11 @@ fn a_node_clock_behind_the_control_plane_cannot_stretch_freshness() {
     let receipt = T0 - 500;
     feed(&mut r, frames, receipt);
     let f = r.last_statement().unwrap().clone();
-    assert_eq!((f.fresh_until, f.narrow_until), (T0 + 1_000 + TTL, T0 + 1_000 + TTL + WINDOW));
-    // Effective deadlines count from receipt, on the node's clock.
-    assert_eq!(r.deadlines().unwrap(), (receipt + TTL, receipt + TTL + WINDOW));
+    assert_eq!(f.fresh_until, T0 + 1_000 + TTL);
+    // The effective deadline counts from receipt, on the node's clock.
+    assert_eq!(r.fresh_until().unwrap(), receipt + TTL);
     assert_eq!(r.mode(receipt + TTL - 1), Mode::Fresh);
-    assert_eq!(r.mode(receipt + TTL), Mode::Narrow, "not at the signed fresh_until, 1.5 s later");
-    assert_eq!(r.mode(receipt + TTL + WINDOW), Mode::Closed);
+    assert_eq!(r.mode(receipt + TTL), Mode::Offline, "not at the signed fresh_until, 1.5 s later");
 }
 
 #[test]
@@ -48,6 +47,6 @@ fn delivery_delay_or_a_node_clock_ahead_keeps_the_signed_deadline() {
     let mut r = cp.replica();
     let frames = cp.p.catch_up(&r.hello(), T0).unwrap();
     feed(&mut r, frames, T0 + 800);
-    assert_eq!(r.deadlines().unwrap(), (T0 + TTL, T0 + TTL + WINDOW));
-    assert_eq!(r.mode(T0 + TTL), Mode::Narrow);
+    assert_eq!(r.fresh_until().unwrap(), T0 + TTL);
+    assert_eq!(r.mode(T0 + TTL), Mode::Offline);
 }

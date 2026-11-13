@@ -21,7 +21,7 @@ arms only within one table, where they were interleaved in the same run.
 | egress CPU per 1,000 kept-alive requests, same host | 162 CPU-ms | 32 CPU-ms |
 | `cargo fetch` of a mid-size project in a gVisor box | 24.3 s, 1,012 audit rows | 15.8 s, 19 audit rows |
 | 10 MB upload through an inspected host (streamed bodies) | 44 ms, whole body buffered, 64 MiB cap | 25 ms, streamed, 4 GiB cap |
-| egress CPU per GB, spliced on a remote node | inspected: 2.47 CPU-s/GB | 0.37 CPU-s/GB, while its feed is fresh |
+| egress CPU per GB, spliced on a remote node | inspected: 2.47 CPU-s/GB | 0.37 CPU-s/GB, while the box's token allows the host |
 
 ## Splice-through for hosts allowed wholesale
 
@@ -89,17 +89,17 @@ zone wicket-src: egress over HTTPS (HTTP/3 is always terminated and inspected)
 - **HTTP/3.** wicket terminates QUIC for every host and decides each request, wholesale or not. A
   client that wants the fast path to a spliced host should use HTTP/2 or HTTP/1.1 over TCP.
 - **Plain HTTP.** It is always inspected.
-- **Remote nodes whose policy isn't fresh.** A node decides from its feed replica, which narrows to
-  plain reads, then to nothing, when the control host has been unreachable past the freshness lease.
-  A hostname can't carry that, so a node splices only while its replica is fresh
-  ([#141](https://github.com/public/wicket/issues/141)). The checks above hold on the node too. In
-  addition, the box's own token must allow the host for every method the proxy forwards, at the
-  root and at a deep path, by its ceiling alone. The node checks the token, not just the zone it was
-  minted from. Only top-level boxes are spliced on a node. A child box's token is narrowed by its
-  ancestors' ceilings, which the node can't read back from the token, so the node always inspects
-  a child box's connections. When the replica leaves `fresh`, the node cuts the connections it
-  spliced at the next 2 s check, and inspects new ones, deciding each request as narrow or closed
-  mode says. Hosts the node forwards to the control host (credentials, the node CA's name
+- **Remote nodes.** A node splices a host while its replica is fresh or offline and the box's token
+  still allows it ([#141](https://github.com/public/wicket/issues/141), #153); a lagging or closed
+  replica, or an expired token, refuses per request, which a hostname can't carry. The checks above hold
+  on the node too. In addition, the box's own token must allow the host for every method the proxy
+  forwards, at the root and at a deep path, by its ceiling alone. The node checks the token, not just the
+  zone it was minted from. Only top-level boxes are spliced on a node. A child box's token is narrowed by
+  its ancestors' ceilings, which the node can't read back from the token, so the node always inspects a
+  child box's connections. When the token stops allowing the host (it expired, or the replica is
+  lagging or closed), the node cuts the connections it spliced at the next 2 s check, and inspects new
+  ones, deciding each request. Hosts the node forwards to the control host (credentials it doesn't
+  hold, the node CA's name
   constraints) are still forwarded, and the control host decides there whether to splice them.
 
 ### Measured: the real proxy, with and without splice-through

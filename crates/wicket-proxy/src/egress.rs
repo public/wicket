@@ -21,7 +21,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use wicket_core::{canonical_path, manifest::host_matches, Op};
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
@@ -202,7 +201,7 @@ impl Egress {
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();
@@ -609,6 +608,15 @@ impl Egress {
                     crate::SANDBOX_FACT
                 ), Some(&rid));
             }
+            Outcome::Queued { id, why } => {
+                let for_line = who.as_ref().map(|(_, l)| format!("; for {l}")).unwrap_or_default();
+                emit("queued", format!("{id}: {why}{for_line}"));
+                let note = self.strike(&op.digest());
+                return problem(403, "queued", "Blocked by wicket sandbox: needs human approval (queued offline)", &format!(
+                    "{why}. wicket's control plane is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
+                    crate::SANDBOX_FACT
+                ), None);
+            }
             Outcome::Unavailable(why) => {
                 emit("unavailable", why.clone());
                 return problem(
@@ -778,7 +786,14 @@ impl Egress {
         let mut injected: Vec<String> = Vec::new();
         for rule in &self.ctx.zone.inject {
             if host_matches(&rule.host, host) {
-                // An optional rule whose secret isn't set is as if it weren't there (#175).
+                // On a node, the secret is fetched from the control host on its first use (#152). A
+                // required rule fails if it can't be had; an optional one falls through to the check below.
+                if let Err(e) = self.ctx.vault.ensure(&rule.secret).await {
+                    if !rule.optional {
+                        return Err(e);
+                    }
+                }
+                // An optional rule whose secret isn't set (after any fetch) is as if it weren't there (#175).
                 if self.unset_optional(rule) {
                     continue;
                 }
@@ -808,6 +823,10 @@ impl Egress {
                         headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {real}"))?);
                         injected.push(real);
                         tracing::debug!(host, swap = %sw.name, "credential swapped");
+                    }
+                    None if self.ctx.swaps.iter().any(|s| s.box_bearers && host_matches(&s.host, host)) && auth.starts_with("Bearer ") => {
+                        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(auth)?);
+                        tracing::debug!(host, "the box's own bearer passed (box_bearers)");
                     }
                     None => tracing::debug!(host, "box-supplied authorization dropped (not a known placeholder)"),
                 }
@@ -934,6 +953,7 @@ mod tests {
         assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
         // A swap from the vault is bound the same way, whatever host the swap names.
         let swap = |host: &str| crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: host.into(),
             placeholder: "ph-123".into(),
@@ -1081,6 +1101,7 @@ mod tests {
     async fn plain_http_to_a_credentialed_host_is_refused() {
         use http_body_util::BodyExt;
         let swap = crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: "api.github.com".into(),
             placeholder: "ph-123".into(),

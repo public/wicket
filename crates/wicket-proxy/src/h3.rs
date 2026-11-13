@@ -174,7 +174,7 @@ impl H3 {
     /// node whose sockets are forwarded over SSH, which carries only streams.
     pub async fn serve_stream(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = tokio::net::UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (s, _) = listener.accept().await?;
             let me = self.clone();
@@ -737,6 +737,7 @@ fn seqpacket_listen(path: &Path) -> Result<AsyncFd<OwnedFd>> {
     let fd = cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) } as isize)?;
     // SAFETY: socket succeeded: a fresh descriptor owned here.
     let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let path = &crate::sockpath::resolve(path)?;
     let (a, len) = sockaddr_un(path)?;
     // SAFETY: `a` is a valid sockaddr_un of `len` bytes.
     cvt(unsafe { libc::bind(fd.as_raw_fd(), &a as *const libc::sockaddr_un as *const libc::sockaddr, len) } as isize)

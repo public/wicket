@@ -301,6 +301,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let vault = Vault::new(Vault::default_dir());
     check_secret_hosts(&m, &vault, wrap.is_some())?;
+    // A remote session (#169): its harness registers with its vendor using the account login.
+    let remote = m.agent.as_ref().is_some_and(|a| a.remote.is_some());
+    if remote {
+        if wrap.is_some() {
+            bail!("agent.remote boots its own session in the box: it isn't wrapped");
+        }
+        let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
+        if vault.hosts(secret).is_empty() {
+            bail!("agent.remote: the login secret {secret:?} is bound to no hosts, so it would be swapped in nowhere");
+        }
+    }
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
     }
@@ -367,7 +378,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
     // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
-    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none();
+    // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent.
+    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code" && a.remote.is_none()) && wrap.is_none();
     if wake.is_some() && !long_lived {
         bail!("only a local claude-code agent can be woken");
     }
@@ -659,7 +671,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // A wrapped Claude Code session: placeholders in the box, real credentials swapped at the proxy.
     let wrapped = match &wrap {
-        None => None,
+        None if !remote => None,
         Some(argv) => {
             if m.agent.as_ref().map(|a| a.kind.as_str()) != Some("claude-code") {
                 bail!("only claude-code agents can be wrapped");
@@ -675,12 +687,35 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let env: Vec<(String, String)> = std::env::vars().collect();
             Some(wicket_agent::claude_code_wrapped_plan(&m, &run, argv, &env, &login_meta).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
+        // A remote session (#169): the adapter's own (it refuses if its harness has none). Only the
+        // login's non-secret fields go in, from the file the zone's secret links to.
+        None => {
+            let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
+            let meta = wicket_agent::remote_login_meta(&m, vault.linked_object(secret).as_ref(), vault.linked_file(secret).as_deref());
+            Some(wicket_agent::remote_plan(&m, &run, &meta).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
     };
     let swaps = match &wrapped {
         None => vec![],
+        // A remote session's login: swapped wherever its secret is bound (the provider's hosts).
+        Some(w) if remote => {
+            let secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_default();
+            vault
+                .hosts(&secret)
+                .into_iter()
+                .map(|host| wicket_proxy::CredentialSwap {
+                    box_bearers: true,
+                    name: "account login".into(),
+                    host,
+                    placeholder: w.login_placeholder.clone(),
+                    real: wicket_proxy::SwapSource::Vault(secret.clone()),
+                })
+                .collect()
+        }
         Some(w) => {
             let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
             let mut v = vec![wicket_proxy::CredentialSwap {
+                box_bearers: false,
                 name: "claude login".into(),
                 host: "api.anthropic.com".into(),
                 placeholder: w.login_placeholder.clone(),
@@ -688,6 +723,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }];
             if let Some(t) = &w.session_token {
                 v.push(wicket_proxy::CredentialSwap {
+                    box_bearers: false,
                     name: "remote-control session".into(),
                     host: "api.anthropic.com".into(),
                     placeholder: w.session_placeholder.clone(),
@@ -765,10 +801,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         (None, None, None) => 0,
     };
+    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
+    // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
+    for s in [&es, &ls, &gs] {
+        wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
+    }
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
     // forwards, the model, the MCP gateway): `ctl/`, not the box's `sock/`, which is the node's.
-    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
     let g_task = tokio::spawn({
         let gs = gs.clone();
         async move { gateway.serve(&gs).await }
@@ -926,6 +966,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 trees.push((format!("volume.{}", v.name), d, vec![]));
             }
         }
+        // The box's authority (#153): the zone's `limits.authority`, left over the run's (or the
+        // agent's) life.
+        let backstop = m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
+            + if long_lived { 120 } else { 0 };
+        // Unset, it outlasts the timeouts by 30 s, so a run that times out ends by its timeout (its
+        // block 0 is minted before its box starts, a few seconds before the node's own clock starts).
+        let authority_secs = match m.zone.limits.authority {
+            None => backstop + 30,
+            Some(_) => m.zone.limits.authority()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs().min(backstop),
+        };
         let start = crate::chan::BoxStart {
             run: run.0.clone(),
             tenant: m.tenant.0.clone(),
@@ -956,6 +1006,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm_prior: llm.spent_total(),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
+            swap_hosts: ctx.swaps.iter().map(|s| s.host.clone()).collect(),
             durable: match long_lived {
                 true => m
                     .zone
@@ -983,6 +1034,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             dir: dir.clone(),
             ledger: ledger.clone(),
             events: ctx.events.clone(),
+            authority_secs,
             start,
             calls: node_calls.clone(),
             trees,
@@ -990,6 +1042,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             attach: record.is_some(),
             resume_from,
             attribute: ctx.attribute.clone(),
+            llm: Some(llm.clone()),
+            vault: ctx.vault.clone(),
+            spent_counted: attach_agent.is_some(),
         })
         .await?;
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
@@ -1166,6 +1221,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let _ = l.set_agent_state(&f.agent, f.generation, state, note);
         }
     };
+    let mut remote_url: Option<String> = None;
     loop {
         tokio::select! {
             ex = child.exited(), if lines.is_none() => {
@@ -1186,7 +1242,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if let Err(e) = transcript_f.line(&l) {
                         tracing::warn!("writing the transcript: {e:#}");
                     }
-                    if is_program {
+                    if remote {
+                        // A remote session's server prints text, not events; its session's address is
+                        // what the owner needs (recorded once, and shown on the console's card).
+                        println!("[remote] {}", wicket_agent::clip(&l, 300));
+                        if remote_url.is_none() {
+                            if let Some(u) = wicket_agent::remote_session_url(&m, &l) {
+                                println!("[wicket] remote session: {u}");
+                                if let Ok(lg) = ledger.lock() {
+                                    let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                }
+                                remote_url = Some(u);
+                            }
+                        }
+                    } else if is_program {
                         shown += l.len() as u64 + 1;
                         if shown <= output_cap {
                             println!("[program] {}", wicket_agent::clip(&l, 300));
