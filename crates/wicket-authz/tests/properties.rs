@@ -416,3 +416,16 @@ fn non_ascii_paths_match_byte_for_byte() {
         assert_eq!(kind_of(&decide_compiled(&l, &r)), kind_of_verdict(&cz.evaluate(&o)), "{p}");
     }
 }
+
+/// #153: a node stops a box when its token expires, so a loaded token says when: the earliest
+/// expiry of its first-party blocks, whichever block sets it. Grants (third-party) don't shorten it.
+#[test]
+fn a_loaded_token_reports_its_earliest_block_expiry() {
+    let keys = Keys::new(3);
+    let mut cs = ceilings(2, &keys);
+    cs[0].not_after = 5_000;
+    cs[1].not_after = 4_000;
+    cs[2].not_after = 4_500;
+    assert_eq!(load_ok(&mint_chain(&cs[..1], &keys), &keys).not_after(), Some(5_000));
+    assert_eq!(load_ok(&mint_chain(&cs, &keys), &keys).not_after(), Some(4_000));
+}

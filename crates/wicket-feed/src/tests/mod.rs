@@ -16,7 +16,6 @@ pub(crate) const T0: i64 = 1_800_000_000_000;
 pub(crate) const NODE: &str = "n1";
 /// A scaled-down TTL and window so the arithmetic in tests is easy to read.
 pub(crate) const TTL: i64 = 3_000;
-pub(crate) const WINDOW: i64 = 6_000;
 
 pub(crate) fn key() -> SigningKey {
     SigningKey::generate(&mut rand_core::OsRng)
@@ -104,11 +103,11 @@ pub(crate) struct Cp {
 }
 
 pub(crate) fn cfg() -> PublisherConfig {
-    PublisherConfig { ttl_ms: TTL, refresh_ms: 500, narrow_ms: WINDOW, retain: 100 }
+    PublisherConfig { ttl_ms: TTL, refresh_ms: 500, retain: 100 }
 }
 
 pub(crate) fn cert(root: &SigningKey, feed: &SigningKey, version: u64, not_after: i64) -> String {
-    sign(root, TYP_KEY, &KeyCert::new(&feed.verifying_key(), version, not_after, 30_000, 300_000))
+    sign(root, TYP_KEY, &KeyCert::new(&feed.verifying_key(), version, not_after, 30_000))
 }
 
 impl Cp {

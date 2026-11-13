@@ -20,6 +20,7 @@ mod node;
 mod nodeauth;
 mod nodecall;
 mod noderun;
+mod nodesecrets;
 mod nodesrv;
 mod place;
 mod program;
@@ -710,6 +711,9 @@ enum SecretCmd {
     },
     /// List secret names and the hosts each may be sent to (never values).
     List,
+    /// Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their
+    /// run's lease next reaches them, within seconds while connected (#152).
+    Rm { name: String },
     /// Bind a secret to the only hosts it may be sent to, replacing its list.
     Hosts {
         name: String,
@@ -1368,6 +1372,13 @@ async fn main() -> Result<()> {
                     }
                     v.set_hosts(&name, &hosts)?;
                     println!("secret {name}: {}", secret_hosts_line(&v, &name));
+                }
+                SecretCmd::Rm { name } => {
+                    if !v.has(&name) {
+                        bail!("no secret {name}");
+                    }
+                    v.remove(&name)?;
+                    println!("secret {name} removed");
                 }
                 SecretCmd::List => {
                     for n in v.list() {

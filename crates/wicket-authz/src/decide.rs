@@ -153,6 +153,12 @@ impl Loaded {
     }
 
     /// Every block's revocation id, in block order.
+    /// When the token stops allowing anything (Unix seconds): the earliest expiry of its first-party
+    /// blocks (block 0 and spawn links), read from the verified token (#153).
+    pub fn not_after(&self) -> Option<u64> {
+        self.vetted.not_after
+    }
+
     pub fn revocation_ids(&self) -> &[Vec<u8>] {
         &self.ids
     }

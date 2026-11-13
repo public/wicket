@@ -289,6 +289,8 @@ pub fn probes(zones: &[&ZoneSpec]) -> (Vec<String>, Vec<String>) {
             "/",
             "/x",
             "/octocat/Hello-World.git/git-receive-pack",
+            "/octocat/Hello-World.git/git-upload-pack",
+            "/octocat/Hello-World/GIT-UPLOAD-PACK",
             "/caf\u{e9}/x",
             "/CAF\u{e9}/X",
             "/repos/acme/scratch/issues",

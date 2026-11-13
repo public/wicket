@@ -31,6 +31,10 @@
 #   - an agent hibernates and is woken: its files and its session survive;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
+#   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
+#     165 s cut of its control channel, its model calls included (the credential sealed to the node),
+#     an out-of-reach request is queued there and raised on reconnect, a secret removed meanwhile is
+#     deleted from the node on reconnect, and the node stops the box when its authority expires;
 #   - a control-host restart (#151): every wicket process of the control host killed hard, the boxes
 #     on this host's own node and (--nodes local) on the other node survive, reconcile adopts their
 #     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
@@ -392,6 +396,9 @@ check "with on_output_full: stop, the box is stopped, saying why, and its run en
 if [ -n "$nodes" ]; then
   multihost
 fi
+if [ "$nodes" = local ]; then
+  offline_flow
+fi
 
 # ---- 5. a control-host restart (#151) ----
 # Every wicket process this test started on the control host is killed hard (the runs' supervisors,
@@ -428,6 +435,10 @@ restart_flow() {
     case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"dev mock-llm"* | *"${nodehome:-/nonexistent}"*) continue ;; esac
     kill -9 "$p" 2>/dev/null && killed=$((killed + 1))
   done
+  # This host's node's `serve` is non-dumpable (#152): its environment can't be read, so it is found
+  # by its pid file.
+  p=$(head -1 "$WICKET_HOME/local-node/serve/serve.pid" 2>/dev/null || true)
+  if [ -n "$p" ] && tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q "node serve"; then kill -9 "$p" 2>/dev/null && killed=$((killed + 1)); fi
   echo "   killed $killed wicket processes"
   sleep 3
   for i in "${!runs[@]}"; do
@@ -454,6 +465,8 @@ restart_flow() {
     tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
     case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"node serve"*) kill -9 "$p" 2>/dev/null ;; esac
   done
+  p=$(head -1 "$WICKET_HOME/local-node/serve/serve.pid" 2>/dev/null || true)
+  if [ -n "$p" ] && tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q "node serve"; then kill -9 "$p" 2>/dev/null || true; fi
   if [ "$nodes" = local ] && [ -n "${node_serve_pid:-}" ]; then
     kill -9 "$node_serve_pid" 2>/dev/null || true
     sleep 1

@@ -71,7 +71,7 @@ pub fn route(cmd: &Cmd) -> Route {
             // Setting a secret changes what the proxies present upstream; linking one makes the
             // wicket user read a file the caller names.
             // and binding one to hosts decides where it may go.
-            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } => Forward(Privileged),
+            SecretCmd::Set { .. } | SecretCmd::Link { .. } | SecretCmd::Hosts { .. } | SecretCmd::Rm { .. } => Forward(Privileged),
         },
         // Reads a directory the caller names, as the wicket user.
         Cmd::Image { .. } => Forward(Privileged),
