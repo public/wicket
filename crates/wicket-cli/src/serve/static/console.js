@@ -59,7 +59,7 @@ function describe(a) {
   }
   if (a.action === "say") return "Send to " + s(a.run) + ": \u201c" + s(a.text).slice(0, 80) + "\u201d";
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
-  if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
+  if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
 
@@ -274,6 +274,8 @@ function renderStart(s) {
     const [root, name] = JSON.parse(sel.value || "[]");
     const m = ms.find((x) => x.root === root && x.name === name);
     hosts.replaceChildren();
+    // The image its box starts from (#171), or why it can't start.
+    if (m && m.valid) hosts.append(m.image ? el("div", "", "image " + strip(m.image)) : el("div", "pend", "image refused: " + strip(m.image_error)));
     for (const h of (m && m.hosts) || []) {
       const d = el("div");
       d.append(el("span", h.mode === "spliced" ? "pend" : "ok", (h.mode === "spliced" ? "spliced" : "inspected").padEnd(10)),

@@ -40,6 +40,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Command line](reference/cli.md): every command and flag (generated from `--help`)
 - [Manifest](reference/manifest.md): every field, its type, default and meaning
 - [MCP tools](reference/mcp-tools.md): the gateway's tools for agents
+- [Policy in Cedar](reference/policy.md): org and zone policy, compiling to tokens, `wicket policy`
 - [Risk classes](reference/risk-classes.md) and the dangerous-pattern list
 - [Configuration files and environment variables](reference/configuration.md)
 - [Files and directories](reference/files.md)

@@ -131,6 +131,151 @@ pub struct Ceiling {
     /// Keys whose grants this link's reach and risk checks accept: the approval service, plus (for
     /// spawn links) the parent box's grantor key. Never the box's own key.
     pub grant_keys: Vec<PublicKey>,
+    /// The installation's org policy (#51), compiled from Cedar at mint: block 0 only (a spawn link
+    /// inherits block 0's checks). None: no org policy, and nothing in the token about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<OrgLayer>,
+}
+
+/// The org layer of a token (#51): what the installation's org policy (Cedar, compiled by
+/// `wicket-policy`) allows and forbids, as a ceiling over every zone. Its checks are hard: no grant
+/// lifts them, and its forbids beat every grant.
+///
+/// For each op kind, `None` means the org policy doesn't constrain it, and `Some(alts)` that one of
+/// the alternatives must hold (`Some(vec![])`: never).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgLayer {
+    /// The policy's version (a hash of its source, schema and compiler): the `policy` fact.
+    pub version: String,
+    pub http: Option<Vec<HttpMatch>>,
+    /// HTTP requests refused whatever any zone or grant says.
+    pub forbid: Vec<HttpMatch>,
+    pub spawn: Option<Vec<SpawnMatch>>,
+    /// Zones whose boxes may message boxes under this policy (one set: alternatives are unioned).
+    pub msg_from: Option<Vec<String>>,
+    /// Injections allowed (`host|header|secret`, as [`Inject::key`]).
+    pub inject: Option<Vec<String>>,
+}
+
+impl HttpMatch {
+    /// Whether this conjunction matches a request, as the token's checks would (the same regexes).
+    pub fn matches(&self, host: &str, method: &str, path: &str, risk: i64) -> bool {
+        let host_ok = self.hosts.iter().all(|h| match h {
+            HostPat::Exact(x) => host == x,
+            HostPat::Suffix(x) => host.ends_with(x.as_str()),
+        }) && !self.not_hosts.iter().any(|x| host == x);
+        let method_ok = self.methods.as_ref().is_none_or(|ms| ms.iter().any(|m| m == method));
+        let path_ok = self.paths.iter().all(|p| {
+            let re = match p {
+                PathPat::Glob(g) => crate::generator::path_regex(g),
+                PathPat::GlobAnyCase(g) => crate::generator::path_regex(&wicket_core::manifest::fold_case_glob(g)),
+                PathPat::Like(l) => Ok(crate::generator::like_regex(l)),
+            };
+            // A pattern that doesn't compile matches nothing: in a forbid that would fail open,
+            // which minting already refuses (the token's own check).
+            re.ok().and_then(|r| regex::Regex::new(&r).ok()).is_some_and(|r| r.is_match(&crate::generator::path_term(path)))
+        });
+        let risk_ok = self.max_risk.is_none_or(|n| risk <= n) && self.min_risk.is_none_or(|n| risk >= n);
+        host_ok && method_ok && path_ok && risk_ok
+    }
+}
+
+impl OrgLayer {
+    /// Why the org layer refuses an HTTP request (None: it allows it): the decision the token's org
+    /// checks make, for the control host's own proxies (hosts it forwards for, and local boxes).
+    pub fn refuses_http(&self, host: &str, method: &str, path: &str, risk: i64) -> Option<String> {
+        if let Some(f) = self.forbid.iter().position(|f| f.matches(host, method, path, risk)) {
+            return Some(format!("the org policy ({}) forbids it (forbid {f})", self.version));
+        }
+        match &self.http {
+            Some(alts) if !alts.iter().any(|a| a.matches(host, method, path, risk)) => {
+                Some(format!("the org policy ({}) doesn't allow it", self.version))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether it allows a spawn.
+    pub fn allows_spawn(&self, image: &str, isolation: i64, mem: i64, cpus_milli: i64, pids: i64, timeout_s: i64) -> bool {
+        self.spawn.as_ref().is_none_or(|alts| {
+            alts.iter().any(|a| {
+                a.images.as_ref().is_none_or(|i| i.iter().any(|x| x == image))
+                    && a.min_isolation.is_none_or(|n| isolation >= n)
+                    && a.max_mem_bytes.is_none_or(|n| mem <= n)
+                    && a.max_cpus_milli.is_none_or(|n| cpus_milli <= n)
+                    && a.max_pids.is_none_or(|n| pids <= n)
+                    && a.max_timeout_s.is_none_or(|n| timeout_s <= n)
+            })
+        })
+    }
+
+    /// Whether boxes under it may receive messages from boxes of `zone`.
+    pub fn allows_message_from(&self, zone: &str) -> bool {
+        self.msg_from.as_ref().is_none_or(|z| z.iter().any(|x| x == zone))
+    }
+
+    /// Whether it allows every request to `host` whatever its method, path and risk: no forbid can
+    /// match the host, and (if HTTP is constrained) some permit names the host with nothing else.
+    /// Only then may a node splice the host through without inspecting it (#141, #51).
+    pub fn allows_host_wholesale(&self, host: &str) -> bool {
+        let names = |m: &HttpMatch| {
+            m.hosts.iter().all(|h| match h {
+                HostPat::Exact(x) => host == x,
+                HostPat::Suffix(x) => host.ends_with(x.as_str()),
+            }) && !m.not_hosts.iter().any(|x| host == x)
+        };
+        let no_forbid = !self.forbid.iter().any(names);
+        let permitted = self.http.as_ref().is_none_or(|alts| {
+            alts.iter().any(|a| names(a) && a.methods.is_none() && a.paths.is_empty() && a.max_risk.is_none() && a.min_risk.is_none())
+        });
+        no_forbid && permitted
+    }
+
+    /// Whether it allows an injection (`host|header|secret`).
+    pub fn allows_inject(&self, key: &str) -> bool {
+        self.inject.as_ref().is_none_or(|k| k.iter().any(|x| x == key))
+    }
+}
+
+/// A host pattern: exact, or every name ending in a suffix (`.example.com`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostPat {
+    Exact(String),
+    Suffix(String),
+}
+
+/// A path pattern: a wicket glob (`*` within a segment, `**` across) or a Cedar `like` pattern
+/// (`*` matches anything, `/` included), as a regex for `$p.matches`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathPat {
+    Glob(String),
+    /// A glob matched ignoring ASCII case, as zone forbids are (`ForbidRule::paths`, #115).
+    GlobAnyCase(String),
+    Like(String),
+}
+
+/// One conjunction over an HTTP request; absent parts match anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpMatch {
+    pub hosts: Vec<HostPat>,
+    /// Hosts it must not be (exact).
+    pub not_hosts: Vec<String>,
+    pub methods: Option<Vec<String>>,
+    pub paths: Vec<PathPat>,
+    /// `risk <= n` / `risk >= n` (wicket-core's risk rank).
+    pub max_risk: Option<i64>,
+    pub min_risk: Option<i64>,
+}
+
+/// One conjunction over a spawn; absent parts match anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnMatch {
+    pub images: Option<Vec<String>>,
+    pub min_isolation: Option<i64>,
+    pub max_mem_bytes: Option<i64>,
+    pub max_cpus_milli: Option<i64>,
+    pub max_pids: Option<i64>,
+    pub max_timeout_s: Option<i64>,
 }
 
 /// wicket's isolation strength as an integer (higher is stronger).
@@ -190,6 +335,7 @@ impl Ceiling {
             },
             accept_from: zone.accept_from.clone(),
             grant_keys,
+            org: None,
         };
         c.validate()?;
         Ok(c)

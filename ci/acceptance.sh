@@ -81,14 +81,15 @@ if [ "$mode" = dev ]; then
   export WICKET_HOME=$work/home HOME_FOR_WICKET=$work/userhome
   [ "$nodes" = vultr ] && HOME_FOR_WICKET=$HOME
   mkdir -p "$WICKET_HOME" "$HOME_FOR_WICKET"
-  export WICKET_BOX_PREFIX=acc
+  # Per run, so two acceptance runs on one machine never take each other's boxes for their own.
+  export WICKET_BOX_PREFIX=acc-$$
   HOMEW=$HOME_FOR_WICKET
   w() { HOME=$HOME_FOR_WICKET "$W" "$@"; }
   wt() { local t=$1; shift; HOME=$HOME_FOR_WICKET timeout "$t" "$W" "$@"; }
   wroot() { w "$@"; }
   data() { cat "$WICKET_HOME/$1"; }
   data_ls() { ls "$WICKET_HOME/$1" 2>/dev/null; }
-  box_filter=(--filter name=^acc-run-)
+  box_filter=(--filter "name=^$WICKET_BOX_PREFIX-run-")
 else
   W=$(command -v wicket) || { echo "--installed: no wicket on PATH" >&2; exit 2; }
   unset WICKET_HOME
@@ -491,6 +492,40 @@ restart_flow() {
   check "  then a dry run has nothing to change" 'grep -q "^reconcile: 0 change(s)" "$work/rec-restart2.log"'
 }
 if [ "$mode" = dev ]; then restart_flow; else skip "a control-host restart" "dev mode only (installed: wicketd's processes)"; fi
+
+# ---- 3c. an org policy in Cedar (#51) ----
+# The installation's org policy forbids one path the zone allows: the box's token, compiled at mint,
+# refuses it at the edge. A new version revokes the runs minted under the old one. Development mode
+# only (installed, the wicket user would read the policy file from the test's private directory).
+if [ "$mode" = dev ]; then
+  log "an org policy in Cedar"
+  cat >"$work/org.cedar" <<'CEDAR'
+permit(principal, action, resource);
+forbid(principal, action in [Action::"GET"], resource) when { resource.host == "example.com" && resource.path_matches.contains("/acc-org-no") };
+CEDAR
+  w policy check "$work/org.cedar" >"$work/policy-check.log" 2>&1 || cat "$work/policy-check.log"
+  wroot policy apply "$work/org.cedar" >"$work/policy-apply.log" 2>&1 || cat "$work/policy-apply.log"
+  v1=$(sed -n 's/^org policy \([0-9a-f]*\) applied.*/\1/p' "$work/policy-apply.log")
+  check "wicket policy apply installs the org policy" '[ -n "$v1" ] && w policy show | grep -q "org policy $v1"'
+  HOME=$HOMEW "$W" run "$(manifest org)" --image "$IMAGE_TAG" >"$work/org.log" 2>&1 &
+  org_pid=$!
+  pids+=("$org_pid")
+  wait_for 90 'grep -q acc-org-done "$work/org.log" 2>/dev/null' || true
+  org_run=$(run_id_of "$work/org.log")
+  our_runs+=("$org_run")
+  grep -E "acc-org-(ok|no)=" "$work/org.log" || true
+  check "  a path the org policy forbids is refused at the edge, the other one isn't" \
+    'grep -q "acc-org-no=403" "$work/org.log" && grep -E -q "acc-org-ok=[0-9]+" "$work/org.log" && ! grep -q "acc-org-ok=403" "$work/org.log"'
+  check "  the run is recorded under that version" 'w policy show | grep -q "0 minted under another version"'
+  printf '%s\nforbid(principal, action in [Action::"GET"], resource) when { resource.host == "example.com" && resource.path_matches.contains("/acc-org-other") };\n' "$(cat "$work/org.cedar")" >"$work/org2.cedar"
+  wroot policy apply "$work/org2.cedar" >"$work/policy-apply2.log" 2>&1 || cat "$work/policy-apply2.log"
+  cat "$work/policy-apply2.log"
+  check "  a new version revokes the runs minted under the old one" 'grep -q "^revoked $org_run" "$work/policy-apply2.log"'
+  wait_for 60 '[ -z "$(box_of "$org_run")" ]' || true
+  check "  and their boxes stop" '[ -z "$(box_of "$org_run")" ]'
+  wait "$org_pid" 2>/dev/null || true
+  rm -f "$WICKET_HOME/policy/org.cedar" "$WICKET_HOME/policy/org-entities.json"
+fi
 
 # ---- 6. audit ----
 log "audit"

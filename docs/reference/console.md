@@ -34,7 +34,8 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `examples/` of the directory `wicket serve` was started in. The browser picks a directory and a file name from
   the list the server offers (regular files named `*.yaml`/`*.yml` directly in them; no symlinks, subdirectories
   or paths), and the passkey signs the manifest's SHA-256, so a file changed after you saw it is not started. The
-  run is a detached `wicket run` (it outlives the console; its log is `runs/<run>/console.log`), and its principal
+  start card shows, and the passkey signs, the image the box starts from: the manifest's `agent.image` (default:
+  the installation's agent image); a manifest whose image isn't in its `zone.images` is refused. The run is a detached `wicket run` (it outlives the console; its log is `runs/<run>/console.log`), and its principal
   is you, the passkey-signed-in operator (`passkey:<name>, via console`), not the host's unix user;
 - **send a follow-up** to a running agent (`wicket say`);
 - **revoke an identity** with a reason (`wicket identity revoke`);

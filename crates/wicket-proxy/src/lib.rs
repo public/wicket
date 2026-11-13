@@ -29,6 +29,10 @@ pub struct RunCtx {
     pub run: RunId,
     /// The run's zone, its globs compiled once (it dereferences to the `ZoneSpec`).
     pub zone: Arc<CompiledZone>,
+    /// The installation's org policy, compiled for this box at its start (#51): what the control
+    /// host's own proxies check too (hosts it forwards for, injections, spawns, messages), as the
+    /// box's token does on its node. None: no org policy.
+    pub org: Option<Arc<wicket_authz::OrgLayer>>,
     pub ledger: Arc<Mutex<Ledger>>,
     pub vault: vault::Vault,
     pub events: UnboundedSender<Event>,
@@ -520,6 +524,7 @@ mod fence_tests {
             tenant: TenantId::single(),
             run: RunId("run_old".into()),
             zone: Arc::new(CompiledZone::new(m.zone.clone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(ledger)),
             vault: vault::Vault::new(std::env::temp_dir().join("wicket-fence-no-vault")),
             events: tx,

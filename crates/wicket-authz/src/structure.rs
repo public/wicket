@@ -107,6 +107,8 @@ pub enum CheckClass {
 pub struct Vetted {
     /// Per block, per check.
     pub classes: Vec<Vec<CheckClass>>,
+    /// Block 0 carries an org layer (its `policy` fact, #51).
+    pub org: bool,
     /// The earliest hard expiry any first-party block sets (`check if time($t), $t <= <date>`, Unix
     /// seconds): the token allows nothing after it (#153). None if no block bounds time that way.
     pub not_after: Option<u64>,
@@ -217,7 +219,7 @@ fn query(q: &Rule, p: &Policy, trusted: &mut Vec<PublicKeyData>, regexes: &mut u
                 return Err("more than one approved(...) in a query".into());
             }
             approved = Some(pred);
-        } else if !has(AMBIENT, pred) {
+        } else if !has(AMBIENT, pred) && !(pred.name == "policy" && pred.terms.len() == 1) {
             return Err(format!("predicate outside the fixed vocabulary: {}/{}", pred.name, pred.terms.len()));
         }
         for t in &pred.terms {
@@ -263,9 +265,11 @@ fn query(q: &Rule, p: &Policy, trusted: &mut Vec<PublicKeyData>, regexes: &mut u
 /// A check's class follows from its shape. A hostile block can shape a hard bound to read `host` and
 /// so turn a `Forbidden` into a `NeedsGrant`; that only changes whether the proxy offers to escalate,
 /// never what is allowed (a grant must still pass every block).
+///
+/// A check that reads `policy` is the org layer's (#51): hard, whatever else it reads.
 fn classify(queries: &[Rule], kind: &CheckKind) -> CheckClass {
     let reads = |n: &str| queries.iter().any(|q| q.body.iter().any(|pr| pr.name == n));
-    if *kind == CheckKind::One && (reads("host") || reads("risk") || reads("approved")) {
+    if *kind == CheckKind::One && !reads("policy") && (reads("host") || reads("risk") || reads("approved")) {
         CheckClass::Escalatable
     } else {
         CheckClass::Hard
@@ -328,6 +332,7 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
     if n > p.max_blocks {
         return Err(format!("{n} blocks (cap {})", p.max_blocks));
     }
+    let mut org = false;
     let mut trusted: Vec<PublicKeyData> = Vec::new();
     let mut third_party = Vec::new();
     let mut classes = Vec::with_capacity(n);
@@ -353,13 +358,15 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
         for f in &b.facts {
             let name = f.predicate.name.as_str();
             zones += usize::from(name == "zone");
-            let ok_name = name == "zone" || (i == 0 && (name == "tenant" || name == "principal"));
+            org |= i == 0 && name == "policy";
+            // `policy`: the org policy's version, block 0 only (#51).
+            let ok_name = name == "zone" || (i == 0 && (name == "tenant" || name == "principal" || name == "policy"));
             let ok_terms = matches!(f.predicate.terms.as_slice(), [Term::Str(s)] if s.len() <= p.max_str_len);
             if !ok_name || !ok_terms {
                 return Err(at(format!("fact not allowed: {name}/{}", f.predicate.terms.len())));
             }
         }
-        if zones > 1 || b.facts.len() > 3 {
+        if zones > 1 || b.facts.len() > 4 {
             return Err(at("too many facts".into()));
         }
         if b.checks.len() > p.max_checks_per_block {
@@ -411,5 +418,5 @@ pub fn check(tok: &Biscuit, token_bytes: usize, p: &Policy) -> Result<Vetted, St
             grant_rule(r, p).map_err(at)?;
         }
     }
-    Ok(Vetted { classes, not_after })
+    Ok(Vetted { classes, org, not_after })
 }

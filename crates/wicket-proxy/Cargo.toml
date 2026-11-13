@@ -40,8 +40,10 @@ h3-quinn.workspace = true
 webpki-roots.workspace = true
 libc.workspace = true
 
+# The org layer's IR (#51): what the control host's proxies check (no Cedar here).
+wicket-authz.workspace = true
+
 [dev-dependencies]
 # HTTP/2 origins in the tests (#142).
 hyper = { workspace = true, features = ["http2"] }
-wicket-authz.workspace = true
 ed25519-dalek = "2"

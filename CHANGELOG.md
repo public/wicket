@@ -91,11 +91,22 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   and re-verified offline by `wicket audit --verify` ([#1](https://github.com/public/wicket/pull/1)).
 - The console can start runs from allowlisted manifests, send follow-ups, revoke identities and answer
   `request_access` asks, each action passkey-signed ([#87](https://github.com/public/wicket/pull/87)).
+- `agent.image` names the image an agent's box starts from (default: the installation's agent image),
+  checked against `zone.images` like `spawn`. `wicket run` and console starts use it, `--image`
+  overrides it, and the console's start card shows it ([#171](https://github.com/public/wicket/issues/171)).
 - The console is built to face the internet: TLS from files or ACME, passkeys only, enrolment only through
   one-time links from the host (`wicket operator enrol-link`), rate limits and lockouts, strict browser
   headers, bounded HTTP ([#99](https://github.com/public/wicket/pull/99)).
 
 ### Identity, spawn and links
+
+- Policy in Cedar: an org policy (`<data dir>/policy/org.cedar`, groups in `org-entities.json`) is a
+  ceiling and forbids over every zone, and each zone's policy is generated from its manifest as Cedar.
+  Both are validated strictly and compiled into each box's Biscuit token at mint (the org layer hard,
+  its forbids beating every grant), with the policy's version in the token and the ledger. Nodes
+  evaluate Biscuit only. `wicket policy show/check/apply/zone`; `apply` revokes runs minted under an
+  older version. A differential test checks Cedar's evaluation against the compiled token, and SymCC
+  (cvc5) diffs policy changes in CI ([#51](https://github.com/public/wicket/issues/51)).
 
 - Every box gets an identity from the installation (`spiffe://<trust domain>/…`), short-lived and rotated,
   naming the human it acts for. Agents message each other only through wicket, signed by wicket

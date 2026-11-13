@@ -176,6 +176,7 @@ impl World {
             tenant: TenantId::single(),
             run: RunId("run_h3".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(ledger)),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,

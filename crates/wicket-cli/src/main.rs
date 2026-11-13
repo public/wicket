@@ -23,6 +23,7 @@ mod noderun;
 mod nodesecrets;
 mod nodesrv;
 mod place;
+mod policy;
 mod program;
 mod reap;
 mod reconcile;
@@ -90,9 +91,10 @@ enum Cmd {
         /// Use this task text instead of the manifest's.
         #[arg(long)]
         task: Option<String>,
-        /// Agent image.
-        #[arg(long, default_value = "wicket/claude-code:poc")]
-        image: String,
+        /// Agent image, overriding the manifest's agent.image (default: that, or the installation's
+        /// agent image).
+        #[arg(long)]
+        image: Option<String>,
         /// Run the box on an enrolled node (its name; its host key is pinned), through its `wicket
         /// node serve`. Default: this host's own node, `local`.
         #[arg(long)]
@@ -147,8 +149,9 @@ enum Cmd {
     Wrap {
         #[arg(long)]
         manifest: PathBuf,
-        #[arg(long, default_value = "wicket/claude-code:poc")]
-        image: String,
+        /// Agent image, overriding the manifest's agent.image.
+        #[arg(long)]
+        image: Option<String>,
         /// The agent command line, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -303,6 +306,12 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<PathBuf>,
     },
+    /// The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled
+    /// into each box's token when it is minted.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
+    },
     /// Control-plane state off this host (#154): the state store, the ledger's stream, the recovery
     /// kit and a restore onto a standby.
     State {
@@ -411,6 +420,31 @@ enum AuditCmd {
         #[arg(long)]
         status: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// The org policy's version, and the running runs minted under another.
+    Show,
+    /// Validate and compile an org policy without installing it.
+    Check {
+        file: PathBuf,
+        /// The groups zones are in (Cedar entities JSON).
+        #[arg(long)]
+        entities: Option<PathBuf>,
+    },
+    /// Install an org policy, and revoke the running runs minted under an older version (their boxes
+    /// stop; new runs get the new policy).
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        entities: Option<PathBuf>,
+        /// Leave running runs on the policy they were minted under until they end.
+        #[arg(long)]
+        keep_runs: bool,
+    },
+    /// A zone's policy as Cedar, generated from a manifest (what its boxes' tokens are compiled from).
+    Zone { manifest: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -999,7 +1033,7 @@ async fn main() -> Result<()> {
                 workdir: workdir.as_deref(),
                 workspace_dir: workspace_dir.as_deref(),
                 task,
-                image: &image,
+                image: image.as_deref(),
                 node: node.as_deref(),
                 ssh_key: ssh_key.as_deref(),
                 run_id,
@@ -1017,7 +1051,7 @@ async fn main() -> Result<()> {
                 workdir: None,
                 workspace_dir: None,
                 task: None,
-                image: &image,
+                image: image.as_deref(),
                 node: None,
                 ssh_key: None,
                 run_id: None,
@@ -1034,7 +1068,7 @@ async fn main() -> Result<()> {
             workdir: None,
             workspace_dir: None,
             task: None,
-            image: "",
+            image: None,
             node: None,
             ssh_key: None,
             run_id: Some(run.clone()),
@@ -1406,6 +1440,18 @@ async fn main() -> Result<()> {
             print!("{}", zone_view(&m.zone, json));
             Ok(())
         }
+        Cmd::Policy { cmd } => match cmd {
+            PolicyCmd::Show => policy::show(),
+            PolicyCmd::Check { file, entities } => {
+                policy::sanity(&file)?;
+                policy::check(&file, entities.as_deref())
+            }
+            PolicyCmd::Apply { file, entities, keep_runs } => {
+                policy::sanity(&file)?;
+                policy::apply(&file, entities.as_deref(), keep_runs).await
+            }
+            PolicyCmd::Zone { manifest } => policy::zone(&manifest),
+        },
         Cmd::State { cmd } => {
             // Litestream and the store client block: off the async runtime.
             std::thread::spawn(move || match cmd {

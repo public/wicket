@@ -11,7 +11,7 @@
 //!   is trusted with everything, since it owns the data anyway.
 
 use super::Peer;
-use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, ProgramCmd, SecretCmd, SelfCmd, StateCmd};
+use crate::{Cmd, DevCmd, GrantCmd, IdentityCmd, LeaseCmd, NodeCmd, OperatorCmd, PolicyCmd, ProgramCmd, SecretCmd, SelfCmd, StateCmd};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -105,6 +105,13 @@ pub fn route(cmd: &Cmd) -> Route {
         },
         // Spends money after a terminal prompt.
         Cmd::Place { .. } => Forward(Privileged),
+        // Applying an org policy changes what every box may do, and revokes runs.
+        Cmd::Policy { cmd } => match cmd {
+            PolicyCmd::Show => Forward(Read),
+            PolicyCmd::Apply { .. } => Forward(Privileged),
+            // Read files the caller names, in the caller's own process.
+            PolicyCmd::Check { .. } | PolicyCmd::Zone { .. } => Local,
+        },
         // The kit holds every key and secret; a restore replaces the ledger; the roots are the roots.
         Cmd::State { cmd } => match cmd {
             StateCmd::Check { probe: false } => Forward(Read),

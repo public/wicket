@@ -59,6 +59,22 @@ jobs:
       - name: docs/reference/cli.md matches the commands' --help
         run: cargo build -p wicket-cli --locked && WICKET=target/debug/wicket ci/gen-cli-reference.sh --check
 
+  # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
+  # change touches: narrows or widens. A solver timeout or `unknown` fails.
+  policy:
+    name: SymCC policy diffs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: ci/policy-diff.sh "origin/$BASE"
+        env:
+          BASE: ${{ github.base_ref || 'main' }}
+
   # One Claude Code agent in a gVisor box, end to end, driven by the scripted mock model: no model
   # credential is used.
   smoke:

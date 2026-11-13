@@ -1,0 +1,12 @@
+# Acceptance (ci/acceptance.sh): a box under an org policy (#51) that forbids one of two paths its
+# zone allows. It fetches both, then stays up until the next policy version revokes it.
+task: Fetch two pages and stay up.
+program:
+  name: org
+  command: [sh, -c, 'for p in acc-org-ok acc-org-no; do echo "$p=$(curl -s -m 20 -o /dev/null -w %{http_code} https://example.com/$p)"; done; echo acc-org-done; exec sleep 600']
+zone:
+  name: acc-org
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET] }
+  limits: { memory: 256m, cpus: 1, timeout: 5m }

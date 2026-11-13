@@ -45,6 +45,10 @@ These are general features for any workload:
 - **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
   a follow-up, which becomes its next turn.
 - **Long-lived agents hibernate and wake** (below; [how to](../how-to/hibernate-and-wake-an-agent.md)).
+- **`agent.image`** names the image the agent's box starts from (default: the installation's current agent
+  image), e.g. a project's own toolchain image. Any other image must be listed in `zone.images`, as for
+  `spawn`; a manifest naming one outside it is refused. `wicket run` and runs started from the console use
+  it, and `wicket run --image` overrides it.
 - **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
   allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
 - **`inject` rules can be `optional`:** while the secret isn't in the vault, the rule is as if it weren't

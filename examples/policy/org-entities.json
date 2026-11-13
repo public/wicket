@@ -1,0 +1,4 @@
+[
+  {"uid": {"type": "Group", "id": "dev"}, "attrs": {}, "parents": []},
+  {"uid": {"type": "Zone", "id": "dev-api"}, "attrs": {}, "parents": [{"type": "Group", "id": "dev"}]}
+]

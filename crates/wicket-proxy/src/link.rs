@@ -647,6 +647,7 @@ mod tests {
                 tenant: TenantId::single(),
                 run: RunId(run.into()),
                 zone: Arc::new(wicket_core::CompiledZone::new(zone).unwrap()),
+                org: None,
                 ledger: self.ledger.clone(),
                 vault: crate::vault::Vault::new(std::env::temp_dir()),
                 events: tx,

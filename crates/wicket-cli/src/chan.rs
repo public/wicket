@@ -56,11 +56,16 @@ use serde::{Deserialize, Serialize};
 /// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
 ///   [`Msg::Lease`], [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
 ///   [`Msg::Spent`], sent only on connections talking [`NODE_LEASES`] or later.
-pub const PROTOCOL: u32 = 3;
+/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51): a `policy` fact
+///   and checks reading it, which an older node's structural check refuses: sent only to nodes
+///   talking [`ORG_POLICY`] or later.
+pub const PROTOCOL: u32 = 4;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
 /// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
 pub const NODE_LEASES: u32 = 3;
+/// The first protocol version whose nodes take tokens with an org layer (#51).
+pub const ORG_POLICY: u32 = 4;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 

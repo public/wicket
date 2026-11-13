@@ -119,6 +119,7 @@ impl World {
             tenant: TenantId::single(),
             run: RunId("run_splice".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: ledger.clone(),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,
@@ -438,7 +439,23 @@ fn node_feed(zone: &ZoneSpec, box_run: &str) -> (Arc<NodeDecider>, Arc<std::sync
     let tenant = TenantId::single().0;
     let mut issuer =
         Issuer::root(&authz_root, &tenant, "run:run_splice", "run_splice", 0, zone, &[], 3_600, vec![approver.public()]).unwrap();
-    if box_run != "run_splice" {
+    if box_run == "run_org" {
+        // A top-level box under an org policy (#51) that forbids one path on private.test.
+        let mut c = wicket_authz::Ceiling::from_zone(zone, "run_org", 3_600, vec![approver.public()]).unwrap();
+        c.org = Some(wicket_authz::OrgLayer {
+            version: "v1".into(),
+            http: None,
+            forbid: vec![wicket_authz::HttpMatch {
+                hosts: vec![wicket_authz::HostPat::Exact("private.test".into())],
+                paths: vec![wicket_authz::PathPat::Glob("/x/**".into())],
+                ..Default::default()
+            }],
+            spawn: None,
+            msg_from: None,
+            inject: None,
+        });
+        issuer = Issuer::from_ceiling(&authz_root, &tenant, "run:run_org", "run_org", 0, zone, &c).unwrap();
+    } else if box_run != "run_splice" {
         // A child of run_splice, in the same zone.
         let c = wicket_authz::Ceiling::from_zone(zone, &format!("run_splice/{box_run}"), 3_600, vec![approver.public()]).unwrap();
         issuer = issuer.child(box_run, 0, zone, &c).unwrap();
@@ -536,7 +553,19 @@ async fn a_node_splices_only_top_level_boxes_and_only_wholesale_hosts() {
         assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 1_001_000), Some(0), "offline");
         assert_eq!(r.splice(&TenantId::single(), "run_splice", "open.test", 3_601_000), None, "expired");
     }
-    for d in [child_dir, top_dir] {
+    // Under an org policy (#51), a host it allows wholesale splices; one it has any rule on doesn't.
+    let (d, _, org_dir) = node_feed(&zone(), "run_org");
+    {
+        let r = d.replica.lock().unwrap();
+        assert_eq!(r.splice(&TenantId::single(), "run_org", "open.test", 1_000_000), Some(0), "the org layer allows it wholesale");
+        assert_eq!(r.splice(&TenantId::single(), "run_org", "private.test", 1_000_000), None, "an org forbid on one of its paths");
+    }
+    let (d, _, base_dir) = node_feed(&zone(), "run_splice");
+    {
+        let r = d.replica.lock().unwrap();
+        assert!(r.splice(&TenantId::single(), "run_splice", "private.test", 1_000_000).is_some(), "without the org layer it would");
+    }
+    for d in [child_dir, top_dir, org_dir, base_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

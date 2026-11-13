@@ -226,7 +226,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
-  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT
+  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -336,6 +336,8 @@ impl Ledger {
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
+        // The org policy version a run's token was minted under (#51).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN policy TEXT", []);
         // Ledgers created before runs recorded the node they were placed on (#120).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN node TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
@@ -564,6 +566,24 @@ impl Ledger {
             "SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities ORDER BY issued_at",
         )?;
         let rows = st.query_map([], row_to_identity)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Records the org policy version `run`'s token was minted under (#51; None: no org policy).
+    pub fn set_run_policy(&self, run: &str, version: Option<&str>) -> Result<()> {
+        self.conn.execute("UPDATE runs SET policy = ?2 WHERE id = ?1", params![run, version])?;
+        Ok(())
+    }
+
+    /// The org policy version `run`'s token was minted under (None: none, or no such run).
+    pub fn run_policy(&self, run: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT policy FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Running runs, with their zone and the org policy version their token was minted under.
+    pub fn running_policies(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut st = self.conn.prepare("SELECT id, zone, policy FROM runs WHERE status = 'running' ORDER BY started_at")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
