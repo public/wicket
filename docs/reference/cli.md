@@ -30,6 +30,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket secret hosts`](#wicket-secret-hosts)
   - [`wicket secret link`](#wicket-secret-link)
 - [`wicket image`](#wicket-image)
+  - [`wicket image digest`](#wicket-image-digest)
 - [`wicket serve`](#wicket-serve)
 - [`wicket program`](#wicket-program)
   - [`wicket program digest`](#wicket-program-digest)
@@ -65,6 +66,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket lease list`](#wicket-lease-list)
   - [`wicket lease release`](#wicket-lease-release)
 - [`wicket zone`](#wicket-zone)
+  - [`wicket zone pin`](#wicket-zone-pin)
 - [`wicket doctor`](#wicket-doctor)
 - [`wicket node`](#wicket-node)
   - [`wicket node token`](#wicket-node-token)
@@ -469,11 +471,30 @@ Options:
 Build the agent image (the image directory plus the in-box forwarder's source, compiled in the build). Without --dir, from the copy embedded in this binary, so the image matches it
 
 Usage: wicket image [OPTIONS]
+       wicket image <COMMAND>
+
+Commands:
+  digest  The digest each image is in this installation's Docker (#192): `<ref> sha256:…`, what a zone pins it as (`name@sha256:…`)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
       --tag <TAG>  [default: wicket/claude-code:poc]
       --dir <DIR>  An image directory to build instead (e.g. images/claude-code, while changing it)
   -h, --help       Print help
+```
+
+### `wicket image digest`
+
+```text
+The digest each image is in this installation's Docker (#192): `<ref> sha256:…`, what a zone pins it as (`name@sha256:…`)
+
+Usage: wicket image digest <REFS>...
+
+Arguments:
+  <REFS>...  
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket serve`
@@ -979,14 +1000,34 @@ Options:
 ```text
 The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
 
-Usage: wicket zone [OPTIONS] <MANIFEST>
+Usage: wicket zone [OPTIONS] [MANIFEST]
+       wicket zone <COMMAND>
+
+Commands:
+  pin   Rewrite a manifest's image tags (zone.images, agent.image, program.image) to the digests they point to now, in place, keeping the rest of the file (#192)
+  help  Print this message or the help of the given subcommand(s)
 
 Arguments:
-  <MANIFEST>  The manifest (YAML)
+  [MANIFEST]  The manifest (YAML)
 
 Options:
       --json  JSON instead of text
   -h, --help  Print help
+```
+
+### `wicket zone pin`
+
+```text
+Rewrite a manifest's image tags (zone.images, agent.image, program.image) to the digests they point to now, in place, keeping the rest of the file (#192)
+
+Usage: wicket zone pin [OPTIONS] <MANIFEST>
+
+Arguments:
+  <MANIFEST>  
+
+Options:
+      --dry-run  Say what would change; write nothing
+  -h, --help     Print help
 ```
 
 ## `wicket doctor`

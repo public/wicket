@@ -225,7 +225,8 @@ fn kit_files(with_secrets: bool, with_roots: bool) -> Result<Vec<(String, PathBu
     let roots = ["feed-root.key", "authz-root.key"];
     add_dir("identity", &identity_dir(), &|n| with_roots || !roots.contains(&n))?;
     let d = data_dir();
-    let data = ["state.key", "state-store.yaml", "audit-sinks.yaml", "placement.yaml", "placement-static.json"];
+    let data =
+        ["state.key", "state-store.yaml", "audit-sinks.yaml", "placement.yaml", "placement-static.json", "images.yaml", "ci-builds.yaml"];
     add_dir("data", &d, &|n| data.contains(&n))?;
     if let Ok(rd) = std::fs::read_dir(d.join("nodes")) {
         for e in rd.flatten() {

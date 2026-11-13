@@ -57,6 +57,9 @@ pub struct SpawnedChild {
     pub image: String,
     pub session: String,
     pub started_ms: i64,
+    /// Its image's digest as this node started it (#192).
+    #[serde(default)]
+    pub digest: Option<String>,
     /// The slots it takes of its parent's.
     pub weight: u32,
 }
@@ -70,6 +73,7 @@ impl SpawnedChild {
             image: self.image.clone(),
             session: self.session.clone(),
             started_ms: self.started_ms,
+            digest: self.digest.clone(),
         }
     }
 }
@@ -397,10 +401,16 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         Ok(m) => m,
         Err(e) => return Some((format!("not started: the box's manifest is unreadable on its node ({e})"), true)),
     };
-    let (start, started_ms) = {
+    let (start, started_ms, own_digest) = {
         let boxes = node.boxes.lock().expect("boxes");
         let b = boxes.get(run)?;
-        (b.record.start.clone(), b.record.started_ms)
+        (b.record.start.clone(), b.record.started_ms, b.record.image_digest.clone())
+    };
+    // The box's own image, pinned to the digest it started as here (#192): a child that names no
+    // image is that image, whatever its tag points to now.
+    let own_image = match &own_digest {
+        Some(d) => wicket_core::image::pinned(&start.image, d),
+        None => start.image.clone(),
     };
     let now = wicket_feed::now_ms();
     let deadline = started_ms + i64::try_from(sp.time_left_secs).unwrap_or(i64::MAX / 2000) * 1000;
@@ -432,7 +442,7 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         &crate::spawn::PlanIn {
             parent: &parent,
             run: &wicket_core::RunId(run.into()),
-            image: &start.image,
+            image: &own_image,
             time_left,
             llm_left,
             llm_input_left,
@@ -445,6 +455,14 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         Ok(p) => p,
         Err(e) => return Some((format!("not started: {e}"), true)),
     };
+    if plan.cm.agent.as_ref().is_some_and(|a| a.kind == "acp") {
+        // An ACP agent's client is wicket's control host (#66): its children start there (queued
+        // while it is unreachable, as for a placement elsewhere).
+        return match up {
+            true => None,
+            false => Some(queue_call(node, run, tool, args)),
+        };
+    }
     if !plan.violations.is_empty() {
         // Beyond the box's authority: a human's, on the control host.
         return match (up, req.ask_human) {
@@ -458,6 +476,27 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
                 true,
             )),
         };
+    }
+    // The box's token decides it here (#192): by the entry that allows the image (block 0 names
+    // pinned entries by digest; the node's Docker then checks the image is that digest).
+    let token_entry = if plan.image_entry == own_image { start.image.clone() } else { plan.image_entry.clone() };
+    let limits = match wicket_authz::Ceiling::from_zone(&plan.cm.zone, "child", 0, vec![]) {
+        Ok(c) => c.spawn,
+        Err(e) => return Some((format!("not started: {e}"), true)),
+    };
+    let allowed = node.replica.lock().expect("replica").peek_spawn(
+        run,
+        &start.tenant,
+        &token_entry,
+        limits.min_isolation,
+        limits.mem_bytes,
+        limits.cpus_milli,
+        limits.pids,
+        limits.timeout_s,
+        (node.clock)(),
+    );
+    if let Err(why) = allowed {
+        return Some((format!("not started: your token doesn't allow this spawn on your node ({why})"), true));
     }
     match start_child(node, run, &start, &sp, plan, deadline).await {
         Ok(text) => Some((text, false)),
@@ -543,7 +582,8 @@ async fn start_child(
         Some(_) => None,
         None => wicket_agent::claude_code_plan(m, &child, &session).stdin_task,
     };
-    if let Err(e) = super::start_box_boxed(node, None, bs).await {
+    let started = super::start_box_boxed(node, None, bs).await;
+    if let Err(e) = started {
         node.replica.lock().expect("replica").drop_local(&child.0);
         let _ = std::fs::remove_dir_all(&dir);
         if let (Some(pl), Some(cl)) = (&llm, &m.zone.llm) {
@@ -572,6 +612,7 @@ async fn start_child(
         image: plan.image.clone(),
         session: session.id.clone(),
         started_ms: now,
+        digest: started.as_ref().ok().cloned(),
         weight: plan.weight,
     };
     node.edge.spawned(c.clone());

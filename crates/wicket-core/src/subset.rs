@@ -98,11 +98,12 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             p.limits.authority.as_deref().unwrap_or(&p.limits.timeout)
         )),
     }
-    if !parent.images.iter().any(|i| i == ask.image) {
+    // By digest where either side is pinned (#192): one matcher, wherever a spawn is decided.
+    if crate::image::matching(ask.image, &parent.images).is_none() {
         v.push(format!("image {}: not one this zone may start (allowed: {})", ask.image, parent.images.join(", ")));
     }
     for i in &c.images {
-        if !parent.images.contains(i) {
+        if crate::image::matching(i, &parent.images).is_none() {
             v.push(format!("images: {i} is not one this zone may start"));
         }
     }

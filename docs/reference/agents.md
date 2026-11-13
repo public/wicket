@@ -128,3 +128,69 @@ has both, with what each protects.
 Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone
 doesn't name look like it doesn't exist ([manifest](manifest.md#zone)). Agents ask ahead for reach
 with `request_access`.
+
+## ACP agents
+
+An agent with `kind: acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP, wire
+version 1) on its stdio, and wicket is its client (#66). The manifest names the command
+([`agent.acp`](manifest.md#agentacp)); the image must already have the agent at a pinned version.
+[Run an ACP agent](../how-to/run-an-acp-agent.md) has an example.
+
+What wicket sends:
+
+- `initialize` with no `fs`, `terminal` or `auth.terminal` capability. The agent works with its own tools
+  in its box; wicket never reads or writes files or runs commands for it.
+- `session/new` with the box's `/workspace` as `cwd`, wicket's gateway as the only MCP server, and the
+  sandbox notice as a `systemPrompt` append. For an agent that takes no system prompt, the notice
+  leads the first prompt instead. Agent-specific `_meta` comes from wicket only, for a known
+  `acp.profile`.
+- The task as the first `session/prompt`, and each follow-up (`wicket say`, a peer's message notice,
+  a wake's message) as the next one. A prompt sent while a turn runs waits for it to end.
+
+What wicket checks: the agent speaks version 1 and can use an HTTP MCP server, or the run fails. Its
+`agentInfo` is shown and logged, and decides nothing.
+
+How wicket answers the agent:
+
+| the agent asks | wicket answers |
+|---|---|
+| `session/request_permission` for a mode change (`switch_mode`) | `reject_once` |
+| a write, move or delete (or a command, or `other`) whose paths include a control file | `reject_once` |
+| anything else | `allow_once`: the box contains it, and what leaves the box is decided at wicket's gates |
+| a permission request while a `session/load` replays history | `cancelled`: replayed approvals are history, not decisions |
+| a permission request after `session/cancel`, until the turn ends | `cancelled` |
+| a permission request that offers no once-option of the kind wicket chose | `cancelled`. wicket never selects `allow_always` or `reject_always`, which the agent would keep as its own policy (the Claude adapter writes them to `.claude/settings.local.json`) |
+| `fs/*`, `terminal/*`, elicitation, or any other method | the JSON-RPC error `-32601` (method not found) |
+
+The answer is chosen by the tool call's `kind` and the paths it names (`locations`, the path fields of
+`rawInput`, diff paths), never by its title, an option's name or a command string. Control files are
+`.git/hooks`, `.git/config`, `.gitmodules`, `.claude`, `.mcp.json`, `.gemini`, `.codex`, `.cursor`,
+`.vscode`, `.zed`, `.idea`, `.envrc`, `.devcontainer`, `.github/workflows`, and the agent's own
+`settings*.json` under `/wicket/state`. Each answer is audited as `run.agent_prompt` (tool, kind,
+answer, why), and each refused call as `run.agent_call_refused`.
+
+A long-lived ACP agent hibernates like any other. wicket records the session id its agent chose, and a
+wake continues that session: `session/resume` if the agent offers it, else `session/load`, else a new
+session. The agent's state (its `$HOME` and config) is in the bundle like Claude Code's.
+
+A child an ACP agent starts with `spawn` is an ACP agent too, and starts from the control host: a node
+on its own (#164) queues the request until the control host is back, instead of starting it there.
+
+Not yet:
+
+- the ACP v2 draft, MCP-over-ACP, and holding a prompt for an operator to answer;
+- an ACP agent on another machine's node, which is untested. Answers come from the supervising
+  `wicket run`, so while the control host can't reach that node, an ACP agent's permission requests
+  wait (its gated requests don't: the node decides those). And a node keeps only so much of a box's
+  output while disconnected: a JSON-RPC message lost to that cap would leave the session waiting.
+
+**The Claude adapter.** `acp.profile: claude-agent-acp` runs Claude Code through
+`@agentclientprotocol/claude-agent-acp`, which drives the unmodified `claude` through the Agent SDK.
+Whether a Claude subscription may back that is an open question for the owner (research
+[21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)),
+so it is not the default, and wicket's own Claude sessions stay on `kind: claude-code`. It fails closed: a
+run (or wake) of the profile on a zone whose `llm` is a Claude subscription is refused unless the
+installation sets `acp.allow_subscription_backed_claude_adapter: true` in
+[`/etc/wicket/wicket.yaml`](configuration.md#wicketyaml). An `acp.command` that starts the adapter must
+use the profile, so it can't bypass that check.
+[`examples/acp-claude`](../../examples/acp-claude/) pins it for when that is decided.

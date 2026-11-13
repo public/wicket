@@ -190,13 +190,16 @@ fn token_decisions_match_compiled_zones_fresh_and_offline() {
         assert!(counts.get(&k).copied().unwrap_or(0) > 500, "too few {k:?}: {counts:?}");
     }
     // A box's token decides only for its own zone and run.
-    let (run, z) = &boxes[0];
-    let read = z.reach.iter().find(|r| r.methods.iter().any(|m| m == "GET")).expect("a readable rule");
+    // (The first zone with a readable rule: not every example zone has reach.)
+    let readable = |z: &ZoneSpec| z.reach.iter().find(|r| r.methods.iter().any(|m| m == "GET")).cloned();
+    let (run, z) = boxes.iter().find(|(_, z)| readable(z).is_some()).expect("a zone with a readable rule");
+    let read = readable(z).expect("a readable rule");
+    let other = boxes.iter().find(|(r, _)| r != run).expect("another box");
     let path = common::paths_for(&read.paths[0])[0].clone();
     let host = read.host.replace("*.", "a.");
     assert_eq!(kind(&tr.decide(&op(&z.name, run, "GET", &host, &path), T0)), "allow");
     assert!(
-        matches!(tr.decide(&op(&boxes[1].1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone"))
+        matches!(tr.decide(&op(&other.1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone"))
     );
     assert!(
         matches!(tr.decide(&op(&z.name, "run-unknown", "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("no authority"))
@@ -581,4 +584,24 @@ fn a_feed_is_read_without_writing_and_a_torn_tail_is_skipped() {
     assert_eq!(blocks.len(), 1);
     assert!(blocks[0].source.contains("/v1/"), "{}", blocks[0].source);
     assert!(blocks[0].external_key.is_none() && blocks[0].revocation_id.len() == 128);
+}
+
+/// #192: a zone's pinned images are in block 0 as written (within the node's structural caps, many
+/// of them), and a node decides a spawn by the entry that allows it, read-only.
+#[test]
+fn pinned_images_are_decided_by_the_token_on_the_node() {
+    let mut cp = Cp::new();
+    let pins: Vec<String> = (0..32).map(|i| format!("tool{i}@sha256:{}", format!("{i:02x}").repeat(32))).collect();
+    let mut z = zone("zp", &["/repos/acme/**"]);
+    z.images = pins.clone();
+    let parent = cp.issue("p", &z);
+    cp.put(parent.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    let peek = |image: &str| r.peek_spawn("p", TENANT, image, 2, 128 << 20, 500, 64, 300, T0);
+    assert!(peek(&pins[7]).is_ok(), "{:?}", peek(&pins[7]));
+    assert!(peek(&pins[31]).is_ok());
+    assert!(peek(&format!("tool7@sha256:{}", "ff".repeat(32))).is_err(), "another digest");
+    assert!(peek("tool7:latest").is_err(), "a tag isn't the pinned entry");
+    assert!(r.peek_spawn("nobody", TENANT, &pins[0], 2, 1, 1, 1, 1, T0).is_err());
 }

@@ -63,7 +63,10 @@ use serde::{Deserialize, Serialize};
 ///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
 ///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
 ///   control host talks [`EDGE_DECISIONS`] or later; with an older one it relays every tool call.
-pub const PROTOCOL: u32 = 5;
+/// - 6: images pinned by digest (#192): [`BoxStart::image_pin`], which the node checks against the
+///   image it starts (and then starts it by its id), and the digest it started in `Started` and
+///   `Spawned`. A pinned box goes only to nodes talking [`IMAGE_PINS`] or later.
+pub const PROTOCOL: u32 = 6;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
 /// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
@@ -72,6 +75,8 @@ pub const NODE_LEASES: u32 = 3;
 pub const ORG_POLICY: u32 = 4;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
+/// The first protocol version whose nodes check a box's image against its pin (#192).
+pub const IMAGE_PINS: u32 = 6;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -182,6 +187,11 @@ pub struct BoxStart {
     /// talking [`EDGE_DECISIONS`]; without it the node relays every tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<Box<EdgeStart>>,
+    /// The digest (`sha256:…`) the box's image must be (#192): the node refuses to start it as any
+    /// other, and starts it by its id, so a retag can't swap it. Sent only to nodes talking
+    /// [`IMAGE_PINS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pin: Option<String>,
 }
 
 /// What a node decides a box's gateway tools from (#164), beyond its token in the feed.
@@ -451,6 +461,9 @@ pub enum Msg {
     Started {
         run: String,
         error: Option<String>,
+        /// The image's digest as the node started it (#192).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
     },
     Exited {
         run: String,
@@ -479,6 +492,9 @@ pub enum Msg {
         session: String,
         /// When the node started it (Unix ms, node clock).
         started_ms: i64,
+        /// Its image's digest as the node started it (#192).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
     },
     /// The control host took `child` over (`error`: it refused it, and stops it).
     Adopted {

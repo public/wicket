@@ -29,6 +29,8 @@
 #   - `link` wires two of the agent's boxes, and one fetches a page from the other across it;
 #   - revoking the agent's identity stops its whole subtree (children and a grandchild);
 #   - an agent hibernates and is woken: its files and its session survive;
+#   - an ACP agent (#66) gets wicket's safe client posture, hibernates, and is woken into its own
+#     session, where a prompt asked during the replay isn't approved;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
 #   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
@@ -74,6 +76,7 @@ if [ ${#work} -gt 24 ]; then echo "$work: too long a path for the runs' sockets 
 pids=()
 our_runs=()
 built_image=
+pin_images=()
 
 if [ "$mode" = dev ]; then
   W=$(realpath "${WICKET:-target/debug/wicket}")
@@ -149,6 +152,7 @@ teardown() {
   for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
   wait 2>/dev/null
   for c in $(our_boxes); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
+  for i in "${pin_images[@]}"; do $DOCKER rmi "$i" >/dev/null 2>&1; done
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   if [ "$nodes" = local ]; then node_local_teardown; fi
   if [ -n "${sinks_file:-}" ]; then sudo -n rm -f "$sinks_file"; fi
@@ -294,6 +298,54 @@ wait_for 30 '! kill -0 "$lead_pid" 2>/dev/null' || true
 check "  and its wicket run ended" '! kill -0 "$lead_pid" 2>/dev/null'
 check "  and its identity is revoked" 'w identity show "$lead" 2>&1 | grep -qi revoked'
 
+# ---- 1b. images pinned by digest (#192) ----
+# A private name for the agent image (`:a`) and for another image (`:b`, one more label: another
+# digest). The zone pins the name to `:a`'s digest; the agent spawns `:a` by its tag, then the tag is
+# moved to `:b`: by the tag it still gets `:a`'s digest, and `:b`'s digest is refused. Removed in
+# teardown.
+log "images pinned by digest: the run's digest, a spawn decided by digest on its node, a retag changes nothing"
+pin_name=acc-pin-$$
+$DOCKER tag "$IMAGE_TAG" "$pin_name:a"
+printf 'FROM %s\nLABEL wicket.acc.retag=%s\n' "$IMAGE_TAG" "$$" | $DOCKER build -q -t "$pin_name:b" - >/dev/null 2>&1
+pin_images+=("$pin_name:a" "$pin_name:b")
+pin_a=$($DOCKER image inspect "$pin_name:a" --format '{{.Id}}')
+pin_b=$($DOCKER image inspect "$pin_name:b" --format '{{.Id}}')
+w image digest "$pin_name:a" >"$work/pin-digest.log" 2>&1 || cat "$work/pin-digest.log"
+check "wicket image digest reports what Docker has" 'grep -qx "$pin_name:a $pin_a" "$work/pin-digest.log"'
+pin_ws=$(workdir pin)
+echo "$pin_name" >"$pin_ws/pin-name"
+pin_manifest=$(manifest pin)
+sed -i "s#PIN_IMAGE#$pin_name@$pin_a#" "$pin_manifest"
+HOME=$HOMEW "$W" run "$pin_manifest" --workdir "$pin_ws" --image "$IMAGE_TAG" >"$work/pin.log" 2>&1 &
+pin_pid=$!
+pids+=("$pin_pid")
+wait_for 60 '[ -n "$(run_id_of "$work/pin.log")" ]' || true
+pin_run=$(run_id_of "$work/pin.log")
+our_runs+=("$pin_run")
+plog() { data "runs/$pin_run/workspace/out/pin.log" 2>/dev/null; }
+wait_for 120 'plog | grep -q "^first="' || true
+pin_kid=$(plog | sed -n 's/^first=started program first as run \(run_[a-z0-9]*\).*/\1/p')
+echo "   $(plog | head -1)"
+check "the run's audit and record carry its image's digest" \
+  'w audit --tail 3000 | grep run.image | grep "$pin_run" | grep -q "\"digest\":\"sha256:" && data "runs/$pin_run/ctl/run.json" | jq -e ".image_digest | startswith(\"sha256:\")" >/dev/null'
+check "a spawn of a pinned image's tag starts on the node as the pinned digest" \
+  '[ -n "$pin_kid" ] && [ "$($DOCKER inspect "$(box_of "$pin_kid")" --format "{{.Image}}" 2>/dev/null)" = "$pin_a" ]'
+wait_for 60 'data "runs/$pin_kid/ctl/run.json" 2>/dev/null | jq -e .image_digest >/dev/null' || true
+check "  and its run's record carries that digest" '[ "$(data "runs/$pin_kid/ctl/run.json" | jq -r .image_digest)" = "$pin_a" ]'
+$DOCKER tag "$pin_name:b" "$pin_name:a"
+if [ "$mode" = dev ]; then pin_dir=$WICKET_HOME/runs/$pin_run/workspace; put() { printf '%s' "$2" >"$pin_dir/$1"; }
+else pin_dir=$datadir/runs/$pin_run/workspace; put() { printf '%s' "$2" | sudo -n tee "$pin_dir/$1" >/dev/null; }; fi
+put pin-other "$pin_b"
+put retagged 1
+wait_for 120 'plog | grep -q "^third="' || true
+plog | sed -n '2,3p' | sed 's/^/   /'
+pin_kid2=$(plog | sed -n 's/^second=started program second as run \(run_[a-z0-9]*\).*/\1/p')
+check "once its tag points to another image, a spawn by the tag still starts the pinned digest, never the other" \
+  '[ -n "$pin_kid2" ] && [ "$($DOCKER inspect "$(box_of "$pin_kid2")" --format "{{.Image}}" 2>/dev/null)" = "$pin_a" ] && [ "$pin_b" != "$pin_a" ]'
+check "  and the other image, asked for by its digest, is refused" 'plog | grep "^third=" | grep -q "not within yours"'
+w identity revoke "$pin_run" --reason "acceptance: pins done" >/dev/null 2>&1 || true
+wait_for 60 '[ -z "$(box_of "$pin_run")" ]' || true
+
 # ---- 2. hibernate and wake ----
 log "hibernate and wake"
 hib_ws=$(workdir hib)
@@ -313,6 +365,30 @@ check "  its files survived (/tmp, \$HOME, workspace, durable volume)" '[ "$(hf 
 # A fresh session's requests carry 2 and 4 messages; the resumed one's carry the earlier turn too.
 check "  and the model saw the earlier conversation, then the operator's text" 'grep -qE "finish \(([5-9]|[1-9][0-9]) messages" "$work/mock.log" && grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
 check "  and the generation went up by one" '[ "$(agent_field generation)" = $((gen1 + 1)) ]'
+
+# ---- 2b. an ACP agent (#66) ----
+log "an ACP agent: wicket's client posture, hibernate and wake"
+acp_ws=$(workdir acp)
+wt 300 run "$(manifest acp)" --workdir "$acp_ws" --image "$IMAGE_TAG" >"$work/acp1.log" 2>&1 || true
+our_runs+=("$(run_id_of "$work/acp1.log")")
+ares=$(result_of "$work/acp1.log")
+af() { jq -r "$1" <<<"$ares" 2>/dev/null; }
+check "an ACP agent ran its turn (run ${our_runs[-1]:-?})" '[ "$(af .status)" = done ] && grep -q "ACP session mock-session-1 new" "$work/acp1.log"'
+check "  wicket offered it no file, terminal or auth capability" '[ "$(af ".seen.initialize.clientCapabilities | [.fs.readTextFile, .fs.writeTextFile, .terminal, has(\"auth\")] | map(tostring) | join(\",\")")" = false,false,false,false ]'
+check "  its only MCP server is wicket's gateway, which answers, and the notice is a system-prompt append" '[ "$(af ".seen.session.mcpServers | map(.name) | join(\",\")")" = wicket ] && af .seen.gateway | grep -q "with await_grant: True" && [ "$(af .seen.session.systemPrompt.mode)" = append ] && af .seen.session.systemPrompt.head | grep -q "wicket sandbox" && [ "$(af .seen.session.has_meta)" = false ]'
+check "  its fs and terminal calls got -32601" '[ "$(af "[.seen.errors.fs_read, .seen.errors.fs_write, .seen.errors.terminal] | map(tostring) | join(\",\")")" = -32601,-32601,-32601 ] && grep -q "called terminal/create, which wicket doesn.t offer" "$work/acp1.log"'
+check "  permissions: allow_once for a command, reject_once for settings.local.json and a mode change, never an always" '[ "$(af .seen.answers.execute)" = opt-allow_once ] && [ "$(af .seen.answers.settings_local)" = opt-reject_once ] && [ "$(af .seen.answers.switch_mode)" = opt-reject_once ] && [ "$(af .seen.answers.only_always)" = cancelled ] && [ "$(af .always_state_written)" = false ]'
+check "  and each answer is audited" '[ "$(w audit --tail 400 | grep "${our_runs[-1]}" | grep -c run.agent_prompt)" -ge 4 ] && w audit --tail 400 | grep "${our_runs[-1]}" | grep run.agent_call_refused | grep -q fs/write_text_file'
+acp_agent=$(grep -o "agent agt_[a-z0-9]*" "$work/acp1.log" | head -1 | cut -d" " -f2 || true)
+check "  it hibernated after its turn" '[ -n "$acp_agent" ] && grep -q "hibernated in" "$work/acp1.log"'
+wt 300 wake "$acp_agent" "Again, please." >"$work/acp2.log" 2>&1 || true
+our_runs+=("$(run_id_of "$work/acp2.log")")
+ares=$(result_of "$work/acp2.log")
+check "woken, it loaded its own ACP session" '[ "$(af .seen.load.known)" = true ] && grep -q "ACP session mock-session-1 loaded" "$work/acp2.log"'
+check "  a prompt asked during the replay was cancelled, and the next decided afresh (allow_once)" '[ "$(af .seen.answers.during_replay)" = cancelled ] && [ "$(af .seen.answers.after_replay)" = opt-allow_once ]'
+check "  and the operator's text reached it as a prompt" 'af ".seen.prompts[-1]" | grep -q "Again, please."'
+wt 60 run "$(manifest acp-claude)" --image "$IMAGE_TAG" >"$work/acp-claude.log" 2>&1 || true
+check "Claude Code through its ACP adapter on a subscription is refused at run start (not allowed by default)" 'grep -q "acp.allow_subscription_backed_claude_adapter: true" "$work/acp-claude.log" && [ -z "$(run_id_of "$work/acp-claude.log")" ]'
 
 # ---- 3. reconcile: an orphaned box ----
 # Its supervisor killed hard, the box runs on (on this host's own node); reconcile takes its run over
@@ -571,7 +647,7 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 acp1 acp2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
   exit 1
 fi
 echo "acceptance passed"

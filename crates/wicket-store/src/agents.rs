@@ -176,6 +176,13 @@ impl Ledger {
     }
 
     /// The agent's current generation: the fencing token every proxy compares its own against.
+    /// The image an agent's next activation starts from (#192): pinned to the digest its box
+    /// started as, so a wake doesn't take whatever a tag points to then.
+    pub fn set_agent_image(&self, id: &str, image: &str) -> Result<()> {
+        self.conn.execute("UPDATE agents SET image = ?2 WHERE id = ?1", params![id, image])?;
+        Ok(())
+    }
+
     pub fn agent_generation(&self, id: &str) -> Result<Option<i64>> {
         Ok(self.conn.query_row("SELECT generation FROM agents WHERE id = ?1", params![id], |r| r.get(0)).optional()?)
     }
@@ -185,6 +192,16 @@ impl Ledger {
         let n = self.conn.execute(
             "UPDATE agents SET state = ?3, note = COALESCE(?4, note), updated_at = ?5 WHERE id = ?1 AND generation = ?2",
             params![id, generation, state, note, now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Records the session the agent's harness chose (an ACP agent names its own session, #66), so a
+    /// wake continues it, if `generation` is still current.
+    pub fn set_agent_session(&self, id: &str, generation: i64, session_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agents SET session_id = ?3, updated_at = ?4 WHERE id = ?1 AND generation = ?2",
+            params![id, generation, session_id, now()],
         )?;
         Ok(n == 1)
     }
@@ -348,6 +365,9 @@ mod tests {
         assert_eq!(l.agent_of_run("run_2").unwrap(), Some((id.clone(), 2)));
         // Generation 1 is stale now: its state changes and pushes are refused.
         assert!(!l.set_agent_state(&id, 1, "idle", None).unwrap());
+        assert!(!l.set_agent_session(&id, 1, "acp-old").unwrap());
+        assert!(l.set_agent_session(&id, 2, "acp-new").unwrap());
+        assert_eq!(l.agent(&id).unwrap().unwrap().session_id, "acp-new");
         assert!(!l.commit_agent_push(&id, 1, 1, 2, "a/x/m/2.1", 10).unwrap());
         assert!(l.set_agent_state(&id, 2, "active", None).unwrap());
         // A push that started from an older head is refused too.

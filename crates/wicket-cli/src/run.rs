@@ -56,10 +56,10 @@ impl Stopper {
     }
 
     /// Whether the box is at a quiet point (only the agent's runtime running), as `user`.
-    async fn check_quiet(&self, user: &str) -> std::result::Result<(), String> {
+    async fn check_quiet(&self, user: &str, agent: &[String]) -> std::result::Result<(), String> {
         let out = self.0.calls.ctl(&self.0.run, "processes", user, "").await.map_err(|e| format!("{e:#}"))?;
         let procs: Vec<(u32, u32, String)> = serde_json::from_str(out.as_deref().unwrap_or("[]")).map_err(|e| e.to_string())?;
-        crate::hibernate::quiet(&procs).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
+        crate::hibernate::quiet(&procs, agent).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
     }
 }
 
@@ -139,6 +139,9 @@ struct RunRecord {
     fence: Option<(String, i64)>,
     session_id: String,
     escalate: bool,
+    /// The image's digest as its node started it (#192).
+    #[serde(default)]
+    image_digest: Option<String>,
 }
 
 /// What a supervisor saves as it goes (`ctl/progress.json`), every few seconds: the model spend and
@@ -218,11 +221,16 @@ pub fn manifest_image(m: &Manifest) -> Result<String> {
     };
     match named {
         None => Ok(default),
-        Some(i) if i == crate::image::DEFAULT || i == default || m.zone.images.iter().any(|z| z == i) => Ok(crate::image::effective(i)),
-        Some(i) => bail!(
-            "agent.image {i:?} is not one zone {} may start: it must be the installation's agent image ({default}) or listed in zone.images",
-            m.zone.name
-        ),
+        Some(i) if i == crate::image::DEFAULT || i == default => Ok(crate::image::effective(i)),
+        // One of the zone's: pinned where the entry that allows it is (#192).
+        Some(i) => match wicket_core::image::matching(i, &m.zone.images) {
+            Some((_, Some(pin))) => Ok(wicket_core::image::pinned(i, &pin)),
+            Some((_, None)) => Ok(i.to_string()),
+            None => bail!(
+                "agent.image {i:?} is not one zone {} may start: it must be the installation's agent image ({default}) or listed in zone.images",
+                m.zone.name
+            ),
+        },
     }
 }
 
@@ -351,6 +359,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
     }
+    // What the installation's owner hasn't allowed (#66: the Claude ACP adapter on a subscription),
+    // checked when a run starts or an agent wakes. A supervisor re-attaching to a running box doesn't
+    // start anything.
+    if record.is_none() {
+        crate::settings::check_run(&m, &crate::settings::load()?)?;
+    }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
         Some(_) if record.is_some() => None,
@@ -380,6 +394,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let image = m.program.as_ref().and_then(|p| p.image.clone()).unwrap_or(image);
     let image = image.as_str();
+    // The digest the image must be, if pinned (#192): checked where the box starts, which then
+    // starts it by its id.
+    let image_pin = wicket_core::image::parse(image).map_err(anyhow::Error::msg)?.pin;
+    let image_name = image.to_string();
+    if record.is_none() && wake.is_none() {
+        crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
+    }
     let (workload, workload_kind) = match (&m.agent, &m.program) {
         (Some(a), _) => (a.name.clone(), a.kind.clone()),
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
@@ -420,9 +441,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
     // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent.
-    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code" && a.remote.is_none()) && wrap.is_none();
+    let long_lived =
+        m.agent.as_ref().is_some_and(|a| matches!(a.kind.as_str(), "claude-code" | "acp") && a.remote.is_none()) && wrap.is_none();
     if wake.is_some() && !long_lived {
-        bail!("only a local claude-code agent can be woken");
+        bail!("only a local agent (claude-code or acp) can be woken");
     }
     let dir = data_dir().join("runs").join(&run.0);
     std::fs::create_dir_all(&dir)?;
@@ -739,6 +761,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             run: run.clone(),
             dir: dir.clone(),
             image: image.to_string(),
+            own_digest: Default::default(),
             node: node.as_ref().map(|n| n.target.clone()),
             ssh_key: ssh_key.map(|k| k.to_path_buf()),
             ledger: ledger.clone(),
@@ -749,6 +772,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         })),
         _ => None,
     };
+    let own_digest = spawn_ctx.as_ref().map(|c| c.own_digest.clone());
     let spawner: Option<wicket_proxy::Spawner> = spawn_ctx.clone().map(crate::spawn::spawner);
     // Children its node starts for the box, deciding its spawns there (#164).
     let adopter: Option<crate::noderun::Adopter> = spawn_ctx.map(crate::spawn::adopter);
@@ -930,6 +954,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped) {
         (Some(p), _) => (p, vec![]),
         (None, Some(w)) => (w.plan, w.files),
+        (None, None) if m.agent.as_ref().is_some_and(|a| a.kind == "acp") => {
+            let mut p = wicket_agent::acp_plan(&m, &run).context("an ACP agent's plan")?;
+            if let Some(c) = p.acp.as_mut() {
+                // A wake continues the agent's own session (the id its agent chose, #66).
+                c.resume = session.resume.then(|| session.id.clone()).filter(|s| wicket_agent::acp::valid_session_id(s));
+            }
+            (p, vec![])
+        }
         (None, None) => {
             let mut p = wicket_agent::claude_code_plan(&m, &run, &session);
             if let Some(w) = &wake {
@@ -959,15 +991,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The agent's adapter settings (allowlisted keys only, plus what wicket owns, such as
     // cleanupPeriodDays), in its own config dir. Written after any restore, so wicket's values win.
     let mut state_files: Vec<(String, String)> = vec![];
-    if m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") {
+    if wicket_agent::uses_claude_settings(&m) {
         use base64::Engine;
         let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(&m))?;
         state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
     }
     // The box's own user, as its node runs it.
     let box_user = String::new();
-    let interactive = plan.stdin_task.is_some() || wrap_cwd.is_some();
+    let interactive = plan.stdin_task.is_some() || plan.acp.is_some() || wrap_cwd.is_some();
     let stdin_task = plan.stdin_task.clone();
+    let acp_cfg = plan.acp.clone();
+    // An ACP agent's own command: its runtime, for the quiet-point check (Claude Code is known).
+    let agent_cmd: Vec<String> = if acp_cfg.is_some() { plan.argv.iter().skip(1).cloned().collect() } else { vec![] };
     let name = crate::links::box_name(&run.0);
     let spec = SandboxSpec {
         name: name.clone(),
@@ -1024,6 +1059,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 fence: fence.as_ref().map(|f| (f.agent.clone(), f.generation)),
                 session_id: session.id.clone(),
                 escalate,
+                image_digest: image_pin.clone(),
             },
         )?;
     }
@@ -1137,6 +1173,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     _ => None,
                 },
             })),
+            image_pin: image_pin.clone(),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -1170,6 +1207,33 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             adopt: adopter.clone(),
         })
         .await?;
+        // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
+        // or recorded: in the run's record and the audit, the parent's pin for children that name
+        // no image, and a long-lived agent's next activation.
+        let digest = nb.image_digest.clone().or_else(|| record.as_ref().and_then(|r| r.image_digest.clone())).or_else(|| image_pin.clone());
+        if let Some(d) = &digest {
+            if let Some(mut r) = read_json::<RunRecord>(&dir.join("ctl/run.json")) {
+                if r.image_digest.as_deref() != Some(d.as_str()) {
+                    r.image_digest = Some(d.clone());
+                    write_json(&dir.join("ctl/run.json"), &r)?;
+                }
+            }
+            if nb.image_digest.is_some() {
+                ledger.lock().expect("ledger").audit(
+                    &m.tenant,
+                    Some(&run),
+                    "run.image",
+                    &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
+                )?;
+                println!("  image {image_name} started as {d}");
+            }
+            if let Some(slot) = &own_digest {
+                let _ = slot.set(d.clone());
+            }
+            if let Some(f) = &fence {
+                ledger.lock().expect("ledger").set_agent_image(&f.agent, &wicket_core::image::pinned(&image_name, d))?;
+            }
+        }
         let (mut si, mut so) = (nb.stdin.map(|s| Box::new(s) as Writer), Some(Box::new(nb.stdout) as Reader));
         // A wrapped agent's stdin and stdout are its launcher's: joined to the box's, not read here.
         if let Some(fd) = agent_stdout.take() {
@@ -1272,9 +1336,34 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         use tokio::io::AsyncWriteExt;
         si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
     }
+    // An ACP agent (#66): wicket is its client. A re-attached supervisor carries on with the last
+    // one's client state; otherwise `initialize`, with the task (or a wake's message) queued as the
+    // first prompt.
+    let acp_state = dir.join("ctl/acp.json");
+    let mut acp_audits: u32 = 0;
+    let mut acp: Option<wicket_agent::acp::AcpClient> = None;
+    if let Some(cfg) = acp_cfg {
+        if record.is_some() {
+            let c =
+                std::fs::read(&acp_state).ok().and_then(|b| serde_json::from_slice(&b).ok()).context("the ACP session state of the run")?;
+            acp = Some(c);
+        } else {
+            let (mut c, mut out) = wicket_agent::acp::AcpClient::start(cfg);
+            out.extend(c.prompt(wake.as_ref().map(|w| w.first.as_str()).unwrap_or(&m.task)));
+            if let Some(si) = stdin.as_mut() {
+                use tokio::io::AsyncWriteExt;
+                for l in out {
+                    si.write_all(format!("{l}\n").as_bytes()).await.context("starting the ACP session")?;
+                }
+            }
+            let _ = write_json(&acp_state, &c);
+            acp = Some(c);
+        }
+    }
     let idle = m.agent.as_ref().map(|a| a.idle()).transpose()?.unwrap_or_default();
     // Re-attached: between turns if the box's last output line was a turn's result.
     let mut turn_running = match &record {
+        Some(_) if acp.is_some() => acp.as_ref().is_some_and(|c| c.busy()),
         Some(_) => !crate::transcript::last_line(&dir)
             .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
             .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")),
@@ -1390,6 +1479,64 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if program_tail.len() > 40 {
                             program_tail.remove(0);
                         }
+                    } else if let Some(c) = acp.as_mut() {
+                        let st = c.on_line(&l);
+                        // What the agent asked and what wicket answered, audited up to a cap per run:
+                        // an agent can't flood the ledger with prompts or refused calls.
+                        let mut audit = |kind: &str, body: serde_json::Value| {
+                            acp_audits += 1;
+                            if acp_audits <= ACP_AUDIT_CAP {
+                                if let Ok(lg) = ledger.lock() {
+                                    let _ = lg.audit(&m.tenant, Some(&run), kind, &body);
+                                }
+                            } else if acp_audits == ACP_AUDIT_CAP + 1 {
+                                println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+                            }
+                        };
+                        if let Some(si) = stdin.as_mut() {
+                            use tokio::io::AsyncWriteExt;
+                            for w in &st.write {
+                                if si.write_all(format!("{w}\n").as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        for e in &st.events {
+                            use wicket_agent::acp::SessionEvent as E;
+                            if let Some(r) = wicket_agent::acp::render(e) {
+                                println!("{r}");
+                            }
+                            match e {
+                                E::Started { session: sid, .. } => {
+                                    saw_assistant = true;
+                                    if let (Some(f), Ok(lg)) = (&fence, ledger.lock()) {
+                                        let _ = lg.set_agent_session(&f.agent, f.generation, sid);
+                                    }
+                                }
+                                E::Permission { tool, kind, answer, why } => {
+                                    audit("run.agent_prompt", serde_json::json!({ "tool": tool, "kind": kind, "answer": answer, "why": why }))
+                                }
+                                E::Refused { method } => audit("run.agent_call_refused", serde_json::json!({ "method": method })),
+                                E::TurnDone { .. } if !c.busy() => {
+                                    turn_running = false;
+                                    last_result = std::time::Instant::now();
+                                    if stdin.is_some() && !idle.is_zero() {
+                                        println!("[wicket] turn done; follow-ups for {}: wicket say {} \"…\"", humantime::format_duration(idle), run);
+                                    }
+                                }
+                                E::Failed { error } => {
+                                    // Nothing more can be said to it: end the session.
+                                    if status == "unknown" {
+                                        status = format!("failed (ACP: {})", wicket_agent::clip(error, 200));
+                                    }
+                                    stdin = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !st.write.is_empty() || !st.events.is_empty() {
+                            let _ = write_json(&acp_state, &*c);
+                        }
                     } else {
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
@@ -1489,7 +1636,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     hib_tried = false;
                     println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
-                        if si.write_all(format!("{}\n", wicket_agent::user_message(&text)).as_bytes()).await.is_err() {
+                        if si.write_all(turn_input(&mut acp, &acp_state, &text).as_bytes()).await.is_err() {
                             stdin = None;
                             break;
                         }
@@ -1519,7 +1666,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
                         println!("{t}");
                         if let Some(si) = stdin.as_mut() {
-                            let _ = si.write_all(format!("{}\n", wicket_agent::user_message(&t)).as_bytes()).await;
+                            let _ = si.write_all(turn_input(&mut acp, &acp_state, &t).as_bytes()).await;
                         }
                         notified_msgs = waiting;
                         turn_running = true;
@@ -1534,7 +1681,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     let _ = stopper.unpause().await;
                                     paused = false;
                                 }
-                                match stopper.check_quiet(&box_user).await {
+                                match stopper.check_quiet(&box_user, &agent_cmd).await {
                                     Ok(()) => {
                                         println!("[wicket] quiet point: hibernating agent {}", f.agent);
                                         set_state("hibernating", None);
@@ -1578,7 +1725,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if let (Some(_), false, false, Some(_)) = (&fence, turn_running, hibernating, &stdin) {
                     let _ = stopper.unpause().await;
                     paused = false;
-                    if stopper.check_quiet(&box_user).await.is_ok() {
+                    if stopper.check_quiet(&box_user, &agent_cmd).await.is_ok() {
                         println!("[wicket] timeout after {} while idle: hibernating instead", humantime::format_duration(timeout));
                         set_state("hibernating", None);
                         hibernating = true;
@@ -1999,6 +2146,22 @@ fn write_secret(p: &Path, body: &str) -> Result<()> {
 /// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+}
+
+/// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
+const ACP_AUDIT_CAP: u32 = 1000;
+
+/// What to write to an agent's stdin for a new user turn: a stream-json user message, or for an ACP
+/// agent the `session/prompt` (nothing yet if a turn is running: it is queued until that ends).
+fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text: &str) -> String {
+    match acp {
+        Some(c) => {
+            let out = c.prompt(text);
+            let _ = write_json(state, &*c);
+            out.into_iter().map(|l| format!("{l}\n")).collect()
+        }
+        None => format!("{}\n", wicket_agent::user_message(text)),
+    }
 }
 
 #[cfg(test)]
