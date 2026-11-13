@@ -188,5 +188,9 @@ Not yet:
 `@agentclientprotocol/claude-agent-acp`, which drives the unmodified `claude` through the Agent SDK.
 Whether a Claude subscription may back that is an open question for the owner (research
 [21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)),
-so it is not the default, and wicket's own Claude sessions stay on `kind: claude-code`.
+so it is not the default, and wicket's own Claude sessions stay on `kind: claude-code`. It fails closed: a
+run (or wake) of the profile on a zone whose `llm` is a Claude subscription is refused unless the
+installation sets `acp.allow_subscription_backed_claude_adapter: true` in
+[`/etc/wicket/wicket.yaml`](configuration.md#wicketyaml). An `acp.command` that starts the adapter must
+use the profile, so it can't bypass that check.
 [`examples/acp-claude`](../../examples/acp-claude/) pins it for when that is decided.

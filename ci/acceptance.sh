@@ -337,6 +337,8 @@ ares=$(result_of "$work/acp2.log")
 check "woken, it loaded its own ACP session" '[ "$(af .seen.load.known)" = true ] && grep -q "ACP session mock-session-1 loaded" "$work/acp2.log"'
 check "  a prompt asked during the replay was cancelled, and the next decided afresh (allow_once)" '[ "$(af .seen.answers.during_replay)" = cancelled ] && [ "$(af .seen.answers.after_replay)" = opt-allow_once ]'
 check "  and the operator's text reached it as a prompt" 'af ".seen.prompts[-1]" | grep -q "Again, please."'
+wt 60 run "$(manifest acp-claude)" --image "$IMAGE_TAG" >"$work/acp-claude.log" 2>&1 || true
+check "Claude Code through its ACP adapter on a subscription is refused at run start (not allowed by default)" 'grep -q "acp.allow_subscription_backed_claude_adapter: true" "$work/acp-claude.log" && [ -z "$(run_id_of "$work/acp-claude.log")" ]'
 
 # ---- 3. reconcile: an orphaned box ----
 # Its supervisor killed hard, the box runs on (on this host's own node); reconcile takes its run over

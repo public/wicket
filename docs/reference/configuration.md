@@ -8,6 +8,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | file | read by | what | page |
 |---|---|---|---|
 | `/etc/wicket/wicketd.yaml` | `wicket daemon` | Who may read, run and revoke through the daemon. | [daemon](daemon.md#the-policy-file) |
+| `/etc/wicket/wicket.yaml` (or `$WICKET_CONFIG`) | `wicket run` (each new run and wake) | Installation settings: decisions that belong to the owner, not to a manifest. A missing file means every default; an unreadable or invalid one stops the run. | [below](#wicketyaml) |
 | `/etc/wicket/console.env` | the `wicket-console` unit | `WICKET_CONSOLE_ARGS`: the `wicket serve` options. | [daemon](daemon.md#the-systemd-units) |
 | `/etc/docker/daemon.json` | Docker | gVisor registered as `runsc` with `--host-uds=open`. | [install](../how-to/install-on-a-host.md) |
 | `<data dir>/audit-sinks.yaml` (or `$WICKET_AUDIT_SINKS`) | `wicket run`, `wicket serve`, `wicket audit export` | Where audit records are exported, and how often checkpoints are signed. | [audit](audit.md#the-sinks-file) |
@@ -15,6 +16,14 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile` | The placement backend (static hosts or Vultr) and the money envelope for leases. Without it `request_capacity` is off. | [place nodes on Vultr](../how-to/place-nodes-on-vultr.md#3-leases-for-agents) |
 | `<data dir>/manifests/*.yaml` | `wicket serve` | Manifests the console may start, besides `examples/` of the directory `wicket serve` started in. | [console](console.md#actions) |
 | `<data dir>/release-keys/*.pub` | `wicket self update` | Release keys whose signatures an update accepts. | [update and roll back](../how-to/update-and-roll-back.md) |
+
+### `wicket.yaml`
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `acp.allow_subscription_backed_claude_adapter` | boolean | `false` | Whether Claude Code may run through its ACP adapter (`agent.acp.profile: claude-agent-acp`) on the zone's Claude subscription. The adapter runs the `claude` binary through the Claude Agent SDK, and whether a subscription may back that is the owner's reading of the subscription's terms ([research 21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)). While it is `false`, such a run is refused when it starts, and so is a wake. |
+
+Unknown keys are errors, so a misspelt setting can't silently stay at its default.
 
 ### `placement.yaml`
 
@@ -44,6 +53,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `WICKET_ROOTS` | the identity directory | Where the feed root and authority root are read from while they are offline (`wicket keys certify`, enrolling a node, a feed's new generation). |
 | `WICKET_AUDIT_SINKS` | `<data dir>/audit-sinks.yaml` | The audit sinks file. |
 | `WICKET_PLACEMENT` | `<data dir>/placement.yaml` | The placement file. |
+| `WICKET_CONFIG` | `/etc/wicket/wicket.yaml` | The installation settings file. |
 | `WICKET_VERSIONS` | see [files](files.md#versions) | The versions root in development mode. |
 | `WICKET_TRUST_DOMAIN` | | The trust domain, used only if no issuer key exists yet; must match it after. `wicket identity init` is the usual way. |
 | `WICKET_IDENTITY_TTL` | `600` | Seconds an agent identity is valid (at least 20); it is re-issued at half that. |

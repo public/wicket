@@ -351,6 +351,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let Some(llm) = &m.zone.llm {
         vault.get(&llm.secret).with_context(|| format!("the zone's LLM secret {:?} is not usable", llm.secret))?;
     }
+    // What the installation's owner hasn't allowed (#66: the Claude ACP adapter on a subscription),
+    // checked when a run starts or an agent wakes. A supervisor re-attaching to a running box doesn't
+    // start anything.
+    if record.is_none() {
+        crate::settings::check_run(&m, &crate::settings::load()?)?;
+    }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
         Some(_) if record.is_some() => None,

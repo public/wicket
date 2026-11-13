@@ -59,5 +59,7 @@ woken agent continues its own ACP session.
 
 `acp.profile: claude-agent-acp` runs Claude Code through its ACP adapter, with Claude Code's routes and
 wicket's lockdown options. It is not the default and has not been run against a real subscription:
-whether a subscription may back the adapter is an open question for the owner. See
+whether a subscription may back the adapter is an open question for the owner, and wicket refuses it
+until the installation allows it (`acp.allow_subscription_backed_claude_adapter` in
+[`/etc/wicket/wicket.yaml`](../reference/configuration.md#wicketyaml)). See
 [`examples/acp-claude`](../../examples/acp-claude/). Run Claude Code as `kind: claude-code` meanwhile.

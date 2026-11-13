@@ -31,9 +31,9 @@ wicket run examples/acp-claude/manifest.yaml --workdir path/to/repo
 
 The image has been built with 0.104.1, with the integrity check passing. Against that version, the
 adapter applies the client's `_meta.claudeCode.options` after its own defaults, so `settingSources`,
-`strictMcpConfig` and `model` replace them; it merges `disallowedTools` with its own. Nothing else
-guards against running this example on a subscription: wicket accepts the profile as it does any
-manifest. Running it is the owner's decision.
+`strictMcpConfig` and `model` replace them; it merges `disallowedTools` with its own. wicket refuses to run this example on a subscription unless the installation allows it:
+`acp.allow_subscription_backed_claude_adapter: true` in `/etc/wicket/wicket.yaml`
+([configuration](../../docs/reference/configuration.md#wicketyaml)), which is the owner's decision.
 
 Not done:
 

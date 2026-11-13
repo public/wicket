@@ -70,6 +70,17 @@ pub fn control_file(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether an ACP agent is Claude Code through its ACP adapter, which runs the `claude` binary through
+/// the Claude Agent SDK: by wicket's profile for it, or by a command that starts the adapter (its
+/// package or binary, under its current or earlier names).
+pub fn is_claude_adapter(spec: &wicket_core::AcpSpec) -> bool {
+    spec.profile.as_deref() == Some("claude-agent-acp")
+        || spec.command.iter().any(|c| {
+            let c = c.to_ascii_lowercase();
+            ["claude-agent-acp", "claude-code-acp"].iter().any(|n| c.contains(n))
+        })
+}
+
 /// How wicket starts or continues an ACP session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AcpConfig {
@@ -847,6 +858,21 @@ mod tests {
         c.on_line(&json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s1", "update": { "sessionUpdate": "tool_call", "toolCallId": "k", "title": "t", "kind": "switch_mode" } } }).to_string());
         let (o, _) = ask(&mut c, 24, json!({ "toolCallId": "k" }), &ALL);
         assert_eq!(o["optionId"], "r1");
+    }
+
+    #[test]
+    fn the_claude_adapter_is_recognised_by_profile_or_command() {
+        let spec = |cmd: &[&str], profile: Option<&str>| wicket_core::AcpSpec {
+            command: cmd.iter().map(|s| s.to_string()).collect(),
+            profile: profile.map(String::from),
+        };
+        assert!(is_claude_adapter(&spec(&["my-agent"], Some("claude-agent-acp"))));
+        assert!(is_claude_adapter(&spec(&["claude-agent-acp"], None)));
+        assert!(is_claude_adapter(&spec(&["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.104.1"], None)));
+        assert!(is_claude_adapter(&spec(&["node", "/usr/local/lib/node_modules/@zed-industries/claude-code-acp/dist/index.js"], None)));
+        assert!(is_claude_adapter(&spec(&["/opt/Claude-Agent-ACP"], None)));
+        assert!(!is_claude_adapter(&spec(&["gemini", "--experimental-acp"], None)));
+        assert!(!is_claude_adapter(&spec(&["python3", "/workspace/agent.py"], None)));
     }
 
     #[test]
