@@ -401,6 +401,9 @@ pub enum Msg {
         run: String,
         code: i32,
         result: Option<String>,
+        /// Why the node stopped it, if it did (#153: its authority expired).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// An enforcement event (`wicket_proxy::Event`), for the operator's console.
     Event {

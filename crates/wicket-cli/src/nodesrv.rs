@@ -221,6 +221,8 @@ struct Node {
     /// an answer (by message id).
     queue: crate::nodesecrets::Asks,
     requeued: Mutex<HashMap<u64, String>>,
+    /// Why this node stopped a box itself, by run (#153), for its exit.
+    stopped: Mutex<HashMap<String, String>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
 }
@@ -565,6 +567,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         slices,
         queue: crate::nodesecrets::Asks::open(&node_root),
         requeued: Mutex::new(HashMap::new()),
+        stopped: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
@@ -641,6 +644,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                     }
                     eprintln!("[node] {run}: its authority expired at {until} ms; stopping the box");
                     n.audit_note(&run, "node.authority_expired", serde_json::json!({ "until_ms": until }));
+                    n.stopped.lock().expect("stopped").insert(run.clone(), format!("its authority expired at {until} ms"));
                     let _ = n.docker.unpause(&name).await;
                     let _ = n.docker.kill(&name).await;
                 }
@@ -987,7 +991,8 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                     );
                 }
                 if let Some((code, result)) = exited {
-                    node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result }));
+                    let reason = node.stopped.lock().expect("stopped").get(&run).cloned();
+                    node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result, reason }));
                 }
             }
             Msg::Ack { stream, upto } => {
@@ -1949,7 +1954,8 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.queue.drop_run(run);
     n.llms.lock().expect("llms").remove(run);
     eprintln!("[node] {run}: box exited ({code})");
-    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result }));
+    let reason = n.stopped.lock().expect("stopped").get(run).cloned();
+    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason }));
 }
 
 /// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
@@ -2240,6 +2246,7 @@ mod tests {
             slices: crate::nodesecrets::Slices::new(&i.dir).unwrap(),
             queue: crate::nodesecrets::Asks::open(&i.dir),
             requeued: Mutex::new(HashMap::new()),
+            stopped: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
         })
     }

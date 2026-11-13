@@ -904,7 +904,16 @@ async fn on_frame(
                     let _ = t.send(error);
                 }
             }
-            Msg::Exited { run, code, result } if run == sh.run.0 => {
+            Msg::Exited { run, code, result, reason } if run == sh.run.0 => {
+                if let Some(why) = &reason {
+                    println!("[wicket] node {} stopped the box: {why}", sh.node);
+                    let _ = sh.ledger.lock().expect("ledger").audit(
+                        &sh.tenant,
+                        Some(&sh.run),
+                        "run.stopped_by_node",
+                        &serde_json::json!({ "node": sh.node, "code": code, "why": why }),
+                    );
+                }
                 if let Some(r) = result {
                     let out = sh.dir.join("workspace/out");
                     let _ = std::fs::create_dir_all(&out);
