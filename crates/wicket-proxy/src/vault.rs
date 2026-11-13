@@ -87,6 +87,13 @@ impl Vault {
         Ok(v.trim().to_string())
     }
 
+    /// The file a linked secret refers to (None for a stored secret).
+    pub fn linked_file(&self, name: &str) -> Option<PathBuf> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        spec.get("file")?.as_str().map(PathBuf::from)
+    }
+
     /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
     /// the Claude login's `claudeAiOauth`, for its non-secret fields: scopes, subscription type).
     /// None for a stored secret or a whole-file link.

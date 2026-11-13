@@ -320,6 +320,7 @@ mod tests {
         assert_eq!(route("api.example.com", &z, &[], ca, 1_000), Route::Terminate);
         assert!(matches!(route("secret.example.com", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("injects")));
         let swap = crate::CredentialSwap {
+            box_bearers: false,
             name: "login".into(),
             host: "api.example.com".into(),
             placeholder: "p".into(),

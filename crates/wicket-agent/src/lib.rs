@@ -211,6 +211,49 @@ fn placeholder_login(login_placeholder: &str, tag: &str, login_meta: &Value) -> 
     ("claude/.credentials.json".into(), serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default())
 }
 
+/// What a remote session's adapter may know of the login, from the host (never a credential):
+/// `linked` is the object holding the linked token in its file, `file` that file. For claude-code:
+/// the login's scopes and plan, and its account (`oauthAccount`).
+pub fn remote_login_meta(m: &Manifest, linked: Option<&Value>, file: Option<&std::path::Path>) -> Value {
+    match m.agent.as_ref().map(|a| a.kind.as_str()) {
+        Some("claude-code") => {
+            let mut meta = serde_json::json!({});
+            if let Some(o) = linked {
+                for k in ["scopes", "subscriptionType", "rateLimitTier"] {
+                    if let Some(v) = o.get(k) {
+                        meta[k] = v.clone();
+                    }
+                }
+            }
+            if let Some(a) = file.and_then(claude_code_account) {
+                meta["oauthAccount"] = a;
+            }
+            meta
+        }
+        _ => Value::Null,
+    }
+}
+
+/// The claude.ai account a Claude Code login belongs to (its config's `oauthAccount`: account and
+/// organization ids, plan, roles; no credential), next to the login's credentials file: Remote
+/// Control won't start without it. `~/.claude/.credentials.json` has it in `~/.claude.json`; a
+/// `CLAUDE_CONFIG_DIR` keeps both in one directory. The holder's full name is left out.
+pub fn claude_code_account(credentials: &std::path::Path) -> Option<Value> {
+    let dir = credentials.parent()?;
+    let mut candidates = vec![dir.join(".claude.json")];
+    if dir.file_name().is_some_and(|n| n == ".claude") {
+        candidates.insert(0, dir.parent()?.join(".claude.json"));
+    }
+    for c in candidates {
+        let Some(v) = std::fs::read(&c).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
+        if let Some(Value::Object(mut a)) = v.get("oauthAccount").cloned() {
+            a.remove("fullName");
+            return Some(Value::Object(a));
+        }
+    }
+    None
+}
+
 /// The account login's placeholder for a run (what the box's credentials file holds).
 pub fn login_placeholder(run: &RunId) -> String {
     format!("sk-ant-oat01-wicket-placeholder-{}", run.0.replace('_', "-"))
@@ -253,11 +296,17 @@ pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &V
     let login_placeholder = login_placeholder(run);
     let mut files = vec![placeholder_login(&login_placeholder, &tag, login_meta)];
     let mcp: Value = serde_json::from_str(WICKET_MCP).unwrap_or_default();
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "hasCompletedOnboarding": true,
+        // The owner chose Remote Control by asking for a remote session: no one-time prompt, which
+        // a box without a terminal can't answer.
+        "remoteDialogSeen": true,
         "projects": { WORKSPACE: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
         "mcpServers": mcp["mcpServers"],
     });
+    if let Some(a) = login_meta.get("oauthAccount").filter(|a| a.is_object()) {
+        config["oauthAccount"] = a.clone();
+    }
     files.push(("claude/.claude.json".into(), serde_json::to_vec_pretty(&config).unwrap_or_default()));
     files.push(("claude/CLAUDE.md".into(), format!("{SANDBOX_NOTICE}\n{RC_NOTICE}\n").into_bytes()));
     let argv = [

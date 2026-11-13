@@ -382,6 +382,8 @@ struct NodeRelay {
     run: String,
     zone: Arc<wicket_core::CompiledZone>,
     ca: Option<Arc<NodeCa>>,
+    /// Hosts the control host swaps a credential in for (routing only): always forwarded.
+    swaps: Vec<wicket_proxy::CredentialSwap>,
 }
 
 impl Relay for NodeRelay {
@@ -393,7 +395,7 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        wicket_proxy::decide::route(host, &spec, &[], self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
+        wicket_proxy::decide::route(host, &spec, &self.swaps, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {
@@ -1833,7 +1835,19 @@ async fn serve_box(
         attribute: None,
         identity: None,
         spawner: None,
-        swaps: vec![],
+        // Routing only: hosts the control host swaps a credential in for are forwarded to it (no
+        // placeholder or value here, so nothing is ever swapped on the node).
+        swaps: bs
+            .swap_hosts
+            .iter()
+            .map(|h| wicket_proxy::CredentialSwap {
+                box_bearers: false,
+                name: "the control host's".into(),
+                host: h.clone(),
+                placeholder: String::new(),
+                real: wicket_proxy::SwapSource::Value(String::new()),
+            })
+            .collect(),
         boxes: None,
         capacity: None,
         fence: None,
@@ -1849,7 +1863,7 @@ async fn serve_box(
         clock: node.clock.clone(),
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
-    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca });
+    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, swaps: ctx.swaps.clone() });
     // The model proxy (#151): the run's checks here (allowed routes and models, server tools, the
     // budget), then on to the run's own proxy on the control host, which adds the credential, checks
     // again and is the one that counts the call. Its events stay here (the control host's are shown).
@@ -2109,6 +2123,7 @@ mod tests {
                 llm_prior: (0, 0, 0),
                 output_cap: 64 << 20,
                 output_stop: false,
+                swap_hosts: vec![],
             },
             name: format!("wicket-{run}"),
             started_ms: 0,

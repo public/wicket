@@ -373,7 +373,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
     // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
-    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") && wrap.is_none();
+    // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent.
+    let long_lived = m.agent.as_ref().is_some_and(|a| a.kind == "claude-code" && a.remote.is_none()) && wrap.is_none();
     if wake.is_some() && !long_lived {
         bail!("only a local claude-code agent can be woken");
     }
@@ -676,10 +677,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // login's non-secret fields go in, from the file the zone's secret links to.
         None => {
             let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
-            let meta = vault
-                .linked_object(secret)
-                .map(|o| serde_json::json!({ "scopes": o.get("scopes"), "subscriptionType": o.get("subscriptionType"), "rateLimitTier": o.get("rateLimitTier") }))
-                .unwrap_or(serde_json::Value::Null);
+            let meta = wicket_agent::remote_login_meta(&m, vault.linked_object(secret).as_ref(), vault.linked_file(secret).as_deref());
             Some(wicket_agent::remote_plan(&m, &run, &meta).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
     };
@@ -692,6 +690,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 .hosts(&secret)
                 .into_iter()
                 .map(|host| wicket_proxy::CredentialSwap {
+                    box_bearers: true,
                     name: "account login".into(),
                     host,
                     placeholder: w.login_placeholder.clone(),
@@ -702,6 +701,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(w) => {
             let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
             let mut v = vec![wicket_proxy::CredentialSwap {
+                box_bearers: false,
                 name: "claude login".into(),
                 host: "api.anthropic.com".into(),
                 placeholder: w.login_placeholder.clone(),
@@ -709,6 +709,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }];
             if let Some(t) = &w.session_token {
                 v.push(wicket_proxy::CredentialSwap {
+                    box_bearers: false,
                     name: "remote-control session".into(),
                     host: "api.anthropic.com".into(),
                     placeholder: w.session_placeholder.clone(),
@@ -977,6 +978,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm_prior: llm.spent_total(),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
+            swap_hosts: ctx.swaps.iter().map(|s| s.host.clone()).collect(),
             durable: match long_lived {
                 true => m
                     .zone

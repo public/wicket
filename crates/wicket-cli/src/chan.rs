@@ -142,6 +142,12 @@ pub struct BoxStart {
     pub output_cap: u64,
     #[serde(default)]
     pub output_stop: bool,
+    /// Hosts whose credential the control host swaps in for the box (a remote session's login,
+    /// #169): the node forwards them to the run's egress proxy, never terminating them itself, so
+    /// the swap happens where the secret is. Names only. An older node ignores it and terminates
+    /// them, so the box's placeholder never reaches the host and the request fails, closed.
+    #[serde(default)]
+    pub swap_hosts: Vec<String>,
 }
 
 fn default_output_cap() -> u64 {

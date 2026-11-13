@@ -779,6 +779,10 @@ impl Egress {
                         injected.push(real);
                         tracing::debug!(host, swap = %sw.name, "credential swapped");
                     }
+                    None if self.ctx.swaps.iter().any(|s| s.box_bearers && host_matches(&s.host, host)) && auth.starts_with("Bearer ") => {
+                        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(auth)?);
+                        tracing::debug!(host, "the box's own bearer passed (box_bearers)");
+                    }
                     None => tracing::debug!(host, "box-supplied authorization dropped (not a known placeholder)"),
                 }
             }
@@ -904,6 +908,7 @@ mod tests {
         assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
         // A swap from the vault is bound the same way, whatever host the swap names.
         let swap = |host: &str| crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: host.into(),
             placeholder: "ph-123".into(),
@@ -1019,6 +1024,7 @@ mod tests {
     async fn plain_http_to_a_credentialed_host_is_refused() {
         use http_body_util::BodyExt;
         let swap = crate::CredentialSwap {
+            box_bearers: false,
             name: "t".into(),
             host: "api.github.com".into(),
             placeholder: "ph-123".into(),
