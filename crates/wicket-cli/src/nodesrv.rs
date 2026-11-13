@@ -229,6 +229,10 @@ struct Node {
     edge: gw::EdgeQueue,
     /// Why this node stopped a box itself, by run (#153), for its exit.
     stopped: Mutex<HashMap<String, String>>,
+    /// Why each box that has exited ended (#185), for its exit (and a resumed connection's).
+    causes: Mutex<HashMap<String, String>>,
+    /// Each running box's cgroup, memory as sampled, and whether its agent was warned (#185).
+    mem: Mutex<HashMap<String, BoxMem>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
 }
@@ -600,6 +604,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         edge: gw::EdgeQueue::open(&node_root),
         requeued: Mutex::new(HashMap::new()),
         stopped: Mutex::new(HashMap::new()),
+        causes: Mutex::new(HashMap::new()),
+        mem: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
@@ -649,6 +655,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
             // Stopped once each: the kill is in flight until the box's exit is read.
             let mut stopped: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut tick5 = 0u64;
             loop {
                 t.tick().await;
                 let now = (n.clock)();
@@ -667,6 +674,12 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                         .filter_map(|(run, name)| r.authority_until(&run).filter(|u| *u <= now).map(|u| (run, name, u)))
                         .collect()
                 };
+                // Each box's memory, every 5 s (#185): its peak for an out-of-memory cause, and a
+                // warning to its agent near the limit.
+                tick5 = tick5.wrapping_add(1);
+                if tick5.is_multiple_of(5) {
+                    sample_memory(&n).await;
+                }
                 // Secrets past their expiry are dropped (#152); their use already ended.
                 n.secrets.sweep();
                 stopped.retain(|r| n.boxes.lock().expect("boxes").get(r).is_some_and(|b| b.exited.is_none()));
@@ -1044,7 +1057,7 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
                 // Tool calls that needed a human while it was away (#164): made now.
                 gw::replay(node, &run);
                 if let Some((code, result)) = exited {
-                    let reason = node.stopped.lock().expect("stopped").get(&run).cloned();
+                    let reason = node.causes.lock().expect("causes").get(&run).cloned();
                     node.send_to(gen, Frame::Msg(Msg::Exited { run, code, result, reason }));
                 }
             }
@@ -1070,6 +1083,7 @@ async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Frame) -> Resu
             Msg::Kill { run } => {
                 let name = node.boxes.lock().expect("boxes").get(&run).map(|b| b.name.clone());
                 if let Some(name) = name {
+                    node.stopped.lock().expect("stopped").entry(run.clone()).or_insert_with(|| "its control host stopped it".into());
                     // A paused (idle) box is unpaused first, so it can be killed.
                     let _ = node.docker.unpause(&name).await;
                     let _ = node.docker.kill(&name).await;
@@ -2012,6 +2026,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             };
             if let Some(fr) = frame {
                 n.send_run(&run, fr);
+                n.stopped.lock().expect("stopped").entry(run.clone()).or_insert_with(|| "its image predates wicket's stdin socket".into());
                 let _ = n.docker.kill(&name).await;
             }
         }));
@@ -2079,6 +2094,7 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
             c = n.docker.wait(&box_name) => c.unwrap_or(-1),
             _ = &mut deadline => {
                 eprintln!("[node] {run}: past its timeout; stopping the box");
+                n.stopped.lock().expect("stopped").entry(run.clone()).or_insert_with(|| "past its timeout (the node's backstop)".into());
                 let _ = n.docker.unpause(&box_name).await;
                 let _ = n.docker.kill(&box_name).await;
                 n.docker.wait(&box_name).await.unwrap_or(-1)
@@ -2219,6 +2235,11 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             if let Some(f) = frame {
                 n.send_run(&run, f);
             }
+            n.stopped
+                .lock()
+                .expect("stopped")
+                .entry(run.clone())
+                .or_insert_with(|| format!("its output passed limits.output ({cap} bytes; on_output_full: stop)"));
             let _ = n.docker.kill(&name).await;
         }
         if eof {
@@ -2267,6 +2288,23 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
         );
         n.ship_audit();
     }
+    // Why it ended (#185): wicket's own stop, the OOM killer, the runtime, or a signal; read before
+    // the box is removed.
+    let info = n.docker.exit_info(box_name).await.ok().flatten();
+    let mem = n.mem.lock().expect("mem").remove(run).map(|(_, m, _)| m);
+    let limit = n.boxes.lock().expect("boxes").get(run).map(|b| b.memory_mib << 20).filter(|l| *l > 0);
+    let stopped = n.stopped.lock().expect("stopped").get(run).cloned();
+    let cause = crate::exitcause::describe(code, stopped.as_deref(), info.as_ref(), mem.as_ref(), limit);
+    if let Some(c) = &cause {
+        eprintln!("[node] {run}: {c}");
+        n.audit_note(
+            run,
+            "box.exit_cause",
+            serde_json::json!({ "code": code, "cause": c, "oom_killed": info.as_ref().is_some_and(|i| i.oom_killed),
+                "memory_peak": mem.map(|m| m.peak), "memory_limit": mem.and_then(|m| m.max).or(limit) }),
+        );
+        n.causes.lock().expect("causes").insert(run.to_string(), c.clone());
+    }
     let _ = n.docker.remove(box_name).await;
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
@@ -2279,8 +2317,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.replica.lock().expect("replica").drop_local(run);
     n.llms.lock().expect("llms").remove(run);
     eprintln!("[node] {run}: box exited ({code})");
-    let reason = n.stopped.lock().expect("stopped").get(run).cloned();
-    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason }));
+    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause }));
 }
 
 /// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
@@ -2468,6 +2505,39 @@ pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 
+/// A box's cgroup directory (once found), its memory as sampled, and whether its agent was warned.
+type BoxMem = (Option<std::path::PathBuf>, crate::exitcause::Mem, bool);
+
+/// Samples every running box's memory from its cgroup (#185), keeping its peak, and warns its agent
+/// once it nears its limit (an event to its run, which tells the agent).
+async fn sample_memory(n: &Arc<Node>) {
+    let running: Vec<(String, String)> =
+        n.boxes.lock().expect("boxes").iter().filter(|(_, b)| b.exited.is_none()).map(|(r, b)| (r.clone(), b.name.clone())).collect();
+    for (run, name) in running {
+        let known = n.mem.lock().expect("mem").get(&run).and_then(|e| e.0.clone());
+        let dir = match known {
+            Some(d) => Some(d),
+            None => match n.docker.pid(&name).await {
+                Ok(pid) if pid > 0 => crate::exitcause::cgroup_of(pid),
+                _ => None,
+            },
+        };
+        let Some(dir) = dir else { continue };
+        let (prev, warned) = n.mem.lock().expect("mem").get(&run).map(|e| (e.1, e.2)).unwrap_or_default();
+        let Some(m) = crate::exitcause::sample(&dir, prev) else { continue };
+        let (warned2, text) = crate::exitcause::pressure(&m, warned);
+        n.mem.lock().expect("mem").insert(run.clone(), (Some(dir), m, warned2));
+        if let Some(text) = text {
+            eprintln!("[node] {run}: memory at {} of {}", crate::exitcause::human(m.current), crate::exitcause::human(m.max.unwrap_or(0)));
+            n.audit_note(&run, "box.memory_pressure", serde_json::json!({ "current": m.current, "max": m.max, "peak": m.peak }));
+            let ev = wicket_proxy::Event::Box { what: "memory_pressure".into(), detail: text };
+            if let Ok(event) = serde_json::to_value(&ev) {
+                n.send_run(&run, Frame::Msg(Msg::Event { run: run.clone(), event }));
+            }
+        }
+    }
+}
+
 /// A box's model spend as its node counted it (#152), beside its record.
 const SPEND_FILE: &str = "node-spend.json";
 
@@ -2576,6 +2646,8 @@ mod tests {
             edge: gw::EdgeQueue::open(&i.dir),
             requeued: Mutex::new(HashMap::new()),
             stopped: Mutex::new(HashMap::new()),
+            causes: Mutex::new(HashMap::new()),
+            mem: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
         })
     }

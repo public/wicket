@@ -86,7 +86,8 @@ recipient's zone lists the sender's in `accept_from`.
 ## `await_message`
 
 Waits for the next message to this agent, from its parent, a child or a permitted peer, with the
-sender's identity verified by wicket. A child also sends a final `run_finished` message when it
+sender's identity verified by wicket. A child also sends a final `run_finished` message (its `status`, a
+`cause` when its box ended abnormally, e.g. out of memory, and its `result`) when it
 ends.
 
 | argument | type | default |

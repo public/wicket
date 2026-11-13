@@ -12,6 +12,7 @@ mod ci_update;
 mod daemon;
 mod doctor;
 mod enrol;
+mod exitcause;
 mod hibernate;
 mod image;
 mod links;

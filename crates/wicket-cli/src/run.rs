@@ -1633,8 +1633,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if revoked.load(std::sync::atomic::Ordering::SeqCst) {
         status = "revoked".into();
     }
+    // Why the box ended, as its node saw it (#185): out of memory, wicket's own stop, a signal.
+    let cause = stopper.0.exit_cause();
     if status == "unknown" {
-        status = if exit.success() { "succeeded".into() } else { format!("failed ({exit})") };
+        status = match (exit.success(), &cause) {
+            (true, _) => "succeeded".into(),
+            (false, Some(c)) => format!("failed ({exit}; {c})"),
+            (false, None) => format!("failed ({exit})"),
+        };
     }
     if let Some(f) = &fence {
         ledger.lock().expect("ledger").record_agent_usage(&f.agent, f.generation, &usage())?;
@@ -1765,9 +1771,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let (Some(i), Some(p)) = (identity.as_ref().map(|c| c.current()), &parent_run) {
         let output: String = program_tail.join("\n").chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
         let body = if is_program {
-            serde_json::json!({ "status": status, "result": result, "output_tail": output })
+            serde_json::json!({ "status": status, "cause": cause, "result": result, "output_tail": output })
         } else {
-            serde_json::json!({ "status": status, "result": result })
+            serde_json::json!({ "status": status, "cause": cause, "result": result })
         };
         match ctx.send_message(p, "run_finished", body) {
             Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
@@ -1795,7 +1801,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // Pending requests are withdrawn by run_ended below; report them first.
     let summary = serde_json::json!({
-        "status": status, "seconds": started.elapsed().as_secs(),
+        "status": status, "cause": cause, "seconds": started.elapsed().as_secs(),
         "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
         "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "cache_read_input_tokens": llm.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
@@ -1924,6 +1930,7 @@ fn print_event(ev: &Event) {
             }
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
+        Event::Box { what, detail } => println!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
         Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
             println!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
