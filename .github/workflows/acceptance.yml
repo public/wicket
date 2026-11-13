@@ -55,6 +55,11 @@ jobs:
       - name: Build the agent image
         run: target/debug/wicket image --tag wicket/claude-code:acc
       - name: Acceptance, development mode, with a local node
+        # The node e2e flow's long timings (#219): a 165 s cut, past the old 150 s offline window, and
+        # a 300 s authority. Pull requests and local gates use its short defaults.
+        env:
+          CUT: "165"
+          AUTH: "300"
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh --nodes local
       - name: Acceptance, as an operator against a fresh install
         run: IMAGE=wicket/claude-code:acc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/install-acceptance.sh target/debug/wicket ubuntu:24.04
