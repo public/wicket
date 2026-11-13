@@ -642,7 +642,7 @@ pub fn describe_archive(archive: &Path, stage: &Path) -> Result<Describe> {
     if !out.status.success() {
         bail!("the build's describe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok(serde_json::from_slice(&out.stdout).context("the build's describe")?)
+    serde_json::from_slice(&out.stdout).context("the build's describe")
 }
 
 /// What accepted a CI build, as its version's manifest and the audit record it.
