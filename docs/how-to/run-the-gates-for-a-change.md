@@ -27,7 +27,10 @@ ci/affected.py --worktree
 - **End-to-end suites.** `ci/affected.map` maps paths to suites, and is reviewed like code. A
   change to `wicket-fwd` or the agent image runs the smoke test. Hibernation and state code runs
   `hibernate.sh` (both modes) and `restore.sh`. Node code runs `node-e2e.sh --local` and
-  `acceptance.sh --nodes local`. Update code runs `update.sh`.
+  `acceptance.sh --nodes local`. Update code runs `update.sh`. A CLI command group under
+  `crates/wicket-cli/src/cmd/` runs the CLI reference check plus the suites that call its commands.
+  The exceptions are `run`, `dev`, `secret`, `identity`, `audit` and `image`: nearly every suite calls
+  them, so changing one of those groups runs every suite.
 - **Docs only.** A change to Markdown, `docs/`, `experiments/` or `refs/` runs the doc checks only:
   `check-public.py`, the Markdown links, and, for `docs/reference/cli.md`, the CLI reference check.
 - **Everything.** These select every crate and suite:

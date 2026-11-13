@@ -141,6 +141,18 @@ def select(files, dirs, deps, rules):
     return crates, suites, why
 
 
+def cargo_args(crates):
+    """Cargo's package arguments for `crates`: `--workspace` for all, `-p` per crate, or none."""
+    if crates == ALL:
+        return "--workspace"
+    return " ".join(f"-p {c}" for c in sorted(crates))
+
+
+def doc_args(crates):
+    """The same for doctests: only crates with a library (`cargo test --doc -p` refuses others)."""
+    return "--workspace" if crates == ALL else cargo_args(crates & LIBS)
+
+
 def git(*args):
     return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout
 
@@ -209,6 +221,8 @@ def self_test():
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
     case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, ALL)
+    case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"cli-ref", "update"})
+    case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, ALL)
     case("the lockfile", ["Cargo.lock"], ALL, ALL)
     case("the toolchain", ["rust-toolchain.toml"], ALL, ALL)
     case("a crate manifest", ["crates/wicket-fwd/Cargo.toml"], ALL, ALL)
@@ -227,6 +241,16 @@ def self_test():
     for pat, _, _ in rules:
         if "/" in pat and not any(ch in pat for ch in "*?[") and not (ROOT / pat).exists():
             fails.append(f"ci/affected.map names {pat}, which doesn't exist")
+    # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
+    for files, want_args, want_doc in (
+        (["crates/wicket-cli/src/chan.rs"], "-p wicket-cli", ""),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", "-p wicket-fwd -p wicket-proxy"),
+        (["docs/x.md"], "", ""),
+        (["Cargo.lock"], "--workspace", "--workspace"),
+    ):
+        c, _, _ = select(files, dirs, deps, rules)
+        if (cargo_args(c), doc_args(c)) != (want_args, want_doc):
+            fails.append(f"cargo arguments for {files}: {cargo_args(c)!r} / {doc_args(c)!r}, want {want_args!r} / {want_doc!r}")
     # Every file a crate reads from outside its directory is mapped to that crate.
     for crate, path in out_of_crate_inputs(dirs):
         probe = path if (ROOT / path).is_file() else path + "/x"
@@ -283,6 +307,9 @@ def main(argv):
             f.write(f"all_crates={'true' if crates == ALL else 'false'}\n")
             # The selected crates with a library: doctests (`cargo test --doc` refuses a crate without one).
             f.write(f"doc_crates={'' if crates == ALL else docs}\n")
+            # Cargo's package arguments, ready to use; empty when nothing is selected.
+            f.write(f"args={cargo_args(crates)}\n")
+            f.write(f"doc_args={doc_args(crates)}\n")
             # The Rust job: for the selected crates, and for the CLI reference check (which builds wicket-cli).
             rust = crates == ALL or bool(crates) or suites == ALL or "cli-ref" in suites
             f.write(f"rust={'true' if rust else 'false'}\n")
