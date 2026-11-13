@@ -90,3 +90,23 @@ pub(crate) fn zone_view(zone: &wicket_core::ZoneSpec, json: bool) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    fn zone(body: &str) -> wicket_core::ZoneSpec {
+        wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, {body} }}\n")).unwrap().zone
+    }
+
+    /// #20: the zone view warns about each wildcard reach rule, in text and JSON, and not otherwise.
+    #[test]
+    fn the_zone_view_warns_about_wildcards() {
+        let z = zone("reach: [{ host: api.example.com }, { host: '*.cdn.example' }], wildcards: { max_names: 5 }");
+        let text = super::zone_view(&z, false);
+        assert!(text.contains("WARNING: wildcard reach rule *.cdn.example") && text.contains("at most 5 names"), "{text}");
+        assert!(!text.contains("WARNING: wildcard reach rule api.example.com"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&super::zone_view(&z, true)).unwrap();
+        assert_eq!(json["warnings"].as_array().map(|a| a.len()), Some(1), "{json}");
+        let exact = super::zone_view(&zone("reach: [{ host: api.example.com }]"), false);
+        assert!(!exact.contains("WARNING"), "{exact}");
+    }
+}
