@@ -1251,7 +1251,10 @@ mod tests {
         let spec = llm.ctx.zone.llm.clone().unwrap();
         let f = llm.filter(Some(&spec), &parts("POST", "/v1/messages?beta=true", None), bytes::Bytes::from_static(body)).ok().unwrap();
         let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
-        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        // (Sorted: JSON objects keep their insertion order when serde_json's preserve_order is on,
+        // which cedar-policy turns on for the whole binary, #51.)
+        let mut keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        keys.sort();
         assert_eq!(keys, ["max_tokens", "messages", "model", "tools"], "{out}");
         let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["a", "b", "bash"]);
