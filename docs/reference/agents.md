@@ -173,10 +173,16 @@ A long-lived ACP agent hibernates like any other. wicket records the session id 
 wake continues that session: `session/resume` if the agent offers it, else `session/load`, else a new
 session. The agent's state (its `$HOME` and config) is in the bundle like Claude Code's.
 
-Not yet: the ACP v2 draft, MCP-over-ACP, holding a prompt for an operator to answer, and ACP agents
-started by a node on its own (#164: those children are Claude Code). Answers are given by the
-supervising `wicket run`: while the control host can't reach the box's node, an ACP agent's permission
-request waits. Its gated requests don't, because the node decides those.
+A child an ACP agent starts with `spawn` is an ACP agent too, and starts from the control host: a node
+on its own (#164) queues the request until the control host is back, instead of starting it there.
+
+Not yet:
+
+- the ACP v2 draft, MCP-over-ACP, and holding a prompt for an operator to answer;
+- an ACP agent on another machine's node, which is untested. Answers come from the supervising
+  `wicket run`, so while the control host can't reach that node, an ACP agent's permission requests
+  wait (its gated requests don't: the node decides those). And a node keeps only so much of a box's
+  output while disconnected: a JSON-RPC message lost to that cap would leave the session waiting.
 
 **The Claude adapter.** `acp.profile: claude-agent-acp` runs Claude Code through
 `@agentclientprotocol/claude-agent-acp`, which drives the unmodified `claude` through the Agent SDK.

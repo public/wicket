@@ -25,9 +25,15 @@ What the profile sets, beyond the generic ACP posture:
 Build the image (the adapter's version and registry integrity are pinned in the Dockerfile), then run:
 
 ```sh
-docker build -t wicket/claude-code-acp:poc examples/acp-claude
+docker build -t wicket/claude-code-acp:poc examples/acp-claude   # --network host where builds have no DNS
 wicket run examples/acp-claude/manifest.yaml --workdir path/to/repo
 ```
+
+The image has been built with 0.104.1, with the integrity check passing. Against that version, the
+adapter applies the client's `_meta.claudeCode.options` after its own defaults, so `settingSources`,
+`strictMcpConfig` and `model` replace them; it merges `disallowedTools` with its own. Nothing else
+guards against running this example on a subscription: wicket accepts the profile as it does any
+manifest. Running it is the owner's decision.
 
 Not done:
 
