@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -46,6 +46,11 @@ const fetch = async (path, opts) => {
   if (path === "/api/state") return reply(state);
   if (path === "/api/action/begin") return reply({ action: nextAction, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
   if (path === "/api/action/finish") return reply({ ok: "done" });
+  if (path === "/api/manifests/check") return reply({ valid: true, sha256: "bb", saved_sha256: "aa", diff: { widens: true, widening: ["reach api.example.com"], changes: ["+ reach x"] } });
+  if (path.startsWith("/api/manifests/")) return reply({ root: "manifests", name: "a.yaml", yaml: "task: <b>hi</b>\n", valid: true, writable: true, history: [{ version: "1-aa.yaml", saved_before: 1, sha256_prefix: "aa" }],
+    fields: [{ path: "task", value: "<b>hi</b>", default: false }, { path: "zone.isolation", value: "gvisor", default: true }],
+    grants: { task: "<b>hi</b>", image: { Ok: "img" }, isolation: "Gvisor", unlisted_hosts: "escalate", reach: [], hosts: [], forbid: [], inject: [{ secret: "gh", host: "h", header: "authorization", secret_set: false, bound_to_host: true }], volumes: [], limits: {}, org_policy: null } });
+
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
   if (path.endsWith("/authority")) return reply(authority);
   if (path.startsWith("/api/explain/")) return reply(explained);
@@ -156,4 +161,19 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   ids["detail-close"].listeners.click();
   assert.strictEqual(ids.detail.hidden, true);
   console.log("console authority views: ok");
+
+  // #172: a manifest opens with its fields (defaults marked) and its secrets by name; editing checks
+  // it, and Save asks the server for the signed action, which says that it widens authority.
+  run("openManifest('manifests', 'a.yaml')"); await flush(); await flush(); await flush();
+  assert.strictEqual(ids.mfedit.hidden, false);
+  const mt = ids["mfedit-body"].textContent;
+  assert.ok(mt.includes("zone.isolation = \"gvisor\"   (default)") && mt.includes("NOT SET in the vault") && mt.includes("<b>hi</b>"), mt);
+  assert.ok(ids["mfedit-body"].all(n => n.tagName === "b").length === 0, "YAML stays text");
+  assert.ok(mt.includes("WIDENS authority:"), mt);
+  nextAction = { v: 1, action: "save_manifest", root: "manifests", name: "a.yaml", sha256: "bbbbbbbbbbbbbbbb", previous_sha256: "aaaaaaaaaaaaaaaa", widens: true, widening: ["reach api.example.com"], changes: ["+ reach x"] };
+  const save = ids["mfedit-body"].all(n => n.tagName === "button" && n.textContent === "Save…")[0];
+  save.disabled = false; save.click(); await flush();
+  assert.ok(ids["confirm-what"].textContent.startsWith("Save manifests/a.yaml") && ids["confirm-what"].textContent.includes("WIDENS authority: reach api.example.com"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console manifest editor: ok");
 })().catch(e => { console.error(e); process.exit(1); });

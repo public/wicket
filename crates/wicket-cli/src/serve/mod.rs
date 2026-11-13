@@ -52,6 +52,7 @@
 mod acme;
 mod authority;
 mod limits;
+mod manifests;
 mod net;
 mod tls;
 mod web;
@@ -137,6 +138,8 @@ enum Action {
         run: String,
         reason: String,
     },
+    /// Save (or restore) a manifest in the installation's manifests directory (#172).
+    SaveManifest(Box<manifests::Save>),
     Start {
         root: String,
         name: String,
@@ -205,6 +208,8 @@ struct State {
     hsts: bool,
     /// Requests that reached a handler needing a session (the fuzz test watches it).
     authed: AtomicU64,
+    /// The vault (`manifests.rs` says whether a manifest's secrets are set: names only).
+    vault_dir: PathBuf,
     /// The authority root's public key, which runs' tokens load against (`authority.rs`).
     authz_root: Option<wicket_authz::PublicKey>,
 }
@@ -239,6 +244,7 @@ impl State {
             authority,
             hsts,
             authed: AtomicU64::new(0),
+            vault_dir: wicket_proxy::vault::Vault::default_dir(),
             authz_root: crate::roots::authz_root_public().ok(),
         }
     }
@@ -662,6 +668,17 @@ where
                 },
                 _ => denied(),
             },
+            // A manifest, viewed (#172): an operator's session only.
+            p if p.starts_with("/api/manifests/") => match &sess {
+                Some((_, SessionKind::Operator { .. })) => match p["/api/manifests/".len()..].split_once('/') {
+                    Some((root, name)) => match manifests::view(state, root, name) {
+                        Ok(v) => to_response(ok(v)),
+                        Err(e) => to_response(err(StatusCode::NOT_FOUND, format!("{e:#}"))),
+                    },
+                    None => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
+                },
+                _ => denied(),
+            },
             // Read-only views of authority (#173): an operator's session only.
             p => match (authority::get(state, p), &sess) {
                 (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
@@ -761,6 +778,14 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             action_begin(state, &sess, &body)
         }
         "/api/action/finish" | "/api/decide/finish" => action_finish(state, &sess, body),
+        // Validates edited manifest YAML and diffs its authority (#172): read-only, so unsigned.
+        "/api/manifests/check" => match &sess {
+            Some((_, SessionKind::Operator { .. })) => match manifests::check(state, body) {
+                Ok(v) => ok(v),
+                Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
         "/api/logout" => {
             if let (Some((id, _)), Ok(l)) = (&sess, state.ledger()) {
                 let _ = l.end_console_session(id, "sign-out");
@@ -926,7 +951,8 @@ fn str_field<'a>(body: &'a Value, k: &str) -> Option<&'a str> {
 
 /// Resolves an allowlisted manifest: a root by name and a plain file name in it (no separators, no
 /// dot-files, `.yaml`/`.yml`), which must be a regular file (not a symlink). Returns its path and bytes.
-fn resolve_manifest(state: &State, root: &str, name: &str) -> Result<(PathBuf, Vec<u8>)> {
+/// A manifest's file name: letters, digits, '.', '_', '-', ending .yaml or .yml, no `..`.
+fn check_manifest_name(name: &str) -> Result<()> {
     let ok_name = name.len() <= 128
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -935,6 +961,11 @@ fn resolve_manifest(state: &State, root: &str, name: &str) -> Result<(PathBuf, V
     if !ok_name {
         bail!("{name:?} is not a manifest file name (letters, digits, '.', '_', '-'; ending .yaml or .yml)");
     }
+    Ok(())
+}
+
+fn resolve_manifest(state: &State, root: &str, name: &str) -> Result<(PathBuf, Vec<u8>)> {
+    check_manifest_name(name)?;
     let Some((_, dir)) = state.roots.iter().find(|(r, _)| r == root) else {
         bail!(
             "{root:?} is not a directory runs can be started from (have: {})",
@@ -1094,7 +1125,12 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             let image = m.agent.is_some().then_some(image);
             Ok((Action::Start { root: root.into(), name: name.into(), path, manifest_sha256, task, run, principal, image }, v))
         }
-        _ => Err(bad("action must be decide, say, revoke or start_run")),
+        Some(kind @ ("save_manifest" | "restore_manifest")) => {
+            let (save, v) =
+                manifests::prepare(state, kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            Ok((Action::SaveManifest(Box::new(save)), v))
+        }
+        _ => Err(bad("action must be decide, say, revoke, start_run, save_manifest or restore_manifest")),
     }
 }
 
@@ -1229,6 +1265,26 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 "{} {run}: its runner stops the box within seconds; its messages and approvals are refused (signed with {})",
                 if fresh { "revoked" } else { "already revoked" },
                 oc.name
+            ))
+        }
+        Action::SaveManifest(save) => {
+            manifests::apply(state, save)?;
+            let signed_action: Value =
+                signed.get("action_json").and_then(|j| j.as_str()).and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+            l.audit(
+                t,
+                None,
+                "manifest.saved",
+                &json!({ "action": signed_action["action"], "root": manifests::WRITABLE_ROOT, "name": save.name, "sha256": save.sha256,
+                         "previous_sha256": save.previous_sha256, "restored_from": signed_action["restored_from"],
+                         "widens": signed_action["widens"], "widening": signed_action["widening"], "changes": signed_action["changes"],
+                         "by": by, "signed": signed }),
+            )?;
+            Ok(format!(
+                "saved {}/{} (sha256 {}…); the previous version is kept in its history",
+                manifests::WRITABLE_ROOT,
+                save.name,
+                &save.sha256[..12]
             ))
         }
         Action::Start { root, name, path, manifest_sha256, task, run, principal, image } => {
@@ -1471,6 +1527,7 @@ mod tests {
     mod authority;
     mod http;
     mod https;
+    mod manifests;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);

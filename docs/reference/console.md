@@ -84,6 +84,38 @@ that stays a signed action.
 key. Each view is built from named fields, never by serializing a stored record, and a test fetches
 every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
 base64 and hex, except runs inside a public key), identity JWSs and private keys.
+## Manifests
+
+The **Manifests** section lists the manifests runs can be started from (#172). The installation's
+`manifests` directory can be edited; `examples/` is read-only.
+
+- **Viewing** a manifest (`GET /api/manifests/<root>/<name>`) shows:
+  - whether it validates, with the error `wicket run` would give;
+  - every field with its effective value, marking those the file doesn't set (defaults);
+  - what it grants: the task, the agent or program and its image, the isolation, each reach rule,
+    which hosts the egress proxy splices and which it inspects (and why), each forbid, each
+    injection's secret **by name**, with whether the vault has it and binds it to that host, the
+    model route and budgets, volumes and limits;
+  - with an org policy applied, its layer for this zone and whether a box minted from it passes;
+  - the raw YAML, and the saved versions.
+  Secret values are never shown.
+- **Editing** checks the YAML as you type (`POST /api/manifests/check`, read-only): the same
+  validation `wicket run` uses, and the **authority diff** against the saved version:
+  - every reach, forbid, injection, volume, image and `accept_from` rule added or removed, and the
+    isolation, model route, budgets, limits and `max_children` before and after;
+  - whether it **widens** authority, and how: the test a spawned zone passes against its parent's,
+    with the saved version as the parent, plus a removed forbid, another model route or a new
+    injection. A new manifest always widens.
+- **Saving** is a signed action, `save_manifest`. The passkey signs the new bytes' sha256, the sha256
+  of the version they replace, and the authority diff, and the confirmation says plainly when it
+  widens. Applying it checks the file is still the version shown (else it refuses), keeps that
+  version in `manifests/.history/<name>/<time>-<sha256 prefix>.yaml`, writes the new one, and audits
+  `manifest.saved` with the signed record (`wicket audit --verify` re-verifies it offline).
+- **Restoring** a saved version is a signed action too, `restore_manifest`, recorded the same way;
+  the version it replaces is kept as well.
+
+Runs keep the manifest they started with: each run records its manifest's text at start, and the
+console's Start signs the manifest's sha256.
 
 ## On the internet
 
