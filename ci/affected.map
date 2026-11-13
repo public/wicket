@@ -1,0 +1,103 @@
+# Which tests a change can affect (#218), read by ci/affected.py. Reviewed like code.
+#
+#   pattern | crates | suites
+#
+# A changed file selects the union of every rule it matches. A file in a workspace crate always
+# selects that crate; ci/affected.py adds every crate that depends on a selected one (normal, dev
+# and build dependencies). `-` is none, `all` is everything.
+#
+# A file no rule matches selects every suite (and, outside the crates, every crate): add a rule
+# when a path is safe to narrow, never a catch-all. `*` stays within a directory, `**` crosses
+# them, and a pattern without a slash matches the file name anywhere.
+#
+# Suites: docs (check-public, Markdown links), cli-ref (docs/reference/cli.md against --help),
+# policy (SymCC policy diffs), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
+# install-test, and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
+# (acceptance --nodes local), update.
+
+# ---- the selection itself, the build and the toolchain: everything ----
+ci/affected.py                     | all | all
+ci/affected.map                    | all | all
+ci/gates.sh                        | all | all
+.github/**                         | all | all
+Cargo.toml                         | all | all
+Cargo.lock                         | all | all
+rust-toolchain.toml                | all | all
+rustfmt.toml                       | all | all
+.cargo/**                          | all | all
+.config/nextest.toml               | all | all
+third_party/**                     | all | all
+
+# ---- documentation ----
+**/*.md                            | -   | docs
+docs/**                            | -   | docs
+docs/reference/cli.md              | -   | docs cli-ref
+experiments/**                     | -   | docs
+refs/**                            | -   | docs
+LICENSE                            | -   | docs
+.gitleaks.toml                     | -   | docs
+.gitignore                         | -   | docs
+ci/check-public.py                 | -   | docs
+ci/check-doc-links.sh              | -   | docs
+ci/gen-cli-reference.sh            | -   | cli-ref
+changes/**                         | -   | docs
+ci/changelog.py                    | -   | docs
+ci/changelog_test.py               | -   | docs
+
+# ---- inputs the crates read from outside their directories (the self-test checks this list) ----
+examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
+examples/policy/**                 | wicket-policy | policy
+images/**                          | wicket-cli | smoke acceptance
+deploy/install.sh                  | wicket-cli | install-test daemon-uids
+deploy/vultr/node-setup.sh         | wicket-placement | -
+crates/wicket-core/tests/subset_cases.rs | wicket-authz wicket-feed | -
+crates/wicket-authz/tests/common/** | wicket-feed | -
+
+# ---- crate code with known end-to-end coverage ----
+crates/*/tests/**                  | -   | -
+crates/*/benches/**                | -   | -
+crates/wicket-fwd/src/**           | -   | smoke
+crates/wicket-fwd/bench/**         | -   | -
+crates/wicket-policy/**            | -   | policy
+crates/wicket-policy-diff/**       | -   | policy
+crates/wicket-cli/src/hibernate.rs | -   | hibernate restore
+crates/wicket-cli/src/state.rs     | -   | hibernate restore
+crates/wicket-cli/src/statestore.rs | -  | hibernate restore
+crates/wicket-cli/src/s3.rs        | -   | hibernate restore
+crates/wicket-store/src/bundle.rs  | -   | hibernate restore
+crates/wicket-cli/src/update.rs    | -   | update
+crates/wicket-cli/src/ci_update.rs | -   | update
+crates/wicket-cli/src/daemon/**    | -   | daemon-uids acceptance
+crates/wicket-cli/src/serve/static/** | - | acceptance
+crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes
+crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
+crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
+crates/wicket-placement/**         | -   | acceptance-nodes
+# Not listed on purpose, so they select every suite: the node protocol (chan.rs), the ledger's
+# schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
+
+# ---- the end-to-end scripts themselves ----
+ci/smoke.sh                        | -   | smoke
+ci/smoke.yaml                      | -   | smoke
+ci/h3get/**                        | -   | smoke acceptance
+ci/hibernate.sh                    | -   | hibernate
+ci/hibernate.yaml                  | -   | hibernate
+ci/restore.sh                      | -   | restore
+ci/acceptance.sh                   | -   | acceptance acceptance-nodes
+ci/acceptance/**                   | -   | acceptance acceptance-nodes
+ci/install-acceptance.sh           | -   | install-test
+ci/install-test.sh                 | -   | install-test
+ci/daemon-uids.sh                  | -   | daemon-uids
+ci/node-e2e.sh                     | -   | node-e2e
+ci/node-e2e/**                     | -   | node-e2e
+ci/update.sh                       | -   | update
+ci/update/**                       | -   | update
+ci/policy-diff.sh                  | -   | policy
