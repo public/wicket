@@ -1649,7 +1649,15 @@ async fn main() -> Result<()> {
             SelfCmd::Keygen { key } => update::keygen(&key),
             SelfCmd::Sign { key, artifact } => update::sign(&key, &artifact),
             SelfCmd::Describe => {
-                println!("{}", serde_json::to_string(&update::describe()?)?);
+                #[allow(unused_mut)]
+                let mut d = update::describe()?;
+                // Tests only (debug builds): the protocol this build reports when staged, so
+                // ci/update.sh can stage a "jump" (#207) with two builds of the same code.
+                #[cfg(debug_assertions)]
+                if let Some(p) = std::env::var("WICKET_TEST_DESCRIBE_PROTOCOL").ok().and_then(|p| p.parse().ok()) {
+                    d.protocol = p;
+                }
+                println!("{}", serde_json::to_string(&d)?);
                 Ok(())
             }
             SelfCmd::Health { node, canary, image } => update::health(node, canary, image).await,
