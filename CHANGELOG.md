@@ -2,6 +2,9 @@
 
 User-facing changes, grouped by area. Numbers link to the pull requests.
 
+Pull requests don't edit this file: each adds a fragment under [changes/](changes/README.md), and
+`ci/changelog.py assemble` writes them in at release time (#220).
+
 ## 0.0.2 (unreleased)
 
 ### DNS
