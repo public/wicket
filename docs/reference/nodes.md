@@ -187,7 +187,7 @@ wicket node revoke n1
   more. With a control host on protocol 1 (#162's skew), the call is relayed to the run's own proxy there
   as in #151, which adds the credential and counts it.
 - **Decisions at the edge** (#164; protocol 5, the list of what a node still asks the control host and why:
-  [design.md §9.2.1](design.md)). The node answers `whoami`, `request_access`, `await_grant` and
+  [design §9.2.1](../explanation/design.md)). The node answers `whoami`, `request_access`, `await_grant` and
   `pending_requests` from the box's token, connected or not. Cut off, what needs a human
   (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the box's
   zone) is queued on the node (`edge.json`, `q-…` ids, like #153's asks) and made when the control host

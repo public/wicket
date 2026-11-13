@@ -5,9 +5,17 @@ wicket's MCP gateway is the agent's only MCP server. Claude Code reaches it at
 `crates/wicket-proxy/src/gateway.rs` (`tools()`); every call is an event in the run's output
 (`[wicket-tool] <name>: …`) and the tools that decide something are audited.
 
-Every tool answers with one text block; a refusal or failure sets `isError`. Tools that need the
-ledger fail while a node can't reach the control host: the node's gateway relays every call there
-and, while it is away, answers only MCP's own `initialize` and `ping`.
+Every tool answers with one text block; a refusal or failure sets `isError`.
+
+**On a node** (protocol 5, #164), the box's node decides from its token, connected or not:
+`whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, `spawn` and
+`spawn_agent` within the box's zone (the child starts on the node, its token attenuated there, and
+the control host takes it over when it can be reached), and `send_message`, `await_message` and
+`link` between boxes on that node. While the control host is unreachable, what needs a human
+(`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the zone) is
+queued on the node under a node-local id `q-…`; `await_grant` with that id follows it once it is
+raised. Every other call is relayed to the control host, and fails clearly while it is away. What a
+node still asks the control host, and why: [design §9.2.1](../explanation/design.md).
 
 | tool | what it does | needs |
 |---|---|---|

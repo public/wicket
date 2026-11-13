@@ -78,8 +78,10 @@ exchanged, for the logs and for the health gate.
 | 1 | Versions (#162). |
 | 2 | Box tokens minted by a certified authority issuing key, carrying its certificate (#154). Needed once the roots are offline: `wicket keys roots-offline` refuses while a node talks 1, and a run on such a node is refused after. |
 | 3 | Budget slices (`Lease`), secrets fetched by a node on first use (`SecretFetch`, `SecretFetched`, `SecretRevoke`) and the node's model spend (`Spent`) (#152, #153). With an older peer a node relays model calls and forwards injected hosts to the control host, as before. |
+| 4 | Block 0 may carry an org layer compiled from the org policy (#51), which an older node's structural check refuses: such tokens go only to nodes talking 4, and `wicket policy apply` refuses while one doesn't. |
+| 5 | Decisions at the edge (#164): `BoxStart.edge` (what the node decides gateway tools and spawns from: the identity's stable claims, the box's manifest, base token, grant keys, time and slots), `Spawned` and `Adopted` (a child the node started, and its takeover), `Ask.prefix`, and `Listen.dial` (a link the node carries between its own boxes). With an older peer a node relays every gateway tool call, as before. |
 
-wicket 0.0.1 speaks version 3.
+wicket 0.0.1 speaks version 5.
 
 ## Ledger schema
 
