@@ -223,6 +223,10 @@ def self_test():
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
          set())
     case("an acceptance scenario", ["ci/acceptance/acp.yaml"], set(), {"acceptance", "acceptance-nodes"})
+    # A rule naming one path (no wildcard) names one that exists: a rename mustn't leave it behind.
+    for pat, _, _ in rules:
+        if "/" in pat and not any(ch in pat for ch in "*?[") and not (ROOT / pat).exists():
+            fails.append(f"ci/affected.map names {pat}, which doesn't exist")
     # Every file a crate reads from outside its directory is mapped to that crate.
     for crate, path in out_of_crate_inputs(dirs):
         probe = path if (ROOT / path).is_file() else path + "/x"
