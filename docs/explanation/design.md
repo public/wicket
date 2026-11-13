@@ -1920,16 +1920,22 @@ its label is the join of everything that shaped it.
   - all of `/wicket/state`;
   - `/tmp`, now a per-box host directory;
   - `durable` volumes. `node` and `cache` volumes stay out of the bundle; on one node they behave the same.
-- Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory now). Each is verified by its
-  tree digest on restore.
+- Trees are tar + zstd -3, content-addressed in an `ObjectStore` (a directory, or an S3-compatible store,
+  #154), and each object is sealed at rest with our own chunked AES-256-GCM (#148). Each is verified by its
+  tree digest on restore. An unchanged tree reuses its object; a changed one is stored again whole.
+- **Format decision (owner, 2026-11-13, #195):** wicket keeps this format of its own and its dependencies
+  minimal, with no `rustic_core`/restic and no `age` for now. Experiment E5
+  (`experiments/bundle-formats/RESULTS.md`) measured the restic format storing 5–18× less after many
+  sessions and saving incrementals 2–6× faster for Rust and Node trees, at the cost of a 0.x dependency,
+  more memory, and restore safety wicket would have to add itself. Revisit if bundle size or save time
+  becomes the bottleneck.
 - The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
   recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
   messages can't buy it a fresh budget.
 - Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
   box stays Idle.
 - Not built:
-  - encryption and signing (the agent data key, a signed `StateManifest`);
-  - S3-compatible backends;
+  - per-agent data keys and a signed `StateManifest` (sealing today uses the installation's one state key);
   - the Sleeping tier (a stopped box with its state cached on the node);
   - the gVisor checkpoint (H2);
   - garbage collection;
