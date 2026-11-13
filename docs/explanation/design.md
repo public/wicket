@@ -991,6 +991,24 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
   don't do this. Never enable libkrun TSI `HIJACK_UNIX`.
 - On Ubuntu, ship an **AppArmor profile granting `userns` to `wicket-jail`** instead of flipping the
   sysctl.
+- **Lessons for `wicket-jail` from a layer-by-layer sandbox write-up** (muhammadraza.me, 2026-11-11, with
+  its attack matrix; see #215):
+  - **`umount2(MNT_DETACH)` of the old root after `pivot_root` is load-bearing.** Without it, a path like
+    `/..//home/<user>/secret` still reaches the host while the plain path returns ENOENT. A test of only the
+    obvious path passes on a broken jail, so the matrix must try the odd spellings.
+  - **Read-only must be recursive** (`mount_setattr` with `AT_RECURSIVE`), and system binds need `nosuid`:
+    file capabilities on binaries are honoured inside a user namespace.
+  - **Abstract Unix sockets live in the network namespace,** not the mount namespace, so a new root alone
+    doesn't hide host services listening on them. Only a new netns does.
+  - **Landlock catches what namespaces miss:** a host directory file descriptor passed in over a Unix socket
+    (the runc CVE-2024-21626 class) defeats the new root and seccomp, and Landlock refuses it.
+  - **`memory.swap.max = 0`** alongside `memory.max`, or a box swaps instead of being killed at its limit (the
+    same finding as #208 for Docker's `--memory-swap`).
+  - **Seccomp tests must be meaningful:** "mount returns EPERM" proves nothing for a non-root process. Test
+    by becoming root in a nested user namespace and mounting.
+  - **Order:** cgroup limits first (the new root hides `/sys/fs/cgroup`), then namespaces, the new root, the
+    network, dropping capabilities, seccomp after the new root (it forbids mount and `pivot_root`), Landlock
+    last (it also forbids mounting), then close every inherited file descriptor.
 - **DNS:** in proxy mode the box has no resolver. In transparent and VM modes, synthetic DNS maps every
   name to one sinkhole IP and the proxy decides on SNI/Host. A **DNS-canary test is a blocking release
   gate** for every backend and proxy build: Claude's own sandbox shipped a DNS leak twice [06].
