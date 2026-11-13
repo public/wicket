@@ -49,6 +49,41 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
 
+## Authority views
+
+Read-only, behind the session like the rest of the page (#173). Nothing here changes authority:
+that stays a signed action.
+
+- **A run's authority** (its row's *authority* link; `GET /api/runs/<run>/authority`): its token as
+  its node's feed holds it now, read from the feed's delta log without writing anything.
+  - Every block decoded to Datalog: block 0 (the zone's policy compiled, the org layer, the box's
+    lifetime), each spawn block (the chain back to its root run), and each grant block, with the
+    public key of whoever signed it.
+  - Whether each block is revoked, with a **fingerprint** of its revocation id. In Biscuit a
+    revocation id is the block's signature, so the id itself is never shown.
+  - Each grant: what it allows, its uses (counted on the node) and expiry, who approved it (passkey
+    or root) and when, whether it was revoked, and whether its node has the feed delta that carries it.
+  - The policy version it was minted under, against the installed one; its deadline (when its
+    authority ends) and whether its box stopped; which node holds it and its feed's epoch.
+  - What its node holds for it (#152): the secrets it fetched, **by name only**, and its budget
+    slice.
+  - The zone's policy as Cedar, generated from the manifest.
+  - Whether the token loads (it may not, for instance once its issuing key's certificate ended).
+  An ended run's token is gone from its node's feed; its page says so.
+- **Explain a decision** (an activity row's *explain* link; `GET /api/explain/<seq>`): the request
+  that row records, as it was decided then (by whom, the control host or the box's node, and the
+  detail recorded), and the run's token's decision for it **as the token is now**: the ceilings,
+  the grant that allows it, or the failed checks, each naming its block. Grants and policy may have
+  changed since; the page says so. Explaining spends no grant use and asks no node.
+- **The org policy** (the *Policy* section; `GET /api/policy`): the applied Cedar and its entities,
+  whether `org.cedar` still matches what was applied (a hand edit refuses every mint), every kept
+  version with when and by whom it was applied, and each running run with the version it was minted
+  under: current, older, or revoked by a later `wicket policy apply`.
+
+**Never shown:** a serialized token, any signature (a block's or a JWS's), a secret's value, a private
+key. Each view is built from named fields, never by serializing a stored record, and a test fetches
+every console endpoint and scans each answer for the token, any 24-byte run of its bytes (base64url,
+base64 and hex, except runs inside a public key), identity JWSs and private keys.
 ## Manifests
 
 The **Manifests** section lists the manifests runs can be started from (#172). The installation's

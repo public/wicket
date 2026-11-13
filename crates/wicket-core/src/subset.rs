@@ -174,6 +174,12 @@ fn reach_violations(p: &ZoneSpec, c: &ZoneSpec) -> Vec<String> {
     if p.unlisted_hosts == UnlistedHosts::Hide && c.unlisted_hosts != UnlistedHosts::Hide {
         v.push("unlisted_hosts must be hide, as in this zone".into());
     }
+    if p.wildcards.forbid && !c.wildcards.forbid {
+        v.push("wildcards.forbid must be true, as in this zone".into());
+    }
+    if c.wildcards.max_names > p.wildcards.max_names {
+        v.push(format!("wildcards.max_names {} is more than this zone's {}", c.wildcards.max_names, p.wildcards.max_names));
+    }
     for (i, r) in c.reach.iter().enumerate() {
         for m in &r.methods {
             for path in &r.paths {
@@ -403,6 +409,18 @@ mod tests {
         ] {
             assert!(errs.contains(needle), "missing {needle:?} in:\n{errs}");
         }
+    }
+
+    /// #20: a zone that forbids wildcards binds its children, and a child may not reach more names
+    /// under a wildcard than its parent.
+    #[test]
+    fn a_zone_forbidding_wildcards_binds_its_children() {
+        let p = zone("  wildcards: { forbid: true, max_names: 8 }\n  reach: [{ host: api.example.com }]\n");
+        let errs = check(&ask(&zone("")), &Bounds { zone: &p, ..bounds(&p) }).unwrap_err().join("\n");
+        assert!(errs.contains("wildcards.forbid must be true") && errs.contains("max_names 32 is more than this zone's 8"), "{errs}");
+        let ok = zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  wildcards: { forbid: true, max_names: 4 }\n  reach: [{ host: api.example.com }]\n");
+        let r = check(&ask(&ok), &Bounds { zone: &p, ..bounds(&p) });
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]

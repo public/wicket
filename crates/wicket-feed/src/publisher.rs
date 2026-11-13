@@ -104,6 +104,27 @@ where
     }
 }
 
+/// A node feed's state as its delta log in `dir` has it, read without writing anything: for views
+/// (the console, #173) beside the publishers that write it. No key or certificate is needed. Only
+/// complete lines are replayed: a torn last line (one a publisher is writing now) is skipped, never
+/// truncated. A log that isn't a chain for `feed` is refused. `ctx` compiles each entry as a node
+/// would (for tokens, the authority root), so a token's `compiled` says whether it loads.
+pub fn read_state<P: Policy>(dir: &Path, feed: &str, ctx: P::Ctx) -> Result<State<P>, PublishError> {
+    let mut state = State::genesis(0, ctx);
+    let text = read_opt(&dir.join(DELTAS))?.unwrap_or_default();
+    let (complete, _torn) = lines(&text);
+    for line in complete {
+        let d: Delta<P> =
+            payload_unverified(line).ok_or_else(|| PublishError::Invalid(format!("delta log, epoch {}: unreadable", state.epoch + 1)))?;
+        if d.feed != feed || d.epoch != state.epoch + 1 || d.prev != state.head {
+            return Err(PublishError::Invalid(format!("delta log, epoch {}: not a chain for this feed", d.epoch)));
+        }
+        state.version = d.version;
+        state.apply(&d, sha(line));
+    }
+    Ok(state)
+}
+
 impl<P: Policy> Publisher<P> {
     /// Opens (or creates) the feed for node `feed` in `dir`, replaying its delta log. `cert_jws` is the
     /// root-signed certificate for `key`; a higher version than the log's is a re-genesis. `ctx` is

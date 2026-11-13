@@ -239,6 +239,9 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
             if !obj.contains_key("unlisted_hosts") {
                 obj.insert("unlisted_hosts".into(), serde_json::to_value(p.zone.unlisted_hosts).unwrap_or_default());
             }
+            if !obj.contains_key("wildcards") {
+                obj.insert("wildcards".into(), serde_json::to_value(p.zone.wildcards).unwrap_or_default());
+            }
             if !obj.contains_key("limits") {
                 let mut l = serde_json::to_value(&p.zone.limits).unwrap_or_default();
                 l["timeout"] = format!("{}s", time_left.as_secs()).into();

@@ -39,6 +39,10 @@ h3.workspace = true
 h3-quinn.workspace = true
 webpki-roots.workspace = true
 libc.workspace = true
+# The public suffix list, compiled in (#19): which part of a host is its registered domain, decided
+# offline. No dependencies of its own; released whenever the list changes, pinned by Cargo.lock
+# (refresh with `cargo update -p psl`).
+psl = "2"
 
 # The org layer's IR (#51): what the control host's proxies check (no Cedar here).
 wicket-authz.workspace = true

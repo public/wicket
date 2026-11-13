@@ -25,12 +25,19 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
 const calls = [];
 let state = null;
+// A hostile string an agent chose (a grant's path): it must stay text.
+const HOSTILE = "/x<img src=x onerror=alert(1)>";
+const authority = { status: "running", node: "local", policy: { version: null }, token: { held: true, box_path: "run_a", epoch: 0, zone: "z", issued_by: "the authority root", loads: true,
+  blocks: [{ index: 0, kind: "zone", source: "check if reach(\"" + HOSTILE + "\");", signed_by: null, revocation_fingerprint: "0123456789abcdef", revoked: false }],
+  grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
+const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
+  against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null;
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
@@ -43,6 +50,10 @@ const fetch = async (path, opts) => {
   if (path.startsWith("/api/manifests/")) return reply({ root: "manifests", name: "a.yaml", yaml: "task: <b>hi</b>\n", valid: true, writable: true, history: [{ version: "1-aa.yaml", saved_before: 1, sha256_prefix: "aa" }],
     fields: [{ path: "task", value: "<b>hi</b>", default: false }, { path: "zone.isolation", value: "gvisor", default: true }],
     grants: { task: "<b>hi</b>", image: { Ok: "img" }, isolation: "Gvisor", unlisted_hosts: "escalate", reach: [], hosts: [], forbid: [], inject: [{ secret: "gh", host: "h", header: "authorization", secret_set: false, bound_to_host: true }], volumes: [], limits: {}, org_policy: null } });
+
+  if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
+  if (path.endsWith("/authority")) return reply(authority);
+  if (path.startsWith("/api/explain/")) return reply(explained);
   return reply({}, false);
 };
 let ceremonies = 0;
@@ -136,6 +147,20 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);
   console.log("console approval flow: ok");
+
+  // #173: a run's authority and an explained decision open read-only in the detail card, and an
+  // agent's strings in them stay text (the fake DOM has no innerHTML: only textContent exists).
+  run("showAuthority('run_a')"); await flush(); await flush();
+  assert.strictEqual(ids.detail.hidden, false);
+  const text = ids["detail-body"].textContent;
+  assert.ok(text.includes(HOSTILE) && text.includes("block 0 · zone") && text.includes("approved by passkey:laptop"), text);
+  assert.ok(ids["detail-body"].all(n => n.tagName === "img").length === 0, "no element from an agent's string");
+  run("showExplain(7)"); await flush(); await flush();
+  assert.ok(ids["detail-body"].textContent.includes("block 0: check if " + HOSTILE), ids["detail-body"].textContent);
+  assert.ok(calls.some(c => c.path === "/api/explain/7"));
+  ids["detail-close"].listeners.click();
+  assert.strictEqual(ids.detail.hidden, true);
+  console.log("console authority views: ok");
 
   // #172: a manifest opens with its fields (defaults marked) and its secrets by name; editing checks
   // it, and Save asks the server for the signed action, which says that it widens authority.

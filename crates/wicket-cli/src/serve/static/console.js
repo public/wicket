@@ -193,11 +193,26 @@ function renderRows(id, rows, f, emptyText) {
   for (const r of rows) box.append(f(r));
 }
 
+// A decision on a request, from the control host (`op`) or shipped by a node (`node.audit`, its
+// record as a JSON string), with a link to explain it (#173).
+function egressOf(op) {
+  const b = op.body || {};
+  if (op.kind === "op" && b.kind === "egress") return [b, ""];
+  if (op.kind === "node.audit" && typeof b.body === "string") {
+    try { const n = JSON.parse(b.body); if (n && n.kind === "egress") return [n, " (node)"]; } catch (e) { /* not a decision */ }
+  }
+  return null;
+}
+
 function line(op) {
   const b = op.body || {};
-  if (op.kind === "op" && b.kind === "egress") {
-    const cls = b.outcome === "allow" || b.outcome === "spliced" ? "ok" : b.outcome === "pending" ? "pend" : "blocked";
-    const d = el("div"); d.append(el("span", cls, b.outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(b.method + " " + b.host + b.path)));
+  const eg = egressOf(op);
+  if (eg) {
+    const [x, where] = eg;
+    const outcome = String(x.outcome || "?");
+    const cls = outcome === "allow" || outcome === "spliced" ? "ok" : outcome === "pending" ? "pend" : "blocked";
+    const d = el("div"); d.append(el("span", cls, outcome.toUpperCase().padEnd(9)), document.createTextNode(strip(x.method + " " + x.host + x.path + where) + " "));
+    if (op.run) { const why = el("button", "link", "explain"); why.onclick = () => showExplain(op.seq); d.append(why); }
     return d;
   }
   if (op.kind === "op" && b.kind === "llm") return el("div", "", "model  #" + b.requests + " " + strip(b.model || "?") + " → " + b.status + "  in " + b.input_tokens + " / out " + b.output_tokens);
@@ -224,6 +239,9 @@ function renderRun(s, x) {
     a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
     left.append(document.createTextNode(" · "), a);
   }
+  const auth = el("button", "link", "authority");
+  auth.onclick = () => showAuthority(x.id);
+  left.append(document.createTextNode(" · "), auth);
   if (x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
     const say = el("button", "", "Follow-up…");
@@ -328,6 +346,105 @@ async function boot() {
     const b = el("div", "buttons"); const go = el("button", "approve", "Sign in with passkey"); go.onclick = signIn; b.append(go); auth.append(b);
     auth.append(el("div", "note", "No passkey yet? Open a one-time enrolment link from the host (`wicket serve` prints one at first start; `wicket operator enrol-link` makes another)."));
   }
+}
+
+// ---- read-only views of authority (#173) ----
+// Everything here is text: block sources hold strings an agent chose (a grant's path), so nothing
+// is ever parsed as markup.
+async function getJson(path) {
+  const r = await fetch(path);
+  const j = await r.json().catch(() => ({ error: "unreadable answer" }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function openDetail(title) {
+  const d = document.getElementById("detail");
+  document.getElementById("detail-title").textContent = title;
+  const body = document.getElementById("detail-body"); body.replaceChildren(el("div", "meta", "loading…"));
+  d.hidden = false; d.scrollIntoView({ block: "nearest" });
+  return body;
+}
+
+const kv = (k, v) => { const d = el("div", "row"); d.append(el("span", "meta", k), el("span", "mono", strip(v))); return d; };
+const when = s => s ? new Date(s * 1000).toISOString().replace(".000", "") : "—";
+const whenMs = ms => ms ? new Date(ms).toISOString().replace(/\.\d+Z$/, "Z") : "—";
+
+async function showAuthority(run) {
+  const body = openDetail("authority of " + run);
+  try {
+    const a = await getJson("/api/runs/" + encodeURIComponent(run) + "/authority");
+    const out = [];
+    out.push(kv("status", a.status + (a.revoked ? " · identity revoked by " + a.revoked.by + ": " + a.revoked.reason : "")));
+    out.push(kv("node", a.node + (a.feed ? " · its feed at epoch " + a.feed.epoch : "")));
+    out.push(kv("policy", (a.policy.version || "no org policy") + (a.policy.version ? (a.policy.current ? " (current)" : " (not the installed " + (a.policy.installed || "none") + ")") : "")));
+    if (a.deadline) out.push(kv("authority until", whenMs(a.deadline.until_ms) + (a.deadline.stopped ? " · box stopped" : "")));
+    if (a.holdings) {
+      out.push(kv("secrets on its node", a.holdings.secrets.length ? a.holdings.secrets.join(", ") + " (names only)" : "none"));
+      const s = a.holdings.slice;
+      out.push(kv("budget slice", s ? s.requests + " requests, " + s.output_tokens + " output tokens" + (s.input_tokens != null ? ", " + s.input_tokens + " input tokens" : "") : "none"));
+    }
+    const t = a.token || {};
+    if (!t.held) { out.push(el("div", "note", "No token: " + strip(t.why))); body.replaceChildren(...out); return; }
+    out.push(kv("token", "box " + t.box_path + " · epoch " + t.epoch + " · zone " + t.zone + " · minted by " + t.issued_by + (t.loads === true ? " · loads" : " · does NOT load: " + (t.loads.error || ""))));
+    for (const b of t.blocks) {
+      const h = el("div", "row");
+      h.append(el("span", b.revoked ? "blocked" : "ok", "block " + b.index + " · " + b.kind + (b.revoked ? " · REVOKED" : "")),
+        el("span", "meta", "revocation " + b.revocation_fingerprint + (b.signed_by ? " · signed by " + b.signed_by : "")));
+      out.push(h, el("pre", "src", b.source));
+    }
+    if (t.grants.length) {
+      out.push(el("div", "meta", "grants"));
+      for (const g of t.grants) {
+        out.push(kv(g.id, g.method + " " + g.host + g.path + " · " + (g.uses == null ? "unlimited uses" : g.uses + " uses (counted on the node)") +
+          " · until " + when(g.expires_at) + " · approved by " + (g.approved_by || "?") + " at " + when(g.approved_at) +
+          (g.revoked ? " · revoked" : "") + (g.reached_node === false ? " · not yet on its node" : "")));
+      }
+    }
+    if (t.zone_cedar) { out.push(el("div", "meta", "zone policy (Cedar, generated from the manifest)"), el("pre", "src", t.zone_cedar)); }
+    body.replaceChildren(...out);
+  } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
+}
+
+async function showExplain(seq) {
+  const body = openDetail("decision #" + seq);
+  try {
+    const x = await getJson("/api/explain/" + encodeURIComponent(seq));
+    const r = x.recorded, n = x.against_token_now;
+    const out = [
+      kv("request", r.method + " " + r.host + r.path + " (" + (r.risk || "?") + ")"),
+      kv("recorded", String(r.outcome) + " on " + r.decided_on + " at " + when(r.at) + ": " + strip(r.detail)),
+      kv("run", x.run + " · policy " + (x.policy || "none")),
+    ];
+    if (n.available) {
+      out.push(kv("token now", n.decision), el("pre", "src", n.why), kv("zone says", n.zone_says));
+      out.push(el("div", "note", "Against the run's token as its node's feed holds it now: grants and policy may have changed since it was decided."));
+    } else out.push(el("div", "note", "Can't evaluate it now: " + strip(n.why)));
+    body.replaceChildren(...out);
+  } catch (e) { body.replaceChildren(el("div", "blocked", strip(e.message))); }
+}
+
+let policyShown = 0;
+async function renderPolicy() {
+  // The policy changes rarely: fetched at most every 30 s.
+  if (performance.now() - policyShown < 30000 && policyShown) return;
+  policyShown = performance.now();
+  const box = document.getElementById("policy");
+  try {
+    const p = await getJson("/api/policy");
+    const out = [];
+    if (!p.installed) out.push(el("div", "note", "No org policy applied: tokens carry their zone's policy only (wicket policy apply)."));
+    else {
+      out.push(kv("applied", p.installed + (p.current.matches_applied === false ? " · org.cedar was changed by hand: every mint is refused until it is applied" : "")));
+      out.push(el("pre", "src", p.current.cedar || ""));
+    }
+    for (const v of p.versions) {
+      const a = v.applied.length ? v.applied[v.applied.length - 1] : null;
+      out.push(kv("version " + v.version + (v.current ? " (current)" : ""), a ? "applied " + when(a.at) + " by " + a.by : "kept"));
+    }
+    for (const r of p.runs) out.push(kv(r.run, "zone " + r.zone + " · policy " + (r.policy || "none") + " · " + r.status));
+    box.replaceChildren(...out);
+  } catch (e) { box.replaceChildren(el("div", "blocked", strip(e.message))); }
 }
 
 // ---- manifests (#172): view, check as you type, save and restore as signed actions ----
@@ -455,6 +572,7 @@ async function refresh() {
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
     renderOperator(s);
+    renderPolicy();
   } catch (e) { /* keep polling */ }
 }
 document.addEventListener("DOMContentLoaded", () => {
@@ -462,6 +580,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("runform-cancel").addEventListener("click", closeRunForm);
   document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
   document.getElementById("mfedit-close").addEventListener("click", () => { document.getElementById("mfedit").hidden = true; });
+  document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
   boot();
   setInterval(() => { if (!document.getElementById("console").hidden) refresh(); }, 2000);
 });

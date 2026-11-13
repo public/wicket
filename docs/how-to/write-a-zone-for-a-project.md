@@ -112,6 +112,11 @@ on its name and relayed without inspection, which is much cheaper but sees no pa
 ([performance](../explanation/performance.md#splice-through-for-hosts-allowed-wholesale)). A forbid
 rule on the host keeps it inspected.
 
+The view also warns about every wildcard reach rule (`*.cdn.example`). The agent can make up any name
+under one, and wicket resolves it on the host, so the names themselves are a narrow channel out. wicket
+resolves such a name only after a request to it is allowed, and at most `wildcards.max_names` (32)
+names per rule per run. In a sensitive zone, name hosts exactly and set `wildcards: { forbid: true }`.
+
 ## 8. Let agents start narrower boxes
 
 With `agent.max_children: N` the agent can `spawn` children in zones it writes, each a subset of

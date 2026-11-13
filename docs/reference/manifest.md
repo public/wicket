@@ -95,7 +95,8 @@ A program's zone has no model: a `zone.llm` section is an error.
 | `name` | string | required | The zone's name, part of every SPIFFE ID in it (`…/z/<name>/…`). A spawned zone is named `<parent zone>.<name>.<parent run>`. |
 | `isolation` | `gvisor` or `runc` | `gvisor` | The runtime. `runc` is plain containers, for development only. |
 | `reach` | list of [reach rules](#reach) | `[]` | What the box may reach without asking. |
-| `unlisted_hosts` | `escalate` or `hide` | `escalate` | What a host no reach rule names is. `escalate`: a request to it becomes a pending request. `hide`: it doesn't exist for the box (NXDOMAIN, and the proxy refuses the connection before TLS with a not-found status). |
+| `unlisted_hosts` | `escalate` or `hide` | `escalate` | What a host no reach rule names is. `escalate`: a request to it becomes a pending request, unless its registered domain doesn't exist (only that is looked up, never the full name), when it is an unknown host. `hide`: it doesn't exist for the box (NXDOMAIN, and the proxy refuses the connection before TLS with a not-found status). |
+| `wildcards` | `{ forbid, max_names }` | `{ forbid: false, max_names: 32 }` | Wildcard reach rules (`*.cdn.example`). wicket resolves every name under one on the host, so the names are a narrow channel out of the box. It resolves a name only after a request to it is allowed, and reaches at most `max_names` (at least 1) distinct names under each rule per run. With `forbid: true`, no reach rule may be a wildcard. `wicket zone` warns about each one. |
 | `forbid` | list of [forbid rules](#forbid) | `[]` | Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked before `reach`. |
 | `inject` | list of [inject rules](#inject) | `[]` | Credentials the egress proxy adds to requests. |
 | `llm` | [llm](#llm) | none | The model route. Required for agents (`llm: {}` takes every default), refused for programs. |
@@ -181,7 +182,7 @@ Docker reads a zero limit as "no limit", so every limit must be a positive bound
 ## Spawned zones
 
 The `spawn` tool takes a `zone` object with these fields. What it leaves out: no reach and no
-credentials; the parent's limits, isolation and `unlisted_hosts`; for an agent, half the parent's
+credentials; the parent's limits, isolation, `unlisted_hosts` and `wildcards`; for an agent, half the parent's
 remaining model budget. The zone must be a subset of the parent's, as
 [concepts](../explanation/concepts.md#zones-and-the-subset-rule) explains, or it is refused with
 every violation listed.

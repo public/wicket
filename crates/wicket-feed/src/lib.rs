@@ -52,10 +52,10 @@ pub mod token;
 
 pub use format::{Change, Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, RevokeKind, Revoked, Snapshot, GENESIS, MAX_FRAME_BYTES};
 pub use jws::{kid, sha, sign, sign_as, TYP_AUTHZ_KEY, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
-pub use publisher::{PublishError, Publisher, PublisherConfig};
+pub use publisher::{read_state, PublishError, Publisher, PublisherConfig};
 pub use replica::{Allowed, Decision, Escalation, LoadError, Mode, Replica, ReplicaConfig, Stats};
 pub use state::{Policy, State, Zone};
-pub use token::{AuthzKeyCert, BoxAuthority, CompiledAuthority, Issuer, LiveGrant, TokenGrant};
+pub use token::{explain, AuthzKeyCert, BoxAuthority, CompiledAuthority, Explained, Issuer, LiveGrant, TokenGrant};
 
 /// How long a freshness statement keeps a node fresh: `fresh_until − issued_at`.
 pub const DEFAULT_TTL_MS: i64 = 30_000;

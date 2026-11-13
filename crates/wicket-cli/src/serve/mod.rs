@@ -50,6 +50,7 @@
 //! remains a break-glass path and is audited as such.
 
 mod acme;
+mod authority;
 mod limits;
 mod manifests;
 mod net;
@@ -209,6 +210,8 @@ struct State {
     authed: AtomicU64,
     /// The vault (`manifests.rs` says whether a manifest's secrets are set: names only).
     vault_dir: PathBuf,
+    /// The authority root's public key, which runs' tokens load against (`authority.rs`).
+    authz_root: Option<wicket_authz::PublicKey>,
 }
 
 impl State {
@@ -242,6 +245,7 @@ impl State {
             hsts,
             authed: AtomicU64::new(0),
             vault_dir: wicket_proxy::vault::Vault::default_dir(),
+            authz_root: crate::roots::authz_root_public().ok(),
         }
     }
 }
@@ -675,7 +679,15 @@ where
                 },
                 _ => denied(),
             },
-            _ => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
+            // Read-only views of authority (#173): an operator's session only.
+            p => match (authority::get(state, p), &sess) {
+                (Some(r), Some((_, SessionKind::Operator { .. }))) => match r {
+                    Ok(v) => to_response(ok(v)),
+                    Err(e) => to_response(err(StatusCode::NOT_FOUND, e)),
+                },
+                (Some(_), _) => denied(),
+                (None, _) => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
+            },
         };
     }
     if method != Method::POST {
@@ -1512,6 +1524,7 @@ mod tests {
         }
     }
 
+    mod authority;
     mod http;
     mod https;
     mod manifests;

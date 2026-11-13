@@ -23,6 +23,11 @@
   <div id="pending"></div>
   <h2>Runs</h2>
   <div class="card" id="runs"></div>
+  <!-- A run's authority, or an explained decision (#173): read-only, opened from a row. -->
+  <div class="card" id="detail" hidden>
+    <div class="buttons"><span id="detail-title" class="mono"></span><button type="button" id="detail-close">Close</button></div>
+    <div id="detail-body"></div>
+  </div>
   <form class="card" id="runform" hidden>
     <div id="runform-title"></div>
     <textarea id="runform-text"></textarea>
@@ -41,6 +46,8 @@
   <div class="card" id="decided"></div>
   <h2>Activity</h2>
   <div class="card log" id="audit"></div>
+  <h2>Policy</h2>
+  <div class="card" id="policy"></div>
   <h2>Operator</h2>
   <div class="card" id="operator"></div>
   </div>
