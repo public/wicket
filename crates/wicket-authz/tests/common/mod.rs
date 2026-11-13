@@ -348,3 +348,17 @@ pub fn intersect(zones: &[CompiledZone], o: &wicket_core::Op) -> u8 {
 pub fn http_request(box_id: &str, o: &wicket_core::Op) -> Request {
     Request { time: T0, tenant: TENANT.into(), box_id: box_id.into(), epoch: 1, action: Action::from_op(o, None), uses_left: vec![] }
 }
+
+/// Decides `r` and asserts the compiled evaluator decided it, not the generic fallback (#183).
+/// Metadata and private hosts are decided before evaluation, so there is nothing to check for them.
+pub fn decide_compiled(l: &Loaded, r: &Request) -> Decision {
+    let d = l.decide(r);
+    let early = matches!(&r.action, Action::Http { host, .. } if wicket_core::never_reachable(host).is_some());
+    assert!(early || !l.last_fell_back(), "decided in the generic engine, not the compiled evaluator: {r:?}");
+    d
+}
+
+/// The most steps the mint-time estimate allows a request to this token in the generic engine.
+pub fn estimated_steps(t: &Token) -> u64 {
+    wicket_authz::cost::estimate(t.biscuit()).unwrap().steps()
+}

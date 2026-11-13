@@ -18,7 +18,7 @@
 //!
 //! Deterministic, no wall clock: [`STEP_BUDGET`] steps, 256 facts and 8 rule iterations per request
 //! (and the same for saturating the token's own facts at load). See [`STEP_BUDGET`] for how the
-//! budget was chosen.
+//! budget was chosen, and `cost` for the estimate `mint` and `attenuate` check against it.
 
 use crate::generator::request_facts;
 use crate::payload::{Action, PublicKey, Request};
@@ -31,24 +31,36 @@ use std::time::Duration;
 
 /// Steps (fuel) one request may take.
 ///
-/// Measured on every legitimate token the tests build (the 46 zones of oracle 1: example manifests
-/// and the subset tests' zones, as single blocks; the depth-0..5 chains of #59 with globs, with and
-/// without grants, under oracle 3's random requests of every kind), the most any request took was
-/// 308 steps in the compiled evaluator and 6,605 in the fork's generic engine (5,597 before forbid
-/// globs ignored case, #115: a folded letter is a four-byte class, so forbid patterns got longer). They differ because
-/// the compiled evaluator compiles each `.matches()` pattern once, while the generic engine charges
-/// 16 steps per pattern byte for compiling it on every evaluation. Legitimate tokens always run
-/// compiled (the tests assert it; the generic engine is the fallback for constructs the compiler
-/// doesn't handle and for run-time expression errors, neither of which wicket's blocks produce).
+/// Legitimate tokens run in the compiled evaluator, which compiles each `.matches()` pattern once;
+/// the tests assert that every request they decide on every legitimate token (every example zone and
+/// subset-test zone in oracle 1, the zone of #183, oracle 2's random chains, oracle 3's depth-0..5
+/// chains with and without grants, and the chains the property and hostile-token tests build on)
+/// was decided there, never by the generic fallback. The most a request took there was 308 steps
+/// (oracle 3, 100k requests).
+/// The fork's generic engine is the fallback for constructs the compiler doesn't handle and for
+/// run-time expression errors, neither of which wicket's blocks produce. It charges 16 steps per
+/// pattern byte, because it compiles each pattern on every evaluation, so its cost grows with the
+/// globs on one host: 5,242 steps at most on oracle 1's zones, 6,605 on oracle 3's chains (5,597
+/// before forbid globs ignored case, #115: a folded letter is a four-byte class), and 9,497 on the
+/// zone of #183 (fixture `tests/fixtures/zone-183.yaml`).
 ///
-/// 25,000 is about 80x the compiled maximum and 3.8x the generic one, so legitimate requests decide
-/// the same in both engines with room for larger zones, while no token that passes the structural
-/// check can make a request cost more (a hostile block at every cap is cut off with a run-limit
-/// error, which decides `Forbidden`). Asserted by the oracle tests ([`MEASURED_MAX_STEPS`]) and the
-/// hostile-token tests.
+/// So that the fallback could never decide a legitimate request `Forbidden` for its cost alone,
+/// [`crate::mint`] and [`crate::Token::attenuate`] refuse a token whose costliest host could exceed
+/// this budget in the generic engine ([`crate::cost`], [`crate::AuthzError::Cost`]). The oracle
+/// tests assert that every generic run on a legitimate token stays within that per-token estimate.
+///
+/// 25,000 is about 80x the compiled maximum, and well above the generic cost of every zone the
+/// tests build, while no token that passes the structural check can make a request cost more (a
+/// hostile block at every cap, appended by other means, is cut off with a run-limit error, which
+/// decides `Forbidden`; asserted by the hostile-token tests). A node's `load` doesn't estimate cost:
+/// the budget is what bounds a token it didn't make.
 pub const STEP_BUDGET: u64 = 25_000;
 
-/// The bound the tests assert on legitimate requests (generic engine; see [`STEP_BUDGET`]).
+/// The most generic-engine steps oracle 3 measured on its fixed chains (6,605), with headroom; its
+/// test asserts it, so a change to the fork or the generator that makes those requests costlier
+/// shows. It is a measurement over fixed test fixtures, not a limit on zones: oracle 1, over
+/// `examples/`, asserts the per-token cost estimate instead ([`crate::cost`]), so adding an example
+/// can't trip it (#183). The zone of #183 takes more than this, within its estimate.
 pub const MEASURED_MAX_STEPS: u64 = 7_000;
 
 /// The per-request limits.

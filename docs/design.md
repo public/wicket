@@ -204,6 +204,13 @@ follow-up, 2026-11-11).
     - blocks (16), token size and checks per block are capped.
 
     Without it, a hostile block can burn CPU inside the step budget.
+  - A **cost estimate where tokens are made** (#183). The stock engine compiles each path pattern on
+    every evaluation, about 16 steps per pattern byte, so its cost grows with the globs on one host.
+    `mint` and `attenuate` refuse a token whose costliest host could exceed the step budget there. The
+    error names the host and its pattern bytes. Otherwise, if the token ever fell back, its requests
+    would be cut off and decided `Forbidden`. The tests assert that every legitimate token runs
+    compiled, and that the stock engine stays within each token's estimate
+    (`crates/wicket-authz/README.md`, "How the bounds are measured").
   - A **differential test in CI** compares the compiled evaluator with the stock engine on random tokens
     and requests. It runs on every change to the fork and every rebase onto upstream.
   - Patches 1 and 2 are small and general, and should go upstream. Patch 3 is wicket's to maintain.

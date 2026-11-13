@@ -111,6 +111,10 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
   `biscuit-auth` ([#83](https://github.com/public/wicket/pull/83)). Served nodes decide with these tokens
   ([#102](https://github.com/public/wicket/pull/102)); the control host decides from the compiled zone and
   the ledger.
+- A zone whose path globs on one host could cost more than the authz step budget, if its token ever
+  ran in the generic engine, is refused when its token is minted. The error names the host and its
+  pattern bytes. Before, such a token could have decided `Forbidden` on every request to that host
+  ([#183](https://github.com/public/wicket/issues/183)).
 
 ### Remote nodes and capacity
 
