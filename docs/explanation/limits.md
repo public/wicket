@@ -96,6 +96,11 @@ not a permanent decision.
   address, so a server in the box can't bind it, even on 127.0.0.1.
 - **The `/tmp` cap is a poll, not a quota.** wicket stops a box whose `/tmp` goes over 512 MiB, checking
   every 5 s, so a fast writer can exceed the cap briefly ([#106](https://github.com/public/wicket/pull/106)).
+- **Out of memory kills the whole box, and the warning comes late or not at all** (#185). The kernel's OOM
+  killer ends a box that goes over its zone's memory limit, and with it every uncommitted change. The node
+  samples memory every 5 s and warns an agent at 90% of the limit. The warning reaches the agent as a
+  message at its next turn, not in the middle of one, and programs get none. A box that grows past its
+  limit within 5 s is killed before any warning, and its cause then names the limit but not the peak.
 
 ## Authority and the Biscuit fork
 

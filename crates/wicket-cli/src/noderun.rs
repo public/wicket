@@ -282,11 +282,18 @@ pub struct NodeCtl {
     next: [std::sync::atomic::AtomicU64; 2],
     /// The protocol version the current connection talks (0: none yet).
     proto: std::sync::atomic::AtomicU32,
+    /// Why the box ended, as its node reported with its exit (#185).
+    exit_cause: Mutex<Option<String>>,
 }
 
 impl NodeCtl {
     fn send(&self, f: Frame) -> bool {
         self.link.lock().expect("link").as_ref().is_some_and(|l| l.send(f).is_ok())
+    }
+
+    /// Why the box ended, if its node said (#185): wicket's own stop, out of memory, a signal.
+    pub fn exit_cause(&self) -> Option<String> {
+        self.exit_cause.lock().expect("exit cause").clone()
     }
 
     /// How far into the box's stdout and stderr this supervisor got.
@@ -521,6 +528,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         done: tokio::sync::Notify::new(),
         next: [std::sync::atomic::AtomicU64::new(s.resume_from[0]), std::sync::atomic::AtomicU64::new(s.resume_from[1])],
         proto: std::sync::atomic::AtomicU32::new(0),
+        exit_cause: Mutex::new(None),
     });
     let shared = Arc::new(Shared {
         node: name.clone(),
@@ -963,13 +971,14 @@ async fn on_frame(
                 // The node says the box has stopped: nothing fences a wake of its agent any more.
                 confirm_stopped(&sh.dir);
                 if let Some(why) = &reason {
-                    println!("[wicket] node {} stopped the box: {why}", sh.node);
+                    println!("[wicket] the box ended (exit status {code}): {why}");
                     let _ = sh.ledger.lock().expect("ledger").audit(
                         &sh.tenant,
                         Some(&sh.run),
-                        "run.stopped_by_node",
-                        &serde_json::json!({ "node": sh.node, "code": code, "why": why }),
+                        "run.exit_cause",
+                        &serde_json::json!({ "node": sh.node, "code": code, "cause": why }),
                     );
+                    *sh.ctl.exit_cause.lock().expect("exit cause") = Some(why.clone());
                 }
                 if let Some(r) = result {
                     let out = sh.dir.join("workspace/out");
@@ -996,6 +1005,13 @@ async fn on_frame(
             }
             Msg::Event { run, event } if run == sh.run.0 => {
                 if let Ok(ev) = serde_json::from_value::<wicket_proxy::Event>(event) {
+                    // Near its memory limit (#185): the agent is told, as a message from wicket, so it
+                    // can scale down before the kernel kills the box.
+                    if let wicket_proxy::Event::Box { what, detail } = &ev {
+                        if what == "memory_pressure" {
+                            let _ = sh.ledger.lock().expect("ledger").add_operator_message(&sh.run.0, detail, "wicket");
+                        }
+                    }
                     let _ = sh.events.send(ev);
                 }
             }

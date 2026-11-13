@@ -11,6 +11,24 @@ explains why it is built this way.
   capability, adds wicket's addresses to the loopback, and then runs everything as the agent's user
   (`WICKET_AS_USER`) with no capabilities.
 - Memory, CPUs and PIDs from the zone's `limits`. `/tmp` is capped at 512 MiB, checked every 5 s.
+- **Memory** (#185): the node samples the box's cgroup every 5 s. When the box reaches 90% of its memory
+  limit, its agent gets a message from wicket (at its next turn) saying so and asking it to reduce
+  parallelism and save its work; it is warned again only after dropping below 75%. A box over its limit is
+  killed whole by the kernel's OOM killer (gVisor's sandbox included).
+- **How a box ended** (#185): when a box ends abnormally its node says why, and `wicket run` prints it
+  with the status, for example `failed (exit status: 137; killed: out of memory (limit 3 GiB, peak 3 GiB))`.
+  The causes:
+  - wicket's own stops: `stopped by wicket: …` (the node's timeout backstop, an expired authority, the
+    output cap with `on_output_full: stop`, its control host's stop);
+  - the kernel's OOM killer: `killed: out of memory`, from Docker's `State.OOMKilled` or the cgroup's
+    `oom_kill` count, with the limit and the peak seen;
+  - the container runtime's own error;
+  - a signal from elsewhere (`killed by signal 9 (SIGKILL), not by wicket and not for memory`), or a crash
+    (`crashed: signal 11 (SIGSEGV)`).
+
+  A box that exited by itself (its program's own exit code) has no cause. The cause is in the audit
+  (`run.exit_cause`, `run.end`'s `cause`, and the node's `box.exit_cause`), on the console, and in a
+  parent's `run_finished` message (`cause`).
 - The agent image (`wicket image`, tag `wicket/claude-code:poc`) holds Claude Code, bash, curl, jq,
   git, python3 and `wicket-fwd`, the in-box forwarder.
 

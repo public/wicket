@@ -235,6 +235,11 @@ pub enum Event {
         name: String,
         detail: String,
     },
+    /// The box itself (#185): `memory_pressure` near its memory limit (the text for its agent).
+    Box {
+        what: String,
+        detail: String,
+    },
 }
 
 impl RunCtx {

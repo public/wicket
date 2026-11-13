@@ -149,7 +149,7 @@ if [ -n "${NODE_LOG:-}" ]; then cp "$NODE_LOG" "$work/node.log"
 elif [ "$MODE" != --local ]; then node_sh 'XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u wicket-node -o cat --since "-15 min"' >"$work/node.log" 2>/dev/null || true
 fi
 # When the node stopped the box: what the run printed from the node's exit (#153), or the node's log.
-t_expired=$(grep -o "stopped the box: its authority expired at [0-9]* ms" "$work/run.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
+t_expired=$(grep -o "stopped by wicket: its authority expired at [0-9]* ms" "$work/run.log" | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
 [ -n "$t_expired" ] || t_expired=$(grep -o "$run: its authority expired at [0-9]* ms" "$work/node.log" 2>/dev/null | grep -o '[0-9]* ms' | grep -o '[0-9]*' | tail -1 || true)
 # Else from the node's audit, shipped to the control host on reconnect.
 for _ in $(seq 20); do
