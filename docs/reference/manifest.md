@@ -41,9 +41,9 @@ Exactly one of `agent` and `program` must be given.
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The agent's name, the last part of its SPIFFE ID (`…/a/<name>`). |
-| `kind` | string | `claude-code` | The harness. Only `claude-code` is supported. |
-| `model` | string | the harness's default | The model id passed to the agent. |
-| `max_turns` | integer | none | The most agentic turns per task, passed to Claude Code. |
+| `kind` | string | `claude-code` | The harness. `claude-code`: Claude Code, driven by wicket over its stream-json. `acp`: any agent that speaks the Agent Client Protocol, started from [`agent.acp`](#agentacp). |
+| `model` | string | the harness's default | The model id passed to the agent. For `acp`, only with a known `acp.profile`. |
+| `max_turns` | integer | none | The most agentic turns per task, passed to Claude Code. Not for `acp`. |
 | `max_children` | integer | `0` | How many boxes this agent may start with `spawn` or `spawn_agent`. `0`: neither tool works. A child's own `max_children` counts against its parent's. |
 | `in_box_subagents` | boolean | `true` | Whether Claude Code may run its own subagents (its Agent tool) inside the box. They share the box, its identity and its reach; their requests are attributed but not provably identified. `false` makes wicket children the only kind of subagent. |
 | `idle_timeout` | duration | `0s` | How long the session stays open after each turn for follow-ups (`wicket say`). `0s`: the run ends when the first task is done. |
@@ -60,6 +60,19 @@ Exactly one of `agent` and `program` must be given.
 
 The zone's `llm.secret` is then the account login, which the box only ever holds as a placeholder.
 See [drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md).
+
+### `agent.acp`
+
+For `kind: acp` (and only then). See [ACP agents](agents.md#acp-agents) for what wicket offers the agent
+and how it answers it.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `command` | list of strings | required | The agent's command inside the box, such as `[gemini, --experimental-acp]`. The image must already have it, at a pinned version: nothing is installed when the box starts. |
+| `profile` | string | none | A wicket profile for a known adapter: what wicket itself sets for it. `claude-agent-acp`: Claude Code through its ACP adapter, with Claude Code's placeholders and routes, its `settings.json`, and wicket's `_meta.claudeCode.options`. None: a generic ACP agent, which gets wicket's shared routes and the manifest's `env` only; `model` and `adapter_settings` are refused. |
+
+A manifest can't set `_meta`, MCP servers or a system prompt for an ACP agent: wicket sets those.
+`remote` and `max_turns` are refused.
 
 ## `program`
 

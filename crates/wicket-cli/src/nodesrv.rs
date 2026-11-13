@@ -1812,7 +1812,7 @@ fn child_start(
         None => wicket_agent::claude_code_plan(m, child, session),
     };
     let mut state_files = vec![];
-    if m.agent.as_ref().is_some_and(|a| a.kind == "claude-code") {
+    if wicket_agent::uses_claude_settings(m) {
         let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(m))?;
         state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
     }

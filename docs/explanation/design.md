@@ -794,7 +794,7 @@ pub trait AgentSession: Send {
 | Tier | Agents | How wicket drives it | Pending path |
 |---|---|---|---|
 | **T1: native control protocol** | **Claude Code** (stream-json control protocol, spoken natively from Rust); **Codex app-server** (JSON-RPC: host-answered `requestApproval`, `turn/steer`, per-turn `outputSchema`, `thread/resume`/`fork`, `dynamicTools`); **pi** RPC mode plus a small in-box wicket extension | the agent's own permission prompts are answered by wicket; steering; native typed output (pi: a terminating `wicket_result` tool) | hold the prompt open + pause/snapshot; Claude `defer` + `--resume`; Codex replays pending approvals on reconnect |
-| **T2: ACP** | Gemini CLI, goose, OpenCode, Cline…, and fallbacks `codex-acp`, Claude's ACP adapter (official `agent-client-protocol` crate, protocol v1) | JSON-RPC over stdio; MCP servers passed per session | hold `session/request_permission`; follow-up prompt after grant |
+| **T2: ACP** | Gemini CLI, goose, OpenCode, Cline…, and fallbacks `codex-acp`, Claude's ACP adapter (protocol v1; manifest `kind: acp`) | JSON-RPC over stdio. wicket advertises no `fs`, `terminal` or `auth.terminal`; it sends the gateway as the only MCP server and the sandbox notice via `systemPrompt` append; it answers prompts only with `allow_once` or `reject_once`, chosen by `kind` and paths, never by titles, names or command text; gate-mediated operations are allowed to reach the gate; approvals replayed after `load`/`resume` are never honoured; agent-specific `_meta` (`claudeCode.options`) is set by wicket only | follow-up prompt after grant; `session/resume` or `load` after a wake |
 | **T3: process** | anything; optionally with a structured event stream (`codex exec --json`, `pi --mode json`) | enforcement only at the proxies; `/wicket/out/result.json` outbox validated outside | structured 403 / MCP error with `request_id`; restart with checkpointed workdir |
 
 **Placement is a separate axis:**
@@ -813,8 +813,8 @@ pub trait AgentSession: Send {
 - `config_lockdown` (managed file | file ownership only);
 - `config_exec_vectors` (config keys that run commands, e.g. pi `!cmd` values) — always rejected;
 - `context_files` (preflight taint list);
-- `persistent_policy_writes` (in-box state an approval could persist, e.g. Codex rules amendments) —
-  never sent;
+- `persistent_policy_writes` (in-box state an approval could persist, e.g. Codex rules amendments, ACP
+  `allow_always`, which the Claude adapter writes to `.claude/settings.local.json`) — never sent;
 - `session_store`, `fork_at`, `settled_signal`, `native_remote`, `background_traffic`.
 
 **Launches.** Common to all three: no model credential in the box, only a zone- and session-bound
@@ -918,6 +918,15 @@ The suite runs in CI inside a real zone:
     as the real secret, and a zone placeholder seen anywhere except its own injection slot trips an
     anomaly.
 13. Each SandboxEscapeBench misconfiguration class is negated in the box.
+14. (ACP) The agent never gets `fs/*` or `terminal/*` served: `-32601` if it tries.
+15. (ACP) No "always" state is written: wicket never selects an `allow_always` or `reject_always` option.
+16. (ACP) A permission request during a `session/load` replay is answered `cancelled`; afterwards, prompts
+    are decided afresh.
+17. (ACP) `acp-tck` passes for the pinned agent.
+18. (ACP, Claude adapter) `/remote-control` fails closed outside `vendor_rc`.
+
+Cases 14–16 run against a misbehaving mock ACP agent (unit tests in `wicket-agent`, and in a real box in
+`ci/acceptance.sh`). 17 and 18 need a live run of a pinned agent and are not done yet.
 
 Per-agent experiments:
 - **E-PI1:** pi runs with a read-only agent dir.

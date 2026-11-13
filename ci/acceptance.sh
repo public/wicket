@@ -29,6 +29,8 @@
 #   - `link` wires two of the agent's boxes, and one fetches a page from the other across it;
 #   - revoking the agent's identity stops its whole subtree (children and a grandchild);
 #   - an agent hibernates and is woken: its files and its session survive;
+#   - an ACP agent (#66) gets wicket's safe client posture, hibernates, and is woken into its own
+#     session, where a prompt asked during the replay isn't approved;
 #   - an orphaned box (its `wicket run` killed hard) is taken over by `wicket reconcile`, and after
 #     it is revoked a dry run has nothing to change;
 #   - (--nodes local) a node on its own (#152, #153): a box on the other node keeps working through a
@@ -314,6 +316,28 @@ check "  its files survived (/tmp, \$HOME, workspace, durable volume)" '[ "$(hf 
 check "  and the model saw the earlier conversation, then the operator's text" 'grep -qE "finish \(([5-9]|[1-9][0-9]) messages" "$work/mock.log" && grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
 check "  and the generation went up by one" '[ "$(agent_field generation)" = $((gen1 + 1)) ]'
 
+# ---- 2b. an ACP agent (#66) ----
+log "an ACP agent: wicket's client posture, hibernate and wake"
+acp_ws=$(workdir acp)
+wt 300 run "$(manifest acp)" --workdir "$acp_ws" --image "$IMAGE_TAG" >"$work/acp1.log" 2>&1 || true
+our_runs+=("$(run_id_of "$work/acp1.log")")
+ares=$(result_of "$work/acp1.log")
+af() { jq -r "$1" <<<"$ares" 2>/dev/null; }
+check "an ACP agent ran its turn (run ${our_runs[-1]:-?})" '[ "$(af .status)" = done ] && grep -q "ACP session mock-session-1 new" "$work/acp1.log"'
+check "  wicket offered it no file, terminal or auth capability" '[ "$(af ".seen.initialize.clientCapabilities | [.fs.readTextFile, .fs.writeTextFile, .terminal, has(\"auth\")] | map(tostring) | join(\",\")")" = false,false,false,false ]'
+check "  its only MCP server is wicket's gateway, which answers, and the notice is a system-prompt append" '[ "$(af ".seen.session.mcpServers | map(.name) | join(\",\")")" = wicket ] && af .seen.gateway | grep -q "with await_grant: True" && [ "$(af .seen.session.systemPrompt.mode)" = append ] && af .seen.session.systemPrompt.head | grep -q "wicket sandbox" && [ "$(af .seen.session.has_meta)" = false ]'
+check "  its fs and terminal calls got -32601" '[ "$(af "[.seen.errors.fs_read, .seen.errors.fs_write, .seen.errors.terminal] | map(tostring) | join(\",\")")" = -32601,-32601,-32601 ] && grep -q "called terminal/create, which wicket doesn.t offer" "$work/acp1.log"'
+check "  permissions: allow_once for a command, reject_once for settings.local.json and a mode change, never an always" '[ "$(af .seen.answers.execute)" = opt-allow_once ] && [ "$(af .seen.answers.settings_local)" = opt-reject_once ] && [ "$(af .seen.answers.switch_mode)" = opt-reject_once ] && [ "$(af .seen.answers.only_always)" = cancelled ] && [ "$(af .always_state_written)" = false ]'
+check "  and each answer is audited" '[ "$(w audit --tail 400 | grep "${our_runs[-1]}" | grep -c run.agent_prompt)" -ge 4 ] && w audit --tail 400 | grep "${our_runs[-1]}" | grep run.agent_call_refused | grep -q fs/write_text_file'
+acp_agent=$(grep -o "agent agt_[a-z0-9]*" "$work/acp1.log" | head -1 | cut -d" " -f2 || true)
+check "  it hibernated after its turn" '[ -n "$acp_agent" ] && grep -q "hibernated in" "$work/acp1.log"'
+wt 300 wake "$acp_agent" "Again, please." >"$work/acp2.log" 2>&1 || true
+our_runs+=("$(run_id_of "$work/acp2.log")")
+ares=$(result_of "$work/acp2.log")
+check "woken, it loaded its own ACP session" '[ "$(af .seen.load.known)" = true ] && grep -q "ACP session mock-session-1 loaded" "$work/acp2.log"'
+check "  a prompt asked during the replay was cancelled, and the next decided afresh (allow_once)" '[ "$(af .seen.answers.during_replay)" = cancelled ] && [ "$(af .seen.answers.after_replay)" = opt-allow_once ]'
+check "  and the operator's text reached it as a prompt" 'af ".seen.prompts[-1]" | grep -q "Again, please."'
+
 # ---- 3. reconcile: an orphaned box ----
 # Its supervisor killed hard, the box runs on (on this host's own node); reconcile takes its run over
 # instead of ending it (#151), and the run ends when it is revoked.
@@ -571,7 +595,7 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 acp1 acp2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
   exit 1
 fi
 echo "acceptance passed"

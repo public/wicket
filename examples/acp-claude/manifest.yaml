@@ -1,0 +1,21 @@
+# Claude Code through its ACP adapter, in a wicket box (#66). wicket is the ACP client: no fs or
+# terminal capability, its gateway the only MCP server, once-only answers to permission prompts, and
+# its own _meta.claudeCode.options (strictMcpConfig, settingSources without "local").
+#
+# Not the default way to run Claude Code under wicket (that is `kind: claude-code`): see README.md.
+task: Read the repository in /workspace and summarise what it does in /workspace/out/result.json.
+agent:
+  name: claude-acp
+  kind: acp
+  acp:
+    command: [claude-agent-acp]
+    profile: claude-agent-acp
+  idle_timeout: 0s
+  image: wicket/claude-code-acp:poc
+zone:
+  name: claude-acp
+  isolation: gvisor
+  images: [wicket/claude-code-acp:poc]
+  llm:
+    secret: claude-oauth
+  limits: { memory: 3g, cpus: 2, timeout: 30m }
