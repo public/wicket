@@ -552,6 +552,7 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn a_wrapped_session_gets_placeholders_and_keeps_its_own_settings() {
@@ -646,5 +647,78 @@ mod tests {
         assert!(!r.contains('\u{1b}'));
         assert!(r.contains("[tool]  Bash: ls -la"));
         assert!(render_event("not json").is_none());
+    }
+
+    fn remote_manifest(kind: &str) -> Manifest {
+        let mut m =
+            Manifest::from_yaml("agent: { name: rc, remote: { name: my box } }\nzone: { name: z, llm: { secret: claude-login } }\n")
+                .unwrap();
+        m.agent.as_mut().unwrap().kind = kind.into();
+        m
+    }
+
+    #[test]
+    fn a_remote_session_boots_claude_remote_control_with_placeholders_only() {
+        let m = remote_manifest("claude-code");
+        let run = RunId("run_rc1".into());
+        let meta = serde_json::json!({
+            "scopes": ["user:inference"], "subscriptionType": "max",
+            "oauthAccount": { "organizationUuid": "org-1", "emailAddress": "a@example.com" }
+        });
+        let w = remote_plan(&m, &run, &meta).unwrap();
+        assert_eq!(&w.plan.argv[..5], ["wicket-entry", "claude", "remote-control", "--name", "my box"]);
+        assert!(w.plan.argv.windows(2).any(|p| p == ["--spawn", "session"]));
+        assert!(w.plan.stdin_task.is_none());
+        let file = |rel: &str| -> Value { serde_json::from_slice(&w.files.iter().find(|(r, _)| r == rel).unwrap().1).unwrap() };
+        let creds = file("claude/.credentials.json");
+        assert_eq!(creds["claudeAiOauth"]["accessToken"], w.login_placeholder);
+        assert_eq!(creds["claudeAiOauth"]["subscriptionType"], "max");
+        assert!(creds["claudeAiOauth"]["refreshToken"].as_str().unwrap().contains("placeholder"));
+        let cfg = file("claude/.claude.json");
+        assert_eq!(cfg["remoteDialogSeen"], true);
+        assert_eq!(cfg["projects"][WORKSPACE]["hasTrustDialogAccepted"], true);
+        assert_eq!(cfg["oauthAccount"]["organizationUuid"], "org-1");
+        assert_eq!(cfg["mcpServers"]["wicket"]["url"], "http://wicket.internal:8081/mcp");
+        let notice = String::from_utf8(w.files.iter().find(|(r, _)| r == "claude/CLAUDE.md").unwrap().1.clone()).unwrap();
+        assert!(notice.contains("wicket sandbox"));
+        // No credential anywhere but the placeholders, and the routes are wicket's.
+        let env: HashMap<_, _> = w.plan.env.iter().cloned().collect();
+        assert_eq!(env["HTTPS_PROXY"], "http://wicket.internal:3128");
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") && !env.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn a_harness_without_remote_sessions_refuses_one() {
+        let m = remote_manifest("codex");
+        let e = remote_plan(&m, &RunId("run_x".into()), &Value::Null).err().unwrap();
+        assert!(e.to_string().contains("the codex adapter has no remote sessions"), "{e}");
+        assert_eq!(remote_session_url(&m, "see https://chatgpt.example/x"), None);
+    }
+
+    #[test]
+    fn the_session_url_is_read_from_the_servers_output() {
+        let m = remote_manifest("claude-code");
+        assert_eq!(
+            remote_session_url(&m, "Continue at https://claude.ai/code/session_01abc?x=1 (or the app)").as_deref(),
+            Some("https://claude.ai/code/session_01abc?x=1")
+        );
+        assert_eq!(remote_session_url(&m, "visit claude.ai/code in a browser"), None);
+    }
+
+    #[test]
+    fn the_account_comes_from_the_config_beside_the_login_without_the_holders_name() {
+        let d = std::env::temp_dir().join(format!("wicket-agent-acct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        std::fs::write(d.join(".claude.json"), r#"{"oauthAccount":{"organizationUuid":"o","fullName":"A Person"},"projects":{}}"#).unwrap();
+        let a = claude_code_account(&d.join(".claude/.credentials.json")).unwrap();
+        assert_eq!(a, serde_json::json!({ "organizationUuid": "o" }));
+        // A CLAUDE_CONFIG_DIR layout: both in one directory.
+        std::fs::write(d.join(".claude/.claude.json"), r#"{"oauthAccount":{"organizationUuid":"p"}}"#).unwrap();
+        assert_eq!(claude_code_account(&d.join("cfg/.credentials.json")), None);
+        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::copy(d.join(".claude/.claude.json"), d.join("cfg/.claude.json")).unwrap();
+        assert_eq!(claude_code_account(&d.join("cfg/.credentials.json")).unwrap()["organizationUuid"], "p");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

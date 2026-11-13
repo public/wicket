@@ -750,4 +750,19 @@ zone:
         assert!(!host_matches("*.githubusercontent.com", "evilgithubusercontent.com"));
         assert!(host_matches("api.github.com", "API.GitHub.com."));
     }
+
+    #[test]
+    fn a_remote_session_needs_no_task_but_a_good_name_and_never_hibernates() {
+        let y = |agent: &str| Manifest::from_yaml(&format!("agent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
+        let m = y(", remote: { name: my box }").unwrap();
+        assert_eq!(m.agent.unwrap().remote.unwrap().name, "my box");
+        assert!(y("").unwrap_err().to_string().contains("task is empty"));
+        assert!(y(", remote: { name: '' }").is_err());
+        assert!(y(", remote: { name: 'a/b' }").is_err());
+        assert!(y(", remote: { name: x, mode: y }").is_err(), "unknown fields");
+        assert!(y(", remote: { name: x }, idle_timeout: 1m, hibernate_after: 1h").unwrap_err().to_string().contains("can't hibernate"));
+        // Other manifests serialize as before (their identity digests don't change).
+        let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));
+    }
 }
