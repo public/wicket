@@ -145,6 +145,7 @@ impl World {
             tenant: TenantId::single(),
             run: RunId("run_stream".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
             vault: wicket_proxy::vault::Vault::new(dir.join("vault")),
             events: tx,

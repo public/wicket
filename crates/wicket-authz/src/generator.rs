@@ -218,7 +218,125 @@ pub(crate) fn ceiling_code(ceiling: &Ceiling, authority: Option<&AuthorityInfo<'
     let keys: Vec<String> = ceiling.inject.iter().map(Inject::key).collect();
     let inject = c.set(keys.iter().map(String::as_str));
     c.push(&format!("reject if inject($k), !{inject}.contains($k);\n"));
+    if let (Some(org), Some(_)) = (&ceiling.org, authority) {
+        org_code(&mut c, org)?;
+    }
     Ok(c)
+}
+
+/// One HTTP conjunction's predicates and expressions (after `op` and with `$h`, `$m`, `$p`, `$r`).
+fn http_match(c: &mut Code, m: &HttpMatch) -> Result<String, AuthzError> {
+    let mut parts = vec![];
+    if !m.hosts.is_empty() || !m.not_hosts.is_empty() {
+        parts.push("host($h)".to_string());
+    }
+    for h in &m.hosts {
+        parts.push(match h {
+            HostPat::Exact(x) => format!("$h == {}", c.s(x)),
+            HostPat::Suffix(x) => format!("$h.ends_with({})", c.s(x)),
+        });
+    }
+    for x in &m.not_hosts {
+        parts.push(format!("$h != {}", c.s(x)));
+    }
+    if let Some(ms) = &m.methods {
+        let set = c.set(ms.iter().map(String::as_str));
+        parts.push(format!("method($m), {set}.contains($m)"));
+    }
+    if !m.paths.is_empty() {
+        parts.push("path($p)".to_string());
+    }
+    for p in &m.paths {
+        let re = match p {
+            PathPat::Glob(g) => path_regex(g)?,
+            PathPat::GlobAnyCase(g) => path_regex(&wicket_core::manifest::fold_case_glob(g))?,
+            PathPat::Like(l) => like_regex(l),
+        };
+        parts.push(format!("$p.matches({})", c.s(&re)));
+    }
+    if m.max_risk.is_some() || m.min_risk.is_some() {
+        parts.push("risk($r)".to_string());
+    }
+    if let Some(n) = m.max_risk {
+        parts.push(format!("$r <= {}", c.i(n)));
+    }
+    if let Some(n) = m.min_risk {
+        parts.push(format!("$r >= {}", c.i(n)));
+    }
+    Ok(parts.join(", "))
+}
+
+/// A Cedar `like` pattern as an anchored regex: `*` is any run of characters (`/` included), `\*` a
+/// literal star, everything else itself.
+pub fn like_regex(pat: &str) -> String {
+    let mut out = String::from("^");
+    let mut chars = pat.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push_str("\\*");
+            }
+            '*' => out.push_str(".*"),
+            ch => out.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    out.push('$');
+    out
+}
+
+/// The org layer's checks (#51), in block 0. Each reads the `policy` fact, which classes it hard:
+/// a grant can't lift the org ceiling.
+fn org_code(c: &mut Code, org: &OrgLayer) -> Result<(), AuthzError> {
+    let v = c.s(&org.version);
+    c.push(&format!("policy({v});\n"));
+    if let Some(alts) = &org.http {
+        let http = c.s(OpKind::Http.as_str());
+        let mut q = format!("check if policy($v), op($o), $o != {http}");
+        for a in alts {
+            let m = http_match(c, a)?;
+            q.push_str(&format!("\n  or op($o){}{m}", if m.is_empty() { "" } else { ", " }));
+        }
+        c.push(&format!("{q};\n"));
+    }
+    for f in &org.forbid {
+        let http = c.s(OpKind::Http.as_str());
+        let m = http_match(c, f)?;
+        c.push(&format!("reject if policy($v), op({http}){}{m};\n", if m.is_empty() { "" } else { ", " }));
+    }
+    if let Some(alts) = &org.spawn {
+        let kind = c.s(OpKind::Spawn.as_str());
+        let mut q = format!("check if policy($v), op($o), $o != {kind}");
+        for a in alts {
+            let mut parts = vec!["spawn($i, $iso, $mem, $cpu, $pids, $secs)".to_string()];
+            if let Some(imgs) = &a.images {
+                parts.push(format!("{}.contains($i)", c.set(imgs.iter().map(String::as_str))));
+            }
+            for (var, cmp, v) in [
+                ("$iso", ">=", a.min_isolation),
+                ("$mem", "<=", a.max_mem_bytes),
+                ("$cpu", "<=", a.max_cpus_milli),
+                ("$pids", "<=", a.max_pids),
+                ("$secs", "<=", a.max_timeout_s),
+            ] {
+                if let Some(v) = v {
+                    parts.push(format!("{var} {cmp} {}", c.i(v)));
+                }
+            }
+            q.push_str(&format!("\n  or {}", parts.join(", ")));
+        }
+        c.push(&format!("{q};\n"));
+    }
+    if let Some(from) = &org.msg_from {
+        let kind = c.s(OpKind::Msg.as_str());
+        let set = c.set(from.iter().map(String::as_str));
+        c.push(&format!("check if policy($v), op($o), $o != {kind}\n  or msg_from($z), {set}.contains($z);\n"));
+    }
+    if let Some(keys) = &org.inject {
+        let set = c.set(keys.iter().map(String::as_str));
+        c.push(&format!("reject if policy($v), inject($k), !{set}.contains($k);\n"));
+    }
+    Ok(())
 }
 
 /// A spawn block for `ceiling`, unchecked (tests: tokens over the caps, built to show that a node
@@ -302,6 +420,7 @@ mod tests {
             llm: LlmBudget { max_requests: 0, max_output_tokens: 0 },
             accept_from: vec![],
             grant_keys: vec![PublicKey([7; 32])],
+            org: None,
         };
         let code = ceiling_code(&c, Some(&AuthorityInfo { tenant: "t", principal: "p" })).unwrap();
         // Nothing but fixed fragments and placeholders: no quote, digit literal or brace other than

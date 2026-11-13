@@ -122,6 +122,7 @@ impl World {
             tenant: TenantId::single(),
             run: RunId("run_rc".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: ledger.clone(),
             vault,
             events: tx,

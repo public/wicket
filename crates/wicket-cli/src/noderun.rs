@@ -344,6 +344,8 @@ pub struct Start {
     pub node: String,
     pub via: Via,
     pub tenant: TenantId,
+    /// The installation's org policy, compiled for this box (#51): block 0's org layer.
+    pub org: Option<Arc<wicket_authz::OrgLayer>>,
     pub run: RunId,
     pub zone: ZoneSpec,
     pub dir: PathBuf,
@@ -392,6 +394,8 @@ struct Shared {
     issuer: Arc<wicket_identity::Issuer>,
     /// The box's base token (block 0), and the key that signs its grant blocks.
     token_issuer: wicket_feed::Issuer,
+    /// Block 0 carries an org layer (#51): only for nodes talking [`crate::chan::ORG_POLICY`].
+    org: bool,
     approver: wicket_authz::SigningKey,
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
@@ -423,19 +427,22 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.authority_secs.max(1);
     let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000;
     let ((minter, issuer_cert), approver) = (crate::roots::minting_key(until_ms)?, crate::enrol::token_key(&paths.approver_key)?);
-    let mut token_issuer = wicket_feed::Issuer::root(
-        &minter,
-        &s.tenant.0,
-        &format!("run:{}", s.run),
-        &s.run.0,
-        0,
+    // Block 0 is compiled from Cedar (#51): the zone's policy and, if the installation has one, the
+    // org policy, for this box as it is now (its zone's groups, its principal, its spawn depth).
+    let ceiling = wicket_policy::ceiling(
         &s.zone,
-        std::slice::from_ref(&s.start.image),
+        &s.run.0,
         not_after,
         vec![approver.public()],
+        std::slice::from_ref(&s.start.image),
+        s.org.as_deref().cloned(),
     )
-    .context("minting the box's token")?;
+    .context("compiling the box's policy")?;
+    let mut token_issuer =
+        wicket_feed::Issuer::from_ceiling(&minter, &s.tenant.0, &format!("run:{}", s.run), &s.run.0, 0, &s.zone, &ceiling)
+            .context("minting the box's token")?;
     token_issuer.issuer_cert = issuer_cert;
+    s.ledger.lock().expect("ledger").set_run_policy(&s.run.0, s.org.as_ref().map(|o| o.version.as_str()))?;
     // A re-attached run's token carries the grants the ledger already handed this node for it, so
     // nothing a human approved is lost with the supervisor that published them.
     let carried: Vec<LiveGrant> = match s.attach {
@@ -502,6 +509,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         cfg,
         issuer,
         token_issuer,
+        org: s.org.is_some(),
         approver,
         attribute: s.attribute.clone(),
         llm: s.llm.clone(),
@@ -702,6 +710,16 @@ async fn session(
             sh.node,
             authed.proto,
             crate::chan::ISSUER_CERT,
+            sh.node
+        );
+    }
+    if sh.org && authed.proto < crate::chan::ORG_POLICY {
+        p.ever = false;
+        bail!(
+            "node {} talks protocol {}, and this box's token carries the org policy, which needs {}: update the node (`wicket node install {}`)",
+            sh.node,
+            authed.proto,
+            crate::chan::ORG_POLICY,
             sh.node
         );
     }

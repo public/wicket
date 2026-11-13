@@ -20,7 +20,7 @@ doesn't protect", before you trust it with anything.
 - Reference: [agents](docs/agents.md) (identity, children, links, sessions, hibernation),
   [console](docs/console.md), [nodes](docs/nodes.md) (enrolment, `node serve`, placement, leases),
   [audit export](docs/audit-export.md), [state off the host and restore](docs/state.md),
-  [performance](docs/performance.md).
+  [policy in Cedar](docs/policy.md), [performance](docs/performance.md).
 - Design: [docs/design.md](docs/design.md), [research](docs/research/), [prior art](docs/prior-art.md),
   [test record](docs/poc-results.md).
 

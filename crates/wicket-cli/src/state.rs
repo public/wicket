@@ -234,6 +234,9 @@ fn kit_files(with_secrets: bool, with_roots: bool) -> Result<Vec<(String, PathBu
             add_dir(&format!("data/nodes/{node}/feed"), &e.path().join("feed"), &|n| n == "feed.key" || n == "cert.jws")?;
         }
     }
+    // The org policy (#51), and every version runs were minted under: a standby mints as this host did.
+    add_dir("data/policy", &d.join("policy"), &|_| true)?;
+    add_dir("data/policy/versions", &d.join("policy/versions"), &|_| true)?;
     if with_secrets {
         add_dir("secrets", &vault_dir(), &|_| true)?;
     }

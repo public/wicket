@@ -1,0 +1,15 @@
+[package]
+name = "wicket-policy-diff"
+description = "Does an org policy change narrow or widen what boxes may do? SymCC (with cvc5), in CI (#51)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Pinned together, as the experiment (#58) and the SymCC README pin them.
+cedar-policy = "=4.14.1"
+cedar-policy-symcc = "=0.8.1"
+wicket-policy.workspace = true
+tokio = { workspace = true }
+anyhow.workspace = true

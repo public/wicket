@@ -100,6 +100,14 @@ everything they reach, and can run boxes on remote nodes it enrols or provisions
 
 ### Identity, spawn and links
 
+- Policy in Cedar: an org policy (`<data dir>/policy/org.cedar`, groups in `org-entities.json`) is a
+  ceiling and forbids over every zone, and each zone's policy is generated from its manifest as Cedar.
+  Both are validated strictly and compiled into each box's Biscuit token at mint (the org layer hard,
+  its forbids beating every grant), with the policy's version in the token and the ledger. Nodes
+  evaluate Biscuit only. `wicket policy show/check/apply/zone`; `apply` revokes runs minted under an
+  older version. A differential test checks Cedar's evaluation against the compiled token, and SymCC
+  (cvc5) diffs policy changes in CI ([#51](https://github.com/public/wicket/issues/51)).
+
 - Every box gets an identity from the installation (`spiffe://<trust domain>/…`), short-lived and rotated,
   naming the human it acts for. Agents message each other only through wicket, signed by wicket
   ([#2](https://github.com/public/wicket/pull/2)).

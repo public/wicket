@@ -222,7 +222,7 @@ fn audit(kind: &str, body: serde_json::Value) -> Result<()> {
 
 /// Active nodes that can't be shown to talk protocol `proto` or later (unreachable, or older), each
 /// with why. This host's own node is started if it isn't serving.
-async fn nodes_below(proto: u32) -> Result<Vec<(String, String)>> {
+pub(crate) async fn nodes_below(proto: u32) -> Result<Vec<(String, String)>> {
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(wicket_store::Ledger::open(&crate::ledger_path())?));
     let nodes: Vec<String> = ledger.lock().expect("ledger").nodes()?.into_iter().filter(|n| n.status == "active").map(|n| n.name).collect();
     let mut out = vec![];
@@ -236,10 +236,9 @@ async fn nodes_below(proto: u32) -> Result<Vec<(String, String)>> {
         let scope = format!("keys:{}", std::process::id());
         match tokio::time::timeout(std::time::Duration::from_secs(10), crate::nodecall::Link::connect(&n, &scope, &ledger)).await {
             Ok(Ok(l)) if l.proto >= proto => {}
-            Ok(Ok(l)) => out.push((
-                n,
-                format!("it talks protocol {}, and issuing-key tokens need {proto}: update it (`wicket node install`)", l.proto),
-            )),
+            Ok(Ok(l)) => {
+                out.push((n, format!("it talks protocol {}, and these tokens need {proto}: update it (`wicket node install`)", l.proto)))
+            }
             Ok(Err(e)) => out.push((n, format!("can't be asked: {e:#}"))),
             Err(_) => out.push((n, "can't be asked: no answer in 10 s".into())),
         }

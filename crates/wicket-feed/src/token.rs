@@ -66,6 +66,10 @@ pub struct BoxAuthority {
     /// block 0, signed by the root ([`AuthzKeyCert`]). None: the root minted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer_cert: Option<String>,
+    /// The org layer block 0 carries (#51), as data: a node splices a host through only if it allows
+    /// that host wholesale. It narrows splicing only; every allow still comes from the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<authz::OrgLayer>,
 }
 
 /// An online authority issuing key, certified by the (offline) authority root (#154): tokens whose
@@ -307,6 +311,12 @@ impl Replica<BoxAuthority> {
         if entry.spec.box_path != entry.spec.run {
             return None;
         }
+        // Under an org policy (#51) a rule can depend on any path, which probes can't vouch for: only
+        // a host its org layer allows wholesale is spliced (the record carries the layer; a token
+        // with an org layer and no record of it is never spliced).
+        if c.loaded.has_org_layer() && !entry.spec.org.as_ref().is_some_and(|o| o.allows_host_wholesale(host)) {
+            return None;
+        }
         let rule = match wicket_core::splice::inspection(&entry.spec.zone, host) {
             wicket_core::splice::Inspection::Spliced { rule } => rule,
             wicket_core::splice::Inspection::Inspected(_) => return None,
@@ -352,6 +362,8 @@ pub struct Issuer {
     pub zone: ZoneSpec,
     /// The minting key's certificate, when it isn't the root ([`BoxAuthority::issuer_cert`]).
     pub issuer_cert: Option<String>,
+    /// Block 0's org layer, carried into every record ([`BoxAuthority::org`]).
+    pub org: Option<authz::OrgLayer>,
 }
 
 /// One grant to publish: what the token says, and its use cap.
@@ -379,8 +391,28 @@ impl Issuer {
     ) -> Result<Issuer, authz::AuthzError> {
         let mut c = authz::Ceiling::from_zone(zone, run, not_after, grant_keys)?;
         c.spawn.images.extend(images.iter().cloned());
-        let base = authz::mint(root, tenant, principal, &c)?;
-        Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone(), issuer_cert: None })
+        Issuer::from_ceiling(root, tenant, principal, run, epoch, zone, &c)
+    }
+
+    /// A top-level box whose ceiling was compiled already: from its zone's and the org's Cedar
+    /// policies (`wicket-policy`, #51). `zone` is the one the ceiling was compiled from.
+    pub fn from_ceiling(
+        root: &authz::SigningKey,
+        tenant: &str,
+        principal: &str,
+        run: &str,
+        epoch: i64,
+        zone: &ZoneSpec,
+        ceiling: &authz::Ceiling,
+    ) -> Result<Issuer, authz::AuthzError> {
+        if ceiling.box_prefix != run {
+            return Err(authz::AuthzError::Ceiling(format!(
+                "a top-level box's ceiling is bounded to its own run, not {}",
+                ceiling.box_prefix
+            )));
+        }
+        let base = authz::mint(root, tenant, principal, ceiling)?;
+        Ok(Issuer { base, run: run.into(), box_path: run.into(), epoch, zone: zone.clone(), issuer_cert: None, org: ceiling.org.clone() })
     }
 
     /// A child box started by this one, in `zone`: this box's base token plus a spawn block with the
@@ -397,6 +429,7 @@ impl Issuer {
             epoch,
             zone: zone.clone(),
             issuer_cert: self.issuer_cert.clone(),
+            org: self.org.clone(),
         })
     }
 
@@ -435,6 +468,7 @@ impl Issuer {
             token: B64.encode(token.to_bytes()?),
             grants: listed,
             issuer_cert: self.issuer_cert.clone(),
+            org: self.org.clone(),
         })
     }
 }

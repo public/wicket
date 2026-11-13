@@ -31,8 +31,8 @@ pub mod token;
 pub use cost::Estimate;
 pub use decide::{limits, load, load_with, Decision, Loaded, MEASURED_MAX_STEPS, STEP_BUDGET};
 pub use payload::{
-    isolation_level, risk_level, Action, Ceiling, Forbid, Grant, Inject, LlmBudget, OpKind, PublicKey, Reach, Request, SpawnLimits,
-    MAX_REACH_RISK,
+    isolation_level, risk_level, Action, Ceiling, Forbid, Grant, HostPat, HttpMatch, Inject, LlmBudget, OpKind, OrgLayer, PathPat,
+    PublicKey, Reach, Request, SpawnLimits, SpawnMatch, MAX_REACH_RISK,
 };
 pub use structure::Policy;
 pub use token::{grant, mint, sign_grant, GrantRequest, SignedGrant, SigningKey, Token};

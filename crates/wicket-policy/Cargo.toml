@@ -1,0 +1,21 @@
+[package]
+name = "wicket-policy"
+description = "Authored policy in Cedar (org ceiling, zone policy, forbids), compiled into wicket's Biscuit tokens at mint (#51)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cedar-policy = "=4.14.1"
+wicket-core.workspace = true
+wicket-authz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+regex = "1"
+
+[dev-dependencies]
+serde_yaml.workspace = true

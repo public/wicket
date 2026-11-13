@@ -1979,6 +1979,7 @@ async fn serve_box(
         tenant: wicket_core::TenantId(bs.tenant.clone()),
         run: wicket_core::RunId(bs.run.clone()),
         zone: compiled.clone(),
+        org: None,
         ledger: node.audit.clone(),
         // The secrets the run uses, fetched from the control host on first use and kept in memory
         // only (#152).

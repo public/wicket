@@ -16,6 +16,8 @@ members = [
     "crates/wicket-feed",
     "crates/wicket-placement",
     "crates/wicket-fwd",
+    "crates/wicket-policy",
+    "crates/wicket-policy-diff",
 ]
 
 [workspace.package]
@@ -71,6 +73,7 @@ wicket-feed = { path = "crates/wicket-feed" }
 wicket-authz = { path = "crates/wicket-authz" }
 wicket-placement = { path = "crates/wicket-placement" }
 wicket-fwd = { path = "crates/wicket-fwd" }
+wicket-policy = { path = "crates/wicket-policy" }
 
 [profile.release]
 debug = 1

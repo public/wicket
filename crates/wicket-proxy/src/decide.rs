@@ -79,7 +79,11 @@ impl Decider for Central {
     }
 
     /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
+    /// Under an org policy (#51), only a host it allows wholesale (its rules can depend on any path).
     fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
+        if ctx.org.as_ref().is_some_and(|o| !o.allows_host_wholesale(host)) {
+            return None;
+        }
         match wicket_core::splice::inspection(ctx.zone.spec(), host) {
             wicket_core::splice::Inspection::Spliced { rule } => Some(rule),
             wicket_core::splice::Inspection::Inspected(_) => None,
@@ -88,6 +92,10 @@ impl Decider for Central {
 }
 
 fn central(ctx: &RunCtx, op: &Op, who: Option<&(serde_json::Value, String)>) -> Outcome {
+    // The org layer first: hard, no grant lifts it (#51; on a node the token's org checks do this).
+    if let Some(why) = ctx.org.as_ref().and_then(|o| o.refuses_http(&op.host, &op.method, &op.path, op.risk.rank())) {
+        return Outcome::Forbidden(why);
+    }
     let why = match ctx.zone.evaluate(op) {
         Verdict::AllowByReach(i) => return Outcome::Allow(format!("reach rule {i}")),
         Verdict::Forbidden(why) => return Outcome::Forbidden(why),
@@ -320,6 +328,39 @@ mod tests {
         .zone
     }
 
+    /// #51: the control host decides hosts it forwards for (credentials injected here) and its own
+    /// boxes' egress: the org layer refuses there too, hard, and nothing splices under it.
+    #[test]
+    fn the_org_layer_refuses_on_the_control_host_and_stops_splicing() {
+        use wicket_authz::{HostPat, HttpMatch, OrgLayer, PathPat};
+        let op = |m: &str, h: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", m, h, p);
+        let mut c = ctx(true);
+        // Without an org layer: the zone allows this.
+        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)));
+        c.org = Some(Arc::new(OrgLayer {
+            version: "v1".into(),
+            http: None,
+            forbid: vec![
+                HttpMatch {
+                    hosts: vec![HostPat::Exact("api.example.com".into())],
+                    paths: vec![PathPat::Glob("/v1/admin/**".into())],
+                    ..Default::default()
+                },
+                HttpMatch { hosts: vec![HostPat::Exact("secret.example.com".into())], ..Default::default() },
+            ],
+            spawn: None,
+            msg_from: None,
+            inject: None,
+        }));
+        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)), "other paths still allowed");
+        assert!(
+            matches!(central(&c, &op("GET", "api.example.com", "/v1/admin/users"), None), Outcome::Forbidden(w) if w.contains("org policy"))
+        );
+        // The host the zone injects into, forwarded to the control host: refused, not a grant away.
+        assert!(matches!(central(&c, &op("GET", "secret.example.com", "/"), None), Outcome::Forbidden(w) if w.contains("org policy")));
+        assert_eq!(Central.splice(&c, "api.example.com"), None, "not a host the org layer allows wholesale");
+    }
+
     #[test]
     fn subtrees_match_like_a_verifier() {
         // The same lists as ca.rs's verifier test, which checks these against webpki.
@@ -391,6 +432,7 @@ mod tests {
             tenant: TenantId::single(),
             run: RunId("run_a".into()),
             zone: Arc::new(wicket_core::CompiledZone::new(zone()).unwrap()),
+            org: None,
             ledger: Arc::new(Mutex::new(wicket_store::Ledger::open_in_memory().unwrap())),
             vault: crate::vault::Vault::new(std::env::temp_dir().join("wicket-decide-no-vault")),
             events: tx,
