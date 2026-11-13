@@ -4,6 +4,9 @@ Move an installation to another wicket build, blue/green, and back. [How updates
 work](../explanation/updates.md) explains the rollout, the health gates and migrations;
 `ci/update.sh` is the test.
 
+To update to builds CI signed for `main`, by hand or on a timer, see [Update from CI-signed
+builds](update-from-ci.md).
+
 Updating is root's alone on an installed host: `self update`, `self rollback`, `self prune` and
 `self trust-key` are refused for operators, passkeys and the daemon's own uid. An agent can only ask
 (`request_update`).

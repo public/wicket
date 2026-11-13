@@ -1,0 +1,14 @@
+# Runs wicket-follow.service every 15 minutes. Not enabled by deploy/install.sh:
+#   systemctl enable --now wicket-follow.timer
+[Unit]
+Description=wicket: follow main's signed builds
+Documentation=https://github.com/public/wicket
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

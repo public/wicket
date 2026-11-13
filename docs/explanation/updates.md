@@ -67,6 +67,51 @@ that skips verification.
 the daemon's own uid either, which runs runs' supervisors, proxies and gateways. An agent can only ask:
 `request_update` files an R4 request and returns; nothing an agent can call updates wicket.
 
+## Builds CI signed
+
+An agent can build wicket, but a box that could update wicket could replace its own jail, so an
+agent-built artifact needs a human to approve its sha256, update by update (above). Builds of `main`
+move the trust anchor to the reviewed merge instead (#190). An agent proposes and builds; a human
+reviews and merges the pull request; CI builds the merge and runs the gates. A reviewer then approves
+its signing in the repository's `release` environment, and installations update to that build without
+approving each update.
+
+- **What is signed.** The `sign` job (`.github/workflows/build.yml`) gets the release key only after
+  the environment's required reviewers approve it. It signs, after the domain
+  `wicket-ci-release-v1\0`, a statement of claims:
+  - the archive's name and sha256;
+  - the repository and the commit;
+  - the ref, which must be `refs/heads/main`;
+  - the workflow and the run;
+  - the environment (`release`);
+  - when it was signed.
+
+  The `.sig` carries the statement's bytes as signed, and they are verified as such, never
+  re-serialised. The job runs openssl only: no build output and no repository code runs while the key
+  is there.
+- **What an installation takes** (`self update --from-ci`, `self follow`):
+  - a build signed by a key it trusts;
+  - for the repository it is configured with (never taken from the build);
+  - for the workflow, the commit asked for, `main` and the `release` environment;
+  - whose commit is on `main` by GitHub's compare API;
+  - downloaded host-side.
+
+  A plain signature from the same key, or an approval of its sha256, doesn't stand in for the claims.
+  The version's manifest and `self.staged` record the commit, run, environment and key.
+- **Following** (`wicket-follow.timer`, not enabled by default) is the same, unattended, within a
+  policy: a window, a soak counted from the signed time, only forward along `main` from the running
+  build's commit, never across a schema contract step or more than one protocol version, and never
+  again to a build whose gate failed here. One update or rollback runs at a time on a host
+  (`<data dir>/self-update.lock`), whoever starts it.
+- **Why a key, not keyless attestations.** GitHub's artifact attestations (Sigstore) would need no
+  long-lived key. But verifying their bundles in wicket means `sigstore` 0.15, which calls itself
+  experimental: its verifier brings Fulcio, Rekor and TUF trust-root fetching, plus OpenSSL or
+  aws-lc-rs. So the key is a dedicated Ed25519 key, held only as the `release` environment's secret,
+  released per job by a reviewer, and never on an installation. Keyless can replace it when a small,
+  pure-Rust bundle verifier exists.
+
+[Update from CI-signed builds](../how-to/update-from-ci.md) has the settings and commands.
+
 ## Protocol versions and skew
 
 Nodes used to refuse any control host running another build, which made every update all-or-nothing.
