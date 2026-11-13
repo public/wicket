@@ -38,6 +38,8 @@ jobs:
       crates: ${{ steps.select.outputs.crates }}
       all_crates: ${{ steps.select.outputs.all_crates }}
       doc_crates: ${{ steps.select.outputs.doc_crates }}
+      args: ${{ steps.select.outputs.args }}
+      doc_args: ${{ steps.select.outputs.doc_args }}
       rust: ${{ steps.select.outputs.rust }}
       suites: ${{ steps.select.outputs.suites }}
     steps:
@@ -106,16 +108,15 @@ jobs:
       - name: Selected crates
         id: pkgs
         env:
-          CRATES: ${{ needs.select.outputs.crates }}
-          DOCS: ${{ needs.select.outputs.doc_crates }}
+          ARGS: ${{ needs.select.outputs.args }}
+          DOC_ARGS: ${{ needs.select.outputs.doc_args }}
           ALL: ${{ needs.select.outputs.all_crates }}
+        # ci/affected.py builds the package arguments (its self-test covers them): `-p` per crate,
+        # empty when none (a doctest step then skips). No selection (its job failed): everything.
         run: |
-          if [ "$ALL" = false ] && [ -n "$CRATES" ]; then
-            echo "args=$(printf -- '-p %s ' $CRATES)" >>"$GITHUB_OUTPUT"
-            echo "doc_args=$(printf -- '-p %s ' $DOCS)" >>"$GITHUB_OUTPUT"
-          elif [ "$ALL" = false ]; then
-            echo "args=" >>"$GITHUB_OUTPUT"   # no crate selected (the CLI reference only)
-            echo "doc_args=" >>"$GITHUB_OUTPUT"
+          if [ "$ALL" = false ]; then
+            echo "args=$ARGS" >>"$GITHUB_OUTPUT"
+            echo "doc_args=$DOC_ARGS" >>"$GITHUB_OUTPUT"
           else
             echo "args=--workspace" >>"$GITHUB_OUTPUT"
             echo "doc_args=--workspace" >>"$GITHUB_OUTPUT"
