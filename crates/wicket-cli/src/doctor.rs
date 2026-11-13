@@ -237,7 +237,7 @@ async fn console(r: &mut Report, l: &Ledger, system: bool) {
                 r.bad("  NOT OK: passkeys need https:// or localhost");
             }
             if origin.starts_with("http://") && system {
-                r.good("  reach it from your devices with an ssh tunnel, or serve it over HTTPS (README: the console from a phone)");
+                r.good("  reach it from your devices with an ssh tunnel, or serve it over HTTPS (docs/how-to/put-the-console-on-the-internet.md)");
             }
         }
         Err(e) => r.bad(format!("console: NOT OK ({e:#})")),

@@ -1,7 +1,7 @@
 # wicket-authz
 
 A box's authority as a Biscuit token: design A of #76 ("Identity is JWT; authority is Biscuit" in
-`docs/design.md`). It uses the patched fork in `third_party/` (load once, step budget, compiled
+`docs/explanation/design.md`). It uses the patched fork in `third_party/` (load once, step budget, compiled
 evaluator).
 
 | block | signed by | holds |

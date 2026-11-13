@@ -1,8 +1,10 @@
-# The audit trail: batched writes and export
+# Audit: the log, its export and its verification
 
 wicket's audit log is a hash-chained table in the control host's ledger (`ledger.db`). This page
-covers two things: how records get written (#62), and how they are copied to systems outside the
-control host (#91).
+covers how records get written (#62), how they are copied to systems outside the control host (#91),
+what is sent, and how `wicket audit --verify --against` checks the ledger against it. [Export
+audit](../how-to/export-audit.md) sets up a sink, including an OpenTelemetry Collector in front of
+cloud logging.
 
 ## Writing: the batched audit writer
 
@@ -33,6 +35,8 @@ transaction and one fsync per batch, with the ledger in WAL mode and `synchronou
 
 ## Exporting
 
+### The sinks file
+
 The ledger remains the source of truth, and it is what `wicket audit --verify` checks. Audit records
 are also streamed to the sinks set in the installation's sinks file:
 `$WICKET_HOME/audit-sinks.yaml` by default (`~/.local/share/wicket/audit-sinks.yaml`), or the path
@@ -57,7 +61,7 @@ sinks:
     headers: {}          # extra request headers, e.g. a tenant header the Collector routes on
     resource:            # extra resource attributes (service.name is always "wicket")
       deployment.environment: prod
-  # Objects in the installation's state store (state-store.yaml, docs/state.md): one per delivered
+  # Objects in the installation's state store (state-store.yaml, see "state off the host"): one per delivered
   # batch or checkpoint, audit/<name>/…, never overwritten. `wicket audit --verify --against
   # store:<name>` compares the local chain with them; a restore puts back records they have
   # beyond a restored ledger.
@@ -65,13 +69,17 @@ sinks:
     type: store
 ```
 
-**Who sends.** `wicket serve` and every `wicket run` start an exporter thread when the sinks file
+### Who sends
+
+`wicket serve` and every `wicket run` start an exporter thread when the sinks file
 exists. `wicket audit export` runs one in the foreground (`--once` for a single pass, `--checkpoint`
 to send a checkpoint now, `--status` for each sink's position and last error). Each sink is fed by
 one process at a time, which holds a lease on it in the ledger. A run that ends makes a last pass and
 hands its sinks over; if a process dies instead, another takes over within 30 s. Exporters use their own ledger connection and never touch a request's path.
 
-**Delivery** is at least once, by sequence number:
+### Delivery
+
+Delivery is at least once, by sequence number:
 - Each sink's cursor in the ledger is the last `seq` it acknowledged. The ledger is the buffer: a sink
   that is down keeps its cursor and catches up from it when it is back (backing off up to a minute
   between tries). Nothing is held in memory, and nothing is dropped.
@@ -82,7 +90,9 @@ hands its sinks over; if a process dies instead, another takes over within 30 s.
   --status`. A record that is never accepted needs a person, not silence.
 - Renaming a sink gives it a new cursor, so it starts again from `seq` 1.
 
-**What is sent.** One JSON object per record:
+### What is sent
+
+One JSON object per record:
 
 ```json
 {"type":"wicket.audit.record","seq":42,"ts":1762900000,"tenant":"default","run":"run_…","kind":"op",
@@ -132,72 +142,21 @@ one. The files can be wicket's JSON lines, or a Collector `file` exporter's outp
 batch per line), from which the log bodies are read. `--issuer-jwk` checks signatures against a
 public key you keep elsewhere (as `wicket identity issuer` prints it) rather than the local key file.
 
-## A Collector in front of cloud logging
+## Record kinds
 
-wicket ships no cloud SDKs: the OpenTelemetry Collector (contrib distribution) does the last hop.
-Run it on the control host, listening on localhost only. Configure a **persistent sending queue**:
-a Collector acknowledges a request once the record is queued, before it is delivered. Without
-persistent storage, a Collector restart loses whatever is still queued, and wicket has already moved
-its cursor past it.
+Each record's `kind` says what it records. The kinds wicket 0.0.1 writes, by area (`grep` the code
+for a kind to see its body):
 
-Google Cloud Logging:
+| area | kinds |
+|---|---|
+| requests | `op` (an egress or model decision), `decision` (an approve or deny), `grant.revoked`, `daemon.refused` |
+| runs | `run.start`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.stopped_by_node`, `box.output`, `box.output.gap`, `box.reaped` |
+| agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `spawn.beyond_parent`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
+| links | `link.expose`, `link.open`, `link.close`, `link.cut` |
+| operators | `operator.signed_in`, `operator.lockout`, `operator.passkey_added`, `operator.enrol_link_issued`, `operator.enrol_link_used`, `operator.reset`, `operator.sessions_revoked`, `operator.message` |
+| nodes | `node.token`, `node.enrolled`, `node.ca_renewed`, `node.revoked`, `node.audit`, `node.audit.restart`, `node.ask_queued`, `node.authority_expired`, `node.secret_fetch`, `node.secret_fetched`, `node.secret_unavailable`, `feed.refused` |
+| placement | `lease.requested`, `lease.released`, `placement.node_created`, `placement.node_released`, `reconcile.<what>` (one per change a pass makes, such as `reconcile.destroyed` and `reconcile.run_adopted`) |
+| updates | `self.staged`, `self.snapshot`, `self.switched`, `self.health`, `self.committed`, `self.rolled_back`, `self.update_refused`, `self.pruned`, `self.key_trusted` |
+| state and keys | `state.kit`, `state.restored`, `keys.roots_offline`, `keys.roots_online`, `keys.certified` |
 
-```yaml
-extensions:
-  file_storage/queue:
-    directory: /var/lib/otelcol/file_storage
-    create_directory: true
-receivers:
-  otlp:
-    protocols:
-      http:
-        endpoint: 127.0.0.1:4318
-exporters:
-  googlecloud:
-    project: my-project
-    log:
-      default_log_name: wicket-audit
-    sending_queue:
-      storage: file_storage/queue
-  # A local copy of everything, records and checkpoints, for `--verify --against`.
-  file/audit:
-    path: /var/log/otelcol/wicket-audit.jsonl
-    append: true             # the default (false) truncates the file when the Collector starts
-service:
-  extensions: [file_storage/queue]
-  pipelines:
-    logs:
-      receivers: [otlp]
-      exporters: [googlecloud, file/audit]
-```
-
-`googlecloud` has no `retry_on_failure` key (the Collector refuses to start with one); it retries
-through its own client.
-
-CloudWatch Logs: the same receiver and extension, with this exporter.
-
-```yaml
-exporters:
-  awscloudwatchlogs:
-    region: eu-west-2
-    log_group_name: wicket-audit
-    log_stream_name: control-host
-    sending_queue:
-      queue_size: 10000
-      storage: file_storage/queue
-    retry_on_failure:
-      max_elapsed_time: 0      # never give up
-```
-
-The `awscloudwatchlogs` exporter is alpha, and its README documents only an in-memory queue.
-Collector 0.165.0 accepts `storage` on it, but check that on the version you run. Where it isn't
-honoured, keep the `file/audit` copy above, or add a second wicket sink that writes JSON lines
-your log agent ships.
-
-Both examples pass `otelcol-contrib validate` (0.165.0). An `otlp` receiver with the `file/audit`
-exporter was tested end to end:
-- every record arrived, along with the checkpoints;
-- a stopped Collector lost nothing once it was started again;
-- `wicket audit --verify --against` on the file's output caught a consistently re-chained forgery.
-
-The same pattern works for any other Collector logs exporter: Azure Monitor, Splunk HEC, Datadog.
+A node's own records arrive as `node.audit`, each carrying the node's record in its body.

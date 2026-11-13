@@ -1,6 +1,6 @@
 # Prior art catalogue
 
-*Generated 2026-11-08 from the study tables in `research/05`–`08`, extended with `research/13`, `16` and `17`; see those files for each item's notes. Local copies are under `refs/` (not committed; read [refs/README.md](../refs/README.md) first). Relevance: 3 = directly shapes a wicket mechanism, 2 = useful evidence or partial reuse, 1 = background.*
+*Generated 2026-11-08 from the study tables in `research/05`–`08`, extended with `research/13`, `16` and `17`; see those files for each item's notes. Local copies are under `refs/` (not committed; read [refs/README.md](../../refs/README.md) first). Relevance: 3 = directly shapes a wicket mechanism, 2 = useful evidence or partial reuse, 1 = background.*
 
 112 papers and specs, 94 projects (including the meta-harness section at the end).
 

@@ -16,7 +16,7 @@
 #   - /var/lib/wicket (0700, the wicket user's): ledger, vault, issuer key, runs and their sockets;
 #   - the binary as a version under /var/lib/wicket-versions (`<build id>/wicket`, `current` and
 #     `previous` links; the wicket user's, which `wicket self update` switches: see
-#     docs/operations.md), /usr/local/bin/wicket a link to its `current`, the agent image's directory
+#     docs/explanation/updates.md), /usr/local/bin/wicket a link to its `current`, the agent image's directory
 #     under /usr/local/share/wicket, and /etc/wicket (the daemon's policy, the console's options);
 #   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
@@ -235,7 +235,7 @@ done
 if [ "$systemd" = 1 ]; then
     systemctl daemon-reload
     if [ "$start" = 1 ]; then
-        # wicket-state starts only once state-store.yaml exists (docs/state.md).
+        # wicket-state starts only once state-store.yaml exists (docs/how-to/state-off-host-and-restore.md).
         systemctl enable wicketd wicket-console wicket-reconcile wicket-state >/dev/null 2>&1
         # Restarting wicketd stops the runs started through it: only when something changed.
         if [ "$units_changed" = 1 ] || [ "$binary_changed" = 1 ] || ! systemctl is-active -q wicketd; then
@@ -260,7 +260,7 @@ if [ "$skip_image" = 0 ]; then
     tag=wicket/claude-code:$id
     docker image inspect "$tag" >/dev/null 2>&1 || as_wicket image --tag "$tag"
     docker tag "$tag" wicket/claude-code:poc
-    # The ledger's stream (wicket-state, docs/state.md) runs Litestream from this image unless
+    # The ledger's stream (wicket-state, docs/how-to/state-off-host-and-restore.md) runs Litestream from this image unless
     # state-store.yaml names another: pinned by digest, the same as LITESTREAM_IMAGE in
     # crates/wicket-cli/src/statestore.rs (a test keeps the two equal).
     say "Litestream image (for the ledger's stream)"

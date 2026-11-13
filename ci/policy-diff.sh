@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SymCC in CI (#51, docs/policy.md): its fixtures (known narrowings and widenings), then, for each
+# SymCC in CI (#51, docs/reference/policy.md): its fixtures (known narrowings and widenings), then, for each
 # org policy under examples/policy/ that this change touches, whether the change narrows or widens.
 # cvc5 1.3.1 (the version SymCC pins), checksum-verified; a timeout, an `unknown` or a solver error
 # fails. A widening doesn't fail: it is printed, for the review to decide.

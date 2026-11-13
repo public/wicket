@@ -12,7 +12,7 @@
 //! | Run directories (transcripts, workspaces), this host's own node, feed delta logs | Not kept: runs that were running end as lost, the node is made again, each feed starts a new generation |
 //!
 //! `wicket state restore` puts a kit and the streamed ledger back on a fresh host. See
-//! docs/state.md for the procedure.
+//! docs/how-to/state-off-host-and-restore.md for the procedure.
 
 use crate::statestore::{LedgerStream, StateStore};
 use crate::{data_dir, ledger_path};

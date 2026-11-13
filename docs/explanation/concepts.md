@@ -1,9 +1,11 @@
-# wicket — core concepts (0.0.1)
+# Concepts (0.0.1)
 
-This page explains the concepts behind what wicket 0.0.1 builds and how they fit together. The README
-shows the commands. [design.md](design.md) has the full design, much of which is not built yet; the
+This page explains the concepts behind what wicket 0.0.1 builds and how they fit together. The
+[tutorials](../tutorials/first-box.md) show them at work, and the [reference](../README.md#reference)
+has every command and field. [design.md](design.md) has the full design, much of which is not built yet; the
 Claude Doc "wicket — core concepts" (https://claude.ai/artifact/AATnju2Q7j6j2TvpCJ8XuP) gives that
-design-level overview. [limits.md](limits.md) lists what 0.0.1 doesn't protect.
+design-level overview. [Security model](security-model.md) and [limits](limits.md) say what 0.0.1 protects and what it
+doesn't.
 
 ## The box and the control host
 
@@ -92,6 +94,25 @@ A grant belongs to the run that asked for it, and ends with it; `wicket approve 
 the zone use it until it expires. `wicket approve` prints the request as wicket recorded it, and at a
 terminal asks before approving (`--yes` skips the question).
 
+## Grants
+
+A grant is a human's answer to one pending request, kept in the ledger:
+
+- **Bound to the request.** It covers the method, host and path asked (or, with `--prefix` or a
+  `request_access` prefix ask, every path under a prefix, in whole segments), and nothing riskier than
+  the request shown ([risk classes](../reference/risk-classes.md)).
+- **Small by default.** One use, ten minutes, for the run that asked (`wicket approve --uses`,
+  `--unlimited`, `--ttl` up to 24 h, `--zone-wide`). It ends with the run, and lapses if the run's
+  identity is revoked first.
+- **Recorded before it exists.** The approval's audit record is committed before the grant is
+  usable; a console approval carries the passkey's signature over exactly that decision.
+- **Revocable.** `wicket grant revoke` ends it, on the control host at once and on a node within
+  250 ms of its push.
+
+wicket's own approvals are grants too: a child zone beyond its parent's (`SPAWN`), a link beyond the
+default policy (`LINK`), a capacity lease (`CAPACITY`), an agent's build (`UPDATE`). Leases are the
+same idea for money: see [placement and leases](#placement-and-leases).
+
 ## Identities: agents and nodes
 
 - **Agents.** Every box gets an identity from the installation's issuer:
@@ -121,8 +142,20 @@ token that contains it. The library also builds spawn blocks, which narrow a par
 children so that revoking a parent's block revokes the whole subtree. In 0.0.1 that is tested at library
 level only: a child run on a node gets its own block 0 from its zone, which `spawn` has already checked
 is a subset of its parent's. wicket checks tokens with a vendored, patched `biscuit-auth` (see
-limits.md). It runs a structural check before loading, and uses a step budget instead of a wall-clock
+[limits](limits.md#authority-and-the-biscuit-fork)). It runs a structural check before loading, and uses a step budget instead of a wall-clock
 limit, so a decision doesn't depend on load.
+
+### Deciding at the edge
+
+A request is decided where the box runs, not on the control host. On the control host's own node and
+on remote nodes alike, the node's egress proxy decides from what it already holds: the box's token,
+its grants, the secrets it fetched and a slice of the model budget. The control host issues
+authority, takes approvals, and reconciles counts and audit afterwards; it isn't asked during a
+request. That keeps the request path short, and it means a node that loses the control host keeps
+working, narrowly, instead of failing open or stopping everything. Each piece of authority it holds
+has its own lifetime, so working alone ends on its own ([lifetimes](../reference/nodes.md)).
+
+### The signed feed
 
 The control host sends these tokens to each node in a **signed policy feed**. The feed has snapshots,
 hash-chained deltas and freshness statements, all signed by a per-node feed key that the feed root
@@ -140,7 +173,7 @@ grants last: every grant has a lifetime, the box's own authority (its token's bl
 `limits.authority`, by default the run's timeout) included, and the node stops the box when that ends.
 The node also keeps, in memory only, the secrets its runs have used (their model credential and
 injected secrets, fetched on first use) and a slice of each run's model budget, so model calls go on
-too ([nodes.md](nodes.md)). Revocations are pushed to the
+too ([nodes.md](../reference/nodes.md)). Revocations are pushed to the
 node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node that hears nothing
 keeps what it holds until it expires. Tampered, replayed and rolled-back frames are refused.
 
@@ -201,7 +234,7 @@ what is left, and a spent agent isn't woken.
   grant use or an approval, is committed before the action happens; if it can't be, the action fails.
 - **Export** sends the records to JSON lines files or OTLP collectors, with signed chain-head checkpoints.
   `wicket audit --verify --against FILE` checks the ledger against what was exported
-  ([audit-export.md](audit-export.md)).
+  ([audit-export.md](../reference/audit.md)).
 
 ## Designed, not built
 

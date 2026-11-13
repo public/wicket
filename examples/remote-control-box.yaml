@@ -1,6 +1,6 @@
 # A box that is its own Remote Control session (#169): Claude Code boots in the box as
 # `claude remote-control`, registers the session with your account, and you drive it from the Claude
-# apps (desktop, web, phone). See docs/agents.md ("Remote sessions").
+# apps (desktop, web, phone). See docs/reference/agents.md ("Remote sessions").
 #
 #   wicket secret link claude-login --file ~/.claude/.credentials.json \
 #       --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt --hosts api.anthropic.com

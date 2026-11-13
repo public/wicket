@@ -18,7 +18,7 @@
 //! **The API key** is an [`ApiKey`]: it prints as `[redacted]`, goes only into the `Authorization`
 //! header, never into a URL, an error or a log. The CLI reads it from wicket's vault by name.
 //!
-//! **Isolation.** Vultr cloud compute exposes no KVM (docs/research/10-infrastructure.md), so its
+//! **Isolation.** Vultr cloud compute exposes no KVM (docs/explanation/research/10-infrastructure.md), so its
 //! nodes offer gVisor at most; a request for `vm` gets no Vultr offer and becomes a request for a
 //! KVM host elsewhere (#7).
 

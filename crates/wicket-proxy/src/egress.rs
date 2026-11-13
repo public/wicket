@@ -160,7 +160,7 @@ impl Egress {
             // per host carries many box connections' requests (#142). Fixed windows large enough for
             // a far upstream (8 MiB at 100 ms is 80 MB/s per stream) and 1 MiB frames: hyper's
             // adaptive window measured at less than half the download rate, and 16 KiB frames cost
-            // CPU on both ends (docs/performance.md).
+            // CPU on both ends (docs/explanation/performance.md).
             .http2_initial_stream_window_size(H2_STREAM_WINDOW)
             .http2_initial_connection_window_size(H2_CONN_WINDOW)
             .http2_max_frame_size(H2_MAX_FRAME)
@@ -1012,6 +1012,45 @@ mod tests {
         for t in ["optional-unset", "required-unset"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
         }
+    }
+
+    /// #51 with #180: the org policy is checked on an injected host before anything else, so a
+    /// credential it refuses is never fetched or sent, required or optional; one it allows goes in.
+    #[tokio::test]
+    async fn the_org_policy_decides_an_injection_before_the_vault_is_asked() {
+        let inject = |optional: bool| {
+            format!("reach: [{{host: api.github.com, methods: [GET]}}], inject: [{{host: api.github.com, header: Authorization, format: 'Bearer {{secret}}', secret: gh, optional: {optional}}}]")
+        };
+        let org = |keys: Vec<String>| {
+            Some(std::sync::Arc::new(wicket_authz::OrgLayer {
+                version: "v1".into(),
+                http: None,
+                forbid: vec![],
+                spawn: None,
+                msg_from: None,
+                inject: Some(keys),
+            }))
+        };
+        for optional in [false, true] {
+            let (mut c, dir) = ctx(&inject(optional), vec![], "org-refused");
+            c.org = org(vec![]);
+            let e = prepare(c, "api.github.com", None).await.err().expect("refused").to_string();
+            assert!(e.contains("org policy (v1) doesn't allow injecting gh"), "{e}");
+            let (mut c, _) = ctx(&inject(optional), vec![], "org-allowed");
+            c.org = org(vec!["api.github.com|Authorization|gh".into()]);
+            let out = prepare(c, "api.github.com", None).await.unwrap();
+            assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
+            for t in ["org-refused", "org-allowed"] {
+                let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+            }
+        }
+        // The order: an optional rule whose secret isn't set is still the org's to refuse (it is
+        // checked first), not skipped as unset.
+        let unset = inject(true).replace("secret: gh", "secret: absent");
+        let (mut c, dir) = ctx(&unset, vec![], "org-unset");
+        c.org = org(vec![]);
+        assert!(prepare(c, "api.github.com", None).await.is_err(), "refused by the org, before the unset skip");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// #130: only allow-listed headers go upstream, and requests that could run as something other

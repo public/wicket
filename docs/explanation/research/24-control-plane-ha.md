@@ -6,7 +6,7 @@ should run on each node, and nodes must be able to run on their own for some tim
 unavailable. This is research and design; no code changes.
 
 Context: design §3.1 (process layout), §3.2 (identity, node identity), §8.5 (leases and money), §9.2–§9.4
-(gateway, model proxy, upstream credentials), §13.5 (durability), §14.1.3 (console); [nodes.md](../nodes.md),
+(gateway, model proxy, upstream credentials), §13.5 (durability), §14.1.3 (console); [nodes.md](../../reference/nodes.md),
 [limits.md](../limits.md), [concepts.md](../concepts.md); research [18](18-authorization-landscape.md) §5.1
 (the signed feed) and [22](22-pause-resume-hibernate.md) (hibernate); `crates/wicket-feed`; issues #57 (feed),
 #16 (node identity), #70 (hibernate), #146 (the control host is a node too).

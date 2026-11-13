@@ -29,7 +29,7 @@
 //! - **Worst case, reserved first.** The worst case is what the provider bills for the requested
 //!   lifetime under its [`BillingModel`], every partial unit rounded up.
 //!
-//! **Billing (Vultr).** Measured on our own account's pending charges (docs/research/10-infrastructure.md,
+//! **Billing (Vultr).** Measured on our own account's pending charges (docs/explanation/research/10-infrastructure.md,
 //! 2026-11-08; Vultr's billing doc of 2026-10-26 agrees): cloud compute is billed **per started hour**,
 //! each charge line rounded **up** to the cent, capped at **672 hours a month**, and stopped instances
 //! still bill. A plan's hourly rate is its `hourly_cost` when the API gives one, else

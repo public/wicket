@@ -303,7 +303,7 @@ they will hit:
 ## 7. After the fix: the batched audit writer (2026-11-12)
 
 #62's first fix is in: `wicket run` now starts one background audit writer per process, which
-commits in batches (`wicket-store`'s `writer.rs`, `docs/audit-export.md`). The replica has a
+commits in batches (`wicket-store`'s `writer.rs`, `docs/reference/audit.md`). The replica has a
 `--batched` mode that does what `RunCtx::emit` now does. With a writer present, it holds the ledger
 lock only long enough to clone the writer, then queues an allowed-by-reach row without waiting for
 it. Same box, same day, load 5–6. The three arms were interleaved over 3 rounds (`netbench bench
@@ -387,5 +387,5 @@ because the upstream is dialled (and its address checked) before the `CONNECT` i
 
 `workloads/` holds real workloads in a gVisor box: `cargo fetch` of wicket's own workspace,
 `npm install` of 168 packages, and a 1 GiB download. Each ran once per arm, and the results are in
-`docs/performance.md`. They also found that npm scoped packages fail through an inspected registry
+`docs/explanation/performance.md`. They also found that npm scoped packages fail through an inspected registry
 (#143).
