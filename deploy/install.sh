@@ -20,6 +20,7 @@
 #     under /usr/local/share/wicket, and /etc/wicket (the daemon's policy, the console's options);
 #   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
+#     wicket-follow's (following main's signed builds, #190) installed but not enabled;
 #   - the identity issuer, and the agent image (wicket/claude-code:<build id>, and :poc as an alias).
 # Then the one secret: sudo wicket secret set claude-oauth (from `claude setup-token`).
 set -euo pipefail
@@ -229,6 +230,13 @@ units_changed=0
 for u in wicketd wicket-console wicket-reconcile wicket-state; do
     if ! cmp -s "$here/systemd/$u.service" "/etc/systemd/system/$u.service"; then
         install -m 0644 "$here/systemd/$u.service" "/etc/systemd/system/$u.service"
+        units_changed=1
+    fi
+done
+# Following main's signed builds (#190): installed, never enabled here (docs/how-to/update-from-ci.md).
+for u in wicket-follow.service wicket-follow.timer; do
+    if ! cmp -s "$here/systemd/$u" "/etc/systemd/system/$u"; then
+        install -m 0644 "$here/systemd/$u" "/etc/systemd/system/$u"
         units_changed=1
     fi
 done

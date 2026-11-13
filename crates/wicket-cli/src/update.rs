@@ -41,6 +41,71 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 /// What a release signature signs, before the artifact's sha256 (hex).
 const SIG_DOMAIN: &[u8] = b"wicket-release-v1\0";
 
+/// What a CI signature signs, before its claims ([`CiClaims`], the payload's bytes as shipped, #190).
+pub const CI_DOMAIN: &[u8] = b"wicket-ci-release-v1\0";
+
+/// What CI states about a build it signed (#190): the artifact, the commit and ref it was built
+/// from, where (repository, workflow, run) and that it was signed in the `release` environment,
+/// after a reviewer approved it. Verified as the bytes CI signed, never re-serialised.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CiClaims {
+    pub v: u32,
+    pub artifact: String,
+    pub sha256: String,
+    pub repo: String,
+    pub commit: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub workflow: String,
+    pub run_id: u64,
+    pub run_attempt: u32,
+    pub environment: String,
+    /// Unix seconds, CI's clock.
+    pub signed_at: i64,
+}
+
+/// What a CI build must be to be taken (`self update --from-ci`, `self follow`): from this
+/// installation's configured repository and workflow, of this commit, on `main`, signed in the
+/// `release` environment. The repository comes from the installation, never from the build.
+#[derive(Clone, Debug)]
+pub struct CiExpect {
+    pub repo: String,
+    pub workflow: String,
+    pub commit: String,
+}
+
+/// The only ref CI builds are taken from.
+pub const CI_REF: &str = "refs/heads/main";
+/// The environment CI signs in, behind its required reviewers.
+pub const CI_ENVIRONMENT: &str = "release";
+
+/// Whether `c` is a build `e` asks for, at `now` (Unix seconds).
+pub fn check_claims(c: &CiClaims, e: &CiExpect, now: i64) -> Result<()> {
+    if c.v != 1 {
+        bail!("CI claims version {} (this build reads 1)", c.v);
+    }
+    if !c.repo.eq_ignore_ascii_case(&e.repo) {
+        bail!("built from repository {}, not {}", c.repo, e.repo);
+    }
+    if c.workflow != e.workflow {
+        bail!("signed by workflow {}, not {}", c.workflow, e.workflow);
+    }
+    if c.commit != e.commit {
+        bail!("built from commit {}, not {}", c.commit, e.commit);
+    }
+    if c.git_ref != CI_REF {
+        bail!("built from {}, not {CI_REF}", c.git_ref);
+    }
+    if c.environment != CI_ENVIRONMENT {
+        bail!("signed in environment {:?}, not {CI_ENVIRONMENT}", c.environment);
+    }
+    if c.signed_at > now + 300 {
+        bail!("signed at {} (Unix), in the future", c.signed_at);
+    }
+    Ok(())
+}
+
 /// A build's compatibility facts (`wicket self describe`), recorded in its version's manifest.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Describe {
@@ -313,13 +378,16 @@ fn sha256_file(p: &Path) -> Result<String> {
 // ---- release keys and signatures ----
 
 /// A detached signature (`<artifact>.sig`).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Signature {
     alg: String,
     /// The signing key's public half (base64url).
     key: String,
     sha256: String,
     sig: String,
+    /// A CI signature's claims ([`CiClaims`]), base64url: what it signs, after [`CI_DOMAIN`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<String>,
 }
 
 fn key_id(public: &[u8; 32]) -> String {
@@ -373,7 +441,19 @@ fn read_secret(key: &Path) -> Result<wicket_identity::SigningKey> {
 }
 
 fn read_public(p: &Path) -> Result<[u8; 32]> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).with_context(|| p.display().to_string())?)?;
+    let bytes = std::fs::read(p).with_context(|| p.display().to_string())?;
+    // An Ed25519 public key in PEM (`openssl pkey -pubout`): CI's release key (#190).
+    if let Some(body) = std::str::from_utf8(&bytes).ok().and_then(|t| {
+        t.trim().strip_prefix("-----BEGIN PUBLIC KEY-----").and_then(|r| r.trim_end().strip_suffix("-----END PUBLIC KEY-----"))
+    }) {
+        let der = base64::engine::general_purpose::STANDARD.decode(body.split_whitespace().collect::<String>())?;
+        const SPKI: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        return match der.strip_prefix(&SPKI[..]) {
+            Some(k) => k.try_into().map_err(|_| anyhow::anyhow!("not an Ed25519 public key")),
+            None => bail!("not an Ed25519 public key"),
+        };
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes)?;
     B64.decode(v["key"].as_str().context("not a release public key")?)?.try_into().map_err(|_| anyhow::anyhow!("not a release public key"))
 }
 
@@ -383,7 +463,7 @@ pub fn sign(key: &Path, artifact: &Path) -> Result<()> {
     let k: SigningKey = read_secret(key)?;
     let sha = sha256_file(artifact)?;
     let sig = ed25519_sign(&k, &sha);
-    let s = Signature { alg: "ed25519".into(), key: B64.encode(k.verifying_key().to_bytes()), sha256: sha.clone(), sig };
+    let s = Signature { alg: "ed25519".into(), key: B64.encode(k.verifying_key().to_bytes()), sha256: sha.clone(), sig, payload: None };
     let out = PathBuf::from(format!("{}.sig", artifact.display()));
     std::fs::write(&out, format!("{}\n", serde_json::to_string(&s)?))?;
     println!("{}: sha256 {sha}, signed by {}", out.display(), key_id(&k.verifying_key().to_bytes()));
@@ -401,6 +481,9 @@ fn ed25519_sign(k: &wicket_identity::SigningKey, sha: &str) -> String {
 /// key's id.
 fn verify_sig(sig: &Signature, sha: &str, trusted: &[[u8; 32]]) -> Result<String> {
     use ed25519_dalek::Verifier;
+    if sig.payload.is_some() {
+        return verify_ci_sig(sig, sha, trusted).map(|(k, _)| k);
+    }
     if sig.alg != "ed25519" {
         bail!("an {} signature (only ed25519)", sig.alg);
     }
@@ -417,6 +500,30 @@ fn verify_sig(sig: &Signature, sha: &str, trusted: &[[u8; 32]]) -> Result<String
     msg.extend_from_slice(sha.as_bytes());
     vk.verify(&msg, &s).map_err(|_| anyhow::anyhow!("the signature doesn't verify"))?;
     Ok(key_id(&public))
+}
+
+/// Whether `sig` is a valid CI signature (#190) of the artifact with `sha` by one of `trusted`: the
+/// key's id and the claims, read from the bytes it signed.
+fn verify_ci_sig(sig: &Signature, sha: &str, trusted: &[[u8; 32]]) -> Result<(String, CiClaims)> {
+    use ed25519_dalek::Verifier;
+    if sig.alg != "ed25519" {
+        bail!("an {} signature (only ed25519)", sig.alg);
+    }
+    let payload = B64.decode(sig.payload.as_deref().context("not a CI signature (no claims)")?)?;
+    let public: [u8; 32] = B64.decode(&sig.key)?.try_into().map_err(|_| anyhow::anyhow!("a malformed key"))?;
+    if !trusted.contains(&public) {
+        bail!("signed by key {}, which this installation doesn't trust", key_id(&public));
+    }
+    let vk = wicket_identity::VerifyingKey::from_bytes(&public)?;
+    let s = ed25519_dalek::Signature::from_slice(&B64.decode(&sig.sig)?)?;
+    let mut msg = CI_DOMAIN.to_vec();
+    msg.extend_from_slice(&payload);
+    vk.verify(&msg, &s).map_err(|_| anyhow::anyhow!("the signature doesn't verify"))?;
+    let claims: CiClaims = serde_json::from_slice(&payload).context("the signed claims")?;
+    if claims.sha256 != sha || sig.sha256 != sha {
+        bail!("the signature is for another artifact (sha256 {})", claims.sha256);
+    }
+    Ok((key_id(&public), claims))
 }
 
 fn trusted_keys() -> Result<Vec<[u8; 32]>> {
@@ -455,7 +562,7 @@ struct Accepted {
 
 /// Copies the artifact into `stage` (private), then accepts that copy if it is signed by a trusted
 /// release key or its sha256 was approved for an update (used up here). Refusals are audited.
-fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &Path) -> Result<Accepted> {
+fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &Path, ci: Option<&CiExpect>) -> Result<Accepted> {
     std::fs::create_dir_all(stage)?;
     std::fs::set_permissions(stage, std::fs::Permissions::from_mode(0o700))?;
     let copy = stage.join("artifact");
@@ -471,11 +578,36 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
         anyhow::anyhow!("refused: {why}")
     };
     let sig_path = sig.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact.display())));
+    // A CI build (#190): only a CI signature whose claims are what was asked for. No other
+    // signature, and no human approval of its sha256, stands in for it.
+    if let Some(e) = ci {
+        let checked = std::fs::read(&sig_path)
+            .with_context(|| format!("no signature ({})", sig_path.display()))
+            .and_then(|b| Ok(serde_json::from_slice::<Signature>(&b)?))
+            .and_then(|s| verify_ci_sig(&s, &sha, &trusted_keys()?))
+            .and_then(|(key, c)| check_claims(&c, e, wicket_store::now()).map(|_| (key, c)));
+        return match checked {
+            Ok((key, c)) => Ok(Accepted { copy, sha256: sha, source: ci_source(&key, &c) }),
+            Err(e) => Err(refuse(format!("the CI build isn't signed as asked: {e:#}"))),
+        };
+    }
     let mut why_not_signed = format!("no signature ({} doesn't exist)", sig_path.display());
     if let Ok(bytes) = std::fs::read(&sig_path) {
         match serde_json::from_slice::<Signature>(&bytes).map_err(anyhow::Error::from).and_then(|s| verify_sig(&s, &sha, &trusted_keys()?))
         {
-            Ok(key) => return Ok(Accepted { copy, sha256: sha, source: serde_json::json!({ "signed": key }) }),
+            Ok(key) => {
+                // A CI signature given by hand: its claims are recorded too.
+                let claims = serde_json::from_slice::<Signature>(&bytes)
+                    .ok()
+                    .and_then(|s| s.payload)
+                    .and_then(|p| B64.decode(p).ok())
+                    .and_then(|p| serde_json::from_slice::<CiClaims>(&p).ok());
+                let source = match claims {
+                    Some(c) => ci_source(&key, &c),
+                    None => serde_json::json!({ "signed": key }),
+                };
+                return Ok(Accepted { copy, sha256: sha, source });
+            }
             Err(e) => why_not_signed = format!("{} ({e:#})", sig_path.display()),
         }
     }
@@ -489,21 +621,58 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     }
 }
 
+/// Verifies a downloaded CI build without staging it (#190, `self follow`'s soak and contract-step
+/// checks, before an update verifies it again from its private copy): the signing key's id and
+/// the claims.
+pub fn verify_ci_files(archive: &Path, sig: &Path, e: &CiExpect) -> Result<(String, CiClaims)> {
+    let sha = sha256_file(archive)?;
+    let s: Signature = serde_json::from_slice(&std::fs::read(sig)?)?;
+    let (key, c) = verify_ci_sig(&s, &sha, &trusted_keys()?)?;
+    check_claims(&c, e, wicket_store::now())?;
+    Ok((key, c))
+}
+
+/// What a verified archive's build is (`self describe`, run from a private copy).
+pub fn describe_archive(archive: &Path, stage: &Path) -> Result<Describe> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(stage)?;
+    std::fs::set_permissions(stage, std::fs::Permissions::from_mode(0o700))?;
+    let bin = binary_in(archive, stage)?;
+    let out = std::process::Command::new(&bin).args(["self", "describe"]).output().context("running the build's describe")?;
+    if !out.status.success() {
+        bail!("the build's describe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    serde_json::from_slice(&out.stdout).context("the build's describe")
+}
+
+/// What accepted a CI build, as its version's manifest and the audit record it.
+fn ci_source(key: &str, c: &CiClaims) -> serde_json::Value {
+    serde_json::json!({
+        "signed": key,
+        "ci": { "repo": c.repo, "commit": c.commit, "ref": c.git_ref, "workflow": c.workflow, "run_id": c.run_id,
+                "run_attempt": c.run_attempt, "environment": c.environment, "signed_at": c.signed_at },
+    })
+}
+
 /// The wicket binary in an accepted artifact: the artifact itself (an executable), or the
 /// `<dir>/wicket` of a release archive (`ci/package.sh`), read without unpacking anything else.
 fn binary_of(a: &Accepted, stage: &Path) -> Result<PathBuf> {
+    binary_in(&a.copy, stage)
+}
+
+fn binary_in(artifact: &Path, stage: &Path) -> Result<PathBuf> {
     let mut magic = [0u8; 4];
     {
         use std::io::Read;
-        std::fs::File::open(&a.copy)?.read_exact(&mut magic).context("an empty artifact")?;
+        std::fs::File::open(artifact)?.read_exact(&mut magic).context("an empty artifact")?;
     }
     if magic == *b"\x7fELF" {
-        return Ok(a.copy.clone());
+        return Ok(artifact.to_path_buf());
     }
     if magic[..2] != [0x1f, 0x8b] {
         bail!("the artifact is neither a wicket binary nor a release archive (.tar.gz)");
     }
-    let list = std::process::Command::new("tar").arg("-tzf").arg(&a.copy).output().context("running tar")?;
+    let list = std::process::Command::new("tar").arg("-tzf").arg(artifact).output().context("running tar")?;
     if !list.status.success() {
         bail!("not a readable archive: {}", String::from_utf8_lossy(&list.stderr).trim());
     }
@@ -513,9 +682,10 @@ fn binary_of(a: &Accepted, stage: &Path) -> Result<PathBuf> {
         .find(|n| matches!(n.split('/').collect::<Vec<_>>()[..], [d, "wicket"] if d.starts_with("wicket-") && !d.contains("..")))
         .context("the archive has no <wicket-…>/wicket")?
         .to_string();
+    std::fs::create_dir_all(stage)?;
     let out = stage.join("wicket");
     let f = std::fs::File::create(&out)?;
-    let st = std::process::Command::new("tar").arg("-xzOf").arg(&a.copy).arg("--").arg(&member).stdout(f).status()?;
+    let st = std::process::Command::new("tar").arg("-xzOf").arg(artifact).arg("--").arg(&member).stdout(f).status()?;
     if !st.success() {
         bail!("extracting {member} from the archive failed");
     }
@@ -535,6 +705,8 @@ pub struct UpdateOpts {
     pub gate: Gate,
     /// Prune afterwards, where it updated (`wicket self prune`).
     pub prune: bool,
+    /// A CI build (#190): taken only with a CI signature whose claims match.
+    pub ci: Option<CiExpect>,
 }
 
 /// The health gate's settings.
@@ -640,7 +812,8 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     let v = Versions::control();
     let stage = crate::data_dir().join(format!("self-stage-{}", std::process::id()));
     let _clean = RemoveOnDrop(stage.clone());
-    let accepted = accept(&ledger, &o.artifact, o.sig.as_deref(), &stage)?;
+    let _one = update_lock()?;
+    let accepted = accept(&ledger, &o.artifact, o.sig.as_deref(), &stage, o.ci.as_ref())?;
     let bin = binary_of(&accepted, &stage)?;
     if v.pointer("current").is_none() {
         let id = v.import_running()?;
@@ -697,6 +870,19 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One update or rollback at a time on a control host, whoever starts it (an operator, `self
+/// follow`): held until dropped.
+pub fn update_lock() -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let p = crate::data_dir().join("self-update.lock");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p).with_context(|| p.display().to_string())?;
+    // SAFETY: flock on a file this process holds open.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("another update or rollback is running on this control host");
+    }
+    Ok(f)
 }
 
 struct RemoveOnDrop(PathBuf);
@@ -1208,6 +1394,7 @@ async fn node_rollback(ledger: &Arc<Mutex<Ledger>>, node: &crate::node::Node, na
 /// `wicket self rollback`: the control host (unless `only_nodes`) and the nodes named, back to
 /// their previous versions.
 pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
+    let _one = update_lock()?;
     let ledger = Arc::new(Mutex::new(Ledger::open(&crate::ledger_path())?));
     let nodes = match &nodes {
         Some(s) => node_list(&ledger.lock().expect("ledger"), s)?,
@@ -1288,6 +1475,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A CI signature (#190) as the `sign` job makes one: the claims' bytes as given, signed after
+    /// [`CI_DOMAIN`].
+    fn ci_sign(k: &wicket_identity::SigningKey, payload: &[u8], sha: &str) -> Signature {
+        use ed25519_dalek::Signer;
+        let mut msg = CI_DOMAIN.to_vec();
+        msg.extend_from_slice(payload);
+        Signature {
+            alg: "ed25519".into(),
+            key: B64.encode(k.verifying_key().to_bytes()),
+            sha256: sha.into(),
+            sig: B64.encode(k.sign(&msg).to_bytes()),
+            payload: Some(B64.encode(payload)),
+        }
+    }
+
+    fn claims_json(sha: &str, commit: &str, git_ref: &str, environment: &str, signed_at: i64) -> String {
+        // Keys in another order than the struct's, and spaced: what is verified is these bytes.
+        format!(
+            r#"{{"signed_at": {signed_at}, "v": 1, "sha256": "{sha}", "artifact": "wicket-0.0.1-{c}-x86_64-linux.tar.gz", "repo": "acme/wicket", "commit": "{commit}", "ref": "{git_ref}", "workflow": ".github/workflows/build.yml", "run_id": 42, "run_attempt": 1, "environment": "{environment}"}}"#,
+            c = &commit[..12]
+        )
+    }
+
+    /// #190: a CI signature verifies only for its artifact and a trusted key, over the claims' bytes
+    /// as signed; `--from-ci` takes it only for this repository, workflow, commit, main and the
+    /// release environment, signed in the past; a plain (sha-only) signature from the same key
+    /// isn't one.
+    #[test]
+    fn a_ci_signature_binds_the_commit_main_and_the_release_environment() {
+        let k = wicket_identity::SigningKey::from_bytes(&[7; 32]);
+        let trusted = [k.verifying_key().to_bytes()];
+        let sha = "ab".repeat(32);
+        let commit = "c0ffee".repeat(6) + "c0ff";
+        let now = 1_800_000_000;
+        let e = CiExpect { repo: "acme/wicket".into(), workflow: ".github/workflows/build.yml".into(), commit: commit.clone() };
+        let ok = ci_sign(&k, claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, now - 60).as_bytes(), &sha);
+        let (_, c) = verify_ci_sig(&ok, &sha, &trusted).unwrap();
+        check_claims(&c, &e, now).unwrap();
+        assert!(verify_sig(&ok, &sha, &trusted).is_ok(), "a plain update takes it too");
+        assert!(verify_ci_sig(&ok, &sha, &[]).unwrap_err().to_string().contains("doesn't trust"));
+        assert!(verify_ci_sig(&ok, &"cd".repeat(32), &trusted).unwrap_err().to_string().contains("another artifact"));
+        // The claims edited after signing (their bytes changed): refused.
+        let mut edited = ok.clone();
+        edited.payload = Some(B64.encode(claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, now - 60).replace("acme", "evil")));
+        assert!(verify_ci_sig(&edited, &sha, &trusted).unwrap_err().to_string().contains("doesn't verify"));
+        // A sha-only signature from the same key isn't a CI signature.
+        let plain =
+            Signature { alg: "ed25519".into(), key: ok.key.clone(), sha256: sha.clone(), sig: ed25519_sign(&k, &sha), payload: None };
+        assert!(verify_sig(&plain, &sha, &trusted).is_ok());
+        assert!(verify_ci_sig(&plain, &sha, &trusted).unwrap_err().to_string().contains("no claims"));
+        // Each claim must be what was asked for.
+        let refused = |payload: String, e: &CiExpect| {
+            let s = ci_sign(&k, payload.as_bytes(), &sha);
+            let (_, c) = verify_ci_sig(&s, &sha, &trusted).unwrap();
+            check_claims(&c, e, now).unwrap_err().to_string()
+        };
+        assert!(refused(claims_json(&sha, &commit, "refs/heads/feature", CI_ENVIRONMENT, now), &e).contains("not refs/heads/main"));
+        assert!(refused(claims_json(&sha, &commit, CI_REF, "staging", now), &e).contains("not release"));
+        assert!(refused(claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, now + 3600), &e).contains("future"));
+        let other = CiExpect { commit: "d".repeat(40), ..e.clone() };
+        assert!(refused(claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, now), &other).contains("not dddd"));
+        let fork = CiExpect { repo: "someone/wicket".into(), ..e.clone() };
+        assert!(refused(claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, now), &fork).contains("not someone/wicket"));
+    }
+
+    /// #190: the `sign` job signs with openssl (no build output touches the key), and its public
+    /// key is PEM: both read here as the workflow makes them.
+    #[test]
+    fn an_openssl_signature_and_pem_key_verify() {
+        let d = tmp("openssl");
+        let run = |args: &[&str]| std::process::Command::new("openssl").args(args).current_dir(&d).output();
+        if !run(&["version"]).is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: no openssl");
+            return;
+        }
+        assert!(run(&["genpkey", "-algorithm", "ed25519", "-out", "k.pem"]).unwrap().status.success());
+        assert!(run(&["pkey", "-in", "k.pem", "-pubout", "-out", "k.pub.pem"]).unwrap().status.success());
+        let sha = "ef".repeat(32);
+        let commit = "1".repeat(40);
+        let payload = claims_json(&sha, &commit, CI_REF, CI_ENVIRONMENT, 1_700_000_000);
+        let mut msg = CI_DOMAIN.to_vec();
+        msg.extend_from_slice(payload.as_bytes());
+        std::fs::write(d.join("msg"), &msg).unwrap();
+        let o = run(&["pkeyutl", "-sign", "-rawin", "-inkey", "k.pem", "-in", "msg", "-out", "sig.bin"]).unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let public = read_public(&d.join("k.pub.pem")).unwrap();
+        let s = Signature {
+            alg: "ed25519".into(),
+            key: B64.encode(public),
+            sha256: sha.clone(),
+            sig: B64.encode(std::fs::read(d.join("sig.bin")).unwrap()),
+            payload: Some(B64.encode(&payload)),
+        };
+        let (_, c) = verify_ci_sig(&s, &sha, &[public]).unwrap();
+        assert_eq!((c.commit.as_str(), c.run_id), (commit.as_str(), 42));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

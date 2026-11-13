@@ -1,0 +1,138 @@
+name: Signed build
+
+# #190: every push to main is built and tested here; its archive is signed only after a reviewer
+# approves the `sign` job in the `release` environment (Settings, Environments, release: required
+# reviewers, deployment branches main only, prevent self-review; the signing key is that
+# environment's secret WICKET_RELEASE_KEY). Installations take a build with
+# `wicket self update --from-ci`, or `wicket self follow`. No tags and no GitHub Releases: builds
+# are this run's artifacts, named by commit (docs/how-to/update-from-ci.md).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-build-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build and gate
+    # The oldest supported runner: the binary's glibc floor (2.35) runs on Ubuntu 24.04 and Debian 12.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No cache: what is signed is built from the commit and the pinned toolchain alone.
+      - run: rustup show active-toolchain
+      - name: No secrets or machine details
+        run: ci/check-public.py
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Build (as reproducibly as practical)
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
+          cargo build --release --locked -p wicket-cli
+      - name: Package
+        id: package
+        run: |
+          a=$(ci/package.sh target/release/wicket dist "${GITHUB_SHA:0:12}")
+          echo "archive=$(basename "$a")" >>"$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "$a.sha256")" >>"$GITHUB_OUTPUT"
+          cat "$a.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/${{ steps.package.outputs.archive }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+  sign:
+    name: Sign (after a reviewer approves)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The reviewer sees this run's commit, the archive's sha256 (in the build job's log) and the
+    # gates, and approves or rejects. Only then does this job get the environment's secret.
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # GitHub creates an environment named in a workflow, unprotected, the first time it runs: never
+      # sign unless it has required reviewers and a branch rule.
+      - name: The release environment is protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "::error::builds are signed from main only, not $REF"; exit 1; }
+          env=$(curl -sSf -H "authorization: Bearer $GH_TOKEN" -H 'accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$REPO/environments/release")
+          jq -e '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers | length)] | any(. > 0)' <<<"$env" >/dev/null \
+            || { echo "::error::the release environment has no required reviewers (docs/how-to/update-from-ci.md)"; exit 1; }
+          jq -e '.deployment_branch_policy != null' <<<"$env" >/dev/null \
+            || { echo "::error::the release environment isn't restricted to main (docs/how-to/update-from-ci.md)"; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.archive }}
+          path: dist
+      # openssl only: nothing from the repository or the build runs while the key is here.
+      - name: Sign
+        env:
+          KEY: ${{ secrets.WICKET_RELEASE_KEY }}
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+          BUILT_SHA256: ${{ needs.build.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEY" ] || { echo "::error::no WICKET_RELEASE_KEY in the release environment"; exit 1; }
+          b64u() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
+          cd dist
+          sha=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+          [ "$sha" = "$BUILT_SHA256" ] || { echo "::error::the archive isn't the one built ($sha, not $BUILT_SHA256)"; exit 1; }
+          # owner/name/.github/workflows/build.yml@refs/heads/main -> .github/workflows/build.yml
+          workflow=${WORKFLOW_REF#"$REPO/"}
+          workflow=${workflow%@*}
+          payload=$(jq -cn --arg a "$ARCHIVE" --arg s "$sha" --arg repo "$REPO" --arg c "$COMMIT" --arg r "$REF" \
+            --arg w "$workflow" --argjson id "$RUN_ID" --argjson at "$RUN_ATTEMPT" --argjson t "$(date +%s)" \
+            '{v: 1, artifact: $a, sha256: $s, repo: $repo, commit: $c, ref: $r, workflow: $w, run_id: $id, run_attempt: $at, environment: "release", signed_at: $t}')
+          umask 077
+          k=$RUNNER_TEMP/release.pem
+          trap 'rm -f "$k"' EXIT
+          printf '%s\n' "$KEY" >"$k"
+          { printf 'wicket-ci-release-v1\0'; printf '%s' "$payload"; } >"$RUNNER_TEMP/msg"
+          openssl pkeyutl -sign -rawin -inkey "$k" -in "$RUNNER_TEMP/msg" -out "$RUNNER_TEMP/sig.bin"
+          openssl pkey -in "$k" -pubout -out "$RUNNER_TEMP/pub.pem"
+          rm -f "$k"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/pub.pem" -in "$RUNNER_TEMP/msg" -sigfile "$RUNNER_TEMP/sig.bin"
+          pub=$(openssl pkey -pubin -in "$RUNNER_TEMP/pub.pem" -outform DER | tail -c 32 | b64u)
+          jq -cn --arg k "$pub" --arg s "$sha" --arg sig "$(b64u <"$RUNNER_TEMP/sig.bin")" --arg p "$(printf '%s' "$payload" | b64u)" \
+            '{alg: "ed25519", key: $k, sha256: $s, sig: $sig, payload: $p}' >"$ARCHIVE.sig"
+          echo "signed $ARCHIVE ($sha) at $COMMIT, key $(openssl pkey -pubin -in "$RUNNER_TEMP/pub.pem" -outform DER | tail -c 32 | sha256sum | cut -c1-16)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/${{ needs.build.outputs.archive }}.sig
+          archive: false
+          if-no-files-found: error
+          retention-days: 90

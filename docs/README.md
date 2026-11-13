@@ -32,6 +32,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Export audit](how-to/export-audit.md)
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
+- [Update from CI-signed builds](how-to/update-from-ci.md), and follow main
 - [Run wicket in wicket](how-to/run-wicket-in-wicket.md)
 - [Run the acceptance tests](how-to/run-the-acceptance-tests.md)
 

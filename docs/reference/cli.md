@@ -85,6 +85,7 @@ humantime strings (`90s`, `10m`, `1h`).
 - [`wicket self`](#wicket-self)
   - [`wicket self status`](#wicket-self-status)
   - [`wicket self update`](#wicket-self-update)
+  - [`wicket self follow`](#wicket-self-follow)
   - [`wicket self rollback`](#wicket-self-rollback)
   - [`wicket self prune`](#wicket-self-prune)
   - [`wicket self trust-key`](#wicket-self-trust-key)
@@ -1298,6 +1299,7 @@ Usage: wicket self <COMMAND>
 Commands:
   status     The staged versions, which is current and previous, and the ledger's schema
   update     Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
+  follow     Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
   rollback   Switch back to the previous version: the control host (unless --only-nodes) and these nodes
   prune      Remove what no rollback or running box needs: versions other than current and previous that no process runs, their agent images unless a container uses them, and ledger snapshots beyond the newest few (always keeping the newest of the current and previous versions')
   trust-key  Trust a release public key (from `wicket self keygen`) for updates
@@ -1325,22 +1327,34 @@ Options:
 ```text
 Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
 
-Usage: wicket self update [OPTIONS] <ARTIFACT>
+Usage: wicket self update [OPTIONS] [ARTIFACT]
 
 Arguments:
-  <ARTIFACT>  
+  [ARTIFACT]  The artifact: a wicket binary, or a release archive
 
 Options:
-      --sig <SIG>            The detached signature (default: <artifact>.sig)
-      --nodes <NODES>        Also update these nodes after the control host: `all`, or names (comma-separated). The first is the canary
-      --only-nodes           The control host already runs this build: only the nodes
-      --window <WINDOW>      How long each new build is watched after its switch [default: 30s]
-      --interval <INTERVAL>  How often within the window [default: 10s]
-      --check <CHECK>        A command (sh -c) that must succeed each time; $WICKET is the new build's binary and $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable
-      --canary <CANARY>      A task manifest the new build runs once on the control host; it must succeed
-      --image <IMAGE>        The canary's image (default: the new build's own, wicket/claude-code:<build id>)
-      --no-prune             Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does, where it updated)
-  -h, --help                 Print help
+      --from-ci <COMMIT|latest>  A build CI signed instead (#190): a commit on main, or `latest`. Downloaded here and taken only if signed in the release environment by a trusted key, for this installation's repository (`<data dir>/ci-builds.yaml`) and that commit, on main
+      --sig <SIG>                The detached signature (default: <artifact>.sig)
+      --nodes <NODES>            Also update these nodes after the control host: `all`, or names (comma-separated). The first is the canary
+      --only-nodes               The control host already runs this build: only the nodes
+      --window <WINDOW>          How long each new build is watched after its switch [default: 30s]
+      --interval <INTERVAL>      How often within the window [default: 10s]
+      --check <CHECK>            A command (sh -c) that must succeed each time; $WICKET is the new build's binary and $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable
+      --canary <CANARY>          A task manifest the new build runs once on the control host; it must succeed
+      --image <IMAGE>            The canary's image (default: the new build's own, wicket/claude-code:<build id>)
+      --no-prune                 Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does, where it updated)
+  -h, --help                     Print help
+```
+
+### `wicket self follow`
+
+```text
+Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
+
+Usage: wicket self follow
+
+Options:
+  -h, --help  Print help
 ```
 
 ### `wicket self rollback`

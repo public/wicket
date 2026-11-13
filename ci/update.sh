@@ -23,6 +23,8 @@
 #      check on the control host and is switched back to A; the approval is used up;
 #   5. pruning (#166): a dry run removes nothing; then B, now neither current nor previous on the
 #      control host, goes with its image, while A and C stay (and the nodes, A and B, keep both);
+#   5b. builds CI signed (#190), from a fake GitHub API: --from-ci, its refusals, and follow
+#       (ci/update/from-ci.sh);
 #   6. the audit chain verifies and has every step.
 #
 # Needs Docker with runsc and the agent image. Env: WICKET, IMAGE (an existing agent image: not
@@ -67,7 +69,7 @@ teardown() {
   for c in $($DOCKER ps -aq --filter name=^upd-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   # Each build's own image, made by the updates (these builds are this test's alone).
-  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
+  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
   if [ "${UPD_KEEP:-}" = 1 ]; then echo "kept: $work"; else chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"; fi
   echo
   printf '%s\n' "${results[@]}"
@@ -270,6 +272,9 @@ w self prune --nodes n1,n2 >"$work/prune.log" 2>&1 || cat "$work/prune.log"
 cat "$work/prune.log"
 check "  prune removes B and its image; A (current) and C (previous) stay" '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ]'
 check "  the nodes keep their current and previous" '[ -d "$(node_dir n1)/versions/$A_ID" ] && [ -d "$(node_dir n1)/versions/$B_ID" ] && grep -q "node:n1: removed 0 version" "$work/prune.log"'
+
+# ---- 5b. builds CI signed (#190) ----
+. ci/update/from-ci.sh
 
 # ---- 6. audit ----
 log "6. audit"

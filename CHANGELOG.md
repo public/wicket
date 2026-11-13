@@ -2,6 +2,17 @@
 
 User-facing changes, grouped by area. Numbers link to the pull requests.
 
+## 0.0.2 (unreleased)
+
+### Updates
+
+- CI-signed builds: every push to `main` is built and tested (`.github/workflows/build.yml`); after a
+  reviewer approves it in the `release` environment, its reproducible archive is signed with claims
+  naming its commit, `main` and the environment. `wicket self update --from-ci <commit|latest>`
+  downloads, verifies and takes such a build; `wicket self follow` (the `wicket-follow` timer, not
+  enabled by default) follows `main` within a window, a soak time, and never across a schema contract
+  step. No tags or GitHub Releases ([#190](https://github.com/public/wicket/issues/190)).
+
 ## 0.0.1 (unreleased)
 
 The first release: one control host runs Claude Code agents in gVisor boxes with no network, brokers
