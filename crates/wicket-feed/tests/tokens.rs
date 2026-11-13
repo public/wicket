@@ -521,3 +521,37 @@ fn the_feed_entry_replaces_a_derived_one() {
     r.drop_local("c");
     assert!(r.local("c").is_none());
 }
+
+/// #164: deriving a child on the node takes exactly its parent's base token (verified, and the
+/// start of the token the feed holds, without its grants): another box's base, a forged one, or
+/// the parent's token with its grants is refused, so a child never inherits a grant.
+#[test]
+fn a_node_derives_a_child_only_from_its_parents_own_base_token() {
+    let mut cp = Cp::new();
+    let (zp, zc) = (zone("zp", &["/repos/acme/**"]), zone("zc", &["/repos/acme/**"]));
+    let keys = vec![cp.approver.public()];
+    let parent = cp.issue("p", &zp);
+    let other = cp.issue("o", &zp);
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 600_000), uses: None };
+    let with_grant = parent.publish(&cp.approver, std::slice::from_ref(&g)).unwrap();
+    cp.put(with_grant.clone(), T0 - 100);
+    cp.put(other.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    assert_eq!(kind(&r.decide(&gh("zp", "p", "POST", "/repos/acme/app/hooks"), T0)), "grant");
+    let ceiling = Ceiling::from_zone(&zc, "p/c", secs(T0) + 3600, keys.clone()).unwrap();
+    let base = parent.record().unwrap().token;
+    for (bad, why) in [
+        (other.record().unwrap().token, "another box's"),
+        (with_grant.token.clone(), "with its grants"),
+        (base.replace('A', "B"), "forged"),
+    ] {
+        assert!(r.derive_child("p", &bad, "c", &zc, &ceiling).is_err(), "{why}");
+    }
+    let wrong_path = Ceiling::from_zone(&zc, "o/c", secs(T0) + 3600, keys).unwrap();
+    assert!(r.derive_child("p", &base, "c", &zc, &wrong_path).is_err(), "bounded to its parent's path");
+    let rec = r.derive_child("p", &base, "c", &zc, &ceiling).unwrap();
+    assert_eq!(rec.box_path, "p/c");
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app"), T0)), "allow");
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "POST", "/repos/acme/app/hooks"), T0)), "needs-grant", "the parent's grant isn't the child's");
+}

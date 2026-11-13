@@ -696,12 +696,25 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // The installation's org policy for this box (#51): compiled once, into its token at mint and
     // for the control host's own checks (forwarded hosts, injections, spawns, messages).
-    let org_layer: Option<Arc<wicket_authz::OrgLayer>> = match crate::policy::for_run(&run.0, record.is_some())? {
+    let org_policy = crate::policy::for_run(&run.0, record.is_some())?;
+    let org_layer: Option<Arc<wicket_authz::OrgLayer>> = match &org_policy {
         Some(o) => {
-            let mint = crate::policy::mint_ctx(&o, &m.zone.name, &m.tenant.0, &principal, depth);
+            let mint = crate::policy::mint_ctx(o, &m.zone.name, &m.tenant.0, &principal, depth);
             Some(Arc::new(o.layer(&mint).with_context(|| format!("the org policy {} for zone {}", o.version(), m.zone.name))?))
         }
         None => None,
+    };
+    // Whether the org policy decides for this box's children as for the box itself (#164): it
+    // doesn't read the spawn depth, the zone or its groups. A child a node starts keeps its
+    // parent's org layer (in block 0), so where the policy would differ a level down, spawns
+    // are decided here instead.
+    let org_alike = match (&org_policy, &org_layer) {
+        (Some(o), Some(own)) => {
+            let child_zone = format!("{}.child.{}", m.zone.name, run.0.strip_prefix("run_").unwrap_or(&run.0));
+            let mint = crate::policy::mint_ctx(o, &child_zone, &m.tenant.0, &principal, depth + 1);
+            o.layer(&mint).is_ok_and(|l| l == **own)
+        }
+        _ => true,
     };
 
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and

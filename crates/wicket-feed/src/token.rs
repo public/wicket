@@ -34,7 +34,7 @@
 
 use crate::format::RevokeKind;
 use crate::replica::{Allowed, Decision, Mode, Replica};
-use crate::state::Policy;
+use crate::state::{Policy, Zone};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -356,6 +356,53 @@ impl Replica<BoxAuthority> {
         c.loaded.not_after().map(|s| i64::try_from(s).unwrap_or(i64::MAX / 1000).saturating_add(1).saturating_mul(1000))
     }
 
+    /// Derives box `child`'s authority on this node (#164), from box `parent`'s base token (its
+    /// block 0 and spawn links, without grants, as its control host handed it to the node): the
+    /// base must verify against the authority root (or the issuing key that minted it), and be the
+    /// start of the token the feed holds for `parent`, unrevoked. The child's token is the base
+    /// with a spawn block bounded to `<parent's box path>/<child>`, so it holds at most what its
+    /// parent's token does, and goes when any of its parent's blocks is revoked. Held as an entry
+    /// of this node's own until the feed holds `child`.
+    pub fn derive_child(
+        &mut self,
+        parent: &str,
+        base: &str,
+        child: &str,
+        zone: &ZoneSpec,
+        ceiling: &authz::Ceiling,
+    ) -> Result<BoxAuthority, String> {
+        let (spec, ids) = match self.entry(parent) {
+            Some(Zone { spec, compiled: Ok(c) }) => (spec.clone(), c.ids.clone()),
+            Some(Zone { compiled: Err(e), .. }) => return Err(format!("box {parent}'s authority is invalid: {e}")),
+            None => return Err(format!("no authority for box {parent} on this node")),
+        };
+        let key = match &spec.issuer_cert {
+            Some(c) => AuthzKeyCert::open(c, self.ctx())?.0,
+            None => *self.ctx(),
+        };
+        let bytes = B64.decode(base).map_err(|e| format!("base token encoding: {e}"))?;
+        let base = authz::Token::from_bytes(&bytes, &key).map_err(|e| e.to_string())?;
+        let base_ids: Vec<String> = base.revocation_ids().iter().map(|i| revocation_id(i)).collect();
+        // Exactly the token without its grant blocks (appended last): a child never inherits its
+        // parent's grants.
+        let first_party = ids.len().saturating_sub(spec.grants.len());
+        if base_ids.is_empty() || base_ids.len() != first_party || base_ids[..] != ids[..first_party] {
+            return Err(format!("the base token isn't box {parent}'s, without its grants"));
+        }
+        let issuer = Issuer {
+            base,
+            run: spec.run.clone(),
+            box_path: spec.box_path.clone(),
+            epoch: spec.epoch,
+            zone: spec.zone.clone(),
+            issuer_cert: spec.issuer_cert.clone(),
+            org: spec.org.clone(),
+        };
+        let record = issuer.child(child, 0, zone, ceiling).map_err(|e| e.to_string())?.record().map_err(|e| e.to_string())?;
+        self.put_local(record.clone())?;
+        Ok(record)
+    }
+
     /// The zone a box's authority was minted from, if the node holds it.
     pub fn zone_of(&self, run: &str) -> Option<&ZoneSpec> {
         self.entry(run).map(|z| &z.spec.zone)
@@ -448,6 +495,20 @@ impl Issuer {
     /// revoking it revokes this box and every box below it.
     pub fn block_ids(&self) -> Vec<String> {
         self.base.revocation_ids().iter().map(|i| revocation_id(i)).collect()
+    }
+
+    /// The record of the base token alone, without grants.
+    pub fn record(&self) -> Result<BoxAuthority, authz::AuthzError> {
+        Ok(BoxAuthority {
+            run: self.run.clone(),
+            box_path: self.box_path.clone(),
+            epoch: self.epoch,
+            zone: self.zone.clone(),
+            token: B64.encode(self.base.to_bytes()?),
+            grants: vec![],
+            issuer_cert: self.issuer_cert.clone(),
+            org: self.org.clone(),
+        })
     }
 
     /// The record to publish: the base token with one grant block per live grant, signed by

@@ -742,6 +742,11 @@ impl<P: Policy> Replica<P> {
         Ok(())
     }
 
+    /// What compiling an entry needs (for tokens, their root key).
+    pub fn ctx(&self) -> &P::Ctx {
+        &self.ctx
+    }
+
     /// Drops an entry this node derived (its box ended, or the feed now holds it).
     pub fn drop_local(&mut self, name: &str) {
         self.local.remove(name);
