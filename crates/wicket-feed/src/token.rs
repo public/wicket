@@ -240,7 +240,7 @@ impl Replica<BoxAuthority> {
     fn decide_inner(&mut self, op: &Op, now: i64, record: bool) -> Decision {
         let found = match self.gate(op, now) {
             Err(d) => Found::Done(d),
-            Ok((_, st)) => match st.zones.get(&op.run.0) {
+            Ok((_, st)) => match self.entry(&op.run.0) {
                 None => Found::Done(Decision::Forbidden(format!("no authority for box {} on this node", op.run))),
                 Some(entry) => match &entry.compiled {
                     Err(e) => Found::Done(Decision::Forbidden(format!("this box's authority is invalid: {e}"))),
@@ -299,7 +299,7 @@ impl Replica<BoxAuthority> {
     /// whose token didn't load, gets `Open`: its requests are then refused one by one by
     /// [`Self::decide`].
     pub fn host_verdict(&self, run: &str, host: &str) -> HostVerdict {
-        match self.state().and_then(|s| s.zones.get(run)).map(|z| &z.compiled) {
+        match self.state().and_then(|_| self.entry(run)).map(|z| &z.compiled) {
             Some(Ok(c)) => c.zone.host_verdict(host),
             _ => HostVerdict::Open,
         }
@@ -316,7 +316,8 @@ impl Replica<BoxAuthority> {
     /// - the token itself allows every method the proxy forwards, at the root and at a deep path,
     ///   by its ceiling alone (the allow comes from the token, as for every request).
     pub fn splice(&self, tenant: &wicket_core::TenantId, run: &str, host: &str, now: i64) -> Option<usize> {
-        let entry = self.state()?.zones.get(run)?;
+        self.state()?;
+        let entry = self.entry(run)?;
         let c = entry.compiled.as_ref().ok()?;
         if entry.spec.box_path != entry.spec.run {
             return None;
@@ -350,14 +351,14 @@ impl Replica<BoxAuthority> {
     /// When box `run`'s authority ends (Unix ms), read from its verified token: the earliest expiry
     /// of its first-party blocks (#153). None if the node holds no valid token for it.
     pub fn authority_until(&self, run: &str) -> Option<i64> {
-        let c = self.state()?.zones.get(run)?.compiled.as_ref().ok()?;
+        let c = self.entry(run)?.compiled.as_ref().ok()?;
         // The token's check is `time <= not_after` in whole seconds: it allows through that second.
         c.loaded.not_after().map(|s| i64::try_from(s).unwrap_or(i64::MAX / 1000).saturating_add(1).saturating_mul(1000))
     }
 
     /// The zone a box's authority was minted from, if the node holds it.
     pub fn zone_of(&self, run: &str) -> Option<&ZoneSpec> {
-        self.state().and_then(|s| s.zones.get(run)).map(|z| &z.spec.zone)
+        self.entry(run).map(|z| &z.spec.zone)
     }
 }
 

@@ -451,3 +451,73 @@ fn a_token_minted_by_a_certified_issuing_key_loads_until_its_certificate_expires
     let plain = cp.issue("q", &z).publish(&cp.approver, &[]).unwrap();
     assert!(serde_json::to_value(&plain).unwrap().get("issuer_cert").is_none());
 }
+
+/// #164: a child's token derived on the node (its parent's base token attenuated, with no feed
+/// update) is decided from as a feed entry is, never beyond its parent, never past its parent's
+/// authority, only under its parent's box path, and goes when its parent's block is revoked. Once
+/// the feed holds the child, the feed's entry decides.
+#[test]
+fn a_child_derived_on_the_node_is_bounded_by_and_revoked_with_its_parent() {
+    let mut cp = Cp::new();
+    let (zp, zc) = (zone("zp", &["/repos/acme/**"]), zone("zc", &["/repos/acme/app/**"]));
+    let keys = vec![cp.approver.public()];
+    let parent = cp.issue("p", &zp);
+    cp.put(parent.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    // The child's ceiling says two hours; its parent's says one.
+    let ceiling = |prefix: &str| Ceiling::from_zone(&zc, prefix, secs(T0) + 7200, keys.clone()).unwrap();
+    assert!(parent.child("c", 0, &zc, &ceiling("q/c")).is_err(), "a child is bounded to its parent's path");
+    let child = parent.child("c", 0, &zc, &ceiling("p/c")).unwrap();
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app/x"), T0)), "forbidden", "not held yet");
+    r.put_local(child.publish(&cp.approver, &[]).unwrap()).unwrap();
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app/x"), T0)), "allow");
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/web"), T0)), "needs-grant", "narrower than its parent");
+    assert!(r.authority_until("c").unwrap() <= r.authority_until("p").unwrap(), "never past its parent's authority");
+    // Offline, as fresh: it holds until it expires.
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app/x"), T0 + 10 * TTL)), "allow");
+    // A record claiming another box path for the same token is forbidden everything.
+    let mut forged = child.publish(&cp.approver, &[]).unwrap();
+    forged.run = "c2".into();
+    forged.box_path = "x/c2".into();
+    r.put_local(forged).unwrap();
+    assert_eq!(kind(&r.decide(&gh("zc", "c2", "GET", "/repos/acme/app/x"), T0)), "forbidden", "not under its parent's path");
+    // A token that doesn't verify is refused outright.
+    let mut bad = child.publish(&cp.approver, &[]).unwrap();
+    bad.run = "c3".into();
+    bad.box_path = "p/c3".into();
+    bad.token = cp.issue("other", &zc).publish(&cp.approver, &[]).unwrap().token.replace('A', "B");
+    assert!(r.put_local(bad).is_err());
+    // Revoking the parent's block 0 takes the child with it.
+    let root = parent.block_ids()[0].clone();
+    let rev = cp.p.commit(vec![Change::Revoke { kind: RevokeKind::Token, id: root, until: T0 + 3_600_000 }], T0 + 10).unwrap();
+    r.accept(&rev, T0 + 10).unwrap();
+    let d = r.decide(&gh("zc", "c", "GET", "/repos/acme/app/x"), T0 + 10);
+    assert!(matches!(&d, Decision::Forbidden(w) if w.contains("revoked")), "{d:?}");
+    // And a child derived after the revocation is refused when it is added.
+    assert!(r.put_local(child.publish(&cp.approver, &[]).unwrap()).is_err());
+}
+
+/// #164: once the feed holds a box the node derived, the feed's entry decides.
+#[test]
+fn the_feed_entry_replaces_a_derived_one() {
+    let mut cp = Cp::new();
+    let (zp, zc) = (zone("zp", &["/repos/acme/**"]), zone("zc", &["/repos/acme/app/**"]));
+    let keys = vec![cp.approver.public()];
+    let parent = cp.issue("p", &zp);
+    cp.put(parent.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    let child = parent.child("c", 0, &zc, &Ceiling::from_zone(&zc, "p/c", secs(T0) + 3600, keys.clone()).unwrap()).unwrap();
+    r.put_local(child.publish(&cp.approver, &[]).unwrap()).unwrap();
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/web"), T0)), "needs-grant");
+    // Adopted by the control host: published in a narrower zone of its own.
+    let zn = zone("zc", &["/repos/acme/app/issues/**"]);
+    let adopted = Issuer::root(&cp.authz_root, TENANT, "trigger:t", "c", 0, &zn, &[], secs(T0) + 3600, keys).unwrap();
+    cp.put(adopted.publish(&cp.approver, &[]).unwrap(), T0 + 1);
+    sync(&mut cp.p, &mut r, T0 + 1);
+    assert_eq!(kind(&r.decide(&gh("zc", "c", "GET", "/repos/acme/app/x"), T0 + 1)), "needs-grant", "the feed's entry decides");
+    assert!(r.local("c").is_some(), "kept until the node drops it");
+    r.drop_local("c");
+    assert!(r.local("c").is_none());
+}
