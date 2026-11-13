@@ -1100,14 +1100,24 @@ fn authority_file(run_dir: &Path) -> PathBuf {
 }
 
 /// Records a box's authority beside its run (a re-attach keeps what the node confirmed).
+/// Durably, before the box starts: on disk (file and directory synced) before the node is asked to
+/// start anything, so a crash can't leave a running box with no fence.
 pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()> {
-    let p = authority_file(run_dir);
-    std::fs::create_dir_all(p.parent().expect("ctl"))?;
     let stopped = read_authority(run_dir).is_some_and(|a| a.stopped && a.until_ms == until_ms);
-    let rec = AuthorityRecord { node: node.into(), until_ms, stopped };
+    write_authority(run_dir, &AuthorityRecord { node: node.into(), until_ms, stopped })
+}
+
+fn write_authority(run_dir: &Path, rec: &AuthorityRecord) -> Result<()> {
+    use std::io::Write;
+    let p = authority_file(run_dir);
+    let dir = p.parent().expect("ctl");
+    std::fs::create_dir_all(dir)?;
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&rec)?)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&serde_json::to_vec(rec)?)?;
+    f.sync_all()?;
     std::fs::rename(&tmp, &p)?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -1117,14 +1127,12 @@ pub fn read_authority(run_dir: &Path) -> Option<AuthorityRecord> {
 
 /// The node has confirmed the box stopped (its exit, or it says it has no box for the run).
 pub fn confirm_stopped(run_dir: &Path) {
-    if let Some(mut a) = read_authority(run_dir) {
-        if !a.stopped {
-            a.stopped = true;
-            let p = authority_file(run_dir);
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, serde_json::to_vec(&a).unwrap_or_default()).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
-            }
+    // A run with no record (from before #153, or lost) gets one: confirmed, nothing left to fence.
+    let mut a = read_authority(run_dir).unwrap_or_default();
+    if !a.stopped {
+        a.stopped = true;
+        if let Err(e) = write_authority(run_dir, &a) {
+            eprintln!("[wicket] recording that {}'s box stopped: {e:#}", run_dir.display());
         }
     }
 }
@@ -1138,10 +1146,26 @@ pub fn fenced_until(run: &str, now_ms: i64) -> Option<(String, i64)> {
 }
 
 /// [`fenced_until`] for the run in `run_dir`.
+///
+/// A run whose record is missing (lost, or from before #153) fences until its timeout, from its run
+/// record: its box may run that long on its node, and no longer. A run with neither record never
+/// started a box.
 pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
-    let a = read_authority(run_dir)?;
+    let a = match read_authority(run_dir) {
+        Some(a) => a,
+        None => AuthorityRecord { node: "its node".into(), until_ms: timeout_end(run_dir)?, stopped: false },
+    };
     let until = a.until_ms.saturating_add(WAKE_SKEW_MS);
     (!a.stopped && now_ms < until).then_some((a.node, until))
+}
+
+/// When a run's box must have stopped by its timeout (Unix ms), from its run record (`ctl/run.json`):
+/// its start, its zone's timeout, and a long-lived agent's node backstop (120 s).
+fn timeout_end(run_dir: &Path) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(run_dir.join("ctl/run.json")).ok()?).ok()?;
+    let m = wicket_core::Manifest::from_yaml(v["manifest"].as_str()?).ok()?;
+    let secs = i64::try_from(m.zone.limits.timeout().ok()?.as_secs()).ok()?;
+    Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
 }
 
 /// When (Unix ms) as a readable UTC time.
@@ -1451,7 +1475,21 @@ mod tests {
     fn a_box_fences_its_agent_until_its_authority_ends_or_its_node_confirms_it_stopped() {
         let d = std::env::temp_dir().join(format!("wicket-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        assert!(fenced_in(&d, 0).is_none(), "no record: nothing to fence (a run from before #153)");
+        assert!(fenced_in(&d, 0).is_none(), "neither record: no box was started");
+        // A run record, but no authority record: fenced until its timeout (5m) and the backstop.
+        std::fs::create_dir_all(d.join("ctl")).unwrap();
+        let manifest = "task: t\nprogram: { name: p, command: [x] }\nzone: { name: z, limits: { timeout: 5m } }\n";
+        std::fs::write(
+            d.join("ctl/run.json"),
+            serde_json::to_vec(&serde_json::json!({ "manifest": manifest, "started_ms": 1_000 })).unwrap(),
+        )
+        .unwrap();
+        let end = 1_000 + 300_000 + 120_000 + WAKE_SKEW_MS;
+        assert_eq!(fenced_in(&d, 2_000).map(|f| f.1), Some(end), "a missing record fences, not opens");
+        assert!(fenced_in(&d, end).is_none());
+        confirm_stopped(&d);
+        assert!(fenced_in(&d, 2_000).is_none(), "confirmed even without a record");
+        std::fs::remove_file(d.join("ctl/authority.json")).unwrap();
         record_authority(&d, "n1", 100_000).unwrap();
         assert_eq!(fenced_in(&d, 50_000), Some(("n1".to_string(), 100_000 + WAKE_SKEW_MS)));
         assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS - 1).is_some(), "skew past the authority");
