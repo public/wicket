@@ -31,7 +31,7 @@ node_local_setup() {
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >"$work/node-serve.log" 2>&1 &
   node_serve_pid=$!
   pids+=("$node_serve_pid")
-  wait_for 20 '[ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ]'
+  wait_for 90 '[ -S "$nodehome/.local/share/wicket-node/ctl/ctl.sock" ]'
   cat >"$WICKET_HOME/placement.yaml" <<EOF
 owner: acc.wicket.test
 backend: static
@@ -226,7 +226,7 @@ offline_flow() {
   node_serve_pid=$!
   pids+=("$node_serve_pid")
   local t_rs; t_rs=$(date +%s%3N)
-  wait_for 20 '[ -S "$nd/ctl/ctl.sock" ]' || true
+  wait_for 90 '[ -S "$nd/ctl/ctl.sock" ]' || true
   # The new serve made a fresh socket: keep the box's control host out until the cut ends.
   mv "$nd/ctl/ctl.sock" "$nd/ctl/ctl.sock.off" 2>/dev/null || true
   sleep 75

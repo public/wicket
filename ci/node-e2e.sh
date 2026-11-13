@@ -58,7 +58,9 @@ if [ "$MODE" = --local ]; then
   "$WICKET" node install "$NODE" --no-service
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >"$work/node.log" 2>&1 &
   pids+=($!)
-  for _ in $(seq 50); do [ -S "$nodedir/ctl/ctl.sock" ] && break; sleep 0.2; done
+  # `serve` hashes its binary as it starts, which takes a while on a busy machine.
+  for _ in $(seq 450); do [ -S "$nodedir/ctl/ctl.sock" ] && break; sleep 0.2; done
+  [ -S "$nodedir/ctl/ctl.sock" ] || { echo "node serve did not start within 90 s"; cat "$work/node.log"; exit 1; }
   node_sh() { env HOME="$nodehome" sh -c "$1"; }
 else
   NODE=$MODE
