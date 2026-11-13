@@ -152,7 +152,7 @@ Everything around that uses standard components:
 | Workload identity, rotation, attestation | **SPIFFE** IDs and SVID formats; a real **SPIRE** deployment can be the issuer | the PoC has its own small issuer with SPIFFE-shaped IDs (#52) |
 | Org rules: images, hosts, escalation and inspection rights, operator roles | **Cedar** (the `cedar-policy` crate, embedded), static and reviewed; **SymCC** in CI to diff policy changes (#50, #34, #11) | the PoC's checks are hand-written (#51) |
 | Delegated authority: zone ceilings, grants and leases | **capability chains in the Biscuit format**, checked by a vendored, patched `biscuit-auth`: narrowing by construction, signed, checked offline, revocable by subtree; intersected with the org rules at decision time | the PoC's `subset.rs` is hand-written and conservative (#57) |
-| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed with a freshness lease** (TUF-style), so nodes know when they're stale and fail narrow; no product signs increments or fails narrow | central checks on the control host (#57) |
+| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed** (TUF-style), with freshness statements so a node knows when it's cut off; it then works on the lifetimes of the tokens, grants and cached secrets it holds, and stops a box when its authority expires (#152, #153); no product signs increments | central checks on the control host (#57) |
 | Relationship data: spawn trees, tenants, roles | Cedar entities materialised from wicket's ledger; **OpenFGA** as an optional source in platform mode | the ledger (#11) |
 | Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP | passkeys enrolled in wicket's console (#53) |
 | Downstream credentials | providers' **scoped native credentials** (AWS STS session policies, GCP downscoped tokens, GitHub App installation tokens; §9.4) | whole tokens injected from the vault (#54) |
@@ -204,6 +204,13 @@ follow-up, 2026-11-11).
     - blocks (16), token size and checks per block are capped.
 
     Without it, a hostile block can burn CPU inside the step budget.
+  - A **cost estimate where tokens are made** (#183). The stock engine compiles each path pattern on
+    every evaluation, about 16 steps per pattern byte, so its cost grows with the globs on one host.
+    `mint` and `attenuate` refuse a token whose costliest host could exceed the step budget there. The
+    error names the host and its pattern bytes. Otherwise, if the token ever fell back, its requests
+    would be cut off and decided `Forbidden`. The tests assert that every legitimate token runs
+    compiled, and that the stock engine stays within each token's estimate
+    (`crates/wicket-authz/README.md`, "How the bounds are measured").
   - A **differential test in CI** compares the compiled evaluator with the stock engine on random tokens
     and requests. It runs on every change to the fork and every rebase onto upstream.
   - Patches 1 and 2 are small and general, and should go upstream. Patch 3 is wicket's to maintain.

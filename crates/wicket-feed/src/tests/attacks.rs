@@ -55,7 +55,7 @@ fn honest(r: &Replica<ZoneSpec>, issued_at: i64) -> Fresh {
         head: st.head.clone(),
         issued_at,
         fresh_until: issued_at + TTL,
-        narrow_until: issued_at + TTL + WINDOW,
+        narrow_until: 0,
     }
 }
 
@@ -113,8 +113,6 @@ fn a07_stolen_feed_key_signs_an_hour() {
     let (cp, mut r, _) = at_epoch_3();
     let f = Fresh { fresh_until: T0 + 20 + 3_600_000, narrow_until: T0 + 20 + 3_600_000, ..honest(&r, T0 + 20) };
     refused(&mut r, statement(&cp.feed_key, None, &f), T0 + 20, "too_long");
-    let f = Fresh { narrow_until: T0 + 20 + TTL + 3_600_000, ..honest(&r, T0 + 20) };
-    refused(&mut r, statement(&cp.feed_key, None, &f), T0 + 20, "too_long");
 }
 
 #[test]
@@ -135,7 +133,7 @@ fn a09_expired_statement() {
 fn a10_forged_feed_key_certificate() {
     let (cp, mut r, _) = at_epoch_3();
     let attacker = key();
-    let c = KeyCert::new(&attacker.verifying_key(), 2, i64::MAX, 30_000, 300_000);
+    let c = KeyCert::new(&attacker.verifying_key(), 2, i64::MAX, 30_000);
     let forged = sign_as(&attacker, TYP_KEY, &kid(&cp.root.verifying_key()), &c);
     refused(&mut r, Frame::new(FrameKind::Key, forged), T0 + 20, "bad_signature");
     let own_kid = sign(&attacker, TYP_KEY, &c);
@@ -185,7 +183,7 @@ fn stolen_feed_key_is_useless_past_its_certificate() {
     let d = cp.p.commit(vec![add(grant("evil", &evil(), i64::MAX))], T0 + 5_001).unwrap();
     assert_eq!(r.accept(&d, T0 + 5_001).unwrap_err().kind(), "key_expired");
     // And the node is closed from not_after, whatever the statements said.
-    assert_eq!(r.mode(T0 + 4_999), Mode::Narrow);
+    assert_eq!(r.mode(T0 + 4_999), Mode::Offline);
     assert_eq!(r.mode(T0 + 5_000), Mode::Closed);
     // An expired certificate is refused, too.
     let old = cert(&cp.root, &cp.feed_key, 1, T0 + 5_000);
@@ -224,7 +222,7 @@ fn statement_epoch_never_goes_back_from_the_last_statement() {
     // The node accepts a statement naming epoch 4 before the delta arrives (lagging).
     let d4 = cp.p.commit(vec![add(grant("g-4", &read(), T0 + 3_600_000))], T0 + 20).unwrap();
     r.accept(&cp.p.statement(T0 + 21), T0 + 21).unwrap();
-    assert_eq!(r.mode(T0 + 22), Mode::Narrow, "lagging counts as stale");
+    assert_eq!(r.mode(T0 + 22), Mode::Lagging, "lagging allows nothing");
     // A later statement naming epoch 3 again (an old-backup control plane, say) is a rollback.
     let st = r.state().unwrap();
     let f = Fresh {
@@ -234,7 +232,7 @@ fn statement_epoch_never_goes_back_from_the_last_statement() {
         head: st.head.clone(),
         issued_at: T0 + 30,
         fresh_until: T0 + 30 + TTL,
-        narrow_until: T0 + 30 + TTL + WINDOW,
+        narrow_until: 0,
     };
     assert_eq!(r.accept(&statement(&cp.feed_key, None, &f), T0 + 30).unwrap_err().kind(), "rollback");
     r.accept(&d4, T0 + 31).unwrap();
@@ -268,8 +266,7 @@ fn restored_backup_is_refused_until_regenesis() {
     }
     assert_eq!(r.state().unwrap().epoch, 6);
     assert_eq!(r.mode(T0 + 30 + TTL - 1), Mode::Fresh);
-    assert_eq!(r.mode(T0 + 30 + TTL), Mode::Narrow);
-    assert_eq!(r.mode(T0 + 30 + TTL + WINDOW), Mode::Closed);
+    assert_eq!(r.mode(T0 + 30 + TTL), Mode::Offline, "offline on what it verified, never on the restored state");
     // The new history diverges from the node's (a different epoch 4): still refused.
     let d4 = cp.p.commit(vec![add(grant("after-restore", &read(), T0 + 3_600_000))], T0 + 3_000).unwrap();
     assert_eq!(r.accept(&d4, T0 + 3_000).unwrap_err().kind(), "replay");

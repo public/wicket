@@ -126,17 +126,23 @@ limit, so a decision doesn't depend on load.
 
 The control host sends these tokens to each node in a **signed policy feed**. The feed has snapshots,
 hash-chained deltas and freshness statements, all signed by a per-node feed key that the feed root
-certifies. The node decides from its verified replica of the feed, in one of three modes:
+certifies. The node decides from its verified replica of the feed:
 
 | mode | when | allowed |
 |---|---|---|
-| **fresh** | a freshness statement within its TTL (30 s) | reach rules and live grants; anything else raises a pending request on the control host |
-| **narrow** | up to the narrow window after that (120 s) | plain reads in reach only |
-| **closed** | after that | nothing |
+| **fresh** | a freshness statement within its TTL (30 s) | the box's token and its live grants; anything else raises a pending request on the control host |
+| **offline** | no live statement: the control host is unreachable | the same, each until its own expiry; anything else is queued on the node and raised when the control host is back |
+| **lagging** | a live statement names deltas the node hasn't got yet | nothing, until they arrive |
+| **closed** | no verified state, or the feed key's certificate has expired | nothing |
 
-So a box on a node keeps working, failing narrow, while the control host is unreachable. Revocations
-are pushed to the node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node
-that hears nothing goes stale within the TTL anyway. Tampered, replayed and rolled-back frames are refused.
+So a box on a node keeps working while the control host is unreachable, for exactly as long as its
+grants last: every grant has a lifetime, the box's own authority (its token's block 0, the zone's
+`limits.authority`, by default the run's timeout) included, and the node stops the box when that ends.
+The node also keeps, in memory only, the secrets its runs have used (their model credential and
+injected secrets, fetched on first use) and a slice of each run's model budget, so model calls go on
+too ([nodes.md](nodes.md)). Revocations are pushed to the
+node: a grant revoke is picked up within 250 ms and a run revocation within 2 s. A node that hears nothing
+keeps what it holds until it expires. Tampered, replayed and rolled-back frames are refused.
 
 ## Links
 

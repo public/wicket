@@ -630,6 +630,12 @@ pub fn list() -> Result<()> {
             None => "no identity certificate".into(),
         };
         println!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
+        // What it holds for this host's runs (#152, #153): authority deadlines, secrets fetched (by
+        // name), budget slices.
+        let now_ms = wicket_feed::now_ms();
+        for (run, a, h) in crate::noderun::node_holdings(&l, &n.name)? {
+            println!("{}", crate::noderun::holdings_line(&run, a.as_ref(), &h, now_ms));
+        }
     }
     Ok(())
 }

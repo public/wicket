@@ -85,7 +85,14 @@ box_of() { $DOCKER ps -q --filter "label=wicket.run=$1" 2>/dev/null; }
 id_of() { sha256sum "$1" | cut -c1-12; }
 current() { basename "$(readlink "$1/current")"; }
 node_dir() { echo "$work/$1/.local/share/wicket-node"; }
-serve_runs() { basename "$(dirname "$(readlink "/proc/$1/exe")")"; }   # the version a process runs
+# The version a process runs: from /proc, or for a non-dumpable `node serve` (#152) what it wrote beside
+# its pid file (the pid on the first line, the binary on the second).
+serve_runs() {
+  local e
+  e=$(readlink "/proc/$1/exe" 2>/dev/null) || e=$(cat "$WICKET_HOME/local-node/serve/serve.exe" "$work"/n*/.local/share/wicket-node/serve.exe 2>/dev/null \
+    | awk -v p="$1" 'NR%2==1 {m=($1==p)} NR%2==0 && m {print; exit}')
+  basename "$(dirname "$e")"
+}
 # A new box with the default image: which image its run got.
 new_box_image() {
   local log=$work/newbox-$1.log r
@@ -206,6 +213,9 @@ check "while the request is pending, its artifact is still refused" '! w self up
 
 # ---- 2. A -> B ----
 log "2. update to B: control host, then n1 (canary) and n2"
+# The node agent's model credential, fetched by n1 on its first use (#152): kept in n1's memory.
+fetched() { w audit --tail 3000 | grep node.secret_fetch | grep "$r_node" | grep -c '"released":true'; }
+fetched_before=$(fetched)
 set +e
 w self update "$B_ART" --nodes n1,n2 --window 10s --interval 5s --canary ci/update/canary.yaml 2>&1 | tee "$work/u-b.log"
 st=${PIPESTATUS[0]}
@@ -220,6 +230,9 @@ check "  the runs were handed over and adopted by B" 'grep -qE "runs: ([0-9]+) h
 check "  B's own image was built while staging, and the canary ran on it" '$DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && w audit --tail 300 | grep run.start | grep -q "wicket/claude-code:$B_ID"'
 check "  a new box with the default image gets B's" '[ "$(new_box_image b)" = "wicket/claude-code:$B_ID" ]'
 another_turn "the update to B"
+check "  n1's secret cache was handed to its new serve through a memfd, and not fetched again (#152)" \
+  'grep -q "cached secret(s) handed over from the previous process" "$work/n1.log" && [ "$fetched_before" -ge 1 ] && [ "$(fetched)" = "$fetched_before" ]'
+check "  and n1's data dir holds no copy of it" '! grep -rlsF mock-model-credential "$(node_dir n1)"'
 
 # ---- 3. manual rollback ----
 log "3. rollback by hand"
