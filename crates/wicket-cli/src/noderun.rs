@@ -471,6 +471,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.epoch()
     };
     let token_root = (token_issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
+    // What fences a wake of the agent elsewhere while this box may still run (#153).
+    record_authority(&s.dir, &name, token_root.1 + 1000).context("recording the box's authority")?;
     // Records the node ships are filed under this run only once the ledger says it runs there (#120).
     s.ledger.lock().expect("ledger").set_run_node(&s.run.0, &name).context("recording the run's node")?;
     let ctl = Arc::new(NodeCtl {
@@ -905,6 +907,8 @@ async fn on_frame(
                 }
             }
             Msg::Exited { run, code, result, reason } if run == sh.run.0 => {
+                // The node says the box has stopped: nothing fences a wake of its agent any more.
+                confirm_stopped(&sh.dir);
                 if let Some(why) = &reason {
                     println!("[wicket] node {} stopped the box: {why}", sh.node);
                     let _ = sh.ledger.lock().expect("ledger").audit(
@@ -1072,6 +1076,80 @@ fn ask(sh: &Shared, id: u64, run: &str, op: &Op, _why: &str, who: Option<&serde_
         Ok((rid, fresh)) => reply(Some((rid, fresh)), None, None),
         Err(e) => reply(None, None, Some(e.to_string())),
     }
+}
+
+/// A run's authority on its node, kept beside the run (`ctl/authority.json`, #153): until when the
+/// node may keep its box running without this host (its token's block 0), and whether the node has
+/// confirmed the box stopped. While it is live and unconfirmed, the run's agent is not woken
+/// anywhere else, and a run on a node that can't be asked isn't ended as lost: two copies of an
+/// agent would otherwise act at once, with separate budget slices and writes.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AuthorityRecord {
+    pub node: String,
+    /// Unix ms.
+    pub until_ms: i64,
+    #[serde(default)]
+    pub stopped: bool,
+}
+
+/// How far past a box's authority a wake still waits: clock skew between this host and the node.
+pub const WAKE_SKEW_MS: i64 = 30_000;
+
+fn authority_file(run_dir: &Path) -> PathBuf {
+    run_dir.join("ctl").join("authority.json")
+}
+
+/// Records a box's authority beside its run (a re-attach keeps what the node confirmed).
+pub fn record_authority(run_dir: &Path, node: &str, until_ms: i64) -> Result<()> {
+    let p = authority_file(run_dir);
+    std::fs::create_dir_all(p.parent().expect("ctl"))?;
+    let stopped = read_authority(run_dir).is_some_and(|a| a.stopped && a.until_ms == until_ms);
+    let rec = AuthorityRecord { node: node.into(), until_ms, stopped };
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&rec)?)?;
+    std::fs::rename(&tmp, &p)?;
+    Ok(())
+}
+
+pub fn read_authority(run_dir: &Path) -> Option<AuthorityRecord> {
+    serde_json::from_slice(&std::fs::read(authority_file(run_dir)).ok()?).ok()
+}
+
+/// The node has confirmed the box stopped (its exit, or it says it has no box for the run).
+pub fn confirm_stopped(run_dir: &Path) {
+    if let Some(mut a) = read_authority(run_dir) {
+        if !a.stopped {
+            a.stopped = true;
+            let p = authority_file(run_dir);
+            let tmp = p.with_extension("tmp");
+            if std::fs::write(&tmp, serde_json::to_vec(&a).unwrap_or_default()).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
+    }
+}
+
+/// Whether run `run`'s box may still be running on its node at `now_ms`: its node, and when that
+/// ends for certain (its authority's end plus [`WAKE_SKEW_MS`]). None once the node confirmed the
+/// box stopped, or the authority has ended, or for a run without a record.
+pub fn fenced_until(run: &str, now_ms: i64) -> Option<(String, i64)> {
+    crate::run::check_run_id(run).ok()?;
+    fenced_in(&crate::data_dir().join("runs").join(run), now_ms)
+}
+
+/// [`fenced_until`] for the run in `run_dir`.
+pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
+    let a = read_authority(run_dir)?;
+    let until = a.until_ms.saturating_add(WAKE_SKEW_MS);
+    (!a.stopped && now_ms < until).then_some((a.node, until))
+}
+
+/// When (Unix ms) as a readable UTC time.
+pub fn fmt_ms(ms: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_else(|| format!("{ms} ms"))
 }
 
 /// The fraction of a run's model budget leased to its node at a time (#152):
@@ -1365,6 +1443,27 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #153, the wake fence: while a box's authority is live on a node this host can't hear, its
+    /// agent isn't woken elsewhere; it can be once the authority (plus skew) has ended, or as soon
+    /// as the node confirms the box stopped; a re-attach doesn't lose that confirmation.
+    #[test]
+    fn a_box_fences_its_agent_until_its_authority_ends_or_its_node_confirms_it_stopped() {
+        let d = std::env::temp_dir().join(format!("wicket-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(fenced_in(&d, 0).is_none(), "no record: nothing to fence (a run from before #153)");
+        record_authority(&d, "n1", 100_000).unwrap();
+        assert_eq!(fenced_in(&d, 50_000), Some(("n1".to_string(), 100_000 + WAKE_SKEW_MS)));
+        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS - 1).is_some(), "skew past the authority");
+        assert!(fenced_in(&d, 100_000 + WAKE_SKEW_MS).is_none(), "ended");
+        confirm_stopped(&d);
+        assert!(fenced_in(&d, 50_000).is_none(), "the node confirmed the box stopped");
+        record_authority(&d, "n1", 100_000).unwrap();
+        assert!(fenced_in(&d, 50_000).is_none(), "a re-attach keeps the confirmation");
+        record_authority(&d, "n1", 200_000).unwrap();
+        assert!(fenced_in(&d, 50_000).is_some(), "a new authority is fenced again");
+        let _ = std::fs::remove_dir_all(d);
+    }
     use wicket_core::RiskClass;
 
     /// #121, #117: what a node asks about is rebuilt and classified on the control host.

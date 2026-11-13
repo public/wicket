@@ -118,9 +118,13 @@ wicket node revoke n1
   works for the box, connected or not, for exactly as long as these are valid, and **stops the box when
   its authority expires**, whether or not it can reach the control host: the workload's grants decide, not
   the node (this replaces #151's run lease and `WICKET_NODE_LEASE_EXPIRY`). What the node reports for each
-  box says when its authority ends (`authority_until`). A run on a node that can't be reached is ended by
-  `wicket reconcile` only past its timeout plus 3 minutes, so nothing replaces a box its node may still be
-  running.
+  box says when its authority ends (`authority_until`). **The wake fence:** while a box's authority is live
+  on a node this host can't hear from, nothing replaces it. Its agent isn't woken anywhere (`wicket wake`
+  says from when it can be: the authority's end plus 30 s of clock skew) unless the node has confirmed the
+  box stopped (its exit, or it says it has no box for the run), and `wicket reconcile` reports the run as
+  unreachable, "still authorized there until …", rather than lost, whatever the node's status. Two copies
+  of an agent never act at once with separate budget slices and writes. The authority and the node's
+  confirmation are kept beside the run (`ctl/authority.json`).
 - **Secrets come to a node only when used, and stay in its memory** (#152). A secret reaches a node only
   when one of its runs first needs it: the run's model credential (`llm.secret`) on its first model call,
   an `inject` rule's secret on the first request to its host. The node asks over that run's own

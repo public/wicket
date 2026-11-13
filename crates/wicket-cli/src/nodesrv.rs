@@ -477,7 +477,14 @@ impl Relay for NodeRelay {
         // control host before protocol 3 they are forwarded to it, as before. Hosts the control host
         // swaps a credential in for (#169) are always forwarded: swaps stay there.
         let v1 = (1..chan::NODE_LEASES).contains(&self.node.proto_of(&self.run));
-        wicket_proxy::decide::route_sealed(host, &spec, &self.swaps, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now, &|_| !v1)
+        wicket_proxy::decide::route_sealed(
+            host,
+            &spec,
+            &self.swaps,
+            self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
+            now,
+            &|_| !v1,
+        )
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {

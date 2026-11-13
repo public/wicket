@@ -558,8 +558,9 @@ limits.md.
 Not built with these (phase 3's other items, left for later issues): node issuing keys for agent
 identities (§3.5; identities on a cut-off node still lapse after 10 minutes), certificate renewal over the
 channel from any control host, distributing node CA revocations, local hibernation with per-agent data
-keys (§5.5), and the control plane's time fence before waking an agent elsewhere (beyond reconcile's wait
-past a run's timeout).
+keys (§5.5). The time fence of §5.2 is built in its simplest form: an agent isn't woken while its last
+activation's block 0 is live (plus skew) unless the node confirmed the box stopped, and reconcile doesn't
+end such a run as lost.
 
 ---
 

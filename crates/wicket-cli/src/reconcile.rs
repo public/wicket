@@ -114,6 +114,8 @@ pub struct Pass<'a, P, S, B, F> {
     pub node_runs: HashMap<String, Option<Vec<String>>>,
     /// Starts a new supervisor for a run (`wicket attach <run>`, detached).
     pub adopt: fn(&str) -> Result<()>,
+    /// Whether a run's box may still run on its node at a time (Unix ms), and until when (#153).
+    pub fenced: fn(&str, i64) -> Option<(String, i64)>,
     pub now: i64,
     pub dry_run: bool,
     done: Vec<Done>,
@@ -138,6 +140,7 @@ where
             owner_alive: crate::reap::owner_alive,
             node_runs: HashMap::new(),
             adopt: crate::run::spawn_attach,
+            fenced: crate::noderun::fenced_until,
             now,
             dry_run,
             done: vec![],
@@ -228,6 +231,12 @@ where
                     );
                 }
                 Some(Some(_)) => {
+                    // The node says it has no box for the run: confirmed stopped (#153).
+                    if !self.dry_run {
+                        if let Ok(()) = crate::run::check_run_id(&run) {
+                            crate::noderun::confirm_stopped(&crate::data_dir().join("runs").join(&run));
+                        }
+                    }
                     let why = format!("its wicket process is gone, and node {node} has no box for it");
                     self.end_run(&run, &why)?;
                     self.did("run_lost", &run, &why, Some(&run));
@@ -237,6 +246,19 @@ where
                     // (revoked: nothing will supervise it there again), or past its own deadline.
                     let active = self.ledger.node(&node)?.is_some_and(|n| n.status == "active");
                     let overdue = run_deadline(&run).is_some_and(|d| d < self.now);
+                    // Still authorized on its node (#153): the box may be running there, so the run
+                    // isn't lost yet, whatever the node's status, until its authority has ended.
+                    if let Some((_, until)) = (self.fenced)(&run, self.now.saturating_mul(1000)) {
+                        self.note(
+                            "unreachable",
+                            &run,
+                            &format!(
+                                "its supervisor is gone and node {node} can't be asked about it; it is still authorized there until {}: left for a later pass",
+                                crate::noderun::fmt_ms(until)
+                            ),
+                        );
+                        continue;
+                    }
                     if !active || overdue {
                         let why = match active {
                             false => format!("its wicket process is gone, and node {node} is no longer active"),
@@ -1053,13 +1075,31 @@ mod tests {
         asked.insert("n1".to_string(), Some(vec!["run_kept".to_string()]));
         asked.insert("n2".to_string(), None);
         asked.insert("n3".to_string(), None);
-        async fn pass(w: &World<Fake>, l: &mut Ledger, asked: &HashMap<String, Option<Vec<String>>>, dry_run: bool) -> Vec<Done> {
+        /// #153: run_fenced's box is still authorized on its (revoked, unreachable) node until
+        /// NOW + 60 s, so it may still run there.
+        fn fenced(run: &str, now_ms: i64) -> Option<(String, i64)> {
+            (run == "run_fenced" && now_ms < (NOW + 60) * 1000).then(|| ("n3".to_string(), (NOW + 60) * 1000))
+        }
+        l.run_started(&TenantId::single(), &RunId("run_fenced".into()), "z", "a").unwrap();
+        l.set_run_owner("run_fenced", "dead:1:1").unwrap();
+        l.set_run_node("run_fenced", "n3").unwrap();
+        async fn pass_at(
+            w: &World<Fake>,
+            l: &mut Ledger,
+            asked: &HashMap<String, Option<Vec<String>>>,
+            dry_run: bool,
+            at: i64,
+        ) -> Vec<Done> {
             let m = Machines { placer: &w.placer, approver: &w.approver, setup: &w.setup, warm_pool: false };
             let nodes = w.nodes.clone();
-            let mut p = Pass::new(l, Some(m), &w.local, move |n: &str| nodes.get(n).cloned(), NOW, dry_run).with_node_runs(asked.clone());
+            let mut p = Pass::new(l, Some(m), &w.local, move |n: &str| nodes.get(n).cloned(), at, dry_run).with_node_runs(asked.clone());
             p.owner_alive = alive;
             p.adopt = adopt;
+            p.fenced = fenced;
             p.run().await.unwrap()
+        }
+        async fn pass(w: &World<Fake>, l: &mut Ledger, asked: &HashMap<String, Option<Vec<String>>>, dry_run: bool) -> Vec<Done> {
+            pass_at(w, l, asked, dry_run, NOW).await
         }
         // A dry run says so and changes nothing.
         let d = pass(&w, &mut l, &asked, true).await;
@@ -1074,7 +1114,16 @@ mod tests {
         assert!(d.iter().any(|x| x.kind == "unreachable" && x.target == "run_far"));
         // A revoked node will never supervise its runs again: they end.
         assert_eq!(l.run_status("run_revoked").unwrap().as_deref(), Some(LOST));
+        // Unless the box may still run there (#153): unreachable, still authorized until its
+        // authority ends, not lost; then it ends.
+        assert_eq!(l.run_status("run_fenced").unwrap().as_deref(), Some("running"));
+        assert!(
+            d.iter().any(|x| x.kind == "unreachable" && x.target == "run_fenced" && x.detail.contains("still authorized there until")),
+            "{d:?}"
+        );
         assert_eq!(audited(&l, "reconcile.run_adopted"), 1);
+        pass_at(&w, &mut l, &asked, false, NOW + 61).await;
+        assert_eq!(l.run_status("run_fenced").unwrap().as_deref(), Some(LOST));
     }
 
     #[tokio::test]
