@@ -344,11 +344,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
         _ => unreachable!("validated"),
     };
+    // An optional injection whose secret isn't set is as if it weren't there (#175): dropped from
+    // the zone every enforcement point sees (this run's proxies, the node's feed and routing), so
+    // its host's requests go without it, and the host is spliced if reach allows it wholesale.
+    let unset_injections = m.zone.drop_unset_optional_injections(|s| vault.get(s).is_ok());
+    for i in &unset_injections {
+        println!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
+    }
     for i in &m.zone.inject {
-        match vault.get(&i.secret) {
-            Ok(_) => {}
-            Err(_) if i.optional => println!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host),
-            Err(e) => return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host)),
+        if let Err(e) = vault.get(&i.secret) {
+            return Err(e).with_context(|| format!("inject secret {:?} for {}", i.secret, i.host));
         }
     }
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
@@ -484,6 +489,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 "session_id": long_lived.then(|| session.id.clone()), "resumed": session.resume,
             }),
         )?;
+        // One note per run for each optional injection left out (#175), not one per request.
+        for i in &unset_injections {
+            l.audit(
+                &m.tenant,
+                Some(&run),
+                "inject.skipped",
+                &serde_json::json!({ "host": i.host, "secret": i.secret, "why": "optional secret not set" }),
+            )?;
+        }
     }
 
     // Enforcement points, on unix sockets that only this box gets.
@@ -822,10 +836,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         (None, None, None) => 0,
     };
+    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
+    // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
+    for s in [&es, &ls, &gs] {
+        wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
+    }
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
     // forwards, the model, the MCP gateway): `ctl/`, not the box's `sock/`, which is the node's.
-    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
     let g_task = tokio::spawn({
         let gs = gs.clone();
         async move { gateway.serve(&gs).await }

@@ -21,7 +21,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use wicket_core::{canonical_path, manifest::host_matches, Op};
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
@@ -51,6 +50,8 @@ pub struct Egress {
     /// The run's model proxy, which vets and accounts model calls that reach the model host through
     /// here (a wrapped session's, #112).
     model_gate: std::sync::OnceLock<Arc<crate::llm::Llm>>,
+    /// Optional injections skipped for want of their secret, each noted once (#175).
+    skipped: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
@@ -187,6 +188,7 @@ impl Egress {
             h3_up: Default::default(),
             strikes: Default::default(),
             model_gate: Default::default(),
+            skipped: Default::default(),
         }))
     }
 
@@ -199,7 +201,7 @@ impl Egress {
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();
@@ -639,7 +641,30 @@ impl Egress {
 
     /// Whether the zone injects a credential into requests for `host`, or swaps one in.
     fn credentials_for(&self, host: &str) -> bool {
-        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host)) || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
+        self.ctx.zone.inject.iter().any(|r| host_matches(&r.host, host) && !self.unset_optional(r))
+            || self.ctx.swaps.iter().any(|s| host_matches(&s.host, host))
+    }
+
+    /// Whether `rule` is optional and its secret isn't in the vault: then it is skipped, as if the
+    /// zone didn't have it (#175). The run drops such rules from its zone at start; this covers a
+    /// secret removed while the run lasts. Noted in the audit log once per rule, not per request.
+    fn unset_optional(&self, rule: &wicket_core::manifest::InjectRule) -> bool {
+        if !rule.optional || self.ctx.vault.has(&rule.secret) {
+            return false;
+        }
+        let first = self.skipped.lock().expect("skipped").insert(format!("{}\n{}", rule.host, rule.secret));
+        if first {
+            tracing::info!(host = %rule.host, secret = %rule.secret, "optional secret not set: requests go without it");
+            if let Ok(l) = self.ctx.ledger.lock() {
+                let _ = l.audit_deferred(
+                    &self.ctx.tenant,
+                    Some(&self.ctx.run),
+                    "inject.skipped",
+                    &serde_json::json!({ "host": rule.host, "secret": rule.secret, "why": "optional secret not set" }),
+                );
+            }
+        }
+        true
     }
 
     pub(crate) async fn forward<B>(&self, req: Request<B>, host: &str, scheme: &str, pq: &str, via: Via) -> Result<Response<BoxBody>>
@@ -773,12 +798,16 @@ impl Egress {
                         );
                     }
                 }
-                // On a node, the secret is fetched from the control host on its first use (#152).
+                // On a node, the secret is fetched from the control host on its first use (#152). A
+                // required rule fails if it can't be had; an optional one falls through to the check below.
                 if let Err(e) = self.ctx.vault.ensure(&rule.secret).await {
-                    if rule.optional {
-                        break;
+                    if !rule.optional {
+                        return Err(e);
                     }
-                    return Err(e);
+                }
+                // An optional rule whose secret isn't set (after any fetch) is as if it weren't there (#175).
+                if self.unset_optional(rule) {
+                    continue;
                 }
                 // Whatever the zone says, a secret goes only to the hosts it is bound to in the vault.
                 self.ctx.vault.check(&rule.secret, host)?;
@@ -949,6 +978,38 @@ mod tests {
         let out = prepare(c, "api.github.com", Some("Bearer ph-123")).await.unwrap();
         assert_eq!(out.headers.get("authorization").unwrap(), "Bearer the-real-token");
         for t in ["evil", "evil-wild", "ok", "swap-evil", "swap-ok"] {
+            let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
+        }
+    }
+
+    /// #175: an optional injection whose secret isn't in the vault is as if it weren't there: the
+    /// request goes without the header (and without the box's own), not a 502, and the skip is noted
+    /// in the audit log once, not per request. A required one still fails.
+    #[tokio::test]
+    async fn an_optional_injection_with_no_secret_sends_the_request_without_it() {
+        let inject = |optional: bool| {
+            format!("reach: [{{host: api.github.com, methods: [GET]}}], inject: [{{host: api.github.com, header: Authorization, format: 'Bearer {{secret}}', secret: github-wicket, optional: {optional}}}]")
+        };
+        let (c, dir) = ctx(&inject(true), vec![], "optional-unset");
+        let ledger = c.ledger.clone();
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::new(c, ca).unwrap();
+        assert!(!e.credentials_for("api.github.com"), "no credential goes to the host");
+        for auth in [None, Some("Bearer the-box-own")] {
+            let mut b = http::Request::get("/x").header("host", "api.github.com");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            let req = b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            let out = e.prepare(req, "api.github.com", "https", "/x", true).await.expect("goes through");
+            assert!(out.headers.get("authorization").is_none(), "{:?}", out.headers);
+            assert!(out.injected.is_empty());
+        }
+        let notes = ledger.lock().unwrap().audit_tail(100).unwrap().into_iter().filter(|r| r.2 == "inject.skipped").count();
+        assert_eq!(notes, 1, "one note per run, not per request");
+        let (c, _) = ctx(&inject(false), vec![], "required-unset");
+        assert!(prepare(c, "api.github.com", None).await.is_err(), "a required injection with no secret still fails");
+        for t in ["optional-unset", "required-unset"] {
             let _ = std::fs::remove_dir_all(dir.with_file_name(format!("wicket-egress-{t}-{}", std::process::id())));
         }
     }

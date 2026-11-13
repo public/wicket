@@ -81,14 +81,15 @@ if [ "$mode" = dev ]; then
   export WICKET_HOME=$work/home HOME_FOR_WICKET=$work/userhome
   [ "$nodes" = vultr ] && HOME_FOR_WICKET=$HOME
   mkdir -p "$WICKET_HOME" "$HOME_FOR_WICKET"
-  export WICKET_BOX_PREFIX=acc
+  # Per run, so two acceptance runs on one machine never take each other's boxes for their own.
+  export WICKET_BOX_PREFIX=acc-$$
   HOMEW=$HOME_FOR_WICKET
   w() { HOME=$HOME_FOR_WICKET "$W" "$@"; }
   wt() { local t=$1; shift; HOME=$HOME_FOR_WICKET timeout "$t" "$W" "$@"; }
   wroot() { w "$@"; }
   data() { cat "$WICKET_HOME/$1"; }
   data_ls() { ls "$WICKET_HOME/$1" 2>/dev/null; }
-  box_filter=(--filter name=^acc-run-)
+  box_filter=(--filter "name=^$WICKET_BOX_PREFIX-run-")
 else
   W=$(command -v wicket) || { echo "--installed: no wicket on PATH" >&2; exit 2; }
   unset WICKET_HOME
