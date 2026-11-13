@@ -37,8 +37,9 @@ CHANGES = ROOT / "changes"
 CHANGELOG = ROOT / "CHANGELOG.md"
 TYPES = ["Security", "Added", "Changed", "Fixed", "Removed"]
 MARKED = {"Security", "Fixed", "Removed"}
-# What a PR may change without a fragment: documentation, CI, the fragments themselves, notes.
-EXEMPT = [r"^docs/", r"^changes/", r"^ci/", r"^\.github/", r"^experiments/", r"^refs/", r"^[^/]+\.md$", r"^LICENSE$"]
+# What a PR may change without a fragment: documentation, CI, the fragments themselves, notes, and
+# the repository's own top-level dotfiles (.gitignore, .gitleaks.toml).
+EXEMPT = [r"^docs/", r"^\.[^/]+$", r"^changes/", r"^ci/", r"^\.github/", r"^experiments/", r"^refs/", r"^[^/]+\.md$", r"^LICENSE$"]
 
 
 class Bad(Exception):
