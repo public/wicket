@@ -21,7 +21,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use wicket_core::{canonical_path, manifest::host_matches, Op};
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
@@ -199,7 +198,7 @@ impl Egress {
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket)?;
+        let listener = crate::sockpath::bind(socket)?;
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();

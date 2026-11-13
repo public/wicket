@@ -12,6 +12,7 @@ pub mod h3;
 pub mod link;
 pub mod llm;
 pub mod provider;
+pub mod sockpath;
 mod splice;
 pub mod vault;
 

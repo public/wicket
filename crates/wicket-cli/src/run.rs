@@ -787,10 +787,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         (None, None, None) => 0,
     };
+    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
+    // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
+    for s in [&es, &ls, &gs] {
+        wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
+    }
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
     // forwards, the model, the MCP gateway): `ctl/`, not the box's `sock/`, which is the node's.
-    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
     let g_task = tokio::spawn({
         let gs = gs.clone();
         async move { gateway.serve(&gs).await }

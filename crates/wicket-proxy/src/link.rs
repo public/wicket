@@ -485,7 +485,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::net::UnixStream;
     use wicket_core::{Manifest, RunId, TenantId};
     use wicket_identity::{AgentKey, Issuer};
     use wicket_store::{IdentityRow, Ledger};
@@ -516,7 +516,7 @@ mod tests {
         fn accept<'a>(&'a self, run: &'a str, sock: &'a str) -> Fut<'a, Result<tokio::sync::mpsc::UnboundedReceiver<Stream>, String>> {
             Box::pin(async move {
                 let path = self.root.join(run).join("sock").join(sock);
-                let l = UnixListener::bind(&path).map_err(|e| e.to_string())?;
+                let l = crate::sockpath::bind(&path).map_err(|e| e.to_string())?;
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let t = tokio::spawn(async move {
                     while let Ok((s, _)) = l.accept().await {
