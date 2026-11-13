@@ -1231,6 +1231,16 @@ fn dashboard(state: &State) -> Result<Value> {
             let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
             v["has_identity"] = l.identity(&id).ok().flatten().is_some().into();
             v["revoked"] = l.revoked(&id).ok().flatten().is_some().into();
+            // A remote session's address (#169), as its run recorded it.
+            if let Some(u) = l
+                .audit_latest(&id, "run.remote_session")
+                .ok()
+                .flatten()
+                .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+                .and_then(|b| b["url"].as_str().filter(|u| u.starts_with("https://")).map(String::from))
+            {
+                v["remote_url"] = u.into();
+            }
             v
         })
         .collect();

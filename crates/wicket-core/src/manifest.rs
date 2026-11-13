@@ -23,7 +23,9 @@ pub enum ManifestError {
 pub struct Manifest {
     #[serde(default)]
     pub tenant: TenantId,
-    /// Trusted task text: the only input policy derivation ever sees.
+    /// Trusted task text: the only input policy derivation ever sees. Optional only for a remote
+    /// session (`agent.remote`), whose messages come from the harness's own app.
+    #[serde(default)]
     pub task: String,
     /// Exactly one of `agent` or `program`.
     #[serde(default)]
@@ -103,6 +105,20 @@ pub struct AgentSpec {
     /// to keys that can't change what the agent can reach or run (ADAPTER_SETTINGS_ALLOWED).
     #[serde(default)]
     pub adapter_settings: serde_json::Map<String, serde_json::Value>,
+    /// A remote session (#169): the harness in the box registers its own session with its vendor's
+    /// apps, and the owner drives it from there (for `claude-code`, Remote Control). The account
+    /// login is the zone's `llm.secret`, which the box only ever holds as a placeholder. Harness
+    /// adapters that have no such feature refuse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteSpec>,
+}
+
+/// `agent.remote`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSpec {
+    /// The session's name in the vendor's apps.
+    pub name: String,
 }
 
 /// Adapter settings a manifest may set: presentation and commit metadata only. Hooks, permissions,
@@ -457,6 +473,25 @@ impl Manifest {
                     None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
                 }
                 a.idle()?;
+                match &a.remote {
+                    Some(r) => {
+                        let ok = !r.name.trim().is_empty()
+                            && r.name.len() <= 64
+                            && r.name.chars().all(|c| c.is_ascii_alphanumeric() || " -_.".contains(c));
+                        if !ok {
+                            return Err(ManifestError::Invalid("agent.remote.name: 1-64 letters, digits, spaces, '-', '_' or '.'".into()));
+                        }
+                        if a.hibernate_after.is_some() {
+                            return Err(ManifestError::Invalid(
+                                "agent.remote can't hibernate: its session lives in the vendor's apps, not in the box (#169)".into(),
+                            ));
+                        }
+                    }
+                    None if self.task.trim().is_empty() => {
+                        return Err(ManifestError::Invalid("task is empty (only an agent.remote session may leave it out)".into()))
+                    }
+                    None => {}
+                }
                 if let Some(h) = a.hibernate()? {
                     if h < a.idle()? {
                         return Err(ManifestError::Invalid("agent.hibernate_after must not be shorter than agent.idle_timeout".into()));
@@ -714,5 +749,20 @@ zone:
         assert!(!host_matches("*.githubusercontent.com", "githubusercontent.com"));
         assert!(!host_matches("*.githubusercontent.com", "evilgithubusercontent.com"));
         assert!(host_matches("api.github.com", "API.GitHub.com."));
+    }
+
+    #[test]
+    fn a_remote_session_needs_no_task_but_a_good_name_and_never_hibernates() {
+        let y = |agent: &str| Manifest::from_yaml(&format!("agent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
+        let m = y(", remote: { name: my box }").unwrap();
+        assert_eq!(m.agent.unwrap().remote.unwrap().name, "my box");
+        assert!(y("").unwrap_err().to_string().contains("task is empty"));
+        assert!(y(", remote: { name: '' }").is_err());
+        assert!(y(", remote: { name: 'a/b' }").is_err());
+        assert!(y(", remote: { name: x, mode: y }").is_err(), "unknown fields");
+        assert!(y(", remote: { name: x }, idle_timeout: 1m, hibernate_after: 1h").unwrap_err().to_string().contains("can't hibernate"));
+        // Other manifests serialize as before (their identity digests don't change).
+        let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));
     }
 }

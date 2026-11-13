@@ -210,6 +210,12 @@ function renderRun(s, x) {
   const d = el("div", "row");
   const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
   d.append(left);
+  // A remote session (#169): where the owner drives it, in the vendor's app.
+  if (x.remote_url && x.remote_url.startsWith("https://")) {
+    const a = el("a", "mono", "open session");
+    a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    left.append(document.createTextNode(" · "), a);
+  }
   if (x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
     const say = el("button", "", "Follow-up…");
