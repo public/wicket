@@ -105,7 +105,7 @@ def save(status):
 
 
 def turn(sid, text):
-    seen["prompts"].append(text[:40])
+    seen["prompts"].append(text[-40:])
     update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it"}})
     update(sid, {"sessionUpdate": "plan", "entries": [{"content": "misbehave", "priority": "high", "status": "in_progress"}]})
     # Client capabilities wicket didn't offer.
