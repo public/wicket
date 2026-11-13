@@ -110,6 +110,11 @@ fn classify(method: &str, host: &str, path: &str, query: &str) -> (RiskClass, Ve
     let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
     let has = |names: &[&str]| segs.iter().any(|s| names.contains(s));
     if host == "github.com" {
+        // A fetch (`git-upload-pack`, with or without `.git`, any case) only reads: it uses POST
+        // just to carry the negotiation (#179). Pushes are raised below.
+        if method == "POST" && lower.ends_with("/git-upload-pack") {
+            risk = RiskClass::R1ReadScoped;
+        }
         // Ref discovery is a read only for exactly the upload-pack (fetch) service: any other query
         // (receive-pack, or an escaped or repeated spelling of it) is treated as a push.
         let discovery = lower.ends_with("/info/refs") && !(query.is_empty() || query == "service=git-upload-pack");
@@ -456,6 +461,8 @@ zone:
     fn reads_in_reach_are_allowed() {
         assert_eq!(evaluate(&zone(), &op("GET", "api.github.com", "/repos/octocat/hello/readme")), Verdict::AllowByReach(0));
         assert_eq!(evaluate(&zone(), &op("POST", "github.com", "/octocat/hello.git/git-upload-pack")), Verdict::AllowByReach(2));
+        // #179: a fetch is rated a read, so a zone allows it by reach like any other read.
+        assert_eq!(op("POST", "github.com", "/octocat/hello.git/git-upload-pack").risk, RiskClass::R1ReadScoped);
     }
 
     #[test]
@@ -708,7 +715,16 @@ zone:
                 .chain(z.forbid.iter().flat_map(|f| f.paths.iter()))
                 .flat_map(|g| paths_for(g))
                 .collect();
-            paths.extend(["/", "/x", "/octocat/Hello-World.git/git-receive-pack"].map(String::from));
+            paths.extend(
+                [
+                    "/",
+                    "/x",
+                    "/octocat/Hello-World.git/git-receive-pack",
+                    "/octocat/Hello-World.git/git-upload-pack",
+                    "/octocat/Hello-World/git-upload-pack",
+                ]
+                .map(String::from),
+            );
             // Case-flipped spellings (#115: forbids ignore case, reach doesn't).
             let flipped: Vec<String> = paths.iter().map(|p| p.to_ascii_uppercase()).collect();
             paths.extend(flipped);
@@ -766,6 +782,18 @@ zone:
         assert_eq!(risk("POST", "api.github.com", "/repos/acme/app/pulls/7/Reviews"), R3ExternalOrIrreversible);
         // git over HTTPS: push in any case, and ref discovery for anything but a plain fetch.
         assert_eq!(risk("POST", "github.com", "/acme/app.git/GIT-RECEIVE-PACK"), R4ExecOrPrivilege);
+        // #179: a fetch is a read, with or without `.git`, in any case; a push stays a write.
+        for p in
+            ["/acme/app.git/git-upload-pack", "/acme/app/git-upload-pack", "/ACME/App.Git/GIT-Upload-Pack", "/acme/app/GIT-UPLOAD-PACK"]
+        {
+            assert_eq!(risk("POST", "github.com", p), R1ReadScoped, "{p}");
+        }
+        for p in ["/acme/app.git/git-receive-pack", "/acme/app/git-receive-pack", "/ACME/App.Git/Git-Receive-Pack"] {
+            assert_eq!(risk("POST", "github.com", p), R4ExecOrPrivilege, "{p}");
+        }
+        // Only github.com's smart-HTTP fetch is lowered; elsewhere a POST stays a write.
+        assert_eq!(risk("POST", "example.com", "/acme/app.git/git-upload-pack"), R2WriteReversible);
+        assert_eq!(risk("POST", "github.com", "/acme/app.git/git-upload-pack-x"), R2WriteReversible);
         let disc = |q: &str| {
             Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", "GET", "github.com", "/a/b.git/info/refs", q).risk
         };
