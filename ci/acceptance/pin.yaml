@@ -6,7 +6,7 @@ task: Run the command you are given and stop.
 agent:
   name: pinner
   max_turns: 4
-  max_children: 2
+  max_children: 4
 zone:
   name: acc-pin
   isolation: gvisor

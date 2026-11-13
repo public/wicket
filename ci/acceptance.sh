@@ -304,7 +304,7 @@ check "  and its identity is revoked" 'w identity show "$lead" 2>&1 | grep -qi r
 log "images pinned by digest: the run's digest, a spawn decided by digest on its node, a retag changes nothing"
 pin_name=acc-pin-$$
 $DOCKER tag "$IMAGE_TAG" "$pin_name:a"
-printf 'FROM %s\nLABEL wicket.acc.retag=%s\n' "$IMAGE_TAG" "$$" | $DOCKER build -q -t "$pin_name:b" - >/dev/null
+printf 'FROM %s\nLABEL wicket.acc.retag=%s\n' "$IMAGE_TAG" "$$" | $DOCKER build -q -t "$pin_name:b" - >/dev/null 2>&1
 pin_images+=("$pin_name:a" "$pin_name:b")
 pin_a=$($DOCKER image inspect "$pin_name:a" --format '{{.Id}}')
 pin_b=$($DOCKER image inspect "$pin_name:b" --format '{{.Id}}')
