@@ -40,6 +40,9 @@ LICENSE                            | -   | docs
 ci/check-public.py                 | -   | docs
 ci/check-doc-links.sh              | -   | docs
 ci/gen-cli-reference.sh            | -   | cli-ref
+changes/**                         | -   | docs
+ci/changelog.py                    | -   | docs
+ci/changelog_test.py               | -   | docs
 
 # ---- inputs the crates read from outside their directories (the self-test checks this list) ----
 examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
