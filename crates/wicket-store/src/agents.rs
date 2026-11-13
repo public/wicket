@@ -189,6 +189,16 @@ impl Ledger {
         Ok(n == 1)
     }
 
+    /// Records the session the agent's harness chose (an ACP agent names its own session, #66), so a
+    /// wake continues it, if `generation` is still current.
+    pub fn set_agent_session(&self, id: &str, generation: i64, session_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agents SET session_id = ?3, updated_at = ?4 WHERE id = ?1 AND generation = ?2",
+            params![id, generation, session_id, now()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Records the agent's spend so far (totals over its life, never lower than what is recorded),
     /// if `generation` is still current.
     pub fn record_agent_usage(&self, id: &str, generation: i64, u: &AgentUsage) -> Result<bool> {
@@ -348,6 +358,9 @@ mod tests {
         assert_eq!(l.agent_of_run("run_2").unwrap(), Some((id.clone(), 2)));
         // Generation 1 is stale now: its state changes and pushes are refused.
         assert!(!l.set_agent_state(&id, 1, "idle", None).unwrap());
+        assert!(!l.set_agent_session(&id, 1, "acp-old").unwrap());
+        assert!(l.set_agent_session(&id, 2, "acp-new").unwrap());
+        assert_eq!(l.agent(&id).unwrap().unwrap().session_id, "acp-new");
         assert!(!l.commit_agent_push(&id, 1, 1, 2, "a/x/m/2.1", 10).unwrap());
         assert!(l.set_agent_state(&id, 2, "active", None).unwrap());
         // A push that started from an older head is refused too.

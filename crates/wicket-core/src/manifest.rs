@@ -70,7 +70,8 @@ pub enum OnPending {
 #[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub name: String,
-    /// Only `claude-code` in the PoC.
+    /// `claude-code` (default: Claude Code's stream-json, spoken by wicket) or `acp` (any agent that
+    /// speaks the Agent Client Protocol, started from `acp.command`, #66).
     #[serde(default = "default_agent_kind")]
     pub kind: String,
     /// Model id passed to the agent; None = the agent's default.
@@ -115,7 +116,26 @@ pub struct AgentSpec {
     /// adapters that have no such feature refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSpec>,
+    /// For `kind: acp`: how to start the agent in its box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpSpec>,
 }
+
+/// `agent.acp` (#66): an Agent Client Protocol agent in the box, driven by wicket over its stdio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpSpec {
+    /// The agent's command inside the box. The image must already have it, at a pinned version:
+    /// nothing is installed at start.
+    pub command: Vec<String>,
+    /// A wicket profile for a known adapter: what wicket itself sets for it (environment, `_meta`).
+    /// `claude-agent-acp`: Claude Code through its ACP adapter. None: a generic ACP agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// The adapter profiles wicket knows (`agent.acp.profile`).
+pub const ACP_PROFILES: [&str; 1] = ["claude-agent-acp"];
 
 /// `agent.remote`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -499,13 +519,53 @@ impl Manifest {
         self.zone.limits.authority()?;
         match (&self.agent, &self.program) {
             (Some(a), None) => {
-                if a.kind != "claude-code" {
-                    return Err(ManifestError::Invalid(format!("agent kind {:?} not supported in the PoC", a.kind)));
+                match (a.kind.as_str(), &a.acp) {
+                    ("claude-code", None) => {}
+                    ("claude-code", Some(_)) => return Err(ManifestError::Invalid("agent.acp is for kind: acp".into())),
+                    ("acp", None) => return Err(ManifestError::Invalid("kind: acp needs agent.acp.command".into())),
+                    ("acp", Some(acp)) => {
+                        if acp.command.is_empty() || acp.command.iter().any(|c| c.is_empty() || c.contains('\0')) {
+                            return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
+                        }
+                        let claude = match acp.profile.as_deref() {
+                            None => false,
+                            Some(p) if ACP_PROFILES.contains(&p) => true,
+                            Some(p) => {
+                                return Err(ManifestError::Invalid(format!("agent.acp.profile {p:?}: known profiles are {ACP_PROFILES:?}")))
+                            }
+                        };
+                        if a.remote.is_some() {
+                            return Err(ManifestError::Invalid("agent.remote: an ACP agent has no remote session of its own".into()));
+                        }
+                        if a.max_turns.is_some() {
+                            return Err(ManifestError::Invalid(
+                                "agent.max_turns isn't part of ACP; set it in the agent's own configuration".into(),
+                            ));
+                        }
+                        if !claude && (a.model.is_some() || !a.adapter_settings.is_empty()) {
+                            return Err(ManifestError::Invalid(
+                                "agent.model and agent.adapter_settings need an ACP profile wicket knows; set them in the agent's own configuration".into(),
+                            ));
+                        }
+                    }
+                    (k, _) => return Err(ManifestError::Invalid(format!("agent kind {k:?}: claude-code or acp"))),
                 }
+                // The zone's model route is a Claude subscription, which backs Claude Code only (its
+                // own CLI, or through its ACP adapter). A generic ACP agent gets no model route until
+                // routes per provider exist (#174).
+                let claude = a.kind == "claude-code" || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp");
                 match &self.zone.llm {
+                    Some(_) if !claude => {
+                        return Err(ManifestError::Invalid(
+                            "zone.llm: a generic ACP agent gets no model route yet. The zone's llm is a Claude subscription, which only Claude Code may use; \
+                             leave llm out (routes per provider are #174)"
+                                .into(),
+                        ))
+                    }
                     Some(l) if l.provider == "anthropic" => {}
                     Some(_) => return Err(ManifestError::Invalid("only the anthropic LLM provider is supported in the PoC".into())),
-                    None => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
+                    None if claude => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
+                    None => {}
                 }
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));

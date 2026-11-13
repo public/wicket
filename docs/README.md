@@ -28,6 +28,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Hibernate and wake an agent](how-to/hibernate-and-wake-an-agent.md)
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
+- [Run an ACP agent](how-to/run-an-acp-agent.md)
 - [Use HTTP/3](how-to/use-http3.md)
 - [Export audit](how-to/export-audit.md)
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)

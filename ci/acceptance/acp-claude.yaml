@@ -1,0 +1,14 @@
+# Acceptance (ci/acceptance.sh): Claude Code through its ACP adapter on the zone's Claude subscription
+# (#66). Refused at run start: the installation hasn't allowed it (acp.allow_subscription_backed_claude_adapter).
+task: Never runs.
+agent:
+  name: claude-acp
+  kind: acp
+  acp: { command: [claude-agent-acp], profile: claude-agent-acp }
+zone:
+  name: acc-acp-claude
+  isolation: gvisor
+  llm:
+    secret: mock
+    upstream: http://127.0.0.1:MOCK_PORT
+  limits: { memory: 512m, cpus: 1, timeout: 1m }

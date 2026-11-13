@@ -190,13 +190,16 @@ fn token_decisions_match_compiled_zones_fresh_and_offline() {
         assert!(counts.get(&k).copied().unwrap_or(0) > 500, "too few {k:?}: {counts:?}");
     }
     // A box's token decides only for its own zone and run.
-    let (run, z) = &boxes[0];
-    let read = z.reach.iter().find(|r| r.methods.iter().any(|m| m == "GET")).expect("a readable rule");
+    // (The first zone with a readable rule: not every example zone has reach.)
+    let readable = |z: &ZoneSpec| z.reach.iter().find(|r| r.methods.iter().any(|m| m == "GET")).cloned();
+    let (run, z) = boxes.iter().find(|(_, z)| readable(z).is_some()).expect("a zone with a readable rule");
+    let read = readable(z).expect("a readable rule");
+    let other = boxes.iter().find(|(r, _)| r != run).expect("another box");
     let path = common::paths_for(&read.paths[0])[0].clone();
     let host = read.host.replace("*.", "a.");
     assert_eq!(kind(&tr.decide(&op(&z.name, run, "GET", &host, &path), T0)), "allow");
     assert!(
-        matches!(tr.decide(&op(&boxes[1].1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone"))
+        matches!(tr.decide(&op(&other.1.name, run, "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("holds authority for zone"))
     );
     assert!(
         matches!(tr.decide(&op(&z.name, "run-unknown", "GET", &host, &path), T0), Decision::Forbidden(w) if w.contains("no authority"))

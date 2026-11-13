@@ -2,6 +2,7 @@
 //! output. Everything configured here is advisory: the box boundary and the proxies enforce.
 //! The launch carries placeholders and routes only, never a credential.
 
+pub mod acp;
 pub mod attribution;
 
 use serde_json::Value;
@@ -28,6 +29,8 @@ pub struct LaunchPlan {
     /// The first message to write to the agent's stdin (stream-json input), if it takes its task
     /// that way. Follow-ups from the operator are written the same way while the session is open.
     pub stdin_task: Option<String>,
+    /// An ACP agent (#66): wicket speaks the protocol on its stdio, starting with this.
+    pub acp: Option<acp::AcpConfig>,
 }
 
 /// The run's CA bundle (system roots plus the run CA) inside the box, built by wicket-entry. Tools that
@@ -78,7 +81,7 @@ pub fn program_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     let p = m.program.as_ref()?;
     let mut argv = vec!["wicket-entry".to_string()];
     argv.extend(p.command.iter().cloned());
-    Some(LaunchPlan { env: common_env(m, run), argv, stdin_task: None })
+    Some(LaunchPlan { env: common_env(m, run), argv, stdin_task: None, acp: None })
 }
 
 /// A Claude Code command line that another program launched (e.g. Remote Control's session process,
@@ -188,7 +191,13 @@ pub fn claude_code_wrapped_plan(
     env.push(("WICKET_RUN".into(), run.0.clone()));
     env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
     env.extend(m.agent.as_ref().map(|a| a.env.clone()).unwrap_or_default());
-    Ok(WrappedPlan { plan: LaunchPlan { env, argv: out, stdin_task: None }, files, session_token, session_placeholder, login_placeholder })
+    Ok(WrappedPlan {
+        plan: LaunchPlan { env, argv: out, stdin_task: None, acp: None },
+        files,
+        session_token,
+        session_placeholder,
+        login_placeholder,
+    })
 }
 
 /// The box's `.credentials.json`: the account login as placeholders (`login_placeholder`, which
@@ -347,7 +356,7 @@ pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &V
     env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
     env.extend(agent.env.clone());
     Ok(WrappedPlan {
-        plan: LaunchPlan { env, argv, stdin_task: None },
+        plan: LaunchPlan { env, argv, stdin_task: None, acp: None },
         files,
         session_token: None,
         session_placeholder: String::new(),
@@ -415,9 +424,10 @@ impl Default for AgentSession {
     }
 }
 
-pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> LaunchPlan {
+/// Claude Code's environment in a box: routes and placeholders only, whichever way it is driven.
+fn claude_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
     let agent = m.agent.as_ref().expect("an agent manifest");
-    let env = vec![
+    vec![
         ("ANTHROPIC_BASE_URL", LLM_URL.to_string()),
         // A placeholder shaped like a subscription token: the LLM proxy strips it and injects the real
         // one. The box never holds a usable credential, and no API key is ever involved.
@@ -444,7 +454,57 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
     .map(|(k, v)| (k.to_string(), v))
     // The manifest's own non-secret variables (validated: none of wicket's reserved names).
     .chain(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())))
-    .collect();
+    .collect()
+}
+
+/// Whether wicket writes Claude Code's settings.json for this agent (allowlisted adapter settings
+/// plus the keys wicket owns): Claude Code, driven directly or through its ACP adapter.
+pub fn uses_claude_settings(m: &Manifest) -> bool {
+    m.agent
+        .as_ref()
+        .is_some_and(|a| a.kind == "claude-code" || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp"))
+}
+
+/// An ACP agent (#66): its command in the box, and how wicket opens its session. The task becomes
+/// the first prompt once the session is open. A generic agent gets the shared routes only; a known
+/// profile also gets what wicket sets for that adapter, and its `_meta` is wicket's, never the
+/// manifest's.
+pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
+    let agent = m.agent.as_ref().filter(|a| a.kind == "acp")?;
+    let spec = agent.acp.as_ref()?;
+    let claude = spec.profile.as_deref() == Some("claude-agent-acp");
+    let env = if claude {
+        claude_env(m, run)
+    } else {
+        common_env(m, run).into_iter().chain(agent.env.iter().map(|(k, v)| (k.clone(), v.clone()))).collect()
+    };
+    let meta = claude.then(|| {
+        let mut disallowed = vec!["WebSearch"];
+        if !agent.in_box_subagents {
+            disallowed.extend(["Agent", "Task"]);
+        }
+        let mut options = serde_json::json!({
+            // wicket's gateway is the only MCP server; repo- or account-supplied servers are ignored.
+            "strictMcpConfig": true,
+            // Not "local": .claude/settings.local.json is where the adapter keeps "always" decisions,
+            // which wicket never makes and doesn't let an earlier session's file make either.
+            "settingSources": ["user", "project"],
+            "disallowedTools": disallowed,
+        });
+        if let Some(model) = &agent.model {
+            options["model"] = Value::from(model.clone());
+        }
+        serde_json::json!({ "claudeCode": { "options": options } })
+    });
+    let mut argv = vec!["wicket-entry".to_string()];
+    argv.extend(spec.command.iter().cloned());
+    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{SANDBOX_NOTICE}\n{BATCH_NOTICE}"), meta, resume: None };
+    Some(LaunchPlan { env, argv, stdin_task: None, acp: Some(cfg) })
+}
+
+pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> LaunchPlan {
+    let agent = m.agent.as_ref().expect("an agent manifest");
+    let env = claude_env(m, run);
 
     let mut argv = vec![
         "wicket-entry".to_string(),
@@ -481,7 +541,7 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
     }
     argv.push(if session.resume { "--resume" } else { "--session-id" }.into());
     argv.push(session.id.clone());
-    LaunchPlan { env, argv, stdin_task: Some(user_message(&m.task)) }
+    LaunchPlan { env, argv, stdin_task: Some(user_message(&m.task)), acp: None }
 }
 
 /// A one-line, human-readable rendering of a stream-json event, or None to skip it.
@@ -553,6 +613,55 @@ pub fn clip(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn an_acp_agent_gets_routes_its_command_and_only_wicket_s_meta() {
+        let y = |extra: &str, llm: &str| {
+            format!("task: hi\nagent: {{name: a, kind: acp, acp: {{command: [my-agent, --acp]{extra}}}, env: {{FOO: bar}}}}\nzone: {{name: z{llm}}}")
+        };
+        let m = Manifest::from_yaml(&y("", "")).unwrap();
+        let p = acp_plan(&m, &RunId("run_x".into())).unwrap();
+        assert_eq!(p.argv, ["wicket-entry", "my-agent", "--acp"]);
+        assert!(p.stdin_task.is_none());
+        let env: HashMap<_, _> = p.env.iter().cloned().collect();
+        assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some(PROXY_URL));
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"), "a generic agent gets no Claude placeholder");
+        let cfg = p.acp.unwrap();
+        assert_eq!((cfg.cwd.as_str(), cfg.meta.is_none()), (WORKSPACE, true));
+        assert!(cfg.system_prompt.starts_with(SANDBOX_NOTICE));
+        assert!(!uses_claude_settings(&m));
+        // The Claude adapter: Claude Code's placeholders, and wicket's lockdown in _meta.
+        let m = Manifest::from_yaml(&y(", profile: claude-agent-acp", ", llm: {}")).unwrap();
+        let p = acp_plan(&m, &RunId("run_x".into())).unwrap();
+        assert!(p.env.iter().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.contains("placeholder")));
+        let o = &p.acp.unwrap().meta.unwrap()["claudeCode"]["options"];
+        assert_eq!(o["strictMcpConfig"], true);
+        assert_eq!(o["settingSources"], serde_json::json!(["user", "project"]));
+        assert!(uses_claude_settings(&m));
+        // Not an ACP agent: no plan.
+        let m = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        assert!(acp_plan(&m, &RunId("run_x".into())).is_none());
+    }
+
+    #[test]
+    fn acp_manifests_are_checked() {
+        let bad = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z}}")).unwrap_err().to_string();
+        assert!(bad("{name: a, kind: acp}").contains("acp.command"));
+        assert!(bad("{name: a, kind: acp, acp: {command: []}}").contains("acp.command"));
+        assert!(bad("{name: a, acp: {command: [x]}}").contains("kind: acp"));
+        assert!(bad("{name: a, kind: acp, acp: {command: [x], profile: nope}}").contains("profile"));
+        assert!(bad("{name: a, kind: acp, acp: {command: [x]}, model: m}").contains("profile"));
+        assert!(bad("{name: a, kind: acp, acp: {command: [x]}, max_turns: 3}").contains("max_turns"));
+        assert!(bad("{name: a, kind: acp, acp: {command: [x], _meta: {}}}").contains("unknown field"));
+        assert!(bad("{name: a, kind: gemini}").contains("claude-code or acp"));
+        // The zone's model route is a Claude subscription: Claude Code only (#174 adds other routes).
+        let with_llm = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z, llm: {{}}}}"));
+        assert!(with_llm("{name: a, kind: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("only Claude Code"));
+        assert!(with_llm("{name: a, kind: acp, acp: {command: [x], profile: claude-agent-acp}}").is_ok());
+        assert!(bad("{name: a, kind: acp, acp: {command: [x], profile: claude-agent-acp}}").contains("llm section"));
+        assert!(Manifest::from_yaml("task: hi\nagent: {name: a, kind: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
+    }
 
     #[test]
     fn a_wrapped_session_gets_placeholders_and_keeps_its_own_settings() {
