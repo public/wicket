@@ -15,6 +15,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long `await_grant` waits for a fresh grant to be handed to the box's node (#231): several of
+/// the run's 250 ms ticks, which a grant the control host keeps deciding also waits, once.
+const HAND_OFF: Duration = Duration::from_millis(1500);
+
 pub struct Gateway {
     ctx: RunCtx,
 }
@@ -156,13 +160,19 @@ impl Gateway {
                 return (format!("request {id} does not belong to this run"), true);
             }
             match req.status.as_str() {
-                // Its grant was handed to the box's node: answer once the node has it (at most 15 s),
-                // or the box's retry would find no grant there and ask again.
+                // The box's retry must find the grant where it is decided, or it asks again. A grant
+                // handed to the box's node: answer once the node has it (at most 15 s). One not yet
+                // handed: the run's process hands it over on its next tick (every 250 ms), or keeps
+                // deciding it here; wait a few ticks for that before answering.
                 "granted"
-                    if self.ctx.ledger.lock().expect("ledger").grant_in_flight(id).unwrap_or(false)
-                        && granted_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(15) =>
+                    if {
+                        let since = granted_at.get_or_insert_with(Instant::now).elapsed();
+                        let l = self.ctx.ledger.lock().expect("ledger");
+                        (since < Duration::from_secs(15) && l.grant_in_flight(id).unwrap_or(false))
+                            || (since < HAND_OFF && l.grant_unhanded(id).unwrap_or(false))
+                    } =>
                 {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 "granted" => {
@@ -1015,6 +1025,49 @@ mod tests {
         assert!(capacity_ask(&json!({ "duration_minutes": 0, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(capacity_ask(&json!({ "duration_minutes": 100000, "max_hourly_usd": "0.01", "reason": "x" })).is_err());
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "request_capacity"));
+    }
+
+    /// #231: `await_grant` answers "granted" only once the box's node has the grant: not between the
+    /// approval and the run's process handing it over, nor before the node has it; a grant that is
+    /// never handed over (the control host keeps deciding it) waits only a few ticks.
+    #[tokio::test]
+    async fn await_grant_answers_once_the_node_has_the_grant() {
+        use wicket_core::Op;
+        use wicket_store::Approval;
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "lead", "run_g", None, &[]) };
+        let approve = |path: &str| {
+            let mut l = w.ledger.lock().unwrap();
+            let op = Op::egress(&TenantId("t0".into()), &RunId("run_g".into()), "z", "GET", "example.com", path);
+            let (rid, _) = l.pending_for(&op, "out of reach", None).unwrap();
+            let gid = l
+                .approve(&rid, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "t".into() })
+                .unwrap();
+            (rid, gid)
+        };
+        // Handed over after 400 ms, and the node has it 400 ms later.
+        let (rid, gid) = approve("/a");
+        let ledger = w.ledger.clone();
+        let handing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(ledger.lock().unwrap().hand_grant_to_node(&gid, "n1").unwrap());
+            std::thread::sleep(Duration::from_millis(400));
+            let l = ledger.lock().unwrap();
+            l.grants_published(std::slice::from_ref(&gid), 3).unwrap();
+            l.node_feed_at("n1", 3).unwrap();
+        });
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": rid })).await;
+        let took = t.elapsed();
+        handing.join().unwrap();
+        assert!(!err && text.starts_with("granted"), "{text}");
+        assert!(took >= Duration::from_millis(800), "answered after {took:?}, before the node had the grant");
+        // Never handed over: answered after the hand-off wait, not the delivery one.
+        let (rid, _) = approve("/b");
+        let t = Instant::now();
+        let (text, err) = gw.await_grant(&json!({ "request_id": rid })).await;
+        assert!(!err && text.starts_with("granted"), "{text}");
+        assert!((HAND_OFF..Duration::from_secs(5)).contains(&t.elapsed()), "{:?}", t.elapsed());
     }
 
     /// #162: an agent can ask for an update to its own build, and that is all: an R4 request a human

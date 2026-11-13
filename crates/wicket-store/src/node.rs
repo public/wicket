@@ -147,6 +147,18 @@ impl Ledger {
             .is_some())
     }
 
+    /// Whether request `id` has a live grant not handed to any node: one the run's process hands to
+    /// its node on its next tick, or keeps deciding on the control host (#231).
+    pub fn grant_unhanded(&self, request_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM grants WHERE request_id = ?1 AND node IS NULL AND revoked = 0 LIMIT 1", params![request_id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some())
+    }
+
     /// Revokes a grant. Grants handed to a node are revoked there through the feed by whoever
     /// publishes it (the run's control-host process).
     pub fn revoke_grant(&self, id: &str) -> Result<()> {
@@ -338,7 +350,9 @@ mod tests {
         assert_eq!((g[0].id.as_str(), g[0].uses_left, g[0].node.as_deref()), (gid.as_str(), Some(2), None));
         assert!(l.grants_for_run("run_b").unwrap().is_empty());
         assert!(!l.grant_in_flight(&rid).unwrap(), "not handed: the ledger decides it");
+        assert!(l.grant_unhanded(&rid).unwrap());
         assert!(l.hand_grant_to_node(&gid, "n1").unwrap());
+        assert!(!l.grant_unhanded(&rid).unwrap());
         assert!(!l.hand_grant_to_node(&gid, "n2").unwrap(), "handed once");
         // In flight until the node reports the epoch that carries it.
         assert!(l.grant_in_flight(&rid).unwrap(), "handed, not yet published");

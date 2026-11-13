@@ -81,6 +81,15 @@ crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
 crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
 crates/wicket-placement/**         | -   | acceptance-nodes
+# The CLI's command groups (#223 split them out of main.rs): each changes its commands' --help (the
+# CLI reference) and is called by the suites listed. Not listed, so every suite: cmd/mod.rs, and the
+# groups nearly every suite calls (run, dev mock-llm, secret, identity, audit, image).
+crates/wicket-cli/src/cmd/approve.rs | - | cli-ref acceptance install-test node-e2e update daemon-uids
+crates/wicket-cli/src/cmd/itself.rs  | - | cli-ref update
+crates/wicket-cli/src/cmd/node.rs    | - | cli-ref hibernate restore acceptance acceptance-nodes node-e2e update
+crates/wicket-cli/src/cmd/operator.rs | - | cli-ref install-test daemon-uids acceptance
+crates/wicket-cli/src/cmd/policy.rs  | - | cli-ref restore acceptance policy
+crates/wicket-cli/src/cmd/zone.rs    | - | cli-ref acceptance
 # Not listed on purpose, so they select every suite: the node protocol (chan.rs), the ledger's
 # schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
 
