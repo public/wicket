@@ -196,6 +196,17 @@ pub struct ZoneSpec {
     pub limits: Limits,
 }
 
+impl ZoneSpec {
+    /// Drops the optional injections whose secret `is_set` says isn't set, and returns them (#175).
+    /// Such a rule behaves as if it weren't there: requests to its host go without the credential,
+    /// and a host with no injection left is spliced when its reach rule allows it wholesale.
+    pub fn drop_unset_optional_injections(&mut self, is_set: impl Fn(&str) -> bool) -> Vec<InjectRule> {
+        let (dropped, kept) = std::mem::take(&mut self.inject).into_iter().partition(|i| i.optional && !is_set(&i.secret));
+        self.inject = kept;
+        dropped
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UnlistedHosts {

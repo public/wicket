@@ -44,8 +44,9 @@ These are general features for any workload:
 - **Long-lived agents hibernate and wake** (see below).
 - **`agent.env`** sets non-secret variables (wicket's own are refused). **`agent.adapter_settings`** passes
   allowlisted settings to the agent's adapter, e.g. turning off commit attribution.
-- **`inject` rules can be `optional`,** and `{basic:USER}` renders an HTTP Basic credential (e.g. git over
-  HTTPS with a token).
+- **`inject` rules can be `optional`:** while the secret isn't in the vault, the rule is as if it weren't
+  there (requests go without the header, noted once per run in the audit log, and a host allowed
+  wholesale is spliced). `{basic:USER}` renders an HTTP Basic credential (e.g. git over HTTPS with a token).
 
 `examples/self-hosting/` uses all of these to run an agent on wicket's own source; see its README.
 
