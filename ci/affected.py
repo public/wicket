@@ -209,6 +209,8 @@ def self_test():
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
     case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, ALL)
+    case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"cli-ref", "update"})
+    case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, ALL)
     case("the lockfile", ["Cargo.lock"], ALL, ALL)
     case("the toolchain", ["rust-toolchain.toml"], ALL, ALL)
     case("a crate manifest", ["crates/wicket-fwd/Cargo.toml"], ALL, ALL)
