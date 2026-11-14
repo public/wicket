@@ -1022,27 +1022,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
     // forwards, the model, the MCP gateway): `ctl/`, not the box's `sock/`, which is the node's.
-    let g_task = tokio::spawn({
-        let gs = gs.clone();
-        async move { gateway.serve(&gs).await }
-    });
-    let e_task = tokio::spawn({
-        let es = es.clone();
-        async move { egress.serve(&es).await }
-    });
-    let l_task = tokio::spawn({
-        let llm = llm.clone();
-        let ls = ls.clone();
-        async move { llm.serve(&ls).await }
-    });
+    // Each is bound and listening before it is served, so it is ready here, with no wait for its
+    // socket to appear (#287), and one that can't be bound fails the run, naming it.
     let waited = std::time::Instant::now();
-    for _ in 0..50 {
-        if es.exists() && ls.exists() && gs.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
+    let (gl, el, ll) = (listen(&gs)?, listen(&es)?, listen(&ls)?);
     timings.since("proxies.sockets", waited);
+    let g_task = tokio::spawn(gateway.serve_on(gl));
+    let e_task = tokio::spawn(egress.serve_on(el));
+    let l_task = tokio::spawn(llm.clone().serve_on(ll));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 

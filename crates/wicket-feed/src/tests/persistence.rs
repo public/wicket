@@ -221,3 +221,40 @@ fn a_crash_while_installing_a_snapshot_loads_closed_not_corrupt() {
     feed(&mut r, frames, T0 + 20);
     assert_eq!((r.state().unwrap().epoch, r.mode(T0 + 20)), (3, Mode::Fresh));
 }
+
+/// #287: reopening the log compiles only the entries still held at its end, not every one ever put
+/// (each run puts its entry and drops it at exit), and reaches the same state as applying it all.
+#[test]
+fn reopening_compiles_only_the_entries_still_held() {
+    use crate::state::COMPILES;
+    let mut cp = Cp::new();
+    for i in 0..20 {
+        let z = format!("run-{i}");
+        cp.p.commit(vec![Change::PutZone { zone: zone(&z) }, add(grant(&format!("g-{i}"), &granted(), T0 + 3_600_000))], T0 + i).unwrap();
+        if i % 5 != 4 {
+            cp.p.commit(vec![Change::DropZone { name: z }], T0 + i).unwrap();
+        }
+    }
+    // Replaced, then dropped, in the same delta; and replaced and kept.
+    cp.p.commit(vec![Change::PutZone { zone: zone("x") }, Change::DropZone { name: "x".into() }], T0 + 30).unwrap();
+    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0 + 31).unwrap();
+    cp.p.commit(vec![Change::PutZone { zone: zone("z") }, Change::PutZone { zone: zone("z") }], T0 + 32).unwrap();
+    let before: Vec<String> = cp.p.state().zones.keys().cloned().collect();
+    let (head, grants) = (cp.p.state().head.clone(), cp.p.state().grants.len());
+    assert_eq!(before, ["run-14", "run-19", "run-4", "run-9", "z"]);
+
+    COMPILES.with(|c| c.set(0));
+    cp.restart(cfg());
+    assert_eq!(COMPILES.with(|c| c.get()), 5, "one per entry held at the end");
+    let st = cp.p.state();
+    assert_eq!(st.zones.keys().cloned().collect::<Vec<_>>(), before);
+    assert!(st.zones.values().all(|z| z.compiled.is_ok()), "every entry held is compiled");
+    assert_eq!((st.head.clone(), st.grants.len()), (head.clone(), grants));
+
+    COMPILES.with(|c| c.set(0));
+    let viewed = read_state::<ZoneSpec>(cp.dir.path(), NODE, ()).unwrap();
+    assert_eq!(COMPILES.with(|c| c.get()), 5);
+    assert_eq!(viewed.zones.keys().cloned().collect::<Vec<_>>(), before);
+    assert!(viewed.zones.values().all(|z| z.compiled.is_ok()));
+    assert_eq!(viewed.head, head);
+}

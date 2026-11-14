@@ -22,7 +22,7 @@
 
 use crate::format::{Change, Delta, Frame, FrameKind, Fresh, Hello, KeyCert, GENESIS};
 use crate::jws::{kid, open, payload_unverified, sha, sign, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
-use crate::state::{Policy, State};
+use crate::state::{superseded, Policy, State};
 use crate::store::{lines, read_opt};
 use crate::{DEFAULT_REFRESH_MS, DEFAULT_TTL_MS};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -104,6 +104,12 @@ where
     }
 }
 
+/// A delta log's complete lines, parsed (not verified: the log is the publisher's own), or the
+/// epoch of the first that doesn't read (counted from 1, as a log starts at epoch 1).
+fn parse_log<P: Policy>(lines: &[&str]) -> Result<Vec<Delta<P>>, u64> {
+    lines.iter().enumerate().map(|(i, l)| payload_unverified(l).ok_or(i as u64 + 1)).collect()
+}
+
 /// A node feed's state as its delta log in `dir` has it, read without writing anything: for views
 /// (the console, #173) beside the publishers that write it. No key or certificate is needed. Only
 /// complete lines are replayed: a torn last line (one a publisher is writing now) is skipped, never
@@ -113,14 +119,14 @@ pub fn read_state<P: Policy>(dir: &Path, feed: &str, ctx: P::Ctx) -> Result<Stat
     let mut state = State::genesis(0, ctx);
     let text = read_opt(&dir.join(DELTAS))?.unwrap_or_default();
     let (complete, _torn) = lines(&text);
-    for line in complete {
-        let d: Delta<P> =
-            payload_unverified(line).ok_or_else(|| PublishError::Invalid(format!("delta log, epoch {}: unreadable", state.epoch + 1)))?;
+    let deltas = parse_log::<P>(&complete).map_err(|e| PublishError::Invalid(format!("delta log, epoch {e}: unreadable")))?;
+    let skip = superseded(&deltas);
+    for ((line, d), skip) in complete.iter().zip(&deltas).zip(&skip) {
         if d.feed != feed || d.epoch != state.epoch + 1 || d.prev != state.head {
             return Err(PublishError::Invalid(format!("delta log, epoch {}: not a chain for this feed", d.epoch)));
         }
         state.version = d.version;
-        state.apply(&d, sha(line));
+        state.apply_replaying(d, sha(line), skip);
     }
     Ok(state)
 }
@@ -150,9 +156,11 @@ impl<P: Policy> Publisher<P> {
         let text = read_opt(&path)?.unwrap_or_default();
         let (complete, torn) = lines(&text);
         let bad = |e: u64, why: &str| PublishError::Invalid(format!("delta log, epoch {e}: {why}"));
-        for line in complete {
-            // Our own log: chain and structure are checked; signatures were made by us.
-            let d: Delta<P> = payload_unverified(line).ok_or_else(|| bad(state.epoch + 1, "unreadable"))?;
+        // Our own log: chain and structure are checked; signatures were made by us. Entries a later
+        // delta replaces or drops aren't compiled (#287): the log holds every run's, most long gone.
+        let deltas = parse_log::<P>(&complete).map_err(|e| bad(e, "unreadable"))?;
+        let skip = superseded(&deltas);
+        for ((line, d), skip) in complete.iter().copied().zip(deltas).zip(&skip) {
             if d.feed != feed || d.epoch != state.epoch + 1 || d.prev != state.head {
                 return Err(bad(d.epoch, "not a chain for this feed"));
             }
@@ -163,7 +171,7 @@ impl<P: Policy> Publisher<P> {
             if d.version < cert.version {
                 gen_start = d.epoch;
             }
-            state.apply(&d, sha(line));
+            state.apply_replaying(&d, sha(line), skip);
             heads.push(state.head.clone());
             log.push((d.version, line.to_string()));
         }
