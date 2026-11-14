@@ -230,7 +230,8 @@ fn placeholder_login(login_placeholder: &str, tag: &str, login_meta: &Value) -> 
 
 /// The claude.ai account a Claude Code login belongs to (its config's `oauthAccount`: account and
 /// organization ids, plan, roles; no credential), next to the login's credentials file: Remote
-/// Control won't start without it. `~/.claude/.credentials.json` has it in `~/.claude.json`; a
+/// Control won't start without it. Read once, when the login is linked (#298): Claude Code
+/// replaces that file often, so a box start uses the copy kept with the secret. `~/.claude/.credentials.json` has it in `~/.claude.json`; a
 /// `CLAUDE_CONFIG_DIR` keeps both in one directory. The holder's full name is left out.
 pub fn claude_code_account(credentials: &std::path::Path) -> Option<Value> {
     let dir = credentials.parent()?;
@@ -814,6 +815,28 @@ mod tests {
             Some("https://claude.ai/code/session_01abc?x=1")
         );
         assert_eq!(rc.remote_session_url("visit claude.ai/code in a browser"), None);
+    }
+
+    #[test]
+    fn the_claude_adapter_keeps_its_logins_account_at_link_time_and_starts_from_that() {
+        let d = std::env::temp_dir().join(format!("wicket-agent-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        let creds = d.join(".claude/.credentials.json");
+        std::fs::write(d.join(".claude.json"), r#"{"oauthAccount":{"organizationUuid":"o","fullName":"A Person"}}"#).unwrap();
+        let ptr = Some("/claudeAiOauth/accessToken");
+        let kept = harness::link_login_meta(&creds, ptr).unwrap().unwrap();
+        assert_eq!(kept, serde_json::json!({ "oauthAccount": { "organizationUuid": "o" } }));
+        assert!(harness::link_login_meta(&creds, None).is_none(), "a whole-file link is no Claude login");
+        std::fs::remove_file(d.join(".claude.json")).unwrap();
+        assert!(harness::link_login_meta(&creds, ptr).unwrap().unwrap_err().contains("re-link"));
+        // A start uses the kept copy only (and never a name, even one kept by hand).
+        let rc = harness::adapter(Harness::ClaudeCode);
+        let stored = serde_json::json!({ "oauthAccount": { "organizationUuid": "o", "fullName": "A Person" } });
+        let meta = rc.remote_login_meta(Some(&serde_json::json!({ "subscriptionType": "max" })), Some(&stored));
+        assert_eq!(meta, serde_json::json!({ "subscriptionType": "max", "oauthAccount": { "organizationUuid": "o" } }));
+        assert_eq!(rc.remote_login_meta(None, None), serde_json::json!({}));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

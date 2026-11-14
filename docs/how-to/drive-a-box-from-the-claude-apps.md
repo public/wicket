@@ -18,6 +18,17 @@ Two ways to chat with an agent in a wicket box from the Claude apps (desktop, we
        --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt --hosts api.anthropic.com
    ```
 
+   For a Claude login, the link also reads the account fields Remote Control checks before it starts
+   (organization and account ids, plan, roles; never the holder's name) from the login's Claude
+   config, `~/.claude.json` beside `~/.claude/.credentials.json` (or `.claude.json` in a
+   `CLAUDE_CONFIG_DIR`), and keeps them with the secret. Box starts use that copy and never read
+   `~/.claude.json`, which Claude Code replaces often (dropping any ACL on it). So the user running
+   the link must be able to read that file at that moment: on an installed host, grant the `wicket`
+   user read just before linking (`setfacl -m u:wicket:r ~/.claude.json`); it doesn't need to keep
+   it. If it can't be read, the secret is linked anyway and `wicket secret link` warns that Remote
+   Control boxes need a re-link. Re-link to refresh the fields, such as after switching accounts or
+   organizations.
+
 2. Start from `examples/remote-control-box.yaml`, a whole zone for it: `agent.remote.name` is the
    session's name in the apps, and `zone.llm.secret` names the login linked above.
 3. Run it:
@@ -49,8 +60,9 @@ What it protects, and how:
   non-secret account fields reach the box (scopes, plan, and the account and organization ids Claude
   Code checks before it starts Remote Control; not the holder's name).
 - **Reach is the authority.** Everything the zone reaches on the provider's host is reached with the
-  owner's login, so the example names only what a session needs (registering its environment, its
-  work and worker channel, model calls, the profile), forbids the account's connectors
+  owner's login, so the example names only what a session needs (registering, reconnecting and
+  deregistering its environment, its work and worker channel, creating its session and posting its
+  events, model calls, the profile, validating the login's scopes), forbids the account's connectors
   (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`) and token refresh outright, and leaves everything
   else (other sessions, triggers, memory) to a human's decision, as in any zone: deny those.
 - **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the

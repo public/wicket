@@ -106,9 +106,18 @@ pub trait Adapter: Send + Sync {
     }
 
     /// What a remote session may know of its login, from the host (never a credential): `linked` is
-    /// the object holding the linked token in its file, `file` that file.
-    fn remote_login_meta(&self, _linked: Option<&Value>, _file: Option<&std::path::Path>) -> Value {
+    /// the object holding the linked token in its file, `stored` what [`Adapter::link_login_meta`]
+    /// kept with the secret when it was linked.
+    fn remote_login_meta(&self, _linked: Option<&Value>, _stored: Option<&Value>) -> Value {
         Value::Null
+    }
+
+    /// At `wicket secret link`, for a link to this harness's login (`file`, the JSON `pointer` into
+    /// it): the non-secret fields to keep with the secret for later remote sessions (#298). None
+    /// when the link isn't this harness's login; Err (the link still stands) when the fields can't
+    /// be read now, saying what that leaves out.
+    fn link_login_meta(&self, _file: &std::path::Path, _pointer: Option<&str>) -> Option<Result<Value, String>> {
+        None
     }
 
     /// The address of the remote session the harness printed on this line of its output, if any.
@@ -141,6 +150,17 @@ pub fn adapter(h: Harness) -> &'static dyn Adapter {
         Harness::ClaudeCode => &ClaudeCode,
         Harness::Acp => &Acp,
     }
+}
+
+/// Every harness's adapter.
+pub fn adapters() -> [&'static dyn Adapter; 2] {
+    [&ClaudeCode, &Acp]
+}
+
+/// At `wicket secret link`: what the harness whose login the link is keeps with the secret (see
+/// [`Adapter::link_login_meta`]); None when it is no harness's login.
+pub fn link_login_meta(file: &std::path::Path, pointer: Option<&str>) -> Option<Result<Value, String>> {
+    adapters().into_iter().find_map(|a| a.link_login_meta(file, pointer))
 }
 
 /// The adapter for a manifest's agent; None for a program.
@@ -205,7 +225,7 @@ impl Adapter for ClaudeCode {
         Ok(Some(mode.as_str()))
     }
 
-    fn remote_login_meta(&self, linked: Option<&Value>, file: Option<&std::path::Path>) -> Value {
+    fn remote_login_meta(&self, linked: Option<&Value>, stored: Option<&Value>) -> Value {
         let mut meta = serde_json::json!({});
         if let Some(o) = linked {
             for k in ["scopes", "subscriptionType", "rateLimitTier"] {
@@ -214,10 +234,30 @@ impl Adapter for ClaudeCode {
                 }
             }
         }
-        if let Some(a) = file.and_then(crate::claude_code_account) {
+        // The account fields as they were at link time: `~/.claude.json` is never read at a start
+        // (Claude Code replaces it often, dropping any ACL that let wicket read it).
+        if let Some(a) = stored.and_then(|s| s.get("oauthAccount")).filter(|a| a.is_object()) {
+            let mut a = a.clone();
+            if let Some(o) = a.as_object_mut() {
+                o.remove("fullName");
+            }
             meta["oauthAccount"] = a;
         }
         meta
+    }
+
+    fn link_login_meta(&self, file: &std::path::Path, pointer: Option<&str>) -> Option<Result<Value, String>> {
+        if !pointer.is_some_and(|p| p.starts_with("/claudeAiOauth/")) {
+            return None;
+        }
+        Some(match crate::claude_code_account(file) {
+            Some(a) => Ok(serde_json::json!({ "oauthAccount": a })),
+            None => Err(format!(
+                "no oauthAccount readable in the Claude config next to {} (~/.claude.json, or .claude.json in a CLAUDE_CONFIG_DIR): \
+                 a Remote Control box needs it, so make it readable and re-link this secret before starting one",
+                file.display()
+            )),
+        })
     }
 
     fn remote_session_url(&self, line: &str) -> Option<String> {

@@ -3,7 +3,8 @@
 The vault is one file per secret under `$HOME/.config/wicket/secrets/` (installed:
 `/var/lib/wicket/.config/wicket/secrets/`), mode 0600, or a `<name>.ref` file for a linked secret
 (`wicket secret link`), naming a file that is re-read at every use. Each secret's `<name>.hosts`
-lists the hosts it may be sent to. [Store and link secrets](../how-to/store-and-link-secrets.md)
+lists the hosts it may be sent to. A `.ref` may also keep non-secret metadata a harness read when the
+secret was linked (below). [Store and link secrets](../how-to/store-and-link-secrets.md)
 shows how to use it.
 
 ## Who may read a secret's file
@@ -36,3 +37,18 @@ sudo wicket secret link claude-oauth --file ~/.claude/.credentials.json \
 that rewrites the file may replace it with one without the ACL (Claude Code refreshing its login, for
 one): if wicket then can't read it, grant the ACL again, or set a default ACL on the directory
 (`setfacl -d -m u:wicket:r ~/.claude`) so new files there get it.
+
+## What a link keeps besides the reference
+
+The vault keeps a linked secret's `meta` as the harness adapter hands it over at `wicket secret
+link`, without reading it. A re-link replaces it. For a Claude login (a pointer under
+`/claudeAiOauth/`), the Claude adapter keeps the login's `oauthAccount` from its Claude config
+(`~/.claude.json` beside `~/.claude/.credentials.json`, or `.claude.json` in a `CLAUDE_CONFIG_DIR`):
+account and organization ids, plan and roles, without `fullName`. No credential is kept.
+
+A Remote Control box (`agent.remote`) gets those fields from the stored copy and never reads
+`~/.claude.json`. Claude Code replaces that file often, so an ACL on it doesn't last: grant the
+`wicket` user read on it only for the link (`setfacl -m u:wicket:r ~/.claude.json`, then `sudo wicket
+secret link ...`). If the config can't be read, the secret is linked anyway and the link warns that
+Remote Control boxes need a re-link once it can be. Re-link after switching accounts or
+organizations to refresh the fields.
