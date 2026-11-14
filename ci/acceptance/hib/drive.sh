@@ -8,3 +8,4 @@ else
   echo vol-kept > /volumes/data/acc-vol; touch /workspace/turn1
   echo '{"turn":"first"}' > /workspace/out/result.json
 fi
+echo "wicket-mock: hibernate"

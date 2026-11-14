@@ -1938,7 +1938,7 @@ its label is the join of everything that shaped it.
 - **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
   mounted over its `out/`.
 - **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
-  input. The session stays open for `agent.idle_timeout` after each turn and closes after that. Operator
+  input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
 **Hibernate and wake (#70, 2026-11-12).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0), with `docker pause` for Idle.

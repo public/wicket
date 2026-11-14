@@ -6,11 +6,17 @@ records what wicket (its client) sent and answered, in /workspace/out/result.jso
 gateway it was given answers. On session/load (a wake) it replays its history and asks for permission
 in the middle of the replay, which must not be approved.
 
+It also decides its own lifetime (#249). After its first turn it idles on its own timer (SELF_WAKE
+seconds, reading nothing), wakes by itself, says so, and only then asks wicket to hibernate it
+(the gateway's hibernate tool): wicket must neither have ended nor paused it meanwhile. Woken, it
+asks to finish after its turn.
+
 No model is involved. Standard library only.
 """
 import json
 import os
 import sys
+import time
 import urllib.request
 
 HOME = os.environ.get("HOME", "/tmp")
@@ -26,6 +32,7 @@ if os.path.exists(OUT):
 history = json.load(open(HIST)) if os.path.exists(HIST) else {"session": None, "updates": []}
 next_id = 1000
 inbox = []  # messages that arrived while waiting for an answer, handled next
+SELF_WAKE = 8  # seconds the agent idles between its turn and its own wakeup
 
 
 def send(msg):
@@ -81,6 +88,25 @@ def gateway():
         body = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=20).read().decode()
         names = [t["name"] for t in json.loads(body)["result"]["tools"]]
         return "tools: %d, with await_grant: %s" % (len(names), "await_grant" in names)
+    except Exception as e:  # noqa: BLE001
+        return "error: %s" % e
+
+
+def call_tool(name):
+    """Calls one of wicket's gateway tools; the first line of its answer."""
+    servers = (seen.get("session") or {}).get("mcpServers") or []
+    if len(servers) != 1:
+        return "not exactly one MCP server"
+    req = urllib.request.Request(
+        servers[0]["url"],
+        data=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": {}}}).encode(),
+        headers={"content-type": "application/json", "accept": "application/json, text/event-stream"},
+    )
+    try:
+        body = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=20).read().decode()
+        r = json.loads(body)["result"]
+        # Short: wicket prints result.json clipped.
+        return (("error: " if r.get("isError") else "") + r["content"][0]["text"].splitlines()[0])[:50]
     except Exception as e:  # noqa: BLE001
         return "error: %s" % e
 
@@ -169,8 +195,19 @@ for m in messages():
         permission("after_replay", sid, {"toolCallId": "t-exec", "kind": "execute"})
         save("done")
     elif method == "session/prompt":
-        turn(p.get("sessionId"), " ".join(b.get("text", "") for b in p.get("prompt", [])))
+        sid = p.get("sessionId")
+        turn(sid, " ".join(b.get("text", "") for b in p.get("prompt", [])))
         send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        if seen.get("load") is None and seen.get("self_wakeup") is None:
+            # Its turn is over: it idles on its own timer, then wakes by itself (#249).
+            t0 = time.monotonic()
+            time.sleep(SELF_WAKE)
+            slept = round(time.monotonic() - t0, 1)
+            update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "woke on my own timer after %d s idle" % SELF_WAKE}})
+            seen["self_wakeup"] = {"slept": SELF_WAKE, "elapsed": slept, "hibernate": call_tool("hibernate")}
+        else:
+            seen["finish"] = call_tool("finish")
+        save("done")
     elif method == "session/cancel":
         pass
     elif rid is not None and method:

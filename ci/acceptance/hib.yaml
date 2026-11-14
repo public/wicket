@@ -1,10 +1,9 @@
-# Acceptance (ci/acceptance.sh): a long-lived agent that hibernates after its turn and is woken.
+# Acceptance (ci/acceptance.sh): a long-lived agent that asks to hibernate after its turn (its
+# drive.sh says so to the mock model) and is woken.
 task: Run the command you are given and stop.
 agent:
   name: hib
   max_turns: 6
-  idle_timeout: 1s
-  hibernate_after: 4s
 zone:
   name: acc-hibernate
   isolation: gvisor

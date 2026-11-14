@@ -42,8 +42,12 @@ These are general features for any workload:
   of copying it. `--task "…"` replaces the manifest's task.
 - **`zone.volumes`** are named directories under `/volumes/` that persist between runs of a zone: caches,
   datasets, any state.
-- **`agent.idle_timeout`** keeps the session open after each turn. **`wicket say <run> "…"`** sends the agent
-  a follow-up, which becomes its next turn.
+- **The agent decides when it is done** (#249). Its session stays open after each turn, and the run ends
+  only when the agent's process exits, at the zone's `limits.timeout`, or when its authority ends. The
+  agent ends it with wicket's `finish` tool (wicket closes its input at the end of the turn, and the
+  harness exits). **`wicket say <run> "…"`** sends the agent a follow-up, which becomes its next turn.
+  `/workspace/out/result.json` is an optional output: wicket prints it at the end of the run if the
+  agent wrote one.
 - **Long-lived agents hibernate and wake** (below; [how to](../how-to/hibernate-and-wake-an-agent.md)).
 - **`agent.image`** names the image the agent's box starts from (default: the installation's current agent
   image), e.g. a project's own toolchain image. Any other image must be listed in `zone.images`, as for
@@ -64,14 +68,15 @@ Every Claude Code agent wicket launches on this host is a long-lived agent with 
 Claude Code session, and a generation number. Each run is one activation of it. `wicket agents` lists them with
 their state, generation and bundle size.
 
-- **Idle.** With `agent.hibernate_after` set, the box is paused (`docker pause`) once `idle_timeout` has passed
-  after a turn. Its processes and memory are kept, and a follow-up unpauses it.
-- **Hibernated.** At `hibernate_after`, or when you run `wicket hibernate <run>`, the agent is hibernated if
-  the box is at a quiet point: its turn has ended, and nothing but the agent runtime runs in it. Its box stops,
+- **Active.** While its box runs: during a turn, and between turns for as long as the agent waits. wicket
+  never pauses, closes or hibernates it on a turn boundary or a timer of its own, so anything the agent
+  scheduled for itself (a wakeup, a background job) still runs.
+- **Hibernated.** When the agent asks (wicket's `hibernate` tool) or you run `wicket hibernate <run>`, the
+  agent is hibernated at the end of its turn if the box is at a quiet point: its turn has ended, and nothing but the agent runtime runs in it. Its box stops,
   and its whole writable state is bundled into wicket's object store: the workspace, all of `/wicket/state`
   (`$HOME` and the Claude Code config), `/tmp`, and the zone's `persist: durable` volumes. Each tree is tar +
   zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
-  background build, a dev server) stays Idle instead, because a rebuild restores files, not processes.
+  background build, a dev server) goes on running instead, because a rebuild restores files, not processes.
 - **Wake.** `wicket wake <agent> ["…"]`, `wicket say <run or agent> "…"`, or a message from another agent
   rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
   `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,
@@ -99,10 +104,10 @@ their state, generation and bundle size.
   - `node` (the default): shared by the zone, kept on the node;
   - `cache`: never bundled, and may be empty after a wake on another node. On one node it behaves like `node`.
 - **Budgets belong to the agent, over its whole life.** The zone's model budget (`max_requests`,
-  `max_output_tokens`, `max_input_tokens`) and `limits.timeout` (total time in a box, Idle included) are
+  `max_output_tokens`, `max_input_tokens`) and `limits.timeout` (total time in a box, waiting between turns included) are
   recorded on the agent. A wake continues from what is left; it never resets them. Budget handed to children
   counts as spent. An agent that has spent a budget isn't woken again, by any source.
-- At the timeout, an idle agent at a quiet point hibernates, and any other is stopped.
+- At the timeout the box is stopped, between turns or not.
 - Only a hibernated agent can be woken. If its session ends any other way (stopped, timed out mid-turn, or
   over its `/tmp` cap), the agent is `ended`.
 - A long-lived agent's `/tmp` is a directory (in the run's directory, or the node's), so it is kept with the
