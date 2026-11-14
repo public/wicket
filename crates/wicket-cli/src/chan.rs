@@ -191,6 +191,11 @@ pub struct BoxStart {
     /// [`IMAGE_PINS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pin: Option<String>,
+    /// Measure the runtime's part of the start too (#287: `WICKET_TIMINGS=1`): one more `docker
+    /// inspect` for when Docker created the box and when its runtime started it. A node that
+    /// doesn't know this field sends what it always measures (or nothing).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timings: bool,
 }
 
 /// What a node decides a box's gateway tools from (#164), beyond its token in the feed.
@@ -498,6 +503,9 @@ pub enum Msg {
         /// The image's digest as the node started it (#192).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digest: Option<String>,
+        /// Where the start's time went on the node (#287), from when it took the start in.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        timings: Vec<wicket_core::timing::Span>,
     },
     Exited {
         run: String,
@@ -562,6 +570,10 @@ pub enum Msg {
     Spent {
         run: String,
         spent: wicket_proxy::llm::Spent,
+        /// When the box's first model request reached the node's model proxy (Unix ms, on the
+        /// node's clock; #287).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_request_ms: Option<i64>,
     },
     /// Open a tunnel to the run's `target` socket on the control host: `egress`, `llm` or `gateway`.
     TunnelOpen {
@@ -1007,5 +1019,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(w, Msg::Welcome { proto: 0, .. }));
+    }
+
+    #[test]
+    fn start_timings_are_optional_both_ways() {
+        // From a node before #287: no timings, no first request.
+        let st: Msg = serde_json::from_str(r#"{"m":"started","run":"r","error":null}"#).unwrap();
+        assert!(matches!(st, Msg::Started { ref timings, .. } if timings.is_empty()));
+        let sp: Msg =
+            serde_json::from_value(serde_json::json!({"m":"spent","run":"r","spent":wicket_proxy::llm::Spent::default()})).unwrap();
+        assert!(matches!(sp, Msg::Spent { first_request_ms: None, .. }));
+        // To one: nothing new on the wire when there is nothing to say.
+        let quiet = serde_json::to_value(Msg::Started { run: "r".into(), error: None, digest: None, timings: vec![] }).unwrap();
+        assert!(quiet.get("timings").is_none());
+        let span = wicket_core::timing::Span { name: "docker.run".into(), at_ms: 1.0, ms: 2.0 };
+        let said = Msg::Started { run: "r".into(), error: None, digest: None, timings: vec![span.clone()] };
+        let back: Msg = serde_json::from_value(serde_json::to_value(&said).unwrap()).unwrap();
+        assert!(matches!(back, Msg::Started { timings, .. } if timings == vec![span]));
     }
 }
