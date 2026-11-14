@@ -223,8 +223,13 @@ impl Egress {
 
     /// Serves CONNECT (and plain absolute-form HTTP) on a unix socket until the task is dropped.
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
-        let _ = std::fs::remove_file(socket);
-        let listener = crate::sockpath::bind(socket)?;
+        let listener = crate::sockpath::listen(socket)?;
+        self.serve_on(listener).await
+    }
+
+    /// As [`Self::serve`], on a socket already listening ([`crate::sockpath::listen`]): its
+    /// caller knows it is ready the moment it is bound, with no wait for it to appear (#287).
+    pub async fn serve_on(self: Arc<Self>, listener: tokio::net::UnixListener) -> Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
             let me = self.clone();

@@ -1811,29 +1811,28 @@ async fn serve_box(
     // the proxy, which forwards them.
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
-    tasks.push(tokio::spawn({
-        let us = sock.join("udp.sock");
-        async move {
-            if let Err(e) = h3.serve(&us).await {
-                eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
-            }
+    // Each socket is bound and listening before the box can start (#287): the box's forwarder's
+    // connections wait in its backlog until it is served, with no wait for the socket to appear.
+    let waited = Instant::now();
+    let us = wicket_proxy::h3::H3::listen(&sock.join("udp.sock"))?;
+    let el = wicket_proxy::sockpath::listen(&sock.join("egress.sock")).context("the box's egress socket")?;
+    let ll = wicket_proxy::sockpath::listen(&sock.join("llm.sock")).context("the box's model socket")?;
+    if let Some(t) = t {
+        t.since("proxies.sockets", waited);
+    }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = h3.serve_on(us).await {
+            eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
         }
     }));
-    let es = sock.join("egress.sock");
-    tasks.push(tokio::spawn({
-        let es = es.clone();
-        async move {
-            if let Err(e) = egress.serve(&es).await {
-                eprintln!("[node] egress proxy ended: {e:#}");
-            }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = egress.serve_on(el).await {
+            eprintln!("[node] egress proxy ended: {e:#}");
         }
     }));
-    tasks.push(tokio::spawn({
-        let ls = sock.join("llm.sock");
-        async move {
-            if let Err(e) = llm.serve(&ls).await {
-                eprintln!("[node] model proxy ended: {e:#}");
-            }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = llm.serve_on(ll).await {
+            eprintln!("[node] model proxy ended: {e:#}");
         }
     }));
     // The MCP gateway (#151): served here, each call relayed to the run's gateway on the control
@@ -1867,17 +1866,6 @@ async fn serve_box(
             }
         }));
     }
-    let waited = Instant::now();
-    for _ in 0..50 {
-        if es.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    if let Some(t) = t {
-        t.since("proxies.sockets", waited);
-    }
-
     Ok(tasks)
 }
 

@@ -149,7 +149,18 @@ impl H3 {
 
     /// Serves the box's forwarder on a `SOCK_SEQPACKET` unix socket at `socket`, until dropped.
     pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
-        let listener = seqpacket_listen(socket)?;
+        self.serve_on(H3::listen(socket)?).await
+    }
+
+    /// The forwarder's `SOCK_SEQPACKET` socket at `socket`, bound and listening: connections wait
+    /// in its backlog until [`H3::serve_on`] serves it (#287: no wait for the socket to appear).
+    pub fn listen(socket: &Path) -> Result<SeqpacketListener> {
+        Ok(SeqpacketListener(seqpacket_listen(socket)?))
+    }
+
+    /// As [`H3::serve`], on a socket [`H3::listen`] bound.
+    pub async fn serve_on(self: Arc<Self>, listener: SeqpacketListener) -> Result<()> {
+        let listener = listener.0;
         loop {
             let mut g = listener.readable().await?;
             let fd = match g.try_io(|l| seqpacket_accept(l.as_raw_fd())) {
@@ -731,6 +742,9 @@ fn set_bufs(fd: RawFd) {
 
 /// A nonblocking `SOCK_SEQPACKET` listener at `path` (replacing a stale socket), with the same mode
 /// as the proxies' sockets beside it.
+/// A listening `SOCK_SEQPACKET` unix socket ([`H3::listen`]).
+pub struct SeqpacketListener(AsyncFd<OwnedFd>);
+
 fn seqpacket_listen(path: &Path) -> Result<AsyncFd<OwnedFd>> {
     let _ = std::fs::remove_file(path);
     // SAFETY: plain socket(2); checked before use.
