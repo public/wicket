@@ -427,8 +427,6 @@ struct Shared {
     issuer: Arc<wicket_identity::Issuer>,
     /// The box's base token (block 0), and the key that signs its grant blocks.
     token_issuer: wicket_feed::Issuer,
-    /// Block 0 carries an org layer (#51): only for nodes talking [`crate::chan::ORG_POLICY`].
-    org: bool,
     approver: wicket_authz::SigningKey,
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
@@ -552,7 +550,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         cfg,
         issuer,
         token_issuer,
-        org: s.org.is_some(),
         approver,
         attribute: s.attribute.clone(),
         llm: s.llm.clone(),
@@ -806,27 +803,6 @@ async fn session(
             bail!("{why}")
         }
     };
-    // A token minted by the issuing key (the roots offline, #154) is for nodes that can read it.
-    if sh.token_issuer.issuer_cert.is_some() && authed.proto < crate::chan::ISSUER_CERT {
-        p.ever = false;
-        bail!(
-            "node {} talks protocol {}, and this box's token (minted by the authority issuing key, the roots being offline) needs {}: update the node (`wicket node install {}`)",
-            sh.node,
-            authed.proto,
-            crate::chan::ISSUER_CERT,
-            sh.node
-        );
-    }
-    if sh.org && authed.proto < crate::chan::ORG_POLICY {
-        p.ever = false;
-        bail!(
-            "node {} talks protocol {}, and this box's token carries the org policy, which needs {}: update the node (`wicket node install {}`)",
-            sh.node,
-            authed.proto,
-            crate::chan::ORG_POLICY,
-            sh.node
-        );
-    }
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, .. } => {
             p.proto = proto;
@@ -1427,9 +1403,6 @@ fn slice_fraction() -> f64 {
 /// its budget slice, renewed once less than half a slice is left, and lowered at once if what is
 /// left of the budget shrinks below it (a spawn's carve-out).
 fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
-    if p.proto < crate::chan::NODE_LEASES {
-        return None;
-    }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
     let spent = l.spent();
@@ -1487,9 +1460,6 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
 /// the node is told to drop them (#152).
 fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     let mut out = vec![];
-    if p.proto < crate::chan::NODE_LEASES {
-        return out;
-    }
     let names: Vec<String> = p.fetched.keys().cloned().collect();
     for name in names {
         let now = crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.token_root.1).ok().map(|f| crate::nodesecrets::digest(&f));
@@ -1603,9 +1573,8 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             &[],
             ca.as_ref().map(|c| (&c.hosts[..], c.not_after)),
             now_s,
-            // A version-3 node fetches a zone's injected secrets on first use, and decides those hosts
-            // itself; an older node forwards them here.
-            &|_| p.proto >= crate::chan::NODE_LEASES,
+            // A node fetches a zone's injected secrets on first use, and decides those hosts itself.
+            &|_| true,
         );
         if route != wicket_proxy::decide::Route::Terminate {
             continue;

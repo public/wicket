@@ -36,14 +36,9 @@
 //!   peer may ignore does not.
 //! - A message added in version N is sent only on a connection that negotiated N or later, since an
 //!   older peer drops the connection on a message it can't parse.
-//! - Support for version N−1 is removed only after a release that spoke N everywhere.
-//!
-//! Version 3 (#152, #153) adds [`Msg::Lease`] (budget slices), [`Msg::SecretFetch`],
-//! [`Msg::SecretFetched`], [`Msg::SecretRevoke`] (secrets fetched by a node on first use) and
-//! [`Msg::Spent`] (the node's model spend), sent only on connections that negotiated 3; a
-//! version-3 control host no longer sends [`Msg::RunLease`], which a version-3 node accepts and
-//! ignores (a box's authority decides when it stops). With an older peer, a node relays model calls
-//! and forwards injected hosts to the control host, as before.
+//! - Support for version N−1 is removed only after a release that spoke N everywhere. What versions
+//!   below `PROTOCOL - PROTOCOL_SKEW` added is assumed, not checked: such a peer is refused at the
+//!   handshake.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,14 +46,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// - 1: versions (#162).
 /// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
-///   (`BoxAuthority::issuer_cert`, #154), which a version-1 node can't read: sent only to nodes
-///   talking [`ISSUER_CERT`] or later.
+///   (`BoxAuthority::issuer_cert`, #154).
 /// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
 ///   [`Msg::Lease`], [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
-///   [`Msg::Spent`], sent only on connections talking [`NODE_LEASES`] or later.
-/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51): a `policy` fact
-///   and checks reading it, which an older node's structural check refuses: sent only to nodes
-///   talking [`ORG_POLICY`] or later.
+///   [`Msg::Spent`]; the control host's per-run lease message is gone (a box's authority decides
+///   when it stops).
+/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51).
 /// - 5: decisions at the edge (#164): a node answers the MCP gateway's tools itself from the box's
 ///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
 ///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
@@ -70,12 +63,6 @@ use serde::{Deserialize, Serialize};
 ///   data frames, the node's [`Msg::Ack`]s of them and its [`Msg::ImagePut`]. Sent only on
 ///   connections talking [`IMAGE_DELIVERY`] or later; an older node must have the image already.
 pub const PROTOCOL: u32 = 7;
-/// The first protocol version whose nodes take issuing-key tokens (#154).
-pub const ISSUER_CERT: u32 = 2;
-/// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
-pub const NODE_LEASES: u32 = 3;
-/// The first protocol version whose nodes take tokens with an org layer (#51).
-pub const ORG_POLICY: u32 = 4;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -317,12 +304,6 @@ pub enum Msg {
     },
     StdinClose {
         run: String,
-    },
-    /// Version 1 only: the control host's lease of a run. Accepted from a version-1 control host and
-    /// ignored (#153: the box's authority decides when it stops).
-    RunLease {
-        run: String,
-        until: i64,
     },
     /// A run's model budget slice (#152).
     Lease {
