@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Writes docs/reference/cli.md from the help that clap prints for every wicket command, so the CLI
-# reference is the code's own description of itself. With --check, fails if the page differs from
-# what the binary prints (run it after changing a command, an argument or its doc comment).
+# reference is the code's own description of itself. Run it after changing a command, an argument or
+# its doc comment. A wicket-cli unit test (src/cli_reference.rs) checks the page against every
+# command's help, so CI needs no build of its own for it; --check compares with the binary.
 #
 # Usage: WICKET=target/debug/wicket ci/gen-cli-reference.sh [--check]
 #
