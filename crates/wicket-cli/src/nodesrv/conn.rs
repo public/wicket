@@ -303,7 +303,6 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     }
                 }
             }
-            Msg::RunLease { .. } => {}
             Msg::Lease { run, lease } => {
                 if let Some(sl) = &lease.slice {
                     if let Err(e) = node.slices.put(&run, sl) {

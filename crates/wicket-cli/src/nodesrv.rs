@@ -405,10 +405,6 @@ impl Node {
         Arc::new(move |run: String, name: String| {
             let n = n.clone();
             Box::pin(async move {
-                // A control host before protocol 3 doesn't release secrets: its node relays instead.
-                if (1..chan::NODE_LEASES).contains(&n.proto_of(&run)) {
-                    return Err(format!("{OLD_CONTROL}: credential {name} stays on the control host"));
-                }
                 let id = n.id();
                 let (tx, rx) = oneshot::channel();
                 n.asks.lock().expect("asks").insert(id, tx);
@@ -507,17 +503,15 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        // Injected hosts are decided here too, their secret fetched on first use (#152); with a
-        // control host before protocol 3 they are forwarded to it, as before. Hosts the control host
-        // swaps a credential in for (#169) are always forwarded: swaps stay there.
-        let v1 = (1..chan::NODE_LEASES).contains(&self.node.proto_of(&self.run));
+        // Injected hosts are decided here too, their secret fetched on first use (#152). Hosts the
+        // control host swaps a credential in for (#169) are always forwarded: swaps stay there.
         wicket_proxy::decide::route_sealed(
             host,
             &spec,
             &self.swaps,
             self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
             now,
-            &|_| !v1,
+            &|_| true,
         )
     }
 
@@ -1700,7 +1694,7 @@ async fn serve_box(
                 if now != last {
                     let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
                 }
-                if (now != last || i.is_multiple_of(10)) && n.proto_of(&run) >= chan::NODE_LEASES {
+                if now != last || i.is_multiple_of(10) {
                     n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
                 }
                 last = now;
@@ -1780,8 +1774,9 @@ async fn serve_box(
     Ok(tasks)
 }
 
-/// How a fetch for a version-1 control host fails: the model proxy relays on it.
-pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
+/// How a tool call relayed to a control host before [`chan::EDGE_DECISIONS`] fails: it would decide
+/// it differently.
+pub const OLD_CONTROL: &str = "the control host speaks an older protocol";
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 
