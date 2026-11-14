@@ -555,13 +555,15 @@ impl Docker {
         Ok(())
     }
 
-    /// Builds an image from a directory, with host networking for the build only (the daemon has no
-    /// bridge network; sandboxes never get one).
-    pub async fn build_image(&self, tag: &str, dir: &std::path::Path) -> Result<()> {
-        let st = self
-            .command_with(["build".to_string(), "--network".into(), "host".into(), "-t".into(), tag.into(), dir.display().to_string()])
-            .status()
-            .await?;
+    /// Builds an image from a directory with these `--build-arg`s, with host networking for the build
+    /// only (the daemon has no bridge network; sandboxes never get one).
+    pub async fn build_image(&self, tag: &str, dir: &std::path::Path, build_args: &[(&str, &str)]) -> Result<()> {
+        let mut args = vec!["build".to_string(), "--network".into(), "host".into(), "-t".into(), tag.into()];
+        for (k, v) in build_args {
+            args.extend(["--build-arg".to_string(), format!("{k}={v}")]);
+        }
+        args.push(dir.display().to_string());
+        let st = self.command_with(args).status().await?;
         if !st.success() {
             bail!("docker build failed");
         }
