@@ -2,11 +2,11 @@
 # terminal capability, its gateway the only MCP server, once-only answers to permission prompts, and
 # its own _meta.claudeCode.options (strictMcpConfig, settingSources without "local").
 #
-# Not the default way to run Claude Code under wicket (that is `kind: claude-code`): see README.md.
+# Not the default way to run Claude Code under wicket (that is `harness: claude-code`): see README.md.
 task: Read the repository in /workspace and summarise what it does in /workspace/out/result.json.
 agent:
   name: claude-acp
-  kind: acp
+  harness: acp
   acp:
     command: [claude-agent-acp]
     profile: claude-agent-acp

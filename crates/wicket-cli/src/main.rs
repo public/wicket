@@ -357,7 +357,7 @@ enum Cmd {
     },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
-        #[arg(long, default_value = "wicket/claude-code:poc")]
+        #[arg(long, default_value = crate::image::DEFAULT)]
         image: String,
     },
     /// Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node

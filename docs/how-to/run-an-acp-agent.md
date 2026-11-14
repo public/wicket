@@ -21,7 +21,7 @@ docker build -t my-agent-acp:1 path/to/dockerfile-dir
 task: Tidy the README and say what you changed in /workspace/out/result.json.
 agent:
   name: tidy
-  kind: acp
+  harness: acp
   acp:
     command: [my-agent, --acp]   # the agent's ACP mode, as the image has it
   image: my-agent-acp:1
@@ -63,4 +63,4 @@ wicket's lockdown options. It is not the default and has not been run against a 
 whether a subscription may back the adapter is an open question for the owner, and wicket refuses it
 until the installation allows it (`acp.allow_subscription_backed_claude_adapter` in
 [`/etc/wicket/wicket.yaml`](../reference/configuration.md#wicketyaml)). See
-[`examples/acp-claude`](../../examples/acp-claude/). Run Claude Code as `kind: claude-code` meanwhile.
+[`examples/acp-claude`](../../examples/acp-claude/). Run Claude Code as `harness: claude-code` meanwhile.

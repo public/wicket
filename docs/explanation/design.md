@@ -770,7 +770,7 @@ loopback forwarders like Claude Code.
 
 ```rust
 pub trait InnerAgent: Send + Sync {
-    fn kind(&self) -> AgentKind;
+    fn harness(&self) -> Harness;                             // the manifest's agent.harness
     fn tier(&self) -> Tier;                                   // T1 | T2 | T3: protocol class
     fn placement(&self) -> Vec<PlacementSupport>;             // Whole | Split{hands}
     fn caps(&self) -> AgentCaps;
@@ -794,7 +794,7 @@ pub trait AgentSession: Send {
 | Tier | Agents | How wicket drives it | Pending path |
 |---|---|---|---|
 | **T1: native control protocol** | **Claude Code** (stream-json control protocol, spoken natively from Rust); **Codex app-server** (JSON-RPC: host-answered `requestApproval`, `turn/steer`, per-turn `outputSchema`, `thread/resume`/`fork`, `dynamicTools`); **pi** RPC mode plus a small in-box wicket extension | the agent's own permission prompts are answered by wicket; steering; native typed output (pi: a terminating `wicket_result` tool) | hold the prompt open + pause/snapshot; Claude `defer` + `--resume`; Codex replays pending approvals on reconnect |
-| **T2: ACP** | Gemini CLI, goose, OpenCode, Cline…, and fallbacks `codex-acp`, Claude's ACP adapter (protocol v1; manifest `kind: acp`) | JSON-RPC over stdio. wicket advertises no `fs`, `terminal` or `auth.terminal`; it sends the gateway as the only MCP server and the sandbox notice via `systemPrompt` append; it answers prompts only with `allow_once` or `reject_once`, chosen by `kind` and paths, never by titles, names or command text; gate-mediated operations are allowed to reach the gate; approvals replayed after `load`/`resume` are never honoured; agent-specific `_meta` (`claudeCode.options`) is set by wicket only | follow-up prompt after grant; `session/resume` or `load` after a wake |
+| **T2: ACP** | Gemini CLI, goose, OpenCode, Cline…, and fallbacks `codex-acp`, Claude's ACP adapter (protocol v1; manifest `harness: acp`) | JSON-RPC over stdio. wicket advertises no `fs`, `terminal` or `auth.terminal`; it sends the gateway as the only MCP server and the sandbox notice via `systemPrompt` append; it answers prompts only with `allow_once` or `reject_once`, chosen by `kind` and paths, never by titles, names or command text; gate-mediated operations are allowed to reach the gate; approvals replayed after `load`/`resume` are never honoured; agent-specific `_meta` (`claudeCode.options`) is set by wicket only | follow-up prompt after grant; `session/resume` or `load` after a wake |
 | **T3: process** | anything; optionally with a structured event stream (`codex exec --json`, `pi --mode json`) | enforcement only at the proxies; `/wicket/out/result.json` outbox validated outside | structured 403 / MCP error with `request_id`; restart with checkpointed workdir |
 
 **Placement is a separate axis:**
