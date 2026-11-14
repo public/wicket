@@ -37,7 +37,7 @@ Unknown keys are errors, so a misspelt setting can't silently stay at its defaul
 | `max_total_usd` | decimal string | required | Every lease together, worst case, in total. |
 | `static_hosts` | list | `[]` | For `static`: `name` (the enrolled node's name), `ssh_target`, `capacity: {vcpus, memory_mib}`, `isolation`, `region`. |
 | `install_static` | boolean | `false` | Run `wicket node install` on a static host when a lease binds it. |
-| `vultr` | object | none | For `vultr`: `region`, `ssh_key_ids` (keys in the Vultr account), `ssh_key` (the private half's path on this host). The API key is the vault secret `vultr-api-key`. |
+| `vultr` | object | none | For `vultr`: `region`, `ssh_key_ids` (keys in the Vultr account), `ssh_key` (the private half's path on this host), `give_up_silent` (default `4m`: a new node that gives no answer of any kind on port 22 for this long fails its lease and is destroyed; once the port answers, setup is waited for up to 15 minutes). The API key is the vault secret `vultr-api-key`. |
 | `node_hosts` | list of strings | | Hosts the CA of a node enrolled for a lease may issue for (`node enrol --hosts`). |
 | `warm_pool` | boolean | `false` | Keep a node whose lease ended until minute 50 of its paid hour instead of destroying it at once. |
 

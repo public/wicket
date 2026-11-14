@@ -44,6 +44,14 @@ wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetim
 - wicket generates the node's ssh host key, installs it through cloud-init as its only host key,
   pins it before the node boots, waits for `node-setup.sh` to finish, enrols the node and removes the
   key from the instance's user data. There is no trust on first use.
+- A node that never comes up on the network is released, not left billing. While waiting, wicket
+  connects to the node's port 22: a connect that is accepted or refused means the network is up
+  (setup may still be running), and wicket waits up to 15 minutes for setup. If every connect times
+  out or is unreachable for `--give-up-silent` (default `4m`), wicket releases the instance (it
+  checks the owner tag first), records a `placement.node_unreachable` audit record with the reason,
+  and says so. Its cost leaves the envelope with it, so you can run `create` again, perhaps in
+  another `--region`. A node that answers but doesn't finish setup within 15 minutes is still left
+  running, with the `wicket place release` command to run.
 - A retried `create` with the same `--idempotency-key` (default: derived from `--name`) finds the
   first instance instead of making a second.
 
@@ -90,6 +98,10 @@ wicket lease release l-…           # end it now
 The agent waits with `request_capacity {lease}`, then starts children there with `spawn` and
 `placement: {"lease": "l-…"}`. At the lease's end, or when its holder run ends, what runs on the
 node stops and the node is destroyed, before the next paid hour.
+
+A node created for a lease that gives no answer on port 22 for `vultr.give_up_silent` (default
+`4m`) fails the lease and is destroyed at once (`reconcile.destroyed`), so it doesn't bill for the
+whole setup timeout.
 
 The reconciler installs wicket on a node it creates for a lease, but not the agent image: build it
 there as above before boxes are placed on it.
