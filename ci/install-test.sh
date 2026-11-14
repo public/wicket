@@ -133,7 +133,7 @@ out=$(as_alex self apply-units 2>&1) && fail "alex applied units: $out"
 grep -q "updated /etc/systemd/system/wicketd.service" /tmp/apply.log || { cat /tmp/apply.log; fail "apply-units said: $(cat /tmp/apply.log)"; }
 cmp -s /etc/systemd/system/wicketd.service /opt/pkg/wicket-*/deploy/systemd/wicketd.service || fail "wicketd.service is not the version'"'"'s"
 out=$(cd / && wicket self update /tmp/wicket-b 2>&1) || true
-case "$out" in *"units differ"*) fail "still refused over units: $out" ;; *"staged $b"*) ;; *) fail "the update after apply-units: $out" ;; esac
+case "$out" in *"units differ"*) fail "still refused over units: $out" ;; *"building wicket/claude-code:$b with $b"*) ;; *) fail "the update after apply-units: $out" ;; esac
 echo "ok: an update to other systemd units waits for root'"'"'s apply-units, then goes on"
 echo "install-test: all checks passed"
 '
