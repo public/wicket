@@ -147,12 +147,14 @@ impl World {
         let sock = dir.join("egress.sock");
         let s2 = sock.clone();
         tokio::spawn(async move { egress.serve(&s2).await });
-        for _ in 0..200 {
+        // Ready once its socket exists (bound and listening): on a loaded host that can take seconds.
+        for _ in 0..3000 {
             if sock.exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(sock.exists(), "the proxy's socket {} never appeared", sock.display());
         World { sock, seen, ledger, dir }
     }
 
