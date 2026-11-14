@@ -9,6 +9,7 @@ mod audit_export;
 mod capacity;
 mod chan;
 mod ci_update;
+mod cli_reference;
 mod cmd;
 mod daemon;
 mod doctor;
