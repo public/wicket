@@ -184,8 +184,7 @@ wicket node revoke n1
   carve-outs, a long-lived agent's budget and the console see what the node spent. A slice is a quarter of
   the zone's budget by default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while
   connected once less than half of it is left: offline, a node spends what is left of its slice and nothing
-  more. With a control host on protocol 1 (#162's skew), the call is relayed to the run's own proxy there
-  as in #151, which adds the credential and counts it.
+  more.
 - **Decisions at the edge** (#164; protocol 5, the list of what a node still asks the control host and why:
   [design §9.2.1](../explanation/design.md)). The node answers `whoami`, `request_access`, `await_grant` and
   `pending_requests` from the box's token, connected or not. Cut off, what needs a human
@@ -228,7 +227,7 @@ wicket node revoke n1
   the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
   the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
   it with the run CA), for: hosts with a credential swap (an `inject` rule's host is terminated and injected on the node, its
-  secret fetched on first use, #152, unless the control host speaks protocol 1),
+  secret fetched on first use, #152),
   hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
   every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
