@@ -125,9 +125,10 @@ that protocol can't survive.
 
 ## Remote sessions and wrapped agents
 
-Two ways for the owner to drive an agent in a box from the vendor's apps: `agent.remote`, which
-boots the harness's own remote-session feature in the box (#169), and `wicket wrap`, which boxes an
-agent process another program launches. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
+Two [harness modes](manifest.md#harness-modes) let the owner drive an agent in a box from the
+vendor's apps: remote (`agent.remote`), which boots the harness's own remote-session feature in the
+box (#169), and wrapped (`wicket wrap`), which boxes an agent process another program launches. Each
+is its harness adapter's; one without the mode refuses it. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
 has both, with what each protects.
 
 Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone
@@ -136,7 +137,7 @@ with `request_access`.
 
 ## ACP agents
 
-An agent with `kind: acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP, wire
+An agent with `harness: acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP, wire
 version 1) on its stdio, and wicket is its client (#66). The manifest names the command
 ([`agent.acp`](manifest.md#agentacp)); the image must already have the agent at a pinned version.
 [Run an ACP agent](../how-to/run-an-acp-agent.md) has an example.
@@ -193,7 +194,7 @@ Not yet:
 `@agentclientprotocol/claude-agent-acp`, which drives the unmodified `claude` through the Agent SDK.
 Whether a Claude subscription may back that is an open question for the owner (research
 [21 §2.6](../explanation/research/21-agent-client-protocol.md#26-claude-code-over-acp-stays-the-fallback-not-the-default)),
-so it is not the default, and wicket's own Claude sessions stay on `kind: claude-code`. It fails closed: a
+so it is not the default, and wicket's own Claude sessions stay on `harness: claude-code`. It fails closed: a
 run (or wake) of the profile on a zone whose `llm` is a Claude subscription is refused unless the
 installation sets `acp.allow_subscription_backed_claude_adapter: true` in
 [`/etc/wicket/wicket.yaml`](configuration.md#wicketyaml). An `acp.command` that starts the adapter must

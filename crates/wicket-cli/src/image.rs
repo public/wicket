@@ -31,9 +31,10 @@ const IMAGE_SOURCES: &[(&str, &str)] = &[
     ("wicket-entry", include_str!("../../../images/claude-code/wicket-entry")),
 ];
 
-/// The agent image's repository, and the tag a box gets when nothing names another.
-pub const REPO: &str = "wicket/claude-code";
-pub const DEFAULT: &str = "wicket/claude-code:poc";
+/// The agent image's repository, and the tag a box gets when nothing names another: the Claude
+/// adapter's (the only harness with an image of wicket's).
+pub const REPO: &str = wicket_agent::claude::IMAGE_REPO;
+pub const DEFAULT: &str = wicket_agent::claude::DEFAULT_IMAGE;
 
 /// A build's own image: `wicket/claude-code:<build id>`.
 pub fn tag_for(build_id: &str) -> String {

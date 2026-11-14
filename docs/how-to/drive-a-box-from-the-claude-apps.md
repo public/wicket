@@ -32,8 +32,9 @@ Two ways to chat with an agent in a wicket box from the Claude apps (desktop, we
 4. Decide what the zone doesn't allow as usual (`wicket pending`, or the console). Deny what a
    session doesn't need.
 
-For `kind: claude-code` this is Remote Control: `claude remote-control --spawn session` in the box.
-Harness adapters that have no such feature refuse the manifest, saying so.
+This is the harness's remote [mode](../reference/manifest.md#harness-modes). For
+`harness: claude-code` it is Remote Control: `claude remote-control --spawn session` in the box.
+Harness adapters that have no remote mode refuse the manifest, saying so.
 
 What it protects, and how:
 

@@ -82,7 +82,7 @@
 <rect x="764" y="419" width="330" height="150" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
 <text x="776" y="440" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">The agent</text>
 <text x="776" y="460" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Claude Code today; others through</text>
-<text x="776" y="477" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">adapters (agent.kind; Codex, opencode: #174).</text>
+<text x="776" y="477" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">adapters (agent.harness; Codex, opencode: #174).</text>
 <text x="776" y="494" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Or a pinned program without an agent.</text>
 <text x="776" y="511" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Sees only placeholders for credentials.</text>
 <text x="776" y="528" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Workspace: a copy, or a folder in place;</text>

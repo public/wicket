@@ -160,7 +160,7 @@ pub enum SelfCmd {
         node: Vec<String>,
         #[arg(long)]
         canary: Option<PathBuf>,
-        #[arg(long, default_value = "wicket/claude-code:poc")]
+        #[arg(long, default_value = crate::image::DEFAULT)]
         image: String,
     },
 }
