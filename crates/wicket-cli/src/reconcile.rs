@@ -6,8 +6,8 @@
 //!   `<machine>:<pid>:<start>`) is gone on this machine is asked about on its node (#151). If the node
 //!   still has its box, the run is **adopted**: a new supervisor (`wicket attach <run>`) takes it over,
 //!   its box untouched. If the node says the box is gone, the run is ended as `lost`; if the node
-//!   can't be reached, the run is left for the next pass. A run with no node recorded (from before
-//!   #146) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
+//!   can't be reached, the run is left for the next pass. A run with no node recorded (its process
+//!   died before it reached one) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
 //!   tell.
 //! - *Leases* (`wicket_store::LeaseRow`): a pending lease whose request a human granted becomes
 //!   `approved`, one denied or withdrawn ends. An approved or active lease ends when its holder run has

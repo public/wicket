@@ -27,8 +27,10 @@ pub enum DevCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// A scripted stand-in for the Anthropic Messages API: the first turn runs one Bash command,
-    /// the second ends the conversation. Lets the whole path be tested without an API key.
+    /// A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then
+    /// calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a
+    /// `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without
+    /// an API key.
     MockLlm {
         #[arg(long, default_value = "127.0.0.1:9999")]
         listen: String,

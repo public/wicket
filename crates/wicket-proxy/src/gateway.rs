@@ -132,6 +132,8 @@ impl Gateway {
             "links" => crate::link::list(&self.ctx),
             "request_capacity" => self.request_capacity(&args).await,
             "request_update" => self.request_update(&args),
+            "finish" => self.want(crate::Want::Finish),
+            "hibernate" => self.want(crate::Want::Hibernate),
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
@@ -310,7 +312,8 @@ impl Gateway {
             wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host this sandbox can see."), false),
             wicket_core::HostVerdict::Open => {}
         }
-        let op = wicket_core::Op::egress_with_query(&self.ctx.tenant, &self.ctx.run, &self.ctx.zone.name, &method, &host, &path, query);
+        // A push's discovery is asked for as the push it is part of (#26).
+        let op = wicket_core::git::op_for(&self.ctx.tenant, &self.ctx.run, &self.ctx.zone.name, &method, &host, &path, query);
         match self.ctx.zone.evaluate(&op) {
             wicket_core::Verdict::AllowByReach(_) if !prefix => {
                 return (format!("{method} {host}{path} is already allowed: just make the request."), false)
@@ -432,6 +435,25 @@ impl Gateway {
             ),
             Err(e) => (format!("not requested: {e}"), true),
         }
+    }
+
+    /// `finish` and `hibernate` (#249): the agent decides its own lifetime; its supervisor acts at
+    /// the end of the agent's turn.
+    fn want(&self, w: crate::Want) -> (String, bool) {
+        let Some(tx) = &self.ctx.lifecycle else {
+            return ("this run's lifetime is its process's: it ends when the process exits".into(), true);
+        };
+        if w == crate::Want::Hibernate && self.ctx.fence.is_none() {
+            return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped or a remote session); call finish when you are done".into(), true);
+        }
+        if tx.send(w).is_err() {
+            return ("this run's supervisor is gone".into(), true);
+        }
+        let text = match w {
+            crate::Want::Finish => "wicket ends your session at the end of this turn: your harness exits, and the run ends. Messages sent to you from now on are not delivered to this run.",
+            crate::Want::Hibernate => "wicket hibernates you at the end of this turn, once nothing but you runs in your box: your box stops and its state is kept. A message to you (or your operator) wakes you, with that message as your next turn. If something else still runs, you go on running and are told nothing more.",
+        };
+        (text.into(), false)
     }
 
     fn pending_requests(&self) -> (String, bool) {
@@ -765,6 +787,16 @@ fn tools() -> Value {
             "description": "List this run's requests that are still waiting for a human decision.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "finish",
+            "description": "End your session when all your work is done: wicket closes your input at the end of this turn, your harness exits and the run ends. wicket never ends it for you: until you call this (or exit), your session stays open for follow-up messages, however long you wait.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "hibernate",
+            "description": "Sleep until a message arrives: at the end of this turn wicket stops your box and keeps its state (workspace, home, /tmp, durable volumes). A message to you, or your operator, wakes you with it as your next turn. Only for long-lived agents; nothing is paused or hibernated unless you (or your operator) ask.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         }
     ])
 }
@@ -839,6 +871,7 @@ mod tests {
                 capacity: None,
                 fence: None,
                 waker: None,
+                lifecycle: None,
             }
         }
     }
@@ -1094,6 +1127,41 @@ mod tests {
         assert!(gw.request_update(&json!({ "sha256": sha.to_uppercase(), "reason": "x" })).1);
         assert!(gw.request_update(&json!({ "sha256": sha })).1);
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "request_update"));
+    }
+
+    /// #26: an agent asking ahead for a push's discovery asks for the push itself, so its one
+    /// request is the one the egress proxy finds when the discovery and the upload are made.
+    #[test]
+    fn asking_ahead_for_a_push_asks_for_the_push() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let mut ctx = w.agent("t0", "z", "pusher", "run_p", None, &[]);
+        let mut zone = ctx.zone.spec().clone();
+        zone.reach = serde_json::from_value(json!([{"host": "github.com", "methods": ["GET", "POST"], "paths": ["/acme/app.git/info/refs", "/acme/app.git/git-upload-pack"]}])).unwrap();
+        ctx.zone = Arc::new(wicket_core::CompiledZone::new(zone).unwrap());
+        let gw = Gateway { ctx };
+        let ask = |url: &str, method: &str| gw.request_access(&json!({ "url": url, "method": method, "reason": "push my branch" }));
+        let (text, err) = ask("https://github.com/acme/app.git/info/refs?service=git-receive-pack", "GET");
+        assert!(!err && text.starts_with("requested:"), "{text}");
+        let pending = w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap();
+        assert_eq!(pending.len(), 1);
+        let r = &pending[0];
+        assert_eq!((r.method.as_str(), r.host.as_str(), r.path.as_str()), ("POST", "github.com", "/acme/app.git/git-receive-pack"));
+        // The upload is the same request, and so is the op the egress proxy decides for either.
+        let (again, _) = ask("https://github.com/acme/app.git/git-receive-pack", "POST");
+        assert!(again.starts_with("already requested:") && again.contains(&r.id), "{again}");
+        let egress = wicket_core::git::op_for(
+            &TenantId("t0".into()),
+            &RunId("run_p".into()),
+            "z",
+            "GET",
+            "github.com",
+            "/acme/app.git/info/refs",
+            "service=git-receive-pack",
+        );
+        assert_eq!(w.ledger.lock().unwrap().pending_for(&egress, "x", None).unwrap(), (r.id.clone(), false));
+        // A fetch's discovery is still itself: allowed by reach, nothing to ask.
+        let (fetch, _) = ask("https://github.com/acme/app.git/info/refs?service=git-upload-pack", "GET");
+        assert!(fetch.contains("already allowed"), "{fetch}");
     }
 
     /// #117's class for UPDATE: `request_access` can't file the request `request_update` files (or

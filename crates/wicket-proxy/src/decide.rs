@@ -100,7 +100,7 @@ fn central(ctx: &RunCtx, op: &Op, who: Option<&(serde_json::Value, String)>) -> 
         Verdict::AllowByReach(i) => return Outcome::Allow(format!("reach rule {i}")),
         Verdict::Forbidden(why) => return Outcome::Forbidden(why),
         Verdict::NeedsGrant(why) if !ctx.escalate => return Outcome::NoEscalation(why),
-        Verdict::NeedsGrant(why) => why,
+        Verdict::NeedsGrant(why) => wicket_core::git::ask_reason(op, &why),
     };
     let mut ledger = ctx.ledger.lock().expect("ledger lock");
     match ledger.consume_grant(op) {
@@ -195,7 +195,11 @@ impl Decider for NodeDecider {
 
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
-            match self.decide_now(op) {
+            let decision = match self.decide_now(op) {
+                Decision::NeedsGrant(why) => Decision::NeedsGrant(wicket_core::git::ask_reason(op, &why)),
+                d => d,
+            };
+            match decision {
                 Decision::Allow(Allowed::Reach(i)) => Outcome::Allow(format!("reach rule {i} (node)")),
                 Decision::Allow(Allowed::Ceiling) => Outcome::Allow("the box's token (node)".into()),
                 Decision::Allow(Allowed::Grant(g)) => Outcome::Allow(format!("grant {g} (counted on the node)")),
@@ -445,6 +449,7 @@ mod tests {
             capacity: None,
             fence: None,
             waker: None,
+            lifecycle: None,
         }
     }
 
@@ -534,6 +539,71 @@ mod tests {
         replica.lock().unwrap().accept(&rev, t1).unwrap();
         link.up.store(true, Ordering::SeqCst);
         assert!(matches!(d.decide(&c, &op("GET", "/other"), None).await, Outcome::Pending { .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #26 at the edge: on a node, from the box's token, a push is one op (its discovery and upload
+    /// share one grant, which covers them until the window ends on the node's clock).
+    #[tokio::test]
+    async fn on_a_node_a_push_is_one_op_with_a_window() {
+        let (mut p, replica, dir, authz_root) = feed();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock: Clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let link = Arc::new(Link { up: AtomicBool::new(true), asks: AtomicI64::new(0) });
+        let d = NodeDecider { replica: replica.clone(), clock, control: link.clone() };
+        let z = Manifest::from_yaml(
+            "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: z\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n",
+        )
+        .unwrap()
+        .zone;
+        let mut c = ctx(true);
+        c.zone = Arc::new(wicket_core::CompiledZone::new(z.clone()).unwrap());
+        let t0 = now.load(Ordering::SeqCst);
+        let tenant = TenantId::single();
+        let issuer = Issuer::root(&authz_root, &tenant.0, "run:run_a", "run_a", 0, &z, &[], 3_600, vec![approver.public()]).unwrap();
+        p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], t0).unwrap();
+        let hello = replica.lock().unwrap().hello();
+        for f in p.catch_up(&hello, t0).unwrap() {
+            replica.lock().unwrap().accept(&f, t0).unwrap();
+        }
+        let run = RunId("run_a".into());
+        let push = Op::egress(&tenant, &run, "z", "POST", "github.com", &wicket_core::git::push_op_path("/acme/app.git"));
+        let fetch = Op::egress(&tenant, &run, "z", "POST", "github.com", "/acme/app.git/git-upload-pack");
+        // A fetch is a read the token allows; the push is asked about, worded as a push.
+        assert!(matches!(d.decide(&c, &fetch, None).await, Outcome::Allow(_)));
+        assert!(
+            matches!(d.decide(&c, &push, None).await, Outcome::Pending { why, .. } if why.starts_with("git push to github.com/acme/app.git"))
+        );
+        // A push grant, as the ledger makes it: no use count, until the window ends.
+        let t1 = t0 + 1_000;
+        now.store(t1, Ordering::SeqCst);
+        let until = u64::try_from(t1 / 1000).unwrap() + wicket_core::git::PUSH_WINDOW_SECS;
+        let g = wicket_authz::Grant {
+            gid: "g-push".into(),
+            box_id: String::new(),
+            epoch: 0,
+            host: "github.com".into(),
+            method: "POST".into(),
+            path: push.path.clone(),
+            not_after: until,
+            approver: "human:test".into(),
+            digest: vec![],
+        };
+        let a = issuer.publish(&approver, &[LiveGrant { grant: g, uses: None }]).unwrap();
+        let delta = p.commit(vec![Change::PutZone { zone: a }], t1).unwrap();
+        replica.lock().unwrap().accept(&delta, t1).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(d.decide(&c, &push, None).await, Outcome::Allow(t) if t.contains("g-push")));
+        }
+        // Past the window, on the node's clock: asked about again.
+        now.store(i64::try_from(until + 1).unwrap() * 1000, Ordering::SeqCst);
+        replica.lock().unwrap().accept(&p.statement(now.load(Ordering::SeqCst)), now.load(Ordering::SeqCst)).unwrap();
+        assert!(matches!(d.decide(&c, &push, None).await, Outcome::Pending { .. }));
+        assert_eq!(link.asks.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

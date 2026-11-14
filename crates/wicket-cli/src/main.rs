@@ -27,6 +27,7 @@ mod nodecall;
 mod noderun;
 mod nodesecrets;
 mod nodesrv;
+mod oci;
 mod owner;
 mod pin;
 mod place;
@@ -119,11 +120,11 @@ enum Cmd {
         adopt: Option<String>,
     },
     /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
-    /// turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A
-    /// long-lived agent can be named by its id or any of its runs; a hibernated one is woken.
+    /// turn; the session stays open until the agent finishes or exits. A long-lived agent can be
+    /// named by its id or any of its runs; a hibernated one is woken.
     Say { run: String, text: Vec<String> },
     /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
-    /// and nothing but the agent runs in its box. Otherwise it stays idle (paused).
+    /// and nothing but the agent runs in its box. Otherwise it goes on running.
     Hibernate {
         run: String,
         /// How long to wait for the outcome (seconds).

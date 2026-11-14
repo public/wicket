@@ -1459,7 +1459,9 @@ Detail: [04 §7].
     never leaves it (Fly's tokenizer).
 - **Pinned/mTLS clients** get SNI-only tunnels, with no inspection and no credentials. Each such tunnel
   appears in the zone view as an unmediated channel.
-- **Git:** smart HTTP only; SSH is denied. Branch and tag rules come from the receive-pack command list.
+- **Git:** smart HTTP only; SSH is denied. A push (its ref discovery and its receive-pack) is one
+  request and one approval, for a short window (#26). Which refs it may update is left to the forge:
+  a token scoped to the task's repositories, and the forge's own branch and tag rules.
   Path rules (`.github/workflows/**`) need **store-and-forward**: receive the push into a quarantined local
   mirror, check the diff with the adapter rules, then push upstream with expected old OIDs. `gix` for the
   mirror.
@@ -1938,7 +1940,7 @@ its label is the join of everything that shaped it.
 - **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
   mounted over its `out/`.
 - **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
-  input. The session stays open for `agent.idle_timeout` after each turn and closes after that. Operator
+  input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
 **Hibernate and wake (#70, 2026-11-12).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0), with `docker pause` for Idle.
@@ -2741,7 +2743,5 @@ of the rest matters.
     - Running wicket's own end-to-end tests from inside needs Docker and gVisor in the box. The host's
       Docker socket would be an escape, so this needs a throwaway node per test run, started as a program
       or tool (§17).
-    - A push is two approvals today: the push discovery and the push itself. A grant scoped to one push
-      would make it one.
     - Steering from a phone needs the console reachable (§14.1).
 14. **Name.** "wicket" is a working name (the small door set into a larger gate).

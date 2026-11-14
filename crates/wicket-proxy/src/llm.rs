@@ -908,6 +908,7 @@ mod tests {
             capacity: None,
             fence,
             waker: None,
+            lifecycle: None,
         }
     }
 

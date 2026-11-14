@@ -106,7 +106,22 @@ pub struct Calls {
     next: AtomicU64,
     /// The protocol version the connection talks (0: none up yet).
     proto: std::sync::atomic::AtomicU32,
+    /// Images being sent (#191): how far the node has taken each, by stream.
+    acks: Mutex<HashMap<u64, tokio::sync::watch::Sender<u64>>>,
 }
+
+/// How far an image's bytes may run ahead of what the node has taken (#191). The channel itself
+/// has no flow control: without this, an image would sit in memory on the way.
+const IMAGE_WINDOW: u64 = 16 << 20;
+/// Where an image delivery's verdict is awaited: its stream without the tunnel bit, which neither a
+/// call's id nor a tunnel's stream can be.
+fn image_done_key(stream: u64) -> u64 {
+    stream & !TUNNEL_BIT
+}
+/// How long the node may take nothing before an image delivery is given up.
+const IMAGE_STALL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long the node may take to verify and import an image it has whole.
+const IMAGE_IMPORT: std::time::Duration = std::time::Duration::from_secs(900);
 
 impl Calls {
     /// The connection is up (`Some`) or gone (`None`): calls in flight fail, tunnels and link sockets end.
@@ -118,6 +133,7 @@ impl Calls {
             self.pending.lock().expect("pending").clear();
             self.exits.lock().expect("exits").clear();
             self.incoming.lock().expect("incoming").clear();
+            self.acks.lock().expect("acks").clear();
         }
     }
 
@@ -162,6 +178,19 @@ impl Calls {
             Frame::Msg(Msg::TunnelOpened { stream, error }) if stream & CONTROL_TUNNEL_BIT != 0 => {
                 if let Some(tx) = self.pending.lock().expect("pending").remove(&stream) {
                     let _ = tx.send(Msg::TunnelOpened { stream, error });
+                }
+                None
+            }
+            Frame::Msg(Msg::Ack { stream, upto }) if stream & CONTROL_TUNNEL_BIT != 0 => {
+                if let Some(w) = self.acks.lock().expect("acks").get(&stream) {
+                    let _ = w.send(upto);
+                }
+                None
+            }
+            Frame::Msg(m @ Msg::ImagePut { .. }) => {
+                let Msg::ImagePut { stream, .. } = &m else { unreachable!() };
+                if let Some(tx) = self.pending.lock().expect("pending").remove(&image_done_key(*stream)) {
+                    let _ = tx.send(m);
                 }
                 None
             }
@@ -323,6 +352,92 @@ impl Calls {
             Ok(Ok(0)) => Ok(()),
             Ok(Ok(c)) => bail!("the node could not archive {tree} (tar exited {c})"),
             _ => bail!("the node did not finish archiving {tree}"),
+        }
+    }
+
+    /// Whether the node has the image `digest` names (#191). Only on connections talking
+    /// [`chan::IMAGE_DELIVERY`].
+    pub async fn has_image(&self, digest: &str) -> Result<bool> {
+        let id = self.id();
+        match self.answer(id, Frame::Msg(Msg::ImageHave { id, digest: digest.into() }), "an image query").await? {
+            Msg::BoxCtlDone { error: Some(e), .. } => bail!("{e}"),
+            Msg::BoxCtlDone { out, .. } => Ok(out.as_deref() == Some("present")),
+            _ => bail!("an unexpected answer to an image query"),
+        }
+    }
+
+    /// Sends the node image `digest`, read as an OCI image layout archive from `from`, to import as
+    /// `name` (#191): returns once the node has verified and imported it. At most [`IMAGE_WINDOW`]
+    /// bytes are in flight. Only on connections talking [`chan::IMAGE_DELIVERY`].
+    pub async fn put_image(&self, digest: &str, name: Option<&str>, mut from: impl AsyncRead + Unpin) -> Result<u64> {
+        let stream = TUNNEL_BIT | CONTROL_TUNNEL_BIT | self.id();
+        let (atx, mut acked) = tokio::sync::watch::channel(0u64);
+        self.acks.lock().expect("acks").insert(stream, atx);
+        let r = self.put_image_on(stream, digest, name, &mut from, &mut acked).await;
+        self.acks.lock().expect("acks").remove(&stream);
+        let mut p = self.pending.lock().expect("pending");
+        p.remove(&stream);
+        p.remove(&image_done_key(stream));
+        r
+    }
+
+    async fn put_image_on(
+        &self,
+        stream: u64,
+        digest: &str,
+        name: Option<&str>,
+        from: &mut (impl AsyncRead + Unpin),
+        acked: &mut tokio::sync::watch::Receiver<u64>,
+    ) -> Result<u64> {
+        // The node's verdict may come before the last byte (it refused the image part way).
+        let (tx, mut done) = oneshot::channel();
+        self.pending.lock().expect("pending").insert(image_done_key(stream), tx);
+        let verdict = |m: Result<Msg, oneshot::error::RecvError>| match m {
+            Ok(Msg::ImagePut { error: None, .. }) => Ok(()),
+            Ok(Msg::ImagePut { error: Some(e), .. }) => Err(anyhow::anyhow!("{e}")),
+            _ => Err(anyhow::anyhow!("lost the node while it took the image")),
+        };
+        let f = Frame::Msg(Msg::PutImage { stream, digest: digest.into(), name: name.map(String::from) });
+        match self.answer(stream, f, "an image delivery").await? {
+            Msg::TunnelOpened { error: None, .. } => {}
+            Msg::TunnelOpened { error: Some(e), .. } => bail!("{e}"),
+            _ => bail!("an unexpected answer to an image delivery"),
+        }
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut sent = 0u64;
+        loop {
+            while sent.saturating_sub(*acked.borrow()) > IMAGE_WINDOW {
+                tokio::select! {
+                    m = &mut done => {
+                        verdict(m)?;
+                        bail!("the node answered before it had the whole image");
+                    }
+                    r = tokio::time::timeout(IMAGE_STALL, acked.changed()) => match r {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => bail!("lost the node while sending the image"),
+                        Err(_) => bail!("the node took none of the image for {} s", IMAGE_STALL.as_secs()),
+                    },
+                }
+            }
+            if let Ok(m) = done.try_recv() {
+                verdict(Ok(m))?;
+                bail!("the node answered before it had the whole image");
+            }
+            let n = from.read(&mut buf).await.context("reading the image")?;
+            if n == 0 {
+                break;
+            }
+            if !self.send(Frame::Data { stream, offset: sent, bytes: buf[..n].to_vec() }) {
+                bail!("lost the node while sending the image");
+            }
+            sent += n as u64;
+        }
+        if !self.send(Frame::Msg(Msg::Close { stream })) {
+            bail!("lost the node while sending the image");
+        }
+        match tokio::time::timeout(IMAGE_IMPORT, done).await {
+            Ok(m) => verdict(m).map(|()| sent),
+            Err(_) => bail!("the node did not import the image within {} s", IMAGE_IMPORT.as_secs()),
         }
     }
 

@@ -38,6 +38,10 @@ Exactly one of `agent` and `program` must be given.
 
 ## `agent`
 
+The agent's harness decides how long it runs (#249): its session stays open after each turn, and the
+run ends when the agent calls wicket's [`finish`](mcp-tools.md#finish) tool or exits, at
+`zone.limits.timeout`, or when its authority ends. wicket has no turn or idle timers.
+
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The agent's name, the last part of its SPIFFE ID (`…/a/<name>`). |
@@ -47,8 +51,6 @@ Exactly one of `agent` and `program` must be given.
 | `max_children` | integer | `0` | How many boxes this agent may start with `spawn` or `spawn_agent`. `0`: neither tool works. A child's own `max_children` counts against its parent's. |
 | `in_box_subagents` | boolean | `true` | Whether Claude Code may run its own subagents (its Agent tool) inside the box. They share the box, its identity and its reach; their requests are attributed but not provably identified. `false` makes wicket children the only kind of subagent. |
 | `image` | string | the agent image | The image the agent's box starts from: the installation's agent image, or one `zone.images` allows. A tag of a repository `zone.images` pins starts as that pin. `wicket run --image` overrides it. See [pins](#image-pins). |
-| `idle_timeout` | duration | `0s` | How long the session stays open after each turn for follow-ups (`wicket say`). `0s`: the run ends when the first task is done. |
-| `hibernate_after` | duration | none | Makes the agent long-lived: after a turn and `idle_timeout` the box is paused, and at `hibernate_after` (from the end of the turn) it is hibernated. Must not be shorter than `idle_timeout`. Not allowed with `remote`. See [agents](agents.md#hibernate-and-wake). |
 | `env` | map of string to string | `{}` | Non-secret environment variables for the agent. Names are `[A-Z0-9_]+`. Refused: `HOME`, `PATH`, `USER`, and names starting `ANTHROPIC_`, `CLAUDE_`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_`, `CURL_`, `NODE_`, `MCP_`, `GIT_SSL` or `WICKET_`. |
 | `adapter_settings` | map | `{}` | Settings for the harness (for Claude Code, its `settings.json`). Only `includeCoAuthoredBy`, `attribution`, `outputStyle`, `alwaysThinkingEnabled` and `language` are allowed. `cleanupPeriodDays` is wicket's own and refused. |
 | `remote` | object | none | A remote session the owner drives from the vendor's apps (for Claude Code, Remote Control). See [`agent.remote`](#agentremote). |
@@ -130,6 +132,19 @@ inspected: see [performance](../explanation/performance.md#splice-through-for-ho
 | `host` | string | required | As in `reach`. |
 | `paths` | list of globs | `["/**"]` | As in `reach`, but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
 
+#### Git pushes
+
+A git push over smart HTTP is decided as one request, the push of its repository
+(`POST {repo}/git-receive-pack`): its ref discovery (`GET {repo}/info/refs?service=git-receive-pack`)
+and its upload share one pending request, and one approval covers both, with git's retries, for
+5 minutes (whatever uses the approver picked). An agent asking ahead with `request_access` for
+either URL asks for that same request. Fetches are reads, as before.
+
+wicket decides which repositories a box may push to, not which refs: it doesn't read the push's
+body. Limit what a push can change where the forge enforces it, by injecting a token scoped to the
+repositories the task needs and protecting branches and tags with the forge's own rules (on GitHub,
+rulesets or branch protection).
+
 ### `inject`
 
 | field | type | default | meaning |
@@ -172,7 +187,7 @@ one reads.
 | `memory` | size | `2g` | Memory, swap included (a box never swaps past it). At least 1 byte. The agent is warned at 90% of it; a box over it is killed by the kernel, and its run says so ([the box](box.md#runtime)). |
 | `cpus` | number | `1` | CPUs. At least 0.01. |
 | `pids` | integer | `512` | Processes. At least 1. |
-| `timeout` | duration | `30m` | Total time in a box over the agent's life, idle time included. Not zero. |
+| `timeout` | duration | `30m` | Total time in a box over the agent's life, time waiting between turns included. Not zero. The box is stopped when it is reached. |
 | `authority` | duration | the `timeout` | How long the box's authority lasts from the run's start: its token's block 0, and so how long its node keeps working for it without the control host. Never longer than `timeout`, never zero. The node stops the box when it ends. |
 | `output` | size | `64m` | How much of the box's output (stdout and stderr) its node's host and the control host's transcript keep, each. At least `64k`. |
 | `on_output_full` | `keep_newest` or `stop` | `keep_newest` | When output passes `output`: keep the newest (the oldest goes, and the bytes dropped are recorded), or stop the box. |
@@ -194,7 +209,10 @@ hex>`, or `sha256:<64 hex>` alone. Anything with `@` must be a valid pin, or the
 
 - **A pin is what a box starts.** Its node finds the image by the pinned reference, or by the digest
   alone, and starts it by its id, the digest Docker reports for it (`docker image inspect`'s `Id`, or one
-  of its `RepoDigests`). A node without it refuses, and moving a tag to another image changes nothing.
+  of its `RepoDigests`). Moving a tag to another image changes nothing.
+- **Delivered if missing.** A remote node that hasn't the image gets it from the control host, over the
+  node channel, and verifies it against the pin before importing it ([nodes](nodes.md#images-on-nodes)).
+  If neither has it, the node refuses the box.
 - **What a pinned entry allows.** In `zone.images`, a pinned entry allows that digest, by the pin
   itself, by the digest alone, or by any tag of the same repository: a child asking for
   `wicket-self:dev` when the zone pins `wicket-self@sha256:…` starts as the pin. Another digest of the
