@@ -204,12 +204,14 @@ impl World {
                 h3.serve(&s2).await
             }
         });
-        for _ in 0..100 {
+        // Ready once its socket exists (bound and listening): on a loaded host that can take seconds.
+        for _ in 0..3000 {
             if sock.exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(sock.exists(), "the proxy's socket {} never appeared", sock.display());
         World { run_ca, names, sock, events: Mutex::new(rx), dir }
     }
 
