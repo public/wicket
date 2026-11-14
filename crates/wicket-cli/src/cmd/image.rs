@@ -20,14 +20,18 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Image { tag, dir, .. } => {
             // An installed version (a control host, or a node after `wicket node install`) builds its own
             // image, `wicket/claude-code:<build id>`, by default: the one its boxes, and the control
-            // host's runs placed on it, ask for.
-            let tag = image::effective(&tag);
+            // host's runs placed on it, ask for. An explicit --tag is kept as given (#277).
+            let own = image::effective(image::DEFAULT);
+            let tag = image::build_tag(tag, &own);
             let ctx = match &dir {
                 Some(d) => image::context(d)?,
                 None => image::embedded_context()?,
             };
+            // A derived image (examples/self-hosting) builds on this installation's own (#277).
+            let df = std::fs::read_to_string(ctx.dir.join("Dockerfile")).unwrap_or_default();
+            let args: Vec<(&str, &str)> = if image::declares_arg(&df, "BASE") { vec![("BASE", own.as_str())] } else { vec![] };
             let d = wicket_sandbox::Docker::from_env();
-            d.build_image(&tag, &ctx.dir).await?;
+            d.build_image(&tag, &ctx.dir, &args).await?;
             // Its digest: what a zone pins it as (#192).
             match d.image_identity(&tag).await? {
                 Some(i) => println!("built {tag} ({}; pin it as {})", i.id, wicket_core::image::pinned(&tag, &i.id)),
