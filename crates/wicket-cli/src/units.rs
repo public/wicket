@@ -4,15 +4,16 @@
 //!
 //! `wicket self update` runs as the wicket user inside wicketd, which can't (and mustn't) write
 //! `/etc/systemd/system`. So on an installed host it refuses to switch to a version whose units
-//! differ from the installed ones, until root applies them with that version's binary
-//! (`sudo <versions>/<id>/wicket self apply-units`): installed and reloaded, never restarted (a
+//! differ from the installed ones, until root applies them with root's own copy of that version
+//! (`sudo /usr/local/lib/wicket/<id>/wicket self apply-units`, #261: never the versions root's
+//! binary, which the wicket user can write): installed and reloaded, never restarted (a
 //! restart of wicketd stops the runs started through it). They take effect when each service next
 //! restarts, so a unit change has to work with the previous version too, like an expand step of the
 //! schema. A rollback is never refused over units: it only warns.
 //!
 //! Only units that run the versions root being updated are compared: the installed
-//! `wicketd.service`'s `ExecStart` binary must resolve into it (`/usr/local/bin/wicket` links to
-//! `<root>/current/wicket`). A host without one (a node), or a development-mode installation on a
+//! `wicketd.service`'s `ExecStart` binary must resolve into it (it runs
+//! `/var/lib/wicket-versions/current/wicket`). A host without one (a node), or a development-mode installation on a
 //! host that also has a system install, has no units of its own to compare: nothing is checked.
 
 use anyhow::{bail, Context, Result};
@@ -84,18 +85,37 @@ pub struct UnitsPending {
     pub version: String,
     pub units: Vec<String>,
     pub dir: PathBuf,
-    pub binary: PathBuf,
+    /// Root's own copy of the version (#261), which applies them.
+    pub root_copy: PathBuf,
+}
+
+/// Where root's own copy of version `id` is (`rootcopy`).
+pub fn root_copy(id: &str) -> PathBuf {
+    Path::new(crate::rootcopy::COPIES).join(id).join("wicket")
+}
+
+/// What root runs to apply version `id`'s units: its own copy of the build, never the versions
+/// root's (the wicket user's); first made from the artifact if root has none yet.
+pub fn apply_hint(id: &str, root_copy: &Path) -> String {
+    let apply = format!("`sudo {} self apply-units`", root_copy.display());
+    if root_copy.is_file() {
+        format!("as root, with root's own copy of it: {apply}")
+    } else {
+        format!(
+            "as root, from root's own copy of it: first `sudo wicket self admit ARTIFACT` with {id}'s artifact (for a CI build, its release archive, downloaded yourself), then {apply}"
+        )
+    }
 }
 
 impl std::fmt::Display for UnitsPending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "refused: version {}'s systemd units differ from those installed in {} ({}). Apply them first, as root: `sudo {} self apply-units`; then run the update again (they take effect as each service next restarts)",
+            "refused: version {}'s systemd units differ from those installed in {} ({}). Apply them first, {}; then run the update again (they take effect as each service next restarts)",
             self.version,
             self.dir.display(),
             self.units.join(", "),
-            self.binary.display()
+            apply_hint(&self.version, &self.root_copy)
         )
     }
 }
@@ -179,32 +199,70 @@ mod tests {
         }
     }
 
+    /// #261: the wicket user's services run the versions root it switches; the one root runs
+    /// (following main) runs root's own link, never a path in the versions root.
+    #[test]
+    fn units_run_the_versions_root_as_wicket_and_roots_copy_as_root() {
+        let versions_bin = format!("{}/current/wicket ", crate::rootcopy::VERSIONS);
+        let root_bin = format!("{} ", crate::rootcopy::LINK);
+        for (n, c) in UNITS {
+            let Some(exec) = c.lines().find_map(|l| l.strip_prefix("ExecStart=")) else { continue };
+            if c.lines().any(|l| l == "User=wicket") {
+                assert!(exec.starts_with(&versions_bin), "{n} runs as wicket: {exec}");
+            } else {
+                assert!(!c.lines().any(|l| l.starts_with("User=")), "{n}");
+                assert!(exec.starts_with(&root_bin), "{n} runs as root: {exec}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_roots_copy() {
+        let e = UnitsPending {
+            version: "0123456789ab".into(),
+            units: vec!["wicketd.service".into()],
+            dir: "/etc/systemd/system".into(),
+            root_copy: "/nonexistent/0123456789ab/wicket".into(),
+        }
+        .to_string();
+        assert!(
+            e.contains("sudo wicket self admit ARTIFACT") && e.contains("`sudo /nonexistent/0123456789ab/wicket self apply-units`"),
+            "{e}"
+        );
+        assert!(!e.contains(crate::rootcopy::VERSIONS), "{e}");
+        let have = std::env::current_exe().unwrap();
+        let e = UnitsPending { version: "x".into(), units: vec![], dir: "/d".into(), root_copy: have.clone() }.to_string();
+        assert!(e.contains(&format!("root's own copy of it: `sudo {} self apply-units`", have.display())) && !e.contains("admit"), "{e}");
+    }
+
     #[test]
     fn differing_units_are_found_and_applied() {
         let d = std::env::temp_dir().join(format!("wicket-units-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let _clean = Remove(d.clone());
         let d = Dir(d);
-        // A versions root, and the link the units run (as /usr/local/bin/wicket is).
+        // A versions root, and the path the units run (as /var/lib/wicket-versions/current/wicket is).
         let (units, root) = (d.path().join("units"), d.path().join("versions"));
         std::fs::create_dir_all(root.join("aaaaaaaaaaaa")).unwrap();
         std::fs::create_dir_all(&units).unwrap();
         std::fs::write(root.join("aaaaaaaaaaaa/wicket"), "").unwrap();
         std::os::unix::fs::symlink("aaaaaaaaaaaa", root.join("current")).unwrap();
-        let link = d.path().join("bin-wicket");
-        std::os::unix::fs::symlink(root.join("current/wicket"), &link).unwrap();
-        let ours = |unit: &str| unit.replace("/usr/local/bin/wicket", &link.display().to_string());
+        let ours = |unit: &str| unit.replace(crate::rootcopy::VERSIONS, &root.display().to_string());
         let want: BTreeMap<String, String> = embedded().into_iter().map(|(n, c)| (n, ours(&c))).collect();
         // No wicketd.service: not an installed host, nothing compared.
         assert_eq!(differing(&units, &root, &want), None);
         apply(Some(units.clone())).unwrap();
-        // The embedded units run /usr/local/bin/wicket, not this root: not ours to compare.
+        // The embedded units run /var/lib/wicket-versions, not this root: not ours to compare.
         assert_eq!(differing(&units, &root, &want), None);
         for (n, c) in &want {
             std::fs::write(units.join(n), c).unwrap();
         }
         assert_eq!(differing(&units, &root, &want), Some(vec![]));
-        std::fs::write(units.join("wicketd.service"), ours("[Service]\nExecStart=/usr/local/bin/wicket daemon --other\n")).unwrap();
+        std::fs::write(
+            units.join("wicketd.service"),
+            ours("[Service]\nExecStart=/var/lib/wicket-versions/current/wicket daemon --other\n"),
+        )
+        .unwrap();
         std::fs::remove_file(units.join("wicket-follow.timer")).unwrap();
         assert_eq!(differing(&units, &root, &want), Some(vec!["wicket-follow.timer".to_string(), "wicketd.service".to_string()]));
         // Another versions root (a development-mode installation on the same host): not compared.

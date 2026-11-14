@@ -96,7 +96,9 @@ pub struct ClaudeAdapterSettings {
 /// Refuses, at run start, a manifest that runs the Claude adapter in a way the installation's
 /// settings (read from `settings_path`) don't allow (#66). Every other agent passes.
 pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings, settings_path: &str) -> Result<(), String> {
-    let Some(spec) = m.agent.as_ref().filter(|a| a.kind == "acp").and_then(|a| a.acp.as_ref()) else { return Ok(()) };
+    let Some(spec) = m.agent.as_ref().filter(|a| a.harness == wicket_core::Harness::Acp).and_then(|a| a.acp.as_ref()) else {
+        return Ok(());
+    };
     if !is_claude_adapter(spec) {
         return Ok(());
     }
@@ -110,7 +112,7 @@ pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings
         return Err(format!(
             "this zone runs Claude Code through its ACP adapter (the Claude Agent SDK) on the Claude subscription in zone.llm, \
              which this installation doesn't allow. Whether the subscription may back the adapter is the owner's decision; \
-             to allow it, set acp.allow_subscription_backed_claude_adapter: true in {settings_path}. Meanwhile, run Claude Code as kind: claude-code"
+             to allow it, set acp.allow_subscription_backed_claude_adapter: true in {settings_path}. Meanwhile, run Claude Code as harness: claude-code"
         ));
     }
     Ok(())

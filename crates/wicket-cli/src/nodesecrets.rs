@@ -93,6 +93,23 @@ pub fn release(zone: &wicket_core::ZoneSpec, vault: &wicket_proxy::vault::Vault,
     Ok(Fetched { name: name.into(), value, hosts: vault.hosts(name), not_after, upstream_expiry: vault.expires_at(name) })
 }
 
+/// A secret released for a registry pull only (#191: a node pulling a box's image): the vault's
+/// binding must cover every host it may be sent to, `hosts` (`host[:port]`; the port doesn't count).
+pub fn release_for_hosts(vault: &wicket_proxy::vault::Vault, name: &str, hosts: &[String], not_after: i64) -> Result<Fetched, String> {
+    let bare = |h: &str| -> String {
+        match h.rsplit_once(':') {
+            Some((a, p)) if p.chars().all(|c| c.is_ascii_digit()) => a.trim_start_matches('[').trim_end_matches(']').to_string(),
+            _ => h.to_string(),
+        }
+    };
+    let hosts: Vec<String> = hosts.iter().map(|h| bare(h)).collect();
+    for h in &hosts {
+        vault.check(name, h).map_err(|e| e.to_string())?;
+    }
+    let value = vault.get(name).map_err(|e| e.to_string())?;
+    Ok(Fetched { name: name.into(), value, hosts, not_after, upstream_expiry: vault.expires_at(name) })
+}
+
 /// What the control host last released, to tell a change (rotation, removal, rebinding) from none.
 pub fn digest(f: &Fetched) -> String {
     use sha2::Digest;
@@ -560,6 +577,19 @@ mod tests {
         v.set("other", "x-other").unwrap();
         v.set_hosts("other", &["api.github.com".into()]).unwrap();
         v
+    }
+
+    #[test]
+    fn a_registry_secret_is_released_only_for_hosts_its_binding_covers() {
+        let d = tmp("registry");
+        let v = Vault::new(d.join("vault"));
+        v.set("reg", "u:p").unwrap();
+        v.set_hosts("reg", &["registry.example.com".into(), "auth.example.com".into()]).unwrap();
+        let f = release_for_hosts(&v, "reg", &["registry.example.com:5000".into(), "auth.example.com".into()], 1).unwrap();
+        assert_eq!((f.value.as_str(), f.hosts.clone()), ("u:p", vec!["registry.example.com".to_string(), "auth.example.com".to_string()]));
+        assert!(release_for_hosts(&v, "reg", &["registry.example.com".into(), "elsewhere.example.com".into()], 1).is_err());
+        assert!(release_for_hosts(&v, "missing", &["registry.example.com".into()], 1).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     fn fetcher(v: Vault, z: wicket_core::ZoneSpec, up: Arc<AtomicI64>, calls: Arc<AtomicU64>) -> Fetcher {

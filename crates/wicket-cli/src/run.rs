@@ -45,10 +45,11 @@ impl Stopper {
     }
 
     /// Whether the box is at a quiet point (only the agent's runtime running), as `user`.
-    async fn check_quiet(&self, user: &str, agent: &[String]) -> std::result::Result<(), String> {
+    /// `harness` says which processes are the harness's own.
+    async fn check_quiet(&self, user: &str, harness: &(dyn Fn(&str) -> bool + Sync), agent: &[String]) -> std::result::Result<(), String> {
         let out = self.0.calls.ctl(&self.0.run, "processes", user, "").await.map_err(|e| format!("{e:#}"))?;
         let procs: Vec<(u32, u32, String)> = serde_json::from_str(out.as_deref().unwrap_or("[]")).map_err(|e| e.to_string())?;
-        crate::hibernate::quiet(&procs, agent).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
+        crate::hibernate::quiet(&procs, harness, agent).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
     }
 }
 
@@ -176,17 +177,16 @@ fn supervise_lock(dir: &Path) -> Result<SupervisorLock> {
 
 /// Every secret the manifest would send goes only to hosts the vault binds it to: the model secret
 /// to its upstream, each injected secret to its rule's host (a `*.` rule needs a `*.` binding
-/// covering it), and a wrapped agent's login to Anthropic's API. Checked again where each is sent.
+/// covering it), and a wrapped agent's login to the host its harness adapter swaps it toward.
+/// Checked again where each is sent.
 pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<()> {
     if let Some(llm) = &m.zone.llm {
         let url = reqwest::Url::parse(&llm.upstream).with_context(|| format!("llm.upstream {:?}", llm.upstream))?;
         let host = url.host_str().with_context(|| format!("llm.upstream {:?} has no host", llm.upstream))?;
         vault.check(&llm.secret, host).context("the zone's model route")?;
-        if wrapped {
-            vault.check(&llm.secret, "api.anthropic.com").context("the wrapped agent's login")?;
-        }
-    } else if wrapped {
-        vault.check("claude-oauth", "api.anthropic.com").context("the wrapped agent's login")?;
+    }
+    if let Some(login) = wicket_agent::harness::of(m).and_then(|a| a.login(m)).filter(|_| wrapped) {
+        vault.check(&login.secret, login.host).context("the wrapped agent's login")?;
     }
     for i in &m.zone.inject {
         if i.optional && !vault.has(&i.secret) {
@@ -334,12 +334,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let vault = Vault::new(Vault::default_dir());
     check_secret_hosts(&m, &vault, wrap.is_some())?;
-    // A remote session (#169): its harness registers with its vendor using the account login.
-    let remote = m.agent.as_ref().is_some_and(|a| a.remote.is_some());
+    // The agent's harness adapter, and the mode it runs in: driven by wicket, remote (#169: the
+    // harness registers with its vendor using the account login), or wrapped. None for a program.
+    let harness = wicket_agent::harness::of(&m);
+    let mode = match &m.agent {
+        Some(a) => Some(wicket_agent::harness::Mode::of(a, wrap.as_deref()).map_err(anyhow::Error::msg)?),
+        None if wrap.is_some() => bail!("only an agent can be wrapped"),
+        None => None,
+    };
+    let remote = matches!(mode, Some(wicket_agent::harness::Mode::Remote(_)));
     if remote {
-        if wrap.is_some() {
-            bail!("agent.remote boots its own session in the box: it isn't wrapped");
-        }
         let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
         if vault.hosts(secret).is_empty() {
             bail!("agent.remote: the login secret {secret:?} is bound to no hosts, so it would be swapped in nowhere");
@@ -390,8 +394,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if record.is_none() && wake.is_none() {
         crate::images_policy::check(&m, image, &crate::image::effective(crate::image::DEFAULT))?;
     }
-    let (workload, workload_kind) = match (&m.agent, &m.program) {
-        (Some(a), _) => (a.name.clone(), a.kind.clone()),
+    // The workload's name, and what runs it: an agent's harness, or a program's command.
+    let (workload, workload_runs) = match (&m.agent, &m.program) {
+        (Some(a), _) => (a.name.clone(), a.harness.to_string()),
         (_, Some(p)) => (p.name.clone(), "program".to_string()),
         _ => unreachable!("validated"),
     };
@@ -429,11 +434,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
-    // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent.
-    let long_lived =
-        m.agent.as_ref().is_some_and(|a| matches!(a.kind.as_str(), "claude-code" | "acp") && a.remote.is_none()) && wrap.is_none();
+    // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent: only the
+    // driven mode is long-lived.
+    let long_lived = matches!(mode, Some(wicket_agent::harness::Mode::Driven));
     if wake.is_some() && !long_lived {
-        bail!("only a local agent (claude-code or acp) can be woken");
+        bail!("only an agent wicket drives itself (not a remote or wrapped session) can be woken");
     }
     let dir = data_dir().join("runs").join(&run.0);
     std::fs::create_dir_all(&dir)?;
@@ -450,9 +455,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         println!("[wicket] restored and verified the agent's state in {} ms", t0.elapsed().as_millis());
     }
-    // What wicket mounts and writes into must be real directories, whatever a restored bundle held.
+    // What wicket mounts and writes into must be real directories, whatever a restored bundle held:
+    // wicket's own, and the harness's config directories.
+    let state_dirs: Vec<String> = harness.map(|h| h.state_dirs(&m)).unwrap_or_default();
     crate::hibernate::real_dirs(
-        &["ctl", "sock", "ca", "state", "state/home", "state/claude", "workspace", "workspace/out"].map(|s| dir.join(s)),
+        &["ctl", "sock", "ca", "state", "state/home", "workspace", "workspace/out"]
+            .into_iter()
+            .map(String::from)
+            .chain(state_dirs.iter().map(|d| format!("state/{d}")))
+            .map(|s| dir.join(s))
+            .collect::<Vec<_>>(),
     )?;
     // An agent's /tmp is a directory its node keeps with the rest of its state (and through a crash),
     // capped at the size the tmpfs had. Programs keep the tmpfs.
@@ -537,7 +549,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some(&run),
             "run.start",
             &serde_json::json!({
-                "zone": m.zone.name, "agent": workload, "kind": workload_kind, "isolation": m.zone.isolation, "image": image,
+                "zone": m.zone.name, "agent": workload, "kind": if m.program.is_some() { "program" } else { "agent" },
+                "harness": m.agent.as_ref().map(|a| a.harness), "isolation": m.zone.isolation, "image": image,
                 "reach": m.zone.reach.len(), "task": m.task,
                 "program_digest": program_src.as_ref().map(|(_, d)| d.clone()),
                 "program_pinned": m.program.as_ref().map(|p| p.digest.is_some()),
@@ -645,13 +658,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     };
                     (pc.principal.clone(), Some(pc.act_for_child()))
                 }
+                // The human driving a wrapped session, as its harness's launcher says.
                 None if wrap.is_some() => {
-                    // The human driving the session through their claude.ai account.
-                    let who = std::env::var("CLAUDE_CODE_BRIDGE_OWNER_ACCOUNT_UUID").unwrap_or_else(|_| "unknown".into());
-                    (
-                        serde_json::json!({ "type": "human", "id": format!("claude.ai account {who}"), "via": "remote-control", "assurance": "claude.ai login" }),
-                        None,
-                    )
+                    let env: Vec<(String, String)> = std::env::vars().collect();
+                    (harness.expect("a wrapped agent").wrapped_principal(&env), None)
                 }
                 None => (crate::cli_principal(), None),
             };
@@ -779,31 +789,21 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some((serde_json::to_value(&a).ok()?, a.summary()))
         }))
     };
-    // A wrapped Claude Code session: placeholders in the box, real credentials swapped at the proxy.
-    let wrapped = match &wrap {
-        None if !remote => None,
-        Some(argv) => {
-            if m.agent.as_ref().map(|a| a.kind.as_str()) != Some("claude-code") {
-                bail!("only claude-code agents can be wrapped");
-            }
-            // Only the login's non-secret fields (scopes, subscription type) are kept.
+    // A remote or wrapped session: the harness adapter's own plan (it refuses a mode its harness
+    // hasn't), with placeholders in the box and the real credentials swapped at the proxy.
+    let wrapped = match (harness, mode) {
+        (Some(h), Some(wicket_agent::harness::Mode::Wrapped(argv))) => {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-            let login_meta = std::fs::read(home.join(".claude/.credentials.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v.get("claudeAiOauth").cloned())
-                .map(|o| serde_json::json!({ "scopes": o.get("scopes"), "subscriptionType": o.get("subscriptionType"), "rateLimitTier": o.get("rateLimitTier") }))
-                .unwrap_or(serde_json::Value::Null);
             let env: Vec<(String, String)> = std::env::vars().collect();
-            Some(wicket_agent::claude_code_wrapped_plan(&m, &run, argv, &env, &login_meta).map_err(|e| anyhow::anyhow!("{e}"))?)
+            Some(h.wrapped_plan(&m, &run, argv, &env, &home).map_err(anyhow::Error::msg)?)
         }
-        // A remote session (#169): the adapter's own (it refuses if its harness has none). Only the
-        // login's non-secret fields go in, from the file the zone's secret links to.
-        None => {
+        // Only the login's non-secret fields go in, from the file the zone's secret links to.
+        (Some(h), Some(wicket_agent::harness::Mode::Remote(_))) => {
             let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
-            let meta = wicket_agent::remote_login_meta(&m, vault.linked_object(secret).as_ref(), vault.linked_file(secret).as_deref());
-            Some(wicket_agent::remote_plan(&m, &run, &meta).map_err(|e| anyhow::anyhow!("{e}"))?)
+            let meta = h.remote_login_meta(vault.linked_object(secret).as_ref(), vault.linked_file(secret).as_deref());
+            Some(h.remote_plan(&m, &run, &meta).map_err(anyhow::Error::msg)?)
         }
+        _ => None,
     };
     let swaps = match &wrapped {
         None => vec![],
@@ -822,26 +822,21 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 })
                 .collect()
         }
-        Some(w) => {
-            let login_secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_else(|| "claude-oauth".into());
-            let mut v = vec![wicket_proxy::CredentialSwap {
+        // A wrapped session's: what its adapter says the box holds placeholders for.
+        Some(w) => w
+            .swaps
+            .iter()
+            .map(|s| wicket_proxy::CredentialSwap {
                 box_bearers: false,
-                name: "claude login".into(),
-                host: "api.anthropic.com".into(),
-                placeholder: w.login_placeholder.clone(),
-                real: wicket_proxy::SwapSource::Vault(login_secret),
-            }];
-            if let Some(t) = &w.session_token {
-                v.push(wicket_proxy::CredentialSwap {
-                    box_bearers: false,
-                    name: "remote-control session".into(),
-                    host: "api.anthropic.com".into(),
-                    placeholder: w.session_placeholder.clone(),
-                    real: wicket_proxy::SwapSource::Value(t.clone()),
-                });
-            }
-            v
-        }
+                name: s.name.into(),
+                host: s.host.into(),
+                placeholder: s.placeholder.clone(),
+                real: match &s.real {
+                    wicket_agent::harness::SwapSource::Secret(n) => wicket_proxy::SwapSource::Vault(n.clone()),
+                    wicket_agent::harness::SwapSource::Value(v) => wicket_proxy::SwapSource::Value(v.clone()),
+                },
+            })
+            .collect(),
     };
     // request_capacity (#7): agents may ask when a placement backend is configured; a human decides.
     let capacity = match (&m.agent, crate::capacity::PlacementConfig::load()) {
@@ -960,24 +955,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
 
     let is_program = m.program.is_some();
-    let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped) {
-        (Some(p), _) => (p, vec![]),
-        (None, Some(w)) => (w.plan, w.files),
-        (None, None) if m.agent.as_ref().is_some_and(|a| a.kind == "acp") => {
-            let mut p = wicket_agent::acp_plan(&m, &run).context("an ACP agent's plan")?;
-            if let Some(c) = p.acp.as_mut() {
-                // A wake continues the agent's own session (the id its agent chose, #66).
-                c.resume = session.resume.then(|| session.id.clone()).filter(|s| wicket_agent::acp::valid_session_id(s));
-            }
-            (p, vec![])
+    let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped, harness) {
+        (Some(p), _, _) => (p, vec![]),
+        (None, Some(w), _) => (w.plan, w.files),
+        // Driven: the task is the first turn, or what woke the agent.
+        (None, None, Some(h)) => {
+            let first = wake.as_ref().map_or(m.task.as_str(), |w| w.first.as_str());
+            (h.plan(&m, &run, &session, first).map_err(anyhow::Error::msg)?, vec![])
         }
-        (None, None) => {
-            let mut p = wicket_agent::claude_code_plan(&m, &run, &session);
-            if let Some(w) = &wake {
-                p.stdin_task = Some(wicket_agent::user_message(&w.first));
-            }
-            (p, vec![])
-        }
+        (None, None, None) => unreachable!("validated: an agent or a program"),
     };
     let box_root = dir.clone();
     for (rel, body) in &wrap_files {
@@ -997,20 +983,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (Some(w), true) => vec![(w.display().to_string(), wicket_agent::WORKSPACE.into(), false), outbox],
         _ => vec![],
     };
-    // The agent's adapter settings (allowlisted keys only, plus what wicket owns, such as
-    // cleanupPeriodDays), in its own config dir. Written after any restore, so wicket's values win.
-    let mut state_files: Vec<(String, String)> = vec![];
-    if wicket_agent::uses_claude_settings(&m) {
+    // The harness's own files (its adapter settings: allowlisted keys only, plus what wicket owns,
+    // such as cleanupPeriodDays), in its config dir. Written after any restore, so wicket's values win.
+    let state_files: Vec<(String, String)> = {
         use base64::Engine;
-        let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(&m))?;
-        state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
-    }
+        let files = harness.map(|h| h.state_files(&m)).unwrap_or_default();
+        files.into_iter().map(|(rel, body)| (rel, base64::engine::general_purpose::STANDARD.encode(body))).collect()
+    };
     // The box's own user, as its node runs it.
     let box_user = String::new();
     let interactive = plan.stdin_task.is_some() || plan.acp.is_some() || wrap_cwd.is_some();
     let stdin_task = plan.stdin_task.clone();
     let acp_cfg = plan.acp.clone();
-    // An ACP agent's own command: its runtime, for the quiet-point check (Claude Code is known).
+    // An ACP agent's own command: its runtime, for the quiet-point check (with its harness's own).
     let agent_cmd: Vec<String> = if acp_cfg.is_some() { plan.argv.iter().skip(1).cloned().collect() } else { vec![] };
     let name = crate::links::box_name(&run.0);
     let spec = SandboxSpec {
@@ -1037,7 +1022,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         m.zone.name,
         if is_program { "program" } else { "agent" },
         workload,
-        workload_kind
+        workload_runs
     );
     println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
     if let Some(i) = &identity {
@@ -1144,6 +1129,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             ca_pem: ca.cert_pem(),
             workspace_tar: String::new(),
             state_files: state_files.clone(),
+            state_dirs: state_dirs.clone(),
             volumes: m.zone.volumes.iter().map(|v| (v.name.clone(), v.path.clone())).collect(),
             streams: [1, 2, 3],
             binds,
@@ -1473,7 +1459,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         // what the owner needs (recorded once, and shown on the console's card).
                         println!("[remote] {}", wicket_agent::clip(&l, 300));
                         if remote_url.is_none() {
-                            if let Some(u) = wicket_agent::remote_session_url(&m, &l) {
+                            if let Some(u) = harness.and_then(|h| h.remote_session_url(&l)) {
                                 println!("[wicket] remote session: {u}");
                                 if let Ok(lg) = ledger.lock() {
                                     let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
@@ -1683,7 +1669,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     hib_asked = false;
                     match &fence {
                         None => println!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
-                        Some(f) => match stopper.check_quiet(&box_user, &agent_cmd).await {
+                        Some(f) => match stopper.check_quiet(&box_user, &|c: &str| harness.is_some_and(|h| h.is_runtime(&m, c)), &agent_cmd).await {
                             Ok(()) => {
                                 println!("[wicket] quiet point: hibernating agent {}", f.agent);
                                 set_state("hibernating", None);

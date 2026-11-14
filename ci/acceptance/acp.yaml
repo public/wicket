@@ -6,7 +6,7 @@
 task: Misbehave, then stop.
 agent:
   name: acp
-  kind: acp
+  harness: acp
   acp: { command: [python3, /workspace/agent.py] }
 zone:
   name: acc-acp

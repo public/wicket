@@ -8,8 +8,9 @@ Where wicket keeps what. On an installed control host the data directory is `/va
 
 | path | what |
 |---|---|
-| `/usr/local/bin/wicket` | A link to `/var/lib/wicket-versions/current/wicket` (installed). |
-| `/var/lib/wicket-versions/` | The [versions root](#versions). |
+| `/usr/local/bin/wicket` | Root's link to one of root's copies, `/usr/local/lib/wicket/<build id>/wicket` (installed; #261). |
+| `/usr/local/lib/wicket/` | Root's own copies of wicket builds (root's, 0755): the only wicket binaries root runs. |
+| `/var/lib/wicket-versions/` | The [versions root](#versions) (the `wicket` user's; its services run `current/wicket`). |
 | `/etc/wicket/wicketd.yaml`, `/etc/wicket/console.env` | The daemon's policy and the console's options ([daemon](daemon.md)). |
 | `/usr/local/share/wicket/` | The agent image's build directory. |
 | `/run/wicket/wicketd.sock` | The daemon's socket. |
@@ -33,7 +34,7 @@ Where wicket keeps what. On an installed control host the data directory is `/va
 | `snapshots/<time>-<version>.db` | Ledger snapshots taken before each `wicket self update` switch; the newest five are kept. |
 | `pids/` | Pid files of the console and the reconciler, which `wicket self update` signals. |
 | `release-keys/*.pub` | Release keys updates are accepted from. |
-| `images.yaml` | The installation's image policy (#192): `require_digests: true` refuses a run unless its image and its zone's `images` are pinned by digest (the installation's own agent image excepted). |
+| `images.yaml` | The installation's image policy (#192, #191): `require_digests: true` refuses a run unless its image and its zone's `images` are pinned by digest (the installation's own agent image excepted). `registries` lists the registries nodes may pull pinned images from, host-side: each `host` (`host[:port]`; `docker.io` for Docker Hub), and optionally its `secret` (a vault secret bound to the registry's hosts: `user:password` or a token), `auth_hosts` (its token service) and `blob_hosts` (where it redirects downloads). See [nodes](nodes.md#images-on-nodes). |
 | `ci-builds.yaml` | The repository whose CI-signed builds of main this installation takes, its token's vault secret, and `self follow`'s policy (#190). |
 | `follow.json` | What `self follow` remembers: builds whose update failed here, and why it last didn't update. |
 | `self-update.lock` | Held by the update or rollback running on this host. |
@@ -109,7 +110,9 @@ Secrets a node fetched are never on its disk: they are in `serve`'s memory only.
   8e21d07f9a55/…                     another
   current  -> 8e21d07f9a55           what runs
   previous -> 3f9c0a1b2c4d           what `wicket self rollback` goes back to
-/usr/local/bin/wicket -> /var/lib/wicket-versions/current/wicket
+/usr/local/lib/wicket/               (root's own copies; root's, 0755)
+  8e21d07f9a55/wicket                root's copy of a build
+/usr/local/bin/wicket -> /usr/local/lib/wicket/8e21d07f9a55/wicket
 ```
 
 A build id is the first 12 hex digits of the binary's sha256. In development mode the versions root

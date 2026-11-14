@@ -84,8 +84,9 @@ exchanged, for the logs and for the health gate.
 | 5 | Decisions at the edge (#164): `BoxStart.edge` (what the node decides gateway tools and spawns from: the identity's stable claims, the box's manifest, base token, grant keys, time and slots), `Spawned` and `Adopted` (a child the node started, and its takeover), `Ask.prefix`, and `Listen.dial` (a link the node carries between its own boxes). With an older peer a node relays every gateway tool call, as before. |
 | 6 | Images pinned by digest (#192): `BoxStart.image_pin`, which the node checks against the image it starts (then started by its id), and the digest it started in `Started` and `Spawned`. A pinned box goes only to a node talking 6. |
 | 7 | Images delivered over the channel (#191): `ImageHave` (does the node have this digest), and `PutImage`, an OCI image layout archive on a control-host stream whose data frames the node acknowledges (`Ack`) as it takes them, ended by `Close` and answered by `ImagePut` once the node has verified and imported it, or refused it. With an older node, the image must be there already. |
+| 8 | Images pulled by the node from an allowlisted registry, host-side (#191): `PullImage` (the digest, the registry and repository, the hosts the pull may reach and the name of the registry's secret, which the node fetches for the run) and `ImagePulled`. With a node talking 7, the image is sent instead. |
 
-wicket speaks version 7.
+wicket speaks version 8.
 
 ## Ledger schema
 

@@ -54,19 +54,18 @@ mod tests {
 
     #[test]
     fn the_claude_adapter_on_a_subscription_is_refused_unless_the_installation_allows_it() {
-        let claude = manifest("{name: a, kind: acp, acp: {command: [claude-agent-acp], profile: claude-agent-acp}}", true);
+        let claude = manifest("{name: a, harness: acp, acp: {command: [claude-agent-acp], profile: claude-agent-acp}}", true);
         let e = check_run(&claude, &Settings::default()).unwrap_err().to_string();
-        assert!(e.contains("acp.allow_subscription_backed_claude_adapter: true") && e.contains("kind: claude-code"), "{e}");
+        assert!(e.contains("acp.allow_subscription_backed_claude_adapter: true") && e.contains("harness: claude-code"), "{e}");
         assert!(check_run(&claude, &allowed(false)).is_err());
         // The owner's opt-in.
         assert!(check_run(&claude, &allowed(true)).is_ok());
         // The adapter by its command alone must use the profile (and so this check).
-        let bare = manifest("{name: a, kind: acp, acp: {command: [npx, '@agentclientprotocol/claude-agent-acp@0.104.1']}}", false);
+        let bare = manifest("{name: a, harness: acp, acp: {command: [npx, '@agentclientprotocol/claude-agent-acp@0.104.1']}}", false);
         assert!(check_run(&bare, &allowed(true)).unwrap_err().to_string().contains("profile: claude-agent-acp"));
         // Nothing else is affected.
-        assert!(
-            check_run(&manifest("{name: a, kind: acp, acp: {command: [gemini, --experimental-acp]}}", false), &Settings::default()).is_ok()
-        );
+        assert!(check_run(&manifest("{name: a, harness: acp, acp: {command: [gemini, --experimental-acp]}}", false), &Settings::default())
+            .is_ok());
         assert!(check_run(&manifest("{name: a}", true), &Settings::default()).is_ok());
     }
 

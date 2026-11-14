@@ -70,10 +70,10 @@ pub enum OnPending {
 #[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub name: String,
-    /// `claude-code` (default: Claude Code's stream-json, spoken by wicket) or `acp` (any agent that
-    /// speaks the Agent Client Protocol, started from `acp.command`, #66).
-    #[serde(default = "default_agent_kind")]
-    pub kind: String,
+    /// The harness that runs the agent in its box: `claude-code` (default) or `acp`. Its adapter
+    /// (`wicket-agent`) is the only part of wicket that knows it.
+    #[serde(default)]
+    pub harness: Harness,
     /// Model id passed to the agent; None = the agent's default.
     #[serde(default)]
     pub model: Option<String>,
@@ -100,13 +100,13 @@ pub struct AgentSpec {
     /// to keys that can't change what the agent can reach or run (ADAPTER_SETTINGS_ALLOWED).
     #[serde(default)]
     pub adapter_settings: serde_json::Map<String, serde_json::Value>,
-    /// A remote session (#169): the harness in the box registers its own session with its vendor's
-    /// apps, and the owner drives it from there (for `claude-code`, Remote Control). The account
-    /// login is the zone's `llm.secret`, which the box only ever holds as a placeholder. Harness
-    /// adapters that have no such feature refuse it.
+    /// The harness's remote mode (#169): the harness in the box registers its own session with its
+    /// vendor's apps, and the owner drives it from there (for `claude-code`, Remote Control). The
+    /// account login is the zone's `llm.secret`, which the box only ever holds as a placeholder.
+    /// Harness adapters that have no such mode refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSpec>,
-    /// For `kind: acp`: how to start the agent in its box.
+    /// For `harness: acp`: how to start the agent in its box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp: Option<AcpSpec>,
 }
@@ -152,8 +152,31 @@ fn yes() -> bool {
     true
 }
 
-fn default_agent_kind() -> String {
-    "claude-code".into()
+/// `agent.harness`: what runs an agent in its box. How each is launched, configured and resumed is
+/// its adapter's, in `wicket-agent`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Harness {
+    /// Claude Code, driven by wicket over its stream-json stdio.
+    #[default]
+    ClaudeCode,
+    /// Any agent that speaks the Agent Client Protocol, started from `agent.acp.command` (#66).
+    Acp,
+}
+
+impl Harness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+            Harness::Acp => "acp",
+        }
+    }
+}
+
+impl std::fmt::Display for Harness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -609,11 +632,11 @@ impl Manifest {
         }
         match (&self.agent, &self.program) {
             (Some(a), None) => {
-                match (a.kind.as_str(), &a.acp) {
-                    ("claude-code", None) => {}
-                    ("claude-code", Some(_)) => return Err(ManifestError::Invalid("agent.acp is for kind: acp".into())),
-                    ("acp", None) => return Err(ManifestError::Invalid("kind: acp needs agent.acp.command".into())),
-                    ("acp", Some(acp)) => {
+                match (a.harness, &a.acp) {
+                    (Harness::ClaudeCode, None) => {}
+                    (Harness::ClaudeCode, Some(_)) => return Err(ManifestError::Invalid("agent.acp is for harness: acp".into())),
+                    (Harness::Acp, None) => return Err(ManifestError::Invalid("harness: acp needs agent.acp.command".into())),
+                    (Harness::Acp, Some(acp)) => {
                         if acp.command.is_empty() || acp.command.iter().any(|c| c.is_empty() || c.contains('\0')) {
                             return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
                         }
@@ -638,12 +661,12 @@ impl Manifest {
                             ));
                         }
                     }
-                    (k, _) => return Err(ManifestError::Invalid(format!("agent kind {k:?}: claude-code or acp"))),
                 }
                 // The zone's model route is a Claude subscription, which backs Claude Code only (its
                 // own CLI, or through its ACP adapter). A generic ACP agent gets no model route until
                 // routes per provider exist (#174).
-                let claude = a.kind == "claude-code" || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp");
+                let claude =
+                    a.harness == Harness::ClaudeCode || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp");
                 match &self.zone.llm {
                     Some(_) if !claude => {
                         return Err(ManifestError::Invalid(
@@ -951,6 +974,18 @@ zone:
             let err = Manifest::from_yaml(&y).unwrap_err().to_string();
             assert!(err.contains("agent.env may not set"), "{name}: {err}");
         }
+    }
+
+    #[test]
+    fn the_harness_is_agent_harness() {
+        let y = |agent: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
+        assert_eq!(y("").unwrap().agent.unwrap().harness, Harness::ClaudeCode);
+        assert_eq!(y(", harness: claude-code").unwrap().agent.unwrap().harness, Harness::ClaudeCode);
+        assert!(y(", harness: nope").unwrap_err().to_string().contains("unknown variant"));
+        // `kind` is spawn's word for a workload (agent or program), not a manifest field.
+        assert!(y(", kind: claude-code").unwrap_err().to_string().contains("unknown field `kind`"));
+        let plain = serde_yaml::to_string(&y("").unwrap()).unwrap();
+        assert!(plain.contains("harness: claude-code"), "{plain}");
     }
 
     #[test]

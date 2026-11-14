@@ -14,10 +14,12 @@
 #     and the `wicket-operators` group for the people who start runs (--operator, default the
 #     user running sudo); operators are taken out of the docker group;
 #   - /var/lib/wicket (0700, the wicket user's): ledger, vault, issuer key, runs and their sockets;
-#   - the binary as a version under /var/lib/wicket-versions (`<build id>/wicket`, `current` and
-#     `previous` links; the wicket user's, which `wicket self update` switches: see
-#     docs/explanation/updates.md), /usr/local/bin/wicket a link to its `current`, the agent image's directory
-#     under /usr/local/share/wicket, and /etc/wicket (the daemon's policy, the console's options);
+#   - the binary twice: root's own copy, /usr/local/lib/wicket/<build id>/wicket (root's; what
+#     /usr/local/bin/wicket links to, and so what `sudo wicket` runs, #261), and a version under
+#     /var/lib/wicket-versions (`<build id>/wicket`, `current` and `previous` links; the wicket
+#     user's, which `wicket self update` switches and wicket's services run: see
+#     docs/explanation/updates.md); the agent image's directory under /usr/local/share/wicket, and
+#     /etc/wicket (the daemon's policy, the console's options);
 #   - a release public key to accept updates signed with (--release-key, from `wicket self keygen`);
 #   - systemd units for wicketd, the console (wicket serve) and the reconciler, enabled and started;
 #     wicket-follow's (following main's signed builds, #190) installed but not enabled;
@@ -46,7 +48,7 @@ while [ $# -gt 0 ]; do
         --skip-gvisor) skip_gvisor=1; shift ;;
         --skip-image) skip_image=1; shift ;;
         --no-start) start=0; shift ;;
-        -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -164,21 +166,36 @@ if [ ! -e /etc/wicket/console.env ]; then
         >/etc/wicket/console.env
 fi
 
-say "wicket $("$binary" --version | awk '{print $2}')"
-# The binary is a version under /var/lib/wicket-versions, owned by the wicket user so that `wicket
-# self update` (run by wicketd, as that user) can stage and switch versions; /usr/local/bin/wicket
-# links to `current`. Root then runs a binary the wicket user could replace: no new power, since that
-# user is in the docker group (Docker is root on this host).
+# Root's own copy first (#261): root copies the binary from this archive into a directory only root
+# can write, hashes that copy, and runs only it. /usr/local/bin/wicket (what `sudo wicket` and the
+# root wicket-follow service run) links to it. The wicket user's version under
+# /var/lib/wicket-versions is made from root's copy, owned by that user so that `wicket self update`
+# (run by wicketd, as that user) can stage and switch versions; wicket's services run its `current`,
+# and root never runs anything there.
+copies=/usr/local/lib/wicket
+install -d -o root -g root -m 0755 "$copies"
+rm -rf "$copies/.install-$$"
+install -d -o root -g root -m 0700 "$copies/.install-$$"
+install -o root -g root -m 0755 "$binary" "$copies/.install-$$/wicket"
+sha=$(sha256sum "$copies/.install-$$/wicket" | cut -d' ' -f1)
+id=${sha:0:12}
+if [ -f "$copies/$id/wicket" ] && [ "$(sha256sum "$copies/$id/wicket" | cut -d' ' -f1)" = "$sha" ]; then
+    rm -rf "$copies/.install-$$"
+else
+    chmod 0755 "$copies/.install-$$"
+    rm -rf "${copies:?}/$id"
+    mv "$copies/.install-$$" "$copies/$id"
+fi
+rootbin=$copies/$id/wicket
+say "wicket $("$rootbin" --version | awk '{print $2}')"
 vroot=/var/lib/wicket-versions
 install -d -o wicket -g wicket -m 0755 "$vroot"
-sha=$(sha256sum "$binary" | cut -d' ' -f1)
-id=${sha:0:12}
-if [ ! -f "$vroot/$id/manifest.json" ]; then
+if [ ! -f "$vroot/$id/manifest.json" ] || ! cmp -s "$rootbin" "$vroot/$id/wicket"; then
     rm -rf "$vroot/$id.new"
     install -d -o wicket -g wicket -m 0755 "$vroot/$id.new"
-    install -o wicket -g wicket -m 0755 "$binary" "$vroot/$id.new/wicket"
+    install -o wicket -g wicket -m 0755 "$rootbin" "$vroot/$id.new/wicket"
     probe=$(mktemp -d)
-    describe=$(WICKET_HOME=$probe "$vroot/$id.new/wicket" self describe)
+    describe=$(WICKET_HOME=$probe "$rootbin" self describe)
     rm -rf "$probe"
     python3 - "$vroot/$id.new/manifest.json" "$describe" "$sha" <<'PY'
 import json, sys, time
@@ -199,8 +216,8 @@ if [ "$cur" != "$id" ]; then
     chown -h wicket:wicket "$vroot/current" "$vroot/previous" 2>/dev/null || true
     binary_changed=1
 fi
-if [ "$(readlink /usr/local/bin/wicket 2>/dev/null)" != "$vroot/current/wicket" ]; then
-    ln -sfn "$vroot/current/wicket" /usr/local/bin/wicket.new
+if [ "$(readlink /usr/local/bin/wicket 2>/dev/null)" != "$rootbin" ]; then
+    ln -sfn "$rootbin" /usr/local/bin/wicket.new
     mv -Tf /usr/local/bin/wicket.new /usr/local/bin/wicket
     binary_changed=1
 fi
@@ -210,7 +227,8 @@ chmod -R u=rwX,go=rX /usr/local/share/wicket/images.new
 rm -rf /usr/local/share/wicket/images
 mv /usr/local/share/wicket/images.new /usr/local/share/wicket/images
 
-as_wicket() { (cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket "$@"); }
+# As the wicket user, its own current version (as its services run it).
+as_wicket() { (cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket "$vroot/current/wicket" "$@"); }
 
 if [ -n "$release_key" ]; then
     say "release key"

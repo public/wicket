@@ -480,7 +480,7 @@ function renderManifests(s) {
 function grantsView(g) {
   const out = [];
   out.push(kvRow("task", g.task || "(none)"));
-  if (g.agent) out.push(kvRow("agent", g.agent.name + " · " + g.agent.kind + " · max_turns " + (g.agent.max_turns ?? "default") + " · children " + g.agent.max_children + (g.agent.remote ? " · remote session " + g.agent.remote : "")));
+  if (g.agent) out.push(kvRow("agent", g.agent.name + " · " + g.agent.harness + " · max_turns " + (g.agent.max_turns ?? "default") + " · children " + g.agent.max_children + (g.agent.remote ? " · remote session " + g.agent.remote : "")));
   if (g.program) out.push(kvRow("program", g.program.name + ": " + g.program.command.join(" ")));
   out.push(kvRow("image", g.image.Ok || ("refused: " + g.image.Err), g.image.Ok ? "mono" : "blocked"));
   out.push(kvRow("isolation", g.isolation + " · unlisted hosts " + JSON.stringify(g.unlisted_hosts)));

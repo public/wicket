@@ -53,9 +53,21 @@ for u in wicketd wicket-console wicket-reconcile wicket-state; do [ -f /etc/syst
 [ "$(stat -c %U /var/lib/wicket/identity/issuer.key)" = wicket ] || fail "issuer key not the wicket user'"'"'s"
 echo "ok: users, groups, data dir, config, units and issuer in place"
 
+# #261: root runs only its own copy; the wicket user'"'"'s services run its versions root.
+vroot=/var/lib/wicket-versions
+a=$(basename "$(readlink $vroot/current)")
+[ "$(readlink /usr/local/bin/wicket)" = "/usr/local/lib/wicket/$a/wicket" ] || fail "/usr/local/bin/wicket -> $(readlink /usr/local/bin/wicket)"
+for p in /usr/local/lib/wicket /usr/local/lib/wicket/$a /usr/local/lib/wicket/$a/wicket; do
+    [ "$(stat -c "%U %G %a" $p)" = "root root 755" ] || fail "$p: $(stat -c "%U %G %a" $p)"
+done
+cmp -s /usr/local/lib/wicket/$a/wicket $vroot/$a/wicket || fail "root'"'"'s copy is not the installed version"
+grep -q "^ExecStart=$vroot/current/wicket daemon" /etc/systemd/system/wicketd.service || fail "wicketd.service does not run the versions root"
+grep -q "^ExecStart=/usr/local/bin/wicket self follow" /etc/systemd/system/wicket-follow.service || fail "wicket-follow.service does not run root'"'"'s link"
+echo "ok: /usr/local/bin/wicket is root'"'"'s own copy; wicket'"'"'s services run its versions root"
+
 # What systemd would do: the runtime directory, then the daemon as wicket.
 install -d -o wicket -g wicket -m 0755 /run/wicket
-(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket daemon) 2>/tmp/wicketd.log &
+(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket daemon) 2>/tmp/wicketd.log &
 for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
 [ -S /run/wicket/wicketd.sock ] || { cat /tmp/wicketd.log; fail "wicketd did not start"; }
 
@@ -63,7 +75,7 @@ for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
 sed -i "s/127.0.0.1:8787/127.0.0.1:18787/" /etc/wicket/console.env
 set -a; . /etc/wicket/console.env; set +a
 # shellcheck disable=SC2086
-(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket serve $WICKET_CONSOLE_ARGS) >/tmp/console.log 2>&1 &
+(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket serve $WICKET_CONSOLE_ARGS) >/tmp/console.log 2>&1 &
 for _ in $(seq 50); do grep -q "wicket console on" /tmp/console.log && break; sleep 0.1; done
 grep -q "wicket console on http://localhost:18787" /tmp/console.log || { cat /tmp/console.log; fail "the console did not start"; }
 grep -q "/enrol?t=" /tmp/console.log && fail "the console printed an enrolment link in its log"
@@ -114,26 +126,58 @@ n=$(wicket audit --tail 200 | grep -c daemon.refused) || true
 wicket audit --verify >/dev/null || fail "audit chain"
 echo "ok: $n refusals audited; the chain verifies"
 
+# #261: the wicket user plants a binary in its versions root; root never runs it.
+cp $vroot/$a/wicket /tmp/wicket-a.orig
+cat >/tmp/planted <<"EOS"
+#!/bin/sh
+id -u >>/tmp/planted-ran
+exec /tmp/wicket-a.orig "$@"
+EOS
+chmod 755 /tmp/planted
+# Renamed into place, as the binary is running (wicketd).
+plant() { runuser -u wicket -- cp "$1" "$2.new" && runuser -u wicket -- mv -f "$2.new" "$2"; }
+plant /tmp/planted $vroot/$a/wicket || fail "the wicket user could not replace its own version"
+(cd / && wicket --version && wicket pending && wicket self status) >/dev/null 2>&1 || true
+grep -qx 0 /tmp/planted-ran 2>/dev/null && fail "root ran the binary the wicket user planted"
+out=$(cd / && wicket self admit $vroot/$a/wicket 2>&1) && fail "root admitted the wicket user'"'"'s binary: $out"
+case "$out" in *refused*"owned by the wicket user"*) ;; *) fail "admit of a planted binary: $out" ;; esac
+ln -sf $vroot/$a/wicket /tmp/innocent-looking
+out=$(cd / && wicket self admit /tmp/innocent-looking 2>&1) && fail "root admitted the planted binary through a link: $out"
+out=$(cd / && /tmp/wicket-a.orig --version 2>&1) || fail "root'"'"'s own copy of a build outside the versions root: $out"
+cp /tmp/wicket-a.orig $vroot/$a/wicket.honest && chown wicket:wicket $vroot/$a/wicket.honest
+out=$(cd / && $vroot/$a/wicket.honest --version 2>&1) && fail "an honest build ran as root from the versions root: $out"
+case "$out" in *"refusing to run as root"*"install.sh"*) ;; *) fail "running from the versions root as root: $out" ;; esac
+rm -f $vroot/$a/wicket.honest
+plant /tmp/wicket-a.orig $vroot/$a/wicket
+grep -qx 0 /tmp/planted-ran 2>/dev/null && fail "root ran the binary the wicket user planted"
+rm -f /tmp/planted /tmp/planted-ran /tmp/innocent-looking
+echo "ok: root runs its own copy, not one the wicket user planted, and refuses to copy or run one"
+
 # #165: an update to a version whose systemd units differ from the installed ones is refused until
-# root applies that version'"'"'s own units; then it goes on (here as far as its agent image, which needs
-# the Docker daemon this container lacks).
-vroot=/var/lib/wicket-versions
-a=$(basename "$(readlink $vroot/current)")
+# root applies that version'"'"'s own units, with root'"'"'s own copy of it (#261); then it goes on (here as
+# far as its agent image, which needs the Docker daemon this container lacks).
 (cd /tmp && wicket self keygen /tmp/rk >/dev/null && wicket self trust-key /tmp/rk.pub >/dev/null) || fail "release key"
 cp /usr/local/bin/wicket /tmp/wicket-b && printf "build b" >>/tmp/wicket-b && chmod 755 /tmp/wicket-b
 (cd /tmp && wicket self sign --key /tmp/rk /tmp/wicket-b >/dev/null) && chmod 644 /tmp/wicket-b.sig || fail "signing b"
 b=$(sha256sum /tmp/wicket-b | cut -c1-12)
 echo "# edited here" >>/etc/systemd/system/wicketd.service
 out=$(cd / && wicket self update /tmp/wicket-b 2>&1) && fail "an update with other units went through: $out"
-case "$out" in *"systemd units differ"*wicketd.service*"self apply-units"*) ;; *) fail "update with other units: $out" ;; esac
+case "$out" in *"systemd units differ"*wicketd.service*"sudo /usr/local/lib/wicket/$b/wicket self apply-units"*) ;; *) fail "update with other units: $out" ;; esac
+case "$out" in *"sudo $vroot/"*) fail "the refusal told root to run the versions root'"'"'s binary: $out" ;; esac
 [ "$(basename "$(readlink $vroot/current)")" = "$a" ] || fail "current moved to $(readlink $vroot/current)"
+[ "$(readlink /usr/local/bin/wicket)" = "/usr/local/lib/wicket/$a/wicket" ] || fail "root'"'"'s link moved to $(readlink /usr/local/bin/wicket)"
+cmp -s /usr/local/lib/wicket/$b/wicket /tmp/wicket-b || fail "root made no copy of b"
 wicket audit --tail 20 | grep self.update_refused | grep -q "\"units\"" || fail "the units refusal was not audited"
 out=$(as_alex self apply-units 2>&1) && fail "alex applied units: $out"
-"$vroot/$b/wicket" self apply-units >/tmp/apply.log || { cat /tmp/apply.log; fail "apply-units"; }
+# The wicket user replaces its staged b: root applies b'"'"'s units from its own copy all the same.
+runuser -u wicket -- sh -c "printf planted >>$vroot/$b/wicket"
+/usr/local/lib/wicket/$b/wicket self apply-units >/tmp/apply.log || { cat /tmp/apply.log; fail "apply-units"; }
 grep -q "updated /etc/systemd/system/wicketd.service" /tmp/apply.log || { cat /tmp/apply.log; fail "apply-units said: $(cat /tmp/apply.log)"; }
 cmp -s /etc/systemd/system/wicketd.service /opt/pkg/wicket-*/deploy/systemd/wicketd.service || fail "wicketd.service is not the version'"'"'s"
+runuser -u wicket -- cp /tmp/wicket-b $vroot/$b/wicket
 out=$(cd / && wicket self update /tmp/wicket-b 2>&1) || true
 case "$out" in *"units differ"*) fail "still refused over units: $out" ;; *"building wicket/claude-code:$b with $b"*) ;; *) fail "the update after apply-units: $out" ;; esac
-echo "ok: an update to other systemd units waits for root'"'"'s apply-units, then goes on"
+[ "$(readlink /usr/local/bin/wicket)" = "/usr/local/lib/wicket/$a/wicket" ] || fail "root'"'"'s link moved after a failed update"
+echo "ok: an update to other systemd units waits for root'"'"'s apply-units, from root'"'"'s copy, then goes on"
 echo "install-test: all checks passed"
 '

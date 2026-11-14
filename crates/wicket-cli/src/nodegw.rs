@@ -425,7 +425,7 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         Ok(p) => p,
         Err(e) => return Some((format!("not started: {e}"), true)),
     };
-    if plan.cm.agent.as_ref().is_some_and(|a| a.kind == "acp") {
+    if plan.cm.agent.as_ref().is_some_and(|a| a.harness == wicket_core::Harness::Acp) {
         // An ACP agent's client is wicket's control host (#66): its children start there (queued
         // while it is unreachable, as for a placement elsewhere).
         return match up {
@@ -548,9 +548,9 @@ async fn start_child(
         w
     };
     let bs = super::child_start(parent, &plan, &child, &session, who, until)?;
-    let stdin_task = match wicket_agent::program_plan(m, &child) {
-        Some(_) => None,
-        None => wicket_agent::claude_code_plan(m, &child, &session).stdin_task,
+    let stdin_task = match (wicket_agent::program_plan(m, &child), wicket_agent::harness::of(m)) {
+        (None, Some(h)) => h.plan(m, &child, &session, &m.task).ok().and_then(|p| p.stdin_task),
+        _ => None,
     };
     let started = super::start_box_boxed(node, None, bs).await;
     if let Err(e) = started {

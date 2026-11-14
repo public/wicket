@@ -45,7 +45,7 @@ run ends when the agent calls wicket's [`finish`](mcp-tools.md#finish) tool or e
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The agent's name, the last part of its SPIFFE ID (`…/a/<name>`). |
-| `kind` | string | `claude-code` | The harness. `claude-code`: Claude Code, driven by wicket over its stream-json. `acp`: any agent that speaks the Agent Client Protocol, started from [`agent.acp`](#agentacp). |
+| `harness` | string | `claude-code` | What runs the agent in its box. `claude-code`: Claude Code, driven by wicket over its stream-json. `acp`: any agent that speaks the Agent Client Protocol, started from [`agent.acp`](#agentacp). See [harness modes](#harness-modes). |
 | `model` | string | the harness's default | The model id passed to the agent. For `acp`, only with a known `acp.profile`. |
 | `max_turns` | integer | none | The most agentic turns per task, passed to Claude Code. Not for `acp`. |
 | `max_children` | integer | `0` | How many boxes this agent may start with `spawn` or `spawn_agent`. `0`: neither tool works. A child's own `max_children` counts against its parent's. |
@@ -53,7 +53,20 @@ run ends when the agent calls wicket's [`finish`](mcp-tools.md#finish) tool or e
 | `image` | string | the agent image | The image the agent's box starts from: the installation's agent image, or one `zone.images` allows. A tag of a repository `zone.images` pins starts as that pin. `wicket run --image` overrides it. See [pins](#image-pins). |
 | `env` | map of string to string | `{}` | Non-secret environment variables for the agent. Names are `[A-Z0-9_]+`. Refused: `HOME`, `PATH`, `USER`, and names starting `ANTHROPIC_`, `CLAUDE_`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_`, `CURL_`, `NODE_`, `MCP_`, `GIT_SSL` or `WICKET_`. |
 | `adapter_settings` | map | `{}` | Settings for the harness (for Claude Code, its `settings.json`). Only `includeCoAuthoredBy`, `attribution`, `outputStyle`, `alwaysThinkingEnabled` and `language` are allowed. `cleanupPeriodDays` is wicket's own and refused. |
-| `remote` | object | none | A remote session the owner drives from the vendor's apps (for Claude Code, Remote Control). See [`agent.remote`](#agentremote). |
+| `remote` | object | none | The harness's remote mode: a session the owner drives from the vendor's apps (for Claude Code, Remote Control). See [`agent.remote`](#agentremote). |
+
+### Harness modes
+
+An agent is one kind of workload; its harness runs in one of three modes, and the harness's adapter
+says which it has (a mode it hasn't is refused, saying so):
+
+| mode | how | `claude-code` | `acp` |
+|---|---|---|---|
+| driven | the default: wicket starts the harness and gives it the task, follow-ups and messages as turns. The only mode that hibernates and wakes. | yes | yes |
+| remote | `agent.remote`: the harness registers its own session with its vendor's apps, and the owner drives it from there. | Remote Control | no |
+| wrapped | `wicket wrap`: a command line another program launched runs in a box, keeping its launcher's stdio. | Remote Control's session processes | no |
+
+(`spawn`'s `kind`, `agent` or `program`, is the workload type, not the harness.)
 
 ### `agent.remote`
 
@@ -66,7 +79,7 @@ See [drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-app
 
 ### `agent.acp`
 
-For `kind: acp` (and only then). See [ACP agents](agents.md#acp-agents) for what wicket offers the agent
+For `harness: acp` (and only then). See [ACP agents](agents.md#acp-agents) for what wicket offers the agent
 and how it answers it.
 
 | field | type | default | meaning |

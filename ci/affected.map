@@ -71,6 +71,7 @@ crates/wicket-store/src/bundle.rs  | -   | hibernate restore
 crates/wicket-cli/src/update.rs    | -   | update
 crates/wicket-cli/src/ci_update.rs | -   | update
 crates/wicket-cli/src/units.rs     | -   | update install-test
+crates/wicket-cli/src/rootcopy.rs  | -   | update install-test
 crates/wicket-cli/src/daemon/**    | -   | daemon-uids acceptance
 crates/wicket-cli/src/serve/static/** | - | acceptance
 crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes

@@ -360,7 +360,7 @@ fn runs(pid: u32, bin: &Path, pidfile: &Path) -> bool {
     exe.is_some_and(|e| Some(e) == want)
 }
 
-fn sha256_file(p: &Path) -> Result<String> {
+pub(crate) fn sha256_file(p: &Path) -> Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(p).with_context(|| p.display().to_string())?;
     let mut h = Sha256::new();
@@ -660,7 +660,7 @@ fn binary_of(a: &Accepted, stage: &Path) -> Result<PathBuf> {
     binary_in(&a.copy, stage)
 }
 
-fn binary_in(artifact: &Path, stage: &Path) -> Result<PathBuf> {
+pub(crate) fn binary_in(artifact: &Path, stage: &Path) -> Result<PathBuf> {
     let mut magic = [0u8; 4];
     {
         use std::io::Read;
@@ -916,7 +916,7 @@ fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_s
         Some(u) if !u.is_empty() => u,
         _ => return Ok(()),
     };
-    let e = crate::units::UnitsPending { version: green.into(), units, dir, binary: v.binary(green) };
+    let e = crate::units::UnitsPending { version: green.into(), units, dir, root_copy: crate::units::root_copy(green) };
     audit(
         ledger,
         "self.update_refused",
@@ -932,10 +932,10 @@ fn warn_units(v: &Versions, to: &str) {
     if let Ok(Some(want)) = crate::units::of_build(&v.binary(to), &probe) {
         if let Some(u) = crate::units::differing(&dir, &v.root, &want).filter(|u| !u.is_empty()) {
             say(format!(
-                "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, `sudo {} self apply-units`",
+                "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, {}",
                 dir.display(),
                 u.join(", "),
-                v.binary(to).display()
+                crate::units::apply_hint(to, &crate::units::root_copy(to))
             ));
         }
     }

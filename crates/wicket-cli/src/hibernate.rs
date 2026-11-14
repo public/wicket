@@ -92,21 +92,22 @@ pub fn trees(m: &Manifest, agent: &str, run_dir: &Path, in_place: Option<&Path>)
 }
 
 /// Whether a box is at a quiet point: nothing runs in it but the agent runtime (the init, wicket's
-/// forwarder, Claude Code, or the agent's own command, `agent`: an ACP agent's, #66). Err: what else runs.
-pub fn quiet(procs: &[(u32, u32, String)], agent: &[String]) -> std::result::Result<(), Vec<String>> {
+/// forwarder, what its harness adapter says is the harness's own (`harness`), or the agent's own
+/// command, `agent`: an ACP agent's, #66). Err: what else runs.
+pub fn quiet(procs: &[(u32, u32, String)], harness: &dyn Fn(&str) -> bool, agent: &[String]) -> std::result::Result<(), Vec<String>> {
     let base = |w: &str| w.rsplit('/').next().unwrap_or("").to_string();
     let agent0 = agent.first().map(|a| base(a)).unwrap_or_default();
     let agent_line = std::iter::once(agent0.clone()).chain(agent.iter().skip(1).cloned()).collect::<Vec<_>>().join(" ");
     // The init, wicket's entrypoint (a shell running wicket-entry, which stays as the parent of the
-    // forwarder), the forwarder and Claude Code.
+    // forwarder), the forwarder and the harness.
     let runtime = |cmd: &str| {
         let mut words = cmd.split_whitespace().map(|w| w.rsplit('/').next().unwrap_or(""));
         let base = words.next().unwrap_or("");
         let second = words.next().unwrap_or("");
         let line = std::iter::once(base).chain(cmd.split_whitespace().skip(1)).collect::<Vec<_>>().join(" ");
-        matches!(base, "docker-init" | "tini" | "wicket-fwd" | "claude" | "wicket-entry")
+        matches!(base, "docker-init" | "tini" | "wicket-fwd" | "wicket-entry")
             || (matches!(base, "bash" | "sh") && second == "wicket-entry")
-            || (base == "node" && cmd.contains("claude"))
+            || harness(cmd)
             // The agent's own command, as started (a script's interpreter runs it with its path).
             || (!agent0.is_empty() && (line == agent_line || (matches!(base, "node" | "python3" | "python" | "sh" | "bash") && second == agent0)))
     };
@@ -879,19 +880,22 @@ mod tests {
             (9, 1, "claude -p --input-format stream-json".to_string()),
             (12, 9, String::new()),
         ];
-        assert_eq!(quiet(&idle, &[]), Ok(()));
+        // Claude Code's processes are its harness's, as its adapter says.
+        let claude = |c: &str| wicket_agent::claude::is_runtime(c);
+        assert_eq!(quiet(&idle, &claude, &[]), Ok(()));
+        assert!(quiet(&idle, &|_| false, &[]).unwrap_err()[0].contains("claude -p"), "another harness's box isn't quiet with claude in it");
         let mut busy = idle.clone();
         busy.push((40, 1, "sleep 600".into()));
         busy.push((41, 9, "/usr/bin/node /workspace/server.js".into()));
         busy.push((42, 9, "bash -c sleep 1000".into()));
-        let e = quiet(&busy, &[]).unwrap_err();
+        let e = quiet(&busy, &claude, &[]).unwrap_err();
         assert_eq!(e.len(), 3, "{e:?}");
         assert!(e[0].contains("sleep 600"));
         // An ACP agent's own command (#66) is its runtime: as started, or through its interpreter.
         let acp = |argv: &[&str], cmd: &str| {
             let mut p = idle[..3].to_vec();
             p.push((9, 1, cmd.to_string()));
-            quiet(&p, &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            quiet(&p, &|_| false, &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         };
         assert_eq!(acp(&["python3", "/workspace/agent.py"], "python3 /workspace/agent.py"), Ok(()));
         assert_eq!(acp(&["claude-agent-acp"], "node /usr/local/bin/claude-agent-acp"), Ok(()));

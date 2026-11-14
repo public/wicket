@@ -143,6 +143,9 @@ pub fn route(cmd: &Cmd) -> Route {
             // Writes systemd's units as the caller, who must be root (wicketd can't: it is the
             // wicket user, under ProtectSystem): never through the daemon.
             SelfCmd::ApplyUnits { .. } => Local,
+            // Root's own copy of a build (#261), made by root from an artifact root names: never
+            // through the daemon, whose user root mustn't trust.
+            SelfCmd::Admit { .. } => Local,
         },
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
@@ -353,6 +356,7 @@ mod tests {
             (&["self", "trust-key", "/tmp/k.pub"], Route::Forward(Privileged)),
             (&["self", "keygen", "/tmp/k"], Route::Local),
             (&["self", "sign", "--key", "/tmp/k", "/tmp/w"], Route::Local),
+            (&["self", "admit", "/tmp/w"], Route::Local),
             (&["dev", "mock-llm", "--command", "true"], Route::Local),
         ];
         for (args, want) in cases {

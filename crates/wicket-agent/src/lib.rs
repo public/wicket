@@ -4,9 +4,11 @@
 
 pub mod acp;
 pub mod attribution;
+pub mod claude;
+pub mod harness;
 
 use serde_json::Value;
-use wicket_core::{Manifest, RunId};
+use wicket_core::{Harness, Manifest, RunId};
 
 /// Paths inside the box.
 pub const SOCK_DIR: &str = "/wicket/sock";
@@ -97,6 +99,9 @@ pub struct WrappedPlan {
     pub session_placeholder: String,
     /// Placeholders for the account login in the box's credentials file.
     pub login_placeholder: String,
+    /// What the egress proxy swaps back (a wrapped session's; a remote session's login is swapped
+    /// wherever its secret is bound).
+    pub swaps: Vec<harness::Swap>,
 }
 
 /// Environment the wrapped agent may keep from its launcher: its own session settings. Everything
@@ -188,7 +193,7 @@ pub fn claude_code_wrapped_plan(
     ] {
         env.push((k.into(), v.into()));
     }
-    env.push(("CLAUDE_CONFIG_DIR".into(), format!("{STATE_DIR}/claude")));
+    env.push(("CLAUDE_CONFIG_DIR".into(), format!("{STATE_DIR}/{}", claude::STATE_SUBDIR)));
     env.push(("HOME".into(), format!("{STATE_DIR}/home")));
     env.push(("WICKET_RUN".into(), run.0.clone()));
     env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
@@ -199,6 +204,7 @@ pub fn claude_code_wrapped_plan(
         session_token,
         session_placeholder,
         login_placeholder,
+        swaps: vec![],
     })
 }
 
@@ -220,29 +226,6 @@ fn placeholder_login(login_placeholder: &str, tag: &str, login_meta: &Value) -> 
         }
     }
     ("claude/.credentials.json".into(), serde_json::to_vec_pretty(&serde_json::json!({ "claudeAiOauth": oauth })).unwrap_or_default())
-}
-
-/// What a remote session's adapter may know of the login, from the host (never a credential):
-/// `linked` is the object holding the linked token in its file, `file` that file. For claude-code:
-/// the login's scopes and plan, and its account (`oauthAccount`).
-pub fn remote_login_meta(m: &Manifest, linked: Option<&Value>, file: Option<&std::path::Path>) -> Value {
-    match m.agent.as_ref().map(|a| a.kind.as_str()) {
-        Some("claude-code") => {
-            let mut meta = serde_json::json!({});
-            if let Some(o) = linked {
-                for k in ["scopes", "subscriptionType", "rateLimitTier"] {
-                    if let Some(v) = o.get(k) {
-                        meta[k] = v.clone();
-                    }
-                }
-            }
-            if let Some(a) = file.and_then(claude_code_account) {
-                meta["oauthAccount"] = a;
-            }
-            meta
-        }
-        _ => Value::Null,
-    }
 }
 
 /// The claude.ai account a Claude Code login belongs to (its config's `oauthAccount`: account and
@@ -272,28 +255,6 @@ pub fn login_placeholder(run: &RunId) -> String {
 
 /// What a Remote Control agent is told, besides the sandbox notice: its messages come from the app.
 const RC_NOTICE: &str = "- You are a Remote Control session: the user talks to you from the Claude app. Work in /workspace.";
-
-/// The adapter's plan for a remote session (`agent.remote`, #169): which harnesses have one. Each
-/// harness adapter that adds the feature adds its arm; the others refuse, saying so.
-pub fn remote_plan(m: &Manifest, run: &RunId, login_meta: &Value) -> anyhow_free::Result<WrappedPlan> {
-    match m.agent.as_ref().map(|a| a.kind.as_str()) {
-        Some("claude-code") => claude_code_remote_control_plan(m, run, login_meta),
-        Some(k) => Err(anyhow_free::Error(format!("agent.remote: the {k} adapter has no remote sessions"))),
-        None => Err(anyhow_free::Error("agent.remote applies to agents only".into())),
-    }
-}
-
-/// The address of the remote session a harness's server printed on this line of its output, if
-/// any: where the owner opens it (for claude-code, a claude.ai/code link).
-pub fn remote_session_url(m: &Manifest, line: &str) -> Option<String> {
-    let prefix = match m.agent.as_ref()?.kind.as_str() {
-        "claude-code" => "https://claude.ai/code",
-        _ => return None,
-    };
-    let start = line.find(prefix)?;
-    let url: String = line[start..].chars().take_while(|c| !c.is_whitespace() && !"\"'<>)]".contains(*c)).collect();
-    Some(url)
-}
 
 /// A Remote Control agent (#169): Claude Code booted in the box as `claude remote-control`, so the
 /// box registers its own session in the owner's Claude apps. The account login is a placeholder
@@ -352,7 +313,7 @@ pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &V
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    env.push(("CLAUDE_CONFIG_DIR".into(), format!("{STATE_DIR}/claude")));
+    env.push(("CLAUDE_CONFIG_DIR".into(), format!("{STATE_DIR}/{}", claude::STATE_SUBDIR)));
     env.push(("HOME".into(), format!("{STATE_DIR}/home")));
     env.push(("WICKET_RUN".into(), run.0.clone()));
     env.push(("WICKET_TENANT".into(), m.tenant.0.clone()));
@@ -363,6 +324,7 @@ pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &V
         session_token: None,
         session_placeholder: String::new(),
         login_placeholder,
+        swaps: vec![],
     })
 }
 
@@ -444,7 +406,7 @@ fn claude_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
         ("DISABLE_AUTOUPDATER", "1".into()),
         ("DISABLE_TELEMETRY", "1".into()),
         ("DISABLE_ERROR_REPORTING", "1".into()),
-        ("CLAUDE_CONFIG_DIR", format!("{STATE_DIR}/claude")),
+        ("CLAUDE_CONFIG_DIR", format!("{STATE_DIR}/{}", claude::STATE_SUBDIR)),
         ("HOME", format!("{STATE_DIR}/home")),
         ("WICKET_RUN", run.0.clone()),
         // await_grant blocks until a human decides (up to 10 minutes).
@@ -464,7 +426,7 @@ fn claude_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
 pub fn uses_claude_settings(m: &Manifest) -> bool {
     m.agent
         .as_ref()
-        .is_some_and(|a| a.kind == "claude-code" || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp"))
+        .is_some_and(|a| a.harness == Harness::ClaudeCode || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp"))
 }
 
 /// An ACP agent (#66): its command in the box, and how wicket opens its session. The task becomes
@@ -472,7 +434,7 @@ pub fn uses_claude_settings(m: &Manifest) -> bool {
 /// profile also gets what wicket sets for that adapter, and its `_meta` is wicket's, never the
 /// manifest's.
 pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
-    let agent = m.agent.as_ref().filter(|a| a.kind == "acp")?;
+    let agent = m.agent.as_ref().filter(|a| a.harness == Harness::Acp)?;
     let spec = agent.acp.as_ref()?;
     let claude = spec.profile.as_deref() == Some("claude-agent-acp");
     let env = if claude {
@@ -619,7 +581,7 @@ mod tests {
     #[test]
     fn an_acp_agent_gets_routes_its_command_and_only_wicket_s_meta() {
         let y = |extra: &str, llm: &str| {
-            format!("task: hi\nagent: {{name: a, kind: acp, acp: {{command: [my-agent, --acp]{extra}}}, env: {{FOO: bar}}}}\nzone: {{name: z{llm}}}")
+            format!("task: hi\nagent: {{name: a, harness: acp, acp: {{command: [my-agent, --acp]{extra}}}, env: {{FOO: bar}}}}\nzone: {{name: z{llm}}}")
         };
         let m = Manifest::from_yaml(&y("", "")).unwrap();
         let p = acp_plan(&m, &RunId("run_x".into())).unwrap();
@@ -649,20 +611,20 @@ mod tests {
     #[test]
     fn acp_manifests_are_checked() {
         let bad = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z}}")).unwrap_err().to_string();
-        assert!(bad("{name: a, kind: acp}").contains("acp.command"));
-        assert!(bad("{name: a, kind: acp, acp: {command: []}}").contains("acp.command"));
-        assert!(bad("{name: a, acp: {command: [x]}}").contains("kind: acp"));
-        assert!(bad("{name: a, kind: acp, acp: {command: [x], profile: nope}}").contains("profile"));
-        assert!(bad("{name: a, kind: acp, acp: {command: [x]}, model: m}").contains("profile"));
-        assert!(bad("{name: a, kind: acp, acp: {command: [x]}, max_turns: 3}").contains("max_turns"));
-        assert!(bad("{name: a, kind: acp, acp: {command: [x], _meta: {}}}").contains("unknown field"));
-        assert!(bad("{name: a, kind: gemini}").contains("claude-code or acp"));
+        assert!(bad("{name: a, harness: acp}").contains("acp.command"));
+        assert!(bad("{name: a, harness: acp, acp: {command: []}}").contains("acp.command"));
+        assert!(bad("{name: a, acp: {command: [x]}}").contains("harness: acp"));
+        assert!(bad("{name: a, harness: acp, acp: {command: [x], profile: nope}}").contains("profile"));
+        assert!(bad("{name: a, harness: acp, acp: {command: [x]}, model: m}").contains("profile"));
+        assert!(bad("{name: a, harness: acp, acp: {command: [x]}, max_turns: 3}").contains("max_turns"));
+        assert!(bad("{name: a, harness: acp, acp: {command: [x], _meta: {}}}").contains("unknown field"));
+        assert!(bad("{name: a, harness: gemini}").contains("unknown variant"));
         // The zone's model route is a Claude subscription: Claude Code only (#174 adds other routes).
         let with_llm = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z, llm: {{}}}}"));
-        assert!(with_llm("{name: a, kind: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("only Claude Code"));
-        assert!(with_llm("{name: a, kind: acp, acp: {command: [x], profile: claude-agent-acp}}").is_ok());
-        assert!(bad("{name: a, kind: acp, acp: {command: [x], profile: claude-agent-acp}}").contains("llm section"));
-        assert!(Manifest::from_yaml("task: hi\nagent: {name: a, kind: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
+        assert!(with_llm("{name: a, harness: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("only Claude Code"));
+        assert!(with_llm("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").is_ok());
+        assert!(bad("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").contains("llm section"));
+        assert!(Manifest::from_yaml("task: hi\nagent: {name: a, harness: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
     }
 
     #[test]
@@ -760,23 +722,19 @@ mod tests {
         assert!(render_event("not json").is_none());
     }
 
-    fn remote_manifest(kind: &str) -> Manifest {
-        let mut m =
-            Manifest::from_yaml("agent: { name: rc, remote: { name: my box } }\nzone: { name: z, llm: { secret: claude-login } }\n")
-                .unwrap();
-        m.agent.as_mut().unwrap().kind = kind.into();
-        m
+    fn remote_manifest() -> Manifest {
+        Manifest::from_yaml("agent: { name: rc, remote: { name: my box } }\nzone: { name: z, llm: { secret: claude-login } }\n").unwrap()
     }
 
     #[test]
     fn a_remote_session_boots_claude_remote_control_with_placeholders_only() {
-        let m = remote_manifest("claude-code");
+        let m = remote_manifest();
         let run = RunId("run_rc1".into());
         let meta = serde_json::json!({
             "scopes": ["user:inference"], "subscriptionType": "max",
             "oauthAccount": { "organizationUuid": "org-1", "emailAddress": "a@example.com" }
         });
-        let w = remote_plan(&m, &run, &meta).unwrap();
+        let w = harness::of(&m).unwrap().remote_plan(&m, &run, &meta).unwrap();
         assert_eq!(&w.plan.argv[..5], ["wicket-entry", "claude", "remote-control", "--name", "my box"]);
         assert!(w.plan.argv.windows(2).any(|p| p == ["--spawn", "session"]));
         assert!(w.plan.stdin_task.is_none());
@@ -799,21 +757,22 @@ mod tests {
     }
 
     #[test]
-    fn a_harness_without_remote_sessions_refuses_one() {
-        let m = remote_manifest("codex");
-        let e = remote_plan(&m, &RunId("run_x".into()), &Value::Null).err().unwrap();
-        assert!(e.to_string().contains("the codex adapter has no remote sessions"), "{e}");
-        assert_eq!(remote_session_url(&m, "see https://chatgpt.example/x"), None);
+    fn a_harness_without_a_remote_mode_refuses_one() {
+        let m = remote_manifest();
+        let acp = harness::adapter(Harness::Acp);
+        let e = acp.remote_plan(&m, &RunId("run_x".into()), &Value::Null).err().unwrap();
+        assert!(e.contains("the acp harness has no remote mode"), "{e}");
+        assert_eq!(acp.remote_session_url("see https://claude.ai/code/x"), None);
     }
 
     #[test]
     fn the_session_url_is_read_from_the_servers_output() {
-        let m = remote_manifest("claude-code");
+        let rc = harness::adapter(Harness::ClaudeCode);
         assert_eq!(
-            remote_session_url(&m, "Continue at https://claude.ai/code/session_01abc?x=1 (or the app)").as_deref(),
+            rc.remote_session_url("Continue at https://claude.ai/code/session_01abc?x=1 (or the app)").as_deref(),
             Some("https://claude.ai/code/session_01abc?x=1")
         );
-        assert_eq!(remote_session_url(&m, "visit claude.ai/code in a browser"), None);
+        assert_eq!(rc.remote_session_url("visit claude.ai/code in a browser"), None);
     }
 
     #[test]
