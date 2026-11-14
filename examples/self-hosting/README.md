@@ -19,6 +19,9 @@ Setup, once:
 
 ```sh
 # The image (from the repository root).
+# Built on this installation's own agent image: `wicket image --dir` passes it as the
+# Dockerfile's BASE (wicket/claude-code:<build id> on an installed version, so a fresh node needs
+# only its own `wicket image` first).
 wicket image --tag wicket-self:dev --dir examples/self-hosting
 
 # A separate clone for the agent to work in, with an HTTPS remote (the box can't use SSH).

@@ -51,6 +51,20 @@ pub fn effective(image: &str) -> String {
     image.to_string()
 }
 
+/// The tag `wicket image` builds: an explicit `--tag` exactly as given, else `own`, the
+/// installation's own image ([`effective`] of [`DEFAULT`]).
+pub fn build_tag(explicit: Option<String>, own: &str) -> String {
+    explicit.unwrap_or_else(|| own.to_string())
+}
+
+/// Whether a Dockerfile declares the build argument `name` (`ARG NAME` or `ARG NAME=default`).
+pub fn declares_arg(dockerfile: &str, name: &str) -> bool {
+    dockerfile.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|k| k.eq_ignore_ascii_case("ARG")) && w.next().is_some_and(|a| a.split('=').next() == Some(name))
+    })
+}
+
 /// A temporary build context, removed on drop.
 pub struct BuildContext {
     pub dir: PathBuf,
@@ -152,6 +166,27 @@ mod tests {
         let ctx = embedded_context().unwrap();
         assert!(ctx.dir.join("Dockerfile").is_file() && ctx.dir.join("wicket-fwd/src/main.rs").is_file());
         assert_eq!(tag_for(&"ab".repeat(32)), "wicket/claude-code:abababababab");
+    }
+
+    #[test]
+    fn an_explicit_tag_is_kept_and_the_default_is_the_own_image() {
+        // On an installed version the own image is the build-id tag (#277).
+        let own = tag_for(&"cd".repeat(32));
+        assert_eq!(build_tag(Some(DEFAULT.to_string()), &own), DEFAULT);
+        assert_eq!(build_tag(Some("wicket-self:dev".to_string()), &own), "wicket-self:dev");
+        assert_eq!(build_tag(None, &own), "wicket/claude-code:cdcdcdcdcdcd");
+        // Not installed: the default is the default.
+        assert_eq!(build_tag(None, DEFAULT), DEFAULT);
+    }
+
+    #[test]
+    fn the_self_hosting_dockerfile_declares_base() {
+        let df = include_str!("../../../examples/self-hosting/Dockerfile");
+        assert!(declares_arg(df, "BASE"));
+        assert!(df.contains("FROM ${BASE}"));
+        assert!(!declares_arg(df, "BAS"));
+        assert!(declares_arg("arg BASE\nFROM $BASE", "BASE"));
+        assert!(!declares_arg(IMAGE_SOURCES[0].1, "BASE"));
     }
 
     #[test]

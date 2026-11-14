@@ -50,7 +50,9 @@ ssh wicket@203.0.113.7 '~/.local/bin/wicket image'   # builds the node's own ima
 `node install` checks the binary's sha256 on the node and installs it as a version, with
 `~/.local/bin/wicket` a link to it, then installs the `wicket-node` systemd user service. The node's
 architecture must match the control host's. `wicket image` builds the image from the copy embedded
-in the binary, so it matches the build.
+in the binary, so it matches the build. An explicit `--tag` is kept as given. A derived image built
+with `--dir` whose Dockerfile declares `ARG BASE` (as `examples/self-hosting` does) is built on the
+node's own image: `wicket image` passes it as `BASE`.
 
 ## 4. Run a box there
 
