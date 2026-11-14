@@ -149,8 +149,13 @@ def cargo_args(crates):
 
 
 def doc_args(crates):
-    """The same for doctests: only crates with a library (`cargo test --doc -p` refuses others)."""
-    return "--workspace" if crates == ALL else cargo_args(crates & LIBS)
+    """The same for doctests: the tests' own package set, so cargo resolves the same features and
+    reuses what the tests built (a smaller set rebuilds every dependency: 2–6 minutes). Empty when
+    no selected crate has a library, which `cargo test --doc` refuses; a bin-only crate alongside a
+    library is fine."""
+    if crates == ALL:
+        return "--workspace"
+    return cargo_args(crates) if crates & LIBS else ""
 
 
 def git(*args):
@@ -244,7 +249,7 @@ def self_test():
     # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
     for files, want_args, want_doc in (
         (["crates/wicket-cli/src/chan.rs"], "-p wicket-cli", ""),
-        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", "-p wicket-fwd -p wicket-proxy"),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", "-p wicket-cli -p wicket-fwd -p wicket-proxy"),
         (["docs/x.md"], "", ""),
         (["Cargo.lock"], "--workspace", "--workspace"),
     ):
@@ -295,7 +300,8 @@ def main(argv):
         print(f"affected: {e}; selecting everything", file=sys.stderr)
         crates, suites, why = ALL, ALL, [f"error: {e}"]
     c, s = show(crates, suites)
-    docs = "all" if crates == ALL else " ".join(sorted(crates & LIBS))
+    # Doctests run over the tests' crates (the same features), when one of them has a library.
+    docs = "all" if crates == ALL else (" ".join(sorted(crates)) if crates & LIBS else "")
     for w in why:
         print(f"  {w}", file=sys.stderr)
     print(f"crates: {c}")

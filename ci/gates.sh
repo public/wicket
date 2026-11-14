@@ -80,7 +80,8 @@ if [ "$rust" = 1 ] && [ ${#pkgs[@]} -gt 0 ]; then
   step "clippy (${crates})" cargo clippy "${pkgs[@]}" --all-targets --locked -- -D warnings
   if cargo nextest --version >/dev/null 2>&1; then
     step "tests (${crates}, nextest)" cargo nextest run "${pkgs[@]}" --locked --profile ci
-    # nextest doesn't run doctests; `cargo test --doc` refuses a crate without a library.
+    # nextest doesn't run doctests. They run over the tests' own crates (ci/affected.py), so cargo
+    # resolves the same features and reuses what the tests built.
     if [ ${#doc_pkgs[@]} -gt 0 ]; then step "doctests (${doc_crates})" cargo test "${doc_pkgs[@]}" --locked --doc; fi
   else
     step "tests (${crates})" cargo test "${pkgs[@]}" --locked
