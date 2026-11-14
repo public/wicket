@@ -145,9 +145,6 @@ pub fn principal_label(p: &Value) -> String {
     }
 }
 
-/// The trust domain installations used before it was configurable.
-pub const LEGACY_TRUST_DOMAIN: &str = "wicket.local";
-
 /// Checks a SPIFFE trust domain: 1–255 characters of lowercase letters, digits, `.`, `-` and `_`,
 /// with no scheme, port, path or user info (SPIFFE ID spec §2.1).
 pub fn validate_trust_domain(td: &str) -> Result<()> {
@@ -178,8 +175,8 @@ impl Issuer {
     /// The trust domain is fixed when the key is created, so it can't drift between runs:
     /// - no key yet: `wanted` is required; the key and the domain are created together;
     /// - a key and a recorded domain: `wanted`, if given, must be the same;
-    /// - a key from before trust domains were recorded: `wanted`, or the old default `wicket.local`,
-    ///   is recorded now. Documents issued earlier still verify, by key.
+    /// - a key without a recorded domain (from a development build before trust domains were
+    ///   recorded) is refused: the domain is never guessed.
     pub fn load(path: &Path, wanted: Option<&str>) -> Result<Issuer> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -203,10 +200,12 @@ impl Issuer {
                         )))
                     }
                     (Some(r), _) => r.clone(),
-                    (None, w) => {
-                        let td = w.unwrap_or(LEGACY_TRUST_DOMAIN).to_string();
-                        std::fs::write(&td_path, format!("{td}\n"))?;
-                        td
+                    (None, _) => {
+                        return Err(IdError::TrustDomain(format!(
+                            "{} has no recorded trust domain ({} is missing): this key is from a development build before trust domains were recorded; start again with a new key (`wicket identity init --trust-domain <domain>`)",
+                            path.display(),
+                            td_path.display()
+                        )))
                     }
                 };
                 validate_trust_domain(&td)?;
@@ -542,13 +541,11 @@ mod tests {
         assert_eq!(a.issuer_id(), "spiffe://wicket.example.com");
         assert_eq!(Issuer::load(&path, None).unwrap().trust_domain, "wicket.example.com");
         assert!(matches!(Issuer::load(&path, Some("other.example.com")), Err(IdError::TrustDomain(_))), "fixed once created");
-        // An installation from before trust domains were recorded keeps its key, under the old default,
-        // and documents it issued still verify.
-        let doc = a.issue(&spec("z", "a", None), 1000, 600, &SigningKey::generate(&mut rand_core::OsRng).verifying_key());
+        // A key without its recorded trust domain is refused, whatever is asked for: never guessed.
         std::fs::remove_file(path.with_extension("trust-domain")).unwrap();
-        let legacy = Issuer::load(&path, None).unwrap();
-        assert_eq!(legacy.trust_domain, LEGACY_TRUST_DOMAIN);
-        assert!(verify_identity(&doc, &legacy.verifying_key(), 1100).is_ok());
+        assert!(matches!(Issuer::load(&path, None), Err(IdError::TrustDomain(_))));
+        assert!(matches!(Issuer::load(&path, Some("wicket.example.com")), Err(IdError::TrustDomain(_))));
+        assert!(!path.with_extension("trust-domain").exists(), "nothing recorded");
         let _ = std::fs::remove_dir_all(dir);
     }
 
