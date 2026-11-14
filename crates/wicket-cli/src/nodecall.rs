@@ -187,6 +187,13 @@ impl Calls {
                 }
                 None
             }
+            Frame::Msg(m @ Msg::ImagePulled { .. }) => {
+                let Msg::ImagePulled { id, .. } = &m else { unreachable!() };
+                if let Some(tx) = self.pending.lock().expect("pending").remove(id) {
+                    let _ = tx.send(m);
+                }
+                None
+            }
             Frame::Msg(m @ Msg::ImagePut { .. }) => {
                 let Msg::ImagePut { stream, .. } = &m else { unreachable!() };
                 if let Some(tx) = self.pending.lock().expect("pending").remove(&image_done_key(*stream)) {
@@ -363,6 +370,27 @@ impl Calls {
             Msg::BoxCtlDone { error: Some(e), .. } => bail!("{e}"),
             Msg::BoxCtlDone { out, .. } => Ok(out.as_deref() == Some("present")),
             _ => bail!("an unexpected answer to an image query"),
+        }
+    }
+
+    /// Has the node pull image `digest` from registry `from` for `run`, host-side (#191): returns
+    /// once it has verified and imported it. Only on connections talking [`chan::IMAGE_PULL`].
+    pub async fn pull_image(&self, run: &str, digest: &str, name: Option<&str>, from: &crate::registry::Source) -> Result<()> {
+        let id = self.id();
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().expect("pending").insert(id, tx);
+        let f = Frame::Msg(Msg::PullImage { id, run: run.into(), digest: digest.into(), name: name.map(String::from), from: from.clone() });
+        if !self.send(f) {
+            self.pending.lock().expect("pending").remove(&id);
+            bail!("the node is not connected");
+        }
+        let r = tokio::time::timeout(IMAGE_IMPORT, rx).await;
+        self.pending.lock().expect("pending").remove(&id);
+        match r {
+            Ok(Ok(Msg::ImagePulled { error: None, .. })) => Ok(()),
+            Ok(Ok(Msg::ImagePulled { error: Some(e), .. })) => bail!("{e}"),
+            Ok(_) => bail!("lost the node while it pulled the image"),
+            Err(_) => bail!("the node did not pull the image within {} s", IMAGE_IMPORT.as_secs()),
         }
     }
 

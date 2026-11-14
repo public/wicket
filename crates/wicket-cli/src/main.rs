@@ -28,6 +28,7 @@ mod noderun;
 mod nodesecrets;
 mod nodesrv;
 mod oci;
+mod registry;
 mod pin;
 mod place;
 mod policy;

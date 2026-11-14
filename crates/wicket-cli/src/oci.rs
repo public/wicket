@@ -27,12 +27,12 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 /// The most `index.json`, `oci-layout`, `manifest.json` or a manifest or index blob may be.
-const SMALL_MAX: u64 = 4 << 20;
+pub const SMALL_MAX: u64 = 4 << 20;
 /// How deep indexes may nest.
 const DEPTH_MAX: usize = 4;
 
-const INDEX_TYPES: [&str; 2] = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
-const MANIFEST_TYPES: [&str; 2] = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
+pub const INDEX_TYPES: [&str; 2] = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
+pub const MANIFEST_TYPES: [&str; 2] = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
 /// What [`unpack_verified`] kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +45,8 @@ pub struct Unpacked {
     pub manifests: usize,
 }
 
-fn hex_of(digest: &str) -> Option<&str> {
+/// The hex of a `sha256:<64 lowercase hex>` digest.
+pub fn hex_of(digest: &str) -> Option<&str> {
     digest.strip_prefix("sha256:").filter(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
 }
 
@@ -118,15 +119,23 @@ pub fn unpack_verified(r: impl Read, dir: &Path, pin: &str, name: Option<&str>, 
             }
         }
     }
+    finish(dir, &have, pin, name)
+}
+
+/// The blobs under `dir`'s `blobs/sha256`, each already checked against its digest (`have`: digest
+/// to size), checked to hold the image `pin` whole; what the pin doesn't reach is deleted, and
+/// `oci-layout` and `index.json` are written naming the pin alone (as `name`, if given).
+pub fn finish(dir: &Path, have: &HashMap<String, u64>, pin: &str, name: Option<&str>) -> Result<Unpacked> {
+    let blobs = dir.join("blobs/sha256");
     let Some(&pin_size) = have.get(pin) else { bail!("the image archive does not hold {pin}") };
     let mut keep: HashSet<String> = HashSet::new();
     let mut manifests = 0;
-    let media_type = walk(&blobs, &have, pin, pin_size, None, 0, &mut keep, &mut manifests)?;
+    let media_type = walk(&blobs, have, pin, pin_size, None, 0, &mut keep, &mut manifests)?;
     if manifests == 0 {
         bail!("the image archive holds no complete image under {pin}");
     }
     let mut bytes = 0;
-    for (d, n) in &have {
+    for (d, n) in have {
         if keep.contains(d) {
             bytes += n;
         } else {
@@ -306,8 +315,10 @@ pub mod testkit {
         let index = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2, "mediaType": INDEX_TYPES[0],
             "manifests": [
-                { "mediaType": MANIFEST_TYPES[0], "digest": sha(&manifest), "size": manifest.len() },
-                { "mediaType": MANIFEST_TYPES[0], "digest": sha(b"arm64"), "size": 5 },
+                { "mediaType": MANIFEST_TYPES[0], "digest": sha(&manifest), "size": manifest.len(),
+                  "platform": { "os": "linux", "architecture": crate::registry::testkit::ARCH } },
+                { "mediaType": MANIFEST_TYPES[0], "digest": sha(b"arm64"), "size": 5,
+                  "platform": { "os": "linux", "architecture": "s390x" } },
             ],
         }))
         .unwrap();

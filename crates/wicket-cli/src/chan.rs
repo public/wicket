@@ -69,7 +69,9 @@ use serde::{Deserialize, Serialize};
 /// - 7: images delivered over the channel (#191): [`Msg::ImageHave`], and [`Msg::PutImage`] with its
 ///   data frames, the node's [`Msg::Ack`]s of them and its [`Msg::ImagePut`]. Sent only on
 ///   connections talking [`IMAGE_DELIVERY`] or later; an older node must have the image already.
-pub const PROTOCOL: u32 = 7;
+/// - 8: images pulled by the node from a registry, host-side (#191): [`Msg::PullImage`] and
+///   [`Msg::ImagePulled`], sent only on connections talking [`IMAGE_PULL`] or later.
+pub const PROTOCOL: u32 = 8;
 /// The first protocol version whose nodes take issuing-key tokens (#154).
 pub const ISSUER_CERT: u32 = 2;
 /// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
@@ -82,6 +84,8 @@ pub const EDGE_DECISIONS: u32 = 5;
 pub const IMAGE_PINS: u32 = 6;
 /// The first protocol version whose nodes take an image over the channel and verify it (#191).
 pub const IMAGE_DELIVERY: u32 = 7;
+/// The first protocol version whose nodes pull an image from a registry themselves (#191).
+pub const IMAGE_PULL: u32 = 8;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -440,6 +444,18 @@ pub enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Pull the image `digest` names from registry `from`, host-side, for `run`'s box, verify it
+    /// and import it as `name` (#191). If the registry needs a credential, the node fetches its
+    /// secret for `run` ([`Msg::SecretFetch`]) on this connection. Answered with
+    /// [`Msg::ImagePulled`].
+    PullImage {
+        id: u64,
+        run: String,
+        digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        from: crate::registry::Source,
+    },
 
     // ---- node → control host ----
     /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
@@ -457,6 +473,11 @@ pub enum Msg {
     /// not.
     ImagePut {
         stream: u64,
+        error: Option<String>,
+    },
+    /// Answer to [`Msg::PullImage`]: pulled, verified and imported (`error` None), or why not.
+    ImagePulled {
+        id: u64,
         error: Option<String>,
     },
     /// The connection that shipped audit records went away: send [`Msg::AuditFrom`] with this
@@ -850,6 +871,19 @@ mod tests {
                 name: Some(format!("docker.io/library/x@sha256:{}", "a".repeat(64))),
             }),
             Frame::Msg(Msg::ImagePut { stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5, error: Some("tampered".into()) }),
+            Frame::Msg(Msg::PullImage {
+                id: 9,
+                run: "run_a".into(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                name: None,
+                from: crate::registry::Source {
+                    host: "registry.example.com".into(),
+                    repository: "team/agent".into(),
+                    secret: Some("reg".into()),
+                    ..Default::default()
+                },
+            }),
+            Frame::Msg(Msg::ImagePulled { id: 9, error: None }),
             Frame::Data { stream: TUNNEL_BIT | 4, offset: 1 << 40, bytes: b"hello\0world".to_vec() },
             Frame::Data { stream: 2, offset: 0, bytes: vec![] },
             Frame::Feed(br#"{"t":"fresh","jws":"a.b.c"}"#.to_vec()),
