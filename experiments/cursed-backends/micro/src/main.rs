@@ -79,6 +79,7 @@ fn http() {
     for (name, buf) in corpus() {
         let len = buf.len() - 64;
         let head = &buf[..len];
+        let bp: &[u8] = &buf;
         let hp = || {
             let mut h = [httparse::EMPTY_HEADER; 64];
             let mut r = httparse::Request::new(&mut h);
@@ -93,7 +94,7 @@ fn http() {
                 let mut h = [FbHeader { name: std::ptr::null(), name_len: 0, value: std::ptr::null(), value_len: 0 }; 64];
                 let (mut m, mut ml, mut p, mut pl, mut mi, mut nh) = (std::ptr::null(), 0, std::ptr::null(), 0, 0, 64usize);
                 // SAFETY: buf has 64 readable bytes after len; every out-pointer is a live local.
-                let n = unsafe { f(black_box(buf.as_ptr()), len, &mut m, &mut ml, &mut p, &mut pl, &mut mi, h.as_mut_ptr(), &mut nh) };
+                let n = unsafe { f(black_box(bp.as_ptr()), len, &mut m, &mut ml, &mut p, &mut pl, &mut mi, h.as_mut_ptr(), &mut nh) };
                 assert_eq!(n as usize, len);
                 black_box((n, nh));
             }

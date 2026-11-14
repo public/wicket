@@ -5,10 +5,10 @@
 #
 #   ./profile.sh ../network-overhead/target/release/netbench logs/ [inspect|splice|node]...
 #
-# For each arm, writes OUT/<arm>-<work>.{cpu.json,top.txt,children.txt}. Shared objects are
+# For each arm, writes OUT/<arm>-<work>.{cpu.json,top.txt,shares.json}. Shared objects are
 # reduced to file names, and nothing machine-specific is kept.
 set -euo pipefail
-BIN=$(realpath "$1"); OUT=$(realpath "$2"); shift 2
+HERE=$(dirname "$(realpath "$0")"); mkdir -p "$2"; BIN=$(realpath "$1"); OUT=$(realpath "$2"); shift 2
 ARMS=("${@:-inspect}")
 PORT=${PORT:-18543}; N_KEEP=${N_KEEP:-20000}; N_NEW=${N_NEW:-1000}; N_DL=${N_DL:-5}; FREQ=${FREQ:-999}
 mkdir -p "$OUT"; W=$(mktemp -d)
@@ -22,16 +22,16 @@ until [ -f "$W/origin-ca.der" ]; do sleep 0.1; done
 
 for arm in "${ARMS[@]}"; do
   case $arm in
-    inspect) flags=(--inspect) ;;
-    splice) flags=() ;;
-    node) flags=(--inspect --node) ;;
+    inspect) flags=(--inspect); ca=run-ca.pem ;;
+    splice) flags=(); ca=origin-ca.der ;; # the box sees the origin's own certificate
+    node) flags=(--inspect --node); ca=run-ca.pem ;;
     *) echo "unknown arm $arm" >&2; exit 2 ;;
   esac
   rm -f "$W/egress.sock" "$W/run-ca.pem"
   "$BIN" egress --listen "unix:$W/egress.sock" --dir "$W" --upstream-port "$PORT" --ledger "$W/ledger-$arm.db" "${flags[@]}" >/dev/null 2>&1 &
   EG=$!
   until [ -S "$W/egress.sock" ] && [ -f "$W/run-ca.pem" ]; do sleep 0.1; done
-  probe() { "$BIN" probe --ep "unix:$W/egress.sock" --connect --ca "$W/run-ca.pem" "$@"; }
+  probe() { "$BIN" probe --ep "unix:$W/egress.sock" --connect --ca "$W/$ca" "$@"; }
   probe --work lat_keep --n 500 >/dev/null # warm: leaf minted, pool open
   for work in keep new download; do
     case $work in
@@ -43,7 +43,7 @@ for arm in "${ARMS[@]}"; do
     c0=$(cpu "$EG"); t0=$(date +%s.%N)
     probe "${args[@]}" >"$OUT/$arm-$work.client.json"
     c1=$(cpu "$EG"); t1=$(date +%s.%N)
-    sudo -n sh -c 'echo $$ >"$1"; exec perf record -q -F "$2" --call-graph dwarf,32768 -o "$3" -p "$4"' \
+    sudo -n sh -c 'echo $$ >"$1"; exec perf record -q -F "$2" --call-graph dwarf,16384 -o "$3" -p "$4"' \
       sh "$W/perf.pid" "$FREQ" "$W/$arm-$work.data" "$EG" >/dev/null 2>&1 &
     PR=$!; until [ -s "$W/perf.pid" ]; do sleep 0.05; done; sleep 0.5
     probe "${args[@]}" >/dev/null
@@ -57,10 +57,10 @@ print(json.dumps({"arm": arm, "work": work, "cpu_s": round(c1 - c0, 3), "wall_s"
                   "units": units, "unit": unit, "cpu_us_per_unit": round((c1 - c0) / units * 1e6, 1)}))
 EOF
     strip() { grep -v '^#' | grep '%' | sed -E 's#/[^ ]*/##g; s/ +$//; s/  +/  /g'; }
-    sudo -n perf report -i "$W/$arm-$work.data" --no-children --sort dso,symbol --stdio -g none 2>/dev/null \
+    sudo -n perf report --no-inline -i "$W/$arm-$work.data" --no-children --sort dso,symbol --stdio -g none 2>/dev/null \
       | strip | awk 'NR<=60' >"$OUT/$arm-$work.top.txt"
-    sudo -n perf report -i "$W/$arm-$work.data" --children --sort symbol --stdio -g none 2>/dev/null \
-      | strip | awk 'NR<=400' >"$OUT/$arm-$work.children.txt"
+    sudo -n perf script --no-inline -i "$W/$arm-$work.data" -F ip,sym,dso 2>/dev/null \
+      | python3 -I "$HERE/fold.py" >"$OUT/$arm-$work.shares.json"
     sudo -n rm -f "$W/$arm-$work.data"
   done
   kill "$EG"; wait "$EG" 2>/dev/null || true
