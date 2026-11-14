@@ -47,10 +47,63 @@ impl Stopper {
     /// Whether the box is at a quiet point (only the agent's runtime running), as `user`.
     /// `harness` says which processes are the harness's own.
     async fn check_quiet(&self, user: &str, harness: &(dyn Fn(&str) -> bool + Sync), agent: &[String]) -> std::result::Result<(), String> {
-        let out = self.0.calls.ctl(&self.0.run, "processes", user, "").await.map_err(|e| format!("{e:#}"))?;
-        let procs: Vec<(u32, u32, String)> = serde_json::from_str(out.as_deref().unwrap_or("[]")).map_err(|e| e.to_string())?;
-        crate::hibernate::quiet(&procs, harness, agent).map_err(|others| format!("other processes run in the box: {}", others.join("; ")))
+        let others = self.leftovers(user, harness, agent).await?;
+        if others.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("other processes run in the box: {}", names(&others)))
+        }
     }
+
+    /// The box's processes, as `user`: (pid, parent's pid, command line).
+    async fn processes(&self, user: &str) -> std::result::Result<Vec<(u32, u32, String)>, String> {
+        let out = self.0.calls.ctl(&self.0.run, "processes", user, "").await.map_err(|e| format!("{e:#}"))?;
+        serde_json::from_str(out.as_deref().unwrap_or("[]")).map_err(|e| e.to_string())
+    }
+
+    /// What runs in the box besides the agent runtime (see [`crate::hibernate::leftovers`]).
+    async fn leftovers(
+        &self,
+        user: &str,
+        harness: &(dyn Fn(&str) -> bool + Sync),
+        agent: &[String],
+    ) -> std::result::Result<Vec<(u32, String)>, String> {
+        Ok(crate::hibernate::leftovers(&self.processes(user).await?, harness, agent))
+    }
+
+    /// Stops processes `pids` in the box, as `user` (#293).
+    async fn kill_processes(&self, user: &str, pids: &[u32]) -> std::result::Result<(), String> {
+        let arg = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ");
+        self.0.calls.ctl(&self.0.run, "kill", user, &arg).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// Processes as wicket names them in a note: `pid: command; ...`.
+fn names(procs: &[(u32, String)]) -> String {
+    procs.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("; ")
+}
+
+/// What a harness's grace period to exit is for (#293), once it runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Linger {
+    /// The agent asked to finish and its session closed: at its end, the box is stopped.
+    Finish,
+    /// The agent is to hibernate but other processes ran in its box: at its end, they are stopped.
+    Hibernate,
+}
+
+/// The note a run records when its harness outlived its finished session's grace (#293): what was
+/// left, from the box's process list (or why it couldn't be listed).
+fn finish_note(grace: std::time::Duration, left: &std::result::Result<Vec<String>, String>) -> String {
+    let what = match left {
+        Ok(l) if l.is_empty() => "nothing was listed".to_string(),
+        Ok(l) => l.join("; "),
+        Err(e) => format!("its processes couldn't be listed ({e})"),
+    };
+    format!(
+        "the agent finished, but its harness had not exited {} after its session closed: wicket stopped what was left ({what})",
+        humantime::format_duration(grace)
+    )
 }
 
 /// The box's exit, as its node reports it.
@@ -1405,6 +1458,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     tokio::pin!(give_up);
     let mut stopping = false;
     let stop_grace = std::time::Duration::from_secs(30);
+    // The harness's grace to exit by itself once its session is over (#293), and what it is for.
+    let exit_grace = m.zone.limits.exit_grace()?;
+    let linger = tokio::time::sleep(std::time::Duration::from_secs(86_400 * 365));
+    tokio::pin!(linger);
+    let mut lingering: Option<Linger> = None;
+    // What the run's record says of how it ended, besides its status (what wicket stopped, #293).
+    let mut end_note: Option<String> = None;
     let mut status = "unknown".to_string();
     // A program's last lines of output: its result, when it reports to a parent.
     let mut program_tail: Vec<String> = Vec::new();
@@ -1665,7 +1725,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     notified_msgs = waiting;
                     turn_running = true;
                 }
-                if !turn_running && !hibernating && hib_asked {
+                if !turn_running && !hibernating && hib_asked && lingering.is_none() {
                     hib_asked = false;
                     match &fence {
                         None => println!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
@@ -1675,6 +1735,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 set_state("hibernating", None);
                                 hibernating = true;
                                 stdin = None; // EOF: the agent exits, then its state is pushed
+                            }
+                            Err(why) if why.starts_with("other processes run in the box") => {
+                                // They get the harness's grace to end, then are stopped (#293). It
+                                // goes on running meanwhile, as it was: nothing is paused.
+                                let note = format!("hibernating in {}, stopping what still runs then: {why}", humantime::format_duration(exit_grace));
+                                println!("[wicket] not quiet yet: {note}");
+                                set_state("active", Some(&note));
+                                lingering = Some(Linger::Hibernate);
+                                linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
                             }
                             Err(why) => {
                                 // It goes on running, as it was: nothing is paused.
@@ -1688,8 +1757,84 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if !turn_running && !hibernating && finish_asked && stdin.is_some() {
                     println!("[wicket] closing the session, as the agent asked");
                     stdin = None; // EOF: the agent finishes and exits
+                    // ...within its grace, or what is left of it is stopped (#293). (A hibernate
+                    // waiting for a quiet box gives way: the agent asked to finish since.)
+                    if lingering != Some(Linger::Finish) {
+                        lingering = Some(Linger::Finish);
+                        linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
+                    }
                 }
             }
+            _ = &mut linger, if lingering.is_some() && !stopping => match lingering.take() {
+                Some(Linger::Finish) => {
+                    // Its session is over and the harness lingers (a background process of its, say):
+                    // the run ends as the agent asked, with what wicket stopped named (#293).
+                    let left = stopper.processes(&box_user).await.map(|p| crate::hibernate::left_running(&p));
+                    let note = finish_note(exit_grace, &left);
+                    println!("[wicket] {note}");
+                    if let Ok(lg) = ledger.lock() {
+                        let _ = lg.audit(&m.tenant, Some(&run), "run.leftovers_stopped", &serde_json::json!({ "why": "finish", "processes": left.as_ref().ok(), "note": note }));
+                    }
+                    end_note = Some(note);
+                    hibernating = false;
+                    stopper.kill().await?;
+                    if status == "unknown" {
+                        status = "succeeded".into();
+                    }
+                    stopping = true;
+                    give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                }
+                Some(Linger::Hibernate) if turn_running => {
+                    // A turn began meanwhile (a message): hibernate at its end, with a grace of its own.
+                    println!("[wicket] a turn began before the box was quiet: hibernating at its end");
+                    hib_asked = true;
+                }
+                Some(Linger::Hibernate) if hibernating || stdin.is_none() || fence.is_none() => {}
+                Some(Linger::Hibernate) => {
+                    let agent = fence.as_ref().map(|f| f.agent.as_str()).unwrap_or_default();
+                    let is_harness = |c: &str| harness.is_some_and(|h| h.is_runtime(&m, c));
+                    match stopper.leftovers(&box_user, &is_harness, &agent_cmd).await {
+                        Ok(left) => {
+                            let note = (!left.is_empty()).then(|| {
+                                format!(
+                                    "hibernated: the box wasn't quiet {} after the agent asked; wicket stopped what was left ({})",
+                                    humantime::format_duration(exit_grace),
+                                    names(&left)
+                                )
+                            });
+                            let pids: Vec<u32> = left.iter().map(|(p, _)| *p).collect();
+                            match stopper.kill_processes(&box_user, &pids).await {
+                                Ok(()) => {
+                                    match &note {
+                                        Some(n) => {
+                                            println!("[wicket] {n}");
+                                            if let Ok(lg) = ledger.lock() {
+                                                let _ = lg.audit(&m.tenant, Some(&run), "run.leftovers_stopped", &serde_json::json!({ "why": "hibernate", "processes": left.iter().map(|(_, c)| c).collect::<Vec<_>>(), "note": n }));
+                                            }
+                                        }
+                                        None => println!("[wicket] quiet point: hibernating agent {agent}"),
+                                    }
+                                    set_state("hibernating", Some(note.as_deref().unwrap_or("hibernated at a quiet point")));
+                                    end_note = note;
+                                    hibernating = true;
+                                    stdin = None; // EOF: the agent exits, then its state is pushed
+                                }
+                                Err(e) => {
+                                    let note = format!("not hibernated: stopping what else ran in the box failed: {e}");
+                                    println!("[wicket] {note}; the agent goes on running");
+                                    set_state("active", Some(&note));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let note = format!("not hibernated: {e}");
+                            println!("[wicket] {note}; the agent goes on running");
+                            set_state("active", Some(&note));
+                        }
+                    }
+                }
+                None => {}
+            },
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
                 hibernating = false;
@@ -1857,7 +2002,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             );
             status = "failed (wake)".into();
         } else {
-            set_state("ended", Some(&format!("its session closed ({status}) without hibernating")));
+            let also = end_note.as_deref().map(|n| format!("; {n}")).unwrap_or_default();
+            set_state("ended", Some(&format!("its session closed ({status}) without hibernating{also}")));
         }
     }
     if !exit.success() && !stderr_text.trim().is_empty() {
@@ -1879,7 +2025,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let body = if is_program {
             serde_json::json!({ "status": status, "cause": cause, "result": result, "output_tail": output })
         } else {
-            serde_json::json!({ "status": status, "cause": cause, "result": result })
+            serde_json::json!({ "status": status, "cause": cause, "note": end_note, "result": result })
         };
         match ctx.send_message(p, "run_finished", body) {
             Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
@@ -1907,7 +2053,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     // Pending requests are withdrawn by run_ended below; report them first.
     let summary = serde_json::json!({
-        "status": status, "cause": cause, "seconds": started.elapsed().as_secs(),
+        "status": status, "cause": cause, "note": end_note, "seconds": started.elapsed().as_secs(),
         "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
         "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "cache_read_input_tokens": llm.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
@@ -2126,6 +2272,17 @@ fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lingering_harness_is_named_in_the_note() {
+        let g = std::time::Duration::from_secs(30);
+        let n = finish_note(g, &Ok(vec!["9: claude -p".into(), "14: sleep 86399".into()]));
+        assert!(n.contains("30s after its session closed"), "{n}");
+        assert!(n.ends_with("wicket stopped what was left (9: claude -p; 14: sleep 86399)"), "{n}");
+        assert!(finish_note(g, &Ok(vec![])).contains("(nothing was listed)"));
+        assert!(finish_note(g, &Err("no box".into())).contains("its processes couldn't be listed (no box)"));
+        assert_eq!(names(&[(3, "3: a".into()), (4, "4: b".into())]), "3: a; 4: b");
+    }
 
     const AGENT: &str =
         "task: build\nagent:\n  name: builder\n  image: img:rust\nzone:\n  name: dev\n  images: [img:rust]\n  llm:\n    secret: mock\n";

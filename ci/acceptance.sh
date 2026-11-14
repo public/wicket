@@ -395,6 +395,20 @@ check "  then it asked to finish, and its run ended with it" 'af .seen.finish | 
 wt 60 run "$(manifest acp-claude)" --image "$IMAGE_TAG" >"$work/acp-claude.log" 2>&1 || true
 check "Claude Code through its ACP adapter on a subscription is refused at run start (not allowed by default)" 'grep -q "acp.allow_subscription_backed_claude_adapter: true" "$work/acp-claude.log" && [ -z "$(run_id_of "$work/acp-claude.log")" ]'
 
+# ---- 2c. a harness that lingers after finish (#293) ----
+log "an agent that finishes while its harness lingers: the run ends after limits.exit_grace"
+linger_ws=$(workdir linger)
+t0=$(date +%s)
+wt 120 run "$(manifest linger)" --workdir "$linger_ws" --image "$IMAGE_TAG" >"$work/linger.log" 2>&1 || true
+linger_secs=$(($(date +%s) - t0))
+linger_run=$(run_id_of "$work/linger.log")
+our_runs+=("$linger_run")
+check "an agent left a process running and asked to finish (run ${linger_run:-?})" 'result_of "$work/linger.log" | jq -r .finish | grep -q "^wicket ends your session" && grep -q "closing the session, as the agent asked" "$work/linger.log"'
+check "  its run ended within its 10 s grace (not at its 4 m timeout), as succeeded" 'grep -q "^\[wicket\] run $linger_run: succeeded" "$work/linger.log" && [ "$linger_secs" -lt 90 ]'
+check "  the process wicket stopped is named, in the run's record too" 'grep -q "wicket stopped what was left (.*sleep 86399" "$work/linger.log" && w audit --tail 400 | grep run.end | grep "$linger_run" | grep -q "sleep 86399"'
+check "  its workspace was synced back" '[ "$(data "runs/$linger_run/workspace/out/linger.txt")" = "written before finishing" ]'
+check "  and its box is gone" '[ -z "$(box_of "$linger_run")" ]'
+
 # ---- 3. reconcile: an orphaned box ----
 # Its supervisor killed hard, the box runs on (on this host's own node); reconcile takes its run over
 # instead of ending it (#151), and the run ends when it is revoked.
@@ -652,7 +666,7 @@ n_fail=$(printf '%s\n' "${results[@]}" | grep -c '^FAIL' || true)
 echo "$n_ok ok, $n_fail failed"
 if [ "$fail" != 0 ]; then
   echo "== mock model log (tail)"; tail -20 "$work/mock.log"
-  for f in lead hib1 hib2 acp1 acp2 orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
+  for f in lead hib1 hib2 acp1 acp2 linger orphan decisions; do [ -f "$work/$f.log" ] && { echo "== $f.log (tail)"; tail -25 "$work/$f.log"; }; done
   exit 1
 fi
 echo "acceptance passed"

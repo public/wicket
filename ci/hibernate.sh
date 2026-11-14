@@ -177,27 +177,28 @@ check "a spent agent isn't woken" 'grep -q "request budget is spent" <<<"$out"'
 check "nor by wicket wake, and its generation stays" 'grep -q "request budget is spent" "$work/w3.log" && [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ]'
 check "it made no model call" '[ "$(grep -c "^mock: /v1/messages" "$work/mock.log" || true)" = "$calls" ]'
 
-# Agent B: leaves a background process running, so it can't be rebuilt without losing it.
+# Agent B: leaves a background process running. It gets the zone's limits.exit_grace (30 s) to
+# end, then wicket stops it and hibernates B, naming it (#293): a rebuild restores files, not processes.
 mkdir -p "$work/b"
 echo 'nohup sleep 300 >/dev/null 2>&1 & echo "{\"status\":\"busy\"}" > /workspace/out/result.json; echo "wicket-mock: hibernate"' > "$work/b/step.sh"
-echo "== agent B: a background process keeps it running"
+echo "== agent B: a background process outlives its turn"
 timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/b" "${node_args[@]}" ${IMAGE:+--image "$IMAGE"} >"$work/b.log" 2>&1 & busy_pid=$!
 B=""
 for _ in $(seq 90); do
   B=$(grep -o 'agent agt_[a-z0-9]*' "$work/b.log" 2>/dev/null | head -1 | cut -d' ' -f2 || true)
-  [ -n "$B" ] && grep -q "not hibernated" "$work/b.log" && break
+  [ -n "$B" ] && grep -q "not quiet yet" "$work/b.log" && break
   sleep 1
 done
-grep -E '^\[wicket\]' "$work/b.log" || true
-check "B was not hibernated" 'grep -q "not hibernated: other processes run in the box" "$work/b.log"'
-check "B is active in the ledger, with the reason" '[ "$(agent_field "$B" state)" = active ] && agent_field "$B" note | grep -q sleep'
+check "B was not hibernated at once: something else ran" 'grep -q "not quiet yet: hibernating in 30s, stopping what still runs then: other processes run in the box: .*sleep 300" "$work/b.log"'
+check "B is active in the ledger meanwhile, with the reason" '[ "$(agent_field "$B" state)" = active ] && agent_field "$B" note | grep -q sleep'
 bbox=$($DOCKER ps -q --filter name=^hib-run- | head -1)
-check "B's box runs, not paused (#249)" '[ -n "$bbox" ] && [ "$($DOCKER inspect -f "{{.State.Paused}}" "$bbox")" = false ]'
-out=$("$WICKET" hibernate "$B" --wait 30 || true); echo "   $out"
-check "wicket hibernate leaves it running too" 'grep -q "goes on running" <<<"$out"'
-kill -TERM "$busy_pid" 2>/dev/null || true
+check "B's box runs meanwhile, not paused (#249)" '[ -n "$bbox" ] && [ "$($DOCKER inspect -f "{{.State.Paused}}" "$bbox")" = false ]'
+for _ in $(seq 90); do [ "$(agent_field "$B" state)" = hibernated ] && break; sleep 1; done
+grep -E '^\[wicket\]' "$work/b.log" || true
+check "after its grace, wicket stopped the process and hibernated B" '[ "$(agent_field "$B" state)" = hibernated ] && grep -q "wicket stopped what was left (.*sleep 300" "$work/b.log"'
+check "B's note names what was stopped" 'agent_field "$B" note | grep -q "stopped what was left (.*sleep 300"'
 wait "$busy_pid" 2>/dev/null || true
-check "B's box was stopped with its run" '[ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'
+check "B's run ended hibernated, and its box is gone" 'grep -q "^\[wicket\] run run_[a-z0-9]*: hibernated" "$work/b.log" && [ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'
 
 check "the model never saw the placeholder" '! grep -q "PLACEHOLDER" "$work/mock.log"'
 sealed_only() {

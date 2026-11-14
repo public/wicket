@@ -836,6 +836,11 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
         "pause" => node.docker.pause(&name).await.map(|()| None),
         "unpause" => node.docker.unpause(&name).await.map(|()| None),
         "processes" => Ok(Some(serde_json::to_string(&node.docker.processes(&name, user).await?)?)),
+        // Leftover processes the control host stops (#293): pids, space-separated.
+        "kill" => {
+            let pids = parse_pids(arg)?;
+            node.docker.kill_processes(&name, user, &pids).await.map(|()| None)
+        }
         "hosts" => {
             if arg.len() > 64 * 1024 {
                 bail!("hosts file too large");
@@ -847,6 +852,19 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
         }
         w => bail!("unknown box operation {w:?}"),
     }
+}
+
+/// The pids of a `kill` box operation: up to 4096 of them, each a positive number other than 1
+/// (the box's init: stopping it is stopping the box, which is the run's own stop).
+fn parse_pids(arg: &str) -> Result<Vec<u32>> {
+    let pids = arg
+        .split_whitespace()
+        .map(|p| p.parse::<u32>().ok().filter(|&p| p > 1).with_context(|| format!("bad pid {p:?}")))
+        .collect::<Result<Vec<u32>>>()?;
+    if pids.len() > 4096 {
+        bail!("too many pids");
+    }
+    Ok(pids)
 }
 
 type GwBody = http_body_util::Full<bytes::Bytes>;
@@ -1917,6 +1935,16 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kill_names_pids_never_the_init() {
+        assert_eq!(parse_pids("14 15\n16").unwrap(), vec![14, 15, 16]);
+        assert!(parse_pids("").unwrap().is_empty());
+        for bad in ["1", "0", "-3", "14 x", "14;rm"] {
+            assert!(parse_pids(bad).is_err(), "{bad} was accepted");
+        }
+        assert!(parse_pids(&vec!["2"; 4097].join(" ")).is_err());
+    }
 
     use crate::nodeauth::testkit::Install;
     use crate::nodeauth::HsError;
