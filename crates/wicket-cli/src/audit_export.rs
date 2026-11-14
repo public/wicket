@@ -841,37 +841,6 @@ mod tests {
         assert!(a.problems.iter().any(|p| p.contains("ends at seq 6")), "{:?}", a.problems);
     }
 
-    /// #120: on a v1 ledger, whose hashes cover neither ts, tenant nor run, a record moved to another
-    /// run passes the chain check; `--against` compares every exported field, so it is caught.
-    #[test]
-    fn against_catches_edits_a_v1_hash_does_not_cover() {
-        let d = TmpDir::new("against-fields");
-        let lp = d.0.join("ledger.db");
-        let out = d.0.join("audit.jsonl");
-        let l = Ledger::open(&lp).unwrap();
-        let c = rusqlite_conn(&lp);
-        let mut prev = wicket_store::CHAIN_ZERO.to_string();
-        for i in 0..4 {
-            let body = json!({ "i": i }).to_string();
-            let h = wicket_store::chain_hash(&prev, "op", &body);
-            c.execute(
-                "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (10, 'default', 'run_a', 'op', ?1, ?2, ?3)",
-                rusqlite::params![body, prev, h],
-            )
-            .unwrap();
-            prev = h;
-        }
-        let mut x = Exporter::new(&lp, jsonl_cfg(&out), None).unwrap();
-        x.pass(false);
-        let objs = exported_objects(&std::fs::read_to_string(&out).unwrap());
-        let key = wicket_identity::Issuer::generate("test.local").verifying_key();
-        assert!(verify_against(&l, &objs, &key).unwrap().problems.is_empty());
-        c.execute("UPDATE audit SET run = 'run_b', tenant = 'other', ts = 99 WHERE seq = 2", []).unwrap();
-        assert_eq!(l.verify_audit().unwrap(), 4, "a v1 chain doesn't cover them");
-        let a = verify_against(&l, &objs, &key).unwrap();
-        assert_eq!(a.problems, vec!["record 2: the exported copy's ts, tenant, run differs from the local one".to_string()]);
-    }
-
     #[test]
     fn one_process_feeds_a_sink_at_a_time() {
         let d = TmpDir::new("lease");

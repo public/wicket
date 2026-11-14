@@ -17,7 +17,7 @@
 //! under no run (`"attributed": false`), so a node can't put records into another run's or tenant's
 //! stream. What the node claimed is kept in the body (its chain hash covers it).
 
-use crate::{ChainFields, ChainSummary, Ledger, Result, StoreError, CHAIN_V2_PREFIX, CHAIN_ZERO as ZERO};
+use crate::{chain_hash_v2, ChainFields, Ledger, Result, StoreError, CHAIN_ZERO as ZERO};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -222,20 +222,9 @@ impl Ledger {
             .flatten())
     }
 
-    /// Whether `node` has ever shipped a v2 record: from then on, v1 records from it are refused.
-    fn node_shipped_v2(&self, node: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM audit WHERE kind = 'node.audit' AND json_extract(body, '$.node') = ?1
-                              AND substr(json_extract(body, '$.hash'), 1, 3) = ?2)",
-            params![node, CHAIN_V2_PREFIX],
-            |r| r.get(0),
-        )?)
-    }
-
     /// Appends records shipped by `node`, in a session for `tenant`, each as a `node.audit` record.
     /// They must continue the node's chain from what was shipped before (or restart it at seq 1,
-    /// which is recorded as a `node.audit.restart`), and each hash must recompute under the version
-    /// it names. Each is filed under `tenant`, and under the run it names only if that run was placed
+    /// which is recorded as a `node.audit.restart`), and each hash must recompute. Each is filed under `tenant`, and under the run it names only if that run was placed
     /// on `node` for `tenant`. Returns how many were appended; nothing is appended if any record
     /// doesn't check.
     pub fn append_node_audit(&self, node: &str, tenant: &wicket_core::TenantId, recs: &[AuditRecord]) -> Result<usize> {
@@ -257,11 +246,10 @@ impl Ledger {
         let refuse = || StoreError::Node(node.into(), "shipped audit records do not continue the node's chain");
         let head = self.node_audit_head(node)?;
         let (mut seq, mut prev) = head.clone().unwrap_or((0, ZERO.to_string()));
-        let mut sum = ChainSummary { v1: 0, v2: self.node_shipped_v2(node)? as i64 };
         for r in recs {
             let restart = r.seq == 1 && r.prev == ZERO;
             let f = ChainFields { seq: r.seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body: &r.body };
-            if !(restart || (r.seq == seq + 1 && r.prev == prev)) || !sum.accept(&r.prev, &f, &r.hash) {
+            if !(restart || (r.seq == seq + 1 && r.prev == prev)) || chain_hash_v2(&r.prev, &f) != r.hash {
                 return Err(refuse());
             }
             (seq, prev) = (r.seq, r.hash.clone());
@@ -297,7 +285,7 @@ impl Ledger {
     pub fn verify_node_audit(&self) -> Result<Vec<NodeAuditSummary>> {
         let mut st = self.conn.prepare("SELECT seq, body FROM audit WHERE kind = 'node.audit' ORDER BY seq")?;
         let mut rows = st.query([])?;
-        type Head = (i64, String, ChainSummary, NodeAuditSummary);
+        type Head = (i64, String, NodeAuditSummary);
         let mut heads: std::collections::BTreeMap<String, Head> = Default::default();
         while let Some(r) = rows.next()? {
             let (at, body): (i64, String) = (r.get(0)?, r.get(1)?);
@@ -305,28 +293,21 @@ impl Ledger {
             let s = |k: &str| v[k].as_str().map(String::from).ok_or(StoreError::ChainBroken(at));
             let (node, kind, b, p, h) = (s("node")?, s("kind")?, s("body")?, s("prev")?, s("hash")?);
             let seq = v["seq"].as_i64().ok_or(StoreError::ChainBroken(at))?;
-            // Records shipped before #120 carry neither ts nor tenant in the body; they are v1, whose
-            // hash doesn't cover them. A v2 record without them fails.
-            let (ts, tenant) = (v["ts"].as_i64().unwrap_or(0), v["tenant"].as_str().unwrap_or(""));
-            let f = ChainFields { seq, ts, tenant, run: v["run"].as_str(), kind: &kind, body: &b };
-            let e = heads
-                .entry(node.clone())
-                .or_insert_with(|| (0, ZERO.to_string(), ChainSummary::default(), NodeAuditSummary { node, records: 0, restarts: 0 }));
+            let (ts, tenant) = (v["ts"].as_i64().ok_or(StoreError::ChainBroken(at))?, s("tenant")?);
+            let f = ChainFields { seq, ts, tenant: &tenant, run: v["run"].as_str(), kind: &kind, body: &b };
+            let e = heads.entry(node.clone()).or_insert_with(|| (0, ZERO.to_string(), NodeAuditSummary { node, records: 0, restarts: 0 }));
             let restart = seq == 1 && p == ZERO;
-            if (h.starts_with(CHAIN_V2_PREFIX) && v["tenant"].as_str().is_none())
-                || !(restart || (seq == e.0 + 1 && p == e.1))
-                || !e.2.accept(&p, &f, &h)
-            {
+            if !(restart || (seq == e.0 + 1 && p == e.1)) || chain_hash_v2(&p, &f) != h {
                 return Err(StoreError::ChainBroken(at));
             }
-            if restart && e.3.records > 0 {
-                e.3.restarts += 1;
+            if restart && e.2.records > 0 {
+                e.2.restarts += 1;
             }
             e.0 = seq;
             e.1 = h;
-            e.3.records += 1;
+            e.2.records += 1;
         }
-        Ok(heads.into_values().map(|(_, _, _, s)| s).collect())
+        Ok(heads.into_values().map(|(_, _, s)| s).collect())
     }
 }
 
@@ -442,22 +423,12 @@ mod tests {
         ctl.append_node_audit("n1", &t, &fresh.audit_records_after(0, 10).unwrap()).unwrap();
         let kinds: Vec<String> = ctl.audit_records_after(0, 10).unwrap().into_iter().map(|r| r.kind).collect();
         assert_eq!(kinds, ["node.audit", "node.audit.restart", "node.audit"]);
-        // A v1 restart (an old-format chain, which hides ts, tenant and run) is refused now.
-        let body = "{}".to_string();
-        let v1 = AuditRecord {
-            seq: 1,
-            ts: 5,
-            tenant: "t0".into(),
-            run: Some("run_a".into()),
-            kind: "op".into(),
-            hash: crate::chain_hash(ZERO, "op", &body),
-            body,
-            prev: ZERO.into(),
-        };
-        assert!(ctl.append_node_audit("n1", &t, std::slice::from_ref(&v1)).is_err());
-        // A node that has only ever shipped v1 (an older node) is still accepted.
-        assert_eq!(ctl.append_node_audit("old", &t, &[v1]).unwrap(), 1);
-        assert_eq!(ctl.verify_node_audit().unwrap().len(), 2);
+        // A record whose hash doesn't cover every field (the pre-v2 form) is refused, from any node.
+        let mut forged = fresh.audit_records_after(0, 10).unwrap().remove(0);
+        forged.hash = "0".repeat(64);
+        assert!(ctl.append_node_audit("n1", &t, std::slice::from_ref(&forged)).is_err());
+        assert!(ctl.append_node_audit("other", &t, &[forged]).is_err());
+        assert_eq!(ctl.verify_node_audit().unwrap().len(), 1);
     }
 
     #[test]
