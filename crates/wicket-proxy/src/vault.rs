@@ -99,8 +99,8 @@ impl Vault {
             return self.get_ref(name, &r);
         }
         let meta = std::fs::metadata(&p).with_context(|| format!("secret {name:?} is not set (run: wicket secret set {name})"))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            bail!("secret file {} must not be readable by group or others", p.display());
+        if let Err(why) = check_private(&p, &meta) {
+            bail!("secret file {} must not be readable by group or others: {why}", p.display());
         }
         let v = std::fs::read_to_string(&p)?;
         let v = v.trim().to_string();
@@ -116,8 +116,8 @@ impl Vault {
         // No pointer: the whole file is the secret (e.g. an API key file).
         let pointer = spec.get("pointer").and_then(|v| v.as_str());
         let meta = std::fs::metadata(file).with_context(|| format!("secret {name} refers to {file}, which is missing"))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            bail!("{file} (referenced by secret {name}) must not be readable by group or others");
+        if let Err(why) = check_private(std::path::Path::new(file), &meta) {
+            bail!("{file} (referenced by secret {name}) must not be readable by group or others: {why}");
         }
         let Some(pointer) = pointer else {
             let v = std::fs::read_to_string(file)?;
@@ -314,6 +314,132 @@ pub fn covers(allowed: &str, wanted: &str) -> bool {
     }
 }
 
+/// Refuses a secret file that anyone but its owner (and the user wicket runs as) can read. A mode
+/// with no group or other bits passes. Otherwise the file's POSIX access ACL decides: a file shared
+/// read-only with exactly the wicket user (`setfacl -m u:wicket:r FILE`) shows the ACL mask in its
+/// group bits, and passes as long as no one else is granted read. On refusal, says who can read it.
+fn check_private(path: &std::path::Path, meta: &std::fs::Metadata) -> std::result::Result<(), String> {
+    let mode = meta.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    let refuse_mode = || {
+        let mut who = Vec::new();
+        if mode & 0o070 != 0 {
+            who.push("its group");
+        }
+        if mode & 0o007 != 0 {
+            who.push("others");
+        }
+        Err(format!("its mode {:03o} gives {} access", mode & 0o777, who.join(" and ")))
+    };
+    let Some(raw) = access_acl(path) else { return refuse_mode() };
+    let acl = parse_acl(&raw).map_err(|e| format!("its ACL can't be read ({e})"))?;
+    if !acl.iter().any(|e| matches!(e.tag, AclTag::User | AclTag::Group | AclTag::Mask)) {
+        // A minimal ACL is just the mode.
+        return refuse_mode();
+    }
+    let readers = acl_readers(&acl, unsafe { libc::geteuid() });
+    if readers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("its ACL lets {} read it", readers.join(", ")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AclTag {
+    UserObj,
+    User,
+    GroupObj,
+    Group,
+    Mask,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AclEntry {
+    tag: AclTag,
+    perm: u16,
+    id: u32,
+}
+
+const ACL_READ: u16 = 4;
+
+/// The raw `system.posix_acl_access` xattr, or None when the file has none or the filesystem
+/// doesn't support it.
+fn access_acl(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = c"system.posix_acl_access";
+    for _ in 0..4 {
+        // SAFETY: valid NUL-terminated strings; a null buffer of size 0 asks for the size.
+        let n = unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize];
+        // SAFETY: buf is writable for buf.len() bytes.
+        let m = unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if m >= 0 {
+            buf.truncate(m as usize);
+            return Some(buf);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
+            return None;
+        }
+        // It grew between the calls: ask again.
+    }
+    None
+}
+
+/// Parses the Linux POSIX ACL xattr: a little-endian u32 version (2), then 8-byte entries of
+/// u16 tag, u16 permissions (r=4, w=2, x=1) and u32 id (for named users and groups).
+fn parse_acl(raw: &[u8]) -> Result<Vec<AclEntry>> {
+    if raw.len() < 4 || !(raw.len() - 4).is_multiple_of(8) {
+        bail!("{} bytes is not a POSIX ACL", raw.len());
+    }
+    let version = u32::from_le_bytes(raw[..4].try_into().unwrap());
+    if version != 2 {
+        bail!("ACL version {version}, not 2");
+    }
+    raw[4..]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| {
+            let tag = match u16::from_le_bytes([c[0], c[1]]) {
+                0x01 => AclTag::UserObj,
+                0x02 => AclTag::User,
+                0x04 => AclTag::GroupObj,
+                0x08 => AclTag::Group,
+                0x10 => AclTag::Mask,
+                0x20 => AclTag::Other,
+                t => bail!("unknown ACL tag {t:#x}"),
+            };
+            Ok(AclEntry { tag, perm: u16::from_le_bytes([c[2], c[3]]), id: u32::from_le_bytes([c[4], c[5], c[6], c[7]]) })
+        })
+        .collect()
+}
+
+/// Who, besides the owner and `me`, the ACL lets read the file. Named users, named groups and the
+/// owning group are limited by the mask when there is one; others are not.
+fn acl_readers(acl: &[AclEntry], me: u32) -> Vec<String> {
+    let mask = acl.iter().find(|e| e.tag == AclTag::Mask).map_or(u16::MAX, |e| e.perm);
+    let reads = |e: &AclEntry, masked: bool| e.perm & ACL_READ != 0 && (!masked || mask & ACL_READ != 0);
+    let mut who = Vec::new();
+    for e in acl {
+        match e.tag {
+            AclTag::User if e.id != me && reads(e, true) => who.push(format!("user {}", e.id)),
+            AclTag::GroupObj if reads(e, true) => who.push("its group".to_string()),
+            AclTag::Group if reads(e, true) => who.push(format!("group {}", e.id)),
+            AclTag::Other if reads(e, false) => who.push("others".to_string()),
+            _ => {}
+        }
+    }
+    who
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +517,96 @@ mod tests {
         );
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(v.get("api").is_err(), "world-readable source refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `system.posix_acl_access` bytes for these (tag, perm, id) entries.
+    fn acl_bytes(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut b = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            b.extend(tag.to_le_bytes());
+            b.extend(perm.to_le_bytes());
+            b.extend(id.to_le_bytes());
+        }
+        b
+    }
+
+    const UNDEF: u32 = u32::MAX;
+
+    /// An ACL like `setfacl -m u:wicket:r` on an owner-only file makes, plus `extra` entries,
+    /// with the owning group's and others' permissions and the mask given.
+    fn acl(group: u16, mask: u16, other: u16, extra: &[(u16, u16, u32)]) -> Vec<AclEntry> {
+        let mut e = vec![(0x01, 6, UNDEF), (0x02, 4, 1000)];
+        e.extend_from_slice(extra);
+        e.extend([(0x04, group, UNDEF), (0x10, mask, UNDEF), (0x20, other, UNDEF)]);
+        parse_acl(&acl_bytes(&e)).unwrap()
+    }
+
+    #[test]
+    fn the_acl_parser_reads_the_xattr_format() {
+        let a = parse_acl(&acl_bytes(&[
+            (0x01, 6, UNDEF),
+            (0x02, 4, 1000),
+            (0x04, 0, UNDEF),
+            (0x08, 5, 50),
+            (0x10, 4, UNDEF),
+            (0x20, 0, UNDEF),
+        ]))
+        .unwrap();
+        assert_eq!(a.len(), 6);
+        assert_eq!(a[1], AclEntry { tag: AclTag::User, perm: 4, id: 1000 });
+        assert_eq!(a[3], AclEntry { tag: AclTag::Group, perm: 5, id: 50 });
+        assert_eq!(a[4].tag, AclTag::Mask);
+        assert!(parse_acl(&[2, 0, 0, 0]).unwrap().is_empty());
+        assert!(parse_acl(&[]).is_err(), "too short");
+        assert!(parse_acl(&acl_bytes(&[(0x01, 6, UNDEF)])[..10]).is_err(), "truncated entry");
+        let mut v1 = acl_bytes(&[(0x01, 6, UNDEF)]);
+        v1[0] = 1;
+        assert!(parse_acl(&v1).is_err(), "unknown version");
+        assert!(parse_acl(&acl_bytes(&[(0x40, 6, UNDEF)])).is_err(), "unknown tag");
+    }
+
+    #[test]
+    fn an_acl_may_grant_read_to_the_reader_alone() {
+        assert!(acl_readers(&acl(0, 4, 0, &[]), 1000).is_empty(), "only the reader: accepted");
+        assert_eq!(acl_readers(&acl(0, 4, 0, &[]), 1001), ["user 1000"], "the named user isn't us");
+        assert_eq!(acl_readers(&acl(0, 4, 0, &[(0x02, 4, 1002)]), 1000), ["user 1002"], "another user");
+        assert_eq!(acl_readers(&acl(0, 4, 0, &[(0x08, 4, 50)]), 1000), ["group 50"], "a named group");
+        assert_eq!(acl_readers(&acl(4, 4, 0, &[]), 1000), ["its group"], "the owning group");
+        assert_eq!(acl_readers(&acl(0, 4, 4, &[]), 1000), ["others"], "others, unmasked");
+        assert_eq!(acl_readers(&acl(0, 0, 4, &[]), 1000), ["others"], "the mask doesn't limit others");
+        // The mask can only take away: entries it doesn't let read are no readers.
+        assert!(acl_readers(&acl(4, 0, 0, &[(0x08, 4, 50), (0x02, 4, 1002)]), 1000).is_empty());
+        assert!(acl_readers(&acl(2, 6, 0, &[(0x08, 2, 50)]), 1000).is_empty(), "write isn't read");
+        // Without a mask entry nothing is masked.
+        let no_mask = parse_acl(&acl_bytes(&[(0x01, 6, UNDEF), (0x04, 4, UNDEF), (0x20, 0, UNDEF)])).unwrap();
+        assert_eq!(acl_readers(&no_mask, 1000), ["its group"]);
+    }
+
+    #[test]
+    fn a_file_shared_with_the_reader_by_acl_is_accepted() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("api-key");
+        std::fs::write(&key, "key-1").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let me = unsafe { libc::geteuid() };
+        let setfacl = |spec: &str| {
+            std::process::Command::new("setfacl").args(["-m", spec]).arg(&key).output().map(|o| o.status.success()).unwrap_or(false)
+        };
+        if !setfacl(&format!("u:{me}:r")) || access_acl(&key).is_none() {
+            eprintln!("skipped: setfacl or ACLs aren't available here");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let v = Vault::new(dir.join("vault"));
+        v.link("api", key.to_str().unwrap(), None, None).unwrap();
+        assert_ne!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o070, 0, "the mask shows in the group bits");
+        assert_eq!(v.get("api").unwrap(), "key-1", "readable by the reader alone");
+        assert!(setfacl(&format!("u:{}:r", me.wrapping_add(1))));
+        let e = v.get("api").unwrap_err().to_string();
+        assert!(e.contains(&format!("user {}", me.wrapping_add(1))), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
