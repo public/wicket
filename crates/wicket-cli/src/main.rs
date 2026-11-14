@@ -73,7 +73,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use wicket_core::TenantId;
 use wicket_proxy::vault::Vault;
-use wicket_store::{Approval, Ledger};
+use wicket_store::Ledger;
 
 #[derive(Parser)]
 #[command(name = "wicket", version, about = "Run agents in least-privilege sandboxes (proof of concept)")]

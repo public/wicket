@@ -131,7 +131,7 @@ fn deny(l: &mut Ledger, by: &Granter, id: &str, extra: serde_json::Value) -> Res
 /// Whether a prefix may be granted for `req`: it covers the asked path, or (for a prefix ask) lies
 /// within the asked prefix. What the grant covers is what the granter named, never a silent
 /// fall-back to the exact path.
-pub fn check_prefix(req: &Request, p: &str) -> std::result::Result<(), String> {
+fn check_prefix(req: &Request, p: &str) -> std::result::Result<(), String> {
     let within = req.scope_prefix && wicket_core::prefix_covers(&req.path, p);
     if wicket_core::prefix_covers(p, &req.path) || within {
         return Ok(());
@@ -160,12 +160,7 @@ mod tests {
     }
 
     fn decisions(l: &Ledger) -> Vec<serde_json::Value> {
-        l.audit_tail(50)
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.2 == "decision")
-            .map(|r| serde_json::from_str(&r.4).unwrap())
-            .collect()
+        l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "decision").map(|r| serde_json::from_str(&r.4).unwrap()).collect()
     }
 
     #[test]
@@ -181,7 +176,10 @@ mod tests {
         assert_eq!(l.grant(&grant).unwrap().unwrap().request_id.as_deref(), Some(id.as_str()));
         assert_eq!(l.request(&id).unwrap().status, "granted");
         let d = decisions(&l);
-        assert_eq!((d[0]["decision"].as_str(), d[0]["by"].as_str(), d[0]["grant"].as_str()), (Some("approve"), Some("alice@cli"), Some(grant.as_str())));
+        assert_eq!(
+            (d[0]["decision"].as_str(), d[0]["by"].as_str(), d[0]["grant"].as_str()),
+            (Some("approve"), Some("alice@cli"), Some(grant.as_str()))
+        );
         // Decided once: a second decision on it is refused.
         assert!(decide(&mut l, &by, &id, &Verdict::Deny, serde_json::json!({})).is_err());
     }
@@ -191,10 +189,15 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
         let by = Granter::Human("alice@cli".into());
-        for t in [terms(24 * 3600 + 1), terms(0), Terms { uses: Some(0), ..terms(60) }] {
+        for (t, why) in [
+            (terms(24 * 3600 + 1), "at most 1day"),
+            (terms(0), "needs a lifetime"),
+            (Terms { uses: Some(0), ..terms(60) }, "at least one use"),
+        ] {
             let e = decide(&mut l, &by, &id, &Verdict::Approve(t), serde_json::json!({})).unwrap_err();
-            assert!(!format!("{e:#}").is_empty());
+            assert!(format!("{e:#}").contains(why), "{e:#} should say {why:?}");
         }
+        assert!(decisions(&l).is_empty(), "nothing recorded");
         assert_eq!(l.request(&id).unwrap().status, "pending", "a refused approval decides nothing");
         assert!(decide(&mut l, &by, &id, &Verdict::Approve(terms(24 * 3600)), serde_json::json!({})).is_ok());
     }
@@ -205,9 +208,27 @@ mod tests {
         let id = asked(&l, "/v1/x/y");
         let by = Granter::Human("alice@cli".into());
         let wide = Terms { prefix: Some("/v2/".into()), ..terms(60) };
-        assert!(decide(&mut l, &by, &id, &Verdict::Approve(wide), serde_json::json!({})).is_err());
+        let e = decide(&mut l, &by, &id, &Verdict::Approve(wide), serde_json::json!({})).unwrap_err();
+        assert!(format!("{e:#}").contains("doesn't cover"), "{e:#}");
+        assert_eq!(l.request(&id).unwrap().status, "pending");
+        // Narrower than the path is not covering it either.
+        let narrower = Terms { prefix: Some("/v1/x/y/z/".into()), ..terms(60) };
+        assert!(decide(&mut l, &by, &id, &Verdict::Approve(narrower), serde_json::json!({})).is_err());
         let ok = Terms { prefix: Some("/v1/".into()), ..terms(60) };
         assert!(decide(&mut l, &by, &id, &Verdict::Approve(ok), serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn a_prefix_ask_may_be_granted_within_its_prefix() {
+        let l = Ledger::open_in_memory().unwrap();
+        let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", "/items/");
+        let (id, _) = l.ask(&op, "pages", true, None).unwrap();
+        let req = l.request(&id).unwrap();
+        let with = |p: &str| Terms { prefix: Some(p.into()), ..terms(60) };
+        assert!(check_terms(&req, &with("/items/a/")).is_ok(), "within the asked prefix");
+        assert!(check_terms(&req, &with("/")).is_ok(), "covering it");
+        let e = check_terms(&req, &with("/other/")).unwrap_err();
+        assert!(format!("{e:#}").contains("nor lie within it"), "{e:#}");
     }
 
     #[test]
@@ -215,7 +236,10 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
         let by = Granter::Human("passkey:k".into());
-        assert_eq!(decide(&mut l, &by, &id, &Verdict::Deny, serde_json::json!({ "signed": "s" })).unwrap(), Decided::Denied { lease: None });
+        assert_eq!(
+            decide(&mut l, &by, &id, &Verdict::Deny, serde_json::json!({ "signed": "s" })).unwrap(),
+            Decided::Denied { lease: None }
+        );
         assert_eq!(l.request(&id).unwrap().status, "denied");
         let d = decisions(&l);
         assert_eq!((d[0]["decision"].as_str(), d[0]["signed"].as_str()), (Some("deny"), Some("s")));

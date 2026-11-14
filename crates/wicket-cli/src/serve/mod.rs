@@ -1028,12 +1028,14 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 _ => return Err(bad("decision must be approve or deny")),
             };
             let unlimited = body.get("unlimited").and_then(|u| u.as_bool()).unwrap_or(false);
+            // The terms are what the human asked for, or refused: never clamped to something else.
             let uses = if !approve || unlimited {
                 None
             } else {
-                Some(body.get("uses").and_then(|u| u.as_u64()).unwrap_or(1).clamp(1, 1000) as u32)
+                let n = body.get("uses").and_then(|u| u.as_u64()).unwrap_or(1);
+                Some(u32::try_from(n).map_err(|_| bad("uses: too many; grant unlimited uses instead"))?)
             };
-            let ttl_secs = body.get("ttl_secs").and_then(|u| u.as_u64()).unwrap_or(600).clamp(30, 24 * 3600);
+            let ttl_secs = body.get("ttl_secs").and_then(|u| u.as_u64()).unwrap_or(600);
             let req = l.request(id).map_err(|e| err(StatusCode::NOT_FOUND, e))?;
             if req.status != "pending" {
                 return Err(err(StatusCode::CONFLICT, format!("{id} is {}, not pending", req.status)));
@@ -1041,14 +1043,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             let prefix = match body.get("prefix") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(p)) if approve => {
-                    let p = wicket_core::canonical_path(p).map_err(|e| bad(&format!("prefix: {e}")))?.to_string();
-                    crate::grant::check_prefix(&req, &p).map_err(|e| bad(&e))?;
-                    Some(p)
+                    Some(wicket_core::canonical_path(p).map_err(|e| bad(&format!("prefix: {e}")))?.to_string())
                 }
                 Some(Value::String(_)) => None,
                 Some(_) => return Err(bad("prefix must be a path")),
             };
             let zone_wide = approve && body.get("zone_wide").and_then(|z| z.as_bool()).unwrap_or(false);
+            if approve {
+                // Refused before the passkey is asked for, by the same rule `decide` applies.
+                let t = grant::Terms { uses, ttl: Duration::from_secs(ttl_secs), prefix: prefix.clone(), zone_wide };
+                grant::check_terms(&req, &t).map_err(|e| bad(&format!("{e:#}")))?;
+            }
             let identity = (state.identity)(&l, &req.run);
             if approve && !identity_approvable(&identity) {
                 return Err(err(
@@ -1233,8 +1238,13 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 bail!("{request}: the requesting agent's identity no longer verifies; it can be denied, not approved");
             }
             let t = grant::Terms { uses: *uses, ttl: Duration::from_secs(*ttl_secs), prefix: prefix.clone(), zone_wide: *zone_wide };
-            let grant::Decided::Approved { grant, lease } =
-                grant::decide(&mut l, &grant::Granter::Human(by), request, &grant::Verdict::Approve(t), json!({ "action": "decide", "signed": signed }))?
+            let grant::Decided::Approved { grant, lease } = grant::decide(
+                &mut l,
+                &grant::Granter::Human(by),
+                request,
+                &grant::Verdict::Approve(t),
+                json!({ "action": "decide", "signed": signed }),
+            )?
             else {
                 unreachable!("an approval approves")
             };
@@ -1245,7 +1255,13 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             Ok(format!("approved {request} → {grant}{scope}{zone}{lease} (signed with {})", oc.name))
         }
         Action::Decide { request, approve: false, .. } => {
-            let lease = match grant::decide(&mut l, &grant::Granter::Human(by), request, &grant::Verdict::Deny, json!({ "action": "decide", "signed": signed }))? {
+            let lease = match grant::decide(
+                &mut l,
+                &grant::Granter::Human(by),
+                request,
+                &grant::Verdict::Deny,
+                json!({ "action": "decide", "signed": signed }),
+            )? {
                 grant::Decided::Denied { lease } => lease,
                 grant::Decided::Approved { .. } => unreachable!("a denial denies"),
             };
@@ -1745,6 +1761,82 @@ mod tests {
         assert!(r.body["ok"].as_str().unwrap().contains("lease l-c's reservation is released"), "{:?}", r.body);
         assert_eq!(t.ledger().lease("l-c").unwrap().unwrap().status, "denied");
         assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
+    }
+
+    /// #256: the console and `wicket approve`/`deny` decide through one function, so the same
+    /// decision makes the same grant and the same audit record; the console's record only adds the
+    /// signed decision.
+    #[test]
+    fn the_console_and_the_cli_make_the_same_grant_and_record() {
+        let ask = |t: &T, path: &str| {
+            let op = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "GET", "news.example", path);
+            t.ledger().ask(&op, "item pages", true, None).unwrap().0
+        };
+        // The record without what names this request and grant, or what only the console adds.
+        let comparable = |mut v: Value| {
+            for k in ["request", "grant", "action", "signed"] {
+                v.as_object_mut().unwrap().remove(k);
+            }
+            v
+        };
+        let console = {
+            let mut t = setup("same-console");
+            t.running("run_e", "lead");
+            let (a, d) = (ask(&t, "/items/"), ask(&t, "/other/"));
+            let r = t.act(json!({ "action": "decide", "id": a, "decision": "approve", "uses": 3, "ttl_secs": 3600, "prefix": "/items/a/", "zone_wide": true }));
+            assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+            assert_eq!(t.act(json!({ "action": "decide", "id": d, "decision": "deny" })).status, StatusCode::OK);
+            let recs: Vec<Value> = t.audit_kinds().into_iter().filter(|(k, _)| k == "decision").map(|(_, v)| v).collect();
+            assert!(recs.iter().all(|r| r["action"] == "decide" && r["signed"].is_object()), "{recs:?}");
+            let gid = recs[0]["grant"].as_str().unwrap().to_string();
+            (t.ledger().grant(&gid).unwrap().unwrap(), recs, t.ledger().request(&d).unwrap().status)
+        };
+        let cli = {
+            let t = setup("same-cli");
+            t.running("run_e", "lead");
+            let (a, d) = (ask(&t, "/items/"), ask(&t, "/other/"));
+            // As `wicket approve --uses 3 --ttl 1h --prefix /items/a/ --zone-wide` and `wicket deny`.
+            let by = grant::Granter::Human("passkey:laptop".into());
+            let terms = grant::Terms { uses: Some(3), ttl: Duration::from_secs(3600), prefix: Some("/items/a/".into()), zone_wide: true };
+            let mut l = t.ledger();
+            let grant::Decided::Approved { grant: gid, .. } =
+                grant::decide(&mut l, &by, &a, &grant::Verdict::Approve(terms), json!({})).unwrap()
+            else {
+                panic!("not approved")
+            };
+            grant::decide(&mut l, &by, &d, &grant::Verdict::Deny, json!({})).unwrap();
+            let recs: Vec<Value> = t.audit_kinds().into_iter().filter(|(k, _)| k == "decision").map(|(_, v)| v).collect();
+            (l.grant(&gid).unwrap().unwrap(), recs, l.request(&d).unwrap().status)
+        };
+        let same_grant =
+            |g: &wicket_store::GrantRow| wicket_store::GrantRow { id: String::new(), request_id: None, expires_at: 0, ..g.clone() };
+        assert_eq!(same_grant(&console.0), same_grant(&cli.0));
+        assert!((console.0.expires_at - cli.0.expires_at).abs() <= 5, "the same lifetime");
+        assert_eq!(console.1.len(), 2);
+        assert_eq!(console.1.iter().cloned().map(comparable).collect::<Vec<_>>(), cli.1.into_iter().map(comparable).collect::<Vec<_>>());
+        assert_eq!((console.2.as_str(), cli.2.as_str()), ("denied", "denied"));
+    }
+
+    /// The console refuses terms no grant may have rather than clamping them to others (#256).
+    #[test]
+    fn the_console_refuses_terms_it_used_to_clamp() {
+        let mut t = setup("decide-terms");
+        t.running("run_e", "lead");
+        let op = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "GET", "news.example", "/x");
+        let (rid, _) = t.ledger().ask(&op, "x", false, None).unwrap();
+        for (terms, why) in [
+            (json!({ "ttl_secs": 24 * 3600 + 1 }), "at most"),
+            (json!({ "ttl_secs": 0 }), "lifetime"),
+            (json!({ "uses": 0 }), "at least one use"),
+            (json!({ "uses": u64::from(u32::MAX) + 1 }), "too many"),
+        ] {
+            let mut body = json!({ "action": "decide", "id": rid, "decision": "approve" });
+            body.as_object_mut().unwrap().extend(terms.as_object().unwrap().clone());
+            assert_refused(&t.begin(body), StatusCode::BAD_REQUEST, why);
+        }
+        assert_eq!(t.ledger().request(&rid).unwrap().status, "pending");
+        let r = t.act(json!({ "action": "decide", "id": rid, "decision": "approve", "ttl_secs": 24 * 3600 }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     }
 
     #[test]
