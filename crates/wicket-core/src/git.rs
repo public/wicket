@@ -69,6 +69,17 @@ pub fn is_push(method: &str, path: &str) -> bool {
     method.eq_ignore_ascii_case("POST") && path.to_ascii_lowercase().ends_with(RECEIVE_PACK) && path.len() > RECEIVE_PACK.len() + 1
 }
 
+/// The uses and lifetime (seconds) a grant for `method path` is made with, given what the approver
+/// picked: a push's grant covers its requests for [`PUSH_WINDOW_SECS`] at most, uncounted, since
+/// one push is a discovery, an upload, and git's probes and retries between them. Others as picked.
+pub fn grant_terms(method: &str, path: &str, uses: Option<u32>, ttl_secs: u64) -> (Option<u32>, u64) {
+    if is_push(method, path) {
+        (None, ttl_secs.min(PUSH_WINDOW_SECS))
+    } else {
+        (uses, ttl_secs)
+    }
+}
+
 /// The paths a ref update of `repo` is checked against forbid rules as: with and without `.git`
 /// (forges serve both spellings of a repository), so one rule covers either.
 pub fn ref_paths(repo: &str, name: &str) -> Vec<String> {

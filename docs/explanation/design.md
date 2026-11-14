@@ -2744,7 +2744,5 @@ of the rest matters.
     - Running wicket's own end-to-end tests from inside needs Docker and gVisor in the box. The host's
       Docker socket would be an escape, so this needs a throwaway node per test run, started as a program
       or tool (§17).
-    - A push is two approvals today: the push discovery and the push itself. A grant scoped to one push
-      would make it one.
     - Steering from a phone needs the console reachable (§14.1).
 14. **Name.** "wicket" is a working name (the small door set into a larger gate).

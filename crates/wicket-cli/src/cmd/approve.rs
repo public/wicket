@@ -35,6 +35,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let lease = capacity::lease_of_request(&l, &req)?;
             let a = Approval { uses: if unlimited { None } else { Some(uses) }, ttl, path_prefix: prefix.clone(), decided_by: operator() };
             let gid = if zone_wide { l.approve_zone_wide(&id, &a)? } else { l.approve(&id, &a)? };
+            // What the grant is made with: a push gets its window, whatever was picked (#26).
+            let (uses, ttl) = match prefix.is_some() || req.scope_prefix {
+                true => (a.uses, ttl.as_secs()),
+                false => wicket_core::git::grant_terms(&req.method, &req.path, a.uses, ttl.as_secs()),
+            };
+            let (unlimited, uses, ttl) = (uses.is_none(), uses.unwrap_or(0), Duration::from_secs(ttl));
             // A grant exists only if its approval is on the record (fail closed).
             if let Err(e) = l.audit(
                 &TenantId::single(),

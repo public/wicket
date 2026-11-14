@@ -767,11 +767,7 @@ impl Ledger {
         let max_risk = wicket_core::RiskClass::from_name(&req.risk).map(|r| r.rank()).unwrap_or(0);
         // A push is one request in two (#26): its ref discovery and its upload, and git's retries and
         // probes between them. Its grant covers them all for a short window, not a number of uses.
-        let (uses, ttl) = if wicket_core::git::is_push(&req.method, &path) {
-            (None, a.ttl.as_secs().min(wicket_core::git::PUSH_WINDOW_SECS))
-        } else {
-            (a.uses, a.ttl.as_secs())
-        };
+        let (uses, ttl) = wicket_core::git::grant_terms(&req.method, &path, a.uses, a.ttl.as_secs());
         let gid = new_grant_id();
         let t = now();
         tx.execute(
