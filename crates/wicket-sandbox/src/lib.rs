@@ -5,7 +5,9 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::{Child, Command};
+use wicket_core::timing::{SpanGuard, Timings};
 use wicket_core::Isolation;
 
 /// The size of a box's /tmp, in MiB: the tmpfs's size, or the cap wicket keeps a host /tmp to.
@@ -73,6 +75,8 @@ pub struct Docker {
     cmd: Vec<String>,
     /// Arguments pass through a remote shell (ssh) and must be quoted.
     quote: bool,
+    /// Where each call's wall time goes, if anywhere (#287): `docker.<call>`.
+    timings: Option<Arc<Timings>>,
 }
 
 /// Quotes one argument for a POSIX shell.
@@ -95,18 +99,30 @@ pub fn shell_quote(s: &str) -> String {
 impl Docker {
     pub fn from_env() -> Docker {
         let cmd = std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into());
-        Docker { cmd: cmd.split_whitespace().map(String::from).collect(), quote: false }
+        Docker { cmd: cmd.split_whitespace().map(String::from).collect(), quote: false, timings: None }
     }
 
     /// A Docker run as this command (its argv's start), on this host.
     pub fn with_command(cmd: Vec<String>) -> Docker {
-        Docker { cmd, quote: false }
+        Docker { cmd, quote: false, timings: None }
     }
 
     /// Docker on a remote node, reached with the given ssh command (ending in the target).
     pub fn over_ssh(mut ssh: Vec<String>) -> Docker {
         ssh.push("docker".into());
-        Docker { cmd: ssh, quote: true }
+        Docker { cmd: ssh, quote: true, timings: None }
+    }
+
+    /// This Docker, recording the wall time of each call it makes into `t` (#287), as
+    /// `docker.<call>`: the CLI process, dockerd, and whatever it waits on (containerd, the shim, the
+    /// runtime).
+    pub fn timed(&self, t: Arc<Timings>) -> Docker {
+        Docker { timings: Some(t), ..self.clone() }
+    }
+
+    /// A span for one call, if this Docker records them.
+    fn span(&self, call: &str) -> Option<SpanGuard<'_>> {
+        self.timings.as_deref().map(|t| t.span(format!("docker.{call}")))
     }
 
     fn command(&self) -> Command {
@@ -125,6 +141,7 @@ impl Docker {
 
     /// Which runtimes the daemon offers (e.g. "runc", "runsc").
     pub async fn runtimes(&self) -> Result<Vec<String>> {
+        let _t = self.span("info");
         let out = self
             .command_with(["info".to_string(), "--format".into(), "{{range $k, $v := .Runtimes}}{{$k}} {{end}}".into()])
             .output()
@@ -139,6 +156,7 @@ impl Docker {
     /// The arguments the daemon passes a runtime (e.g. runsc's `--host-uds=open`), or None if it
     /// has no such runtime.
     pub async fn runtime_args(&self, name: &str) -> Result<Option<Vec<String>>> {
+        let _t = self.span("info");
         let out = self
             .command_with(["info".to_string(), "--format".into(), "{{json .Runtimes}}".into()])
             .output()
@@ -159,6 +177,7 @@ impl Docker {
     /// What `image` is in this Docker (#192): its id and repository digests, as `docker image
     /// inspect` reports them. None if it has no such image.
     pub async fn image_identity(&self, image: &str) -> Result<Option<ImageIdentity>> {
+        let _t = self.span("image_inspect");
         let out = self
             .command_with(["image".to_string(), "inspect".into(), "--format".into(), "{{json .}}".into(), "--".into(), image.into()])
             .stdin(Stdio::null())
@@ -175,6 +194,7 @@ impl Docker {
     }
 
     pub async fn image_exists(&self, image: &str) -> Result<bool> {
+        let _t = self.span("image_inspect");
         let st = self
             .command_with(["image".to_string(), "inspect".into(), image.into()])
             .stdout(Stdio::null())
@@ -314,6 +334,7 @@ impl Docker {
     /// its stdin, if interactive, stays open between attaches, so a supervisor that restarts can
     /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
     pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<()> {
+        let _t = self.span("run");
         // Its output on the host is bounded (#151): `json-file` (whatever the daemon's default), two
         // files of half the cap each, so at most `log_cap` bytes are kept; the box's logs go with it
         // when it is removed. Whoever replays them lines their offsets up again after a rotation.
@@ -365,6 +386,7 @@ impl Docker {
 
     /// Waits for a box to exit; its exit code.
     pub async fn wait(&self, name: &str) -> Result<i32> {
+        let _t = self.span("wait");
         let out = self.command_with(["wait".to_string(), name.into()]).stdin(Stdio::null()).stderr(Stdio::piped()).output().await?;
         if !out.status.success() {
             bail!("docker wait failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -376,6 +398,7 @@ impl Docker {
     /// kernel's OOM killer ended it (Docker's `State.OOMKilled`, which runsc reports too), and the
     /// runtime's own error, if any. None if the box doesn't exist.
     pub async fn exit_info(&self, name: &str) -> Result<Option<ExitInfo>> {
+        let _t = self.span("inspect");
         let out = self
             .command_with(["inspect".to_string(), "-f".into(), "{{json .State}}".into(), name.into()])
             .stdin(Stdio::null())
@@ -395,6 +418,7 @@ impl Docker {
 
     /// The host pid of a running box's init process (0 if it isn't running).
     pub async fn pid(&self, name: &str) -> Result<u32> {
+        let _t = self.span("inspect");
         let out = self
             .command_with(["inspect".to_string(), "-f".into(), "{{.State.Pid}}".into(), name.into()])
             .stdin(Stdio::null())
@@ -406,6 +430,7 @@ impl Docker {
 
     /// Whether a box exists, and if so whether it runs and its exit code.
     pub async fn state(&self, name: &str) -> Result<Option<(bool, i32)>> {
+        let _t = self.span("inspect");
         let out = self
             .command_with(["inspect".to_string(), "-f".into(), "{{.State.Running}} {{.State.ExitCode}}".into(), name.into()])
             .stdin(Stdio::null())
@@ -418,6 +443,23 @@ impl Docker {
         let s = String::from_utf8_lossy(&out.stdout);
         let mut it = s.split_whitespace();
         Ok(Some((it.next() == Some("true"), it.next().and_then(|c| c.parse().ok()).unwrap_or(-1))))
+    }
+
+    /// When Docker created a box and when its runtime started it (#287), as Docker reports them
+    /// (RFC 3339, UTC): between the two, containerd, the shim and the runtime (runsc: its sandbox
+    /// and gofer) set it up and started its first process. None if the box doesn't exist.
+    pub async fn start_times(&self, name: &str) -> Result<Option<(String, String)>> {
+        let _t = self.span("inspect");
+        let out = self
+            .command_with(["inspect".to_string(), "-f".into(), "{{.Created}} {{.State.StartedAt}}".into(), name.into()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        Ok(parse_start_times(&String::from_utf8_lossy(&out.stdout)))
     }
 
     /// wicket boxes that have exited and are still there (started detached): (name, run).
@@ -450,6 +492,7 @@ impl Docker {
 
     /// Removes a box (running or not).
     pub async fn remove(&self, name: &str) -> Result<()> {
+        let _t = self.span("rm");
         let _ =
             self.command_with(["rm".to_string(), "-f".into(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
         Ok(())
@@ -485,6 +528,7 @@ impl Docker {
     }
 
     async fn simple(&self, args: &[&str]) -> Result<()> {
+        let _t = self.span(args[0]);
         let out = self.command_with(args.iter().map(|s| s.to_string())).stdout(Stdio::null()).stderr(Stdio::piped()).output().await?;
         if !out.status.success() {
             bail!("docker {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
@@ -534,6 +578,7 @@ impl Docker {
     }
 
     pub async fn kill(&self, name: &str) -> Result<()> {
+        let _t = self.span("kill");
         let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
         Ok(())
     }
@@ -607,6 +652,14 @@ fn parse_processes(out: &str) -> Vec<(u32, u32, String)> {
         .collect()
 }
 
+/// Parses `<created> <started>`, as [`Docker::start_times`] asks for them.
+fn parse_start_times(out: &str) -> Option<(String, String)> {
+    let mut it = out.split_whitespace();
+    let (c, st) = (it.next()?, it.next()?);
+    // A box that never started has Go's zero time.
+    (!st.starts_with("0001-")).then(|| (c.to_string(), st.to_string()))
+}
+
 /// Parses `docker ps` lines of `name<TAB>run<TAB>owner`.
 fn parse_boxes(out: &str) -> Vec<BoxInfo> {
     let some = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
@@ -625,7 +678,7 @@ mod tests {
 
     #[test]
     fn args_never_include_a_network() {
-        let d = Docker { cmd: vec!["docker".into()], quote: false };
+        let d = Docker { cmd: vec!["docker".into()], quote: false, timings: None };
         let spec = SandboxSpec {
             name: "wicket-test".into(),
             image: "img".into(),
@@ -664,6 +717,33 @@ mod tests {
         assert_eq!(e, "exec --user 1000:1000 -i wicket-x socat -");
         assert!(a.contains(" --interactive "));
         assert!(a.ends_with("img claude"));
+    }
+
+    #[tokio::test]
+    async fn a_timed_docker_records_each_call_under_its_name() {
+        let t = Arc::new(Timings::new());
+        // `true` stands in for the CLI: every call succeeds at once with no output.
+        let d = Docker::with_command(vec!["true".into()]).timed(t.clone());
+        assert!(d.image_exists("img").await.unwrap());
+        d.remove("box").await.unwrap();
+        d.pause("box").await.unwrap();
+        assert_eq!(d.start_times("box").await.unwrap(), None, "no output: no times");
+        let names: Vec<String> = t.spans().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["docker.image_inspect", "docker.rm", "docker.pause", "docker.inspect"]);
+        // Untimed, nothing is recorded anywhere.
+        let plain = Docker::with_command(vec!["true".into()]);
+        plain.remove("box").await.unwrap();
+        assert_eq!(t.spans().len(), 4);
+    }
+
+    #[test]
+    fn start_times_parse_and_a_box_never_started_has_none() {
+        assert_eq!(
+            parse_start_times("2026-11-14T10:00:00.123456789Z 2026-11-14T10:00:00.456Z\n"),
+            Some(("2026-11-14T10:00:00.123456789Z".into(), "2026-11-14T10:00:00.456Z".into()))
+        );
+        assert_eq!(parse_start_times("2026-11-14T10:00:00Z 0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_start_times(""), None);
     }
 
     #[test]

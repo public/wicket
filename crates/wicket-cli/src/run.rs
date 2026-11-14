@@ -185,6 +185,11 @@ struct RunRecord {
     /// The image's digest as its node started it (#192).
     #[serde(default)]
     image_digest: Option<String>,
+    /// Where the box start's time went (#287), as of when it started and again when the run ended
+    /// (its first output and first model request by then): [`wicket_core::timing::Span`]s from when
+    /// this supervisor began.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    timings: Vec<wicket_core::timing::Span>,
 }
 
 /// What a supervisor saves as it goes (`ctl/progress.json`), every few seconds: the model spend and
@@ -202,6 +207,14 @@ struct RunProgress {
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+}
+
+/// Keeps the box start's timings in the run's record (#287); a run without a record has nowhere.
+fn save_timings(dir: &Path, t: &wicket_core::timing::Timings) -> Result<()> {
+    let p = dir.join("ctl/run.json");
+    let Some(mut r) = read_json::<RunRecord>(&p) else { return Ok(()) };
+    r.timings = t.spans();
+    write_json(&p, &r)
 }
 
 pub(crate) fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
@@ -302,6 +315,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         attach,
         adopt,
     } = o;
+    // Where the box start's time goes (#287), from here: in the run's record, and printed with
+    // WICKET_TIMINGS=1.
+    let timings = Arc::new(wicket_core::timing::Timings::new());
     // Re-attaching (#151): the run's own record says what it is.
     let record: Option<RunRecord> = match (&run_id, attach) {
         (Some(id), true) => {
@@ -373,6 +389,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
     // The effective manifest (after any --task) is what the identity's digest covers.
     let text = serde_yaml::to_string(&m)?;
+    timings.since("manifest", timings.origin());
+    let lap = std::time::Instant::now();
     let workspace_dir = match workspace_dir {
         None => None,
         Some(_) if workdir.is_some() => bail!("use either --workdir (copy in) or --workspace-dir (mount in place)"),
@@ -467,7 +485,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     }
     // Every box runs on a node through its `wicket node serve` (#146): an enrolled node, reached over
     // its pinned ssh (a revoked one is refused), or this host's own built-in node over its unix socket.
+    timings.since("checks", lap);
+    let lap = std::time::Instant::now();
     let node: Option<Node> = node.map(|n| crate::enrol::resolve_installed(n, ssh_key)).transpose()?;
+    timings.since("node.resolve", lap);
     if let Some(n) = node.as_ref().filter(|n| n.name.is_none()) {
         bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
@@ -493,6 +514,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if wake.is_some() && !long_lived {
         bail!("only an agent wicket drives itself (not a remote or wrapped session) can be woken");
     }
+    let lap = std::time::Instant::now();
     let dir = data_dir().join("runs").join(&run.0);
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -532,6 +554,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
 
+    timings.since("run.dir", lap);
+    let lap = std::time::Instant::now();
     let ledger: Arc<Mutex<Ledger>> = Arc::new(Mutex::new(crate::audit_export::open_batched(&ledger_path())?));
     // Commits the audit records still queued however the run ends (#62).
     let _flush = crate::audit_export::FlushOnDrop(ledger.clone());
@@ -624,6 +648,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
 
     // Enforcement points, on unix sockets that only this box gets.
     // Its key is kept in `ctl/` (never mounted in the box), for a supervisor that re-attaches.
+    timings.since("ledger", lap);
+    let lap = std::time::Instant::now();
     let ca = match &record {
         Some(_) => Arc::new(RunCa::load(
             &std::fs::read_to_string(dir.join("ctl/run-ca.pem")).context("the run CA's certificate")?,
@@ -638,6 +664,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
     std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
+    timings.since("ca", lap);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
     let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
@@ -647,6 +674,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Identities are short-lived (identity_ttl) and re-issued with a fresh key at half-life while the
     // run lives, so a leaked key or document is useful for minutes, not for the run.
     let identity_ttl = identity_ttl();
+    let id_lap = std::time::Instant::now();
     let mut id_spec: Option<wicket_identity::IdentitySpec> = None;
     // Every box gets one: agents and programs alike (a program signs its run_finished with it).
     let workload_name = m.agent.as_ref().map(|a| a.name.clone()).or_else(|| m.program.as_ref().map(|p| p.name.clone()));
@@ -756,6 +784,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
 
+    timings.since("identity", id_lap);
+    let lap = std::time::Instant::now();
     // Who the run acts for, and its spawn depth: what the org policy decides at mint (#51).
     let principal = identity
         .as_ref()
@@ -804,6 +834,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
 
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
+    timings.since("policy.org", lap);
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
@@ -906,7 +937,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Calls on boxes over this run's node connection (pause, exec, link sockets), made before the
     // connection itself: the link tools use them.
     let node_calls = Arc::new(crate::nodecall::Calls::default());
+    let lap = std::time::Instant::now();
     let compiled_zone = Arc::new(wicket_core::CompiledZone::new(m.zone.clone())?);
+    timings.since("zone.compile", lap);
     // `decide` (#50): an agent whose zone may grant decides its descendants' requests within its
     // own authority, checked here against the zone and org layer its block 0 is minted from.
     let authority_until = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -943,6 +976,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
     };
+    let proxies_lap = std::time::Instant::now();
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
@@ -1000,12 +1034,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let ls = ls.clone();
         async move { llm.serve(&ls).await }
     });
+    let waited = std::time::Instant::now();
     for _ in 0..50 {
         if es.exists() && ls.exists() && gs.exists() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    timings.since("proxies.sockets", waited);
+    timings.since("proxies", proxies_lap);
+    let lap = std::time::Instant::now();
 
     let is_program = m.program.is_some();
     let (plan, wrap_files) = match (wicket_agent::program_plan(&m, &run), wrapped, harness) {
@@ -1068,6 +1106,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         labels: vec![],
     };
 
+    timings.since("plan", lap);
     println!(
         "wicket run {}  tenant {}  zone {}  {} {} ({})",
         run,
@@ -1089,6 +1128,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
+    let lap = std::time::Instant::now();
     // What another supervisor needs to take this run over (#151).
     if record.is_none() {
         write_json(
@@ -1107,9 +1147,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 session_id: session.id.clone(),
                 escalate,
                 image_digest: image_pin.clone(),
+                timings: vec![],
             },
         )?;
     }
+    timings.since("record", lap);
     // Where the last supervisor got to: its transcript is the box's stdout, line by line, so where it
     // ends is exactly what it processed (stderr only as of its last save).
     let resume_from: [u64; 2] = match &record {
@@ -1228,14 +1270,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 },
             })),
             image_pin: image_pin.clone(),
+            timings: wicket_core::timing::enabled(),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
             None => {
+                let _t = timings.span("node.local");
                 crate::localnode::ensure(&ledger).await?;
                 crate::nodecall::Via::Unix(crate::localnode::socket()?)
             }
         };
+        let box_lap = std::time::Instant::now();
         let nb = crate::noderun::start(crate::noderun::Start {
             node: node_name.clone(),
             via,
@@ -1259,8 +1304,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             vault: ctx.vault.clone(),
             spent_counted: attach_agent.is_some(),
             adopt: adopter.clone(),
+            timings: timings.clone(),
         })
         .await?;
+        timings.since("box_start", box_lap);
+        timings.mark("started");
         // The image's digest as its node started it (#192), or (re-attached, taken over) as pinned
         // or recorded: in the run's record and the audit, the parent's pin for children that name
         // no image, and a long-lived agent's next activation.
@@ -1322,6 +1370,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let _ = tokio::io::copy(&mut box_out, &mut out).await;
                 let _ = out.flush().await;
             }));
+        }
+        // Where the start's time went (#287): kept in the run's record, and shown if asked for.
+        if record.is_none() {
+            if let Err(e) = save_timings(&dir, &timings) {
+                eprintln!("[wicket] could not keep the box start's timings in the run's record: {e:#}");
+            }
+        }
+        if wicket_core::timing::enabled() {
+            print!("[wicket] timings (ms from this supervisor's start; node.start.* on node {node_name}'s clock, from when the start was sent):\n{}", wicket_core::timing::table(&timings.spans()));
         }
         (BoxProc(nb.exit), Stopper(nb.ctl), si, so, Box::new(nb.stderr) as Reader)
     };
@@ -2094,6 +2151,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         println!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
     }
     println!("[wicket] transcript {}", transcript.display());
+    // The box's first output and first model request, if they came, join its start's timings.
+    if record.is_none() {
+        let _ = save_timings(&dir, &timings);
+    }
     Ok(())
 }
 

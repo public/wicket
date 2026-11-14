@@ -200,14 +200,16 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 let n = node.clone();
                 tokio::spawn(async move {
                     let run = bs.run.clone();
-                    let (digest, error) = match start_box(&n, Some(gen), *bs).await {
+                    // Where the start's time went here (#287), sent back with it.
+                    let t = std::sync::Arc::new(wicket_core::timing::Timings::new());
+                    let (digest, error) = match start_box(&n, Some(gen), *bs, t.clone()).await {
                         Ok(d) => (Some(d), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                     if let Some(e) = &error {
                         eprintln!("[node] starting {run} failed: {e}");
                     }
-                    n.send_to(gen, Frame::Msg(Msg::Started { run, error, digest }));
+                    n.send_to(gen, Frame::Msg(Msg::Started { run, error, digest, timings: t.spans() }));
                 });
             }
             Msg::Resume { run, stdout_from, stderr_from } => {

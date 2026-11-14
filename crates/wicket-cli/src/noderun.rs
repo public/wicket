@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use wicket_core::timing::Timings;
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
 use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, RevokeKind};
 use wicket_identity::node::NodeCertClaims;
@@ -242,8 +243,9 @@ impl SharedFeed {
 }
 
 /// What the run loop gets: the box's stdio as streams, its exit, and a handle to stop it.
-/// What the node said when it started the box: the image's digest it started (#192), or why not.
-type StartedAs = std::result::Result<Option<String>, String>;
+/// What the node said when it started the box: the image's digest it started (#192) and where the
+/// start's time went there (#287), or why not.
+type StartedAs = std::result::Result<(Option<String>, Vec<wicket_core::timing::Span>), String>;
 
 pub struct NodeBox {
     /// The image's digest as the node started it (#192); None when this host didn't start it now
@@ -396,6 +398,9 @@ pub struct Start {
     pub spent_counted: bool,
     /// Takes over children the node starts for the box (#164): None, it may start none.
     pub adopt: Option<Adopter>,
+    /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
+    /// the box's first output and first model request when they come.
+    pub timings: Arc<Timings>,
 }
 
 struct Shared {
@@ -433,10 +438,15 @@ struct Shared {
     pull: Option<crate::registry::Source>,
     /// Set while the node pulls the box's image: the only time it may fetch the registry's secret.
     pulling: AtomicBool,
+    timings: Arc<Timings>,
+    /// The box's first output has been seen (#287: `box.first_output`).
+    first_output: AtomicBool,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
 pub async fn start(s: Start) -> Result<NodeBox> {
+    let t = s.timings.clone();
+    let keys = t.span("token.keys");
     let name = s.node.clone();
     let issuer = Arc::new(crate::issuer()?);
     let cfg = feed_config();
@@ -450,8 +460,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.authority_secs.max(1);
     let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000;
     let ((minter, issuer_cert), approver) = (crate::roots::minting_key(until_ms)?, crate::enrol::token_key(&paths.approver_key)?);
+    keys.end();
     // Block 0 is compiled from Cedar (#51): the zone's policy and, if the installation has one, the
     // org policy, for this box as it is now (its zone's groups, its principal, its spawn depth).
+    let compiled = t.span("token.policy");
     let ceiling = wicket_policy::ceiling(
         &s.zone,
         &s.run.0,
@@ -461,6 +473,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         s.org.as_deref().cloned(),
     )
     .context("compiling the box's policy")?;
+    compiled.end();
+    let minted = t.span("token.mint");
     let mut token_issuer =
         wicket_feed::Issuer::from_ceiling(&minter, &s.tenant.0, &format!("run:{}", s.run), &s.run.0, 0, &s.zone, &ceiling)
             .context("minting the box's token")?;
@@ -480,6 +494,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
     };
     let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
+    minted.end();
     // What the node attenuates a child's token from, deciding its spawns (#164).
     let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
@@ -490,6 +505,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     // Several runs share the node's feed. Tokens of runs that have ended (whose own exit didn't
     // drop them: a run killed hard) go in the same delta, so the feed and the node's snapshot don't
     // grow with every run.
+    let published = t.span("feed.publish");
     let target_epoch = {
         let mut publisher = feed.lock()?;
         let ended: Vec<String> = {
@@ -507,6 +523,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.commit(changes, now).context("publishing the box's token")?;
         publisher.epoch()
     };
+    published.end();
     let token_root = (token_issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
     // What fences a wake of the agent elsewhere while this box may still run (#153).
     record_authority(&s.dir, &name, token_root.1 + 1000).context("recording the box's authority")?;
@@ -561,6 +578,8 @@ pub async fn start(s: Start) -> Result<NodeBox> {
             None => None,
         },
         pulling: AtomicBool::new(false),
+        timings: t.clone(),
+        first_output: AtomicBool::new(false),
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -569,6 +588,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let (ready_tx, ready_rx) = oneshot::channel();
     let (started_tx, started_rx) = oneshot::channel();
     let interactive = s.start.interactive;
+    let ready_span = t.span("node.ready");
     tokio::spawn(manage(
         shared.clone(),
         Io { stdin: stdin_theirs, stdout: Some(stdout_theirs), stderr: Some(stderr_theirs), exit: Some(exit_tx) },
@@ -581,12 +601,15 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         Ok(Ok(Err(e))) => return Err(e),
         _ => bail!("node {name} did not come up fresh on the feed within 60 s"),
     }
+    ready_span.end();
     let mut image_digest = None;
     if !s.attach {
+        let trees = t.span("trees");
         for (tree, src, exclude) in &s.trees {
             let x: Vec<&str> = exclude.iter().map(String::as_str).collect();
             ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
         }
+        trees.end();
         let mut start = s.start;
         // A node before #164 relays every gateway tool: nothing to decide them from.
         if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
@@ -606,16 +629,24 @@ pub async fn start(s: Start) -> Result<NodeBox> {
             if ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_DELIVERY {
                 let pull = shared.pull.as_ref().filter(|_| ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_PULL);
                 shared.pulling.store(pull.is_some(), Ordering::SeqCst);
+                let _delivering = t.span("image.deliver");
                 let got = deliver_image(&ctl.calls, &name, &ctl.run, &start.image, pin, pull).await;
                 shared.pulling.store(false, Ordering::SeqCst);
                 got.with_context(|| format!("getting image {pin} to node {name}"))?;
             }
         }
+        let sent = std::time::Instant::now();
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
             bail!("lost node {name} while starting the box");
         }
         image_digest = match tokio::time::timeout(std::time::Duration::from_secs(120), started_rx).await {
-            Ok(Ok(Ok(d))) => d,
+            Ok(Ok(Ok((d, spans)))) => {
+                // BoxStart → Started, and the node's own steps within it, placed from when it was
+                // sent (they start up to the channel's one-way latency later).
+                t.since("node.start", sent);
+                t.nest("node.start.", sent, &spans);
+                d
+            }
             Ok(Ok(Err(e))) => bail!("node {name} could not start the box: {e}"),
             _ => bail!("node {name} did not start the box within 120 s"),
         };
@@ -799,6 +830,9 @@ async fn session(
         p.ever = false;
         bail!("{why}: not reconnecting");
     }
+    // Only the first connection's steps are part of the box's start (#287).
+    let first = ready.is_some() && !sh.timings.has("node.dial");
+    let dialing = std::time::Instant::now();
     let d = match sh.via.dial().await {
         Ok(d) => d,
         // This host's own node's `serve` is gone (killed, or exited): start it again, and it adopts
@@ -810,6 +844,10 @@ async fn session(
         Err(e) => return Err(e),
     };
     let (mut from, mut to, mut child, errlog) = (d.rd, d.wr, d.child, d.errlog);
+    let shaking = std::time::Instant::now();
+    if first {
+        sh.timings.record("node.dial", dialing, shaking);
+    }
     let build = crate::nodesrv::build_id()?;
     let hello = |nonce| Msg::Hello {
         node: sh.node.clone(),
@@ -849,6 +887,9 @@ async fn session(
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
     };
+    if first {
+        sh.timings.since("node.handshake", shaking);
+    }
     p.ever = true;
     p.cert = Some(authed.cert);
     p.renewing = None;
@@ -873,13 +914,21 @@ async fn session(
     };
     let feed_frame = |f: wicket_feed::Frame| Frame::Feed(f.to_line().trim_end().as_bytes().to_vec());
     let now = wicket_feed::now_ms();
+    let catching = std::time::Instant::now();
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
+    }
+    let leasing = std::time::Instant::now();
+    if first {
+        sh.timings.record("feed.catch_up", catching, leasing);
     }
     // The run's secrets and budget slice, sealed to the node (#152), before anything the box does.
     p.lease_sent = false;
     if let Some(f) = lease_due(sh, p) {
         send(f);
+    }
+    if first {
+        sh.timings.since("budget.lease", leasing);
     }
     if sh.attach && !p.ever_resumed && !runs.iter().any(|r| r.run == sh.run.0) {
         p.ever = false;
@@ -1012,6 +1061,9 @@ async fn on_frame(
                     crate::nodesrv::OUTPUT_CAP >> 20
                 );
             }
+            if !fresh.is_empty() && !sh.first_output.swap(true, Ordering::SeqCst) {
+                sh.timings.mark("box.first_output");
+            }
             let w = if i == 1 { io.stdout.as_mut() } else { io.stderr.as_mut() };
             if let (Some(w), false) = (w, fresh.is_empty()) {
                 let _ = w.write_all(&fresh).await;
@@ -1034,15 +1086,16 @@ async fn on_frame(
                 }
                 if mode == wicket_feed::Mode::Fresh && epoch.is_some_and(|e| e >= target_epoch) {
                     if let Some(t) = ready.take() {
+                        sh.timings.mark("feed.fresh");
                         let _ = t.send(Ok(()));
                     }
                 }
             }
-            Msg::Started { run, error, digest } if run == sh.run.0 => {
+            Msg::Started { run, error, digest, timings } if run == sh.run.0 => {
                 if let Some(t) = started.take() {
                     let _ = t.send(match error {
                         Some(e) => Err(e),
-                        None => Ok(digest),
+                        None => Ok((digest, timings)),
                     });
                 }
             }
@@ -1121,7 +1174,16 @@ async fn on_frame(
                     let _ = out.send(Frame::Msg(Msg::Adopted { child, error }));
                 });
             }
-            Msg::Spent { run, spent } if run == sh.run.0 => {
+            Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {
+                // The box's first model request (#287), on the node's clock: only as good as the
+                // two hosts' clocks agree.
+                if let Some(ms) = first_request_ms.filter(|_| !sh.timings.has("agent.first_model_request")) {
+                    sh.timings.mark_unix_ms("agent.first_model_request", ms);
+                    if wicket_core::timing::enabled() {
+                        let at = sh.timings.spans().into_iter().find(|s| s.name == "agent.first_model_request").map_or(0.0, |s| s.at_ms);
+                        println!("[wicket] timings: the agent's first model request reached node {} at {at:.1} ms", sh.node);
+                    }
+                }
                 // The node calls the model itself and is the counter of record (#152).
                 if let Some(l) = &sh.llm {
                     let base = {
