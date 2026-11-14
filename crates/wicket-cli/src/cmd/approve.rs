@@ -21,19 +21,21 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Approve { id, uses, unlimited, ttl, prefix, yes, zone_wide } => {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
-            if ttl > Duration::from_secs(24 * 3600) {
-                bail!("grants are capped at 24h in the PoC");
-            }
             let mut l = Ledger::open(&ledger_path())?;
             let req = l.request(&id)?;
+            let t = grant::Terms { uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
+            grant::check_terms(&req, &t)?;
             // What is approved is what wicket recorded, shown before the grant exists: a hint printed
             // from a node's or an agent's text can name the wrong request (#121).
             print!("{}", show_request(&l, &req));
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
-            let d = Decide { by: operator(), uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
-            let Approved { grant: gid, lease, uses: made_uses, ttl } = approve_request(&mut l, &id, &d, serde_json::json!({}))?;
+            let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } =
+                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Approve(t), serde_json::json!({}))?
+            else {
+                unreachable!("an approval approves")
+            };
             // What the grant was made with: a push gets its window, whatever was picked (#26).
             let (unlimited, uses) = (made_uses.is_none(), made_uses.unwrap_or(0));
             println!(
@@ -96,8 +98,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Deny { id } => {
-            let l = Ledger::open(&ledger_path())?;
-            if let Some(lease) = deny_request(&l, &id, &operator(), serde_json::json!({}))? {
+            let mut l = Ledger::open(&ledger_path())?;
+            if let grant::Decided::Denied { lease: Some(lease) } =
+                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Deny, serde_json::json!({}))?
+            {
                 println!("lease {lease} denied: its reservation is released");
             }
             println!("denied {id}");
@@ -115,95 +119,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         _ => unreachable!("dispatched to the wrong command group"),
-    }
-}
-
-/// A human's approval of a pending request, as `wicket approve` and the console both make it.
-pub struct Decide {
-    /// Who decided: `$USER`-style on the CLI, `passkey:<name>` on the console.
-    pub by: String,
-    /// None: unlimited uses until it expires.
-    pub uses: Option<u32>,
-    pub ttl: Duration,
-    /// Grant every path under this prefix: one that covers the asked path, or (for a prefix ask)
-    /// lies within the asked prefix.
-    pub prefix: Option<String>,
-    /// Usable by any run in the request's zone, not only the one that asked.
-    pub zone_wide: bool,
-}
-
-/// What [`approve_request`] made.
-pub struct Approved {
-    pub grant: String,
-    /// The uses and lifetime the grant was made with: the request's own terms for a git push
-    /// (#26, [`wicket_core::git::grant_terms`]), else the decision's.
-    pub uses: Option<u32>,
-    pub ttl: Duration,
-    /// The capacity lease the request asked for, if it is a capacity ask: provisioned by the next
-    /// reconcile pass (`wicket approve` runs one at once).
-    pub lease: Option<String>,
-}
-
-/// Approves a pending request: one grant, which exists only if its approval is on the audit record
-/// (otherwise it is revoked again: fail closed). `extra` is merged into the record (the console's
-/// signed decision).
-pub fn approve_request(l: &mut Ledger, id: &str, d: &Decide, extra: serde_json::Value) -> Result<Approved> {
-    let req = l.request(id)?;
-    if let Some(p) = &d.prefix {
-        check_prefix(&req, p).map_err(anyhow::Error::msg)?;
-    }
-    let lease = capacity::lease_of_request(l, &req)?;
-    let a = Approval { uses: d.uses, ttl: d.ttl, path_prefix: d.prefix.clone(), decided_by: d.by.clone() };
-    let gid = if d.zone_wide { l.approve_zone_wide(id, &a)? } else { l.approve(id, &a)? };
-    let (uses, ttl_secs) = match d.prefix.is_some() || req.scope_prefix {
-        true => (d.uses, d.ttl.as_secs()),
-        false => wicket_core::git::grant_terms(&req.method, &req.path, d.uses, d.ttl.as_secs()),
-    };
-    let mut record = serde_json::json!({
-        "request": id, "decision": "approve", "grant": gid, "by": d.by,
-        "method": req.method, "host": req.host, "path": req.path,
-        "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
-        "agent_identity": verified_identity(l, &req.run, None),
-        "uses": uses, "ttl_secs": ttl_secs, "prefix": d.prefix, "scope_prefix": req.scope_prefix,
-        "scope": if d.zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone, "lease": lease,
-    });
-    merge(&mut record, extra);
-    if let Err(e) = l.audit(&TenantId::single(), None, "decision", &record) {
-        let _ = l.revoke_grant(&gid);
-        return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
-    }
-    Ok(Approved { grant: gid, lease, uses, ttl: Duration::from_secs(ttl_secs) })
-}
-
-/// Denies a pending request and records it; a capacity ask's reservation is released at once.
-/// Returns that lease, if any.
-pub fn deny_request(l: &Ledger, id: &str, by: &str, extra: serde_json::Value) -> Result<Option<String>> {
-    l.deny(id, by)?;
-    let mut record = serde_json::json!({ "request": id, "decision": "deny", "by": by });
-    merge(&mut record, extra);
-    l.audit(&TenantId::single(), None, "decision", &record)?;
-    let req = l.request(id)?;
-    let lease = capacity::lease_of_request(l, &req)?;
-    if let Some(lease) = lease.as_deref() {
-        l.lease_ended(lease, "denied", &format!("request {id} denied by {by}"), None)?;
-    }
-    Ok(lease)
-}
-
-/// Whether a human's prefix may be granted for `req`: it covers the asked path, or (for a prefix ask)
-/// lies within the asked prefix. What the grant covers is what the human named, never a silent
-/// fall-back to the exact path.
-pub fn check_prefix(req: &wicket_store::Request, p: &str) -> std::result::Result<(), String> {
-    let within = req.scope_prefix && wicket_core::prefix_covers(&req.path, p);
-    if wicket_core::prefix_covers(p, &req.path) || within {
-        return Ok(());
-    }
-    Err(format!("prefix {p} doesn't cover {}'s path {}{}", req.id, req.path, if req.scope_prefix { ", nor lie within it" } else { "" }))
-}
-
-fn merge(record: &mut serde_json::Value, extra: serde_json::Value) {
-    if let (Some(r), serde_json::Value::Object(x)) = (record.as_object_mut(), extra) {
-        r.extend(x);
     }
 }
 
