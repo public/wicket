@@ -36,7 +36,9 @@ wicket secret link claude-oauth --file ~/.claude/.credentials.json \
 `--pointer` is a JSON pointer into the file; without it the whole file, trimmed, is the secret (an
 API key file, say). `--expires-pointer` names the field that says when the value expires (Unix ms),
 so a node holding a copy drops it then. `--hosts` works as for `secret set`. On an installed host
-the file is read as the `wicket` user, so it must be readable by it.
+the file is read as the `wicket` user, so it must be readable by it, and by no one else but its
+owner: to share an owner-only file with it, grant it read with an ACL
+([secrets reference](../reference/secrets.md#let-the-wicket-user-read-a-linked-file)).
 
 ## Use it in a zone
 
