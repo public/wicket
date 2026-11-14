@@ -278,8 +278,22 @@ from the control host first (#191):
 - **Imported as checked.** The node writes its own layout naming the pin alone, as `repository@digest` (no
   tag moves), and its runtime imports that; the box then starts by the image's id, which must be the pin.
   The image is never fetched from inside a box.
-- **Recorded.** The node's audit records `image.received` (digest, name, bytes) or `image.refused` (why).
-- **What it needs.** Both ends talking protocol 7, and a runtime that ids images by their manifest digest
+- **Or pulled by the node from a registry.** If the image's registry is listed in `images.yaml`
+  (`registries`, [files](files.md)), the node pulls it itself, host-side, by digest, before the control host
+  sends anything. It falls back to being sent if the pull fails and the control host has the image.
+  - **Only the listed hosts.** The node talks only to the registry's host, its token service's
+    (`auth_hosts`) and where it redirects blob downloads (`blob_hosts`); any other host, a redirect
+    included, is refused. HTTPS only, except for a registry on a loopback address. Never from inside a box.
+  - **By digest.** The manifest is fetched by the pin and must hash to it. From an index, only the node's
+    own platform is fetched. Every blob is hashed as it is written and must match its descriptor's digest
+    and size. The layout is then checked and rebuilt as for a sent image.
+  - **Credentials.** A registry's `secret` is a vault secret (`user:password`, or a token), bound to the
+    registry's host and its `auth_hosts`. The node fetches it for the run over the run's own connection, as
+    it fetches any secret (#152), holds it in memory for the pull only, and never writes or logs it. The
+    control host releases it only for that run's image pull, and audits it (`node.secret_fetch`).
+- **Recorded.** The node's audit records `image.received` (digest, name, bytes, `via` `channel` or
+  `registry`) or `image.refused` (why).
+- **What it needs.** Both ends talking protocol 7 (8 to pull), and a runtime that ids images by their manifest digest
   (Docker's containerd image store): a pin that is a config digest is refused with that reason. An image
   of at most 64 GiB, with room for it under the node's data directory (`images/`, cleared when `serve`
   starts) while it is imported.
