@@ -231,9 +231,12 @@ enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: Option<ImageCmd>,
-        #[arg(long, default_value = crate::image::DEFAULT)]
-        tag: String,
-        /// An image directory to build instead (e.g. images/claude-code, while changing it).
+        /// The tag to build, kept as given [default: this installation's own image:
+        /// wicket/claude-code:<build id> on an installed version, else wicket/claude-code:poc].
+        #[arg(long)]
+        tag: Option<String>,
+        /// An image directory to build instead (e.g. images/claude-code, while changing it). If its
+        /// Dockerfile declares `ARG BASE`, BASE is this installation's own agent image.
         #[arg(long)]
         dir: Option<PathBuf>,
     },

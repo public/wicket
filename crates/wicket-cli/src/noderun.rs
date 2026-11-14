@@ -1496,7 +1496,10 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
         fresh.effects.extend(op.effects.iter().map(|e| wicket_core::text::clip(e, 120)));
     }
     match wicket_core::evaluate(zone_spec, &fresh) {
-        wicket_core::Verdict::NeedsGrant(why) => Ok((fresh, why)),
+        wicket_core::Verdict::NeedsGrant(why) => {
+            let why = wicket_core::git::ask_reason(&fresh, &why);
+            Ok((fresh, why))
+        }
         wicket_core::Verdict::Forbidden(why) => Err(format!("not requested: {why}")),
         wicket_core::Verdict::AllowByReach(i) if prefix => {
             Ok((fresh, format!("reach rule {i} allows this path; asked for every path under it")))
