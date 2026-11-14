@@ -46,7 +46,6 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket identity show`](#wicket-identity-show)
   - [`wicket identity list`](#wicket-identity-list)
   - [`wicket identity revoke`](#wicket-identity-revoke)
-- [`wicket reap`](#wicket-reap)
 - [`wicket policy`](#wicket-policy)
   - [`wicket policy show`](#wicket-policy-show)
   - [`wicket policy check`](#wicket-policy-check)
@@ -122,7 +121,6 @@ Commands:
   program    Programs: deterministic workloads that run without an agent
   operator   Operator passkeys
   identity   Agent identities (design §3.2): the issuer's public key, and verified identity documents
-  reap       Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and that Docker kept running with nothing behind them. Their runs end as "lost"
   policy     The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled into each box's token when it is minted
   state      Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby
   keys       The installation's root keys (#154)
@@ -728,20 +726,6 @@ Arguments:
 Options:
       --reason <REASON>  [default: "revoked by the operator"]
   -h, --help             Print help
-```
-
-## `wicket reap`
-
-```text
-Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and that Docker kept running with nothing behind them. Their runs end as "lost"
-
-Usage: wicket reap [OPTIONS]
-
-Options:
-      --dry-run            Only list what would be stopped
-      --node <NODE>        Reap on a remote node over ssh instead (e.g. wicket@203.0.113.7)
-      --ssh-key <SSH_KEY>  ssh identity for --node
-  -h, --help               Print help
 ```
 
 ## `wicket policy`

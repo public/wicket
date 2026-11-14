@@ -80,11 +80,11 @@ runuser -u alex -- cat /var/lib/wicket/ledger.db >/dev/null 2>&1 && fail "alex r
 runuser -u alex -- test -r /var/lib/wicket/identity/issuer.key && fail "alex can read the issuer key"
 [ -S /var/run/docker.sock ] && runuser -u alex -- test -w /var/run/docker.sock && fail "alex can reach docker"
 echo "ok: alex can'"'"'t reach the data dir, the ledger, the issuer key or Docker"
-for c in "approve R1" "deny R1" "operator enrol-link" "operator reset" "reap"; do
+for c in "approve R1" "deny R1" "operator enrol-link" "operator reset" "reconcile --dry-run"; do
     if out=$(as_alex $c 2>&1); then fail "alex: $c succeeded: $out"; fi
     case "$out" in *"needs root on the host"*) ;; *) fail "alex: $c: $out" ;; esac
 done
-echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reap"
+echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reconcile"
 out=$(as_alex run --run-id x /src/examples/demo.yaml 2>&1) && fail "alex passed --run-id"
 case "$out" in *"for wicket'"'"'s own use"*) ;; *) fail "alex: --run-id: $out" ;; esac
 out=$(as_alex run --workspace-dir /var/lib /src/examples/demo.yaml 2>&1) && fail "alex mounted /var/lib"
