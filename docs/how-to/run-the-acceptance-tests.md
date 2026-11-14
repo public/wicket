@@ -30,8 +30,10 @@ header lists its environment variables (`WICKET`, `IMAGE` and the like).
 
 ## Run without a model
 
-`wicket dev mock-llm` is a scripted stand-in for the Messages API: its first turn asks the agent to
-run one Bash command, its second ends the conversation. With `examples/mock-github.yaml`, whose
+`wicket dev mock-llm` is a scripted stand-in for the Messages API: each turn it asks the agent to
+run one Bash command, then to call wicket's `finish` tool, which ends the session (a line
+`wicket-mock: hibernate` in the command's output asks for `hibernate` instead, and
+`wicket-mock: stay` for neither: the session stays open for follow-ups). With `examples/mock-github.yaml`, whose
 `llm.upstream` points at it, it drives the whole path with no model credential:
 
 ```sh

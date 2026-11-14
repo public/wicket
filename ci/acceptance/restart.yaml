@@ -5,7 +5,6 @@ task: Run the command you are given and stop.
 agent:
   name: restart
   max_turns: 8
-  idle_timeout: 20m
 zone:
   name: acc-restart
   isolation: gvisor

@@ -363,11 +363,11 @@ hf() { jq -r ".$1 // empty" <<<"$hres" 2>/dev/null; }
 check "wicket wake resumed its own session" 'grep -q "session .* resumed" "$work/hib2.log"'
 check "  its files survived (/tmp, \$HOME, workspace, durable volume)" '[ "$(hf tmp)" = tmp-kept ] && [ "$(hf home)" = home-kept ] && [ "$(hf ws)" = ws-kept ] && [ "$(hf vol)" = vol-kept ]'
 # A fresh session's requests carry 2 and 4 messages; the resumed one's carry the earlier turn too.
-check "  and the model saw the earlier conversation, then the operator's text" 'grep -qE "finish \(([5-9]|[1-9][0-9]) messages" "$work/mock.log" && grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
+check "  and the model saw the earlier conversation, then the operator's text" 'grep -qE "end the turn \(([7-9]|[1-9][0-9]) messages" "$work/mock.log" && grep "the user said:" "$work/mock.log" | grep -q "Again, please."'
 check "  and the generation went up by one" '[ "$(agent_field generation)" = $((gen1 + 1)) ]'
 
 # ---- 2b. an ACP agent (#66) ----
-log "an ACP agent: wicket's client posture, hibernate and wake"
+log "an ACP agent: wicket's client posture, its own lifetime, hibernate and wake"
 acp_ws=$(workdir acp)
 wt 300 run "$(manifest acp)" --workdir "$acp_ws" --image "$IMAGE_TAG" >"$work/acp1.log" 2>&1 || true
 our_runs+=("$(run_id_of "$work/acp1.log")")
@@ -380,13 +380,18 @@ check "  its fs and terminal calls got -32601" '[ "$(af "[.seen.errors.fs_read, 
 check "  permissions: allow_once for a command, reject_once for settings.local.json and a mode change, never an always" '[ "$(af .seen.answers.execute)" = opt-allow_once ] && [ "$(af .seen.answers.settings_local)" = opt-reject_once ] && [ "$(af .seen.answers.switch_mode)" = opt-reject_once ] && [ "$(af .seen.answers.only_always)" = cancelled ] && [ "$(af .always_state_written)" = false ]'
 check "  and each answer is audited" '[ "$(w audit --tail 400 | grep "${our_runs[-1]}" | grep -c run.agent_prompt)" -ge 4 ] && w audit --tail 400 | grep "${our_runs[-1]}" | grep run.agent_call_refused | grep -q fs/write_text_file'
 acp_agent=$(grep -o "agent agt_[a-z0-9]*" "$work/acp1.log" | head -1 | cut -d" " -f2 || true)
-check "  it hibernated after its turn" '[ -n "$acp_agent" ] && grep -q "hibernated in" "$work/acp1.log"'
+# The harness decides its lifetime (#249): idle after its turn, it is neither ended nor paused, and
+# wakes on its own timer; only then does it ask to hibernate.
+check "  idle after its turn, it woke on its own timer" '[ "$(af .seen.self_wakeup.slept)" = 8 ] && grep -q "woke on my own timer after 8 s idle" "$work/acp1.log"'
+check "    on time (its box never paused: 8 s idle took under 12)" 'awk "BEGIN { exit !($(af .seen.self_wakeup.elapsed) < 12) }" && ! grep -qi "paused" "$work/acp1.log"'
+check "  then it asked to hibernate, and did, after its turn" '[ -n "$acp_agent" ] && af .seen.self_wakeup.hibernate | grep -q "^wicket hibernates you" && grep -q "the agent asked to hibernate" "$work/acp1.log" && grep -q "hibernated in" "$work/acp1.log"'
 wt 300 wake "$acp_agent" "Again, please." >"$work/acp2.log" 2>&1 || true
 our_runs+=("$(run_id_of "$work/acp2.log")")
 ares=$(result_of "$work/acp2.log")
 check "woken, it loaded its own ACP session" '[ "$(af .seen.load.known)" = true ] && grep -q "ACP session mock-session-1 loaded" "$work/acp2.log"'
 check "  a prompt asked during the replay was cancelled, and the next decided afresh (allow_once)" '[ "$(af .seen.answers.during_replay)" = cancelled ] && [ "$(af .seen.answers.after_replay)" = opt-allow_once ]'
 check "  and the operator's text reached it as a prompt" 'af ".seen.prompts[-1]" | grep -q "Again, please."'
+check "  then it asked to finish, and its run ended with it" 'af .seen.finish | grep -q "^wicket ends your session" && grep -q "closing the session, as the agent asked" "$work/acp2.log" && [ "$(w agents --json | jq -r --arg n "$acp_agent" ".[] | select(.id == \$n) | .state")" = ended ]'
 wt 60 run "$(manifest acp-claude)" --image "$IMAGE_TAG" >"$work/acp-claude.log" 2>&1 || true
 check "Claude Code through its ACP adapter on a subscription is refused at run start (not allowed by default)" 'grep -q "acp.allow_subscription_backed_claude_adapter: true" "$work/acp-claude.log" && [ -z "$(run_id_of "$work/acp-claude.log")" ]'
 

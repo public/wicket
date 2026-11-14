@@ -97,7 +97,7 @@ fn grants(state: &State, m: &Manifest) -> Value {
     json!({
         "task": m.task,
         "agent": m.agent.as_ref().map(|a| json!({ "name": a.name, "kind": a.kind, "model": a.model, "max_turns": a.max_turns,
-            "max_children": a.max_children, "idle_timeout": a.idle_timeout, "hibernate_after": a.hibernate_after,
+            "max_children": a.max_children,
             "remote": a.remote.as_ref().map(|r| r.name.clone()) })),
         "program": m.program.as_ref().map(|p| json!({ "name": p.name, "command": p.command })),
         "image": crate::run::manifest_image(m).map_err(|e| format!("{e:#}")),

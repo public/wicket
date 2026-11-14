@@ -1595,7 +1595,13 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.queue.drop_run(run);
     n.edge.drop_run(run);
     n.replica.lock().expect("replica").drop_local(run);
-    n.llms.lock().expect("llms").remove(run);
+    let llm = n.llms.lock().expect("llms").remove(run);
+    // The run's last spend goes ahead of its exit, on the same channel: the once-a-second report
+    // can miss a model call made just before the box ended (an agent that hibernates or finishes
+    // right after its turn, #249), and the box would not be charged for it.
+    if let Some(l) = llm {
+        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent() }));
+    }
     eprintln!("[node] {run}: box exited ({code})");
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause }));
 }
@@ -1641,6 +1647,7 @@ async fn serve_box(
         capacity: None,
         fence: None,
         waker: None,
+        lifecycle: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = match &ca {

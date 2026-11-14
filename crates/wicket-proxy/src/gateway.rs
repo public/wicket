@@ -132,6 +132,8 @@ impl Gateway {
             "links" => crate::link::list(&self.ctx),
             "request_capacity" => self.request_capacity(&args).await,
             "request_update" => self.request_update(&args),
+            "finish" => self.want(crate::Want::Finish),
+            "hibernate" => self.want(crate::Want::Hibernate),
             _ => (format!("unknown tool {name}"), true),
         };
         self.ctx.emit(Event::Tool { name: name.to_string(), detail: text.lines().next().unwrap_or("").to_string() });
@@ -433,6 +435,25 @@ impl Gateway {
             ),
             Err(e) => (format!("not requested: {e}"), true),
         }
+    }
+
+    /// `finish` and `hibernate` (#249): the agent decides its own lifetime; its supervisor acts at
+    /// the end of the agent's turn.
+    fn want(&self, w: crate::Want) -> (String, bool) {
+        let Some(tx) = &self.ctx.lifecycle else {
+            return ("this run's lifetime is its process's: it ends when the process exits".into(), true);
+        };
+        if w == crate::Want::Hibernate && self.ctx.fence.is_none() {
+            return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped or a remote session); call finish when you are done".into(), true);
+        }
+        if tx.send(w).is_err() {
+            return ("this run's supervisor is gone".into(), true);
+        }
+        let text = match w {
+            crate::Want::Finish => "wicket ends your session at the end of this turn: your harness exits, and the run ends. Messages sent to you from now on are not delivered to this run.",
+            crate::Want::Hibernate => "wicket hibernates you at the end of this turn, once nothing but you runs in your box: your box stops and its state is kept. A message to you (or your operator) wakes you, with that message as your next turn. If something else still runs, you go on running and are told nothing more.",
+        };
+        (text.into(), false)
     }
 
     fn pending_requests(&self) -> (String, bool) {
@@ -766,6 +787,16 @@ fn tools() -> Value {
             "description": "List this run's requests that are still waiting for a human decision.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "finish",
+            "description": "End your session when all your work is done: wicket closes your input at the end of this turn, your harness exits and the run ends. wicket never ends it for you: until you call this (or exit), your session stays open for follow-up messages, however long you wait.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "hibernate",
+            "description": "Sleep until a message arrives: at the end of this turn wicket stops your box and keeps its state (workspace, home, /tmp, durable volumes). A message to you, or your operator, wakes you with it as your next turn. Only for long-lived agents; nothing is paused or hibernated unless you (or your operator) ask.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         }
     ])
 }
@@ -840,6 +871,7 @@ mod tests {
                 capacity: None,
                 fence: None,
                 waker: None,
+                lifecycle: None,
             }
         }
     }

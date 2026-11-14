@@ -7,8 +7,8 @@ agent:
   # console start the same box without --image. It must be listed in zone.images below.
   image: wicket-self:dev
   max_turns: 150
-  # Keep the session open between turns for follow-ups (wicket say <run> "...").
-  idle_timeout: 30m
+  # The session stays open between turns for follow-ups (wicket say <run> "...") until the agent
+  # calls wicket's finish tool (#249).
   env:
     CARGO_HOME: /volumes/cargo
     CARGO_TARGET_DIR: /volumes/target
