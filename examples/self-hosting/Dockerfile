@@ -1,6 +1,9 @@
 # The workload image for wicket working on its own source: the PoC agent image plus a Rust toolchain.
 # This is the project's configuration, not part of wicket. Any project describes its own image.
-FROM wicket/claude-code:poc
+# `wicket image --dir` sets BASE to the installation's own agent image (wicket/claude-code:<build id>
+# on an installed version); a plain `docker build` gets the PoC tag.
+ARG BASE=wicket/claude-code:poc
+FROM ${BASE}
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config \

@@ -480,8 +480,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --tag <TAG>  [default: wicket/claude-code:poc]
-      --dir <DIR>  An image directory to build instead (e.g. images/claude-code, while changing it)
+      --tag <TAG>  The tag to build, kept as given [default: this installation's own image: wicket/claude-code:<build id> on an installed version, else wicket/claude-code:poc]
+      --dir <DIR>  An image directory to build instead (e.g. images/claude-code, while changing it). If its Dockerfile declares `ARG BASE`, BASE is this installation's own agent image
   -h, --help       Print help
 ```
 
