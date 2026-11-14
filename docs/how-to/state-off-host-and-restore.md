@@ -12,6 +12,7 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
 | The ledger: runs, agents, grants, nodes, passkeys, the audit chain | The state store, streamed | `wicket state replicate` (the `wicket-state` service) runs [Litestream](https://litestream.io) |
 | Hibernated agents' bundles | The state store | `bundles: s3`, sealed under `state.key` as before |
 | Audit records and signed checkpoints | The state store | an audit sink of `type: store` |
+| The ledger snapshot `wicket self update` takes before each switch | The state store, and the host | pushed by the update, sealed under `state.key` (`wicket state snapshots`) |
 | Keys and files that rarely change: the identity issuer, the installation CA, the approver key, `state.key`, each node's feed key and pinned host key, the config files, the vault | The recovery kit | `wicket state kit`, kept offline by you |
 | The feed root and the authority root | Offline | `wicket keys roots-offline` |
 | Run directories (transcripts, workspaces), this host's own node, feed delta logs | Not kept | Runs that were running end as `lost`; the node is made again; each feed starts a new generation |

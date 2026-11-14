@@ -1042,7 +1042,38 @@ async fn control_switch(
     ledger.lock().expect("ledger").snapshot(&snap)?;
     let protect: Vec<String> = [Some(from.to_string()), v.pointer("previous")].into_iter().flatten().collect();
     prune_snapshots(&snaps, KEEP_SNAPSHOTS, &protect, false);
-    audit(ledger, "self.snapshot", serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema }));
+    // And off the host, with a state store (#167): an update doesn't switch without it there (the
+    // way back past a contract step must survive losing this host); a rollback waits for the store
+    // only briefly, and only warns.
+    let push = push_snapshot(snap.clone(), KEEP_SNAPSHOTS, protect.clone());
+    let pushed = if rollback {
+        tokio::time::timeout(ROLLBACK_PUSH_WAIT, push).await.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in {ROLLBACK_PUSH_WAIT:?}")))
+    } else {
+        push.await
+    };
+    let stored = match pushed {
+        Ok(k) => k,
+        Err(e) if rollback => {
+            say(format!("warning: the ledger snapshot isn't in the state store: {e:#}"));
+            None
+        }
+        Err(e) => {
+            audit(
+                ledger,
+                "self.snapshot",
+                serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_error": format!("{e:#}") }),
+            );
+            return Err(SnapshotNotStored(format!("{e:#}")).into());
+        }
+    };
+    audit(
+        ledger,
+        "self.snapshot",
+        serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_key": stored }),
+    );
+    if let Some(k) = &stored {
+        say(format!("ledger snapshot {} (and in the state store as {k})", snap.display()));
+    }
     v.switch(to)?;
     let kind = if rollback { "self.rolled_back" } else { "self.switched" };
     audit(ledger, kind, serde_json::json!({ "target": "control", "from": from, "to": to, "automatic": false, "by": crate::operator() }));
@@ -1157,6 +1188,52 @@ fn snapshots_to_prune(mut names: Vec<String>, keep: usize, protect: &[String]) -
     out
 }
 
+/// How long a rollback waits for its snapshot to reach the state store before switching anyway.
+const ROLLBACK_PUSH_WAIT: Duration = Duration::from_secs(15);
+
+/// Why an update didn't switch: its ledger snapshot couldn't be pushed to the state store (#167).
+/// The store's fault, not the build's (`self follow` tries the build again later).
+#[derive(Debug)]
+pub struct SnapshotNotStored(pub String);
+
+impl std::fmt::Display for SnapshotNotStored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not switching: the ledger snapshot couldn't be pushed to the state store: {}", self.0)
+    }
+}
+
+impl std::error::Error for SnapshotNotStored {}
+
+/// Pushes a snapshot to the state store, if there is one, then prunes the store's copies as the
+/// local ones are; returns its key (None: no state store).
+async fn push_snapshot(snap: PathBuf, keep: usize, protect: Vec<String>) -> Result<Option<String>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let Some(st) = crate::snapstore::store()? else { return Ok(None) };
+        let key = crate::snapstore::push(&st, &snap)?;
+        if let Err(e) = prune_store_snapshots(&st, keep, &protect, false) {
+            say(format!("warning: pruning the state store's snapshots: {e:#}"));
+        }
+        Ok(Some(key))
+    })
+    .await?
+}
+
+/// Deletes the store's snapshots `snapshots_to_prune` picks; returns their names.
+fn prune_store_snapshots(
+    st: &dyn wicket_store::objects::ObjectStore,
+    keep: usize,
+    protect: &[String],
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let gone = snapshots_to_prune(crate::snapstore::list(st)?, keep, protect);
+    if !dry_run {
+        for n in &gone {
+            st.delete(&format!("{}{n}", crate::snapstore::PREFIX))?;
+        }
+    }
+    Ok(gone)
+}
+
 /// Deletes the snapshots `snapshots_to_prune` picks; returns their names.
 fn prune_snapshots(dir: &Path, keep: usize, protect: &[String], dry_run: bool) -> Vec<String> {
     let names = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect();
@@ -1252,6 +1329,24 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
         let protect: Vec<String> = [v.pointer("current"), v.pointer("previous")].into_iter().flatten().collect();
         let snapshots = prune_snapshots(&crate::data_dir().join("snapshots"), keep, &protect, dry_run);
         report("control", &String::from_utf8_lossy(&out.stdout), snapshots);
+        // The state store's copies (#167), by the same rule.
+        let stored = tokio::task::spawn_blocking(move || -> Result<Option<Vec<String>>> {
+            match crate::snapstore::store()? {
+                Some(st) => Ok(Some(prune_store_snapshots(&st, keep, &protect, dry_run)?)),
+                None => Ok(None),
+            }
+        })
+        .await?;
+        match stored {
+            Ok(Some(gone)) => {
+                say(format!("state store: {verb} {} snapshot(s)", gone.len()));
+                if !dry_run && !gone.is_empty() {
+                    audit(&ledger, "self.pruned", serde_json::json!({ "target": "store", "snapshots": gone, "by": crate::operator() }));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => say(format!("warning: pruning the state store's snapshots: {e:#}")),
+        }
     }
     for n in &nodes {
         let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;

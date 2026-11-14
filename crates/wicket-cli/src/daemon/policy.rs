@@ -122,7 +122,10 @@ pub fn route(cmd: &Cmd) -> Route {
             // Writes (and deletes) an object in the store.
             StateCmd::Check { probe: true } => Forward(Privileged),
             StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
-            StateCmd::Kit { .. } | StateCmd::Restore { .. } => Forward(Privileged),
+            // The list of snapshots' names: what `state check` reads.
+            StateCmd::Snapshots => Forward(Read),
+            // Writes the unsealed ledger to a file the caller names, as the wicket user.
+            StateCmd::Kit { .. } | StateCmd::Restore { .. } | StateCmd::Snapshot { .. } => Forward(Privileged),
         },
         Cmd::Keys { .. } => Forward(Privileged),
         Cmd::Itself { cmd } => match cmd {

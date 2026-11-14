@@ -65,6 +65,7 @@ crates/wicket-policy-diff/**       | -   | policy
 crates/wicket-cli/src/hibernate.rs | -   | hibernate restore
 crates/wicket-cli/src/state.rs     | -   | hibernate restore
 crates/wicket-cli/src/statestore.rs | -  | hibernate restore
+crates/wicket-cli/src/snapstore.rs  | -   | update restore
 crates/wicket-cli/src/s3.rs        | -   | hibernate restore
 crates/wicket-store/src/bundle.rs  | -   | hibernate restore
 crates/wicket-cli/src/update.rs    | -   | update
