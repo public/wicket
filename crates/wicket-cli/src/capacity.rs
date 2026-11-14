@@ -61,9 +61,24 @@ pub struct VultrSettings {
     /// The vault secret holding the API key.
     #[serde(default = "default_secret")]
     pub api_key_secret: String,
+    /// Give up on a new node, and destroy it, if nothing answers on its ssh port for this long (a
+    /// duration, e.g. `4m`, the default). Once the port answers, setup is waited for up to 15 minutes.
+    #[serde(default)]
+    pub give_up_silent: Option<String>,
     /// Tests only: a local mock of the API. The API key is sent there, so never point it anywhere else.
     #[serde(default)]
     pub api_base: Option<String>,
+}
+
+impl VultrSettings {
+    /// How long to wait for a new node's setup, and when to give up on one that never answers.
+    pub fn ready_wait(&self) -> Result<wicket_placement::boot::ReadyWait> {
+        let mut w = wicket_placement::boot::ReadyWait::default();
+        if let Some(d) = &self.give_up_silent {
+            w.silent_limit = humantime::parse_duration(d).with_context(|| format!("vultr.give_up_silent {d:?}"))?;
+        }
+        Ok(w)
+    }
 }
 
 fn default_region() -> String {
@@ -124,6 +139,9 @@ impl PlacementConfig {
         match c.backend {
             Backend::Static if c.static_hosts.is_empty() => bail!("backend static needs static_hosts"),
             Backend::Vultr if c.vultr.is_none() => bail!("backend vultr needs a vultr section"),
+            Backend::Vultr => {
+                c.vultr.as_ref().map(VultrSettings::ready_wait).transpose()?;
+            }
             _ => {}
         }
         for h in &c.static_hosts {

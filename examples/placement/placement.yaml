@@ -30,6 +30,9 @@ install_static: false
 #   region: lhr
 #   ssh_key_ids: [<id of a key in the Vultr account>]
 #   ssh_key: <path to its private half on this host>
+#   # A new node with no answer at all on port 22 (every connect times out or is unreachable) for this
+#   # long is destroyed and its lease fails; once the port answers, setup gets up to 15 minutes.
+#   give_up_silent: 4m
 # Hosts the CA of a node enrolled for a lease may issue for (`wicket node enrol --hosts`).
 # node_hosts: [api.example.com]
 # Keep a node whose lease ended until minute 50 of its paid hour instead of destroying it at once.

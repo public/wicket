@@ -679,7 +679,7 @@ pub async fn pass(dry_run: bool) -> Result<Vec<Done>> {
             let v = cfg.vultr.clone().context("vultr settings")?;
             let provider = setup::vultr_provider(&v)?;
             let placer = Placer::new(provider, approver.clone(), cfg.owner(), cfg.envelope()?);
-            let s = setup::Vultr { ssh_key: v.ssh_key.clone(), hosts: cfg.node_hosts.clone() };
+            let s = setup::Vultr { ssh_key: v.ssh_key.clone(), hosts: cfg.node_hosts.clone(), wait: v.ready_wait()? };
             let m = Machines { placer: &placer, approver: &approver, setup: &s, warm_pool: cfg.warm_pool };
             Pass::new(&mut ledger, Some(m), &local, node_docker, now, dry_run).with_node_runs(asked.clone()).run().await
         }
@@ -767,6 +767,9 @@ pub mod setup {
     pub struct Vultr {
         pub ssh_key: Option<PathBuf>,
         pub hosts: Vec<String>,
+        /// A node that never answers on its ssh port fails its lease after `wait.silent_limit`, and
+        /// is destroyed like any node whose setup failed.
+        pub wait: wicket_placement::boot::ReadyWait,
     }
 
     impl NodeSetup<VultrProvider> for Vultr {
@@ -789,6 +792,7 @@ pub mod setup {
                 self.ssh_key.clone(),
                 Some(self.hosts.clone()),
                 std::time::Duration::from_secs(24 * 3600),
+                &self.wait,
             )
             .await?;
             crate::enrol::install(&name, self.ssh_key.as_deref(), false).await?;
