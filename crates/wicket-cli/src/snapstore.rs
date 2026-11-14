@@ -60,14 +60,16 @@ pub fn fetch(st: &dyn ObjectStore, name: &str, out: &Path) -> Result<()> {
     let mut r = st.get(&format!("{PREFIX}{name}"))?.with_context(|| format!("no snapshot {name} in the state store"))?;
     let tmp = out.with_file_name(format!(".{}.part", out.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot")));
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| tmp.display().to_string())?;
+    let mut f =
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| tmp.display().to_string())?;
     let copied = std::io::copy(&mut r, &mut f).and_then(|_| f.sync_all());
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).context(format!("reading {name} from the state store (sealed under another state.key?)"));
     }
     let mut head = [0u8; 16];
-    let ok = std::fs::File::open(&tmp).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"SQLite format 3\0";
+    let ok =
+        std::fs::File::open(&tmp).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"SQLite format 3\0";
     if !ok {
         let _ = std::fs::remove_file(&tmp);
         bail!("{name} from the state store isn't a SQLite database");
@@ -87,7 +89,8 @@ pub fn print_list() -> Result<()> {
     }
     for n in names {
         let (t, id) = n.trim_end_matches(".db").split_once('-').unwrap_or(("?", "?"));
-        let when = t.parse::<u64>().ok().map(|s| humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)));
+        let when =
+            t.parse::<u64>().ok().map(|s| humantime::format_rfc3339_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)));
         println!("{n}  (the ledger before switching away from {id}, {})", when.map(|w| w.to_string()).unwrap_or_else(|| "?".into()));
     }
     Ok(())

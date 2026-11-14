@@ -931,7 +931,11 @@ async fn control_switch(
             None
         }
         Err(e) => {
-            audit(ledger, "self.snapshot", serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_error": format!("{e:#}") }));
+            audit(
+                ledger,
+                "self.snapshot",
+                serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_error": format!("{e:#}") }),
+            );
             bail!("not switching: the ledger snapshot couldn't be pushed to the state store: {e:#}");
         }
     };
@@ -1025,7 +1029,12 @@ async fn push_snapshot(snap: PathBuf, keep: usize, protect: Vec<String>) -> Resu
 }
 
 /// Deletes the store's snapshots `snapshots_to_prune` picks; returns their names.
-fn prune_store_snapshots(st: &dyn wicket_store::objects::ObjectStore, keep: usize, protect: &[String], dry_run: bool) -> Result<Vec<String>> {
+fn prune_store_snapshots(
+    st: &dyn wicket_store::objects::ObjectStore,
+    keep: usize,
+    protect: &[String],
+    dry_run: bool,
+) -> Result<Vec<String>> {
     let gone = snapshots_to_prune(crate::snapstore::list(st)?, keep, protect);
     if !dry_run {
         for n in &gone {
