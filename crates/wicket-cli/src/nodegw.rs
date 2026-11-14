@@ -345,39 +345,6 @@ async fn await_message(node: &Arc<Node>, run: &str, args: &Value) -> Option<(Str
     }
 }
 
-/// The spawn request a tool call makes, as the control host's gateway reads it.
-fn spawn_request(tool: &str, args: &Value) -> wicket_proxy::SpawnRequest {
-    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
-    match tool {
-        "spawn_agent" => wicket_proxy::SpawnRequest {
-            name: s("name").unwrap_or_default(),
-            kind: "agent".into(),
-            task: s("task"),
-            reach_hosts: args
-                .get("reach_hosts")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect()),
-            ..Default::default()
-        },
-        _ => wicket_proxy::SpawnRequest {
-            name: s("name").unwrap_or_default(),
-            kind: s("kind").unwrap_or_else(|| "agent".into()),
-            task: s("task"),
-            command: args
-                .get("command")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default(),
-            image: s("image"),
-            zone: args.get("zone").cloned().filter(|z| z.is_object()),
-            max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
-            ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
-            reach_hosts: None,
-            placement: args.get("placement").cloned().filter(|p| p.is_object()),
-        },
-    }
-}
-
 /// A spawn, decided here (#164): a child within the box's authority starts on this node, its token
 /// attenuated from the box's, its model budget carved from the box's slice, its slots from the
 /// box's; the control host is told (`Spawned`) at once or when it is back, checks it again and
@@ -385,7 +352,10 @@ fn spawn_request(tool: &str, args: &Value) -> wicket_proxy::SpawnRequest {
 /// decides differently a level down, a zone beyond the box's while it can be asked).
 async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<(String, bool)> {
     let sp = node.edge_start(run)?.spawn?;
-    let req = spawn_request(tool, args);
+    let req = match wicket_proxy::gateway::spawn_request(tool, args) {
+        Ok(r) => r,
+        Err(e) => return Some((e, true)),
+    };
     let here = req
         .placement
         .as_ref()

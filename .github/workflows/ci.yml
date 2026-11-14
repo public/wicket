@@ -197,11 +197,14 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get install -y -q musl-tools
+          # Built here, not only by smoke.sh: acceptance uses it too, and runs without the smoke step
+          # when the selection (#218) picks acceptance alone.
+          cargo build -q --release --locked --target x86_64-unknown-linux-musl --manifest-path ci/h3get/Cargo.toml
       - name: Build the agent image
         run: target/debug/wicket image
       - name: Smoke test
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
-        run: WICKET=target/debug/wicket ci/smoke.sh
+        run: WICKET=target/debug/wicket H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/smoke.sh
       - name: Hibernate and wake
         if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' hibernate ') }}
         run: WICKET=target/debug/wicket ci/hibernate.sh

@@ -6,11 +6,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
+#[cfg(test)]
 use wicket_core::{CompiledZone, Op, Verdict, ZoneSpec};
 
-/// A policy entry as the feed carries it: a zone's [`ZoneSpec`] (the original payload, kept as the
-/// differential oracle), or a box's capability token ([`crate::token::BoxAuthority`], what nodes
-/// decide with). The feed, the replica and the publisher don't depend on which.
+/// A policy entry as the feed carries it: a box's capability token ([`crate::token::BoxAuthority`],
+/// what nodes decide with), or in this crate's tests a zone's `ZoneSpec`. The feed, the replica and
+/// the publisher don't depend on which.
 pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     /// The policy in the form decisions use, built once when an update is applied.
     type Compiled;
@@ -29,6 +30,9 @@ pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     }
 }
 
+/// Zones as plain specs: the feed's own tests' policy, with no context to compile. Nodes decide
+/// with tokens ([`crate::token::BoxAuthority`]).
+#[cfg(test)]
 impl Policy for ZoneSpec {
     type Compiled = CompiledZone;
     type Ctx = ();
@@ -48,6 +52,7 @@ pub struct Zone<P: Policy> {
     pub compiled: Result<P::Compiled, String>,
 }
 
+#[cfg(test)]
 impl Zone<ZoneSpec> {
     /// The verdict for one op; `Forbidden` if the policy didn't compile.
     pub fn evaluate(&self, op: &Op) -> Verdict {

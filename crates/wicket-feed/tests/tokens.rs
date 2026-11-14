@@ -1,5 +1,5 @@
 //! The feed carrying boxes' authority as Biscuit token chains (#57 step 4):
-//! - decisions through tokens match `CompiledZone` (the `ZoneSpec` feed) on every example and
+//! - decisions through tokens match each zone's `CompiledZone` on every example and
 //!   subset-test zone, fresh and offline;
 //! - revoking a spawn block revokes the subtree on the node;
 //! - a grant reaches the node, its use count is enforced there (and survives a restart), and
@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey as FeedKey;
 use std::path::{Path, PathBuf};
 use wicket_authz::biscuit_auth::BlockBuilder;
 use wicket_authz::{Ceiling, Grant as AuthzGrant, SigningKey, Token};
-use wicket_core::{Op, RunId, TenantId, ZoneSpec};
+use wicket_core::{CompiledZone, Op, RunId, TenantId, Verdict, ZoneSpec};
 use wicket_feed::*;
 
 const T0: i64 = 1_800_000_000_000;
@@ -130,17 +130,21 @@ fn kind(d: &Decision) -> &'static str {
     }
 }
 
+/// A zone verdict's kind, as [`kind`] names a decision's.
+fn verdict_kind(v: &Verdict) -> &'static str {
+    match v {
+        Verdict::AllowByReach(_) => "allow",
+        Verdict::Forbidden(_) => "forbidden",
+        Verdict::NeedsGrant(_) => "needs-grant",
+    }
+}
+
 #[test]
 fn token_decisions_match_compiled_zones_fresh_and_offline() {
     let zones = all_zones();
     let mut cp = Cp::new();
-    // The oracle: the same zones as `ZoneSpec` entries, decided by `CompiledZone` in the replica.
-    let oracle_dir = TempDir::new("oracle");
-    let mut zp: Publisher<ZoneSpec> =
-        Publisher::open(oracle_dir.path(), NODE, &cp.root.verifying_key(), cp.feed_key.clone(), &cert(&cp.root, &cp.feed_key), cfg())
-            .unwrap();
-    // Zone names repeat across the example and subset sets: one box per zone index, and the oracle
-    // gets each zone under a unique name.
+    // The oracle: each zone decided by its `CompiledZone` directly. Zone names repeat across the
+    // example and subset sets: one box per zone index, each under a unique name.
     let mut boxes = vec![];
     for (i, z) in zones.iter().enumerate() {
         let mut z = z.clone();
@@ -148,31 +152,30 @@ fn token_decisions_match_compiled_zones_fresh_and_offline() {
         let run = format!("run-{i}");
         let a = cp.issue(&run, &z).publish(&cp.approver, &[]).unwrap();
         cp.put(a, T0 - 100);
-        zp.commit(vec![Change::PutZone { zone: z.clone() }], T0 - 100).unwrap();
-        boxes.push((run, z));
+        let compiled = CompiledZone::new(z.clone()).unwrap();
+        boxes.push((run, z, compiled));
     }
-    let (mut tr, mut zr) = (cp.replica(), Replica::<ZoneSpec>::new(NODE, cp.root.verifying_key(), ReplicaConfig::default()));
+    let mut tr = cp.replica();
     sync(&mut cp.p, &mut tr, T0);
-    sync(&mut zp, &mut zr, T0);
     let offline = T0 + TTL + 1;
     assert_eq!(tr.mode(offline), Mode::Offline);
     let mut counts = std::collections::BTreeMap::<(&str, &str), usize>::new();
-    for (run, z) in &boxes {
+    for (run, z, compiled) in &boxes {
         let (hosts, paths) = probes(&[z]);
         for h in &hosts {
             for p in &paths {
                 for m in METHODS {
                     let o = op(&z.name, run, m, h, p);
                     for (now, mode) in [(T0, "fresh"), (offline, "offline")] {
-                        let (want, got) = (zr.decide(&o, now), tr.decide(&o, now));
+                        let (want, got) = (compiled.evaluate(&o), tr.decide(&o, now));
                         assert_eq!(
                             kind(&got),
-                            kind(&want),
+                            verdict_kind(&want),
                             "{mode} zone {}: {m} {h}{p} ({:?}): token {got:?}, zone {want:?}",
                             z.name,
                             o.risk
                         );
-                        *counts.entry((mode, kind(&want))).or_default() += 1;
+                        *counts.entry((mode, verdict_kind(&want))).or_default() += 1;
                     }
                 }
             }
@@ -192,9 +195,9 @@ fn token_decisions_match_compiled_zones_fresh_and_offline() {
     // A box's token decides only for its own zone and run.
     // (The first zone with a readable rule: not every example zone has reach.)
     let readable = |z: &ZoneSpec| z.reach.iter().find(|r| r.methods.iter().any(|m| m == "GET")).cloned();
-    let (run, z) = boxes.iter().find(|(_, z)| readable(z).is_some()).expect("a zone with a readable rule");
+    let (run, z, _) = boxes.iter().find(|(_, z, _)| readable(z).is_some()).expect("a zone with a readable rule");
     let read = readable(z).expect("a readable rule");
-    let other = boxes.iter().find(|(r, _)| r != run).expect("another box");
+    let other = boxes.iter().find(|(r, _, _)| r != run).expect("another box");
     let path = common::paths_for(&read.paths[0])[0].clone();
     let host = read.host.replace("*.", "a.");
     assert_eq!(kind(&tr.decide(&op(&z.name, run, "GET", &host, &path), T0)), "allow");

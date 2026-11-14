@@ -53,7 +53,9 @@ function describe(a) {
   if (a.action === "decide") {
     const verb = a.decision === "deny" ? "Deny" : a.uses === 1 ? "Approve once" : "Allow" + (a.uses ? " " + a.uses + " uses" : "");
     const how = a.decision === "deny" ? "" : " for " + Math.round((a.ttl_secs || 0) / 60) + " min";
-    return verb + how + ": " + s(a.method + " " + a.host + a.path) + (a.prefix ? "\u2026 (every path under it)" : "") +
+    const what = a.path_prefix ? s(a.method + " " + a.host + a.path_prefix) : s(a.method + " " + a.host + a.path);
+    return verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") +
+      (a.scope === "zone" ? " \u00b7 any run in zone " + s(a.zone) : "") +
       " \u00b7 " + riskLabel(a.risk) + " \u00b7 request " + s(a.request) + " \u00b7 run " + s(a.run) +
       (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
   }

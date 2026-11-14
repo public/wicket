@@ -23,9 +23,14 @@
 #      check on the control host and is switched back to A; the approval is used up;
 #   5. pruning (#166): a dry run removes nothing; then B, now neither current nor previous on the
 #      control host, goes with its image, while A and C stay (and the nodes, A and B, keep both);
+#   5a. the ledger snapshots each switch took are in the state store too, sealed, pruned alike,
+#       and a standby with state.key fetches one back (#167; ci/update/snapshot-store.sh);
 #   5b. builds CI signed (#190), from a fake GitHub API: --from-ci, its refusals, and follow
 #       (ci/update/from-ci.sh);
-#   6. the audit chain verifies and has every step.
+#   5c. protocol jumps (#207, ci/update/jump.sh): refused while an enrolled node is left behind,
+#      naming it; with every node, the control host and its nodes switch together;
+#   6. the audit chain verifies and has every step;
+#   7. with the remote nodes revoked, a jump with only this host's own node goes through.
 #
 # Needs Docker with runsc and the agent image. Env: WICKET, IMAGE (an existing agent image: not
 # built, not removed; default: built as wicket/claude-code:upd-$$ and removed), WICKET_DOCKER (e.g.
@@ -72,10 +77,10 @@ teardown() {
   for p in $(pgrep -f "$work/" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
   sleep 1
   for c in $($DOCKER ps -aq --filter name=^upd-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
-  $DOCKER rm -f "upd-$$-holds-b" >/dev/null 2>&1
+  $DOCKER rm -f "upd-$$-holds-b" "upd-$$-s3" >/dev/null 2>&1
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   # Each build's own image, made by the updates (these builds are this test's alone).
-  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
+  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}" "${J_ID:-}" "${K_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
   if [ "${UPD_KEEP:-}" = 1 ]; then echo "kept: $work"; else chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"; fi
   echo
   printf '%s\n' "${results[@]}"
@@ -219,6 +224,10 @@ check "an agent's request_update files an R4 request and updates nothing" \
   'jq -r ".content[0].text" <<<"$asked" | grep -q "needs a human" && w pending | grep -q "UPDATE wicket.internal/self/$C_SHA" && [ "$(current "$WICKET_HOME/versions" 2>/dev/null)" != "$C_ID" ]'
 check "while the request is pending, its artifact is still refused" '! w self update "$work/C" >"$work/u-pending.log" 2>&1 && grep -q "no human has approved" "$work/u-pending.log"'
 
+# The state store, for the ledger snapshots each switch pushes (ci/update/snapshot-store.sh).
+. ci/update/snapshot-store.sh
+store_up
+
 # ---- 2. A -> B ----
 log "2. update to B: control host, then n1 (canary) and n2"
 # The node agent's model credential, fetched by n1 on its first use (#152): kept in n1's memory.
@@ -284,9 +293,14 @@ check "  prune removes B, and its image unless a box still has its id; A (curren
   '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ] && if [ -n "$b_used" ]; then grep -q "kept wicket/claude-code:$B_ID (a container uses it)" "$work/prune.log"; else ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1; fi'
 check "  the nodes keep their current and previous" '[ -d "$(node_dir n1)/versions/$A_ID" ] && [ -d "$(node_dir n1)/versions/$B_ID" ] && grep -q "node:n1: removed 0 version" "$work/prune.log"'
 
+store_checks
+
 # ---- 5b. builds CI signed (#190) ----
 . ci/update/from-ci.sh
 another_turn "the CI-signed updates"
+
+# ---- 5c. protocol jumps (#207) ----
+. ci/update/jump.sh
 
 # ---- 6. audit ----
 log "6. audit"
@@ -299,3 +313,6 @@ check "  an automatic rollback is recorded as one" 'w audit --tail 1000 | grep s
 # The agent that asked stays up until here: revoking it would withdraw its request, and its grants.
 for r in "${runs[@]}" "$r_asker"; do w identity revoke "$r" --reason "update test: done" >/dev/null 2>&1 || true; done
 for r in "${runs[@]}" "$r_asker"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done
+
+# ---- 7. a protocol jump with only this host's own node (#207) ----
+. ci/update/jump-local.sh

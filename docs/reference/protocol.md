@@ -67,7 +67,9 @@ two ends talk if the versions are **at most one apart**, at the lower one. So:
 - a control host at N talks to nodes at N−1 and N (the rollout: control host first);
 - a node at N talks to a control host at N−1 (the control host rolled back) and N+1.
 
-`wicket self update` refuses a build more than one protocol version from the running one. A message
+`wicket self update` takes a build more than one protocol version from the running one only as a
+jump that switches the control host and every active enrolled node together, and refuses it while
+any is left out, naming them ([updates](../explanation/updates.md#protocol-versions-and-skew)). A message
 added in version N is sent only on a connection that negotiated N or later, since an older peer
 drops a connection on a message it can't parse; a field added with a default needs no new version.
 Support for N−1 is removed only after a release that spoke N everywhere. The build (sha256) is still
@@ -80,10 +82,10 @@ exchanged, for the logs and for the health gate.
 | 3 | Budget slices (`Lease`), secrets fetched by a node on first use (`SecretFetch`, `SecretFetched`, `SecretRevoke`) and the node's model spend (`Spent`) (#152, #153). With an older peer a node relays model calls and forwards injected hosts to the control host, as before. |
 | 4 | Block 0 may carry an org layer compiled from the org policy (#51), which an older node's structural check refuses: such tokens go only to nodes talking 4, and `wicket policy apply` refuses while one doesn't. |
 | 5 | Decisions at the edge (#164): `BoxStart.edge` (what the node decides gateway tools and spawns from: the identity's stable claims, the box's manifest, base token, grant keys, time and slots), `Spawned` and `Adopted` (a child the node started, and its takeover), `Ask.prefix`, and `Listen.dial` (a link the node carries between its own boxes). With an older peer a node relays every gateway tool call, as before. |
-
 | 6 | Images pinned by digest (#192): `BoxStart.image_pin`, which the node checks against the image it starts (then started by its id), and the digest it started in `Started` and `Spawned`. A pinned box goes only to a node talking 6. |
+| 7 | Images delivered over the channel (#191): `ImageHave` (does the node have this digest), and `PutImage`, an OCI image layout archive on a control-host stream whose data frames the node acknowledges (`Ack`) as it takes them, ended by `Close` and answered by `ImagePut` once the node has verified and imported it, or refused it. With an older node, the image must be there already. |
 
-wicket speaks version 6.
+wicket speaks version 7.
 
 ## Ledger schema
 

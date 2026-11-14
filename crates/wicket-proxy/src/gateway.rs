@@ -113,8 +113,7 @@ impl Gateway {
             "whoami" => self.whoami(),
             "send_message" => self.send_message(&args),
             "await_message" => self.await_message(&args).await,
-            "spawn_agent" => self.spawn_agent(&args),
-            "spawn" => self.spawn(&args),
+            "spawn" | "spawn_agent" => self.spawn(name, &args),
             "request_access" => self.request_access(&args),
             "expose" => crate::link::expose(
                 &self.ctx,
@@ -347,46 +346,15 @@ impl Gateway {
         }
     }
 
-    fn spawn_agent(&self, args: &Value) -> (String, bool) {
-        let Some(spawn) = &self.ctx.spawner else { return ("this agent may not start child agents (max_children is 0)".into(), true) };
-        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-        if task.trim().is_empty() {
-            return ("`task` is required".into(), true);
-        }
-        let reach_hosts =
-            args.get("reach_hosts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect());
-        match spawn(crate::SpawnRequest {
-            name: name.into(),
-            kind: "agent".into(),
-            task: Some(task.into()),
-            reach_hosts,
-            ..Default::default()
-        }) {
-            Ok(msg) => (msg, false),
-            Err(e) => (format!("not started: {e}"), true),
-        }
-    }
-
-    /// The general form: an agent or a program, in a zone the caller writes.
-    fn spawn(&self, args: &Value) -> (String, bool) {
-        let Some(spawn) = &self.ctx.spawner else { return ("this agent may not start other boxes (max_children is 0)".into(), true) };
-        let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
-        let req = crate::SpawnRequest {
-            name: s("name").unwrap_or_default(),
-            kind: s("kind").unwrap_or_else(|| "agent".into()),
-            task: s("task"),
-            command: args
-                .get("command")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default(),
-            image: s("image"),
-            zone: args.get("zone").cloned().filter(|z| z.is_object()),
-            max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
-            ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
-            reach_hosts: None,
-            placement: args.get("placement").cloned().filter(|p| p.is_object()),
+    /// `spawn` and its `spawn_agent` shorthand: one request, parsed by [`spawn_request`].
+    fn spawn(&self, tool: &str, args: &Value) -> (String, bool) {
+        let Some(spawn) = &self.ctx.spawner else {
+            let what = if tool == "spawn_agent" { "child agents" } else { "other boxes" };
+            return (format!("this agent may not start {what} (max_children is 0)"), true);
+        };
+        let req = match spawn_request(tool, args) {
+            Ok(r) => r,
+            Err(e) => return (e, true),
         };
         match spawn(req) {
             Ok(msg) => (msg, false),
@@ -598,6 +566,38 @@ fn update_tool() -> Value {
             "required": ["sha256", "reason"],
             "additionalProperties": false
         }
+    })
+}
+
+/// The request a `spawn` or `spawn_agent` call makes, read the same way by the control host's
+/// gateway and a node's. `spawn_agent` is `spawn` with `kind: "agent"`: it reads only `name`, `task`
+/// (required) and its `reach_hosts` shorthand, which `spawn` doesn't take.
+pub fn spawn_request(tool: &str, args: &Value) -> Result<crate::SpawnRequest, String> {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(String::from);
+    if tool == "spawn_agent" {
+        if s("task").is_none_or(|t| t.trim().is_empty()) {
+            return Err("`task` is required".into());
+        }
+        let mut req = spawn_request("spawn", &json!({ "name": args.get("name"), "task": args.get("task"), "kind": "agent" }))?;
+        req.reach_hosts =
+            args.get("reach_hosts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect());
+        return Ok(req);
+    }
+    Ok(crate::SpawnRequest {
+        name: s("name").unwrap_or_default(),
+        kind: s("kind").unwrap_or_else(|| "agent".into()),
+        task: s("task"),
+        command: args
+            .get("command")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        image: s("image"),
+        zone: args.get("zone").cloned().filter(|z| z.is_object()),
+        max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
+        ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
+        reach_hosts: None,
+        placement: args.get("placement").cloned().filter(|p| p.is_object()),
     })
 }
 
@@ -1130,5 +1130,70 @@ mod tests {
         // A fetch's discovery is still itself: allowed by reach, nothing to ask.
         let (fetch, _) = ask("https://github.com/acme/app.git/info/refs?service=git-upload-pack", "GET");
         assert!(fetch.contains("already allowed"), "{fetch}");
+    }
+
+    /// #117's class for UPDATE: `request_access` can't file the request `request_update` files (or
+    /// any UPDATE), whatever the URL, so an approval for one can only be one wicket asked for.
+    #[test]
+    fn request_access_cannot_file_an_update() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "builder", "run_b", None, &[]) };
+        let sha = "0f".repeat(32);
+        for (url, method) in [
+            (format!("https://wicket.internal/self/{sha}"), "UPDATE"),
+            (format!("https://wicket.internal/self/{sha}"), "update"),
+            (format!("https://wicket.internal/self/{sha}"), "GET"),
+            ("https://api.example.com/self".to_string(), "UPDATE"),
+        ] {
+            let (text, _) = gw.request_access(&json!({ "url": url, "method": method, "reason": "need it" }));
+            assert!(text.starts_with("not requested") || text.contains("wicket's own"), "{method} {url}: {text}");
+        }
+        assert!(w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod spawn_request_tests {
+    use super::spawn_request;
+    use serde_json::json;
+
+    #[test]
+    fn spawn_agent_is_spawn_with_kind_agent() {
+        let a = spawn_request("spawn_agent", &json!({ "name": "fetcher", "task": "fetch it", "reach_hosts": ["a.example"] })).unwrap();
+        let s = spawn_request("spawn", &json!({ "name": "fetcher", "task": "fetch it" })).unwrap();
+        assert_eq!((a.name.as_str(), a.kind.as_str(), a.task.as_deref()), ("fetcher", "agent", Some("fetch it")));
+        assert_eq!((s.name.as_str(), s.kind.as_str(), s.task.as_deref()), ("fetcher", "agent", Some("fetch it")));
+        assert_eq!(a.reach_hosts, Some(vec!["a.example".to_string()]));
+        assert_eq!(s.reach_hosts, None);
+    }
+
+    #[test]
+    fn spawn_agent_reads_only_its_own_arguments() {
+        let wide = json!({
+            "name": "x", "task": "t", "kind": "program", "command": ["sh"], "image": "i:1",
+            "zone": { "name": "z" }, "max_children": 3, "ask_human": true, "placement": { "node": "n" },
+        });
+        let a = spawn_request("spawn_agent", &wide).unwrap();
+        assert_eq!(a.kind, "agent");
+        assert!(a.command.is_empty() && a.image.is_none() && a.zone.is_none() && a.placement.is_none());
+        assert_eq!((a.max_children, a.ask_human), (0, false));
+        let s = spawn_request("spawn", &wide).unwrap();
+        assert_eq!((s.kind.as_str(), s.command.len(), s.max_children, s.ask_human), ("program", 1, 3, true));
+        assert!(s.image.is_some() && s.zone.is_some() && s.placement.is_some());
+    }
+
+    #[test]
+    fn spawn_agent_needs_a_task_spawn_leaves_it_to_the_spawner() {
+        for args in [json!({ "name": "x" }), json!({ "name": "x", "task": "  " })] {
+            assert_eq!(spawn_request("spawn_agent", &args).unwrap_err(), "`task` is required");
+            assert!(spawn_request("spawn", &args).is_ok());
+        }
+    }
+
+    #[test]
+    fn spawn_clamps_and_filters() {
+        let s = spawn_request("spawn", &json!({ "name": "x", "max_children": 1000, "zone": "no", "placement": 3 })).unwrap();
+        assert_eq!(s.max_children, 64);
+        assert!(s.zone.is_none() && s.placement.is_none());
     }
 }

@@ -80,11 +80,11 @@ runuser -u alex -- cat /var/lib/wicket/ledger.db >/dev/null 2>&1 && fail "alex r
 runuser -u alex -- test -r /var/lib/wicket/identity/issuer.key && fail "alex can read the issuer key"
 [ -S /var/run/docker.sock ] && runuser -u alex -- test -w /var/run/docker.sock && fail "alex can reach docker"
 echo "ok: alex can'"'"'t reach the data dir, the ledger, the issuer key or Docker"
-for c in "approve R1" "deny R1" "operator enrol-link" "operator reset" "reap"; do
+for c in "approve R1" "deny R1" "operator enrol-link" "operator reset" "reconcile --dry-run"; do
     if out=$(as_alex $c 2>&1); then fail "alex: $c succeeded: $out"; fi
     case "$out" in *"needs root on the host"*) ;; *) fail "alex: $c: $out" ;; esac
 done
-echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reap"
+echo "ok: alex can'"'"'t approve, deny, enrol a passkey, reset passkeys or reconcile"
 out=$(as_alex run --run-id x /src/examples/demo.yaml 2>&1) && fail "alex passed --run-id"
 case "$out" in *"for wicket'"'"'s own use"*) ;; *) fail "alex: --run-id: $out" ;; esac
 out=$(as_alex run --workspace-dir /var/lib /src/examples/demo.yaml 2>&1) && fail "alex mounted /var/lib"
@@ -113,5 +113,27 @@ n=$(wicket audit --tail 200 | grep -c daemon.refused) || true
 [ "$n" -ge 8 ] || fail "only $n refusals audited"
 wicket audit --verify >/dev/null || fail "audit chain"
 echo "ok: $n refusals audited; the chain verifies"
+
+# #165: an update to a version whose systemd units differ from the installed ones is refused until
+# root applies that version'"'"'s own units; then it goes on (here as far as its agent image, which needs
+# the Docker daemon this container lacks).
+vroot=/var/lib/wicket-versions
+a=$(basename "$(readlink $vroot/current)")
+(cd /tmp && wicket self keygen /tmp/rk >/dev/null && wicket self trust-key /tmp/rk.pub >/dev/null) || fail "release key"
+cp /usr/local/bin/wicket /tmp/wicket-b && printf "build b" >>/tmp/wicket-b && chmod 755 /tmp/wicket-b
+(cd /tmp && wicket self sign --key /tmp/rk /tmp/wicket-b >/dev/null) && chmod 644 /tmp/wicket-b.sig || fail "signing b"
+b=$(sha256sum /tmp/wicket-b | cut -c1-12)
+echo "# edited here" >>/etc/systemd/system/wicketd.service
+out=$(cd / && wicket self update /tmp/wicket-b 2>&1) && fail "an update with other units went through: $out"
+case "$out" in *"systemd units differ"*wicketd.service*"self apply-units"*) ;; *) fail "update with other units: $out" ;; esac
+[ "$(basename "$(readlink $vroot/current)")" = "$a" ] || fail "current moved to $(readlink $vroot/current)"
+wicket audit --tail 20 | grep self.update_refused | grep -q "\"units\"" || fail "the units refusal was not audited"
+out=$(as_alex self apply-units 2>&1) && fail "alex applied units: $out"
+"$vroot/$b/wicket" self apply-units >/tmp/apply.log || { cat /tmp/apply.log; fail "apply-units"; }
+grep -q "updated /etc/systemd/system/wicketd.service" /tmp/apply.log || { cat /tmp/apply.log; fail "apply-units said: $(cat /tmp/apply.log)"; }
+cmp -s /etc/systemd/system/wicketd.service /opt/pkg/wicket-*/deploy/systemd/wicketd.service || fail "wicketd.service is not the version'"'"'s"
+out=$(cd / && wicket self update /tmp/wicket-b 2>&1) || true
+case "$out" in *"units differ"*) fail "still refused over units: $out" ;; *"building wicket/claude-code:$b with $b"*) ;; *) fail "the update after apply-units: $out" ;; esac
+echo "ok: an update to other systemd units waits for root'"'"'s apply-units, then goes on"
 echo "install-test: all checks passed"
 '

@@ -10,8 +10,7 @@
 //!   The feed key signs a **snapshot**, hash-chained **deltas** (each a batch of changes) and short
 //!   **freshness statements**, re-signed on a timer (TUF's timestamp role). All are compact JWS
 //!   (Ed25519), with `typ` separating the kinds.
-//! - **State** ([`State`]): zone policies (a [`Policy`]: `wicket_core::ZoneSpec` today, compiled once
-//!   when applied), grants bound to `Op::digest` with expiry, use count and box, revocations of
+//! - **State** ([`State`]): policy entries (a [`Policy`]: a box's token, compiled once when applied), grants bound to `Op::digest` with expiry, use count and box, revocations of
 //!   grant, run and token ids with an `until` so the set stays bounded, and the epoch.
 //! - **Node side** ([`Replica`]): verifies, applies, refuses; persists what it verified; computes the
 //!   [`Mode`] and [`Replica::decide`]s ops.

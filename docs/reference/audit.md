@@ -106,10 +106,9 @@ are `wicket.audit.type`, `wicket.audit.seq` (int), `wicket.audit.kind`, `wicket.
 ## Checkpoints and `--verify --against`
 
 Each record's hash covers every field it stores: `seq`, `ts`, `tenant`, `run`, `kind`, `body` and the
-previous record's hash. These are v2 hashes and start with `v2:`. Ledgers written by older versions
-hold v1 hashes (64 hex digits), which cover only `prev`, `kind` and `body`. They still verify, and
-new records continue the chain as v2. A v1 record after a v2 one fails, so a record can't be
-downgraded to hide an edit. `wicket audit --verify` reports how many v1 records a ledger holds.
+previous record's hash. These are v2 hashes and start with `v2:`; a record with any other hash
+fails verification (development builds before #120 wrote v1 hashes, which covered only `prev`,
+`kind` and `body`: such ledgers no longer verify).
 
 The hash chain proves that the ledger is internally consistent, not that it is complete: whoever
 controls the control host can rewrite a record and recompute every hash after it. Checkpoints close
@@ -134,8 +133,7 @@ This runs the normal verification first, then checks the local ledger against th
 - that the local record at each checkpoint's `seq` has the checkpoint's head hash;
 - that the local chain reaches the newest checkpoint;
 - that every field of each exported record (`ts`, `tenant`, `run`, `kind`, `body`, `prev`, `hash`)
-  equals the local record's. This catches a v1 record that was moved to another run or tenant, or
-  given another time, which its hash doesn't cover.
+  equals the local record's.
 
 A rewritten chain fails this check even if it was consistently re-chained, and so does a truncated
 one. The files can be wicket's JSON lines, or a Collector `file` exporter's output (OTLP JSON, one
@@ -154,7 +152,7 @@ for a kind to see its body):
 | agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `spawn.beyond_parent`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
 | links | `link.expose`, `link.open`, `link.close`, `link.cut` |
 | operators | `operator.signed_in`, `operator.lockout`, `operator.passkey_added`, `operator.enrol_link_issued`, `operator.enrol_link_used`, `operator.reset`, `operator.sessions_revoked`, `operator.message` |
-| nodes | `node.token`, `node.enrolled`, `node.ca_renewed`, `node.revoked`, `node.audit`, `node.audit.restart`, `node.ask_queued`, `node.authority_expired`, `node.secret_fetch`, `node.secret_fetched`, `node.secret_unavailable`, `feed.refused` |
+| nodes | `node.token`, `node.enrolled`, `node.ca_renewed`, `node.revoked`, `node.audit`, `node.audit.restart`, `node.ask_queued`, `node.authority_expired`, `node.secret_fetch`, `node.secret_fetched`, `node.secret_unavailable`, `feed.refused`, `image.received`, `image.refused` |
 | placement | `lease.requested`, `lease.released`, `placement.node_created`, `placement.node_released`, `reconcile.<what>` (one per change a pass makes, such as `reconcile.destroyed` and `reconcile.run_adopted`) |
 | updates | `self.staged`, `self.snapshot`, `self.switched`, `self.health`, `self.committed`, `self.rolled_back`, `self.update_refused`, `self.pruned`, `self.key_trusted`, `self.follow_update`, `self.follow_skipped`, `self.follow_failed` |
 | state and keys | `state.kit`, `state.restored`, `keys.roots_offline`, `keys.roots_online`, `keys.certified` |

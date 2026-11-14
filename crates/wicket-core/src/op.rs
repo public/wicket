@@ -218,7 +218,7 @@ pub fn never_reachable(host: &str) -> Option<String> {
                 return Some(format!("host {d} is never reachable from a sandbox"));
             }
             // wicket's own name: the box reaches it directly (NO_PROXY), never as an egress target, and
-            // its approval namespace (SPAWN, LINK, CAPACITY) is wicket's alone (#117).
+            // its approval namespace (SPAWN, LINK, CAPACITY, UPDATE) is wicket's alone (#117).
             if is_wicket_host(d) {
                 return Some(format!("host {d} is wicket's own: it is never an egress target"));
             }
@@ -229,8 +229,9 @@ pub fn never_reachable(host: &str) -> Option<String> {
 }
 
 /// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
-/// its parent's zone, a link beyond the default policy, and a capacity lease.
-pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY"];
+/// its parent's zone, a link beyond the default policy, a capacity lease, and accepting a wicket
+/// build (`request_update`, #162).
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE"];
 
 /// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
 pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
@@ -452,6 +453,7 @@ zone:
         let (t, r) = (TenantId::single(), RunId("r".into()));
         let op = |m: &str, h: &str| Op::egress(&t, &r, "z", m, h, "/");
         assert!(op("spawn", "api.example.com").is_reserved());
+        assert!(op("update", "api.example.com").is_reserved());
         assert!(op("GET", "wicket.internal").is_reserved());
         assert!(op("GET", "api.example.com").refused_for_agents().is_none());
         assert!(op("PROPFIND", "api.example.com").refused_for_agents().is_some());

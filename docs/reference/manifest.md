@@ -207,7 +207,10 @@ hex>`, or `sha256:<64 hex>` alone. Anything with `@` must be a valid pin, or the
 
 - **A pin is what a box starts.** Its node finds the image by the pinned reference, or by the digest
   alone, and starts it by its id, the digest Docker reports for it (`docker image inspect`'s `Id`, or one
-  of its `RepoDigests`). A node without it refuses, and moving a tag to another image changes nothing.
+  of its `RepoDigests`). Moving a tag to another image changes nothing.
+- **Delivered if missing.** A remote node that hasn't the image gets it from the control host, over the
+  node channel, and verifies it against the pin before importing it ([nodes](nodes.md#images-on-nodes)).
+  If neither has it, the node refuses the box.
 - **What a pinned entry allows.** In `zone.images`, a pinned entry allows that digest, by the pin
   itself, by the digest alone, or by any tag of the same repository: a child asking for
   `wicket-self:dev` when the zone pins `wicket-self@sha256:…` starts as the pin. Another digest of the

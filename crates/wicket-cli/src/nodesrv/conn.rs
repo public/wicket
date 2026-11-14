@@ -128,6 +128,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
         }
     };
     let gone = node.links.lock().expect("links").remove(&gen);
+    images::gone(&node, gen);
     if let Some(l) = gone {
         l.tunnels.clear();
         let mut a = node.audit_link.lock().expect("audit link");
@@ -179,8 +180,9 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             node.send_to(gen, node.feed_status(r.as_ref().err()));
         }
         Frame::Data { stream, offset, bytes } if stream & TUNNEL_BIT != 0 => {
-            tunnels.data(stream, bytes);
-            let _ = offset;
+            if let Some(bytes) = images::data(node, stream, offset, bytes) {
+                tunnels.data(stream, bytes);
+            }
         }
         Frame::Data { stream, offset, bytes } => {
             let mut boxes = node.boxes.lock().expect("boxes");
@@ -303,7 +305,6 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     }
                 }
             }
-            Msg::RunLease { .. } => {}
             Msg::Lease { run, lease } => {
                 if let Some(sl) = &lease.slice {
                     if let Err(e) = node.slices.put(&run, sl) {
@@ -363,7 +364,11 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     let _ = tx.send(error);
                 }
             }
-            Msg::Close { stream } => tunnels.close(stream),
+            Msg::Close { stream } => {
+                if !images::end(node, stream) {
+                    tunnels.close(stream);
+                }
+            }
             Msg::BoxCtl { id, run, what, user, arg } => {
                 let n = node.clone();
                 tokio::spawn(async move {
@@ -419,6 +424,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 }
             }
             Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
+            Msg::ImageHave { id, digest } => images::have(node, gen, id, digest),
+            Msg::PutImage { stream, digest, name } => images::put(node, gen, stream, digest, name),
             Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),
             Msg::Listen { id, run, sock, dial } => {
                 let error = match dial {
