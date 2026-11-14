@@ -1095,4 +1095,23 @@ mod tests {
         assert!(gw.request_update(&json!({ "sha256": sha })).1);
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "request_update"));
     }
+
+    /// #117's class for UPDATE: `request_access` can't file the request `request_update` files (or
+    /// any UPDATE), whatever the URL, so an approval for one can only be one wicket asked for.
+    #[test]
+    fn request_access_cannot_file_an_update() {
+        let w = World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())) };
+        let gw = Gateway { ctx: w.agent("t0", "z", "builder", "run_b", None, &[]) };
+        let sha = "0f".repeat(32);
+        for (url, method) in [
+            (format!("https://wicket.internal/self/{sha}"), "UPDATE"),
+            (format!("https://wicket.internal/self/{sha}"), "update"),
+            (format!("https://wicket.internal/self/{sha}"), "GET"),
+            ("https://api.example.com/self".to_string(), "UPDATE"),
+        ] {
+            let (text, _) = gw.request_access(&json!({ "url": url, "method": method, "reason": "need it" }));
+            assert!(text.starts_with("not requested") || text.contains("wicket's own"), "{method} {url}: {text}");
+        }
+        assert!(w.ledger.lock().unwrap().pending(&TenantId("t0".into())).unwrap().is_empty());
+    }
 }

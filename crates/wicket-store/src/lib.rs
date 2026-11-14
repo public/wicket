@@ -1813,10 +1813,13 @@ mod tests {
     fn agents_cannot_ask_in_wickets_namespace() {
         let l = Ledger::open_in_memory().unwrap();
         let (t, r) = (TenantId::single(), RunId("run_t".into()));
+        let update = format!("/self/{}", "0f".repeat(32));
         for (m, h, p) in [
             ("SPAWN", "wicket.internal", "/zones/"),
             ("CAPACITY", "wicket.internal", "/capacity/l-1"),
             ("LINK", "wicket.internal", "/links/a/b/80"),
+            ("UPDATE", "wicket.internal", update.as_str()),
+            ("UPDATE", "api.example.com", "/"),
             ("GET", "wicket.internal", "/"),
             ("GET", "relay.wicket.internal", "/"),
             ("SPAWN", "api.example.com", "/"),
