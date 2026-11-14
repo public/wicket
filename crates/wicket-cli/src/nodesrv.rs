@@ -53,6 +53,7 @@ mod conn;
 mod gateway;
 #[path = "nodegw.rs"]
 mod gw;
+mod images;
 mod links;
 use conn::*;
 use gateway::*;
@@ -241,6 +242,8 @@ struct Node {
     mem: Mutex<HashMap<String, BoxMem>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
+    /// Images being received (#191), by stream.
+    images: images::Incoming,
 }
 
 impl Node {
@@ -568,6 +571,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
     let audit = crate::audit_export::open_batched(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
+    // Images a previous `serve` was receiving when it ended (#191) are incomplete.
+    images::clear_spool(&paths.root);
     let ctl = paths.socket();
     let ctl_dir = ctl.parent().expect("socket dir");
     std::fs::create_dir_all(ctl_dir)?;
@@ -613,6 +618,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         causes: Mutex::new(HashMap::new()),
         mem: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
+        images: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -1900,7 +1906,7 @@ mod tests {
     use crate::nodeauth::testkit::Install;
     use crate::nodeauth::HsError;
 
-    fn test_node(i: &Install) -> Arc<Node> {
+    pub(super) fn test_node(i: &Install) -> Arc<Node> {
         let root = wicket_identity::SigningKey::from_bytes(&[3; 32]).verifying_key();
         Arc::new(Node {
             name: "n1".into(),
@@ -1929,6 +1935,7 @@ mod tests {
             causes: Mutex::new(HashMap::new()),
             mem: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
+            images: Default::default(),
         })
     }
 
@@ -2067,7 +2074,7 @@ mod tests {
         a
     }
 
-    async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
+    pub(super) async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
         let (a, r) = handshake(node, gen, chan::PROTOCOL, i, &i.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
         a

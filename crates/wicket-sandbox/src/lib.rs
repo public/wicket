@@ -98,6 +98,11 @@ impl Docker {
         Docker { cmd: cmd.split_whitespace().map(String::from).collect(), quote: false }
     }
 
+    /// A Docker run as this command (its argv's start), on this host.
+    pub fn with_command(cmd: Vec<String>) -> Docker {
+        Docker { cmd, quote: false }
+    }
+
     /// Docker on a remote node, reached with the given ssh command (ending in the target).
     pub fn over_ssh(mut ssh: Vec<String>) -> Docker {
         ssh.push("docker".into());
@@ -507,6 +512,46 @@ impl Docker {
 
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        Ok(())
+    }
+
+    /// Writes image `image` (a reference or a digest) on stdout as an OCI image layout archive
+    /// (#191): the child, its stdout piped. A Docker with the containerd image store writes one.
+    pub fn export_image(&self, image: &str) -> Result<Child> {
+        self.command_with(["save".to_string(), "--".into(), image.into()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("docker save")
+    }
+
+    /// Imports the OCI image layout in local directory `dir` (#191): what [`Docker::export_image`]
+    /// wrote, verified and rebuilt by the caller. Only a local Docker takes a directory.
+    pub async fn import_layout(&self, dir: &std::path::Path) -> Result<()> {
+        if self.quote {
+            bail!("a layout is imported only by the node's own Docker");
+        }
+        let mut tar = Command::new("tar")
+            .arg("-C")
+            .arg(dir)
+            .args(["-cf", "-", "oci-layout", "index.json", "blobs"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("tar")?;
+        let out: Stdio = tar.stdout.take().context("tar's output")?.try_into()?;
+        let load = self.command_with(["load".to_string()]).stdin(out).stdout(Stdio::null()).stderr(Stdio::piped()).output();
+        let (t, l) = tokio::join!(tar.wait(), load);
+        let l = l.context("docker load")?;
+        if !l.status.success() {
+            bail!("docker load failed: {}", String::from_utf8_lossy(&l.stderr).trim());
+        }
+        if !t?.success() {
+            bail!("archiving the image layout failed");
+        }
         Ok(())
     }
 
