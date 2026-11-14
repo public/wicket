@@ -78,6 +78,14 @@ wicket-policy = { path = "crates/wicket-policy" }
 [profile.release]
 debug = 1
 
+# #219: development and test builds keep line tables for wicket's own crates (file and line in
+# panics and backtraces) and no debug info for dependencies: smaller objects, faster links, less
+# memory (experiments/build-times). Release builds (`[profile.release]`, #190) are unaffected.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
 # The authz tests run the Biscuit fork's generic engine on 100k requests (and verify many Ed25519
 # signatures); unoptimized, that takes minutes. Optimizing these dependencies keeps `cargo test` fast
 # without changing what is tested (limits are step counts, not time).
