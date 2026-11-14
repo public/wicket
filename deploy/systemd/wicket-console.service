@@ -11,7 +11,7 @@ Group=wicket
 SupplementaryGroups=docker
 Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
 EnvironmentFile=/etc/wicket/console.env
-ExecStart=/usr/local/bin/wicket serve $WICKET_CONSOLE_ARGS
+ExecStart=/var/lib/wicket-versions/current/wicket serve $WICKET_CONSOLE_ARGS
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full

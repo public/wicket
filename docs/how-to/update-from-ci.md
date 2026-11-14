@@ -90,7 +90,8 @@ The build is downloaded on the control host and taken only if all of these hold:
 - it was signed in the past.
 
 Then the usual update runs: staged, switched, handed over, gated, rolled back on a failed gate. Every
-flag of `self update` applies (`--nodes`, `--window`, `--check`, …).
+flag of `self update` applies (`--nodes`, `--window`, `--check`, …). Root's own copy of the build,
+which `sudo wicket` runs, isn't made: see [following](#follow-main-on-its-own) below.
 
 The audit records the commit, the run, the environment and the signing key (`self.staged`'s
 `source.ci`). A signature without the claims (from `wicket self sign`) doesn't do for `--from-ci`, and
@@ -120,6 +121,11 @@ Each reason it doesn't update is audited once when it changes (`self.follow_skip
 `self.follow_update`, then the usual `self.*` records; a failure is `self.follow_failed`.
 `journalctl -u wicket-follow` shows every run. To stop following:
 `sudo systemctl disable --now wicket-follow.timer`.
+
+The build is downloaded as the `wicket` user, so root has no copy of it: wicket's services run it,
+but `/usr/local/bin/wicket` (what `sudo wicket` and the timer itself run) stays on the build root
+last copied, since root runs only its own copies (#261). To move root to it, download the archive
+yourself and `sudo wicket self admit wicket-….tar.gz` ([update and roll back](update-and-roll-back.md#a-build-that-came-another-way)).
 
 ## What is refused
 

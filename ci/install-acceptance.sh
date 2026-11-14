@@ -74,7 +74,7 @@ runuser -u wicket -- docker info --format "runtimes: {{range \$k, \$v := .Runtim
   || { echo "FAIL: the host Docker has no runsc runtime"; exit 1; }
 # What systemd would do: the runtime directory, then wicketd as wicket.
 install -d -o wicket -g wicket -m 0755 /run/wicket
-(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /usr/local/bin/wicket daemon) 2>/tmp/wicketd.log &
+(cd /var/lib/wicket && runuser -u wicket -- env HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket /var/lib/wicket-versions/current/wicket daemon) 2>/tmp/wicketd.log &
 for _ in $(seq 50); do [ -S /run/wicket/wicketd.sock ] && break; sleep 0.1; done
 [ -S /run/wicket/wicketd.sock ] || { cat /tmp/wicketd.log; exit 1; }
 echo "ok: wicketd is up"

@@ -35,6 +35,7 @@ mod place;
 mod policy;
 mod program;
 mod reconcile;
+mod rootcopy;
 mod roots;
 mod run;
 mod s3;
@@ -563,13 +564,17 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("WICKET_LOG").unwrap_or_else(|_| "warn".into()))
         .with_writer(std::io::stderr)
         .init();
+    // Root runs only its own copies of wicket (#261).
+    rootcopy::refuse_untrusted_exe()?;
     let cli = Cli::parse();
     // With wicketd installed, this user can't read wicket's data: the daemon runs the command.
     let route = daemon::policy::route(&cli.cmd);
     match daemon::client::mode() {
         daemon::client::Mode::Daemon(sock) => match route {
             daemon::policy::Route::Forward(_) => {
+                let around = rootcopy::Around::before(&cli.cmd)?;
                 let code = daemon::client::forward(&sock, &cli.cmd).await?;
+                around.after(code);
                 if code != 0 {
                     std::process::exit(code);
                 }
