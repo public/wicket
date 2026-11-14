@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
-use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, PublishError, Publisher, PublisherConfig, RevokeKind};
+use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, RevokeKind};
 use wicket_identity::node::NodeCertClaims;
 use wicket_store::Ledger;
 
@@ -61,9 +61,7 @@ const COMPACT_BYTES: u64 = 1 << 20;
 pub const REGENESIS: &str = "regenesis";
 
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
-/// the installation's feed root. A delta log from before boxes' authority moved to tokens (zone
-/// entries, which don't parse as box records) is set aside as `deltas.jsonl.zones`, and the feed
-/// starts again under a new certificate version: a re-genesis, so the node takes the new snapshot.
+/// the installation's feed root. A delta log that doesn't read is an error, not set aside.
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     if dir.join(REGENESIS).exists() {
@@ -76,19 +74,7 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthor
         println!("[wicket] node {name}'s feed starts a new generation (restored)");
         return Ok(p);
     }
-    match open_feed_once(name, &cfg, false) {
-        Err(e) if e.downcast_ref::<PublishError>().is_some_and(|e| e.to_string().contains("unreadable")) => {
-            let log = dir.join("deltas.jsonl");
-            std::fs::rename(&log, dir.join("deltas.jsonl.zones")).context("setting aside the old delta log")?;
-            println!("[wicket] node {name}'s feed log predates token authority: set aside, starting a new feed generation");
-            open_feed_once(name, &cfg, true)
-        }
-        r => r,
-    }
-}
-
-fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Result<Publisher<BoxAuthority>> {
-    open_feed_inner(name, cfg, new_generation, false)
+    open_feed_inner(name, &cfg, false, false)
 }
 
 /// `restored`: the kit's certificate may be older than versions the node has seen since (the lost
@@ -233,7 +219,7 @@ impl SharedFeed {
             && crate::roots::feed_root_signing().is_ok()
         {
             std::fs::rename(&log, log.with_extension("jsonl.old")).context("setting the old delta log aside")?;
-            p = open_feed_once(name, &cfg, true)?;
+            p = open_feed_inner(name, &cfg, true, false)?;
         }
         p.note_issued(last_issued(&dir.join("feed")));
         let len = std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0);
@@ -1255,7 +1241,7 @@ pub fn read_authority(run_dir: &Path) -> Option<AuthorityRecord> {
 
 /// The node has confirmed the box stopped (its exit, or it says it has no box for the run).
 pub fn confirm_stopped(run_dir: &Path) {
-    // A run with no record (from before #153, or lost) gets one: confirmed, nothing left to fence.
+    // A run whose record was lost gets one: confirmed, nothing left to fence.
     let mut a = read_authority(run_dir).unwrap_or_default();
     if !a.stopped {
         a.stopped = true;
@@ -1275,7 +1261,7 @@ pub fn fenced_until(run: &str, now_ms: i64) -> Option<(String, i64)> {
 
 /// [`fenced_until`] for the run in `run_dir`.
 ///
-/// A run whose record is missing (lost, or from before #153) fences until its timeout, from its run
+/// A run whose record is missing (lost) fences until its timeout, from its run
 /// record: its box may run that long on its node, and no longer. A run with neither record never
 /// started a box.
 pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
