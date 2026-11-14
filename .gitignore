@@ -7,3 +7,7 @@ experiments/*/tools/
 # Written and removed by ci/node-e2e.sh (#95).
 ci/node-e2e/.e2e-run.yaml
 __pycache__/
+# experiments/build-times scripts' target dirs
+target-measure*/
+target-loop/
+experiments/build-times/.*.log

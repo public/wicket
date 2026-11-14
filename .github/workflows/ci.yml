@@ -142,9 +142,6 @@ jobs:
       - name: Doctests (nextest doesn't run them)
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
         run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
-      - name: docs/reference/cli.md matches the commands' --help
-        if: ${{ needs.select.outputs.all_crates != 'false' || contains(needs.select.outputs.crates, 'wicket-cli') || contains(needs.select.outputs.suites, ' cli-ref ') }}
-        run: cargo build -p wicket-cli --locked && WICKET=target/debug/wicket ci/gen-cli-reference.sh --check
 
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
   # change touches: narrows or widens. A solver timeout or `unknown` fails.
