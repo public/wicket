@@ -31,8 +31,8 @@ mod push;
 #[cfg(test)]
 use connect::parse_head;
 use outgoing::refused_shape;
-use push::read_commands;
 pub use outgoing::render_credential;
+use push::read_commands;
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
 /// arrived over HTTP/3, which are re-sent upstream from memory.

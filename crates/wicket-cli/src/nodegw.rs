@@ -693,7 +693,8 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host this sandbox can see."), false),
         wicket_core::HostVerdict::Open => {}
     }
-    let op = wicket_core::Op::egress_with_query(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
+    // A push's discovery is asked for as the push it is part of (#26).
+    let op = wicket_core::git::op_for(&tenant, &wicket_core::RunId(run.into()), &zone, &method, &host, &path, query);
     if let Some(why) = op.refused_for_agents() {
         return (format!("not requested: {why}"), true);
     }

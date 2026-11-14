@@ -54,6 +54,16 @@ pub fn push_op_path(repo: &str) -> String {
     format!("{repo}{RECEIVE_PACK}")
 }
 
+/// The op a request is decided as: the push of its repository for either of a push's requests,
+/// else the request itself. What the egress proxy decides, and so what an agent asking ahead
+/// (`request_access`) must ask for, so its approval is the one the push finds.
+pub fn op_for(tenant: &crate::TenantId, run: &crate::RunId, zone: &str, method: &str, host: &str, path: &str, query: &str) -> Op {
+    match push_repo(method, path, query) {
+        Some(repo) => Op::egress(tenant, run, zone, "POST", host, &push_op_path(repo)),
+        None => Op::egress_with_query(tenant, run, zone, method, host, path, query),
+    }
+}
+
 /// Whether an op (method and path) is a push's: what a grant for it covers for a window.
 pub fn is_push(method: &str, path: &str) -> bool {
     method.eq_ignore_ascii_case("POST") && path.to_ascii_lowercase().ends_with(RECEIVE_PACK) && path.len() > RECEIVE_PACK.len() + 1
@@ -83,7 +93,8 @@ impl RefUpdate {
 }
 
 fn is_oid(s: &str) -> bool {
-    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    // git reads object names in either case (`get_oid_hex`), so wicket must too.
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The ref update commands at the start of a receive-pack body (pkt-lines up to the first flush):
@@ -93,7 +104,7 @@ fn is_oid(s: &str) -> bool {
 pub fn commands(buf: &[u8]) -> Result<Option<Vec<RefUpdate>>, String> {
     let mut out = Vec::new();
     let mut at = 0;
-    let mut cert = false;
+    let mut cert = Cert::None;
     loop {
         if at + 4 > buf.len() {
             return if buf.len() > MAX_COMMANDS_BYTES { Err(too_long()) } else { Ok(None) };
@@ -121,13 +132,30 @@ pub fn commands(buf: &[u8]) -> Result<Option<Vec<RefUpdate>>, String> {
         let line = line.split(|&b| b == 0).next().unwrap_or_default();
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = std::str::from_utf8(line).map_err(|_| "a command of the push is not UTF-8".to_string())?;
-        if out.is_empty() && !cert && line == "push-cert" {
-            cert = true;
-            continue;
-        }
-        if cert && line == "push-cert-end" {
-            cert = false;
-            continue;
+        // A push certificate: a header, a blank line, the commands, then the signature. Only the
+        // header and the signature are skipped; a line among the commands must be one.
+        match cert {
+            Cert::None if out.is_empty() && line == "push-cert" => {
+                cert = Cert::Header;
+                continue;
+            }
+            Cert::Header => {
+                if line.is_empty() {
+                    cert = Cert::Commands;
+                }
+                continue;
+            }
+            Cert::Commands if line.starts_with("-----BEGIN ") => {
+                cert = Cert::Signature;
+                continue;
+            }
+            Cert::Signature => {
+                if line == "push-cert-end" {
+                    cert = Cert::None;
+                }
+                continue;
+            }
+            _ => {}
         }
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         match parts[..] {
@@ -135,10 +163,18 @@ pub fn commands(buf: &[u8]) -> Result<Option<Vec<RefUpdate>>, String> {
                 out.push(RefUpdate { old: old.into(), new: new.into(), name: name.into() });
             }
             ["shallow", oid] if is_oid(oid) => {}
-            _ if cert => {}
             _ => return Err(format!("unexpected line in the push's commands: {:?}", crate::text::clip(line, 80))),
         }
     }
+}
+
+/// Where [`commands`] is in a push certificate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cert {
+    None,
+    Header,
+    Commands,
+    Signature,
 }
 
 fn too_long() -> String {
@@ -269,6 +305,22 @@ mod tests {
         }
         cert.extend(b"0000");
         assert_eq!(commands(&cert).unwrap().unwrap()[0].name, "refs/heads/y");
+        // Inside a certificate, a line among the commands that isn't one is refused, not skipped
+        // (git reads them all); and object names are read in either case, as git reads them.
+        let signed = |cmd: &str| {
+            let mut c = pkt("push-cert\0report-status\n");
+            for l in
+                ["certificate version 0.1\n", "pusher x 1 +0000\n", "\n", cmd, "-----BEGIN SSH SIGNATURE-----\n", "x\n", "push-cert-end\n"]
+            {
+                c.extend(pkt(l));
+            }
+            c.extend(b"0000");
+            commands(&c)
+        };
+        let upper = format!("{} {} refs/heads/main\n", A.replace('1', "A"), B.replace('2', "F"));
+        assert_eq!(signed(&upper).unwrap().unwrap()[0].name, "refs/heads/main");
+        assert!(signed("not a command\n").is_err());
+        assert_eq!(commands(&[pkt(&upper), b"0000".to_vec()].concat()).unwrap().unwrap()[0].name, "refs/heads/main");
         // Unreadable: refused, never guessed.
         assert!(commands(b"zzzz").is_err());
         assert!(commands(b"0002").is_err());
