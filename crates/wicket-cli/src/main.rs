@@ -127,7 +127,8 @@ enum Cmd {
     /// named by its id or any of its runs; a hibernated one is woken.
     Say { run: String, text: Vec<String> },
     /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
-    /// and nothing but the agent runs in its box. Otherwise it goes on running.
+    /// and nothing but the agent runs in its box. What else runs is stopped after the zone's
+    /// limits.exit_grace.
     Hibernate {
         run: String,
         /// How long to wait for the outcome (seconds).

@@ -1,0 +1,14 @@
+# Acceptance (ci/acceptance.sh): a harness that lingers after its session (#293). The ACP agent
+# (linger/agent.py, no model) starts a background process that never exits, asks to finish, and
+# when its session closes waits for that process instead of exiting. wicket ends the run after
+# limits.exit_grace: the box stopped, the workspace synced back, the run succeeded, and the process
+# it stopped named in the run's record.
+task: Start something that never ends, then finish.
+agent:
+  name: linger
+  harness: acp
+  acp: { command: [python3, /workspace/agent.py] }
+zone:
+  name: acc-linger
+  isolation: gvisor
+  limits: { memory: 256m, cpus: 1, timeout: 4m, exit_grace: 10s }

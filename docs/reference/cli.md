@@ -108,7 +108,7 @@ Usage: wicket <COMMAND>
 Commands:
   run        Run a task manifest: one Claude Code agent in one zone
   say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
-  hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it goes on running
+  hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   agents     Long-lived agents: state, generation, current run and bundle size
   wrap       Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
@@ -182,7 +182,7 @@ Options:
 ## `wicket hibernate`
 
 ```text
-Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it goes on running
+Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
 
 Usage: wicket hibernate [OPTIONS] <RUN>
 

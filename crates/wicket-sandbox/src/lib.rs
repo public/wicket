@@ -554,6 +554,29 @@ impl Docker {
         Ok(parse_processes(&String::from_utf8_lossy(&out.stdout)))
     }
 
+    /// Stops processes `pids` in the box, as `user` (#293): SIGTERM, then SIGKILL to what is left
+    /// after 2 s. A process that already ended is no error.
+    pub async fn kill_processes(&self, name: &str, user: &str, pids: &[u32]) -> Result<()> {
+        if pids.is_empty() {
+            return Ok(());
+        }
+        let script = r#"kill -TERM "$@" 2>/dev/null; for _ in 1 2 3 4 5 6 7 8 9 10; do alive=; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done; [ -z "$alive" ] && exit 0; sleep 0.2; done; kill -KILL "$@" 2>/dev/null; exit 0"#;
+        let mut argv: Vec<String> = vec!["sh".into(), "-c".into(), script.into(), "sh".into()];
+        argv.extend(pids.iter().map(|p| p.to_string()));
+        let out = self
+            .exec(name, user, &[], &argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("docker exec")?;
+        if !out.status.success() {
+            bail!("stopping the box's processes failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
     pub async fn kill(&self, name: &str) -> Result<()> {
         let _t = self.span("kill");
         let _ = self.command_with(["kill".to_string(), name.into()]).stdout(Stdio::null()).stderr(Stdio::null()).status().await?;

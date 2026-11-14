@@ -45,7 +45,8 @@ These are general features for any workload:
 - **The agent decides when it is done** (#249). Its session stays open after each turn, and the run ends
   only when the agent's process exits, at the zone's `limits.timeout`, or when its authority ends. The
   agent ends it with wicket's `finish` tool (wicket closes its input at the end of the turn, and the
-  harness exits). **`wicket say <run> "…"`** sends the agent a follow-up, which becomes its next turn.
+  harness exits; one that hasn't exited by the zone's `limits.exit_grace` has what is left in its box
+  stopped, and the run is recorded as succeeded with the processes named). **`wicket say <run> "…"`** sends the agent a follow-up, which becomes its next turn.
   `/workspace/out/result.json` is an optional output: wicket prints it at the end of the run if the
   agent wrote one.
 - **Long-lived agents hibernate and wake** (below; [how to](../how-to/hibernate-and-wake-an-agent.md)).
@@ -76,7 +77,8 @@ their state, generation and bundle size.
   and its whole writable state is bundled into wicket's object store: the workspace, all of `/wicket/state`
   (`$HOME` and the Claude Code config), `/tmp`, and the zone's `persist: durable` volumes. Each tree is tar +
   zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
-  background build, a dev server) goes on running instead, because a rebuild restores files, not processes.
+  background build, a dev server) has its other processes stopped after the zone's `limits.exit_grace` (30 s
+  by default), named in `wicket agents`, then hibernates, because a rebuild restores files, not processes.
 - **Wake.** `wicket wake <agent> ["…"]`, `wicket say <run or agent> "…"`, or a message from another agent
   rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
   `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,

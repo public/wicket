@@ -567,6 +567,12 @@ pub struct Limits {
     /// dropped are recorded), or stop the box.
     #[serde(default)]
     pub on_output_full: OnOutputFull,
+    /// How long the harness has to exit by itself once its session is over (#293): after the agent
+    /// asked to `finish` and its session closed, or when it asked to hibernate and other processes
+    /// still run in the box. Then wicket stops what is left. Default 30 s.
+    /// (Left out when it is the default, so a node of an earlier version reads the manifest.)
+    #[serde(default = "default_exit_grace", skip_serializing_if = "is_default_exit_grace")]
+    pub exit_grace: String,
 }
 
 /// What happens when a box's output passes its zone's `limits.output`.
@@ -588,6 +594,7 @@ impl Default for Limits {
             pids: default_pids(),
             output: default_output(),
             on_output_full: OnOutputFull::default(),
+            exit_grace: default_exit_grace(),
         }
     }
 }
@@ -605,6 +612,12 @@ fn default_cpus() -> f32 {
 fn default_timeout() -> String {
     "30m".into()
 }
+fn default_exit_grace() -> String {
+    "30s".into()
+}
+fn is_default_exit_grace(g: &String) -> bool {
+    *g == default_exit_grace()
+}
 fn default_pids() -> u32 {
     512
 }
@@ -612,6 +625,11 @@ fn default_pids() -> u32 {
 impl Limits {
     pub fn timeout(&self) -> Result<Duration, ManifestError> {
         humantime::parse_duration(&self.timeout).map_err(|_| ManifestError::Duration(self.timeout.clone()))
+    }
+
+    /// [`Limits::exit_grace`], read.
+    pub fn exit_grace(&self) -> Result<Duration, ManifestError> {
+        humantime::parse_duration(&self.exit_grace).map_err(|_| ManifestError::Duration(self.exit_grace.clone()))
     }
 
     /// How long the box's authority lasts from the run's start (#153): `authority`, or the
@@ -673,6 +691,7 @@ impl Manifest {
 
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.zone.limits.authority()?;
+        self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
@@ -926,6 +945,22 @@ mod tests {
         let back: ZoneSpec = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.escalation, r.escalation);
         assert!(serde_yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
+    }
+
+    /// #293: the harness's grace to exit defaults to 30 s, is written only when set otherwise (nodes
+    /// of an earlier version refuse unknown fields), and must be a duration.
+    #[test]
+    fn exit_grace_defaults_to_30s_and_is_written_only_when_set() {
+        let with =
+            |l: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, limits: {{ {l} }} }}\n"));
+        let d = with("cpus: 1").unwrap();
+        assert_eq!(d.zone.limits.exit_grace().unwrap(), Duration::from_secs(30));
+        assert!(!serde_json::to_string(&d.zone.limits).unwrap().contains("exit_grace"));
+        let s = with("exit_grace: 5s").unwrap();
+        assert_eq!(s.zone.limits.exit_grace().unwrap(), Duration::from_secs(5));
+        let back: Limits = serde_json::from_str(&serde_json::to_string(&s.zone.limits).unwrap()).unwrap();
+        assert_eq!(back.exit_grace, "5s");
+        assert!(with("exit_grace: soon").is_err());
     }
 
     /// #126: a zero limit means no limit to Docker, so a manifest can't set one.

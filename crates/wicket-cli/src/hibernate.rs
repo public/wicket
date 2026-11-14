@@ -6,8 +6,9 @@
 //!   the box) the agent's stdin is closed, the box exits, and its whole writable state is bundled
 //!   into the object store: the workspace, all of `/wicket/state` (HOME and the Claude Code config),
 //!   `/tmp`, and the zone's `durable` volumes. Nothing of it is left on the node except an in-place
-//!   workspace (the operator's own directory). A box that isn't quiet (a background build, a dev
-//!   server) stays Idle: a rebuild restores files, not processes.
+//!   workspace (the operator's own directory). In a box that isn't quiet (a background build, a dev
+//!   server), what else runs gets the zone's `limits.exit_grace` to end, then is stopped (#293): a
+//!   rebuild restores files, not processes.
 //! - **Wake** rebuilds the box: a new run (activation) with a new identity, sockets, CA and
 //!   placeholders, the bundle restored and verified, and Claude Code resumed with `--resume` on the
 //!   agent's own session, at the same workspace path (Claude Code keys sessions by directory). Its
@@ -93,8 +94,21 @@ pub fn trees(m: &Manifest, agent: &str, run_dir: &Path, in_place: Option<&Path>)
 
 /// Whether a box is at a quiet point: nothing runs in it but the agent runtime (the init, wicket's
 /// forwarder, what its harness adapter says is the harness's own (`harness`), or the agent's own
-/// command, `agent`: an ACP agent's, #66). Err: what else runs.
+/// command, `agent`: an ACP agent's, #66). Err: what else runs. (The supervisor asks for
+/// [`leftovers`], to stop them.)
+#[cfg(test)]
 pub fn quiet(procs: &[(u32, u32, String)], harness: &dyn Fn(&str) -> bool, agent: &[String]) -> std::result::Result<(), Vec<String>> {
+    let others = leftovers(procs, harness, agent);
+    if others.is_empty() {
+        Ok(())
+    } else {
+        Err(others.iter().map(|(_, c)| c.clone()).collect())
+    }
+}
+
+/// What runs in a box besides the agent runtime (see [`quiet`]): each process's pid, and its pid
+/// and command line as wicket names it (`pid: command`, clipped).
+pub fn leftovers(procs: &[(u32, u32, String)], harness: &dyn Fn(&str) -> bool, agent: &[String]) -> Vec<(u32, String)> {
     let base = |w: &str| w.rsplit('/').next().unwrap_or("").to_string();
     let agent0 = agent.first().map(|a| base(a)).unwrap_or_default();
     let agent_line = std::iter::once(agent0.clone()).chain(agent.iter().skip(1).cloned()).collect::<Vec<_>>().join(" ");
@@ -105,22 +119,28 @@ pub fn quiet(procs: &[(u32, u32, String)], harness: &dyn Fn(&str) -> bool, agent
         let base = words.next().unwrap_or("");
         let second = words.next().unwrap_or("");
         let line = std::iter::once(base).chain(cmd.split_whitespace().skip(1)).collect::<Vec<_>>().join(" ");
-        matches!(base, "docker-init" | "tini" | "wicket-fwd" | "wicket-entry")
-            || (matches!(base, "bash" | "sh") && second == "wicket-entry")
+        wicket_runtime(base, second)
             || harness(cmd)
             // The agent's own command, as started (a script's interpreter runs it with its path).
             || (!agent0.is_empty() && (line == agent_line || (matches!(base, "node" | "python3" | "python" | "sh" | "bash") && second == agent0)))
     };
-    let others: Vec<String> = procs
+    procs
         .iter()
         .filter(|(pid, _, cmd)| *pid != 1 && !cmd.is_empty() && !runtime(cmd))
-        .map(|(pid, _, cmd)| format!("{pid}: {}", wicket_agent::clip(cmd, 80)))
-        .collect();
-    if others.is_empty() {
-        Ok(())
-    } else {
-        Err(others)
-    }
+        .map(|(pid, _, cmd)| (*pid, format!("{pid}: {}", wicket_agent::clip(cmd, 80))))
+        .collect()
+}
+
+/// Whether a command (its program's base name, and its first argument's) is wicket's own part of a
+/// box: the init, the entrypoint and the forwarder.
+fn wicket_runtime(base: &str, second: &str) -> bool {
+    matches!(base, "docker-init" | "tini" | "wicket-fwd" | "wicket-entry") || (matches!(base, "bash" | "sh") && second == "wicket-entry")
+}
+
+/// What still runs in a box once its harness's session is over (#293): everything but wicket's own
+/// parts (the init, the entrypoint, the forwarder), the harness included. `pid: command` each.
+pub fn left_running(procs: &[(u32, u32, String)]) -> Vec<String> {
+    leftovers(procs, &|_| false, &[]).into_iter().map(|(_, c)| c).collect()
 }
 
 /// Pushes an activation's trees as the agent's next bundle and commits it in the ledger. Returns the
@@ -902,6 +922,23 @@ mod tests {
         assert_eq!(acp(&["gemini", "--experimental-acp"], "/usr/bin/gemini --experimental-acp"), Ok(()));
         assert!(acp(&["python3", "/workspace/agent.py"], "python3 /workspace/other.py").is_err());
         assert!(acp(&["claude-agent-acp"], "python3 -m http.server").is_err());
+    }
+
+    #[test]
+    fn what_is_left_is_named_with_its_pid() {
+        let procs = vec![
+            (1, 0, "/sbin/docker-init -- wicket-entry python3 /workspace/agent.py".to_string()),
+            (5, 1, "/bin/bash /usr/local/bin/wicket-entry python3 /workspace/agent.py".to_string()),
+            (6, 5, "wicket-fwd --listen 198.18.0.1:3128=/wicket/sock/egress.sock".to_string()),
+            (9, 5, "python3 /workspace/agent.py".to_string()),
+            (14, 9, "sleep 86399".to_string()),
+        ];
+        let agent = ["python3".to_string(), "/workspace/agent.py".to_string()];
+        // To hibernate, only what isn't the agent runtime is stopped: its pids, to stop them.
+        assert_eq!(leftovers(&procs, &|_| false, &agent), vec![(14, "14: sleep 86399".to_string())]);
+        // After a finished session the harness lingering is named too; wicket's own parts never.
+        assert_eq!(left_running(&procs), vec!["9: python3 /workspace/agent.py".to_string(), "14: sleep 86399".to_string()]);
+        assert!(left_running(&procs[..3]).is_empty());
     }
 
     #[test]
