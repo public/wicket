@@ -73,6 +73,10 @@ says which it has (a mode it hasn't is refused, saying so):
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
+| `permission_mode` | string | `default` | How far the harness acts without asking in the app: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. |
+
+Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
+whether the harness asks the owner in the app first, as `bypassPermissions` does for the driven mode.
 
 The zone's `llm.secret` is then the account login, which the box only ever holds as a placeholder.
 See [drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md).
