@@ -27,7 +27,10 @@
 #       and a standby with state.key fetches one back (#167; ci/update/snapshot-store.sh);
 #   5b. builds CI signed (#190), from a fake GitHub API: --from-ci, its refusals, and follow
 #       (ci/update/from-ci.sh);
-#   6. the audit chain verifies and has every step.
+#   5c. protocol jumps (#207, ci/update/jump.sh): refused while an enrolled node is left behind,
+#      naming it; with every node, the control host and its nodes switch together;
+#   6. the audit chain verifies and has every step;
+#   7. with the remote nodes revoked, a jump with only this host's own node goes through.
 #
 # Needs Docker with runsc and the agent image. Env: WICKET, IMAGE (an existing agent image: not
 # built, not removed; default: built as wicket/claude-code:upd-$$ and removed), WICKET_DOCKER (e.g.
@@ -77,7 +80,7 @@ teardown() {
   $DOCKER rm -f "upd-$$-holds-b" "upd-$$-s3" >/dev/null 2>&1
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   # Each build's own image, made by the updates (these builds are this test's alone).
-  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
+  for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}" "${J_ID:-}" "${K_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
   if [ "${UPD_KEEP:-}" = 1 ]; then echo "kept: $work"; else chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"; fi
   echo
   printf '%s\n' "${results[@]}"
@@ -296,6 +299,9 @@ store_checks
 . ci/update/from-ci.sh
 another_turn "the CI-signed updates"
 
+# ---- 5c. protocol jumps (#207) ----
+. ci/update/jump.sh
+
 # ---- 6. audit ----
 log "6. audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
@@ -307,3 +313,6 @@ check "  an automatic rollback is recorded as one" 'w audit --tail 1000 | grep s
 # The agent that asked stays up until here: revoking it would withdraw its request, and its grants.
 for r in "${runs[@]}" "$r_asker"; do w identity revoke "$r" --reason "update test: done" >/dev/null 2>&1 || true; done
 for r in "${runs[@]}" "$r_asker"; do wait_for 60 '[ -z "$(box_of "'"$r"'")" ]' || true; done
+
+# ---- 7. a protocol jump with only this host's own node (#207) ----
+. ci/update/jump-local.sh

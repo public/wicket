@@ -15,13 +15,24 @@ wicket secret set vultr-api-key          # read from the terminal; only ever sen
 ```
 
 You also need an ssh key in the Vultr account (its id) and its private half on the control host.
+On an installed control host wicket reaches nodes as the `wicket` user, now and on every later run,
+so keep the private half where that user can read it:
+
+```sh
+sudo install -d -o wicket -g wicket -m 0700 /var/lib/wicket/ssh
+sudo -u wicket ssh-keygen -q -t ed25519 -N '' -C wicket-placement -f /var/lib/wicket/ssh/placement
+sudo cat /var/lib/wicket/ssh/placement.pub   # add this public half to the Vultr account, note its id
+```
+
+`wicket place create` refuses a key it can't read before it creates anything, and asks for the spend
+on the terminal you run it from (`sudo` passes it through wicketd).
 
 ## 2. Create a node by hand
 
 ```sh
 wicket place plans --region lhr                     # plans and their hourly price
 wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
-    --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id> --ssh-key ~/.ssh/vultr \
+    --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id> --ssh-key /var/lib/wicket/ssh/placement \
     --hosts 'api.example.com'
 ```
 
@@ -41,7 +52,7 @@ Then install wicket and the agent image on it, as for any node
 
 ```sh
 wicket node install n2
-ssh -i ~/.ssh/vultr wicket@<its address> '~/.local/bin/wicket image'
+sudo -u wicket ssh -i /var/lib/wicket/ssh/placement wicket@<its address> '~/.local/bin/wicket image'
 wicket run task.yaml --node n2
 ```
 

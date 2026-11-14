@@ -117,9 +117,18 @@ approving each update.
 Nodes used to refuse any control host running another build, which made every update all-or-nothing.
 Now the control channel is versioned: two ends talk if their protocol versions are at most one apart,
 at the lower one. So the control host can go first, and its nodes follow one at a time; a node at N
-also talks to a control host rolled back to N−1. `wicket self update` refuses a build more than one
-protocol version from the running one. The rules for changing the protocol, and what each version
-added, are in [protocol](../reference/protocol.md#versions-and-skew).
+also talks to a control host rolled back to N−1.
+
+A **jump** of more than one version (a host that missed a few releases) switches the control host and
+every enrolled remote node together (#207): each node gets the new build and its `serve` re-executes
+before the control host hands its runs over, the new build's health gate checks them all, and a failed
+gate switches them all back. It is refused while any active enrolled node isn't named in `--nodes`
+(`--nodes all`), naming those nodes; a revoked node doesn't count, and this host's own node always
+moves with the control host. Rolling back across a jump follows the same rule. `wicket self follow`
+never jumps.
+
+The rules for changing the protocol, and what each version added, are in
+[protocol](../reference/protocol.md#versions-and-skew).
 
 ## The rollout
 
