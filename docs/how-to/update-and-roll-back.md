@@ -42,6 +42,10 @@ sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # control
   read). Its signature is `<artifact>.sig` unless `--sig` says otherwise. It must be readable by the
   `wicket` user (`/tmp` is).
 - `--nodes all` (or `n1,n2`) updates nodes after the control host, one at a time, the first a canary.
+- A build more than one protocol version ahead (a host that missed releases) is a **jump**: it needs
+  every enrolled remote node in `--nodes` (`--nodes all`), and switches them with the control host
+  instead of after it. If a node is left out, the update is refused and names it: add it, or revoke a
+  node you no longer use (`sudo wicket node revoke NAME`). With no remote nodes, a jump just works.
   `--only-nodes` updates only them, when the control host already runs the build.
 - Each new build is watched for `--window` (30 s) every `--interval` (10 s). Add your own smoke test
   with `--check 'CMD'` (repeatable; `$WICKET` is the new binary and `$WICKET_UPDATE_TARGET` is
@@ -54,9 +58,24 @@ sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # control
 - Afterwards it prunes, as `wicket self prune` does, where it updated (`--no-prune` to keep
   everything).
 
-An update that needs new systemd units or a new agent image says so in its release notes. Then run
-`deploy/install.sh` from the new archive, or `sudo wicket image`: `self update` changes neither (the
-units run `/usr/local/bin/wicket`, which follows `current`).
+### When the new version's systemd units differ
+
+Each build carries its own systemd units (`deploy/systemd/`). `self update` runs as the `wicket`
+user, which can't write `/etc/systemd/system`, so it refuses to switch to a build whose units
+differ from the installed ones, and says what to run as root:
+
+```sh
+sudo /var/lib/wicket-versions/<build id>/wicket self apply-units   # that build's own units, then daemon-reload
+sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # again: it goes on
+```
+
+`apply-units` installs only what differs and restarts nothing (restarting wicketd stops the runs
+started through it): each changed unit takes effect when its service next restarts, which it names.
+Until then the old unit runs the new build, so a release changes its units only in ways the
+previous release also runs under. A new unit is installed but not enabled. A rollback is never
+refused over units; it warns, and `sudo <versions>/<previous id>/wicket self apply-units` puts that
+build's back. `self follow` skips a build whose units aren't applied yet, and takes it once they
+are. Running `deploy/install.sh` from the new archive does the same, and also restarts the services.
 
 ## Roll back
 
@@ -82,9 +101,22 @@ newest of the current and previous versions').
 ## Restore a ledger snapshot
 
 The way back past a contract step, or from a bad migration. Each switch first snapshots the ledger to
-`<data dir>/snapshots/<time>-<old build id>.db`.
+`<data dir>/snapshots/<time>-<old build id>.db`, and, with a state store, pushes it there sealed (an
+update doesn't switch until it is). If the control host itself is lost, restore a standby first
+([state off the host](state-off-host-and-restore.md#restoring-onto-a-standby)), then fetch the
+snapshot from the store:
 
-1. Stop wicket's services: `sudo systemctl stop wicketd wicket-console wicket-reconcile`.
+```sh
+sudo wicket state snapshots                                          # <time>-<build id>.db, oldest first
+sudo wicket state snapshot 1763150400-0a1b2c3d4e5f.db --out /tmp/ledger-before.db
+```
+
+`--out` must not exist; the file is the wicket user's, 0600. The snapshots are sealed under
+`state.key`, which is made on first use: take the recovery kit (`wicket state kit`) after the first
+update with a state store, or after the first hibernation, so it holds that key. Then, with that file
+as the snapshot:
+
+1. Stop wicket's services: `sudo systemctl stop wicketd wicket-console wicket-reconcile wicket-state`.
 2. As the `wicket` user, copy the snapshot over `/var/lib/wicket/ledger.db`, and remove
    `ledger.db-wal` and `ledger.db-shm`.
 3. Switch `current` back by hand, in `/var/lib/wicket-versions`:

@@ -822,6 +822,10 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     }
     let blue = v.pointer("current").context("no current version")?;
     let (green, m) = v.stage(&bin, &accepted.sha256, accepted.source.clone())?;
+    // Its systemd units installed first (#165), before anything is built or switched.
+    if !o.only_nodes && blue != green {
+        units_installed(&ledger, &v, &green, &accepted.sha256, &stage)?;
+    }
     // Each version's own agent image: the new one's for its boxes and its canary, the old one's for
     // a rollback (running boxes keep whatever they started with).
     let image = ensure_image(&v, &green).await?;
@@ -839,19 +843,46 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         m.describe.version, m.describe.protocol, m.describe.schema, accepted.source
     ));
     let here = describe()?;
-    if here.protocol.abs_diff(m.describe.protocol) > crate::chan::PROTOCOL_SKEW {
-        bail!("{green} speaks protocol {}, this build {}: update one protocol version at a time", m.describe.protocol, here.protocol);
+    // More than the skew apart (#207): every remote node switches with the control host, or none
+    // may be enrolled. See [`jump_blockers`].
+    let jump = here.protocol.abs_diff(m.describe.protocol) > crate::chan::PROTOCOL_SKEW;
+    if jump {
+        if o.only_nodes {
+            bail!(
+                "{green} speaks protocol {}, this build {}: a jump of more than {} switches the control host and its nodes together; run it without --only-nodes",
+                m.describe.protocol,
+                here.protocol,
+                crate::chan::PROTOCOL_SKEW
+            );
+        }
+        let blockers = jump_blockers(&ledger.lock().expect("ledger"), &nodes)?;
+        if !blockers.is_empty() {
+            bail!(
+                "{green} speaks protocol {}, this build {}: more than {} apart, so every enrolled node must switch with the control host, and {} would not (name them in --nodes, or `--nodes all`; or revoke them)",
+                m.describe.protocol,
+                here.protocol,
+                crate::chan::PROTOCOL_SKEW,
+                blockers.join(", ")
+            );
+        }
+        say(format!(
+            "a jump from protocol {} to {}: the control host and {} node(s) switch together",
+            here.protocol,
+            m.describe.protocol,
+            nodes.len()
+        ));
     }
+    let together: &[String] = if jump { &nodes } else { &[] };
     if !o.only_nodes {
         if blue == green {
             say(format!("the control host already runs {green}"));
         } else {
-            control_switch(&ledger, &v, &blue, &green, &nodes, &o.gate, false).await?;
+            control_switch(&ledger, &v, &blue, &green, &nodes, together, &o.gate, false).await?;
         }
     } else if v.pointer("current").as_deref() != Some(green.as_str()) {
         bail!("--only-nodes: the control host runs {blue}, not {green}; update it first");
     }
-    for (i, n) in nodes.iter().enumerate() {
+    for (i, n) in nodes.iter().enumerate().filter(|_| !jump) {
         node_update(&ledger, &v, n, &green, &o.gate, i == 0).await?;
     }
     // wicketd re-executes itself last, once the commands it is running (this one) have ended.
@@ -870,6 +901,93 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses (as [`crate::units::UnitsPending`]) when `green`'s systemd units differ from the
+/// installed ones; a build from before #165, which can't say what its units are, is let through with
+/// a warning.
+fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_sha256: &str, stage: &Path) -> Result<()> {
+    let dir = crate::units::systemd_dir();
+    let Some(want) = crate::units::of_build(&v.binary(green), &stage.join("units-probe"))? else {
+        say(format!("warning: {green} predates `self units`: its systemd units aren't checked against {}", dir.display()));
+        return Ok(());
+    };
+    let units = match crate::units::differing(&dir, &v.root, &want) {
+        Some(u) if !u.is_empty() => u,
+        _ => return Ok(()),
+    };
+    let e = crate::units::UnitsPending { version: green.into(), units, dir, binary: v.binary(green) };
+    audit(
+        ledger,
+        "self.update_refused",
+        serde_json::json!({ "artifact_sha256": artifact_sha256, "version": green, "units": e.units, "why": "units", "by": crate::operator() }),
+    );
+    Err(e.into())
+}
+
+/// Warns when a rollback goes to a version whose units aren't the installed ones (never refused).
+fn warn_units(v: &Versions, to: &str) {
+    let dir = crate::units::systemd_dir();
+    let probe = crate::data_dir().join(format!("units-probe-{}", std::process::id()));
+    if let Ok(Some(want)) = crate::units::of_build(&v.binary(to), &probe) {
+        if let Some(u) = crate::units::differing(&dir, &v.root, &want).filter(|u| !u.is_empty()) {
+            say(format!(
+                "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, `sudo {} self apply-units`",
+                dir.display(),
+                u.join(", "),
+                v.binary(to).display()
+            ));
+        }
+    }
+}
+
+/// The enrolled remote nodes a protocol jump would leave behind (#207): every active node other than
+/// this host's own that isn't in `together`. A jump is allowed only when there are none: they would
+/// otherwise be more than the skew away from the control host, and refuse it (`chan.rs`). Revoked
+/// nodes don't count. This host's own node always moves with the control host (its `serve`
+/// re-executes in the handover).
+pub fn jump_blockers(ledger: &Ledger, together: &[String]) -> Result<Vec<String>> {
+    Ok(ledger
+        .nodes()?
+        .into_iter()
+        .filter(|n| n.status == "active" && !n.target.starts_with("unix:") && n.name != crate::localnode::NAME)
+        .map(|n| n.name)
+        .filter(|n| !together.contains(n))
+        .collect())
+}
+
+/// Switches node `name` to version `id`, staging it there first when `bytes` (with its sha256) are
+/// given, and restarts its `serve` on it. Returns what was current there. Used for a protocol jump,
+/// where the node switches with the control host and no older build can check it: the new build's
+/// health gate does.
+async fn node_switch_together(
+    ledger: &Mutex<Ledger>,
+    name: &str,
+    id: &str,
+    bytes: Option<(&[u8], &str)>,
+    why: &str,
+) -> Result<Option<String>> {
+    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let node = crate::enrol::resolve_installed(&row.name, None)?;
+    let prev = match bytes {
+        Some((b, sha)) => {
+            ensure_image_on_node(&node, &crate::image::tag_for(id)).await.with_context(|| format!("node {name}"))?;
+            push_version(&node, b, sha).await?
+        }
+        None => {
+            let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
+            node.script("switching", &format!("set -eu\n{NODE_ROOT}\n{}\n", node_switch_sh(id))).await?;
+            valid_id(&cur).then_some(cur)
+        }
+    };
+    let how = restart_node_serve(&node).await?;
+    audit(
+        ledger,
+        why,
+        serde_json::json!({ "target": format!("node:{name}"), "from": prev, "to": id, "with_control_host": true, "by": crate::operator() }),
+    );
+    say(format!("node {name}: switched {} → {id} with the control host; serve {how}", prev.as_deref().unwrap_or("?")));
+    Ok(prev)
 }
 
 /// One update or rollback at a time on a control host, whoever starts it (an operator, `self
@@ -895,12 +1013,14 @@ impl Drop for RemoveOnDrop {
 /// Switches the control host from `from` to `to`, hands over, and gates; on a failed gate, switches
 /// back (automatically) and fails. `rollback`: this is `wicket self rollback` (no gate of its own
 /// beyond one health check, and no switching back).
+#[allow(clippy::too_many_arguments)]
 async fn control_switch(
     ledger: &Mutex<Ledger>,
     v: &Versions,
     from: &str,
     to: &str,
     nodes: &[String],
+    together: &[String],
     gate: &Gate,
     rollback: bool,
 ) -> Result<()> {
@@ -922,23 +1042,101 @@ async fn control_switch(
     ledger.lock().expect("ledger").snapshot(&snap)?;
     let protect: Vec<String> = [Some(from.to_string()), v.pointer("previous")].into_iter().flatten().collect();
     prune_snapshots(&snaps, KEEP_SNAPSHOTS, &protect, false);
-    audit(ledger, "self.snapshot", serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema }));
+    // And off the host, with a state store (#167): an update doesn't switch without it there (the
+    // way back past a contract step must survive losing this host); a rollback waits for the store
+    // only briefly, and only warns.
+    let push = push_snapshot(snap.clone(), KEEP_SNAPSHOTS, protect.clone());
+    let pushed = if rollback {
+        tokio::time::timeout(ROLLBACK_PUSH_WAIT, push).await.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in {ROLLBACK_PUSH_WAIT:?}")))
+    } else {
+        push.await
+    };
+    let stored = match pushed {
+        Ok(k) => k,
+        Err(e) if rollback => {
+            say(format!("warning: the ledger snapshot isn't in the state store: {e:#}"));
+            None
+        }
+        Err(e) => {
+            audit(
+                ledger,
+                "self.snapshot",
+                serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_error": format!("{e:#}") }),
+            );
+            return Err(SnapshotNotStored(format!("{e:#}")).into());
+        }
+    };
+    audit(
+        ledger,
+        "self.snapshot",
+        serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_key": stored }),
+    );
+    if let Some(k) = &stored {
+        say(format!("ledger snapshot {} (and in the state store as {k})", snap.display()));
+    }
     v.switch(to)?;
     let kind = if rollback { "self.rolled_back" } else { "self.switched" };
     audit(ledger, kind, serde_json::json!({ "target": "control", "from": from, "to": to, "automatic": false, "by": crate::operator() }));
     say(format!("control host: switched {from} → {to}"));
     let bin = v.binary(to);
+    // A protocol jump (#207): the nodes switch now, before the runs are handed over, so the new
+    // build never has to talk to a node more than the skew away.
+    let mut moved: Vec<(String, Option<String>)> = vec![];
+    if !together.is_empty() {
+        let bytes = std::fs::read(&bin)?;
+        let sha = v.manifest(to)?.describe.build;
+        for n in together {
+            let r = match rollback {
+                false => node_switch_together(ledger, n, to, Some((&bytes, &sha)), "self.switched").await,
+                true => node_switch_together(ledger, n, to, None, "self.rolled_back").await,
+            };
+            match r {
+                Ok(prev) => moved.push((n.clone(), prev)),
+                Err(e) if rollback => say(format!("node {n}: not switched back with the control host: {e:#}")),
+                Err(e) => {
+                    say(format!("node {n}: couldn't switch it with the control host ({e:#}); switching everything back"));
+                    for (m, prev) in &moved {
+                        if let Some(p) = prev {
+                            let _ = node_switch_together(ledger, m, p, None, "self.rolled_back").await;
+                        }
+                    }
+                    v.switch(from)?;
+                    audit(
+                        ledger,
+                        "self.rolled_back",
+                        serde_json::json!({ "target": "control", "from": to, "to": from, "automatic": true, "why": format!("node {n}: {e:#}") }),
+                    );
+                    bail!("the jump to {to} stopped at node {n} and everything was switched back to {from}: {e:#}");
+                }
+            }
+        }
+    }
     handover(&bin).await?;
     let gate = if rollback { Gate { window: Duration::ZERO, canary: None, ..gate.clone() } } else { gate.clone() };
     match run_gate(ledger, &bin, "control", nodes, &gate).await {
         Ok(()) => {
             audit(ledger, "self.committed", serde_json::json!({ "target": "control", "version": to }));
+            for (n, _) in &moved {
+                audit(
+                    ledger,
+                    "self.committed",
+                    serde_json::json!({ "target": format!("node:{n}"), "version": to, "with_control_host": true }),
+                );
+            }
             say(format!("control host: {to} is healthy"));
             Ok(())
         }
         Err(why) if rollback => bail!("control host: rolled back to {to}, but it isn't healthy: {why}"),
         Err(why) => {
             say(format!("control host: {to} failed its health gate ({why}); rolling back to {from}"));
+            // The nodes that switched with it go back first, so `from` meets nodes it can talk to.
+            for (n, prev) in &moved {
+                if let Some(p) = prev {
+                    if let Err(e) = node_switch_together(ledger, n, p, None, "self.rolled_back").await {
+                        say(format!("node {n}: not switched back: {e:#}"));
+                    }
+                }
+            }
             v.switch(from)?;
             audit(
                 ledger,
@@ -988,6 +1186,52 @@ fn snapshots_to_prune(mut names: Vec<String>, keep: usize, protect: &[String]) -
     }
     out.reverse();
     out
+}
+
+/// How long a rollback waits for its snapshot to reach the state store before switching anyway.
+const ROLLBACK_PUSH_WAIT: Duration = Duration::from_secs(15);
+
+/// Why an update didn't switch: its ledger snapshot couldn't be pushed to the state store (#167).
+/// The store's fault, not the build's (`self follow` tries the build again later).
+#[derive(Debug)]
+pub struct SnapshotNotStored(pub String);
+
+impl std::fmt::Display for SnapshotNotStored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not switching: the ledger snapshot couldn't be pushed to the state store: {}", self.0)
+    }
+}
+
+impl std::error::Error for SnapshotNotStored {}
+
+/// Pushes a snapshot to the state store, if there is one, then prunes the store's copies as the
+/// local ones are; returns its key (None: no state store).
+async fn push_snapshot(snap: PathBuf, keep: usize, protect: Vec<String>) -> Result<Option<String>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let Some(st) = crate::snapstore::store()? else { return Ok(None) };
+        let key = crate::snapstore::push(&st, &snap)?;
+        if let Err(e) = prune_store_snapshots(&st, keep, &protect, false) {
+            say(format!("warning: pruning the state store's snapshots: {e:#}"));
+        }
+        Ok(Some(key))
+    })
+    .await?
+}
+
+/// Deletes the store's snapshots `snapshots_to_prune` picks; returns their names.
+fn prune_store_snapshots(
+    st: &dyn wicket_store::objects::ObjectStore,
+    keep: usize,
+    protect: &[String],
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let gone = snapshots_to_prune(crate::snapstore::list(st)?, keep, protect);
+    if !dry_run {
+        for n in &gone {
+            st.delete(&format!("{}{n}", crate::snapstore::PREFIX))?;
+        }
+    }
+    Ok(gone)
 }
 
 /// Deletes the snapshots `snapshots_to_prune` picks; returns their names.
@@ -1085,6 +1329,24 @@ pub async fn prune(nodes: Option<String>, only_nodes: bool, keep: usize, dry_run
         let protect: Vec<String> = [v.pointer("current"), v.pointer("previous")].into_iter().flatten().collect();
         let snapshots = prune_snapshots(&crate::data_dir().join("snapshots"), keep, &protect, dry_run);
         report("control", &String::from_utf8_lossy(&out.stdout), snapshots);
+        // The state store's copies (#167), by the same rule.
+        let stored = tokio::task::spawn_blocking(move || -> Result<Option<Vec<String>>> {
+            match crate::snapstore::store()? {
+                Some(st) => Ok(Some(prune_store_snapshots(&st, keep, &protect, dry_run)?)),
+                None => Ok(None),
+            }
+        })
+        .await?;
+        match stored {
+            Ok(Some(gone)) => {
+                say(format!("state store: {verb} {} snapshot(s)", gone.len()));
+                if !dry_run && !gone.is_empty() {
+                    audit(&ledger, "self.pruned", serde_json::json!({ "target": "store", "snapshots": gone, "by": crate::operator() }));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => say(format!("warning: pruning the state store's snapshots: {e:#}")),
+        }
     }
     for n in &nodes {
         let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
@@ -1106,7 +1368,7 @@ async fn handover(bin: &Path) -> Result<()> {
         let l = Ledger::open(&crate::ledger_path())?;
         for (run, owner) in l.running_runs()? {
             let Some(o) = owner else { continue };
-            if crate::reap::owner_alive(&o) != Some(true) {
+            if crate::owner::owner_alive(&o) != Some(true) {
                 continue;
             }
             let Some(pid) = o.split(':').nth(1).and_then(|p| p.parse::<i32>().ok()) else { continue };
@@ -1401,13 +1663,30 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         None => vec![],
     };
     let gate = Gate { window: Duration::ZERO, interval: Duration::from_secs(1), checks: vec![], canary: None, image: None };
+    let mut jumped = false;
     if !only_nodes {
         let v = Versions::control();
         let cur = v.pointer("current").context("nothing to roll back: no versions here (wicket self status)")?;
         let prev = v.pointer("previous").context("no previous version to roll back to")?;
-        control_switch(&ledger, &v, &cur, &prev, &nodes, &gate, true).await?;
+        warn_units(&v, &prev);
+        // Back across a protocol jump (#207): the same rule as the jump itself.
+        let (pc, pp) =
+            (v.manifest(&cur).map(|m| m.describe.protocol).unwrap_or(0), v.manifest(&prev).map(|m| m.describe.protocol).unwrap_or(0));
+        if pc.abs_diff(pp) > crate::chan::PROTOCOL_SKEW {
+            let blockers = jump_blockers(&ledger.lock().expect("ledger"), &nodes)?;
+            if !blockers.is_empty() {
+                bail!(
+                    "{prev} speaks protocol {pp}, {cur} {pc}: rolling back across that jump switches every enrolled node with the control host, and {} would not (`--nodes all`)",
+                    blockers.join(", ")
+                );
+            }
+            control_switch(&ledger, &v, &cur, &prev, &nodes, &nodes, &gate, true).await?;
+            jumped = true;
+        } else {
+            control_switch(&ledger, &v, &cur, &prev, &nodes, &[], &gate, true).await?;
+        }
     }
-    for n in &nodes {
+    for n in nodes.iter().filter(|_| !jumped) {
         let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
@@ -1719,5 +1998,34 @@ mod tests {
         let _ = running.kill();
         let _ = running.wait();
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// #207: a protocol jump needs every enrolled remote node to switch with the control host;
+    /// this host's own node always does, and revoked nodes don't count.
+    #[test]
+    fn a_protocol_jump_is_blocked_by_the_remote_nodes_left_behind() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let row = |name: &str, target: &str| wicket_store::NodeRow {
+            name: name.into(),
+            tenant: "t0".into(),
+            target: target.into(),
+            host_key: String::new(),
+            host_key_fp: String::new(),
+            node_key: String::new(),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: 0,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        l.enrol_builtin_node(&row(crate::localnode::NAME, "unix:/x/ctl.sock")).unwrap();
+        assert!(jump_blockers(&l, &[]).unwrap().is_empty(), "only this host's own node: a jump is fine");
+        for n in ["n1", "n2", "n3"] {
+            l.enrol_builtin_node(&row(n, &format!("wicket@{n}.example.com"))).unwrap();
+        }
+        assert_eq!(jump_blockers(&l, &[]).unwrap(), ["n1", "n2", "n3"]);
+        assert_eq!(jump_blockers(&l, &["n1".into(), "n3".into()]).unwrap(), ["n2"], "named: the one left behind");
+        l.revoke_node("n2").unwrap();
+        assert!(jump_blockers(&l, &["n1".into(), "n3".into()]).unwrap().is_empty(), "a revoked node is absent");
     }
 }

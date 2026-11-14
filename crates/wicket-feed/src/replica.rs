@@ -36,7 +36,9 @@
 //! [`Replica::reset`], which keeps only the use counts and comes up [`Mode::Closed`] until a live
 //! statement arrives.
 
-use crate::format::{Delta, Frame, FrameKind, Fresh, Grant, Hello, KeyCert, RevokeKind, Snapshot};
+#[cfg(test)]
+use crate::format::Grant;
+use crate::format::{Delta, Frame, FrameKind, Fresh, Hello, KeyCert, RevokeKind, Snapshot};
 use crate::jws::{kid, open, sha, TYP_DELTA, TYP_FRESH, TYP_KEY, TYP_SNAP};
 use crate::state::{Policy, State, Zone};
 use crate::store::{append_line, lines, read_opt, write_atomic};
@@ -45,7 +47,9 @@ use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use wicket_core::{Op, Verdict, ZoneSpec};
+use wicket_core::Op;
+#[cfg(test)]
+use wicket_core::{Verdict, ZoneSpec};
 
 /// The node's mode, from its own clock and the signed deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,6 +788,8 @@ impl<P: Policy> Replica<P> {
     }
 }
 
+/// The test-only decide path for zones as plain specs (this crate's tests of the feed itself).
+#[cfg(test)]
 impl Replica<ZoneSpec> {
     fn live_grant(&self, st: &State<ZoneSpec>, g: &Grant, op: &Op, now: i64) -> bool {
         g.zone == op.zone

@@ -365,8 +365,8 @@ a pass at once; everything else (lease ends, approvals on the console) waits for
   not created again. Ownership is checked again right before every destroy, so a tag changed or a
   `wicket-protected` tag added since the list saves the machine.
 - **Boxes** (`wicket=1` containers) whose run ended are stopped; a running run's box is left to its run (above);
-  a box whose run this ledger doesn't know is left alone, since Docker may be shared. This subsumes
-  `wicket reap`, which now leaves a running run whose supervisor is gone to `wicket reconcile`.
+  a box whose run this ledger doesn't know is left alone, since Docker may be shared. (It replaced
+  `wicket reap`, removed in 0.0.2.)
 - Every change is an audit record `reconcile.<what>`. One pass at a time per installation (a file lock).
 - So killing every control-plane process mid-run and restarting leaves no orphaned machine or box after one
   pass, and every run whose box still runs is supervised again. **Not yet:** the daily money reconcile against the provider's own charges (design §8.5).

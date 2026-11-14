@@ -1,4 +1,4 @@
-//! `wicket node`, `place`, `lease`, `reap` and `reconcile`: nodes, capacity and cleanup.
+//! `wicket node`, `place`, `lease` and `reconcile`: nodes, capacity and cleanup.
 //!
 //! One module per command group, out of `main.rs` (#220): a PR that changes one group's flags or
 //! handling touches only its own file.
@@ -29,28 +29,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             l.audit(&TenantId::single(), None, "lease.released", &serde_json::json!({ "lease": id, "by": operator() }))?;
             drop(l);
             reconcile::print(&reconcile::pass(false).await?, false);
-            Ok(())
-        }
-        Cmd::Reap { dry_run, node, ssh_key } => {
-            let docker = match node {
-                Some(n) => wicket_sandbox::Docker::over_ssh(enrol::resolve_installed(&n, ssh_key.as_deref())?.ssh_prefix()),
-                None => wicket_sandbox::Docker::from_env(),
-            };
-            let l = Ledger::open(&ledger_path())?;
-            let all = reap::reap(&docker, &l, dry_run).await?;
-            let mut stopped = 0;
-            for r in &all {
-                let run = r.run.as_deref().unwrap_or("?");
-                match &r.verdict {
-                    reap::Verdict::Live => {}
-                    reap::Verdict::Orphan(why) => {
-                        stopped += 1;
-                        println!("{} {} (run {run}): {why}", if dry_run { "would stop" } else { "stopped" }, r.name);
-                    }
-                    reap::Verdict::Unknown(why) => println!("left alone {} (run {run}): {why}", r.name),
-                }
-            }
-            println!("{} box(es), {stopped} orphaned{}", all.len(), if dry_run { " (dry run: nothing stopped)" } else { "" });
             Ok(())
         }
         Cmd::Node { cmd } => match cmd {

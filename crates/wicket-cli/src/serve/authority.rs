@@ -16,7 +16,7 @@
 use super::State;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use wicket_core::{Op, RunId, TenantId};
 use wicket_feed::{BoxAuthority, RevokeKind};
 
@@ -38,26 +38,23 @@ fn policy_dir(state: &State) -> PathBuf {
     state.data.join("policy")
 }
 
-fn read_trim(p: &Path) -> Option<String> {
-    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
 /// The org policy: the applied version's Cedar and entities, every kept version with when and by
 /// whom it was applied, and the running runs by the version they were minted under.
 fn policy(state: &State) -> Result<Value> {
     let d = policy_dir(state);
-    let installed = read_trim(&d.join("installed"));
+    let installed = crate::policy::installed_in(&d);
     let current = match &installed {
-        Some(v) => json!({
-            "version": v,
-            "cedar": std::fs::read_to_string(d.join("org.cedar")).ok(),
-            "entities": std::fs::read_to_string(d.join("org-entities.json")).ok(),
-            // A hand edit after `apply` makes every mint refuse (policy.rs): say so.
-            "matches_applied": std::fs::read_to_string(d.join("org.cedar")).ok().map(|t| {
-                let ents = std::fs::read_to_string(d.join("org-entities.json")).unwrap_or_else(|_| "[]".into());
-                wicket_policy::version(&t, &ents) == *v
-            }),
-        }),
+        Some(v) => {
+            let cedar = std::fs::read_to_string(d.join("org.cedar")).ok();
+            let entities = crate::policy::entities_in(&d);
+            json!({
+                "version": v,
+                // A hand edit after `apply` makes every mint refuse (policy.rs): say so.
+                "matches_applied": cedar.as_deref().map(|t| wicket_policy::version(t, &entities) == *v),
+                "cedar": cedar,
+                "entities": entities,
+            })
+        }
         None => Value::Null,
     };
     let l = state.ledger()?;
@@ -136,7 +133,7 @@ fn run_authority(state: &State, run: &str) -> Result<Value> {
     let status = l.run_status(run)?.with_context(|| format!("no run {run}"))?;
     let node = l.run_node(run)?.unwrap_or_else(|| crate::localnode::NAME.to_string());
     let policy = l.run_policy(run)?;
-    let installed = read_trim(&policy_dir(state).join("installed"));
+    let installed = crate::policy::installed_in(&policy_dir(state));
     let revoked = l.revoked(run)?.map(|(at, by, why)| json!({ "at": at, "by": by, "reason": why }));
     let dir = state.data.join("runs").join(run);
     let auth = crate::noderun::read_authority(&dir);

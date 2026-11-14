@@ -120,12 +120,11 @@ fn grants(state: &State, m: &Manifest) -> Value {
 /// layer, and whether the zone's ceiling passes it. Null without an applied org policy.
 fn org_effect(state: &State, m: &Manifest) -> Value {
     let d = state.data.join("policy");
-    let Some(v) = std::fs::read_to_string(d.join("installed")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(v) = crate::policy::installed_in(&d) else {
         return Value::Null;
     };
     let text = std::fs::read_to_string(d.join("org.cedar")).unwrap_or_default();
-    let ents = std::fs::read_to_string(d.join("org-entities.json")).unwrap_or_else(|_| "[]".into());
-    let p = match wicket_policy::OrgPolicy::parse(&text, &ents) {
+    let p = match wicket_policy::OrgPolicy::parse(&text, &crate::policy::entities_in(&d)) {
         Ok(p) if p.version() == v => p,
         Ok(p) => {
             return json!({ "version": v, "error": format!("org.cedar is {}, not the applied {v}: every mint is refused", p.version()) })

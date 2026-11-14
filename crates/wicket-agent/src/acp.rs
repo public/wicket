@@ -81,6 +81,41 @@ pub fn is_claude_adapter(spec: &wicket_core::AcpSpec) -> bool {
         })
 }
 
+/// The installation's settings for the Claude adapter (`acp` in `wicket.yaml`): decisions that
+/// belong to the installation's owner, not to a manifest.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeAdapterSettings {
+    /// Whether Claude Code may run through its ACP adapter (`claude-agent-acp`, which drives the
+    /// `claude` binary through the Claude Agent SDK) on the installation's Claude subscription. The
+    /// owner's reading of the subscription's terms (research 21 §2.6). Default: no.
+    #[serde(default)]
+    pub allow_subscription_backed_claude_adapter: bool,
+}
+
+/// Refuses, at run start, a manifest that runs the Claude adapter in a way the installation's
+/// settings (read from `settings_path`) don't allow (#66). Every other agent passes.
+pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings, settings_path: &str) -> Result<(), String> {
+    let Some(spec) = m.agent.as_ref().filter(|a| a.kind == "acp").and_then(|a| a.acp.as_ref()) else { return Ok(()) };
+    if !is_claude_adapter(spec) {
+        return Ok(());
+    }
+    // Claude Code through its adapter goes through wicket's profile, and so through the check below.
+    if spec.profile.as_deref() != Some("claude-agent-acp") {
+        return Err("agent.acp.command starts Claude Code's ACP adapter: set agent.acp.profile: claude-agent-acp".into());
+    }
+    // The zone's model route is a Claude subscription (wicket never uses an API key).
+    let subscription = m.zone.llm.as_ref().is_some_and(|l| l.provider == "anthropic");
+    if subscription && !s.allow_subscription_backed_claude_adapter {
+        return Err(format!(
+            "this zone runs Claude Code through its ACP adapter (the Claude Agent SDK) on the Claude subscription in zone.llm, \
+             which this installation doesn't allow. Whether the subscription may back the adapter is the owner's decision; \
+             to allow it, set acp.allow_subscription_backed_claude_adapter: true in {settings_path}. Meanwhile, run Claude Code as kind: claude-code"
+        ));
+    }
+    Ok(())
+}
+
 /// How wicket starts or continues an ACP session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AcpConfig {

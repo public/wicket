@@ -473,6 +473,20 @@ pub async fn follow() -> Result<()> {
             save_state(&st);
             Ok(())
         }
+        // Its units aren't installed yet (#165), or the state store didn't take its ledger snapshot
+        // (#167): not the build's fault; tried again on a later run. Recorded once.
+        Err(e) if e.downcast_ref::<crate::units::UnitsPending>().is_some() || e.downcast_ref::<update::SnapshotNotStored>().is_some() => {
+            let why = if e.downcast_ref::<update::SnapshotNotStored>().is_some() { "store" } else { "units" };
+            let key = format!("{why}:{}", b.commit);
+            if st.last.as_deref() != Some(key.as_str()) {
+                st.last = Some(key);
+                save_state(&st);
+                let l = wicket_store::Ledger::open(&crate::ledger_path())?;
+                l.audit(&wicket_core::TenantId::single(), None, "self.follow_skipped", &serde_json::json!({ "why": format!("{e:#}") }))?;
+            }
+            println!("[wicket] follow: not updating: {e:#}");
+            Ok(())
+        }
         Err(e) => {
             st.failed.push(b.commit.clone());
             st.last = Some(format!("failed:{}", b.commit));

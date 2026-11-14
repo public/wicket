@@ -35,10 +35,20 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             SelfCmd::Keygen { key } => update::keygen(&key),
             SelfCmd::Sign { key, artifact } => update::sign(&key, &artifact),
             SelfCmd::Describe => {
-                println!("{}", serde_json::to_string(&update::describe()?)?);
+                #[allow(unused_mut)]
+                let mut d = update::describe()?;
+                // Tests only (debug builds): the protocol this build reports when staged, so
+                // ci/update.sh can stage a "jump" (#207) with two builds of the same code.
+                #[cfg(debug_assertions)]
+                if let Some(p) = std::env::var("WICKET_TEST_DESCRIBE_PROTOCOL").ok().and_then(|p| p.parse().ok()) {
+                    d.protocol = p;
+                }
+                println!("{}", serde_json::to_string(&d)?);
                 Ok(())
             }
             SelfCmd::Health { node, canary, image } => update::health(node, canary, image).await,
+            SelfCmd::Units => units::print(),
+            SelfCmd::ApplyUnits { dir } => units::apply(dir),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -129,6 +139,17 @@ pub enum SelfCmd {
         key: PathBuf,
         artifact: PathBuf,
     },
+    /// Install this build's systemd units (#165) where they differ from the installed ones, and
+    /// reload systemd; restarts nothing. Run as root with the version's own binary, as a refused
+    /// `self update` says: `sudo <versions>/<id>/wicket self apply-units`.
+    ApplyUnits {
+        /// Another units directory (default: /etc/systemd/system, which needs root).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// This build's systemd units (JSON: name to contents).
+    #[command(hide = true)]
+    Units,
     /// This build's version, protocol and schema (JSON).
     #[command(hide = true)]
     Describe,

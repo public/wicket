@@ -95,7 +95,7 @@ pub fn route(cmd: &Cmd) -> Route {
             IdentityCmd::Init { .. } => Forward(Privileged),
         },
         // Both stop things, and a reconcile pass can create machines a lease needs.
-        Cmd::Reap { .. } | Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
+        Cmd::Reconcile { .. } | Cmd::Attach { .. } => Forward(Privileged),
         Cmd::Lease { cmd } => match cmd {
             LeaseCmd::List => Forward(Read),
             LeaseCmd::Release { .. } => Forward(Revoke),
@@ -122,7 +122,10 @@ pub fn route(cmd: &Cmd) -> Route {
             // Writes (and deletes) an object in the store.
             StateCmd::Check { probe: true } => Forward(Privileged),
             StateCmd::Replicate => Refuse("the ledger's stream runs as the wicket user under systemd: systemctl status wicket-state"),
-            StateCmd::Kit { .. } | StateCmd::Restore { .. } => Forward(Privileged),
+            // The list of snapshots' names: what `state check` reads.
+            StateCmd::Snapshots => Forward(Read),
+            // Writes the unsealed ledger to a file the caller names, as the wicket user.
+            StateCmd::Kit { .. } | StateCmd::Restore { .. } | StateCmd::Snapshot { .. } => Forward(Privileged),
         },
         Cmd::Keys { .. } => Forward(Privileged),
         Cmd::Itself { cmd } => match cmd {
@@ -136,7 +139,10 @@ pub fn route(cmd: &Cmd) -> Route {
             | SelfCmd::TrustKey { .. }
             | SelfCmd::Health { .. } => Forward(Privileged),
             // Touch no wicket data.
-            SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe => Local,
+            SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe | SelfCmd::Units => Local,
+            // Writes systemd's units as the caller, who must be root (wicketd can't: it is the
+            // wicket user, under ProtectSystem): never through the daemon.
+            SelfCmd::ApplyUnits { .. } => Local,
         },
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,
@@ -330,7 +336,6 @@ mod tests {
             (&["identity", "list"], Route::Forward(Read)),
             (&["identity", "revoke", "r1"], Route::Forward(Revoke)),
             (&["identity", "init", "--trust-domain", "wicket.example.com"], Route::Forward(Privileged)),
-            (&["reap"], Route::Forward(Privileged)),
             (&["reconcile", "--dry-run"], Route::Forward(Privileged)),
             (&["lease", "list"], Route::Forward(Read)),
             (&["lease", "release", "l1"], Route::Forward(Revoke)),

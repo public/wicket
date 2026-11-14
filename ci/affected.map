@@ -50,6 +50,7 @@ examples/**                        | wicket-core wicket-authz wicket-feed wicket
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
+deploy/systemd/**                  | wicket-cli | install-test update
 deploy/vultr/node-setup.sh         | wicket-placement | -
 crates/wicket-core/tests/subset_cases.rs | wicket-authz wicket-feed | -
 crates/wicket-authz/tests/common/** | wicket-feed | -
@@ -64,10 +65,12 @@ crates/wicket-policy-diff/**       | -   | policy
 crates/wicket-cli/src/hibernate.rs | -   | hibernate restore
 crates/wicket-cli/src/state.rs     | -   | hibernate restore
 crates/wicket-cli/src/statestore.rs | -  | hibernate restore
+crates/wicket-cli/src/snapstore.rs  | -   | update restore
 crates/wicket-cli/src/s3.rs        | -   | hibernate restore
 crates/wicket-store/src/bundle.rs  | -   | hibernate restore
 crates/wicket-cli/src/update.rs    | -   | update
 crates/wicket-cli/src/ci_update.rs | -   | update
+crates/wicket-cli/src/units.rs     | -   | update install-test
 crates/wicket-cli/src/daemon/**    | -   | daemon-uids acceptance
 crates/wicket-cli/src/serve/static/** | - | acceptance
 crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes

@@ -513,14 +513,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
         }
         // This process supervises it now (the reconciler judges the run by this).
-        l.set_run_owner(&run.0, &crate::reap::owner_label())?;
-        l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::reap::owner_label(), "node": node_name }))?;
+        l.set_run_owner(&run.0, &crate::owner::owner_label())?;
+        l.audit(&m.tenant, Some(&run), "run.attach", &serde_json::json!({ "owner": crate::owner::owner_label(), "node": node_name }))?;
     }
     if record.is_none() {
         let l = ledger.lock().expect("ledger");
         l.run_started(&m.tenant, &run, &m.zone.name, &workload)?;
         // Who supervises it, for the reconciler (#38), and the lease it is placed on, if any.
-        l.set_run_owner(&run.0, &crate::reap::owner_label())?;
+        l.set_run_owner(&run.0, &crate::owner::owner_label())?;
         if let Some(lease) = &lease {
             l.set_run_lease(&run.0, lease)?;
         }
@@ -1133,7 +1133,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             streams: [1, 2, 3],
             binds,
             workdir: wrap_cwd.as_ref().map(|c| c.display().to_string()),
-            owner: Some(crate::reap::owner_label()),
+            owner: Some(crate::owner::owner_label()),
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
             llm_prior: llm.spent_total(),
@@ -2098,7 +2098,7 @@ pub fn attach_failed(run: &str, e: &anyhow::Error) {
     if let Ok(l) = Ledger::open(&ledger_path()) {
         if l.run_status(run).ok().flatten().as_deref() == Some("running") {
             let reason = format!("its supervisor is gone and it could not be taken over: {}", wicket_agent::clip(&why, 300));
-            let _ = l.run_ended(&RunId(run.to_string()), crate::reap::LOST, &reason);
+            let _ = l.run_ended(&RunId(run.to_string()), crate::owner::LOST, &reason);
             let _ =
                 l.audit(&wicket_core::TenantId::single(), Some(&RunId(run.to_string())), "run.lost", &serde_json::json!({ "why": reason }));
         }
