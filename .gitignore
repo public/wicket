@@ -10,3 +10,4 @@ __pycache__/
 # experiments/build-times scripts' target dirs
 target-measure*/
 target-loop/
+experiments/build-times/.*.log
