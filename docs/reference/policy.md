@@ -110,8 +110,8 @@ wicket policy zone manifest.yaml                             # a zone's own poli
   - the policy must compile and mint a token a node loads, for every running run's zone, as a member
     of no group, of every group and of each group alone (the node's caps on alternatives, regexes and
     token size show here);
-  - every active node must talk control/node protocol 4 or later (`ORG_POLICY`): older nodes can't
-    read tokens with an org layer. `apply` names the nodes that don't.
+  - every active node must answer (a node that does talks a protocol that reads tokens with an org
+    layer). `apply` names the nodes that can't be asked.
 - `apply` keeps every version under `policy/versions/<version>.cedar` and records `policy.applied`
   in the audit log.
 - It records the installed version in `policy/installed`. A missing `org.cedar`, or one changed by

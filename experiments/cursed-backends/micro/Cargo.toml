@@ -1,0 +1,21 @@
+[package]
+name = "cursed-micro"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Candidate kernels for optional fast backends, in-process: httparse vs cursed-http's fbparse.h, ed25519-dalek vs cursed-jwt's Ed25519."
+
+# Standalone: not a member of the repo workspace.
+[workspace]
+
+[dependencies]
+httparse = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+cursed-jwt = { git = "https://github.com/public/cursed-jwt", rev = "b4535354927ebb37085a6949e6a70f7c4d6c2cc2", default-features = false, features = ["std", "pk"] }
+sha2 = "0.10"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = 1

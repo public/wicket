@@ -18,9 +18,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
-/// What a node's secret source says when its control host keeps the credential (an older protocol):
-/// the call is relayed there instead.
-pub const RELAY_INSTEAD: &str = "the control host speaks an older protocol";
 /// How long a response is still read to its end after the agent stopped reading it, so its final
 /// usage is seen (#113). Past this, the call is charged its whole reservation.
 const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -404,17 +401,12 @@ impl Llm {
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
         // the credential (first use while the control host is unreachable), the call fails clearly.
-        // With a control host too old to release it, the call is relayed to the run's own proxy there.
-        let mut relay = !self.ctx.vault.is_sourced();
+        let relay = !self.ctx.vault.is_sourced();
         if self.ctx.vault.is_sourced() {
             if let Err(e) = self.ctx.vault.ensure(&spec.secret).await {
-                if self.relay.is_some() && format!("{e:#}").contains(RELAY_INSTEAD) {
-                    relay = true;
-                } else {
-                    self.settle(reserved, Usage::default(), true);
-                    self.event(model, 503, Usage::default(), "credential unavailable on this node");
-                    return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
-                }
+                self.settle(reserved, Usage::default(), true);
+                self.event(model, 503, Usage::default(), "credential unavailable on this node");
+                return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
             }
         }
         let up = match &self.relay {

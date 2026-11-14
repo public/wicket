@@ -6,7 +6,7 @@
 #
 # Usage: WICKET=target/debug/wicket ci/gen-cli-reference.sh [--check]
 #
-# Hidden commands (`attach`, `node attach`, `self describe`, `self health`) are internal: they are
+# Hidden commands (`attach`, `node attach`, `self describe`, `self health`, `self units`) are internal: they are
 # what wicket runs itself, and are left out as clap leaves them out of --help.
 set -euo pipefail
 cd "$(dirname "$0")/.."

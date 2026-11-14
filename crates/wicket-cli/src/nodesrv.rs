@@ -405,10 +405,6 @@ impl Node {
         Arc::new(move |run: String, name: String| {
             let n = n.clone();
             Box::pin(async move {
-                // A control host before protocol 3 doesn't release secrets: its node relays instead.
-                if (1..chan::NODE_LEASES).contains(&n.proto_of(&run)) {
-                    return Err(format!("{OLD_CONTROL}: credential {name} stays on the control host"));
-                }
                 let id = n.id();
                 let (tx, rx) = oneshot::channel();
                 n.asks.lock().expect("asks").insert(id, tx);
@@ -507,17 +503,15 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        // Injected hosts are decided here too, their secret fetched on first use (#152); with a
-        // control host before protocol 3 they are forwarded to it, as before. Hosts the control host
-        // swaps a credential in for (#169) are always forwarded: swaps stay there.
-        let v1 = (1..chan::NODE_LEASES).contains(&self.node.proto_of(&self.run));
+        // Injected hosts are decided here too, their secret fetched on first use (#152). Hosts the
+        // control host swaps a credential in for (#169) are always forwarded: swaps stay there.
         wicket_proxy::decide::route_sealed(
             host,
             &spec,
             &self.swaps,
             self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
             now,
-            &|_| !v1,
+            &|_| true,
         )
     }
 
@@ -757,8 +751,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
 /// Takes over the boxes a previous `node serve` from this directory started (#151): each running box
 /// with its record (`node-box.json`) is adopted (its proxies started again, its output read from the
 /// start, its stdin fed, its timeout kept) and waits for its control host to resume it. A box whose
-/// run has no authority in the feed any more is stopped, and so is one from before records (as
-/// before: nobody can supervise it). Any other container, wicket's or not, is left alone.
+/// run has no authority in the feed any more is stopped, and so is an orphan without a record
+/// (nobody can supervise it). Any other container, wicket's or not, is left alone.
 async fn adopt_previous(node: &Arc<Node>) {
     let runs = node.paths.runs();
     let Ok(boxes) = node.docker.boxes().await else { return };
@@ -792,7 +786,7 @@ async fn adopt_previous(node: &Arc<Node>) {
             // a box without its record isn't its to judge (it is another node's, or the reconciler's).
             None if node.paths.shares_host() => {}
             None => {
-                if let crate::reap::Verdict::Orphan(why) = crate::reap::judge(&b, None) {
+                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b, None) {
                     eprintln!("[node] stopping {} ({why})", b.name);
                     let _ = node.docker.kill(&b.name).await;
                 }
@@ -1020,7 +1014,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
                 bs.owner
                     .clone()
                     .filter(|o| node.paths.shares_host() && o.len() <= 200 && !o.contains(['\n', '=']))
-                    .unwrap_or_else(crate::reap::owner_label),
+                    .unwrap_or_else(crate::owner::owner_label),
             ),
         ],
     };
@@ -1599,7 +1593,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     // The run's last spend goes ahead of its exit, on the same channel: the once-a-second report
     // can miss a model call made just before the box ended (an agent that hibernates or finishes
     // right after its turn, #249), and the box would not be charged for it.
-    if let Some(l) = llm.filter(|_| n.proto_of(run) >= chan::NODE_LEASES) {
+    if let Some(l) = llm {
         n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent() }));
     }
     eprintln!("[node] {run}: box exited ({code})");
@@ -1707,7 +1701,7 @@ async fn serve_box(
                 if now != last {
                     let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
                 }
-                if (now != last || i.is_multiple_of(10)) && n.proto_of(&run) >= chan::NODE_LEASES {
+                if now != last || i.is_multiple_of(10) {
                     n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
                 }
                 last = now;
@@ -1787,8 +1781,9 @@ async fn serve_box(
     Ok(tasks)
 }
 
-/// How a fetch for a version-1 control host fails: the model proxy relays on it.
-pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
+/// How a tool call relayed to a control host before [`chan::EDGE_DECISIONS`] fails: it would decide
+/// it differently.
+pub const OLD_CONTROL: &str = "the control host speaks an older protocol";
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 

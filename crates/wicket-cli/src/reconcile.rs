@@ -6,8 +6,8 @@
 //!   `<machine>:<pid>:<start>`) is gone on this machine is asked about on its node (#151). If the node
 //!   still has its box, the run is **adopted**: a new supervisor (`wicket attach <run>`) takes it over,
 //!   its box untouched. If the node says the box is gone, the run is ended as `lost`; if the node
-//!   can't be reached, the run is left for the next pass. A run with no node recorded (from before
-//!   #146) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
+//!   can't be reached, the run is left for the next pass. A run with no node recorded (its process
+//!   died before it reached one) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
 //!   tell.
 //! - *Leases* (`wicket_store::LeaseRow`): a pending lease whose request a human granted becomes
 //!   `approved`, one denied or withdrawn ends. An approved or active lease ends when its holder run has
@@ -45,7 +45,7 @@
 //! records what its node billed under the provider's billing model when it ends.
 
 use crate::capacity::{self, lease_key, LeaseApprover, PlacementConfig};
-use crate::reap::LOST;
+use crate::owner::LOST;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -137,7 +137,7 @@ where
             machines,
             local,
             node_boxes,
-            owner_alive: crate::reap::owner_alive,
+            owner_alive: crate::owner::owner_alive,
             node_runs: HashMap::new(),
             adopt: crate::run::spawn_attach,
             fenced: crate::noderun::fenced_until,
@@ -629,7 +629,7 @@ const FENCE_MARGIN_SECS: i64 = 180;
 pub async fn node_runs(ledger: &Ledger, dry_run: bool) -> Result<HashMap<String, Option<Vec<String>>>> {
     let mut nodes: HashSet<String> = HashSet::new();
     for (run, owner) in ledger.running_runs()? {
-        if owner.as_deref().map(crate::reap::owner_alive) == Some(Some(false)) {
+        if owner.as_deref().map(crate::owner::owner_alive) == Some(Some(false)) {
             if let Some(n) = ledger.run_node(&run)? {
                 nodes.insert(n);
             }

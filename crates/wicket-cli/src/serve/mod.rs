@@ -76,7 +76,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use wicket_auth::{b64u, decision_challenge, unb64u, Credential, RelyingParty};
 use wicket_core::{Manifest, RunId, TenantId};
-use wicket_store::{Approval, ConsoleSession, Ledger, OperatorCredential};
+use wicket_store::{ConsoleSession, Ledger, OperatorCredential};
 
 /// A signed-in session ends after this long without a request (seconds)...
 pub const SESSION_IDLE: i64 = 15 * 60;
@@ -129,6 +129,10 @@ enum Action {
         approve: bool,
         uses: Option<u32>,
         ttl_secs: u64,
+        /// Grant every path under this prefix (as `wicket approve --prefix`).
+        prefix: Option<String>,
+        /// Usable by any run in the request's zone (as `wicket approve --zone-wide`).
+        zone_wide: bool,
     },
     Say {
         run: String,
@@ -1034,6 +1038,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             if req.status != "pending" {
                 return Err(err(StatusCode::CONFLICT, format!("{id} is {}, not pending", req.status)));
             }
+            let prefix = match body.get("prefix") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(p)) if approve => {
+                    let p = wicket_core::canonical_path(p).map_err(|e| bad(&format!("prefix: {e}")))?.to_string();
+                    crate::cmd::approve::check_prefix(&req, &p).map_err(|e| bad(&e))?;
+                    Some(p)
+                }
+                Some(Value::String(_)) => None,
+                Some(_) => return Err(bad("prefix must be a path")),
+            };
+            let zone_wide = approve && body.get("zone_wide").and_then(|z| z.as_bool()).unwrap_or(false);
             let identity = (state.identity)(&l, &req.run);
             if approve && !identity_approvable(&identity) {
                 return Err(err(
@@ -1045,8 +1060,10 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             let v = json!({
                 "v": 1, "action": "decide", "tenant": state.tenant.0, "request": req.id, "run": req.run, "zone": req.zone,
                 "method": req.method, "host": req.host, "path": req.path, "risk": req.risk,
-                // A prefix ask (request_access with scope prefix) is granted as every path under `path`.
-                "prefix": req.scope_prefix,
+                // A prefix ask (request_access with scope prefix) is granted as every path under `path`,
+                // or under `path_prefix` if the human names one; `scope` says which runs may use it.
+                "prefix": req.scope_prefix || prefix.is_some(),
+                "path_prefix": prefix, "scope": if zone_wide { "zone" } else { "run" },
                 "decision": if approve { "approve" } else { "deny" },
                 "uses": uses, "ttl_secs": if approve { Some(ttl_secs) } else { None },
                 // Who the human was told this is for; the passkey signs it with the decision: the
@@ -1056,7 +1073,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "identity_verified": identity.get("verified"),
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
             });
-            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs }, v))
+            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide }, v))
         }
         Some("say") => {
             let (Some(run), Some(text)) = (str_field(body, "run"), str_field(body, "text")) else {
@@ -1209,38 +1226,30 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
     let t = &state.tenant;
     let rid = |r: &str| RunId(r.to_string());
     match action {
-        Action::Decide { request, approve: true, uses, ttl_secs } => {
+        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide } => {
             // The agent may have been revoked since the operator was shown it.
             let req = l.request(request)?;
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
                 bail!("{request}: the requesting agent's identity no longer verifies; it can be denied, not approved");
             }
-            let gid = l.approve(
-                request,
-                &Approval { uses: *uses, ttl: Duration::from_secs(*ttl_secs), path_prefix: None, decided_by: by.clone() },
-            )?;
-            // A grant exists only if its approval is on the record (fail closed).
-            if let Err(e) = l.audit(
-                t,
-                None,
-                "decision",
-                &json!({ "action": "decide", "request": request, "decision": "approve", "grant": gid, "prefix": req.scope_prefix, "by": by, "signed": signed }),
-            ) {
-                let _ = l.revoke_grant(&gid);
-                return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
-            }
-            let scope = if req.scope_prefix { format!(" for every path under {}{}", req.host, req.path) } else { String::new() };
-            Ok(format!("approved {request} → {gid}{scope} (signed with {})", oc.name))
+            let d = crate::cmd::approve::Decide {
+                by: by.clone(),
+                uses: *uses,
+                ttl: Duration::from_secs(*ttl_secs),
+                prefix: prefix.clone(),
+                zone_wide: *zone_wide,
+            };
+            let a = crate::cmd::approve::approve_request(&mut l, request, &d, json!({ "action": "decide", "signed": signed }))?;
+            let under = prefix.as_deref().map(wicket_core::prefix_dir).or(req.scope_prefix.then(|| req.path.clone()));
+            let scope = under.map(|p| format!(" for every path under {}{p}", req.host)).unwrap_or_default();
+            let zone = if *zone_wide { format!(", for any run in zone {}", req.zone) } else { String::new() };
+            let lease = a.lease.map(|x| format!("; lease {x} is provisioned by the next reconcile pass")).unwrap_or_default();
+            Ok(format!("approved {request} → {}{scope}{zone}{lease} (signed with {})", a.grant, oc.name))
         }
         Action::Decide { request, approve: false, .. } => {
-            l.deny(request, &by)?;
-            l.audit(
-                t,
-                None,
-                "decision",
-                &json!({ "action": "decide", "request": request, "decision": "deny", "by": by, "signed": signed }),
-            )?;
-            Ok(format!("denied {request} (signed with {})", oc.name))
+            let lease = crate::cmd::approve::deny_request(&l, request, &by, json!({ "action": "decide", "signed": signed }))?;
+            let lease = lease.map(|x| format!("; lease {x}'s reservation is released")).unwrap_or_default();
+            Ok(format!("denied {request}{lease} (signed with {})", oc.name))
         }
         Action::Say { run, text } => {
             check_running(&l, run).map_err(|r| anyhow::anyhow!("{}", r.body["error"].as_str().unwrap_or("not running")))?;
@@ -1659,7 +1668,7 @@ mod tests {
         let deeper = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "GET", "news.example", "/items/42");
         assert!(l.consume_grant(&deeper).unwrap().is_some(), "the grant covers paths under the prefix");
         let (kind, body) = t.audit_kinds().pop().unwrap();
-        assert_eq!((kind.as_str(), body["prefix"].as_bool()), ("decision", Some(true)));
+        assert_eq!((kind.as_str(), body["scope_prefix"].as_bool()), ("decision", Some(true)));
         // An agent whose identity doesn't verify: approval is refused, denial works.
         let (rid2, _) = t.ledger().ask(&op("run_f"), "please", true, None).unwrap();
         assert_refused(&t.begin(json!({ "action": "decide", "id": rid2, "decision": "approve" })), StatusCode::CONFLICT, "does not verify");
@@ -1672,6 +1681,68 @@ mod tests {
         let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
         assert_eq!(t.post("/api/decide/finish", a).status, StatusCode::OK);
         assert_eq!(t.post("/api/decide/begin", json!([])).status, StatusCode::BAD_REQUEST);
+        assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
+    }
+
+    /// #254: the console decides through `cmd/approve`'s functions, as `wicket approve` and `deny`
+    /// do: a prefix the human names, zone-wide scope, and a capacity ask's lease.
+    #[test]
+    fn console_decisions_take_a_prefix_zone_wide_scope_and_leases() {
+        let mut t = setup("decide-scope");
+        t.running("run_e", "lead");
+        t.running("run_g", "other");
+        let op = |run: &str, path: &str| wicket_core::Op::egress(&TenantId::single(), &RunId(run.into()), "z", "GET", "news.example", path);
+        // A prefix ask, narrowed by the human to a prefix within it.
+        let (rid, _) = t.ledger().ask(&op("run_e", "/items/"), "item pages", true, None).unwrap();
+        let wide = json!({ "action": "decide", "id": rid, "decision": "approve", "prefix": "/elsewhere/" });
+        assert_refused(&t.begin(wide), StatusCode::BAD_REQUEST, "doesn't cover");
+        let b = t.begin(json!({ "action": "decide", "id": rid, "decision": "approve", "uses": 5, "prefix": "/items/a/" }));
+        assert_eq!((b.body["action"]["path_prefix"].as_str(), b.body["action"]["prefix"].as_bool()), (Some("/items/a/"), Some(true)));
+        let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        let r = t.post("/api/action/finish", a);
+        assert!(r.body["ok"].as_str().unwrap().contains("every path under news.example/items/a/"), "{:?}", r.body);
+        let mut l = t.ledger();
+        assert!(l.consume_grant(&op("run_e", "/items/a/1")).unwrap().is_some());
+        assert!(l.consume_grant(&op("run_e", "/items/b/1")).unwrap().is_none(), "narrowed to what the human named");
+        // Zone-wide: another run in the zone may use it too.
+        let (rid, _) = t.ledger().ask(&op("run_e", "/feed"), "the feed", false, None).unwrap();
+        let b = t.begin(json!({ "action": "decide", "id": rid, "decision": "approve", "unlimited": true, "zone_wide": true }));
+        assert_eq!(b.body["action"]["scope"], "zone");
+        let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        assert!(t.post("/api/action/finish", a).body["ok"].as_str().unwrap().contains("any run in zone z"));
+        assert!(t.ledger().consume_grant(&op("run_g", "/feed")).unwrap().is_some(), "zone-wide");
+        let (_, rec) = t.audit_kinds().pop().unwrap();
+        assert_eq!((rec["scope"].as_str(), rec["action"].as_str()), (Some("zone"), Some("decide")));
+        // A capacity ask: denying it releases its lease's reservation at once.
+        let mut l = t.ledger();
+        let row = wicket_store::LeaseRow {
+            id: "l-c".into(),
+            tenant: TenantId::single().0,
+            run: "run_e".into(),
+            request_id: None,
+            provider: "static".into(),
+            spec: json!({}),
+            hourly_cap: 0,
+            reserved: 0,
+            duration_secs: 1800,
+            created_at: 0,
+            not_after: None,
+            status: "pending".into(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        };
+        l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 0, max_total: 0 }).unwrap().unwrap();
+        let cap = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "CAPACITY", "wicket.internal", "/capacity/l-c");
+        let (rid, _) = l.pending_for(&cap, "a node", None).unwrap();
+        l.set_lease_request("l-c", &rid).unwrap();
+        let r = t.act(json!({ "action": "decide", "id": rid, "decision": "deny" }));
+        assert!(r.body["ok"].as_str().unwrap().contains("lease l-c's reservation is released"), "{:?}", r.body);
+        assert_eq!(t.ledger().lease("l-c").unwrap().unwrap().status, "denied");
         assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
     }
 

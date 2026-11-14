@@ -1,18 +1,15 @@
-//! Orphaned boxes (#21). A box is supervised by the `wicket run` process that started it: that process
+//! Box owners (#21). A box is supervised by the `wicket run` process that started it: that process
 //! holds its proxies, sockets and identity. If it dies hard (SIGKILL, a crash), Docker can keep the box
-//! running with nothing behind it. Each box is labelled with its run and its owner process, and the
-//! reaper stops boxes whose owner is gone.
+//! running with nothing behind it. Each box is labelled with its run and its owner process; the
+//! reconciler (`wicket reconcile`) and a node's `serve` judge boxes by it.
 //!
 //! The owner label is `<machine>:<pid>:<start>`: the host's machine id, the process id, and the
 //! process's start time (field 22 of /proc/<pid>/stat), so a reused pid isn't mistaken for the owner.
 //! A box owned by a process on another machine is left alone: only that machine can tell.
 
-use anyhow::Result;
-use wicket_core::{RunId, TenantId};
-use wicket_sandbox::{BoxInfo, Docker};
-use wicket_store::Ledger;
+use wicket_sandbox::BoxInfo;
 
-/// The status a reaped run ends with.
+/// The status a run whose box is gone ends with.
 pub const LOST: &str = "lost";
 
 fn machine_id() -> String {
@@ -70,52 +67,6 @@ pub fn judge(b: &BoxInfo, run_status: Option<&str>) -> Verdict {
             None => Verdict::Unknown("no owner label and no run in this ledger".into()),
         },
     }
-}
-
-pub struct Reaped {
-    pub name: String,
-    pub run: Option<String>,
-    pub verdict: Verdict,
-}
-
-/// Judges every wicket box Docker is running; unless `dry_run`, stops the orphans and ends their runs
-/// in the ledger (which withdraws their pending requests).
-pub async fn reap(docker: &Docker, ledger: &Ledger, dry_run: bool) -> Result<Vec<Reaped>> {
-    let mut out = vec![];
-    for mut b in docker.boxes().await? {
-        let status = match &b.run {
-            Some(r) => ledger.run_status(r)?,
-            None => None,
-        };
-        // Judged by the run's supervisor as the ledger has it (it changes when one re-attaches, #151),
-        // and a running run whose supervisor is gone is left to `wicket reconcile`, which re-attaches
-        // to it or ends it.
-        if let Some(o) = b.run.as_deref().map(|r| ledger.run_owner(r)).transpose()?.flatten() {
-            b.owner = Some(o);
-        }
-        let verdict = match judge(&b, status.as_deref()) {
-            Verdict::Orphan(_) if status.as_deref() == Some("running") => {
-                Verdict::Unknown("its supervisor is gone: `wicket reconcile` re-attaches to its run or ends it".into())
-            }
-            v => v,
-        };
-        if let (Verdict::Orphan(why), false) = (&verdict, dry_run) {
-            docker.kill(&b.name).await?;
-            if let Some(r) = &b.run {
-                if status.as_deref() == Some("running") {
-                    ledger.run_ended(&RunId(r.clone()), LOST, &format!("box stopped by the reaper: {why}"))?;
-                }
-                let _ = ledger.audit(
-                    &TenantId::single(),
-                    Some(&RunId(r.clone())),
-                    "box.reaped",
-                    &serde_json::json!({ "box": b.name, "why": why }),
-                );
-            }
-        }
-        out.push(Reaped { name: b.name, run: b.run, verdict });
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

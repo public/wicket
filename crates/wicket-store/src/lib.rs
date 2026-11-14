@@ -1106,34 +1106,30 @@ impl Ledger {
 
     /// Recomputes the whole chain. Returns the number of records verified.
     pub fn verify_audit(&self) -> Result<i64> {
-        Ok(self.verify_audit_versions()?.total())
-    }
-
-    /// Recomputes the whole chain, counting the records of each chain version (#120).
-    pub fn verify_audit_versions(&self) -> Result<ChainSummary> {
         let mut st = self.conn.prepare("SELECT seq, ts, tenant, run, kind, body, prev, hash FROM audit ORDER BY seq")?;
         let mut rows = st.query([])?;
         let mut prev = CHAIN_ZERO.to_string();
-        let mut sum = ChainSummary::default();
+        let mut n = 0;
         while let Some(r) = rows.next()? {
             let (seq, ts, tenant, run, kind, body, p, h): (i64, i64, String, Option<String>, String, String, String, String) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
             let f = ChainFields { seq, ts, tenant: &tenant, run: run.as_deref(), kind: &kind, body: &body };
-            if p != prev || !sum.accept(&prev, &f, &h) {
+            if p != prev || chain_hash_v2(&prev, &f) != h {
                 return Err(StoreError::ChainBroken(seq));
             }
             prev = h;
+            n += 1;
         }
-        Ok(sum)
+        Ok(n)
     }
 }
 
 /// The `prev` of a chain's first record.
 pub const CHAIN_ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// How a v2 record's hash starts (#120). A hash without it (64 hex digits) is v1.
+/// How a record's hash starts (#120): the chain's version. Only v2 is accepted.
 pub const CHAIN_V2_PREFIX: &str = "v2:";
 
-/// Every stored field of an audit record, as the v2 chain hashes them.
+/// Every stored field of an audit record, as the chain hashes them.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainFields<'a> {
     pub seq: i64,
@@ -1142,51 +1138,6 @@ pub struct ChainFields<'a> {
     pub run: Option<&'a str>,
     pub kind: &'a str,
     pub body: &'a str,
-}
-
-/// What a chain verification found, by chain version.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ChainSummary {
-    /// Records hashed under v1 (prev, kind and body only): written before #120.
-    pub v1: i64,
-    /// Records hashed under v2 (every stored field).
-    pub v2: i64,
-}
-
-impl ChainSummary {
-    pub fn total(&self) -> i64 {
-        self.v1 + self.v2
-    }
-
-    /// Checks one record's hash under the version it names, and that the chain never goes back
-    /// from v2 to v1 (a v1 hash covers fewer fields, so a downgrade would hide edits to the rest).
-    pub fn accept(&mut self, prev: &str, f: &ChainFields<'_>, hash: &str) -> bool {
-        if hash.starts_with(CHAIN_V2_PREFIX) {
-            if chain_hash_v2(prev, f) != hash {
-                return false;
-            }
-            self.v2 += 1;
-        } else {
-            if self.v2 > 0 || chain_hash(prev, f.kind, f.body) != hash {
-                return false;
-            }
-            self.v1 += 1;
-        }
-        true
-    }
-}
-
-/// A v1 audit record's hash: sha256(prev, 0, kind, 0, body), hex. Ledgers written before #120 hold
-/// these; they still verify, but cover neither seq, ts, tenant nor run. New records use
-/// [`chain_hash_v2`].
-pub fn chain_hash(prev: &str, kind: &str, body: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(prev.as_bytes());
-    h.update([0u8]);
-    h.update(kind.as_bytes());
-    h.update([0u8]);
-    h.update(body.as_bytes());
-    hex::encode(h.finalize())
 }
 
 /// A v2 audit record's hash (#120): `v2:` and the hex sha256 of a domain tag and every stored
@@ -1813,10 +1764,13 @@ mod tests {
     fn agents_cannot_ask_in_wickets_namespace() {
         let l = Ledger::open_in_memory().unwrap();
         let (t, r) = (TenantId::single(), RunId("run_t".into()));
+        let update = format!("/self/{}", "0f".repeat(32));
         for (m, h, p) in [
             ("SPAWN", "wicket.internal", "/zones/"),
             ("CAPACITY", "wicket.internal", "/capacity/l-1"),
             ("LINK", "wicket.internal", "/links/a/b/80"),
+            ("UPDATE", "wicket.internal", update.as_str()),
+            ("UPDATE", "api.example.com", "/"),
             ("GET", "wicket.internal", "/"),
             ("GET", "relay.wicket.internal", "/"),
             ("SPAWN", "api.example.com", "/"),
@@ -2077,42 +2031,31 @@ mod tests {
             for i in 0..3 {
                 l.audit(&TenantId::single(), Some(&RunId("run_a".into())), "test", &serde_json::json!({ "i": i })).unwrap();
             }
-            assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 0, v2: 3 });
+            assert_eq!(l.verify_audit().unwrap(), 3);
             l.conn.execute(e, []).unwrap();
             assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(_))), "{e} went unnoticed");
         }
     }
 
-    /// #120: a ledger written before v2 still verifies, new records continue it as v2, and a v1
-    /// record after a v2 one (a downgrade, to hide an edit) is refused.
+    /// #120: a record hashed the pre-v2 way (prev, kind and body only) doesn't verify.
     #[test]
-    fn v1_ledgers_still_verify_and_never_follow_v2() {
+    fn a_pre_v2_record_breaks_the_chain() {
         let l = Ledger::open_in_memory().unwrap();
-        let mut prev = CHAIN_ZERO.to_string();
-        let v1 = |l: &Ledger, prev: &str, i: i64| -> String {
-            let body = serde_json::json!({ "i": i }).to_string();
-            let h = chain_hash(prev, "old", &body);
-            l.conn
-                .execute(
-                    "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (1, 't0', NULL, 'old', ?1, ?2, ?3)",
-                    params![body, prev, h],
-                )
-                .unwrap();
-            h
-        };
-        for i in 0..3 {
-            prev = v1(&l, &prev, i);
-        }
-        assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 3, v2: 0 });
-        l.conn.execute("UPDATE audit SET ts = 99 WHERE seq = 2", []).unwrap();
-        assert_eq!(l.verify_audit().unwrap(), 3, "v1 never covered ts: old ledgers keep verifying");
-        let s = l.audit(&TenantId::single(), None, "new", &serde_json::json!({})).unwrap();
-        assert_eq!(s, 4);
-        assert_eq!(l.verify_audit_versions().unwrap(), ChainSummary { v1: 3, v2: 1 });
+        l.audit(&TenantId::single(), None, "new", &serde_json::json!({})).unwrap();
         let head = l.audit_head().unwrap().unwrap().1;
         assert!(head.starts_with(CHAIN_V2_PREFIX));
-        v1(&l, &head, 9);
-        assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(5))));
+        let body = serde_json::json!({ "i": 9 }).to_string();
+        let mut h = Sha256::new();
+        for part in [head.as_bytes(), b"\0", b"old", b"\0", body.as_bytes()] {
+            h.update(part);
+        }
+        l.conn
+            .execute(
+                "INSERT INTO audit (ts, tenant, run, kind, body, prev, hash) VALUES (1, 't0', NULL, 'old', ?1, ?2, ?3)",
+                params![body, head, hex::encode(h.finalize())],
+            )
+            .unwrap();
+        assert!(matches!(l.verify_audit(), Err(StoreError::ChainBroken(2))));
     }
 
     #[test]

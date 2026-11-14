@@ -23,7 +23,18 @@ fn dir() -> PathBuf {
 }
 
 fn installed() -> Option<String> {
-    std::fs::read_to_string(dir().join("installed")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    installed_in(&dir())
+}
+
+/// The applied org policy's version in a policy directory (`<data dir>/policy`), if one was applied.
+pub fn installed_in(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("installed")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The groups zones are in, as Cedar entities JSON, from a policy directory: its
+/// `org-entities.json`, or none (`[]`) without one. The one reader of that file.
+pub fn entities_in(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("org-entities.json")).unwrap_or_else(|_| "[]".into())
 }
 
 /// The installation's org policy, if one was applied. Refused if it isn't what was applied.
@@ -38,8 +49,7 @@ pub fn org() -> Result<Option<OrgPolicy>> {
         },
         Err(e) => return Err(e).with_context(|| p.display().to_string()),
     };
-    let ents = std::fs::read_to_string(dir().join("org-entities.json")).unwrap_or_else(|_| "[]".into());
-    let o = OrgPolicy::parse(&text, &ents).with_context(|| p.display().to_string())?;
+    let o = OrgPolicy::parse(&text, &entities_in(&dir())).with_context(|| p.display().to_string())?;
     match want {
         Some(v) if v == o.version() => Ok(Some(o)),
         Some(v) => bail!(
@@ -215,7 +225,7 @@ pub async fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool) -> Res
     if !bad.is_empty() {
         bail!("org policy {v} doesn't mint, so nothing changed:\n  - {}", bad.join("\n  - "));
     }
-    let lacking = crate::roots::nodes_below(crate::chan::ORG_POLICY).await?;
+    let lacking = crate::roots::nodes_unreachable().await?;
     if !lacking.is_empty() {
         bail!(
             "not every node can read tokens with an org layer; nothing changed:\n{}\n(update them, or revoke the ones you no longer use)",
