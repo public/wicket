@@ -275,7 +275,8 @@ sys.exit(2)
             return;
         }
         let inst = Install::new("nodesrv-images-docker");
-        let cmd: Vec<String> = std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into()).split_whitespace().map(String::from).collect();
+        let cmd: Vec<String> =
+            std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into()).split_whitespace().map(String::from).collect();
         let ctx = inst.dir.join("ctx");
         std::fs::create_dir_all(&ctx).unwrap();
         std::fs::write(ctx.join("f"), ulid::Ulid::new().to_string()).unwrap();
@@ -301,9 +302,11 @@ sys.exit(2)
         assert!(calls.has_image(&id).await.unwrap());
         let ident = docker.image_identity(&format!("wicket-test/delivered@{id}")).await.unwrap().unwrap();
         assert_eq!(ident.id, id);
-        assert!(ident.tags.is_empty(), "no tag moves: {:?}", ident.tags);
+        // Docker lists the pinned name with its tags: no `name:tag` is made or moved.
+        assert!(ident.tags.iter().all(|t| t.contains('@')), "no tag moves: {:?}", ident.tags);
 
-        // The same archive, its layer changed by a byte.
+        // The same archive, its layer changed by a byte (the manifest names it: a pin of a
+        // manifest, as a local build's is).
         rmi(&id);
         let mut entries: Vec<(String, Vec<u8>)> = vec![];
         let mut ar = tar::Archive::new(bytes.as_slice());
@@ -316,7 +319,11 @@ sys.exit(2)
                 entries.push((p, b));
             }
         }
-        let layer = entries.iter_mut().filter(|(p, _)| p.starts_with("blobs/")).max_by_key(|(_, b)| b.len()).unwrap();
+        let blob =
+            |entries: &[(String, Vec<u8>)], d: &str| entries.iter().position(|(p, _)| p == &format!("blobs/sha256/{}", &d[7..])).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&entries[blob(&entries, &id)].1).unwrap();
+        let at = blob(&entries, manifest["layers"][0]["digest"].as_str().unwrap());
+        let layer = &mut entries[at];
         let last = layer.1.len() - 1;
         layer.1[last] ^= 1;
         let e = calls.put_image(&id, Some(&name), archive(&entries).as_slice()).await.unwrap_err();

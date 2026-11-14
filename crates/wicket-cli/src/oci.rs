@@ -387,7 +387,8 @@ mod tests {
         let (d, r) = unpack(&img.entries, &img.index);
         let u = r.unwrap();
         assert_eq!((u.media_type.as_str(), u.manifests), (INDEX_TYPES[0], 1));
-        let mut kept: Vec<String> = std::fs::read_dir(d.0.join("blobs/sha256")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut kept: Vec<String> =
+            std::fs::read_dir(d.0.join("blobs/sha256")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         kept.sort();
         assert_eq!(kept.len(), 4, "the layer, config, manifest and index: not the unrelated blob");
         assert!(!kept.contains(&hex_of(&sha(b"unrelated")).unwrap().to_string()));
@@ -424,8 +425,7 @@ mod tests {
         let e = unpack(&without, &img.index).1.unwrap_err().to_string();
         assert!(e.contains("lacks"), "{e}");
         // An index whose only manifest is missing has no image.
-        let without: Vec<_> =
-            img.entries.iter().filter(|(p, _)| !p.ends_with(hex_of(&img.manifest).unwrap())).cloned().collect();
+        let without: Vec<_> = img.entries.iter().filter(|(p, _)| !p.ends_with(hex_of(&img.manifest).unwrap())).cloned().collect();
         let e = unpack(&without, &img.index).1.unwrap_err().to_string();
         assert!(e.contains("no complete image"), "{e}");
     }
