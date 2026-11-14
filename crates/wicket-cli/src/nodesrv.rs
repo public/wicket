@@ -751,8 +751,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
 /// Takes over the boxes a previous `node serve` from this directory started (#151): each running box
 /// with its record (`node-box.json`) is adopted (its proxies started again, its output read from the
 /// start, its stdin fed, its timeout kept) and waits for its control host to resume it. A box whose
-/// run has no authority in the feed any more is stopped, and so is one from before records (as
-/// before: nobody can supervise it). Any other container, wicket's or not, is left alone.
+/// run has no authority in the feed any more is stopped, and so is an orphan without a record
+/// (nobody can supervise it). Any other container, wicket's or not, is left alone.
 async fn adopt_previous(node: &Arc<Node>) {
     let runs = node.paths.runs();
     let Ok(boxes) = node.docker.boxes().await else { return };
