@@ -290,7 +290,8 @@ from the control host first (#191):
   - **Credentials.** A registry's `secret` is a vault secret (`user:password`, or a token), bound to the
     registry's host and its `auth_hosts`. The node fetches it for the run over the run's own connection, as
     it fetches any secret (#152), holds it in memory for the pull only, and never writes or logs it. The
-    control host releases it only for that run's image pull, and audits it (`node.secret_fetch`).
+    control host releases it only while that run's image pull is under way, and audits it
+    (`node.secret_fetch`, with `image_pull`); it isn't among the secrets the node keeps for the run.
 - **Recorded.** The node's audit records `image.received` (digest, name, bytes, `via` `channel` or
   `registry`) or `image.refused` (why).
 - **What it needs.** Both ends talking protocol 7 (8 to pull), and a runtime that ids images by their manifest digest
