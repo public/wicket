@@ -413,12 +413,15 @@ impl Egress {
                 ), None);
             }
             Outcome::NoEscalation(why) => {
-                emit("forbidden", format!("{why}; this run does not escalate (on_pending: fail)"));
+                emit("forbidden", format!("{why}; this run does not escalate (escalation.request: false, or on_pending: fail)"));
                 return problem(
                     403,
                     "forbidden",
-                    "Outside this program's reach",
-                    &format!("{why}. Programs do not escalate: change the program's approved reach instead."),
+                    "Blocked by wicket sandbox: never allowed",
+                    &format!(
+                        "{why}. This sandbox may not ask for anything outside its reach (its zone's escalation.request is false, or it is a program with on_pending: fail), so this will never be allowed from here. {} Do not retry it; tell the user it is blocked.",
+                        crate::SANDBOX_FACT
+                    ),
                     None,
                 );
             }
@@ -510,6 +513,7 @@ mod tests {
             swaps,
             boxes: None,
             capacity: None,
+            decisions: None,
             fence: None,
             waker: None,
             lifecycle: None,

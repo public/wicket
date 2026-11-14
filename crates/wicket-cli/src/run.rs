@@ -588,7 +588,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
     let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
-    let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
+    let escalate = m.zone.escalation.request && m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
     // Identity (design §3.2): launch is registration. wicket issues this instance's identity from
     // facts it chose, and keeps the instance's key here; the box never sees either.
     // Identities are short-lived (identity_ttl) and re-issued with a fresh key at half-life while the
@@ -853,10 +853,26 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Calls on boxes over this run's node connection (pause, exec, link sockets), made before the
     // connection itself: the link tools use them.
     let node_calls = Arc::new(crate::nodecall::Calls::default());
+    let compiled_zone = Arc::new(wicket_core::CompiledZone::new(m.zone.clone())?);
+    // `decide` (#50): an agent whose zone may grant decides its descendants' requests within its
+    // own authority, checked here against the zone and org layer its block 0 is minted from.
+    let authority_until = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let decisions = match (&m.agent, &identity) {
+        (Some(_), Some(cell)) if m.zone.escalation.grant => Some(Arc::new(crate::grant::AgentDecisions {
+            tenant: m.tenant.clone(),
+            run: run.clone(),
+            zone: compiled_zone.clone(),
+            org: org_layer.clone(),
+            until: authority_until.clone(),
+            ledger: ledger.clone(),
+            issuer: cell.current().issuer,
+        }) as Arc<dyn wicket_proxy::Decisions>),
+        _ => None,
+    };
     let ctx = RunCtx {
         tenant: m.tenant.clone(),
         run: run.clone(),
-        zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone())?),
+        zone: compiled_zone,
         org: org_layer.clone(),
         ledger: ledger.clone(),
         vault,
@@ -869,6 +885,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         boxes: Some(Arc::new(crate::links::NodeBoxes::new(ledger.clone(), &run.0, &node_name, node_calls.clone(), dir.clone()))
             as Arc<dyn wicket_proxy::link::BoxOps>),
         capacity,
+        decisions,
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
@@ -1086,6 +1103,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             None => backstop + 30,
             Some(_) => m.zone.limits.authority()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs().min(backstop),
         };
+        // Before the box's block 0 is minted (a little later, so it ends a little later): what the
+        // agent may grant ends no later than this.
+        authority_until.store(
+            wicket_store::now().saturating_add(i64::try_from(authority_secs).unwrap_or(i64::MAX)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let start = crate::chan::BoxStart {
             run: run.0.clone(),
             tenant: m.tenant.0.clone(),

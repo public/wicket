@@ -17,8 +17,8 @@ pub mod text;
 
 pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
-    AcpSpec, AgentSpec, Harness, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, Persist, ProgramSpec, ReachRule, RemoteSpec,
-    VolumeSpec, WildcardSpec, ZoneSpec,
+    AcpSpec, AgentSpec, Escalation, Harness, InjectRule, Isolation, Limits, LlmSpec, Manifest, OnPending, Persist, ProgramSpec, ReachRule,
+    RemotePermissionMode, RemoteSpec, VolumeSpec, WildcardSpec, ZoneSpec,
 };
 pub use op::{evaluate, host_verdict, is_public_ip, never_reachable, CompiledZone, HostVerdict, Op, RiskClass, Surface, Verdict};
 

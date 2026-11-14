@@ -133,6 +133,59 @@ pub const ACP_PROFILES: [&str; 1] = ["claude-agent-acp"];
 pub struct RemoteSpec {
     /// The session's name in the vendor's apps.
     pub name: String,
+    /// How far the harness acts without asking in the app (#285). Whatever the mode, wicket's
+    /// proxies decide what the box can reach. Left out when `default`, so manifests that don't set it
+    /// serialize as before.
+    #[serde(default, skip_serializing_if = "RemotePermissionMode::is_default")]
+    pub permission_mode: RemotePermissionMode,
+}
+
+/// `agent.remote.permission_mode`: the modes `claude remote-control --permission-mode` takes. A
+/// harness adapter maps them to its own, and one without the setting refuses any but `default`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePermissionMode {
+    AcceptEdits,
+    Auto,
+    BypassPermissions,
+    /// The harness asks in the app before it acts, as a session on the owner's own machine would.
+    #[default]
+    Default,
+    DontAsk,
+    Plan,
+}
+
+impl RemotePermissionMode {
+    pub const ALL: [RemotePermissionMode; 6] = [
+        RemotePermissionMode::AcceptEdits,
+        RemotePermissionMode::Auto,
+        RemotePermissionMode::BypassPermissions,
+        RemotePermissionMode::Default,
+        RemotePermissionMode::DontAsk,
+        RemotePermissionMode::Plan,
+    ];
+
+    pub fn is_default(&self) -> bool {
+        *self == RemotePermissionMode::Default
+    }
+
+    /// The mode's name, as the manifest spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemotePermissionMode::AcceptEdits => "acceptEdits",
+            RemotePermissionMode::Auto => "auto",
+            RemotePermissionMode::BypassPermissions => "bypassPermissions",
+            RemotePermissionMode::Default => "default",
+            RemotePermissionMode::DontAsk => "dontAsk",
+            RemotePermissionMode::Plan => "plan",
+        }
+    }
+}
+
+impl std::fmt::Display for RemotePermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Adapter settings a manifest may set: presentation and commit metadata only. Hooks, permissions,
@@ -234,6 +287,38 @@ pub struct ZoneSpec {
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+    /// Whether this zone's agents may ask for what is outside their reach, and decide their
+    /// descendants' requests within it (#50). Both default on. Written out only when it isn't the
+    /// default, so a zone that doesn't use it reads the same to a node that doesn't know it.
+    #[serde(default, skip_serializing_if = "Escalation::is_default")]
+    pub escalation: Escalation,
+}
+
+/// Who may escalate (#50): ask for more, and grant others what this zone may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Escalation {
+    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `ask_human`,
+    /// `request_capacity`, `request_update`). Off: anything outside the zone's reach is "never
+    /// allowed" instead of pending.
+    #[serde(default = "yes")]
+    pub request: bool,
+    /// May approve or deny its descendants' requests, only for what its own zone reaches (the
+    /// gateway's `decide` tool).
+    #[serde(default = "yes")]
+    pub grant: bool,
+}
+
+impl Default for Escalation {
+    fn default() -> Self {
+        Escalation { request: true, grant: true }
+    }
+}
+
+impl Escalation {
+    pub fn is_default(&self) -> bool {
+        *self == Escalation::default()
+    }
 }
 
 impl ZoneSpec {
@@ -829,6 +914,20 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// #50: both rights default on, and a zone that doesn't restrict them serializes without the
+    /// field (the feed carries zones to nodes that refuse unknown fields).
+    #[test]
+    fn escalation_defaults_on_and_is_written_only_when_restricted() {
+        let z: ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        assert_eq!(z.escalation, Escalation { request: true, grant: true });
+        assert!(!serde_json::to_string(&z).unwrap().contains("escalation"));
+        let r: ZoneSpec = serde_yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
+        assert_eq!(r.escalation, Escalation { request: false, grant: true });
+        let back: ZoneSpec = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.escalation, r.escalation);
+        assert!(serde_yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
+    }
+
     /// #126: a zero limit means no limit to Docker, so a manifest can't set one.
     #[test]
     fn every_limit_is_a_positive_bound() {
@@ -950,6 +1049,10 @@ zone:
         assert!(host_matches("api.github.com", "API.GitHub.com."));
     }
 
+    fn m_mode(y: &dyn Fn(&str) -> Result<Manifest, ManifestError>, extra: &str) -> Result<RemotePermissionMode, ManifestError> {
+        Ok(y(&format!(", remote: {{ name: x{extra} }}"))?.agent.unwrap().remote.unwrap().permission_mode)
+    }
+
     #[test]
     fn a_remote_session_needs_no_task_but_a_good_name() {
         let y = |agent: &str| Manifest::from_yaml(&format!("agent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
@@ -959,6 +1062,19 @@ zone:
         assert!(y(", remote: { name: '' }").is_err());
         assert!(y(", remote: { name: 'a/b' }").is_err());
         assert!(y(", remote: { name: x, mode: y }").is_err(), "unknown fields");
+        assert_eq!(m_mode(&y, "").unwrap(), RemotePermissionMode::Default);
+        assert_eq!(m_mode(&y, ", permission_mode: bypassPermissions").unwrap(), RemotePermissionMode::BypassPermissions);
+        for mode in RemotePermissionMode::ALL {
+            assert_eq!(m_mode(&y, &format!(", permission_mode: {mode}")).unwrap(), mode);
+        }
+        let e = y(", remote: { name: x, permission_mode: yolo }").unwrap_err().to_string();
+        assert!(e.contains("unknown variant `yolo`"), "{e}");
+        assert!(y(", remote: { name: x, permission_mode: BypassPermissions }").is_err(), "spelled as the CLI takes it");
+        // A default mode isn't written out, so a remote manifest's digest is unchanged.
+        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
+        assert!(!rc.contains("permission_mode"), "{rc}");
+        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
+        assert!(rc.contains("permission_mode: plan"), "{rc}");
         // Other manifests serialize as before (their identity digests don't change).
         let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
         assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));

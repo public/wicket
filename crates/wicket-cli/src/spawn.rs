@@ -239,6 +239,9 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
             if !obj.contains_key("unlisted_hosts") {
                 obj.insert("unlisted_hosts".into(), serde_json::to_value(p.zone.unlisted_hosts).unwrap_or_default());
             }
+            if !obj.contains_key("escalation") {
+                obj.insert("escalation".into(), serde_json::to_value(p.zone.escalation).unwrap_or_default());
+            }
             if !obj.contains_key("wildcards") {
                 obj.insert("wildcards".into(), serde_json::to_value(p.zone.wildcards).unwrap_or_default());
             }
@@ -410,6 +413,13 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                     "spawn.beyond_parent",
                     &serde_json::json!({ "zone": zone_name, "grant": gid, "exceeds": violations }),
                 );
+            }
+            // A zone that may not ask (#50): nobody is asked, whatever the caller says.
+            None if !p.zone.escalation.request => {
+                return Err(format!(
+                    "this zone is not within yours:\n- {}\nYour zone may not ask for more (escalation.request: false), so this will never be allowed from here; narrow it.",
+                    violations.join("\n- ")
+                ));
             }
             None if !req.ask_human => {
                 return Err(format!(
@@ -940,6 +950,23 @@ mod tests {
         let p = parent(1, ZONE);
         let out = spawn(&p.ctx, program("worker")).unwrap();
         assert!(out.contains("zone z.worker.01parent,"), "{out}");
+    }
+
+    /// #50: a child keeps its parent's escalation rights unless it narrows them, and can't be given
+    /// one the parent lacks; a parent that may not ask doesn't ask a human for it either.
+    #[test]
+    fn escalation_rights_only_narrow() {
+        let p = parent(4, &format!("{ZONE}  escalation: {{ request: false, grant: false }}\n"));
+        let out = spawn(&p.ctx, program("worker")).unwrap();
+        assert!(out.contains("zone z.worker.01parent,"), "inherited, so within: {out}");
+        for (esc, needle) in [(json!({ "grant": true, "request": false }), "escalation.grant"), (json!({}), "escalation.request")] {
+            let mut req = program("wider");
+            req.zone.as_mut().unwrap()["escalation"] = esc;
+            req.ask_human = true;
+            let e = spawn(&p.ctx, req).unwrap_err();
+            assert!(e.contains(needle) && e.contains("escalation.request: false"), "{e}");
+        }
+        assert!(p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty(), "nobody asked");
     }
 
     /// #118: a different model route or credential is refused outright; a card for anything else

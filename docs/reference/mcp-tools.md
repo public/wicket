@@ -20,7 +20,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | tool | what it does | needs |
 |---|---|---|
 | [`await_grant`](#await_grant) | Wait for a human's decision on a pending request | |
-| [`pending_requests`](#pending_requests) | List this run's requests still waiting | |
+| [`pending_requests`](#pending_requests) | List this run's requests still waiting, and descendants' it may decide | |
+| [`decide`](#decide) | Approve or deny a descendant's request within the caller's own reach | `escalation.grant` |
 | [`request_access`](#request_access) | Ask a human for reach ahead of time | |
 | [`whoami`](#whoami) | This box's verified identity | |
 | [`send_message`](#send_message) | Message the parent, a child or a permitted peer | |
@@ -51,7 +52,34 @@ request once. A run can only wait on its own requests.
 
 ## `pending_requests`
 
-Lists this run's requests that are still waiting for a human. No arguments.
+Lists this run's requests that are still waiting for a decision. For an agent whose zone may grant
+(`escalation.grant`, the default), it also lists its descendants' pending requests that it could
+decide with [`decide`](#decide). No arguments.
+
+## `decide`
+
+Approves or denies a pending request from one of the caller's descendants (a box it started, or
+one they started; [#50](https://github.com/public/wicket/issues/50)). The decision is signed with
+the caller's wicket identity and recorded, with the chain from the asking run to the caller, as a
+human's is; the first decision on a request wins. Only the caller's own call decides: nothing sent
+with `send_message` can make one. A request the caller may not decide is refused, saying why, and
+stays pending for a human. It may decide a request only when:
+
+- the caller's zone has `escalation.grant` ([manifest](manifest.md#zone));
+- it is an HTTP request for one path (SPAWN, LINK, CAPACITY, UPDATE, prefix requests and git
+  pushes stay with humans);
+- the caller's own zone allows it by reach at the request's risk, and the org policy doesn't
+  refuse it: what the caller could do itself, never by one of its own grants.
+
+An approval grants exactly the asked path, to the asking run only, for `uses` uses, and ends no
+later than the caller's own authority.
+
+| argument | type | default | |
+|---|---|---|---|
+| `request_id` | string | required | from `pending_requests` |
+| `decision` | `approve` or `deny` | required | |
+| `uses` | integer, 1–100 | 1 | |
+| `ttl_seconds` | integer | 600 | at most 24h, and not past the caller's authority |
 
 ## `request_access`
 

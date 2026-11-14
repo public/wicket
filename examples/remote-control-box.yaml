@@ -13,6 +13,8 @@
 # host.
 agent:
   name: rc-box
+  # Add `permission_mode: bypassPermissions` for a box nobody watches: `default` asks in the app
+  # before each action. wicket's proxies decide what the box can reach whatever the mode.
   remote: { name: wicket-box }
 zone:
   name: remote-control-box

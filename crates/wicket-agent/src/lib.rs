@@ -261,7 +261,14 @@ const RC_NOTICE: &str = "- You are a Remote Control session: the user talks to y
 /// (swapped by the egress proxy toward `api.anthropic.com`, refreshed only on the host); wicket's
 /// gateway is the only MCP server, the sandbox notice is the user memory, and `/workspace` is
 /// trusted, so nothing waits on a terminal that isn't there.
-pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &Value) -> anyhow_free::Result<WrappedPlan> {
+///
+/// `permission_mode` is `agent.remote.permission_mode` as `--permission-mode` takes it (#285).
+pub fn claude_code_remote_control_plan(
+    m: &Manifest,
+    run: &RunId,
+    login_meta: &Value,
+    permission_mode: &str,
+) -> anyhow_free::Result<WrappedPlan> {
     let agent = m.agent.as_ref().ok_or_else(|| anyhow_free::Error("not an agent manifest".into()))?;
     let rc = agent.remote.as_ref().ok_or_else(|| anyhow_free::Error("no agent.remote".into()))?;
     let tag = run.0.replace('_', "-");
@@ -290,10 +297,10 @@ pub fn claude_code_remote_control_plan(m: &Manifest, run: &RunId, login_meta: &V
         // One session per box: the box ends with it.
         "--spawn",
         "session",
-        // Claude Code asks in the app before it acts, as a session on the owner's own machine would;
-        // wicket's proxies decide what the box can reach either way.
+        // The manifest's mode: `default` asks in the app before it acts, as a session on the owner's
+        // own machine would; wicket's proxies decide what the box can reach whatever the mode.
         "--permission-mode",
-        "default",
+        permission_mode,
     ]
     .map(String::from)
     .to_vec();
@@ -723,7 +730,41 @@ mod tests {
     }
 
     fn remote_manifest() -> Manifest {
-        Manifest::from_yaml("agent: { name: rc, remote: { name: my box } }\nzone: { name: z, llm: { secret: claude-login } }\n").unwrap()
+        remote_manifest_with("")
+    }
+
+    fn remote_manifest_with(extra: &str) -> Manifest {
+        Manifest::from_yaml(&format!(
+            "agent: {{ name: rc, remote: {{ name: my box{extra} }} }}\nzone: {{ name: z, llm: {{ secret: claude-login }} }}\n"
+        ))
+        .unwrap()
+    }
+
+    fn permission_mode_of(w: &WrappedPlan) -> &str {
+        let at = w.plan.argv.iter().position(|a| a == "--permission-mode").expect("a --permission-mode flag");
+        assert_eq!(w.plan.argv.iter().filter(|a| *a == "--permission-mode").count(), 1);
+        &w.plan.argv[at + 1]
+    }
+
+    #[test]
+    fn a_remote_session_takes_its_permission_mode_from_the_manifest() {
+        let run = RunId("run_rc2".into());
+        let rc = harness::adapter(Harness::ClaudeCode);
+        // Unset: unchanged from before #285.
+        let w = rc.remote_plan(&remote_manifest(), &run, &Value::Null).unwrap();
+        assert_eq!(permission_mode_of(&w), "default");
+        let m = remote_manifest_with(", permission_mode: bypassPermissions");
+        let w = rc.remote_plan(&m, &run, &Value::Null).unwrap();
+        assert_eq!(permission_mode_of(&w), "bypassPermissions");
+        for mode in wicket_core::RemotePermissionMode::ALL {
+            let m = remote_manifest_with(&format!(", permission_mode: {mode}"));
+            assert_eq!(permission_mode_of(&rc.remote_plan(&m, &run, &Value::Null).unwrap()), mode.as_str());
+        }
+        // An unknown mode never makes a manifest.
+        let e = Manifest::from_yaml("agent: { name: rc, remote: { name: b, permission_mode: yolo } }\nzone: { name: z, llm: {} }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown variant `yolo`") && e.contains("bypassPermissions"), "{e}");
     }
 
     #[test]

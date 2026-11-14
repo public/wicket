@@ -73,6 +73,10 @@ says which it has (a mode it hasn't is refused, saying so):
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
+| `permission_mode` | string | `default` | How far the harness acts without asking in the app: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. |
+
+Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
+whether the harness asks the owner in the app first, as `bypassPermissions` does for the driven mode.
 
 The zone's `llm.secret` is then the account login, which the box only ever holds as a placeholder.
 See [drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md).
@@ -118,6 +122,7 @@ A program's zone has no model: a `zone.llm` section is an error.
 | `volumes` | list of [volumes](#volumes) | `[]` | Named directories that persist between runs of the zone. |
 | `images` | list of strings | `[]` | Images boxes in this zone may start children from with `spawn`, besides their own: by tag, or [pinned by digest](#image-pins). |
 | `accept_from` | list of zone names | `[]` | Zones whose agents may message agents in this zone, and connect to its exposed ports, besides parent and children. Senders are identified by wicket, never by their own claim. |
+| `escalation` | `{ request, grant }` | `{ request: true, grant: true }` | Who in this zone may escalate ([#50](https://github.com/public/wicket/issues/50)). `request: false`: anything outside the zone's reach is "never allowed" instead of a pending request (`request_access`, `spawn` with `ask_human`, `request_capacity` and `request_update` ask nobody). `grant: false`: the zone's agents can't [`decide`](mcp-tools.md#decide) their descendants' requests. A spawned zone keeps its parent's unless it narrows them, and can't be given one the parent lacks. |
 | `limits` | [limits](#limits) | see below | Resources, time and output. |
 
 ### `reach`
