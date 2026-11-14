@@ -67,7 +67,9 @@ two ends talk if the versions are **at most one apart**, at the lower one. So:
 - a control host at N talks to nodes at N−1 and N (the rollout: control host first);
 - a node at N talks to a control host at N−1 (the control host rolled back) and N+1.
 
-`wicket self update` refuses a build more than one protocol version from the running one. A message
+`wicket self update` takes a build more than one protocol version from the running one only as a
+jump that switches the control host and every active enrolled node together, and refuses it while
+any is left out, naming them ([updates](../explanation/updates.md#protocol-versions-and-skew)). A message
 added in version N is sent only on a connection that negotiated N or later, since an older peer
 drops a connection on a message it can't parse; a field added with a default needs no new version.
 Support for N−1 is removed only after a release that spoke N everywhere. The build (sha256) is still

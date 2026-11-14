@@ -129,16 +129,32 @@ fn fmt_time(t: i64) -> String {
 }
 
 /// Asks on the terminal. Without one, nothing is approved.
+///
+/// Through wicketd (an installed host) the command runs in the daemon, which has no controlling
+/// terminal: there the caller's own stdin and stderr, passed over the socket, are the terminal when
+/// both are one. Piped input is never taken as an approval.
 struct TerminalApprover;
+
+/// The caller's terminal: /dev/tty, else stdin (read) and stderr (write) when both are terminals.
+fn approval_terminal() -> Option<(Box<dyn std::io::Read + Send>, Box<dyn std::io::Write + Send>)> {
+    use std::io::IsTerminal;
+    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        let w = tty.try_clone().ok()?;
+        return Some((Box::new(tty), Box::new(w)));
+    }
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        return Some((Box::new(std::io::stdin()), Box::new(std::io::stderr())));
+    }
+    None
+}
 
 impl SpendApprover for TerminalApprover {
     async fn approve(&self, r: &SpendRequest) -> Approval {
         let r = r.clone();
         tokio::task::spawn_blocking(move || {
-            let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+            let Some((tty, mut w)) = approval_terminal() else {
                 return Approval::Denied("no terminal to ask on".into());
             };
-            let mut w = &tty;
             let _ = writeln!(
                 w,
                 "\nspend approval: {} node {:?} for {:?}\n  plan {} in {}: {}/h, for {} (worst case {})\n  already committed: {}/h, {} (envelope: {}/h, {} total)",
@@ -158,7 +174,7 @@ impl SpendApprover for TerminalApprover {
             let _ = write!(w, "approve? type yes: ");
             let _ = w.flush();
             let mut line = String::new();
-            let _ = std::io::BufReader::new(&tty).read_line(&mut line);
+            let _ = std::io::BufReader::new(tty).read_line(&mut line);
             if line.trim() == "yes" {
                 Approval::Approved
             } else {
@@ -231,6 +247,17 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             crate::enrol::validate_name(&name)?;
             if !no_enrol {
                 wicket_proxy::ca::permitted_dns_subtrees(&hosts)?;
+            }
+            // Before anything is created or spent: the node is reached with this key now and on every
+            // later run (enrolment records its path), by whoever runs wicket here. Through wicketd that is
+            // the wicket user, which can't read a key in the caller's home.
+            if let Some(k) = &ssh_key {
+                std::fs::File::open(k).with_context(|| {
+                    format!(
+                        "reading the ssh key {} (on an installed host wicket reaches nodes as the wicket user: keep the key where it can read it, e.g. /var/lib/wicket/ssh/, owned by wicket, mode 0600)",
+                        k.display()
+                    )
+                })?;
             }
             let lifetime = humantime::parse_duration(&lifetime)?;
             let ca_ttl = humantime::parse_duration(&ca_ttl)?;

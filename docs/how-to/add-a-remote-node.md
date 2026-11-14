@@ -44,7 +44,7 @@ gives it a 24-hour identity certificate and a 24-hour node CA.
 
 ```sh
 wicket node install n1                       # copies this wicket binary, starts the wicket-node service
-ssh wicket@203.0.113.7 '~/.local/bin/wicket image'   # builds wicket/claude-code:poc on the node
+ssh wicket@203.0.113.7 '~/.local/bin/wicket image'   # builds the node's own image, wicket/claude-code:<build id>
 ```
 
 `node install` checks the binary's sha256 on the node and installs it as a version, with

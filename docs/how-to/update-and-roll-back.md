@@ -42,6 +42,10 @@ sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # control
   read). Its signature is `<artifact>.sig` unless `--sig` says otherwise. It must be readable by the
   `wicket` user (`/tmp` is).
 - `--nodes all` (or `n1,n2`) updates nodes after the control host, one at a time, the first a canary.
+- A build more than one protocol version ahead (a host that missed releases) is a **jump**: it needs
+  every enrolled remote node in `--nodes` (`--nodes all`), and switches them with the control host
+  instead of after it. If a node is left out, the update is refused and names it: add it, or revoke a
+  node you no longer use (`sudo wicket node revoke NAME`). With no remote nodes, a jump just works.
   `--only-nodes` updates only them, when the control host already runs the build.
 - Each new build is watched for `--window` (30 s) every `--interval` (10 s). Add your own smoke test
   with `--check 'CMD'` (repeatable; `$WICKET` is the new binary and `$WICKET_UPDATE_TARGET` is
