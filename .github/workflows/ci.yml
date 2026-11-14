@@ -2,8 +2,17 @@ name: CI
 
 on:
   pull_request:
+    # `labeled`: adding the full-ci label runs everything (#218).
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
+  # GitHub's merge queue (#220): each queued PR is tested on top of the latest main, and of the PRs
+  # ahead of it, before it lands. The queue itself is a repository setting the owner turns on; its
+  # required checks must run on this event, which these jobs do as they are.
+  merge_group:
+  # The full set, nightly (a PR runs what its change can affect).
+  schedule:
+    - cron: "41 2 * * *"
 
 permissions:
   contents: read
@@ -17,6 +26,44 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # #218: what a pull request can affect (ci/affected.py, ci/affected.map): its crates and their
+  # reverse dependencies, and the end-to-end suites its paths map to. Pushes to main, the merge queue,
+  # the nightly run and a PR labelled full-ci select everything. Every job below runs in full when this job fails or
+  # says nothing: an empty output means run.
+  select:
+    name: What this change can affect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      crates: ${{ steps.select.outputs.crates }}
+      all_crates: ${{ steps.select.outputs.all_crates }}
+      doc_crates: ${{ steps.select.outputs.doc_crates }}
+      args: ${{ steps.select.outputs.args }}
+      doc_args: ${{ steps.select.outputs.doc_args }}
+      rust: ${{ steps.select.outputs.rust }}
+      suites: ${{ steps.select.outputs.suites }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The selection's own test (synthetic changes, every out-of-crate input mapped)
+        run: ci/affected.py --self-test
+      - id: select
+        name: Select
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          if [ "$EVENT" = pull_request ] && [ "$FULL" != true ]; then
+            ci/affected.py --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
+          else
+            echo "the full set ($EVENT; full-ci label: $FULL)"
+            ci/affected.py --files /dev/null --github-output "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT" >>"$GITHUB_STEP_SUMMARY"
+
   # The repository is public: no secrets or details of real machines, in any commit.
   public:
     name: No secrets or machine details
@@ -45,18 +92,58 @@ jobs:
 
   rust:
     name: Format, clippy and tests
+    needs: select
+    if: ${{ !cancelled() && needs.select.outputs.rust != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      NEXTEST_VERSION: 0.9.151
+      NEXTEST_SHA256: 1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Selected crates
+        id: pkgs
+        env:
+          ARGS: ${{ needs.select.outputs.args }}
+          DOC_ARGS: ${{ needs.select.outputs.doc_args }}
+          ALL: ${{ needs.select.outputs.all_crates }}
+        # ci/affected.py builds the package arguments (its self-test covers them): `-p` per crate,
+        # empty when none (a doctest step then skips). No selection (its job failed): everything.
+        run: |
+          if [ "$ALL" = false ]; then
+            echo "args=$ARGS" >>"$GITHUB_OUTPUT"
+            echo "doc_args=$DOC_ARGS" >>"$GITHUB_OUTPUT"
+          else
+            echo "args=--workspace" >>"$GITHUB_OUTPUT"
+            echo "doc_args=--workspace" >>"$GITHUB_OUTPUT"
+          fi
+      - name: cargo-nextest (a CI tool, checksum-verified)
+        if: ${{ steps.pkgs.outputs.args != '' }}
+        run: |
+          f=cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz
+          curl -sSfLO "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/$f"
+          echo "${NEXTEST_SHA256}  $f" | sha256sum -c -
+          tar xzf "$f" -C ~/.cargo/bin cargo-nextest
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - if: ${{ steps.pkgs.outputs.args != '' }}
+        run: cargo clippy ${{ steps.pkgs.outputs.args }} --all-targets --locked -- -D warnings
+      - name: Tests (nextest; a test that passed only on a retry is reported as flaky)
+        if: ${{ steps.pkgs.outputs.args != '' }}
+        run: |
+          set -o pipefail
+          cargo nextest run ${{ steps.pkgs.outputs.args }} --locked --profile ci 2>&1 | tee nextest.log
+          if grep -q FLAKY nextest.log; then
+            { echo "### Flaky tests (passed on a retry)"; grep FLAKY nextest.log | sed 's/^/    /'; } >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Doctests (nextest doesn't run them)
+        if: ${{ steps.pkgs.outputs.doc_args != '' }}
+        run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
       - name: docs/reference/cli.md matches the commands' --help
+        if: ${{ needs.select.outputs.all_crates != 'false' || contains(needs.select.outputs.crates, 'wicket-cli') || contains(needs.select.outputs.suites, ' cli-ref ') }}
         run: cargo build -p wicket-cli --locked && WICKET=target/debug/wicket ci/gen-cli-reference.sh --check
 
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
@@ -79,6 +166,9 @@ jobs:
   # credential is used.
   smoke:
     name: gVisor smoke test
+    needs: select
+    # Any of its suites selected (or no selection: everything).
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') || contains(needs.select.outputs.suites, ' hibernate ') || contains(needs.select.outputs.suites, ' restore ') || contains(needs.select.outputs.suites, ' acceptance ') || contains(needs.select.outputs.suites, ' daemon-uids ') || contains(needs.select.outputs.suites, ' install-test ')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -113,19 +203,25 @@ jobs:
       - name: Build the agent image
         run: target/debug/wicket image
       - name: Smoke test
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' smoke ') }}
         run: WICKET=target/debug/wicket ci/smoke.sh
       - name: Hibernate and wake
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' hibernate ') }}
         run: WICKET=target/debug/wicket ci/hibernate.sh
       # #154: the ledger streamed to an S3-compatible store, the host lost, a standby restored.
       - name: Restore onto a standby
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' restore ') }}
         run: WICKET=target/debug/wicket ci/restore.sh
       # #41: the release acceptance test's local flows (a few minutes; the multi-host and installed
       # variants run nightly, .github/workflows/acceptance.yml).
       - name: Acceptance
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' acceptance ') }}
         run: WICKET=target/debug/wicket IMAGE=wicket/claude-code:poc H3GET=ci/h3get/target/x86_64-unknown-linux-musl/release/h3get ci/acceptance.sh
       # #12: the daemon with real, different uids (nobody as an operator, root as the break-glass).
       - name: wicketd with second uids
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' daemon-uids ') }}
         run: ci/daemon-uids.sh target/debug/wicket
       # #40: the host install script, twice, in a fresh container, then #12's checks with real users.
       - name: Install script in a fresh container
+        if: ${{ needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' install-test ') }}
         run: ci/install-test.sh target/debug/wicket ubuntu:24.04

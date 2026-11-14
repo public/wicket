@@ -1,0 +1,30 @@
+name: Changelog
+
+# CHANGELOG fragments (#220): every fragment under changes/ parses, and a pull request that changes
+# more than docs, CI or notes adds one, or carries the `no changelog` label. Its own workflow, so
+# adding or removing the label reruns only this.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  fragment:
+    name: Changelog fragment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the fragments tool's own tests
+        run: python3 -I ci/changelog_test.py
+      - name: fragments parse, and this pull request adds one if it needs one
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no changelog') && '1' || '' }}
+        run: python3 -I ci/changelog.py check ${BASE:+--base "$BASE"}

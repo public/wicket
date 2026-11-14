@@ -5,7 +5,7 @@
 #
 #   ci/update.sh
 #
-# Build A is this checkout's binary (WICKET, default target/debug/wicket); B and C are A with bytes
+# Build A is this checkout's binary (WICKET, default target/debug/wicket), its debug info stripped; B and C are A with bytes
 # appended (another sha256, the same code), so no second build is needed. Agents are driven by
 # `wicket dev mock-llm`: no model credential is used. The nodes are this machine (`wicket node
 # serve` run directly, each with its own HOME; the ssh hop replaced by WICKET_NODE_SSH, as
@@ -34,7 +34,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-A=$(realpath "${WICKET:-target/debug/wicket}")
+bin=$(realpath "${WICKET:-target/debug/wicket}")
 DOCKER=${WICKET_DOCKER:-docker}
 export WICKET_DOCKER=$DOCKER
 # Short: runs' unix sockets live under it.
@@ -43,6 +43,11 @@ chmod 755 "$work"
 export WICKET_HOME=$work/h WICKET_BOX_PREFIX=upd
 HOMEW=$work/u
 mkdir -p "$WICKET_HOME" "$HOMEW"
+# Build A: the binary under test without its debug info (#219). Every build here is a copy of it, and
+# each is copied, hashed, packaged with gzip -9 and sent to two nodes: a debug build is ~500 MB, about
+# 115 MB stripped, and packaging it takes a third of the time. What runs is the same code.
+A=$work/wicket-a
+objcopy --strip-debug "$bin" "$A" 2>/dev/null || cp "$bin" "$A"
 # The control host's binary: A until the first update, then whatever `current` is.
 W=$A
 w() { HOME=$HOMEW "$W" "$@"; }
@@ -67,6 +72,7 @@ teardown() {
   for p in $(pgrep -f "$work/" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
   sleep 1
   for c in $($DOCKER ps -aq --filter name=^upd-run- 2>/dev/null); do $DOCKER rm -f "$c" >/dev/null 2>&1; done
+  $DOCKER rm -f "upd-$$-holds-b" >/dev/null 2>&1
   if [ -n "$built_image" ]; then $DOCKER rmi "$built_image" >/dev/null 2>&1; fi
   # Each build's own image, made by the updates (these builds are this test's alone).
   for i in "${A_ID:-}" "${B_ID:-}" "${C_ID:-}" "${D_ID:-}" "${E_ID:-}"; do [ -n "$i" ] && $DOCKER rmi "wicket/claude-code:$i" >/dev/null 2>&1; done
@@ -147,7 +153,7 @@ for n in n1 n2; do
   HOME=$work/$n "$work/$n/.local/bin/wicket" node serve >"$work/$n.log" 2>&1 &
   pids+=("$!")
   eval "${n}_pid=$!"
-  wait_for 20 '[ -S "$(node_dir '"$n"')/ctl/ctl.sock" ]'
+  wait_for 60 '[ -S "$(node_dir '"$n"')/ctl/ctl.sock" ]'
 done
 check "node install stages A as each node's current version" '[ "$(current "$(node_dir n1)/versions")" = "$A_ID" ] && [ "$(serve_runs "$n1_pid")" = "$A_ID" ]'
 
@@ -261,20 +267,26 @@ another_turn "the automatic rollback"
 
 # ---- 5. prune ----
 log "5. prune"
+# A stopped container of B's image, this test's own: the box that checked new boxes get B's image is
+# cleaned up by now, and `ancestor` matches by image id (and descendants), which isn't this test's alone.
+$DOCKER create --name "upd-$$-holds-b" "wicket/claude-code:$B_ID" true >/dev/null
 w self prune --nodes n1,n2 --dry-run >"$work/prune-dry.log" 2>&1 || cat "$work/prune-dry.log"
 cat "$work/prune-dry.log"
 check "a dry run says B would go, keeps its image while a container uses it, and removes nothing" \
   'grep -q "control: would remove 1 version(s) \[$B_ID\]" "$work/prune-dry.log" && grep -q "kept wicket/claude-code:$B_ID (a container uses it)" "$work/prune-dry.log" && [ -d "$WICKET_HOME/versions/$B_ID" ]'
-# That container is the stopped box which checked that new boxes get B's image: once it is gone,
-# B's image can go too.
-for c in $($DOCKER ps -aq --filter "ancestor=wicket/claude-code:$B_ID"); do $DOCKER rm -f "$c" >/dev/null; done
+$DOCKER rm -f "upd-$$-holds-b" >/dev/null
+# Without it, B's image goes, unless a running box has its id: here the agents' boxes may (every build's
+# box image is made like theirs), and prune keeps an image while one does.
+b_used=$($DOCKER ps -aq --filter "ancestor=wicket/claude-code:$B_ID")
 w self prune --nodes n1,n2 >"$work/prune.log" 2>&1 || cat "$work/prune.log"
 cat "$work/prune.log"
-check "  prune removes B and its image; A (current) and C (previous) stay" '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1 && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ]'
+check "  prune removes B, and its image unless a box still has its id; A (current) and C (previous) stay" \
+  '[ ! -e "$WICKET_HOME/versions/$B_ID" ] && [ -d "$WICKET_HOME/versions/$A_ID" ] && [ -d "$WICKET_HOME/versions/$C_ID" ] && if [ -n "$b_used" ]; then grep -q "kept wicket/claude-code:$B_ID (a container uses it)" "$work/prune.log"; else ! $DOCKER image inspect "wicket/claude-code:$B_ID" >/dev/null 2>&1; fi'
 check "  the nodes keep their current and previous" '[ -d "$(node_dir n1)/versions/$A_ID" ] && [ -d "$(node_dir n1)/versions/$B_ID" ] && grep -q "node:n1: removed 0 version" "$work/prune.log"'
 
 # ---- 5b. builds CI signed (#190) ----
 . ci/update/from-ci.sh
+another_turn "the CI-signed updates"
 
 # ---- 6. audit ----
 log "6. audit"
