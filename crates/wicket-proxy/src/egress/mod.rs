@@ -26,10 +26,12 @@ use wicket_core::{canonical_path, manifest::host_matches, Op};
 mod connect;
 mod hosts;
 mod outgoing;
+mod push;
 
 #[cfg(test)]
 use connect::parse_head;
 use outgoing::refused_shape;
+use push::read_commands;
 pub use outgoing::render_credential;
 
 /// The largest request body read whole: GET and HEAD (which must have none), and requests that
@@ -373,20 +375,6 @@ impl Egress {
         let refused = updates.iter().find_map(|u| self.refuses_ref(&host, &repo, &u.name));
         op.effects.extend(wicket_core::git::refs_effect(&updates));
         self.decide_and_forward(req, host, scheme, via, method, path, pq, op, refused).await
-    }
-
-    /// Why a push to ref `name` of `repo` on `host` is refused, if it is: a name git wouldn't accept,
-    /// a ref the forge never accepts a push to, or one a forbid rule protects (its ref paths, as
-    /// the zone, the org policy or the box's token decide them; see `wicket_core::git`).
-    fn refuses_ref(&self, host: &str, repo: &str, name: &str) -> Option<String> {
-        if let Some(why) = wicket_core::git::bad_ref_name(name).or_else(|| wicket_core::git::forge_refuses(host, name)) {
-            return Some(format!("a push to {name}: {why}"));
-        }
-        let ctx = &self.ctx;
-        wicket_core::git::ref_paths(repo, name).iter().find_map(|p| {
-            let op = Op::egress(&ctx.tenant, &ctx.run, &ctx.zone.name, "POST", host, p);
-            self.decider.refuses(ctx, &op).map(|why| format!("a push to protected ref {name}: {why}"))
-        })
     }
 
     /// Decides `op` (the request's own, or its push's) and, if allowed, forwards the request.
