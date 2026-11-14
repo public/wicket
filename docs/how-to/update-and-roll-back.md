@@ -58,9 +58,24 @@ sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # control
 - Afterwards it prunes, as `wicket self prune` does, where it updated (`--no-prune` to keep
   everything).
 
-An update that needs new systemd units or a new agent image says so in its release notes. Then run
-`deploy/install.sh` from the new archive, or `sudo wicket image`: `self update` changes neither (the
-units run `/usr/local/bin/wicket`, which follows `current`).
+### When the new version's systemd units differ
+
+Each build carries its own systemd units (`deploy/systemd/`). `self update` runs as the `wicket`
+user, which can't write `/etc/systemd/system`, so it refuses to switch to a build whose units
+differ from the installed ones, and says what to run as root:
+
+```sh
+sudo /var/lib/wicket-versions/<build id>/wicket self apply-units   # that build's own units, then daemon-reload
+sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # again: it goes on
+```
+
+`apply-units` installs only what differs and restarts nothing (restarting wicketd stops the runs
+started through it): each changed unit takes effect when its service next restarts, which it names.
+Until then the old unit runs the new build, so a release changes its units only in ways the
+previous release also runs under. A new unit is installed but not enabled. A rollback is never
+refused over units; it warns, and `sudo <versions>/<previous id>/wicket self apply-units` puts that
+build's back. `self follow` skips a build whose units aren't applied yet, and takes it once they
+are. Running `deploy/install.sh` from the new archive does the same, and also restarts the services.
 
 ## Roll back
 

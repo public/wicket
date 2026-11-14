@@ -4269,6 +4269,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wicket-authz",
  "wicket-core",
+ "wicket-identity",
 ]
 
 [[package]]

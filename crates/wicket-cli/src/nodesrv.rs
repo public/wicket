@@ -792,7 +792,7 @@ async fn adopt_previous(node: &Arc<Node>) {
             // a box without its record isn't its to judge (it is another node's, or the reconciler's).
             None if node.paths.shares_host() => {}
             None => {
-                if let crate::reap::Verdict::Orphan(why) = crate::reap::judge(&b, None) {
+                if let crate::owner::Verdict::Orphan(why) = crate::owner::judge(&b, None) {
                     eprintln!("[node] stopping {} ({why})", b.name);
                     let _ = node.docker.kill(&b.name).await;
                 }
@@ -1020,7 +1020,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
                 bs.owner
                     .clone()
                     .filter(|o| node.paths.shares_host() && o.len() <= 200 && !o.contains(['\n', '=']))
-                    .unwrap_or_else(crate::reap::owner_label),
+                    .unwrap_or_else(crate::owner::owner_label),
             ),
         ],
     };

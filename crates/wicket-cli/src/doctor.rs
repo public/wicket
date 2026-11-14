@@ -1,12 +1,19 @@
 //! `wicket doctor`: is this host ready, and is it safe? Through wicketd, the caller's side checks
 //! what the caller must not be able to do (daemon::client), and this runs as the wicket user.
 
-use crate::{daemon, data_dir, issuer_key_path, ledger_path, reap, trust_domain};
+use crate::{daemon, data_dir, issuer_key_path, ledger_path, trust_domain};
 use anyhow::{bail, Result};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use wicket_proxy::vault::Vault;
 use wicket_store::Ledger;
+
+/// Whether a box has nothing behind it: its run has ended, so `wicket reconcile` stops it. A running
+/// run's box is its run's (re-attached or ended by the reconciler), and one whose run this ledger
+/// doesn't know is left alone.
+fn stale_box(l: &Ledger, b: &wicket_sandbox::BoxInfo) -> bool {
+    b.run.as_deref().and_then(|r| l.run_status(r).ok().flatten()).is_some_and(|s| s != "running")
+}
 
 /// Where deploy/install.sh keeps the console's arguments.
 pub const CONSOLE_ENV: &str = "/etc/wicket/console.env";
@@ -87,12 +94,12 @@ pub async fn doctor(image: &str) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     r.good(format!("ledger: {} (audit chain OK, {} records)", ledger_path().display(), l.verify_audit()?));
     console(&mut r, &l, system).await;
-    if let Ok(all) = reap::reap(&d, &l, true).await {
-        let orphans: Vec<_> = all.iter().filter(|r| matches!(r.verdict, reap::Verdict::Orphan(_))).map(|r| r.name.as_str()).collect();
+    if let Ok(all) = d.boxes().await {
+        let orphans: Vec<_> = all.iter().filter(|b| stale_box(&l, b)).map(|b| b.name.as_str()).collect();
         if orphans.is_empty() {
             r.good(format!("boxes: {} running, none orphaned", all.len()));
         } else {
-            r.good(format!("boxes: {} orphaned, with nothing behind them: {} (run: wicket reap)", orphans.len(), orphans.join(", ")));
+            r.good(format!("boxes: {} orphaned, with nothing behind them: {} (run: wicket reconcile)", orphans.len(), orphans.join(", ")));
         }
     }
     if !r.ok {

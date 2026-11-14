@@ -45,7 +45,7 @@
 //! records what its node billed under the provider's billing model when it ends.
 
 use crate::capacity::{self, lease_key, LeaseApprover, PlacementConfig};
-use crate::reap::LOST;
+use crate::owner::LOST;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -137,7 +137,7 @@ where
             machines,
             local,
             node_boxes,
-            owner_alive: crate::reap::owner_alive,
+            owner_alive: crate::owner::owner_alive,
             node_runs: HashMap::new(),
             adopt: crate::run::spawn_attach,
             fenced: crate::noderun::fenced_until,
@@ -629,7 +629,7 @@ const FENCE_MARGIN_SECS: i64 = 180;
 pub async fn node_runs(ledger: &Ledger, dry_run: bool) -> Result<HashMap<String, Option<Vec<String>>>> {
     let mut nodes: HashSet<String> = HashSet::new();
     for (run, owner) in ledger.running_runs()? {
-        if owner.as_deref().map(crate::reap::owner_alive) == Some(Some(false)) {
+        if owner.as_deref().map(crate::owner::owner_alive) == Some(Some(false)) {
             if let Some(n) = ledger.run_node(&run)? {
                 nodes.insert(n);
             }
