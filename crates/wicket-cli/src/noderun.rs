@@ -431,6 +431,8 @@ struct Shared {
     /// Where the node may pull the box's pinned image from (#191), and the registry's secret, which
     /// it may fetch for that pull only.
     pull: Option<crate::registry::Source>,
+    /// Set while the node pulls the box's image: the only time it may fetch the registry's secret.
+    pulling: AtomicBool,
 }
 
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
@@ -558,6 +560,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
             }),
             None => None,
         },
+        pulling: AtomicBool::new(false),
     });
     let (stdin_ours, stdin_theirs) = tokio::io::duplex(256 * 1024);
     let (stdout_theirs, stdout_ours) = tokio::io::duplex(1 << 20);
@@ -602,9 +605,10 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
             if ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_DELIVERY {
                 let pull = shared.pull.as_ref().filter(|_| ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_PULL);
-                deliver_image(&ctl.calls, &name, &ctl.run, &start.image, pin, pull)
-                    .await
-                    .with_context(|| format!("getting image {pin} to node {name}"))?;
+                shared.pulling.store(pull.is_some(), Ordering::SeqCst);
+                let got = deliver_image(&ctl.calls, &name, &ctl.run, &start.image, pin, pull).await;
+                shared.pulling.store(false, Ordering::SeqCst);
+                got.with_context(|| format!("getting image {pin} to node {name}"))?;
             }
         }
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
@@ -655,7 +659,9 @@ pub async fn deliver_image(
     let here = wicket_sandbox::Docker::from_env();
     if !here.image_identity(pin).await?.is_some_and(|i| i.is(pin)) {
         if let Some(e) = pulled {
-            return Err(e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or(""))));
+            return Err(
+                e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or("")))
+            );
         }
         println!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
         return Ok(());
@@ -1466,8 +1472,11 @@ fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 /// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone
 /// uses it and the vault's binding covers the hosts it uses it for. Audited either way.
 fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
-    // The registry's credential, for the pull of the box's image only (#191): bound to its host.
-    let r = match sh.pull.as_ref().filter(|s| s.secret.as_deref() == Some(name)) {
+    // The registry's credential, for the pull of the box's image only (#191): bound to its host
+    // and its token service's, and only while that pull is under way. The node holds it for the
+    // pull alone, so it isn't among the secrets it keeps for the run.
+    let for_pull = sh.pull.as_ref().filter(|s| s.secret.as_deref() == Some(name) && sh.pulling.load(Ordering::SeqCst));
+    let r = match for_pull {
         Some(src) => {
             let hosts: Vec<String> = std::iter::once(src.host.clone()).chain(src.auth_hosts.iter().cloned()).collect();
             crate::nodesecrets::release_for_hosts(&sh.vault, name, &hosts, sh.ctl.token_root.1)
@@ -1476,8 +1485,10 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     };
     let (ok, why) = match &r {
         Ok(f) => {
-            p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
-            save_holdings(sh, p);
+            if for_pull.is_none() {
+                p.fetched.insert(name.to_string(), crate::nodesecrets::digest(f));
+                save_holdings(sh, p);
+            }
             (true, None)
         }
         Err(e) => (false, Some(e.clone())),
@@ -1486,7 +1497,7 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
         &sh.tenant,
         Some(&sh.run),
         "node.secret_fetch",
-        &serde_json::json!({ "node": sh.node, "secret": name, "released": ok, "why": why }),
+        &serde_json::json!({ "node": sh.node, "secret": name, "released": ok, "why": why, "image_pull": for_pull.is_some() }),
     );
     match r {
         Ok(f) => Msg::SecretFetched { id, secret: Some(Box::new(f)), error: None },

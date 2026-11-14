@@ -54,6 +54,10 @@ pub fn registry_of(image: &str) -> Option<(String, String)> {
     }
     let repo = wicket_core::image::repository(&r.name);
     let (first, rest) = repo.split_once('/').unwrap_or(("", repo));
+    if first == "docker.io" || first == "index.docker.io" {
+        let rest = if rest.contains('/') { rest.to_string() } else { format!("library/{rest}") };
+        return Some(("registry-1.docker.io".into(), rest));
+    }
     if first.contains('.') || first.contains(':') || first == "localhost" {
         return Some((first.to_string(), rest.to_string()));
     }
@@ -131,6 +135,8 @@ mod tests {
     fn images_name_their_registry_and_only_listed_ones_are_pulled_from() {
         assert_eq!(registry_of("registry.example.com:5000/team/agent:1"), Some(("registry.example.com:5000".into(), "team/agent".into())));
         assert_eq!(registry_of("ubuntu:24.04"), Some(("registry-1.docker.io".into(), "library/ubuntu".into())));
+        assert_eq!(registry_of("docker.io/ubuntu:24.04"), Some(("registry-1.docker.io".into(), "library/ubuntu".into())));
+        assert_eq!(registry_of("docker.io/wicket/x:1"), Some(("registry-1.docker.io".into(), "wicket/x".into())));
         assert_eq!(registry_of("wicket/claude-code:abc"), Some(("registry-1.docker.io".into(), "wicket/claude-code".into())));
         assert_eq!(registry_of(&format!("localhost/x@sha256:{}", "a".repeat(64))), Some(("localhost".into(), "x".into())));
         assert_eq!(registry_of(&format!("sha256:{}", "a".repeat(64))), None);
@@ -139,6 +145,7 @@ mod tests {
         let (r, repo) = p.registry_for("registry.example.com/team/agent:1").unwrap();
         assert_eq!((r.host.as_str(), r.secret.as_deref(), repo.as_str()), ("registry.example.com", Some("reg"), "team/agent"));
         assert_eq!(p.registry_for("ubuntu:24.04").unwrap().0.host, "registry-1.docker.io");
+        assert_eq!(p.registry_for("docker.io/library/ubuntu:24.04").unwrap().0.host, "registry-1.docker.io");
         assert!(p.registry_for("other.example.com/x:1").is_none());
         assert!(serde_yaml::from_str::<ImagesPolicy>("registries: [{host: a, typo: 1}]").is_err());
     }

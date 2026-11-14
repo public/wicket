@@ -32,7 +32,8 @@ pub const SMALL_MAX: u64 = 4 << 20;
 const DEPTH_MAX: usize = 4;
 
 pub const INDEX_TYPES: [&str; 2] = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
-pub const MANIFEST_TYPES: [&str; 2] = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
+pub const MANIFEST_TYPES: [&str; 2] =
+    ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
 /// What [`unpack_verified`] kept.
 #[derive(Debug, Clone, PartialEq, Eq)]

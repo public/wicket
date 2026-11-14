@@ -134,7 +134,8 @@ pub(super) fn pull(node: &Arc<Node>, gen: u64, id: u64, run: String, digest: Str
         let dir = spool(&n.paths.root).join(format!("pull-{id:x}-{}", ulid::Ulid::new()));
         let r = pull_into(&n, gen, &run, &digest, name.as_deref(), &from, &dir).await;
         let _ = std::fs::remove_dir_all(&dir);
-        let mut body = serde_json::json!({ "digest": digest, "name": name, "via": "registry", "registry": from.host, "repository": from.repository });
+        let mut body =
+            serde_json::json!({ "digest": digest, "name": name, "via": "registry", "registry": from.host, "repository": from.repository });
         let error = match &r {
             Ok(u) => {
                 body["bytes"] = u.bytes.into();
@@ -362,6 +363,9 @@ sys.exit(2)
         assert_eq!(std::fs::read_dir(spool(&node.paths.root)).map(|d| d.count()).unwrap_or(0), 0);
     }
 
+    /// A run id, as `check_run_id` wants one.
+    const RUN: &str = "run_01jz0000000000000000000000";
+
     #[tokio::test]
     async fn a_node_pulls_an_image_from_its_registry_with_a_credential_it_fetches() {
         let inst = Install::new("nodesrv-images-pull");
@@ -377,8 +381,12 @@ sys.exit(2)
         pump_with(connect(&node, 1, &inst).await, calls.clone(), Some(("reg".into(), "u:p".into())));
 
         let img = image_with(b"a pulled layer");
-        let blobs: HashMap<String, Vec<u8>> =
-            img.entries.iter().filter(|(p, _)| p.starts_with("blobs/sha256/")).map(|(p, b)| (format!("sha256:{}", &p[13..]), b.clone())).collect();
+        let blobs: HashMap<String, Vec<u8>> = img
+            .entries
+            .iter()
+            .filter(|(p, _)| p.starts_with("blobs/sha256/"))
+            .map(|(p, b)| (format!("sha256:{}", &p[13..]), b.clone()))
+            .collect();
         let reg = crate::registry::testkit::serve("team/agent", blobs, Some("u:p")).await;
         let src = crate::registry::Source {
             host: reg.addr.to_string(),
@@ -387,13 +395,13 @@ sys.exit(2)
             ..Default::default()
         };
         let name = crate::oci::import_name(&format!("{}/team/agent:1", reg.addr), &img.index).unwrap();
-        calls.pull_image("run_a", &img.index, Some(&name), &src).await.unwrap();
+        calls.pull_image(RUN, &img.index, Some(&name), &src).await.unwrap();
         assert!(calls.has_image(&img.index).await.unwrap());
         assert!(node.docker.image_identity(&name).await.unwrap().unwrap().is(&img.index));
         // Without the credential, the registry's token service refuses.
         let other = image_with(b"another pulled layer");
         let src = crate::registry::Source { secret: Some("missing".into()), ..src };
-        let e = calls.pull_image("run_a", &other.index, None, &src).await.unwrap_err();
+        let e = calls.pull_image(RUN, &other.index, None, &src).await.unwrap_err();
         assert!(format!("{e:#}").contains("refused by the control host"), "{e:#}");
         let k = kinds(&node);
         assert!(k.iter().any(|(k, b)| k == "image.received" && b["via"] == "registry"), "{k:?}");

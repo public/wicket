@@ -579,6 +579,19 @@ mod tests {
         v
     }
 
+    #[test]
+    fn a_registry_secret_is_released_only_for_hosts_its_binding_covers() {
+        let d = tmp("registry");
+        let v = Vault::new(d.join("vault"));
+        v.set("reg", "u:p").unwrap();
+        v.set_hosts("reg", &["registry.example.com".into(), "auth.example.com".into()]).unwrap();
+        let f = release_for_hosts(&v, "reg", &["registry.example.com:5000".into(), "auth.example.com".into()], 1).unwrap();
+        assert_eq!((f.value.as_str(), f.hosts.clone()), ("u:p", vec!["registry.example.com".to_string(), "auth.example.com".to_string()]));
+        assert!(release_for_hosts(&v, "reg", &["registry.example.com".into(), "elsewhere.example.com".into()], 1).is_err());
+        assert!(release_for_hosts(&v, "missing", &["registry.example.com".into()], 1).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     fn fetcher(v: Vault, z: wicket_core::ZoneSpec, up: Arc<AtomicI64>, calls: Arc<AtomicU64>) -> Fetcher {
         Arc::new(move |_run, name| {
             let (v, z, up, calls) = (v.clone(), z.clone(), up.clone(), calls.clone());

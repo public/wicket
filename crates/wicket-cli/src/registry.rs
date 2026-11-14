@@ -61,7 +61,7 @@ impl Source {
 
     fn allows(&self, u: &reqwest::Url, also: &[String]) -> bool {
         let a = authority(u);
-        let ok_host = a == self.host || also.iter().any(|h| *h == a);
+        let ok_host = a == self.host || also.contains(&a);
         let ok_scheme = u.scheme() == "https" || (u.scheme() == "http" && loopback(&a));
         ok_host && ok_scheme
     }
@@ -110,10 +110,13 @@ impl Client {
                 } else if src2.allows(a.url(), &allowed) {
                     a.follow()
                 } else {
-                    a.error(format!("a redirect to {}, which this registry isn't allowed", authority(a.url())))
+                    let to = authority(a.url());
+                    a.error(format!("a redirect to {to}, which this registry isn't allowed"))
                 }
             }))
             .connect_timeout(std::time::Duration::from_secs(15))
+            // A registry that stops sending: the pull fails rather than holding the node's task.
+            .read_timeout(std::time::Duration::from_secs(60))
             .user_agent(concat!("wicket/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Client { http, src, cred: cred.map(Cred::parse), token: None })
@@ -132,9 +135,14 @@ impl Client {
     async fn get(&mut self, path: &str, accept: &str) -> Result<reqwest::Response> {
         let url = format!("{}/v2/{}/{path}", self.src.base(), self.src.repository);
         for attempt in 0..2 {
-            let r = self.authorize(self.http.get(&url).header(reqwest::header::ACCEPT, accept)).send().await.with_context(|| format!("GET {url}"))?;
+            let r = self
+                .authorize(self.http.get(&url).header(reqwest::header::ACCEPT, accept))
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?;
             if r.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                let challenge = r.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                let challenge =
+                    r.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
                 self.challenge(&challenge).await?;
                 continue;
             }
@@ -264,7 +272,7 @@ pub async fn pull(src: &Source, pin: &str, name: Option<&str>, cred: Option<&str
     let mut have: HashMap<String, u64> = HashMap::new();
     let mut total = 0u64;
     let (os, arch) = platform();
-    // Manifests to fetch, and whether each may be an index (only the pin's own children aren't).
+    // Manifests to fetch, and how deep in indexes each is.
     let mut todo = vec![(pin.to_string(), 0usize)];
     while let Some((d, depth)) = todo.pop() {
         if depth > 4 {
@@ -277,18 +285,22 @@ pub async fn pull(src: &Source, pin: &str, name: Option<&str>, cred: Option<&str
         if let Some(ms) = v["manifests"].as_array() {
             let mine: Vec<&serde_json::Value> =
                 ms.iter().filter(|m| m["platform"]["os"] == os && m["platform"]["architecture"] == arch).collect();
-            let mine = if mine.is_empty() && ms.len() == 1 { ms.iter().collect() } else { mine };
+            // An index of one manifest that names no platform at all is taken as this one's.
+            let mine = if mine.is_empty() && ms.len() == 1 && ms[0].get("platform").is_none() { ms.iter().collect() } else { mine };
             if mine.is_empty() {
                 bail!("image {pin} has no manifest for {os}/{arch}");
             }
             for m in mine {
-                todo.push((m["digest"].as_str().context("a descriptor without a digest")?.to_string(), depth + 1));
+                let md =
+                    m["digest"].as_str().filter(|x| crate::oci::hex_of(x).is_some()).context("a descriptor without a sha256 digest")?;
+                todo.push((md.to_string(), depth + 1));
             }
         } else {
             let mut want = vec![&v["config"]];
             want.extend(v["layers"].as_array().context("a manifest without layers")?);
             for b in want {
-                let bd = b["digest"].as_str().filter(|x| crate::oci::hex_of(x).is_some()).context("a descriptor without a sha256 digest")?;
+                let bd =
+                    b["digest"].as_str().filter(|x| crate::oci::hex_of(x).is_some()).context("a descriptor without a sha256 digest")?;
                 let size = b["size"].as_u64().context("a descriptor without a size")?;
                 if have.contains_key(bd) {
                     continue;
@@ -328,6 +340,16 @@ pub mod testkit {
     /// Serves `blobs` (digest to bytes) as `repo`'s manifests and blobs. With `login`
     /// (`user:password`), a token service at `/token` wants it and the registry wants its token.
     pub async fn serve(repo: &str, blobs: HashMap<String, Vec<u8>>, login: Option<&str>) -> Fake {
+        serve_with(repo, blobs, login, None).await
+    }
+
+    /// As [`serve`], redirecting every blob download to the same path at `blobs_at`, if given.
+    pub async fn serve_with(
+        repo: &str,
+        blobs: HashMap<String, Vec<u8>>,
+        login: Option<&str>,
+        blobs_at: Option<std::net::SocketAddr>,
+    ) -> Fake {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -343,17 +365,21 @@ pub mod testkit {
                     let n = s.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
                     let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let auth = req
-                        .lines()
-                        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.trim().to_string()));
+                    let auth = req.lines().find_map(|l| {
+                        l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.trim().to_string())
+                    });
                     h.lock().unwrap().push(path.clone());
                     let (status, extra, body): (&str, String, Vec<u8>) = if path.starts_with("/token") {
                         match (&basic, &auth) {
                             (Some(b), Some(a)) if a == b => ("200 OK", String::new(), br#"{"token":"tok-1"}"#.to_vec()),
                             _ => ("401 Unauthorized", String::new(), vec![]),
                         }
+                    } else if let Some(to) = blobs_at.filter(|_| path.contains("/blobs/")) {
+                        ("307 Temporary Redirect", format!("Location: http://{to}{path}\r\n"), vec![])
                     } else if basic.is_some() && auth.as_deref() != Some("Bearer tok-1") {
-                        let c = format!("WWW-Authenticate: Bearer realm=\"http://{addr}/token\",service=\"fake\",scope=\"repository:{repo}:pull\"\r\n");
+                        let c = format!(
+                            "WWW-Authenticate: Bearer realm=\"http://{addr}/token\",service=\"fake\",scope=\"repository:{repo}:pull\"\r\n"
+                        );
                         ("401 Unauthorized", c, vec![])
                     } else {
                         let d = path
@@ -381,13 +407,27 @@ mod tests {
     use crate::oci::testkit::{image_with, sha};
 
     fn blobs_of(img: &crate::oci::testkit::Img) -> HashMap<String, Vec<u8>> {
-        img.entries.iter().filter(|(p, _)| p.starts_with("blobs/sha256/")).map(|(p, b)| (format!("sha256:{}", &p[13..]), b.clone())).collect()
+        img.entries
+            .iter()
+            .filter(|(p, _)| p.starts_with("blobs/sha256/"))
+            .map(|(p, b)| (format!("sha256:{}", &p[13..]), b.clone()))
+            .collect()
     }
 
     fn tmp() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("wicket-registry-test-{}-{}", std::process::id(), ulid::Ulid::new()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_platform_is_named_as_oci_does() {
+        assert_eq!(platform().1, testkit::ARCH);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(testkit::ARCH, "amd64");
+        } else if cfg!(target_arch = "aarch64") {
+            assert_eq!(testkit::ARCH, "arm64");
+        }
     }
 
     #[test]
@@ -439,6 +479,42 @@ mod tests {
         let e = pull(&src, &img2.index, None, Some("u:p"), &d, 1 << 30).await.unwrap_err();
         assert!(format!("{e:#}").contains("isn't allowed for it"), "{e:#}");
         assert!(!fake2.hits.lock().unwrap().iter().any(|h| h.starts_with("/token")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_downloads_follow_redirects_only_to_blob_hosts() {
+        let img = image_with(b"redirected layer");
+        let cdn = testkit::serve("team/agent", blobs_of(&img), None).await;
+        let reg = testkit::serve_with("team/agent", blobs_of(&img), None, Some(cdn.addr)).await;
+        let src = Source { host: reg.addr.to_string(), repository: "team/agent".into(), ..Default::default() };
+        let d = tmp();
+        let e = pull(&src, &img.index, None, None, &d, 1 << 30).await.unwrap_err();
+        assert!(format!("{e:#}").contains("isn't allowed"), "{e:#}");
+        assert!(cdn.hits.lock().unwrap().is_empty(), "the redirect isn't followed");
+        std::fs::remove_dir_all(&d).unwrap();
+
+        let src = Source { blob_hosts: vec![cdn.addr.to_string()], ..src };
+        let d = tmp();
+        pull(&src, &img.index, None, None, &d, 1 << 30).await.unwrap();
+        assert!(cdn.hits.lock().unwrap().iter().all(|h| h.contains("/blobs/")) && !cdn.hits.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_index_of_another_platform_alone_is_refused() {
+        let img = image_with(b"layer");
+        let m = &img.entries.iter().find(|(p, _)| p.starts_with("blobs/sha256/") && p.ends_with(&img.index[7..])).unwrap().1;
+        let mut v: serde_json::Value = serde_json::from_slice(m).unwrap();
+        v["manifests"].as_array_mut().unwrap().retain(|m| m["platform"]["architecture"] != testkit::ARCH);
+        let index = serde_json::to_vec(&v).unwrap();
+        let mut blobs = blobs_of(&img);
+        blobs.insert(sha(&index), index.clone());
+        let fake = testkit::serve("team/agent", blobs, None).await;
+        let src = Source { host: fake.addr.to_string(), repository: "team/agent".into(), ..Default::default() };
+        let d = tmp();
+        let e = pull(&src, &sha(&index), None, None, &d, 1 << 30).await.unwrap_err();
+        assert!(format!("{e:#}").contains("no manifest for linux/"), "{e:#}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
