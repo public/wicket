@@ -35,8 +35,11 @@ It is safe to run again: it changes only what is missing or out of date. What it
   operators out of `docker`;
 - creates `/var/lib/wicket` (0700, the `wicket` user's) for the ledger, vault, keys, runs and their
   sockets;
-- installs the binary as a version under `/var/lib/wicket-versions`, with `/usr/local/bin/wicket` a
-  link to its `current`, and the image sources under `/usr/local/share/wicket`;
+- installs the binary twice: as root's own copy, `/usr/local/lib/wicket/<build id>/wicket`, which
+  `/usr/local/bin/wicket` (what `sudo wicket` runs) links to; and as the `wicket` user's version under
+  `/var/lib/wicket-versions`, whose `current` wicket's services run and `wicket self update`
+  switches (root never runs a binary there: #261). The image sources go under
+  `/usr/local/share/wicket`;
 - writes the daemon's policy (`/etc/wicket/wicketd.yaml`) and the console's options
   (`/etc/wicket/console.env`) if they don't exist;
 - trusts a release key if you pass `--release-key FILE.pub`;

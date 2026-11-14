@@ -3,7 +3,7 @@
 task: Never runs.
 agent:
   name: claude-acp
-  kind: acp
+  harness: acp
   acp: { command: [claude-agent-acp], profile: claude-agent-acp }
 zone:
   name: acc-acp-claude

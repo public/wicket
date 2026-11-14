@@ -8,8 +8,9 @@ Where wicket keeps what. On an installed control host the data directory is `/va
 
 | path | what |
 |---|---|
-| `/usr/local/bin/wicket` | A link to `/var/lib/wicket-versions/current/wicket` (installed). |
-| `/var/lib/wicket-versions/` | The [versions root](#versions). |
+| `/usr/local/bin/wicket` | Root's link to one of root's copies, `/usr/local/lib/wicket/<build id>/wicket` (installed; #261). |
+| `/usr/local/lib/wicket/` | Root's own copies of wicket builds (root's, 0755): the only wicket binaries root runs. |
+| `/var/lib/wicket-versions/` | The [versions root](#versions) (the `wicket` user's; its services run `current/wicket`). |
 | `/etc/wicket/wicketd.yaml`, `/etc/wicket/console.env` | The daemon's policy and the console's options ([daemon](daemon.md)). |
 | `/usr/local/share/wicket/` | The agent image's build directory. |
 | `/run/wicket/wicketd.sock` | The daemon's socket. |
@@ -109,7 +110,9 @@ Secrets a node fetched are never on its disk: they are in `serve`'s memory only.
   8e21d07f9a55/…                     another
   current  -> 8e21d07f9a55           what runs
   previous -> 3f9c0a1b2c4d           what `wicket self rollback` goes back to
-/usr/local/bin/wicket -> /var/lib/wicket-versions/current/wicket
+/usr/local/lib/wicket/               (root's own copies; root's, 0755)
+  8e21d07f9a55/wicket                root's copy of a build
+/usr/local/bin/wicket -> /usr/local/lib/wicket/8e21d07f9a55/wicket
 ```
 
 A build id is the first 12 hex digits of the binary's sha256. In development mode the versions root

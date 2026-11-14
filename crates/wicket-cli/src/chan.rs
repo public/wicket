@@ -136,6 +136,9 @@ pub struct BoxStart {
     pub workspace_tar: String,
     /// Extra files under the run's state directory: (relative path, base64 contents).
     pub state_files: Vec<(String, String)>,
+    /// Directories under the run's state directory the harness keeps its config in (its adapter's).
+    #[serde(default)]
+    pub state_dirs: Vec<String>,
     /// Volumes: (name, mount path in the box), kept per tenant and zone on the node.
     pub volumes: Vec<(String, String)>,
     /// Stream ids for stdin, stdout and stderr.

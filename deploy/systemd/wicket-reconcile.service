@@ -11,7 +11,7 @@ User=wicket
 Group=wicket
 SupplementaryGroups=docker
 Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
-ExecStart=/usr/local/bin/wicket reconcile --every 1m
+ExecStart=/var/lib/wicket-versions/current/wicket reconcile --every 1m
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full

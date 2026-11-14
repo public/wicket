@@ -917,8 +917,15 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
         std::fs::create_dir_all(dir.join("tmp"))?;
         std::fs::set_permissions(dir.join("tmp"), std::fs::Permissions::from_mode(0o1777))?;
     }
-    for sub in ["sock", "ca", "state/home", "state/claude", "workspace/out"] {
+    for sub in ["sock", "ca", "state/home", "workspace/out"] {
         std::fs::create_dir_all(dir.join(sub))?;
+    }
+    // The harness's own config directories, as its adapter named them.
+    for d in &bs.state_dirs {
+        if d.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
+            bail!("bad state directory name {d:?}");
+        }
+        std::fs::create_dir_all(dir.join("state").join(d))?;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::write(dir.join("ca/ca.pem"), format!("{}{}", node.root_pem, bs.ca_pem))?;
@@ -1079,19 +1086,23 @@ fn child_start(
     until_ms: i64,
 ) -> Result<BoxStart> {
     let m = &plan.cm;
-    if m.agent.as_ref().is_some_and(|a| a.kind == "acp") {
+    if m.agent.as_ref().is_some_and(|a| a.harness == wicket_core::Harness::Acp) {
         // wicket is an ACP agent's client from the control host (#66); a node doesn't drive one.
         bail!("an ACP agent's child starts from wicket's control host, which this node can't reach now");
     }
-    let launch = match wicket_agent::program_plan(m, child) {
-        Some(p) => p,
-        None => wicket_agent::claude_code_plan(m, child, session),
+    let harness = wicket_agent::harness::of(m);
+    let launch = match (wicket_agent::program_plan(m, child), harness) {
+        (Some(p), _) => p,
+        (None, Some(h)) => h.plan(m, child, session, &m.task).map_err(anyhow::Error::msg)?,
+        (None, None) => bail!("a child is an agent or a program"),
     };
-    let mut state_files = vec![];
-    if wicket_agent::uses_claude_settings(m) {
-        let json = serde_json::to_vec_pretty(&wicket_agent::claude_settings(m))?;
-        state_files.push(("claude/settings.json".into(), base64::engine::general_purpose::STANDARD.encode(&json)));
-    }
+    let state_dirs = harness.map(|h| h.state_dirs(m)).unwrap_or_default();
+    let state_files = harness
+        .map(|h| h.state_files(m))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(rel, body)| (rel, base64::engine::general_purpose::STANDARD.encode(body)))
+        .collect();
     let suffix = format!("-{}", parent.run.replace('_', "-"));
     let name = parent.name.as_deref().and_then(|n| n.strip_suffix(&suffix)).map(|p| format!("{p}-{}", child.0.replace('_', "-")));
     let timeout = m.zone.limits.timeout()?.as_secs();
@@ -1113,6 +1124,7 @@ fn child_start(
         ca_pem: parent.ca_pem.clone(),
         workspace_tar: String::new(),
         state_files,
+        state_dirs,
         volumes: vec![],
         streams: [1, 2, 3],
         binds: vec![],
@@ -1998,6 +2010,7 @@ mod tests {
                 ca_pem: String::new(),
                 workspace_tar: String::new(),
                 state_files: vec![],
+                state_dirs: vec![],
                 volumes: vec![],
                 streams: [1, 2, 3],
                 binds: vec![],

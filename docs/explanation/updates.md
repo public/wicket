@@ -18,8 +18,25 @@ Each build is a directory named by its **build id**, the first 12 hex digits of 
   8e21d07f9a55/…                     another
   current  -> 8e21d07f9a55           what runs
   previous -> 3f9c0a1b2c4d           what `wicket self rollback` goes back to
-/usr/local/bin/wicket -> /var/lib/wicket-versions/current/wicket
+/usr/local/lib/wicket/               (root's own copies; root's, 0755)
+  8e21d07f9a55/wicket                root's copy of a build, from an artifact root named
+/usr/local/bin/wicket -> /usr/local/lib/wicket/8e21d07f9a55/wicket
 ```
+
+The `wicket` user's services run `/var/lib/wicket-versions/current/wicket`. **Root runs only its own
+copies** (#261): the versions root is the `wicket` user's, so a binary there is one anything that
+took over wicketd could replace before root next runs it. Root's process makes its copy from the
+artifact root names (`sudo wicket self update ARTIFACT`, `sudo wicket self admit ARTIFACT`, or
+`deploy/install.sh` from the archive): it opens the artifact, refuses it if the `wicket` user could
+have written it (its own file, or one in a directory it can write), copies it, and hashes and
+unpacks only the copy. After a forwarded update, rollback or follow succeeds, root moves
+`/usr/local/bin/wicket` to its copy of the versions root's `current`, if it has one; it reads only
+that build id there, to choose among its own copies, and prunes copies that are neither linked nor
+`current` or `previous`. A build root has no copy of (`--from-ci`, `self follow`, downloaded as the
+`wicket` user) runs in wicket's services, while root's link stays on the build root last copied
+until root admits the build's artifact. As root, wicket also refuses to run from a path the
+`wicket` user can write. The `wicket` user is still in the `docker` group, which is root on the
+host: this keeps `sudo wicket` from being a second way, not the only one.
 
 A switch replaces `previous` and then `current` (each an atomic rename of a new link). A rollback is a
 switch to `previous`, so the two trade places and a second rollback goes forward again. Every wicket
@@ -205,6 +222,6 @@ kit and the store fetches one with `wicket state snapshot`.
 - The control host's own wicketd re-executes only once no command runs through it, so a long `wicket
   attach` session delays it (it logs that it is waiting).
 - `self update` doesn't install a new version's systemd units itself (#165): it waits for root to
-  apply them with that version's binary ([update and roll back](../how-to/update-and-roll-back.md#when-the-new-versions-systemd-units-differ)).
+  apply them with root's own copy of that version ([update and roll back](../how-to/update-and-roll-back.md#when-the-new-versions-systemd-units-differ)).
   A path unit could apply them as root on its own, but then the `wicket` user would decide what
   root's services run, with no human step. A node's own `wicket-node` user unit isn't compared.
