@@ -139,7 +139,10 @@ pub fn route(cmd: &Cmd) -> Route {
             | SelfCmd::TrustKey { .. }
             | SelfCmd::Health { .. } => Forward(Privileged),
             // Touch no wicket data.
-            SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe => Local,
+            SelfCmd::Keygen { .. } | SelfCmd::Sign { .. } | SelfCmd::Describe | SelfCmd::Units => Local,
+            // Writes systemd's units as the caller, who must be root (wicketd can't: it is the
+            // wicket user, under ProtectSystem): never through the daemon.
+            SelfCmd::ApplyUnits { .. } => Local,
         },
         Cmd::Dev { cmd } => match cmd {
             DevCmd::MockLlm { .. } => Local,

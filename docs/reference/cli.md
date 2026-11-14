@@ -95,6 +95,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket self trust-key`](#wicket-self-trust-key)
   - [`wicket self keygen`](#wicket-self-keygen)
   - [`wicket self sign`](#wicket-self-sign)
+  - [`wicket self apply-units`](#wicket-self-apply-units)
 - [`wicket daemon`](#wicket-daemon)
 
 ## `wicket`
@@ -1368,15 +1369,16 @@ Update this installation to another wicket build (#162): blue/green, with a heal
 Usage: wicket self <COMMAND>
 
 Commands:
-  status     The staged versions, which is current and previous, and the ledger's schema
-  update     Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
-  follow     Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
-  rollback   Switch back to the previous version: the control host (unless --only-nodes) and these nodes
-  prune      Remove what no rollback or running box needs: versions other than current and previous that no process runs, their agent images unless a container uses them, and ledger snapshots beyond the newest few (always keeping the newest of the current and previous versions')
-  trust-key  Trust a release public key (from `wicket self keygen`) for updates
-  keygen     Make a release key pair: KEY (private, keep it offline) and KEY.pub
-  sign       Sign an artifact with a release key: writes <artifact>.sig
-  help       Print this message or the help of the given subcommand(s)
+  status       The staged versions, which is current and previous, and the ledger's schema
+  update       Stage an artifact (a wicket binary, or a release archive from ci/package.sh), switch the control host to it, hand its processes over, and watch it; then the nodes, a canary first. Any failed health check switches back
+  follow       Update to the newest build CI signed for main, if `<data dir>/ci-builds.yaml`'s follow policy lets it now (its window, soak time, only forward along main, never across a schema contract step or a failed build). Run by the wicket-follow timer
+  rollback     Switch back to the previous version: the control host (unless --only-nodes) and these nodes
+  prune        Remove what no rollback or running box needs: versions other than current and previous that no process runs, their agent images unless a container uses them, and ledger snapshots beyond the newest few (always keeping the newest of the current and previous versions')
+  trust-key    Trust a release public key (from `wicket self keygen`) for updates
+  keygen       Make a release key pair: KEY (private, keep it offline) and KEY.pub
+  sign         Sign an artifact with a release key: writes <artifact>.sig
+  apply-units  Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with the version's own binary, as a refused `self update` says: `sudo <versions>/<id>/wicket self apply-units`
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -1496,6 +1498,18 @@ Arguments:
 
 Options:
       --key <KEY>  
+  -h, --help       Print help
+```
+
+### `wicket self apply-units`
+
+```text
+Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with the version's own binary, as a refused `self update` says: `sudo <versions>/<id>/wicket self apply-units`
+
+Usage: wicket self apply-units [OPTIONS]
+
+Options:
+      --dir <DIR>  Another units directory (default: /etc/systemd/system, which needs root)
   -h, --help       Print help
 ```
 
