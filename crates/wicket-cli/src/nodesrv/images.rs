@@ -9,9 +9,16 @@ const IMAGE_MAX: u64 = 64 << 30;
 /// How often the node acknowledges what it has taken of an image.
 const ACK_EVERY: u64 = 1 << 20;
 
-/// Images being received, by stream: the connection, the next offset, and where the bytes go.
+/// Images being received, by stream.
 #[derive(Default)]
-pub(super) struct Incoming(Mutex<HashMap<u64, (u64, u64, std::sync::mpsc::Sender<Option<Vec<u8>>>)>>);
+pub(super) struct Incoming(Mutex<HashMap<u64, Receiving>>);
+
+/// One image being received: the connection sending it, the next offset, and where the bytes go.
+pub(super) struct Receiving {
+    gen: u64,
+    next: u64,
+    tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+}
 
 fn spool(root: &std::path::Path) -> PathBuf {
     root.join("images")
@@ -56,7 +63,7 @@ pub(super) fn put(node: &Arc<Node>, gen: u64, stream: u64, digest: String, name:
         return refuse(format!("making {}: {e}", dir.display()));
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    node.images.0.lock().expect("images").insert(stream, (gen, 0, tx));
+    node.images.0.lock().expect("images").insert(stream, Receiving { gen, next: 0, tx });
     node.send_to(gen, Frame::Msg(Msg::TunnelOpened { stream, error: None }));
     let n = node.clone();
     tokio::spawn(async move {
@@ -122,7 +129,7 @@ async fn receive(
 /// Bytes for an image being received; given back if `stream` isn't one. Out-of-order bytes end it.
 pub(super) fn data(node: &Node, stream: u64, offset: u64, bytes: Vec<u8>) -> Option<Vec<u8>> {
     let mut m = node.images.0.lock().expect("images");
-    let Some((_, next, tx)) = m.get_mut(&stream) else { return Some(bytes) };
+    let Some(Receiving { next, tx, .. }) = m.get_mut(&stream) else { return Some(bytes) };
     if offset != *next {
         // Dropping the sender cuts the delivery off: the receiver refuses it.
         m.remove(&stream);
@@ -138,8 +145,8 @@ pub(super) fn data(node: &Node, stream: u64, offset: u64, bytes: Vec<u8>) -> Opt
 /// The sender is done with `stream`; false if it isn't an image.
 pub(super) fn end(node: &Node, stream: u64) -> bool {
     match node.images.0.lock().expect("images").remove(&stream) {
-        Some((_, _, tx)) => {
-            let _ = tx.send(None);
+        Some(r) => {
+            let _ = r.tx.send(None);
             true
         }
         None => false,
@@ -148,7 +155,7 @@ pub(super) fn end(node: &Node, stream: u64) -> bool {
 
 /// Connection `gen` is gone: the images it was sending are cut off.
 pub(super) fn gone(node: &Node, gen: u64) {
-    node.images.0.lock().expect("images").retain(|_, (g, _, _)| *g != gen);
+    node.images.0.lock().expect("images").retain(|_, r| r.gen != gen);
 }
 
 #[cfg(test)]
