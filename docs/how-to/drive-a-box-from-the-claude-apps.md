@@ -55,8 +55,22 @@ What it protects, and how:
   else (other sessions, triggers, memory) to a human's decision, as in any zone: deny those.
 - **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the
   workspace is trusted, Remote Control's one-time prompt is answered, wicket's gateway is the only MCP
-  server, and the sandbox notice is the user memory. Claude Code asks in the app before it acts
-  (permission mode `default`); wicket decides what the box can reach either way.
+  server, and the sandbox notice is the user memory.
+- **Permission mode.** `agent.remote.permission_mode` is passed to `claude remote-control
+  --permission-mode` (`acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`).
+  The default, `default`, asks in the app before each action, so a box nobody is watching stalls on
+  its first prompt; for an unattended box set `bypassPermissions`:
+
+  ```yaml
+  agent:
+    name: rc-box
+    remote: { name: wicket-box, permission_mode: bypassPermissions }
+  ```
+
+  The mode only decides whether Claude Code asks you first. wicket's proxies decide what the box can
+  reach whatever the mode: egress outside the zone's reach is still a decision for a human, and the
+  login is still only a placeholder in the box. An unknown mode is refused, and a harness with no
+  permission modes refuses any but `default`.
 - **Nodes.** It runs on any node: the node forwards the provider's host to the control host, where the
   login is swapped in, so the secret stays with the control host.
 - **Not with hibernation.** The session lives in the vendor's apps, so the `hibernate` tool is refused;

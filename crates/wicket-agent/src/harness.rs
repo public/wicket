@@ -5,7 +5,7 @@
 
 use crate::{claude, AgentSession, LaunchPlan, WrappedPlan};
 use serde_json::Value;
-use wicket_core::{AgentSpec, Harness, Manifest, RemoteSpec, RunId};
+use wicket_core::{AgentSpec, Harness, Manifest, RemotePermissionMode, RemoteSpec, RunId};
 
 /// How a harness runs in its box. One workload kind, the agent, in one of three modes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -93,6 +93,16 @@ pub trait Adapter: Send + Sync {
     /// [`Mode::Remote`]'s plan. `login_meta` is what [`Adapter::remote_login_meta`] read.
     fn remote_plan(&self, _m: &Manifest, _run: &RunId, _login_meta: &Value) -> Result<WrappedPlan, String> {
         Err(format!("agent.remote: the {} harness has no remote mode", self.harness()))
+    }
+
+    /// The harness's own spelling of `agent.remote.permission_mode` (#285): None leaves the
+    /// harness's default. A harness without the setting refuses any mode but `default`.
+    fn remote_permission_mode(&self, mode: RemotePermissionMode) -> Result<Option<&'static str>, String> {
+        if mode.is_default() {
+            Ok(None)
+        } else {
+            Err(format!("agent.remote.permission_mode {:?}: the {} harness has no permission modes", mode.as_str(), self.harness()))
+        }
     }
 
     /// What a remote session may know of its login, from the host (never a credential): `linked` is
@@ -185,7 +195,14 @@ impl Adapter for ClaudeCode {
     }
 
     fn remote_plan(&self, m: &Manifest, run: &RunId, login_meta: &Value) -> Result<WrappedPlan, String> {
-        crate::claude_code_remote_control_plan(m, run, login_meta).map_err(|e| e.0)
+        let mode = m.agent.as_ref().and_then(|a| a.remote.as_ref()).map(|r| r.permission_mode).unwrap_or_default();
+        let mode = self.remote_permission_mode(mode)?.unwrap_or(RemotePermissionMode::Default.as_str());
+        crate::claude_code_remote_control_plan(m, run, login_meta, mode).map_err(|e| e.0)
+    }
+
+    fn remote_permission_mode(&self, mode: RemotePermissionMode) -> Result<Option<&'static str>, String> {
+        // `claude remote-control --permission-mode` takes the manifest's spellings as they are.
+        Ok(Some(mode.as_str()))
     }
 
     fn remote_login_meta(&self, linked: Option<&Value>, file: Option<&std::path::Path>) -> Value {
@@ -327,6 +344,9 @@ mod tests {
         assert!(!a.is_runtime(&m, "claude -p"));
         let run = RunId("run_1".into());
         assert!(a.remote_plan(&m, &run, &Value::Null).err().unwrap().contains("no remote mode"));
+        assert_eq!(a.remote_permission_mode(RemotePermissionMode::Default), Ok(None));
+        let e = a.remote_permission_mode(RemotePermissionMode::BypassPermissions).unwrap_err();
+        assert_eq!(e, "agent.remote.permission_mode \"bypassPermissions\": the acp harness has no permission modes");
         assert!(a.wrapped_plan(&m, &run, &[], &[], std::path::Path::new("/")).err().unwrap().contains("no wrapped mode"));
         let claude = Manifest::from_yaml(
             "task: hi\nagent: { name: a, harness: acp, acp: { command: [claude-agent-acp], profile: claude-agent-acp } }\nzone: { name: z, llm: {} }\n",
