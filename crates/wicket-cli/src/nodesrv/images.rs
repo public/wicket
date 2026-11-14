@@ -290,7 +290,7 @@ sys.exit(2)
         std::fs::write(ctx.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
         let tag = format!("wicket-test/delivered:{}", ulid::Ulid::new().to_string().to_lowercase());
         let docker = Docker::from_env();
-        docker.build_image(&tag, &ctx).await.unwrap();
+        docker.build_image(&tag, &ctx, &[]).await.unwrap();
         let id = docker.image_identity(&tag).await.unwrap().unwrap().id;
         let _rm = Rmi(cmd.clone(), id.clone());
         let mut save = docker.export_image(&id).unwrap();
