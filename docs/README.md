@@ -49,6 +49,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Risk classes](reference/risk-classes.md) and the dangerous-pattern list
 - [Configuration files and environment variables](reference/configuration.md)
 - [Files and directories](reference/files.md)
+- [Secrets and the vault](reference/secrets.md): who may read a secret's file, ACLs
 - [The daemon, and who may do what](reference/daemon.md)
 - [Protocol and version skew](reference/protocol.md): responses to the box, the node channel,
   schema versions
