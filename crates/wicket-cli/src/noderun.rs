@@ -584,6 +584,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
                 crate::chan::IMAGE_PINS
             );
         }
+        // A remote node gets a pinned image it lacks from here, verified there before it imports it
+        // (#191); the control host's own node shares its runtime.
+        if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
+            if ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_DELIVERY {
+                deliver_image(&ctl.calls, &name, &start.image, pin).await.with_context(|| format!("sending image {pin} to node {name}"))?;
+            }
+        }
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
             bail!("lost node {name} while starting the box");
         }
@@ -594,6 +601,45 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         };
     }
     Ok(NodeBox { image_digest, stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
+}
+
+/// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
+/// OCI image layout, and the node verifies it against the pin before importing it. If this host
+/// hasn't it either, nothing is sent, and the node refuses the box as before.
+pub async fn deliver_image(calls: &crate::nodecall::Calls, node: &str, image: &str, pin: &str) -> Result<()> {
+    if calls.has_image(pin).await? {
+        return Ok(());
+    }
+    let here = wicket_sandbox::Docker::from_env();
+    if !here.image_identity(pin).await?.is_some_and(|i| i.is(pin)) {
+        println!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
+        return Ok(());
+    }
+    println!("[wicket] sending image {image} ({pin}) to node {node}");
+    let t0 = std::time::Instant::now();
+    let mut save = here.export_image(pin)?;
+    let out = save.stdout.take().context("the export's output")?;
+    let mut err = save.stderr.take().context("the export's errors")?;
+    let errs = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut err, &mut s).await;
+        s
+    });
+    let sent = calls.put_image(pin, crate::oci::import_name(image, pin).as_deref(), out).await;
+    if sent.is_err() {
+        let _ = save.start_kill();
+    }
+    let st = save.wait().await?;
+    let sent = sent?;
+    if !st.success() {
+        bail!("exporting the image failed: {}", errs.await.unwrap_or_default().trim());
+    }
+    println!(
+        "[wicket] node {node} verified and imported image {pin} ({:.1} MiB in {:.1} s)",
+        sent as f64 / f64::from(1u32 << 20),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// The run loop's side of the box's stdio, held by the connection manager across reconnects.
