@@ -100,6 +100,11 @@ pub enum PlaceCmd {
         no_enrol: bool,
         #[arg(long, default_value = "24h")]
         ca_ttl: String,
+        /// Give up on the node, and release it, if nothing answers on its ssh port for this long (every
+        /// connect times out or is unreachable). Once the port answers (accepted or refused), wait up to
+        /// 15 minutes for setup.
+        #[arg(long, default_value = "4m")]
+        give_up_silent: String,
     },
     /// Destroy an owned node now (refusing anything without the owner tag) and revoke its enrolment.
     Release {
@@ -243,6 +248,7 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             idempotency_key,
             no_enrol,
             ca_ttl,
+            give_up_silent,
         } => {
             crate::enrol::validate_name(&name)?;
             if !no_enrol {
@@ -305,7 +311,20 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                                      "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
             )?;
             let hosts = (!no_enrol).then_some(hosts);
-            let (ready, _) = bring_up(placer.provider(), &n.id, &name, &pinned, ssh_key, hosts, ca_ttl).await?;
+            let wait = boot::ReadyWait { silent_limit: humantime::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
+            let ready = bring_up_or_release::<_, boot::SshProbe>(
+                &placer,
+                &crate::ledger_path(),
+                &n,
+                &name,
+                &pinned,
+                ssh_key,
+                hosts,
+                ca_ttl,
+                &wait,
+                None,
+            )
+            .await?;
             if let Some(next) = placer.next_paid_hour_at(&ready) {
                 println!("next paid hour starts {}; release before then: wicket place release {}", fmt_time(next), n.id);
             }
@@ -343,7 +362,9 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
 /// After a Vultr node is created: waits until it is active and its setup has finished (logging in with
 /// only `pinned` accepted), enrols it under `name` with that key pinned (unless `hosts` is None), and
 /// replaces its user data so the boot host key leaves the metadata service. Returns the node as it is
-/// now and its ssh target. Errors say the node is still billing.
+/// now and its ssh target. Errors say the node is still billing, except [`boot::Unreachable`] (nothing
+/// ever answered on its ssh port within `wait.silent_limit`): the caller releases the node for that.
+#[allow(clippy::too_many_arguments)]
 pub async fn bring_up(
     p: &VultrProvider,
     id: &NodeId,
@@ -352,16 +373,44 @@ pub async fn bring_up(
     ssh_key: Option<PathBuf>,
     hosts: Option<Vec<String>>,
     ca_ttl: Duration,
+    wait: &boot::ReadyWait,
 ) -> Result<(NodeHandle, String)> {
-    let ready = match p.wait_active(id, Duration::from_secs(5), Duration::from_secs(600)).await {
+    bring_up_with::<boot::SshProbe>(p, id, name, pinned, ssh_key, hosts, ca_ttl, wait, None).await
+}
+
+/// [`bring_up`], with `probe` (tests) in place of the TCP connect and pinned ssh login.
+#[allow(clippy::too_many_arguments)]
+async fn bring_up_with<Q: boot::Probe>(
+    p: &VultrProvider,
+    id: &NodeId,
+    name: &str,
+    pinned: &str,
+    ssh_key: Option<PathBuf>,
+    hosts: Option<Vec<String>>,
+    ca_ttl: Duration,
+    wait: &boot::ReadyWait,
+    probe: Option<&Q>,
+) -> Result<(NodeHandle, String)> {
+    let ready = match p.wait_active(id, wait.poll.min(Duration::from_secs(5)), Duration::from_secs(600)).await {
         Ok(r) => r,
         Err(e) => return Err(e.context(format!("{id} is still billing: `wicket place release {id}`"))),
     };
     let target = ready.ssh_target.clone().context("no address")?;
-    println!("{id} is active at {target}; waiting for node setup (host key pinned: {pinned})");
-    boot::wait_ssh_ready(&target, pinned, ssh_key.as_deref(), Duration::from_secs(10), Duration::from_secs(900))
-        .await
-        .with_context(|| format!("{id} is still billing: `wicket place release {id}`"))?;
+    println!(
+        "{id} is active at {target}; waiting for node setup (host key pinned: {pinned}; giving up after {} without any answer on port {})",
+        humantime::format_duration(wait.silent_limit),
+        wait.port
+    );
+    let r = match probe {
+        Some(q) => boot::wait_ready(q, &target, wait).await,
+        None => boot::wait_ssh_ready(&target, pinned, ssh_key.as_deref(), wait).await,
+    };
+    if let Err(e) = r {
+        if e.downcast_ref::<boot::Unreachable>().is_some() {
+            return Err(e);
+        }
+        return Err(e.context(format!("{id} is still billing: `wicket place release {id}`")));
+    }
     if let Some(hosts) = hosts {
         let ledger = Ledger::open(&crate::ledger_path())?;
         let token = ledger.create_node_token(&TenantId::single(), name, 600)?;
@@ -385,4 +434,234 @@ pub async fn bring_up(
         eprintln!("warning: could not replace {id}'s user data (it still holds the boot host key): {e:#}");
     }
     Ok((ready, target))
+}
+
+/// A node that never answered on the network: releases it through `placer` (which checks it is ours
+/// and not protected), audits `placement.node_unreachable` with why, and returns the error to report.
+/// Its lease's money leaves the envelope with it.
+pub async fn give_up_unreachable<A: envelope::SpendApprover>(
+    placer: &Placer<VultrProvider, A>,
+    ledger: &Ledger,
+    node: &NodeHandle,
+    why: &boot::Unreachable,
+) -> anyhow::Error {
+    let id = &node.id;
+    let released = placer.release(id, ReleaseMode::Now).await;
+    let outcome = match &released {
+        Ok(r) => format!("{r:?}"),
+        Err(e) => format!("not released: {e}"),
+    };
+    let audited = ledger.audit(
+        &TenantId::single(),
+        None,
+        "placement.node_unreachable",
+        &serde_json::json!({ "backend": node.backend, "id": id.0, "name": node.name, "target": why.target, "port": why.port,
+                             "silent_secs": why.after.as_secs(), "released": released.is_ok(), "outcome": outcome,
+                             "reason": why.to_string() }),
+    );
+    if let Err(e) = audited {
+        eprintln!("warning: could not audit giving up on {id}: {e:#}");
+    }
+    match released {
+        Ok(_) => anyhow::anyhow!("{why}: released {id} ({}) rather than leave it billing", node.name),
+        Err(e) => anyhow::anyhow!("{why}, and releasing it failed ({e}): {id} is still billing: `wicket place release {id}`"),
+    }
+}
+
+/// [`bring_up`], and on [`boot::Unreachable`] [`give_up_unreachable`].
+#[allow(clippy::too_many_arguments)]
+async fn bring_up_or_release<A: envelope::SpendApprover, Q: boot::Probe>(
+    placer: &Placer<VultrProvider, A>,
+    ledger_path: &std::path::Path,
+    n: &NodeHandle,
+    name: &str,
+    pinned: &str,
+    ssh_key: Option<PathBuf>,
+    hosts: Option<Vec<String>>,
+    ca_ttl: Duration,
+    wait: &boot::ReadyWait,
+    probe: Option<&Q>,
+) -> Result<NodeHandle> {
+    match bring_up_with(placer.provider(), &n.id, name, pinned, ssh_key, hosts, ca_ttl, wait, probe).await {
+        Ok((ready, _)) => Ok(ready),
+        Err(e) => match e.downcast_ref::<boot::Unreachable>() {
+            Some(u) => {
+                let ledger = Ledger::open(ledger_path)?;
+                Err(give_up_unreachable(placer, &ledger, n, u).await)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wicket_placement::envelope::{Approval, SpendApprover, SpendRequest};
+    use wicket_placement::mock::{serve, Shared, KEY};
+
+    /// When the mock's instances were created (2026-11-11T10:00:00Z); the placer's clock is a minute later.
+    const CREATED: i64 = 1_794_391_200;
+    const PINNED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePlaceholderKeyDataxxxxxxxxxxxxxxxxxxx wicket-node";
+
+    struct Yes;
+
+    impl SpendApprover for Yes {
+        async fn approve(&self, _r: &SpendRequest) -> Approval {
+            Approval::Approved
+        }
+    }
+
+    /// A node whose ssh port first answers after `answers_after` (never if None) and whose setup is
+    /// done `ready_after` from the start.
+    struct Node {
+        start: tokio::time::Instant,
+        answers_after: Option<Duration>,
+        ready_after: Duration,
+        logins: AtomicUsize,
+    }
+
+    impl boot::Probe for Node {
+        async fn reach(&self, _t: &str, _port: u16) -> boot::Reach {
+            match self.answers_after {
+                Some(a) if self.start.elapsed() >= a => boot::Reach::Answered,
+                _ => boot::Reach::Silent,
+            }
+        }
+        async fn ready(&self, _t: &str) -> anyhow::Result<Option<String>> {
+            self.logins.fetch_add(1, Ordering::SeqCst);
+            Ok((self.start.elapsed() < self.ready_after).then(|| "Permission denied (publickey)".to_string()))
+        }
+    }
+
+    fn node(answers_after: Option<u64>, ready_after: u64) -> Node {
+        Node {
+            start: tokio::time::Instant::now(),
+            answers_after: answers_after.map(Duration::from_millis),
+            ready_after: Duration::from_millis(ready_after),
+            logins: AtomicUsize::new(0),
+        }
+    }
+
+    /// Short waits: no answer for 300 ms means no network; setup may take up to 3 s.
+    fn wait() -> boot::ReadyWait {
+        boot::ReadyWait {
+            poll: Duration::from_millis(20),
+            timeout: Duration::from_secs(3),
+            silent_limit: Duration::from_millis(300),
+            port: 22,
+        }
+    }
+
+    /// Room in the envelope for one node at a time ($0.014/h, worst case $0.02 each).
+    fn placer(base: &str) -> Placer<VultrProvider, Yes> {
+        let client = Client::with_base(base, ApiKey::new(KEY)).unwrap();
+        let config = VultrConfig { sshkey_ids: vec!["k1".into()], ..VultrConfig::default() };
+        Placer::new(
+            VultrProvider::new(client, config),
+            Yes,
+            Owner::new("example"),
+            MoneyEnvelope { max_hourly: MicroUsd::parse_dollars("0.05").unwrap(), max_total: MicroUsd::parse_dollars("0.03").unwrap() },
+        )
+        .with_clock(std::sync::Arc::new(|| CREATED + 60))
+    }
+
+    fn request(name: &str) -> CapacityRequest {
+        CapacityRequest {
+            resources: Resources { vcpus: 1, memory_mib: 2048 },
+            min_isolation: IsolationTier::Gvisor,
+            region_hint: Some("lhr".into()),
+            plan_hint: None,
+            max_hourly: MicroUsd::parse_dollars("0.02"),
+            lifetime_secs: 3600,
+            idempotency_key: format!("place-create:{name}"),
+            name: name.into(),
+            purpose: format!("wicket place create {name}"),
+            boot: Some(Boot { user_data: "#cloud-config\n{}\n".into(), host_key: PINNED.into() }),
+        }
+    }
+
+    fn ledger_path(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-place-{tag}-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("ledger.db")
+    }
+
+    fn deletes(st: &Shared) -> Vec<String> {
+        st.lock().unwrap().seen.iter().filter(|s| s.method == "DELETE").map(|s| s.path.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_answers_is_released_early_audited_and_its_money_freed() {
+        let (base, st) = serve().await;
+        let p = placer(&base);
+        let n = p.acquire(&request("n1")).await.unwrap();
+        // The envelope holds one node: a second is refused while the first is billing.
+        assert!(matches!(p.acquire(&request("n2")).await, Err(PlacementError::Envelope(_))));
+
+        let path = ledger_path("silent");
+        let probe = node(None, 0);
+        let t0 = tokio::time::Instant::now();
+        let e = bring_up_or_release(&p, &path, &n, "n1", PINNED, None, None, Duration::from_secs(60), &wait(), Some(&probe))
+            .await
+            .unwrap_err()
+            .to_string();
+        // Given up at the silent limit, not the timeout, and without a single ssh login.
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(probe.logins.load(Ordering::SeqCst), 0);
+        assert!(e.contains("never answered on port 22") && e.contains(&format!("released {}", n.id)), "{e}");
+        assert!(!e.contains("still billing"), "{e}");
+
+        assert_eq!(deletes(&st), vec![format!("/v2/instances/{}", n.id)]);
+        assert!(st.lock().unwrap().instances.is_empty());
+        let audit = Ledger::open(&path).unwrap().audit_of_kind("placement.node_unreachable").unwrap();
+        assert_eq!(audit.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&audit[0].body).unwrap();
+        assert_eq!(body["id"], n.id.0.as_str());
+        assert_eq!(body["released"], true);
+        assert_eq!(body["port"], 22);
+        assert!(body["reason"].as_str().unwrap().contains("never answered"), "{body}");
+
+        // Its committed money left the envelope with it: the next node fits.
+        let n2 = p.acquire(&request("n2")).await.unwrap();
+        assert_ne!(n2.id, n.id);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_and_finishes_setup_late_is_kept() {
+        let (base, st) = serve().await;
+        let p = placer(&base);
+        let n = p.acquire(&request("n1")).await.unwrap();
+        let path = ledger_path("late");
+        // The port answers (refused, then accepted) at 100 ms; setup finishes at 800 ms, well past the
+        // 300 ms silent limit and inside the 3 s timeout.
+        let probe = node(Some(100), 800);
+        let ready =
+            bring_up_or_release(&p, &path, &n, "n1", PINNED, None, None, Duration::from_secs(60), &wait(), Some(&probe)).await.unwrap();
+        assert_eq!(ready.id, n.id);
+        assert!(probe.start.elapsed() >= Duration::from_millis(800));
+        assert!(probe.logins.load(Ordering::SeqCst) > 1);
+        assert!(deletes(&st).is_empty());
+        assert_eq!(st.lock().unwrap().instances.len(), 1);
+        assert!(Ledger::open(&path).unwrap().audit_of_kind("placement.node_unreachable").unwrap().is_empty());
+        // The boot host key was scrubbed from its user data as before.
+        assert!(st.lock().unwrap().seen.iter().any(|s| s.method == "PATCH" && s.body["user_data"].is_string()));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_but_never_finishes_waits_the_whole_timeout_and_is_kept() {
+        let (base, st) = serve().await;
+        let p = placer(&base);
+        let n = p.acquire(&request("n1")).await.unwrap();
+        let path = ledger_path("stuck");
+        let probe = node(Some(0), 60_000);
+        let w = boot::ReadyWait { timeout: Duration::from_millis(900), ..wait() };
+        let e = bring_up_or_release(&p, &path, &n, "n1", PINNED, None, None, Duration::from_secs(60), &w, Some(&probe)).await.unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("still billing") && e.contains("not ready after"), "{e}");
+        assert!(probe.start.elapsed() >= Duration::from_millis(850));
+        assert!(deletes(&st).is_empty());
+        assert!(Ledger::open(&path).unwrap().audit_of_kind("placement.node_unreachable").unwrap().is_empty());
+    }
 }

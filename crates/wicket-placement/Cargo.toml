@@ -30,3 +30,5 @@ mock = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
 [dev-dependencies]
 wicket-placement = { path = ".", features = ["mock"] }
 http.workspace = true
+# Paused clocks for the readiness probe's waits (minutes, simulated).
+tokio = { workspace = true, features = ["test-util"] }
