@@ -42,6 +42,7 @@ mod spawn;
 mod state;
 mod statestore;
 mod transcript;
+mod units;
 mod update;
 
 use anyhow::{bail, Context, Result};

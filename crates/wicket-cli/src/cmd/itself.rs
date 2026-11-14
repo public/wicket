@@ -39,6 +39,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 Ok(())
             }
             SelfCmd::Health { node, canary, image } => update::health(node, canary, image).await,
+            SelfCmd::Units => units::print(),
+            SelfCmd::ApplyUnits { dir } => units::apply(dir),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -129,6 +131,17 @@ pub enum SelfCmd {
         key: PathBuf,
         artifact: PathBuf,
     },
+    /// Install this build's systemd units (#165) where they differ from the installed ones, and
+    /// reload systemd; restarts nothing. Run as root with the version's own binary, as a refused
+    /// `self update` says: `sudo <versions>/<id>/wicket self apply-units`.
+    ApplyUnits {
+        /// Another units directory (default: /etc/systemd/system, which needs root).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// This build's systemd units (JSON: name to contents).
+    #[command(hide = true)]
+    Units,
     /// This build's version, protocol and schema (JSON).
     #[command(hide = true)]
     Describe,
