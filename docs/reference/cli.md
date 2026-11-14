@@ -1282,6 +1282,8 @@ Options:
           Create and wait, but don't enrol
       --ca-ttl <CA_TTL>
           [default: 24h]
+      --give-up-silent <GIVE_UP_SILENT>
+          Give up on the node, and release it, if nothing answers on its ssh port for this long (every connect times out or is unreachable). Once the port answers (accepted or refused), wait up to 15 minutes for setup [default: 4m]
   -h, --help
           Print help
 ```
