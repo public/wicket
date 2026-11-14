@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use std::sync::Arc;
-use wicket_core::{canonical_path, manifest::host_matches, Op};
+use wicket_core::{canonical_path, manifest::host_matches};
 
 mod connect;
 mod hosts;
@@ -349,7 +349,9 @@ impl Egress {
         };
         let ctx = &self.ctx;
         let query = pq.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let op = Op::egress_with_query(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
+        // Both requests of a git push are decided as the push of its repository: one request, one
+        // approval (#26).
+        let op = wicket_core::git::op_for(&ctx.tenant, &ctx.run, &ctx.zone.name, &method, &host, &path, query);
         let risk = format!("{:?}", op.risk);
         let emit = |outcome: &str, detail: String| {
             ctx.emit(Event::Egress {

@@ -31,11 +31,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
-            let grant::Decided::Approved { grant: gid, lease } =
+            let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } =
                 grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Approve(t), serde_json::json!({}))?
             else {
                 unreachable!("an approval approves")
             };
+            // What the grant was made with: a push gets its window, whatever was picked (#26).
+            let (unlimited, uses) = (made_uses.is_none(), made_uses.unwrap_or(0));
             println!(
                 "approved {id} → grant {gid}: {} {}{} ({}, {}, {})",
                 wicket_agent::clip(&req.method, 16),

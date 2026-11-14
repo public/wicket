@@ -77,6 +77,28 @@ fn oracle1_single_block_equals_compiled_zone() {
     assert!(kinds.iter().all(|&k| k > 1000), "too few of some kind: {kinds:?}");
 }
 
+/// #26: both requests of a push are decided as one op, the push of its repository; the box's
+/// token decides it as the zone does, so a node asks about it exactly where the control host would.
+#[test]
+fn push_ops_decide_as_the_zone() {
+    let keys = Keys::new(0);
+    let yaml = "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: pushes\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n    - { host: github.com, methods: [POST], paths: [\"/acme/tools.git/git-receive-pack\"], allow_dangerous: true }\n";
+    let z = wicket_core::Manifest::from_yaml(yaml).unwrap().zone;
+    let mut seen = Oracle1::default();
+    oracle1_zone(&z, &keys, &mut seen);
+    let c = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+    let l = load_ok(&mint(&keys.root, TENANT, "trigger:t", &c).unwrap(), &keys);
+    let cz = CompiledZone::new(z.clone()).unwrap();
+    for repo in ["/acme/app.git", "/acme/app", "/ACME/App.git", "/acme/tools.git", "/other/x.git"] {
+        let push = op("pushes", "POST", "github.com", &wicket_core::git::push_op_path(repo));
+        let want = kind_of_verdict(&cz.evaluate(&push));
+        assert_eq!(kind_of(&decide_compiled(&l, &http_request("b0", &push))), want, "push {repo}");
+    }
+    // The push of a repository the zone allows pushing to is allowed by reach; others need a grant.
+    let push = |r: &str| kind_of_verdict(&cz.evaluate(&op("pushes", "POST", "github.com", &wicket_core::git::push_op_path(r))));
+    assert_eq!((push("/acme/tools.git"), push("/acme/app.git")), (0, 2));
+}
+
 /// #183: the remote-control-box zone as first written (5 reach rules, 9 globs on api.anthropic.com;
 /// 6 forbid rules) took 9,497 steps in the generic engine, over the bound measured on the examples
 /// then. It mints (its estimate is within the budget), runs compiled, and decides as its zone.

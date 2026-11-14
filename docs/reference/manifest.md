@@ -132,6 +132,19 @@ inspected: see [performance](../explanation/performance.md#splice-through-for-ho
 | `host` | string | required | As in `reach`. |
 | `paths` | list of globs | `["/**"]` | As in `reach`, but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
 
+#### Git pushes
+
+A git push over smart HTTP is decided as one request, the push of its repository
+(`POST {repo}/git-receive-pack`): its ref discovery (`GET {repo}/info/refs?service=git-receive-pack`)
+and its upload share one pending request, and one approval covers both, with git's retries, for
+5 minutes (whatever uses the approver picked). An agent asking ahead with `request_access` for
+either URL asks for that same request. Fetches are reads, as before.
+
+wicket decides which repositories a box may push to, not which refs: it doesn't read the push's
+body. Limit what a push can change where the forge enforces it, by injecting a token scoped to the
+repositories the task needs and protecting branches and tags with the forge's own rules (on GitHub,
+rulesets or branch protection).
+
 ### `inject`
 
 | field | type | default | meaning |

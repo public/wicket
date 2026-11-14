@@ -57,9 +57,10 @@ pub enum Verdict {
 /// What [`decide`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decided {
-    /// The grant made, and the capacity lease the request asked for, if it is a capacity ask:
-    /// provisioned by the next reconcile pass (`wicket approve` runs one at once).
-    Approved { grant: String, lease: Option<String> },
+    /// The grant made, the uses and lifetime it was made with (a git push gets its own window, #26:
+    /// [`wicket_core::git::grant_terms`]), and the capacity lease the request asked for, if it is a
+    /// capacity ask: provisioned by the next reconcile pass (`wicket approve` runs one at once).
+    Approved { grant: String, lease: Option<String>, uses: Option<u32>, ttl: std::time::Duration },
     /// Denied; a capacity ask's reservation was released at once.
     Denied { lease: Option<String> },
 }
@@ -98,12 +99,17 @@ fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json:
     let label = by.label();
     let a = Approval { uses: t.uses, ttl: t.ttl, path_prefix: t.prefix.clone(), decided_by: label.clone() };
     let gid = if t.zone_wide { l.approve_zone_wide(id, &a)? } else { l.approve(id, &a)? };
+    // What the grant is made with: a push gets its window, whatever was picked (#26).
+    let (uses, ttl_secs) = match t.prefix.is_some() || req.scope_prefix {
+        true => (t.uses, t.ttl.as_secs()),
+        false => wicket_core::git::grant_terms(&req.method, &req.path, t.uses, t.ttl.as_secs()),
+    };
     let mut record = serde_json::json!({
         "request": id, "decision": "approve", "grant": gid, "by": label,
         "method": req.method, "host": req.host, "path": req.path,
         "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
         "agent_identity": crate::verified_identity(l, &req.run, None),
-        "uses": t.uses, "ttl_secs": t.ttl.as_secs(), "prefix": t.prefix, "scope_prefix": req.scope_prefix,
+        "uses": uses, "ttl_secs": ttl_secs, "prefix": t.prefix, "scope_prefix": req.scope_prefix,
         "scope": if t.zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone, "lease": lease,
     });
     merge(&mut record, extra);
@@ -111,7 +117,7 @@ fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json:
         let _ = l.revoke_grant(&gid);
         return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
     }
-    Ok(Decided::Approved { grant: gid, lease })
+    Ok(Decided::Approved { grant: gid, lease, uses, ttl: std::time::Duration::from_secs(ttl_secs) })
 }
 
 fn deny(l: &mut Ledger, by: &Granter, id: &str, extra: serde_json::Value) -> Result<Decided> {
@@ -168,7 +174,7 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
         let by = Granter::Human("alice@cli".into());
-        let Decided::Approved { grant, lease } = decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap()
+        let Decided::Approved { grant, lease, .. } = decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap()
         else {
             panic!("not approved")
         };

@@ -1238,7 +1238,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 bail!("{request}: the requesting agent's identity no longer verifies; it can be denied, not approved");
             }
             let t = grant::Terms { uses: *uses, ttl: Duration::from_secs(*ttl_secs), prefix: prefix.clone(), zone_wide: *zone_wide };
-            let grant::Decided::Approved { grant, lease } = grant::decide(
+            let grant::Decided::Approved { grant, lease, .. } = grant::decide(
                 &mut l,
                 &grant::Granter::Human(by),
                 request,
