@@ -30,8 +30,28 @@ type FbFn = unsafe extern "C" fn(
 ) -> i32;
 
 extern "C" {
-    fn fb_sse2(b: *const u8, l: usize, m: *mut *const u8, ml: *mut usize, p: *mut *const u8, pl: *mut usize, mi: *mut i32, h: *mut FbHeader, nh: *mut usize) -> i32;
-    fn fb_avx2(b: *const u8, l: usize, m: *mut *const u8, ml: *mut usize, p: *mut *const u8, pl: *mut usize, mi: *mut i32, h: *mut FbHeader, nh: *mut usize) -> i32;
+    fn fb_sse2(
+        b: *const u8,
+        l: usize,
+        m: *mut *const u8,
+        ml: *mut usize,
+        p: *mut *const u8,
+        pl: *mut usize,
+        mi: *mut i32,
+        h: *mut FbHeader,
+        nh: *mut usize,
+    ) -> i32;
+    fn fb_avx2(
+        b: *const u8,
+        l: usize,
+        m: *mut *const u8,
+        ml: *mut usize,
+        p: *mut *const u8,
+        pl: *mut usize,
+        mi: *mut i32,
+        h: *mut FbHeader,
+        nh: *mut usize,
+    ) -> i32;
 }
 
 /// Request heads of the shapes a box sends through the proxy (inside TLS, after interception).
@@ -42,7 +62,7 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("curl", "GET /1k HTTP/1.1\r\nHost: origin.test\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n"),
         ("npm", "GET /@types%2fnode HTTP/1.1\r\nuser-agent: npm/10.9.2 node/v22.12.0 linux x64 workspaces/false\r\nnpm-command: install\r\npacote-version: 18.0.6\r\npacote-req-type: packument\r\npacote-pkg-id: registry:@types/node\r\naccept: application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*\r\nnpm-auth-type: web\r\nnpm-command: install\r\naccept-encoding: gzip,deflate\r\nHost: registry.npmjs.org\r\nConnection: keep-alive\r\n\r\n"),
         ("git-upload-pack", "POST /owner/repo.git/git-upload-pack HTTP/1.1\r\nHost: github.com\r\nUser-Agent: git/2.43.0\r\nAccept-Encoding: deflate, gzip, br, zstd\r\nContent-Type: application/x-git-upload-pack-request\r\nAccept: application/x-git-upload-pack-result\r\nGit-Protocol: version=2\r\nContent-Length: 1532\r\n\r\n"),
-        ("chrome", "GET /api/v1/items?page=2&sort=recent HTTP/1.1\r\nHost: app.example.com\r\nConnection: keep-alive\r\nsec-ch-ua: \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Linux\"\r\nUpgrade-Insecure-Requests: 1\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-User: ?1\r\nSec-Fetch-Dest: document\r\nReferer: https://app.example.com/api/v1/items?page=1\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-GB,en;q=0.9\r\nCookie: session=0123456789abcdef0123456789abcdef; theme=dark; _ga=GA1.1.123456789.1700000000\r\n\r\n"),
+        ("chrome", "GET /api/v1/items?page=2&sort=recent HTTP/1.1\r\nHost: app.example.com\r\nConnection: keep-alive\r\nsec-ch-ua: \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Linux\"\r\nUpgrade-Insecure-Requests: 1\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.000 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-User: ?1\r\nSec-Fetch-Dest: document\r\nReferer: https://app.example.com/api/v1/items?page=1\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-GB,en;q=0.9\r\nCookie: session=0123456789abcdef0123456789abcdef; theme=dark; _ga=GA1.1.123456789.1700000000\r\n\r\n"),
         ("model-call", "POST /v1/messages HTTP/1.1\r\nhost: api.anthropic.com\r\nanthropic-version: 2023-06-01\r\ncontent-type: application/json\r\naccept: application/json\r\nuser-agent: claude-cli/2.1.0 (external, cli)\r\nx-app: cli\r\nanthropic-beta: interleaved-thinking-2025-05-14\r\ncontent-length: 48211\r\n\r\n"),
     ];
     v.into_iter()
