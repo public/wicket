@@ -203,7 +203,8 @@ for m in messages():
             t0 = time.monotonic()
             time.sleep(SELF_WAKE)
             slept = round(time.monotonic() - t0, 1)
-            update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "woke on my own timer after %d s idle" % SELF_WAKE}})
+            # A tool call, which wicket shows at once (a message chunk waits for the next turn).
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t-wake", "title": "woke on my own timer after %d s idle" % SELF_WAKE, "kind": "other", "status": "completed"})
             seen["self_wakeup"] = {"slept": SELF_WAKE, "elapsed": slept, "hibernate": call_tool("hibernate")}
         else:
             seen["finish"] = call_tool("finish")

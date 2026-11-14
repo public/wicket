@@ -382,7 +382,8 @@ check "  and each answer is audited" '[ "$(w audit --tail 400 | grep "${our_runs
 acp_agent=$(grep -o "agent agt_[a-z0-9]*" "$work/acp1.log" | head -1 | cut -d" " -f2 || true)
 # The harness decides its lifetime (#249): idle after its turn, it is neither ended nor paused, and
 # wakes on its own timer; only then does it ask to hibernate.
-check "  idle after its turn, it woke on its own timer, still running and never paused" '[ "$(af .seen.self_wakeup.slept)" = 8 ] && awk "BEGIN { exit !($(af .seen.self_wakeup.elapsed) < 12) }" && grep -q "woke on my own timer" "$work/acp1.log" && ! grep -qi "paused" "$work/acp1.log"'
+check "  idle after its turn, it woke on its own timer" '[ "$(af .seen.self_wakeup.slept)" = 8 ] && grep -q "woke on my own timer after 8 s idle" "$work/acp1.log"'
+check "    on time (its box never paused: 8 s idle took under 12)" 'awk "BEGIN { exit !($(af .seen.self_wakeup.elapsed) < 12) }" && ! grep -qi "paused" "$work/acp1.log"'
 check "  then it asked to hibernate, and did, after its turn" '[ -n "$acp_agent" ] && af .seen.self_wakeup.hibernate | grep -q "^wicket hibernates you" && grep -q "the agent asked to hibernate" "$work/acp1.log" && grep -q "hibernated in" "$work/acp1.log"'
 wt 300 wake "$acp_agent" "Again, please." >"$work/acp2.log" 2>&1 || true
 our_runs+=("$(run_id_of "$work/acp2.log")")
