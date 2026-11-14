@@ -211,6 +211,38 @@ pub struct ZoneSpec {
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+    /// Whether this zone's agents may ask for what is outside their reach, and decide their
+    /// descendants' requests within it (#50). Both default on. Written out only when it isn't the
+    /// default, so a zone that doesn't use it reads the same to a node that doesn't know it.
+    #[serde(default, skip_serializing_if = "Escalation::is_default")]
+    pub escalation: Escalation,
+}
+
+/// Who may escalate (#50): ask for more, and grant others what this zone may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Escalation {
+    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `ask_human`,
+    /// `request_capacity`, `request_update`). Off: anything outside the zone's reach is "never
+    /// allowed" instead of pending.
+    #[serde(default = "yes")]
+    pub request: bool,
+    /// May approve or deny its descendants' requests, only for what its own zone reaches (the
+    /// gateway's `decide` tool).
+    #[serde(default = "yes")]
+    pub grant: bool,
+}
+
+impl Default for Escalation {
+    fn default() -> Self {
+        Escalation { request: true, grant: true }
+    }
+}
+
+impl Escalation {
+    pub fn is_default(&self) -> bool {
+        *self == Escalation::default()
+    }
 }
 
 impl ZoneSpec {
@@ -805,6 +837,20 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #50: both rights default on, and a zone that doesn't restrict them serializes without the
+    /// field (the feed carries zones to nodes that refuse unknown fields).
+    #[test]
+    fn escalation_defaults_on_and_is_written_only_when_restricted() {
+        let z: ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        assert_eq!(z.escalation, Escalation { request: true, grant: true });
+        assert!(!serde_json::to_string(&z).unwrap().contains("escalation"));
+        let r: ZoneSpec = serde_yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
+        assert_eq!(r.escalation, Escalation { request: false, grant: true });
+        let back: ZoneSpec = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.escalation, r.escalation);
+        assert!(serde_yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
+    }
 
     /// #126: a zero limit means no limit to Docker, so a manifest can't set one.
     #[test]

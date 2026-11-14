@@ -447,6 +447,7 @@ mod tests {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            decisions: None,
             fence: None,
             waker: None,
             lifecycle: None,

@@ -53,6 +53,9 @@ pub struct RunCtx {
     pub boxes: Option<Arc<dyn link::BoxOps>>,
     /// Asks for capacity leases (`request_capacity`, #7); None when this run may not.
     pub capacity: Option<CapacityHook>,
+    /// Decides descendants' requests within this run's authority (`decide`, #50); None when this
+    /// run may not (its zone has `escalation.grant: false`, or it is a program).
+    pub decisions: Option<Arc<dyn Decisions>>,
     /// The long-lived agent this run is an activation of, and its generation (#70). Requests are
     /// refused once the agent's generation has moved past this one: a newer activation woke it.
     pub fence: Option<Fence>,
@@ -116,6 +119,21 @@ pub enum CapacityState {
 
 /// Ok: what to tell the agent. Err: why not.
 pub type CapacityHook = Arc<dyn Fn(CapacityCall) -> std::result::Result<CapacityState, String> + Send + Sync>;
+
+/// The payload kind of a decision envelope (#50): what the gateway signs for `decide`, never a
+/// message (`send_message` signs `message`), so a message can't be presented as a decision.
+pub const DECISION_KIND: &str = "decision";
+
+/// Decisions an agent makes on its descendants' requests (#50, the `decide` tool). The gateway
+/// signs each decision with this run's identity key; the hook verifies the envelope and checks the
+/// decision is within the run's own authority before recording it.
+pub trait Decisions: Send + Sync {
+    /// The pending requests of this run's descendants that it could decide now.
+    fn decidable(&self) -> std::result::Result<Vec<wicket_store::Request>, String>;
+    /// Records the decision in `signed`, a [`DECISION_KIND`] envelope this run's gateway signed:
+    /// what to tell the agent, or why it was refused (the request then stays pending).
+    fn decide(&self, signed: &str) -> std::result::Result<String, String>;
+}
 
 /// A credential the box only ever sees as a placeholder. When a request to `host` carries exactly
 /// `Authorization: Bearer <placeholder>`, the egress proxy sends the real value instead. The
@@ -455,6 +473,9 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
 }
 
 /// What every refusal reminds the agent of: where it is, and that there is no other way out.
+/// What an agent whose zone may not ask (`escalation.request: false`, #50) is told when it asks.
+pub const NEVER_ASKS: &str = "this zone may not ask for anything outside its reach (escalation.request: false), so this will never be allowed from this sandbox; tell the user";
+
 pub(crate) const SANDBOX_FACT: &str = "You are in a wicket sandbox (a gVisor container with no network of its own); wicket's proxy is its only route out, so no other tool, host, mirror or cache will reach this either.";
 
 /// Request headers the egress proxy forwards from a box to any upstream (#130, design §9.0): content
@@ -557,6 +578,7 @@ mod fence_tests {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            decisions: None,
             fence: Some(Fence { agent, generation: 1 }),
             waker: None,
             lifecycle: None,

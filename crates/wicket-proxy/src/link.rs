@@ -713,6 +713,7 @@ mod tests {
                 swaps: vec![],
                 boxes: Some(Arc::new(boxes)),
                 capacity: None,
+                decisions: None,
                 fence: None,
                 waker: None,
                 lifecycle: None,

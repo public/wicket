@@ -1480,6 +1480,10 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
     if op.surface != wicket_core::Surface::Egress {
         return Err("a node asks only about egress".into());
     }
+    // A zone that may not ask (#50): nothing it asks for is raised, whoever relays it.
+    if !zone_spec.escalation.request {
+        return Err(format!("not requested: {}", wicket_proxy::NEVER_ASKS));
+    }
     match wicket_core::canonical_path(&op.path) {
         Ok(p) if p == op.path => {}
         _ => return Err("not requested: the path is not canonical".into()),

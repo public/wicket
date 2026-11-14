@@ -130,6 +130,7 @@ impl World {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            decisions: None,
             fence: node.is_none().then(|| wicket_proxy::Fence { agent: agent.clone(), generation: 1 }),
             waker: None,
             lifecycle: None,

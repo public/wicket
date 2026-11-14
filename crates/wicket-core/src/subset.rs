@@ -112,6 +112,13 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             v.push(format!("accept_from {z}: this zone doesn't accept messages from it either"));
         }
     }
+    // Escalation rights narrow too (#50): a zone can't give a child a right it lacks.
+    if c.escalation.request && !p.escalation.request {
+        v.push("escalation.request: this zone may not ask for more, so a child it starts can't either".into());
+    }
+    if c.escalation.grant && !p.escalation.grant {
+        v.push("escalation.grant: this zone may not grant requests, so a child it starts can't either".into());
+    }
     if ask.max_children >= parent.child_slots {
         v.push(format!(
             "max_children {}: this zone has {} box(es) left to start, including this one",
@@ -413,6 +420,28 @@ mod tests {
 
     /// #20: a zone that forbids wildcards binds its children, and a child may not reach more names
     /// under a wildcard than its parent.
+    #[test]
+    fn escalation_rights_only_narrow() {
+        let with = |e: &str| {
+            let mut z = parent();
+            z.escalation = serde_yaml::from_str(e).unwrap();
+            z
+        };
+        let child = |e: &str| {
+            let mut z = zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m }\n");
+            z.escalation = serde_yaml::from_str(e).unwrap();
+            z
+        };
+        let verdict = |p: &ZoneSpec, c: &ZoneSpec| check(&ask(c), &bounds(p)).err().unwrap_or_default();
+        assert!(verdict(&with("{}"), &child("{ request: false, grant: false }")).is_empty(), "restricting is allowed");
+        let no_grant = with("{ grant: false }");
+        let v = verdict(&no_grant, &child("{}"));
+        assert!(v.len() == 1 && v[0].starts_with("escalation.grant"), "{v:?}");
+        assert!(verdict(&no_grant, &child("{ grant: false }")).is_empty());
+        let v = verdict(&with("{ request: false }"), &child("{ grant: true }"));
+        assert!(v.len() == 1 && v[0].starts_with("escalation.request"), "{v:?}");
+    }
+
     #[test]
     fn a_zone_forbidding_wildcards_binds_its_children() {
         let p = zone("  wildcards: { forbid: true, max_names: 8 }\n  reach: [{ host: api.example.com }]\n");

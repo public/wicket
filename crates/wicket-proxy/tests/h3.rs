@@ -187,6 +187,7 @@ impl World {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            decisions: None,
             fence: Some(wicket_proxy::Fence { agent, generation: 1 }),
             waker: None,
             lifecycle: None,
