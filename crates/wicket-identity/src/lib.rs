@@ -13,7 +13,6 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -21,6 +20,7 @@ use std::path::Path;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
+pub mod jws;
 pub mod node;
 
 #[derive(Debug, thiserror::Error)]
@@ -396,40 +396,36 @@ pub fn verify_checkpoint(jws: &str, issuer: &VerifyingKey) -> Result<Value> {
     Ok(payload)
 }
 
-// ---- compact JWS (EdDSA) ----
+// ---- compact JWS (EdDSA), over the one implementation in `jws` ----
 
 fn jws_sign(key: &SigningKey, header: Value, payload: &Value) -> String {
-    let input = format!("{}.{}", B64.encode(header.to_string()), B64.encode(payload.to_string()));
-    let sig = key.sign(input.as_bytes());
-    format!("{input}.{}", B64.encode(sig.to_bytes()))
+    jws::sign(key, header.to_string().as_bytes(), payload.to_string().as_bytes())
 }
 
-fn jws_parts(jws: &str) -> Result<(&str, &str, &str)> {
-    let mut it = jws.split('.');
-    match (it.next(), it.next(), it.next(), it.next()) {
-        (Some(h), Some(p), Some(s), None) => Ok((h, p, s)),
-        _ => Err(IdError::Malformed("not a compact JWS")),
-    }
+fn jws_parts(jws: &str) -> Result<jws::Parts<'_>> {
+    jws::split(jws).ok_or(IdError::Malformed("not a compact JWS"))
 }
 
 fn decode_json(part: &str) -> Result<Value> {
-    let b = B64.decode(part).map_err(|_| IdError::Malformed("base64url"))?;
+    let b = jws::decode(part).ok_or(IdError::Malformed("base64url"))?;
     serde_json::from_slice(&b).map_err(|_| IdError::Malformed("json"))
 }
 
 fn jws_header(jws: &str) -> Result<Value> {
-    decode_json(jws_parts(jws)?.0)
+    decode_json(jws_parts(jws)?.header)
 }
 
 fn jws_verify(jws: &str, key: &VerifyingKey) -> Result<(Value, Value)> {
-    let (h, p, s) = jws_parts(jws)?;
-    let header = decode_json(h)?;
+    let parts = jws_parts(jws)?;
+    let header = decode_json(parts.header)?;
     if header.get("alg").and_then(|a| a.as_str()) != Some("EdDSA") {
         return Err(IdError::Malformed("alg must be EdDSA"));
     }
-    let sig: [u8; 64] = B64.decode(s).ok().and_then(|b| b.try_into().ok()).ok_or(IdError::Malformed("signature"))?;
-    key.verify(format!("{h}.{p}").as_bytes(), &Signature::from_bytes(&sig)).map_err(|_| IdError::BadSignature("does not verify"))?;
-    Ok((header, decode_json(p)?))
+    parts.verify(key).map_err(|e| match e {
+        jws::BadSignature::Malformed => IdError::Malformed("signature"),
+        jws::BadSignature::Mismatch => IdError::BadSignature("does not verify"),
+    })?;
+    Ok((header, decode_json(parts.payload)?))
 }
 
 #[cfg(test)]
@@ -509,10 +505,10 @@ mod tests {
     fn a_claim_cannot_be_edited_without_breaking_the_signature() {
         let i = Issuer::generate("test.local");
         let doc = issue(&i, &AgentKey::generate(), "research", "explorer");
-        let (h, p, s) = jws_parts(&doc).unwrap();
-        let mut claims = decode_json(p).unwrap();
+        let p = jws_parts(&doc).unwrap();
+        let mut claims = decode_json(p.payload).unwrap();
         claims["zone"] = "prod".into();
-        let tampered = format!("{h}.{}.{s}", B64.encode(claims.to_string()));
+        let tampered = format!("{}.{}.{}", p.header, B64.encode(claims.to_string()), p.signature);
         assert!(matches!(verify_identity(&tampered, &i.verifying_key(), 1500), Err(IdError::BadSignature(_))));
     }
 
