@@ -9,6 +9,10 @@ comment to one file, then
   dependencies, as `ci/affected.py` selects them);
 - **test run:** running those tests.
 
+Two cargo invocations with different package sets can resolve different features and rebuild the
+dependency tree (wicket-autonomy's finding, #243). The loop's prime builds both invocations' sets, and
+cargo keeps an artifact per feature set, so the timed phases don't pay that.
+
 Each phase's wall time and peak memory (the largest process) is in `loop.jsonl`, from a warm target
 dir with that variant's settings, all under `boxslot run --mem 4500M`. The host's load varied from 2 to
 6 during the runs, so differences of 20–30% between single runs are within noise; the ones below are
