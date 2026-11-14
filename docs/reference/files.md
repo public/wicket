@@ -34,7 +34,7 @@ Where wicket keeps what. On an installed control host the data directory is `/va
 | `snapshots/<time>-<version>.db` | Ledger snapshots taken before each `wicket self update` switch; the newest five are kept. |
 | `pids/` | Pid files of the console and the reconciler, which `wicket self update` signals. |
 | `release-keys/*.pub` | Release keys updates are accepted from. |
-| `images.yaml` | The installation's image policy (#192): `require_digests: true` refuses a run unless its image and its zone's `images` are pinned by digest (the installation's own agent image excepted). |
+| `images.yaml` | The installation's image policy (#192, #191): `require_digests: true` refuses a run unless its image and its zone's `images` are pinned by digest (the installation's own agent image excepted). `registries` lists the registries nodes may pull pinned images from, host-side: each `host` (`host[:port]`; `docker.io` for Docker Hub), and optionally its `secret` (a vault secret bound to the registry's hosts: `user:password` or a token), `auth_hosts` (its token service) and `blob_hosts` (where it redirects downloads). See [nodes](nodes.md#images-on-nodes). |
 | `ci-builds.yaml` | The repository whose CI-signed builds of main this installation takes, its token's vault secret, and `self follow`'s policy (#190). |
 | `follow.json` | What `self follow` remembers: builds whose update failed here, and why it last didn't update. |
 | `self-update.lock` | Held by the update or rollback running on this host. |

@@ -35,6 +35,7 @@ mod place;
 mod policy;
 mod program;
 mod reconcile;
+mod registry;
 mod rootcopy;
 mod roots;
 mod run;

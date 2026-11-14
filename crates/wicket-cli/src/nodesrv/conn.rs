@@ -426,6 +426,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             Msg::PutTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, true),
             Msg::ImageHave { id, digest } => images::have(node, gen, id, digest),
             Msg::PutImage { stream, digest, name } => images::put(node, gen, stream, digest, name),
+            Msg::PullImage { id, run, digest, name, from } => images::pull(node, gen, id, run, digest, name, from),
             Msg::GetTree { stream, run, tree } => transfer(node, gen, tunnels, stream, &run, &tree, false),
             Msg::Listen { id, run, sock, dial } => {
                 let error = match dial {
