@@ -53,6 +53,7 @@ mod conn;
 mod gateway;
 #[path = "nodegw.rs"]
 mod gw;
+mod images;
 mod links;
 use conn::*;
 use gateway::*;
@@ -241,6 +242,8 @@ struct Node {
     mem: Mutex<HashMap<String, BoxMem>>,
     /// Each box's model proxy, for its budget slice and spend reports (#152).
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
+    /// Images being received (#191), by stream.
+    images: images::Incoming,
 }
 
 impl Node {
@@ -405,10 +408,6 @@ impl Node {
         Arc::new(move |run: String, name: String| {
             let n = n.clone();
             Box::pin(async move {
-                // A control host before protocol 3 doesn't release secrets: its node relays instead.
-                if (1..chan::NODE_LEASES).contains(&n.proto_of(&run)) {
-                    return Err(format!("{OLD_CONTROL}: credential {name} stays on the control host"));
-                }
                 let id = n.id();
                 let (tx, rx) = oneshot::channel();
                 n.asks.lock().expect("asks").insert(id, tx);
@@ -507,17 +506,15 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        // Injected hosts are decided here too, their secret fetched on first use (#152); with a
-        // control host before protocol 3 they are forwarded to it, as before. Hosts the control host
-        // swaps a credential in for (#169) are always forwarded: swaps stay there.
-        let v1 = (1..chan::NODE_LEASES).contains(&self.node.proto_of(&self.run));
+        // Injected hosts are decided here too, their secret fetched on first use (#152). Hosts the
+        // control host swaps a credential in for (#169) are always forwarded: swaps stay there.
         wicket_proxy::decide::route_sealed(
             host,
             &spec,
             &self.swaps,
             self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
             now,
-            &|_| !v1,
+            &|_| true,
         )
     }
 
@@ -568,6 +565,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     let ident = crate::nodeauth::NodeIdentity::load(&paths.root, &name, wicket_feed::now_ms() / 1000)?;
     let audit = crate::audit_export::open_batched(&paths.root.join("audit.db"))?;
     std::fs::create_dir_all(paths.runs())?;
+    // Images a previous `serve` was receiving when it ended (#191) are incomplete.
+    images::clear_spool(&paths.root);
     let ctl = paths.socket();
     let ctl_dir = ctl.parent().expect("socket dir");
     std::fs::create_dir_all(ctl_dir)?;
@@ -613,6 +612,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         causes: Mutex::new(HashMap::new()),
         mem: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
+        images: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -757,8 +757,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
 /// Takes over the boxes a previous `node serve` from this directory started (#151): each running box
 /// with its record (`node-box.json`) is adopted (its proxies started again, its output read from the
 /// start, its stdin fed, its timeout kept) and waits for its control host to resume it. A box whose
-/// run has no authority in the feed any more is stopped, and so is one from before records (as
-/// before: nobody can supervise it). Any other container, wicket's or not, is left alone.
+/// run has no authority in the feed any more is stopped, and so is an orphan without a record
+/// (nobody can supervise it). Any other container, wicket's or not, is left alone.
 async fn adopt_previous(node: &Arc<Node>) {
     let runs = node.paths.runs();
     let Ok(boxes) = node.docker.boxes().await else { return };
@@ -1595,7 +1595,13 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     n.queue.drop_run(run);
     n.edge.drop_run(run);
     n.replica.lock().expect("replica").drop_local(run);
-    n.llms.lock().expect("llms").remove(run);
+    let llm = n.llms.lock().expect("llms").remove(run);
+    // The run's last spend goes ahead of its exit, on the same channel: the once-a-second report
+    // can miss a model call made just before the box ended (an agent that hibernates or finishes
+    // right after its turn, #249), and the box would not be charged for it.
+    if let Some(l) = llm {
+        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent() }));
+    }
     eprintln!("[node] {run}: box exited ({code})");
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause }));
 }
@@ -1641,6 +1647,7 @@ async fn serve_box(
         capacity: None,
         fence: None,
         waker: None,
+        lifecycle: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = match &ca {
@@ -1700,7 +1707,7 @@ async fn serve_box(
                 if now != last {
                     let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
                 }
-                if (now != last || i.is_multiple_of(10)) && n.proto_of(&run) >= chan::NODE_LEASES {
+                if now != last || i.is_multiple_of(10) {
                     n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
                 }
                 last = now;
@@ -1780,8 +1787,9 @@ async fn serve_box(
     Ok(tasks)
 }
 
-/// How a fetch for a version-1 control host fails: the model proxy relays on it.
-pub const OLD_CONTROL: &str = wicket_proxy::llm::RELAY_INSTEAD;
+/// How a tool call relayed to a control host before [`chan::EDGE_DECISIONS`] fails: it would decide
+/// it differently.
+pub const OLD_CONTROL: &str = "the control host speaks an older protocol";
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 
@@ -1900,7 +1908,7 @@ mod tests {
     use crate::nodeauth::testkit::Install;
     use crate::nodeauth::HsError;
 
-    fn test_node(i: &Install) -> Arc<Node> {
+    pub(super) fn test_node(i: &Install) -> Arc<Node> {
         let root = wicket_identity::SigningKey::from_bytes(&[3; 32]).verifying_key();
         Arc::new(Node {
             name: "n1".into(),
@@ -1929,6 +1937,7 @@ mod tests {
             causes: Mutex::new(HashMap::new()),
             mem: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
+            images: Default::default(),
         })
     }
 
@@ -2067,7 +2076,7 @@ mod tests {
         a
     }
 
-    async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
+    pub(super) async fn connect(node: &Arc<Node>, gen: u64, i: &Install) -> UnixStream {
         let (a, r) = handshake(node, gen, chan::PROTOCOL, i, &i.issuer).await;
         assert!(matches!(r, Ok(Msg::Welcome { .. })), "{:?}", r.err());
         a

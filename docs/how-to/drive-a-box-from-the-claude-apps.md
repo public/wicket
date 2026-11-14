@@ -58,7 +58,7 @@ What it protects, and how:
   (permission mode `default`); wicket decides what the box can reach either way.
 - **Nodes.** It runs on any node: the node forwards the provider's host to the control host, where the
   login is swapped in, so the secret stays with the control host.
-- **Not with hibernation.** The session lives in the vendor's apps, so `hibernate_after` is refused;
+- **Not with hibernation.** The session lives in the vendor's apps, so the `hibernate` tool is refused;
   the box ends with its session. A supervisor that is handed over (`wicket self update`, #151) rebuilds
   the swap from the manifest.
 

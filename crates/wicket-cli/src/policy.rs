@@ -225,7 +225,7 @@ pub async fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool) -> Res
     if !bad.is_empty() {
         bail!("org policy {v} doesn't mint, so nothing changed:\n  - {}", bad.join("\n  - "));
     }
-    let lacking = crate::roots::nodes_below(crate::chan::ORG_POLICY).await?;
+    let lacking = crate::roots::nodes_unreachable().await?;
     if !lacking.is_empty() {
         bail!(
             "not every node can read tokens with an org layer; nothing changed:\n{}\n(update them, or revoke the ones you no longer use)",

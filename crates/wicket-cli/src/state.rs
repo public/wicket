@@ -7,6 +7,7 @@
 //! | The ledger (runs, agents, grants, nodes, passkeys, the audit chain) | Streamed to the state store by Litestream (`wicket state replicate`), seconds behind |
 //! | Hibernated agents' bundles | The state store (`bundles: s3`), sealed under `state.key` |
 //! | Audit records and signed checkpoints | The state store, by an audit sink of type `store` |
+//! | Ledger snapshots taken before each update's switch (#167) | The state store too, sealed under `state.key` (`crate::snapstore`) |
 //! | Keys that rarely change: the identity issuer, the installation CA, the approver, `state.key`, nodes' feed keys and pinned host keys, the vault, the config files | The recovery kit (`wicket state kit`), kept offline by the operator |
 //! | The feed root and the authority root | Offline (`wicket keys roots-offline`), or in the kit |
 //! | Run directories (transcripts, workspaces), this host's own node, feed delta logs | Not kept: runs that were running end as lost, the node is made again, each feed starts a new generation |

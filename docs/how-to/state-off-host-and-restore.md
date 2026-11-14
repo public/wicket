@@ -12,6 +12,7 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
 | The ledger: runs, agents, grants, nodes, passkeys, the audit chain | The state store, streamed | `wicket state replicate` (the `wicket-state` service) runs [Litestream](https://litestream.io) |
 | Hibernated agents' bundles | The state store | `bundles: s3`, sealed under `state.key` as before |
 | Audit records and signed checkpoints | The state store | an audit sink of `type: store` |
+| The ledger snapshot `wicket self update` takes before each switch | The state store, and the host | pushed by the update, sealed under `state.key` (`wicket state snapshots`) |
 | Keys and files that rarely change: the identity issuer, the installation CA, the approver key, `state.key`, each node's feed key and pinned host key, the config files, the vault | The recovery kit | `wicket state kit`, kept offline by you |
 | The feed root and the authority root | Offline | `wicket keys roots-offline` |
 | Run directories (transcripts, workspaces), this host's own node, feed delta logs | Not kept | Runs that were running end as `lost`; the node is made again; each feed starts a new generation |
@@ -83,10 +84,9 @@ its stream's sync interval (one second by default). This is phase 4 of the contr
    - Nodes pin the same keys as before; tokens then carry the issuing key's certificate, which nodes
      check, by their own clock: past its end a box is refused everything, and a token that would
      outlive it isn't minted. **Every node needs a build with #154 first**: an older node can't read
-     the new field and refuses the records that carry it. Such tokens need control/node protocol 2
-     (`PROTOCOL`, #162). `roots-offline` checks: it asks every active node and refuses, naming each,
-     if one can't be reached or talks an older protocol. Once the roots are offline, a run whose
-     node talks protocol 1 is refused before its box starts.
+     the new field and refuses the records that carry it; every node this build talks to can.
+     `roots-offline` checks: it asks every active node and refuses, naming each, if one can't be
+     reached.
    - Before `--days` run out, renew with `wicket keys certify --roots /media/usb/roots` (or
      `WICKET_ROOTS=…`). Runs warn in the last week. Installed, run it as the wicket user, which must
      be able to read the directory: `sudo -u wicket WICKET_HOME=/var/lib/wicket HOME=/var/lib/wicket

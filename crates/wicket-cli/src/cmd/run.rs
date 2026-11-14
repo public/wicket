@@ -102,7 +102,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                             );
                             return Ok(());
                         }
-                        "active" | "idle" | "waking" | "hibernating" => run = a.run,
+                        "active" | "waking" | "hibernating" => run = a.run,
                         s => bail!("agent {} is {s}", a.id),
                     }
                 }

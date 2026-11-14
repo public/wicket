@@ -210,10 +210,11 @@ the connector's, or a human approves. Every link is recorded and audited. It clo
 Every Claude Code agent wicket launches on the control host is **long-lived**: an id (`agt_…`), its own
 session, and a **generation** number. Each run is one activation of it.
 
-- **Active → Idle:** after a turn and `idle_timeout`, the box is paused (`docker pause`), keeping its
-  processes and memory.
-- **Idle → Hibernated:** at `hibernate_after`, or on `wicket hibernate`, if the box is at a quiet point
-  (turn ended, nothing else running). The box stops, and its whole writable state is bundled into
+- **Active:** the box runs, during a turn and between turns. wicket never ends, pauses or hibernates
+  it on a turn boundary (#249): the agent's harness decides, and the run ends when it exits, at its
+  timeout, or when its authority ends. The agent ends its session with wicket's `finish` tool.
+- **Active → Hibernated:** when the agent asks (`hibernate` tool) or on `wicket hibernate`, at the end
+  of its turn, if the box is at a quiet point (nothing else running). The box stops, and its whole writable state is bundled into
   wicket's object store: the workspace, `$HOME` and the agent's config, `/tmp`, and `persist: durable`
   volumes.
 - **Wake:** `wicket wake`, `wicket say`, or a message from another agent rebuilds the box with a new

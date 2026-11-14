@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use wicket_core::{Op, RunId, TenantId, ZoneSpec};
-use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, PublishError, Publisher, PublisherConfig, RevokeKind};
+use wicket_feed::{BoxAuthority, Change, KeyCert, LiveGrant, Publisher, PublisherConfig, RevokeKind};
 use wicket_identity::node::NodeCertClaims;
 use wicket_store::Ledger;
 
@@ -61,9 +61,7 @@ const COMPACT_BYTES: u64 = 1 << 20;
 pub const REGENESIS: &str = "regenesis";
 
 /// Opens node `name`'s feed: its key (created here on first use, 0600) and a certificate for it from
-/// the installation's feed root. A delta log from before boxes' authority moved to tokens (zone
-/// entries, which don't parse as box records) is set aside as `deltas.jsonl.zones`, and the feed
-/// starts again under a new certificate version: a re-genesis, so the node takes the new snapshot.
+/// the installation's feed root. A delta log that doesn't read is an error, not set aside.
 pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthority>> {
     let dir = crate::data_dir().join("nodes").join(name).join("feed");
     if dir.join(REGENESIS).exists() {
@@ -76,19 +74,7 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthor
         println!("[wicket] node {name}'s feed starts a new generation (restored)");
         return Ok(p);
     }
-    match open_feed_once(name, &cfg, false) {
-        Err(e) if e.downcast_ref::<PublishError>().is_some_and(|e| e.to_string().contains("unreadable")) => {
-            let log = dir.join("deltas.jsonl");
-            std::fs::rename(&log, dir.join("deltas.jsonl.zones")).context("setting aside the old delta log")?;
-            println!("[wicket] node {name}'s feed log predates token authority: set aside, starting a new feed generation");
-            open_feed_once(name, &cfg, true)
-        }
-        r => r,
-    }
-}
-
-fn open_feed_once(name: &str, cfg: &PublisherConfig, new_generation: bool) -> Result<Publisher<BoxAuthority>> {
-    open_feed_inner(name, cfg, new_generation, false)
+    open_feed_inner(name, &cfg, false, false)
 }
 
 /// `restored`: the kit's certificate may be older than versions the node has seen since (the lost
@@ -233,7 +219,7 @@ impl SharedFeed {
             && crate::roots::feed_root_signing().is_ok()
         {
             std::fs::rename(&log, log.with_extension("jsonl.old")).context("setting the old delta log aside")?;
-            p = open_feed_once(name, &cfg, true)?;
+            p = open_feed_inner(name, &cfg, true, false)?;
         }
         p.note_issued(last_issued(&dir.join("feed")));
         let len = std::fs::metadata(p.log_path()).map(|m| m.len()).unwrap_or(0);
@@ -427,8 +413,6 @@ struct Shared {
     issuer: Arc<wicket_identity::Issuer>,
     /// The box's base token (block 0), and the key that signs its grant blocks.
     token_issuer: wicket_feed::Issuer,
-    /// Block 0 carries an org layer (#51): only for nodes talking [`crate::chan::ORG_POLICY`].
-    org: bool,
     approver: wicket_authz::SigningKey,
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
@@ -552,7 +536,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         cfg,
         issuer,
         token_issuer,
-        org: s.org.is_some(),
         approver,
         attribute: s.attribute.clone(),
         llm: s.llm.clone(),
@@ -601,6 +584,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
                 crate::chan::IMAGE_PINS
             );
         }
+        // A remote node gets a pinned image it lacks from here, verified there before it imports it
+        // (#191); the control host's own node shares its runtime.
+        if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
+            if ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_DELIVERY {
+                deliver_image(&ctl.calls, &name, &start.image, pin).await.with_context(|| format!("sending image {pin} to node {name}"))?;
+            }
+        }
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
             bail!("lost node {name} while starting the box");
         }
@@ -611,6 +601,45 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         };
     }
     Ok(NodeBox { image_digest, stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
+}
+
+/// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
+/// OCI image layout, and the node verifies it against the pin before importing it. If this host
+/// hasn't it either, nothing is sent, and the node refuses the box as before.
+pub async fn deliver_image(calls: &crate::nodecall::Calls, node: &str, image: &str, pin: &str) -> Result<()> {
+    if calls.has_image(pin).await? {
+        return Ok(());
+    }
+    let here = wicket_sandbox::Docker::from_env();
+    if !here.image_identity(pin).await?.is_some_and(|i| i.is(pin)) {
+        println!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
+        return Ok(());
+    }
+    println!("[wicket] sending image {image} ({pin}) to node {node}");
+    let t0 = std::time::Instant::now();
+    let mut save = here.export_image(pin)?;
+    let out = save.stdout.take().context("the export's output")?;
+    let mut err = save.stderr.take().context("the export's errors")?;
+    let errs = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut err, &mut s).await;
+        s
+    });
+    let sent = calls.put_image(pin, crate::oci::import_name(image, pin).as_deref(), out).await;
+    if sent.is_err() {
+        let _ = save.start_kill();
+    }
+    let st = save.wait().await?;
+    let sent = sent?;
+    if !st.success() {
+        bail!("exporting the image failed: {}", errs.await.unwrap_or_default().trim());
+    }
+    println!(
+        "[wicket] node {node} verified and imported image {pin} ({:.1} MiB in {:.1} s)",
+        sent as f64 / f64::from(1u32 << 20),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// The run loop's side of the box's stdio, held by the connection manager across reconnects.
@@ -760,27 +789,6 @@ async fn session(
             bail!("{why}")
         }
     };
-    // A token minted by the issuing key (the roots offline, #154) is for nodes that can read it.
-    if sh.token_issuer.issuer_cert.is_some() && authed.proto < crate::chan::ISSUER_CERT {
-        p.ever = false;
-        bail!(
-            "node {} talks protocol {}, and this box's token (minted by the authority issuing key, the roots being offline) needs {}: update the node (`wicket node install {}`)",
-            sh.node,
-            authed.proto,
-            crate::chan::ISSUER_CERT,
-            sh.node
-        );
-    }
-    if sh.org && authed.proto < crate::chan::ORG_POLICY {
-        p.ever = false;
-        bail!(
-            "node {} talks protocol {}, and this box's token carries the org policy, which needs {}: update the node (`wicket node install {}`)",
-            sh.node,
-            authed.proto,
-            crate::chan::ORG_POLICY,
-            sh.node
-        );
-    }
     let (feed, runs) = match authed.welcome {
         Msg::Welcome { feed, runs, proto, .. } => {
             p.proto = proto;
@@ -1255,7 +1263,7 @@ pub fn read_authority(run_dir: &Path) -> Option<AuthorityRecord> {
 
 /// The node has confirmed the box stopped (its exit, or it says it has no box for the run).
 pub fn confirm_stopped(run_dir: &Path) {
-    // A run with no record (from before #153, or lost) gets one: confirmed, nothing left to fence.
+    // A run whose record was lost gets one: confirmed, nothing left to fence.
     let mut a = read_authority(run_dir).unwrap_or_default();
     if !a.stopped {
         a.stopped = true;
@@ -1275,7 +1283,7 @@ pub fn fenced_until(run: &str, now_ms: i64) -> Option<(String, i64)> {
 
 /// [`fenced_until`] for the run in `run_dir`.
 ///
-/// A run whose record is missing (lost, or from before #153) fences until its timeout, from its run
+/// A run whose record is missing (lost) fences until its timeout, from its run
 /// record: its box may run that long on its node, and no longer. A run with neither record never
 /// started a box.
 pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
@@ -1381,9 +1389,6 @@ fn slice_fraction() -> f64 {
 /// its budget slice, renewed once less than half a slice is left, and lowered at once if what is
 /// left of the budget shrinks below it (a spawn's carve-out).
 fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
-    if p.proto < crate::chan::NODE_LEASES {
-        return None;
-    }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
     let spent = l.spent();
@@ -1441,9 +1446,6 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
 /// the node is told to drop them (#152).
 fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     let mut out = vec![];
-    if p.proto < crate::chan::NODE_LEASES {
-        return out;
-    }
     let names: Vec<String> = p.fetched.keys().cloned().collect();
     for name in names {
         let now = crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.token_root.1).ok().map(|f| crate::nodesecrets::digest(&f));
@@ -1557,9 +1559,8 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             &[],
             ca.as_ref().map(|c| (&c.hosts[..], c.not_after)),
             now_s,
-            // A version-3 node fetches a zone's injected secrets on first use, and decides those hosts
-            // itself; an older node forwards them here.
-            &|_| p.proto >= crate::chan::NODE_LEASES,
+            // A node fetches a zone's injected secrets on first use, and decides those hosts itself.
+            &|_| true,
         );
         if route != wicket_proxy::decide::Route::Terminate {
             continue;

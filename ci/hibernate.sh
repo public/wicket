@@ -9,11 +9,12 @@
 #                                                    WICKET_NODE_SSH, as ci/node-e2e.sh --local does
 #
 # Checks:
-#   - a quiet agent hibernates after its turn: its box is gone and its state is one bundle;
+#   - an agent that asks to hibernate (its hibernate tool) does so after its turn: its box is gone
+#     and its state is one bundle;
 #   - woken (`wicket wake`), it resumes its own session: the mock model sees the earlier turn;
 #   - a file under /tmp, one under $HOME, one in the workspace and one in a durable volume all
 #     survive hibernate and wake;
-#   - a box with a background process isn't hibernated: it stays idle, paused;
+#   - a box with a background process isn't hibernated: it goes on running, never paused (#249);
 #   - two concurrent wakes: exactly one wins, and the generation goes up by one;
 #   - `wicket say` to a hibernated agent wakes it, with the message as its turn;
 #   - the zone's model budget is the agent's over all its activations: a wake continues it, and an
@@ -109,9 +110,10 @@ else
   echo vol-kept > /volumes/data/hib-vol; echo 1 > /workspace/turns; touch /workspace/turn1
   echo '{"status":"first"}' > /workspace/out/result.json
 fi
+echo "wicket-mock: hibernate"
 STEP
 
-echo "== agent A: first run (hibernates after its turn)"
+echo "== agent A: first run (asks to hibernate after its turn)"
 timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/a" "${node_args[@]}" ${IMAGE:+--image "$IMAGE"} >"$work/a1.log" 2>&1 || true
 cat "$work/a1.log"
 A=$(grep -o "agent agt_[a-z0-9]*" "$work/a1.log" | head -1 | cut -d" " -f2 || true)
@@ -127,7 +129,7 @@ if [ -n "$on_node" ]; then
   check "  and the node kept nothing of it" '[ ! -e "$noderuns/$r1" ]'
 fi
 gen1=$(agent_field "$A" generation)
-check "A's first run spent 2 requests" '[ "$(agent_field "$A" used.requests)" = 2 ]'
+check "A's first run spent 3 requests" '[ "$(agent_field "$A" used.requests)" = 3 ]'
 
 echo "== agent A: wicket wake"
 timeout 240 "$WICKET" wake "$A" "Run it again, please." ${IMAGE:+} >"$work/a2.log" 2>&1 || true
@@ -144,13 +146,13 @@ check "a file under \$HOME survived" '[ "$(field home)" = home-kept ]'
 check "a file in the workspace survived" '[ "$(field ws)" = ws-kept ]'
 check "a file in the durable volume survived" '[ "$(field vol)" = vol-kept ]'
 check "the woken turn ran the step (turn 2)" '[ "$(field turns)" = 2 ]'
-# The first run's model requests carry 1 and 3 messages; a resumed session's carry the old turn too.
-check "the model saw the prior conversation" 'grep -E "finish \(([5-9]|[1-9][0-9]) messages" "$work/mock.log" >/dev/null'
+# The first run's model requests carry 1, 3 and 5 messages; a resumed session's carry the old turn too.
+check "the model saw the prior conversation" 'grep -E "end the turn \(([7-9]|[1-9][0-9]) messages" "$work/mock.log" >/dev/null'
 check "the operator's text reached the model, after wicket's wake notice" 'grep "the user said:" "$work/mock.log" | grep "woken (wicket wake" | grep -q "Run it again, please."'
 check "A hibernated again" '[ "$(agent_field "$A" state)" = hibernated ]'
 gen2=$(agent_field "$A" generation)
 check "the wake bumped the generation by one" '[ "$gen2" = $((gen1 + 1)) ]'
-check "the woken activation's spend continued from 2" '[ "$(agent_field "$A" used.requests)" = 4 ] && [ "$(agent_field "$A" used.output_tokens)" = 80 ]'
+check "the woken activation's spend continued from 3" '[ "$(agent_field "$A" used.requests)" = 6 ] && [ "$(agent_field "$A" used.output_tokens)" = 120 ]'
 
 echo "== agent A: two wakes at once"
 timeout 240 "$WICKET" wake "$A" >"$work/w1.log" 2>&1 & p1=$!
@@ -167,7 +169,7 @@ echo "== agent A: wicket say wakes it"
 for _ in $(seq 120); do [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ] && break; sleep 1; done
 check "say woke it, and it went back to sleep" '[ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ]'
 check "the message was its turn" 'grep "the user said:" "$work/mock.log" | grep "woken (wicket say" | grep -q "A message for a sleeping agent."'
-check "four activations spent the whole budget" '[ "$(agent_field "$A" used.requests)" = 8 ]'
+check "four activations spent the whole budget" '[ "$(agent_field "$A" used.requests)" = 12 ]'
 calls=$(grep -c "^mock: /v1/messages" "$work/mock.log" || true)
 out=$("$WICKET" say "$A" "One more?" 2>&1 || true); echo "   $out"
 check "a spent agent isn't woken" 'grep -q "request budget is spent" <<<"$out"'
@@ -177,8 +179,8 @@ check "it made no model call" '[ "$(grep -c "^mock: /v1/messages" "$work/mock.lo
 
 # Agent B: leaves a background process running, so it can't be rebuilt without losing it.
 mkdir -p "$work/b"
-echo 'nohup sleep 300 >/dev/null 2>&1 & echo "{\"status\":\"busy\"}" > /workspace/out/result.json' > "$work/b/step.sh"
-echo "== agent B: a background process keeps it idle"
+echo 'nohup sleep 300 >/dev/null 2>&1 & echo "{\"status\":\"busy\"}" > /workspace/out/result.json; echo "wicket-mock: hibernate"' > "$work/b/step.sh"
+echo "== agent B: a background process keeps it running"
 timeout 240 "$WICKET" run ci/hibernate.yaml --workdir "$work/b" "${node_args[@]}" ${IMAGE:+--image "$IMAGE"} >"$work/b.log" 2>&1 & busy_pid=$!
 B=""
 for _ in $(seq 90); do
@@ -188,11 +190,11 @@ for _ in $(seq 90); do
 done
 grep -E '^\[wicket\]' "$work/b.log" || true
 check "B was not hibernated" 'grep -q "not hibernated: other processes run in the box" "$work/b.log"'
-check "B is idle in the ledger, with the reason" '[ "$(agent_field "$B" state)" = idle ] && agent_field "$B" note | grep -q sleep'
+check "B is active in the ledger, with the reason" '[ "$(agent_field "$B" state)" = active ] && agent_field "$B" note | grep -q sleep'
 bbox=$($DOCKER ps -q --filter name=^hib-run- | head -1)
-check "B's box is paused" '[ -n "$bbox" ] && [ "$($DOCKER inspect -f "{{.State.Paused}}" "$bbox")" = true ]'
+check "B's box runs, not paused (#249)" '[ -n "$bbox" ] && [ "$($DOCKER inspect -f "{{.State.Paused}}" "$bbox")" = false ]'
 out=$("$WICKET" hibernate "$B" --wait 30 || true); echo "   $out"
-check "wicket hibernate keeps it idle too" 'grep -q "stays idle" <<<"$out"'
+check "wicket hibernate leaves it running too" 'grep -q "goes on running" <<<"$out"'
 kill -TERM "$busy_pid" 2>/dev/null || true
 wait "$busy_pid" 2>/dev/null || true
 check "B's box was stopped with its run" '[ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'

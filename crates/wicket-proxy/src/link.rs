@@ -715,6 +715,7 @@ mod tests {
                 capacity: None,
                 fence: None,
                 waker: None,
+                lifecycle: None,
             }
         }
     }

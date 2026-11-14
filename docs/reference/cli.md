@@ -56,6 +56,8 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket state replicate`](#wicket-state-replicate)
   - [`wicket state kit`](#wicket-state-kit)
   - [`wicket state restore`](#wicket-state-restore)
+  - [`wicket state snapshots`](#wicket-state-snapshots)
+  - [`wicket state snapshot`](#wicket-state-snapshot)
 - [`wicket keys`](#wicket-keys)
   - [`wicket keys roots-offline`](#wicket-keys-roots-offline)
   - [`wicket keys certify`](#wicket-keys-certify)
@@ -104,8 +106,8 @@ Usage: wicket <COMMAND>
 
 Commands:
   run        Run a task manifest: one Claude Code agent in one zone
-  say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
-  hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it stays idle (paused)
+  say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+  hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it goes on running
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   agents     Long-lived agents: state, generation, current run and bundle size
   wrap       Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
@@ -164,7 +166,7 @@ Options:
 ## `wicket say`
 
 ```text
-Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open for follow-ups for the agent's idle_timeout after each turn. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
 
 Usage: wicket say <RUN> [TEXT]...
 
@@ -179,7 +181,7 @@ Options:
 ## `wicket hibernate`
 
 ```text
-Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it stays idle (paused)
+Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. Otherwise it goes on running
 
 Usage: wicket hibernate [OPTIONS] <RUN>
 
@@ -815,6 +817,8 @@ Commands:
   replicate  Stream the ledger to the state store until stopped (Litestream): a lost control host loses at most `ledger.sync_interval`. Run it as a service beside wicketd
   kit        Write a recovery kit: what a standby needs besides the state store (keys, state.key, nodes' feed keys and pinned host keys, config files, and the vault's secrets). Keep it offline
   restore    Make this fresh host the control host: the kit's files, then the ledger from the state store (as of now, or of --at), audit records the store has beyond it, agents fenced, and each node feed set to start a new generation
+  snapshots  The ledger snapshots `wicket self update` pushed to the state store before each switch (#167): the way back past a contract step after losing the control host
+  snapshot   Fetch one of them (unsealed with state.key) into a new file, to restore as docs/how-to/update-and-roll-back.md says
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -869,6 +873,32 @@ Options:
       --kit <KIT>  
       --at <AT>    Restore the ledger as it was at this time (RFC 3339, UTC), discarding what came after
       --force      Replace a ledger this host already has
+  -h, --help       Print help
+```
+
+### `wicket state snapshots`
+
+```text
+The ledger snapshots `wicket self update` pushed to the state store before each switch (#167): the way back past a contract step after losing the control host
+
+Usage: wicket state snapshots
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket state snapshot`
+
+```text
+Fetch one of them (unsealed with state.key) into a new file, to restore as docs/how-to/update-and-roll-back.md says
+
+Usage: wicket state snapshot --out <OUT> <NAME>
+
+Arguments:
+  <NAME>  Its name, as `wicket state snapshots` lists it
+
+Options:
+      --out <OUT>  
   -h, --help       Print help
 ```
 
@@ -1283,7 +1313,7 @@ Usage: wicket dev <COMMAND>
 
 Commands:
   node-feed-probe  On a node: send `node serve` its own last freshness statement, tampered and then replayed, and print how each was refused (a check for ci/node-e2e.sh). The control connection stays up
-  mock-llm         A scripted stand-in for the Anthropic Messages API: the first turn runs one Bash command, the second ends the conversation. Lets the whole path be tested without an API key
+  mock-llm         A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
   help             Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1305,7 +1335,7 @@ Options:
 ### `wicket dev mock-llm`
 
 ```text
-A scripted stand-in for the Anthropic Messages API: the first turn runs one Bash command, the second ends the conversation. Lets the whole path be tested without an API key
+A scripted stand-in for the Anthropic Messages API: each turn runs one Bash command, then calls wicket's finish tool (or hibernate, or neither, as the command's output asks with a `wicket-mock: hibernate` or `wicket-mock: stay` line). Lets the whole path be tested without an API key
 
 Usage: wicket dev mock-llm [OPTIONS] --command <COMMAND>
 

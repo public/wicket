@@ -34,6 +34,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`link`](#link) | Wire two boxes the caller controls | |
 | [`unlink`](#unlink) | Close a link | |
 | [`links`](#links) | The caller's links | |
+| [`finish`](#finish) | End the session when the work is done | |
+| [`hibernate`](#hibernate) | Sleep until a message arrives | a long-lived agent |
 
 ## `await_grant`
 
@@ -208,6 +210,22 @@ Closes a link the caller opened or is an end of. Live connections over it are dr
 | argument | type |
 |---|---|
 | `link` | string, required: its id, `l-…` |
+
+## `finish`
+
+Ends the agent's session (#249): at the end of the current turn wicket closes the harness's input,
+the harness exits and the run ends. wicket never does this by itself: until the agent calls `finish`
+or exits, its session stays open for follow-ups (`wicket say`) and messages, up to the zone's
+`limits.timeout` or the end of its authority. No arguments. Relayed to the control host on a node.
+
+## `hibernate`
+
+Asks to be hibernated at the end of the current turn, once nothing but the agent runs in its box:
+the box stops and its state is kept (workspace, `$HOME`, `/tmp`, durable volumes), and a message to
+the agent or its operator's `wicket say` wakes it, with that as its next turn. If something else
+still runs, the agent goes on running (the reason is in `wicket agents`). Only for a long-lived agent
+wicket started itself: a wrapped or remote session is refused. No arguments. See
+[hibernate and wake](agents.md#hibernate-and-wake).
 
 ## `links`
 

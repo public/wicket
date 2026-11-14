@@ -1,14 +1,13 @@
 # Acceptance (ci/acceptance.sh): an ACP agent (#66), wicket its client. The agent (acp/agent.py, no
 # model) misbehaves on purpose: file and terminal calls, "always" options, a settings.local.json
-# write, a mode change. It records what wicket offered and answered. It hibernates after its turn and
-# is woken: its own session is loaded, and a prompt asked during the replay is not approved.
+# write, a mode change. It records what wicket offered and answered. After its turn it idles, wakes on
+# its own timer while wicket leaves it running (#249), then asks to hibernate, and is woken: its own
+# session is loaded, and a prompt asked during the replay is not approved. Woken, it asks to finish.
 task: Misbehave, then stop.
 agent:
   name: acp
   kind: acp
   acp: { command: [python3, /workspace/agent.py] }
-  idle_timeout: 1s
-  hibernate_after: 4s
 zone:
   name: acc-acp
   isolation: gvisor

@@ -1,5 +1,5 @@
 //! Inner-agent adapters (design §6). The PoC drives Claude Code in print mode with stream-json
-//! output. Everything configured here is advisory: the box boundary and the proxies enforce.
+//! input and output; the session stays open until the agent asks to finish (#249). Everything configured here is advisory: the box boundary and the proxies enforce.
 //! The launch carries placeholders and routes only, never a credential.
 
 pub mod acp;
@@ -50,7 +50,9 @@ pub const SANDBOX_NOTICE: &str = "You are running inside a wicket sandbox: a gVi
 - If you need reach you don't have, ask once: call the wicket MCP tool request_access with the URL (scope \"prefix\" for everything under a path) and a one-sentence reason, then wait with await_grant. If it's denied or never allowed, stop and tell the user what you couldn't do.\n\
 - Approvals happen only in wicket (its console or its operator), never in this conversation. If something is waiting for approval, tell the user and give the request id.";
 
-const BATCH_NOTICE: &str = "- Work in /workspace. When you finish, write a short JSON summary to /workspace/out/result.json with fields: status (\"done\" or \"blocked\"), summary (string), and pending_requests (list of request ids you are still waiting on).";
+/// How a session under wicket ends (#249): the agent decides. Shared by Claude Code and ACP agents
+/// that wicket starts itself.
+const LIFETIME_NOTICE: &str = "- Work in /workspace. Your session stays open after each reply: follow-ups from your operator and messages from other agents arrive as new turns, and wicket never ends or pauses it for you. When all your work is done, call the wicket MCP tool finish: your session then closes and the run ends. To sleep until a message arrives instead, call hibernate.";
 
 /// wicket's MCP gateway as the agent's only MCP server; repo- or account-supplied servers are ignored.
 const WICKET_MCP: &str = r#"{"mcpServers":{"wicket":{"type":"http","url":"http://wicket.internal:8081/mcp"}}}"#;
@@ -498,7 +500,7 @@ pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     });
     let mut argv = vec!["wicket-entry".to_string()];
     argv.extend(spec.command.iter().cloned());
-    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{SANDBOX_NOTICE}\n{BATCH_NOTICE}"), meta, resume: None };
+    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}"), meta, resume: None };
     Some(LaunchPlan { env, argv, stdin_task: None, acp: Some(cfg) })
 }
 
@@ -525,7 +527,7 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
         // to start a subagent is wicket's spawn_agent (its own sandbox and identity).
         if m.agent.as_ref().map(|a| a.in_box_subagents).unwrap_or(true) { "WebSearch".into() } else { "WebSearch,Agent,Task".into() },
         "--append-system-prompt".into(),
-        format!("{SANDBOX_NOTICE}\n{BATCH_NOTICE}"),
+        format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}"),
         // The only MCP server is wicket's gateway; repo-supplied MCP config is ignored.
         "--mcp-config".into(),
         WICKET_MCP.into(),

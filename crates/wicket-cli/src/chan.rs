@@ -36,14 +36,9 @@
 //!   peer may ignore does not.
 //! - A message added in version N is sent only on a connection that negotiated N or later, since an
 //!   older peer drops the connection on a message it can't parse.
-//! - Support for version N−1 is removed only after a release that spoke N everywhere.
-//!
-//! Version 3 (#152, #153) adds [`Msg::Lease`] (budget slices), [`Msg::SecretFetch`],
-//! [`Msg::SecretFetched`], [`Msg::SecretRevoke`] (secrets fetched by a node on first use) and
-//! [`Msg::Spent`] (the node's model spend), sent only on connections that negotiated 3; a
-//! version-3 control host no longer sends [`Msg::RunLease`], which a version-3 node accepts and
-//! ignores (a box's authority decides when it stops). With an older peer, a node relays model calls
-//! and forwards injected hosts to the control host, as before.
+//! - Support for version N−1 is removed only after a release that spoke N everywhere. What versions
+//!   below `PROTOCOL - PROTOCOL_SKEW` added is assumed, not checked: such a peer is refused at the
+//!   handshake.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,14 +46,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// - 1: versions (#162).
 /// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
-///   (`BoxAuthority::issuer_cert`, #154), which a version-1 node can't read: sent only to nodes
-///   talking [`ISSUER_CERT`] or later.
+///   (`BoxAuthority::issuer_cert`, #154).
 /// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
 ///   [`Msg::Lease`], [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
-///   [`Msg::Spent`], sent only on connections talking [`NODE_LEASES`] or later.
-/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51): a `policy` fact
-///   and checks reading it, which an older node's structural check refuses: sent only to nodes
-///   talking [`ORG_POLICY`] or later.
+///   [`Msg::Spent`]; the control host's per-run lease message is gone (a box's authority decides
+///   when it stops).
+/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51).
 /// - 5: decisions at the edge (#164): a node answers the MCP gateway's tools itself from the box's
 ///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
 ///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
@@ -66,17 +59,16 @@ use serde::{Deserialize, Serialize};
 /// - 6: images pinned by digest (#192): [`BoxStart::image_pin`], which the node checks against the
 ///   image it starts (and then starts it by its id), and the digest it started in `Started` and
 ///   `Spawned`. A pinned box goes only to nodes talking [`IMAGE_PINS`] or later.
-pub const PROTOCOL: u32 = 6;
-/// The first protocol version whose nodes take issuing-key tokens (#154).
-pub const ISSUER_CERT: u32 = 2;
-/// The first protocol version whose nodes and control hosts lease slices and fetch secrets (#152).
-pub const NODE_LEASES: u32 = 3;
-/// The first protocol version whose nodes take tokens with an org layer (#51).
-pub const ORG_POLICY: u32 = 4;
+/// - 7: images delivered over the channel (#191): [`Msg::ImageHave`], and [`Msg::PutImage`] with its
+///   data frames, the node's [`Msg::Ack`]s of them and its [`Msg::ImagePut`]. Sent only on
+///   connections talking [`IMAGE_DELIVERY`] or later; an older node must have the image already.
+pub const PROTOCOL: u32 = 7;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
 pub const IMAGE_PINS: u32 = 6;
+/// The first protocol version whose nodes take an image over the channel and verify it (#191).
+pub const IMAGE_DELIVERY: u32 = 7;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -313,12 +305,6 @@ pub enum Msg {
     StdinClose {
         run: String,
     },
-    /// Version 1 only: the control host's lease of a run. Accepted from a version-1 control host and
-    /// ignored (#153: the box's authority decides when it stops).
-    RunLease {
-        run: String,
-        until: i64,
-    },
     /// A run's model budget slice (#152).
     Lease {
         run: String,
@@ -417,6 +403,24 @@ pub enum Msg {
         run: String,
         tree: String,
     },
+    /// Whether the node has the image `digest` (`sha256:…`) names (#191). Answered with
+    /// [`Msg::BoxCtlDone`], `out` `present` or `absent`.
+    ImageHave {
+        id: u64,
+        digest: String,
+    },
+    /// The image `digest` names, as an OCI image layout archive on stream `stream` (numbered by
+    /// the control host, [`CONTROL_TUNNEL_BIT`]), to be imported as `name` (`repository@digest`) if
+    /// given (#191). Answered with [`Msg::TunnelOpened`]; then data frames, each at its offset, which
+    /// the node acknowledges ([`Msg::Ack`]) as it takes them (the sender keeps a window), and a
+    /// [`Msg::Close`]; then [`Msg::ImagePut`] once the node has verified and imported it, or refused
+    /// it.
+    PutImage {
+        stream: u64,
+        digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 
     // ---- node → control host ----
     /// Answer to [`Msg::BoxCtl`] or [`Msg::Listen`].
@@ -429,6 +433,12 @@ pub enum Msg {
     ExecDone {
         stream: u64,
         code: i32,
+    },
+    /// The end of a [`Msg::PutImage`]: the image is verified and imported (`error` None), or why
+    /// not.
+    ImagePut {
+        stream: u64,
+        error: Option<String>,
     },
     /// The connection that shipped audit records went away: send [`Msg::AuditFrom`] with this
     /// control host's watermark to take over.
@@ -814,6 +824,13 @@ mod tests {
                 }],
                 capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
             }),
+            Frame::Msg(Msg::ImageHave { id: 3, digest: format!("sha256:{}", "a".repeat(64)) }),
+            Frame::Msg(Msg::PutImage {
+                stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5,
+                digest: format!("sha256:{}", "a".repeat(64)),
+                name: Some(format!("docker.io/library/x@sha256:{}", "a".repeat(64))),
+            }),
+            Frame::Msg(Msg::ImagePut { stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5, error: Some("tampered".into()) }),
             Frame::Data { stream: TUNNEL_BIT | 4, offset: 1 << 40, bytes: b"hello\0world".to_vec() },
             Frame::Data { stream: 2, offset: 0, bytes: vec![] },
             Frame::Feed(br#"{"t":"fresh","jws":"a.b.c"}"#.to_vec()),

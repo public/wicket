@@ -10,7 +10,6 @@ agent:
   acp:
     command: [claude-agent-acp]
     profile: claude-agent-acp
-  idle_timeout: 0s
   image: wicket/claude-code-acp:poc
 zone:
   name: claude-acp

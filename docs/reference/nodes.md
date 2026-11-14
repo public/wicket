@@ -7,7 +7,8 @@ remote node](../how-to/add-a-remote-node.md) and [place nodes on Vultr](../how-t
 ## Enrolment
 
 `wicket run --node <name>` runs the box on another machine (prepare one with `deploy/vultr/node-setup.sh`;
-the node also needs the agent image, `~/.local/bin/wicket image` there).
+the node also needs the agent image, `~/.local/bin/wicket image` there, unless it is pinned by digest:
+the control host then sends it, [below](#images-on-nodes)).
 On an **enrolled** node, the node's own `wicket node serve` runs the box and decides its egress, its model
 calls and its injected credentials locally, from a signed policy feed and the secrets it fetched, so the
 box keeps working while the control host is unreachable, for exactly as long as its grants last (#57, #152,
@@ -184,8 +185,7 @@ wicket node revoke n1
   carve-outs, a long-lived agent's budget and the console see what the node spent. A slice is a quarter of
   the zone's budget by default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while
   connected once less than half of it is left: offline, a node spends what is left of its slice and nothing
-  more. With a control host on protocol 1 (#162's skew), the call is relayed to the run's own proxy there
-  as in #151, which adds the credential and counts it.
+  more.
 - **Decisions at the edge** (#164; protocol 5, the list of what a node still asks the control host and why:
   [design §9.2.1](../explanation/design.md)). The node answers `whoami`, `request_access`, `await_grant` and
   `pending_requests` from the box's token, connected or not. Cut off, what needs a human
@@ -228,7 +228,7 @@ wicket node revoke n1
   the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
   the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
   it with the run CA), for: hosts with a credential swap (an `inject` rule's host is terminated and injected on the node, its
-  secret fetched on first use, #152, unless the control host speaks protocol 1),
+  secret fetched on first use, #152),
   hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
   every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
@@ -255,6 +255,37 @@ wicket node revoke n1
 - **For now.** Plain `http://` to a forwarded host is refused, and gateway tools beyond #164's are still decided on the
   control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
+
+## Images on nodes
+
+A box on a node starts from an image its node has. A box whose image is pinned by digest (#192,
+[manifest](manifest.md#image-pins)) starts as exactly that image, and a remote node that lacks it gets it
+from the control host first (#191):
+
+- **Asked first.** Before the box starts, the control host asks the node whether it has the digest; only
+  if it hasn't does anything move. The control host's own node shares its runtime and is never sent one.
+- **Sent as an OCI image layout.** The control host's runtime exports the image by digest as an [OCI image
+  layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) archive, streamed over the
+  node channel in a window of 16 MiB that the node acknowledges as it takes it, so neither end holds the
+  image in memory.
+- **Verified on the node, as it arrives.** The node takes only `oci-layout`, `index.json` and
+  `blobs/sha256/<hex>` as regular files, each once (anything else refuses the image), and hashes every blob
+  as it writes it: a blob that doesn't match its name refuses the image. The pin must be a blob of the
+  archive, an image index or manifest; every manifest under it must have its config and layers there, at the
+  sizes it gives, and at least one must be complete (an index may name other platforms' images the archive
+  lacks). The sender's `index.json` and tags (`manifest.json`) are dropped, and so is every blob the pin
+  doesn't reach.
+- **Imported as checked.** The node writes its own layout naming the pin alone, as `repository@digest` (no
+  tag moves), and its runtime imports that; the box then starts by the image's id, which must be the pin.
+  The image is never fetched from inside a box.
+- **Recorded.** The node's audit records `image.received` (digest, name, bytes) or `image.refused` (why).
+- **What it needs.** Both ends talking protocol 7, and a runtime that ids images by their manifest digest
+  (Docker's containerd image store): a pin that is a config digest is refused with that reason. An image
+  of at most 64 GiB, with room for it under the node's data directory (`images/`, cleared when `serve`
+  starts) while it is imported.
+- **Not yet.** Images for children a node starts itself (#164) are not sent ahead: a child's image must be
+  on its node. Tagged images are not sent: a tag is resolved where the box starts. `wicket self update`
+  still loads its own agent image onto nodes by tag.
 
 ## Provisioning nodes (`wicket place`)
 
