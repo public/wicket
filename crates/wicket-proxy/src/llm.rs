@@ -60,6 +60,8 @@ pub struct Llm {
     /// activation's own counters. None: no slice (the zone's budget alone bounds it).
     slice: std::sync::Mutex<Option<Slice>>,
     last_activity: std::sync::Mutex<Instant>,
+    /// When the box's first request reached this proxy (Unix ms, #287).
+    first_request_ms: std::sync::OnceLock<i64>,
 }
 
 /// A budget slice leased to a node (#152): this activation may count up to these totals of its own
@@ -180,6 +182,7 @@ impl Llm {
             inflight_output_tokens: AtomicU64::new(0),
             slice: std::sync::Mutex::new(None),
             last_activity: std::sync::Mutex::new(Instant::now()),
+            first_request_ms: std::sync::OnceLock::new(),
         }))
     }
 
@@ -286,7 +289,14 @@ impl Llm {
         }
     }
 
+    /// When the box's first request reached this proxy (Unix ms), if one has (#287).
+    pub fn first_request_ms(&self) -> Option<i64> {
+        self.first_request_ms.get().copied()
+    }
+
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
+        self.first_request_ms
+            .get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
         if let Ok(mut t) = self.last_activity.lock() {
             *t = Instant::now();
         }
@@ -969,6 +979,22 @@ mod tests {
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
         (status, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// The box's first request is timed as it arrives (#287), whatever becomes of it, and later
+    /// ones don't move it.
+    #[tokio::test]
+    async fn the_first_request_is_timed_when_it_arrives() {
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{secret: model}")).unwrap();
+        assert_eq!(llm.first_request_ms(), None, "no request yet");
+        let before = now();
+        send(llm.clone(), "first-1", "GET", "/not-a-model-route").await;
+        let first = llm.first_request_ms().expect("timed");
+        assert!(first >= before && first <= now(), "{first} not within the request");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        send(llm.clone(), "first-2", "GET", "/not-a-model-route").await;
+        assert_eq!(llm.first_request_ms(), Some(first), "only the first counts");
     }
 
     /// The model route sends its secret only to an upstream the vault binds it to: a zone pointing

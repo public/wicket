@@ -39,9 +39,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
+use wicket_core::timing::Timings;
 use wicket_feed::{BoxAuthority, Replica, ReplicaConfig};
 use wicket_proxy::ca::{Minter, NodeCa};
 use wicket_proxy::decide::{Asked, Clock, ControlLink, NodeDecider, Route};
@@ -772,7 +774,7 @@ async fn adopt_previous(node: &Arc<Node>) {
                 load_derived(node, &dir, run);
                 let zone = node.replica.lock().expect("replica").zone_of(run).cloned();
                 match zone {
-                    Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z).await {
+                    Some(z) if z.name == rec.start.zone => match serve_box(node, &rec.start, &dir, z, None).await {
                         Ok(tasks) => {
                             eprintln!("[node] {run}: adopted box {} from a previous serve", b.name);
                             wire(node, None, rec, dir, tasks, ids());
@@ -863,12 +865,19 @@ fn start_box_boxed(
     owner: Option<u64>,
     bs: BoxStart,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
-    Box::pin(start_box(node, owner, bs))
+    Box::pin(start_box(node, owner, bs, Arc::new(Timings::new())))
 }
 
 /// Starts a box: for the control connection `owner`, or (a child this node started, #164) for
 /// none until its control host takes it over.
-async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result<String> {
+///
+/// Where its time goes is recorded in `t` (#287), from when it was called: `total`, wicket's own
+/// steps, and each Docker call (`docker.<call>`); with [`BoxStart::timings`], also the runtime's
+/// part of `docker run` as Docker's own timestamps show it ([`runtime_spans`]).
+async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Timings>) -> Result<String> {
+    let total = t.span("total");
+    let docker = node.docker.timed(t.clone());
+    let checks = t.span("checks");
     crate::run::check_run_id(&bs.run)?;
     if node.boxes.lock().expect("boxes").contains_key(&bs.run) {
         bail!("run {} is already on this node", bs.run);
@@ -885,17 +894,17 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
     // reference, or the digest alone; a tag moved to another image since changes nothing, and a
     // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
+    checks.end();
     let ident = match &bs.image_pin {
         Some(pin) => {
-            let by_ref = node.docker.image_identity(&bs.image).await?.filter(|i| i.is(pin));
+            let by_ref = docker.image_identity(&bs.image).await?.filter(|i| i.is(pin));
             let by_digest = match by_ref {
                 Some(i) => Some(i),
-                None => node.docker.image_identity(pin).await?.filter(|i| i.is(pin)),
+                None => docker.image_identity(pin).await?.filter(|i| i.is(pin)),
             };
             by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?
         }
-        None => node
-            .docker
+        None => docker
             .image_identity(&bs.image)
             .await?
             .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
@@ -912,6 +921,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
             bail!("bad bind {host:?} on {target:?}");
         }
     }
+    let layout = t.span("layout");
     let dir = node.paths.runs().join(&bs.run);
     if bs.long_lived {
         std::fs::create_dir_all(dir.join("tmp"))?;
@@ -972,7 +982,10 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
         volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
     }
 
-    let tasks = serve_box(node, &bs, &dir, zone).await?;
+    layout.end();
+    let proxies = t.span("proxies");
+    let tasks = serve_box(node, &bs, &dir, zone, Some(&*t)).await?;
+    proxies.end();
     let sock = dir.join("sock");
 
     let spec = SandboxSpec {
@@ -1034,7 +1047,15 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
     let name = spec.name.clone();
     let cap = bs.output_cap.max(64 << 10);
     // Detached, so the box outlives this `serve` (a restarted one adopts it, `adopt_previous`).
-    node.docker.start_detached(&spec, cap).await?;
+    let run_wall = (std::time::SystemTime::now(), Instant::now());
+    docker.start_detached(&spec, cap).await?;
+    let run_end = (std::time::SystemTime::now(), Instant::now());
+    if bs.timings {
+        if let Ok(Some((created, started))) = docker.start_times(&name).await {
+            runtime_spans(&t, run_wall, run_end, &created, &started);
+        }
+    }
+    let saved = t.span("record");
     let rec = BoxRecord {
         start: bs,
         image_digest: Some(ident.id.clone()),
@@ -1047,9 +1068,32 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart) -> Result
         out_saved_ms: 0,
     };
     rec.save(&dir)?;
+    saved.end();
+    let wired = t.span("wire");
     wire(node, owner, rec, dir, tasks, spec.user.clone());
+    wired.end();
+    total.end();
     eprintln!("[node] box {name} started ({})", ident.id);
     Ok(ident.id)
+}
+
+/// The runtime's part of `docker run` (#287), from Docker's own timestamps (the node's wall clock):
+/// `docker.run.create`, from the CLI starting to Docker having created the box (the CLI, the API
+/// call, the container's config and its layers' mount); `docker.run.runtime`, from then until its
+/// runtime started its first process (containerd, the shim, and runsc's create and start: its
+/// sandbox and gofer); `docker.run.return`, from then until the CLI returned. They are placed by
+/// `run`'s start (wall time, monotonic) and end; a timestamp that can't be read leaves them out.
+fn runtime_spans(t: &Timings, run: (std::time::SystemTime, Instant), end: (std::time::SystemTime, Instant), created: &str, started: &str) {
+    let (Ok(c), Ok(s)) = (humantime::parse_rfc3339_weak(created), humantime::parse_rfc3339_weak(started)) else { return };
+    // Wall times, placed on the monotonic clock from where `run` started on both.
+    let at = |w: std::time::SystemTime| match w.duration_since(run.0) {
+        Ok(d) => run.1 + d,
+        Err(_) => run.1,
+    };
+    let (c, s) = (at(c), at(s));
+    t.record("docker.run.create", run.1, c);
+    t.record("docker.run.runtime", c, s);
+    t.record("docker.run.return", s, end.1.max(s));
 }
 
 /// The authority this node derived for a child it started (#164), kept beside it so a restarted
@@ -1139,6 +1183,7 @@ fn child_start(
         swap_hosts: vec![],
         edge: Some(Box::new(chan::EdgeStart { who, spawn: None })),
         image_pin: plan.image_pin.clone(),
+        timings: parent.timings,
     })
 }
 
@@ -1612,7 +1657,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     // can miss a model call made just before the box ended (an agent that hibernates or finishes
     // right after its turn, #249), and the box would not be charged for it.
     if let Some(l) = llm {
-        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent() }));
+        n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms() }));
     }
     eprintln!("[node] {run}: box exited ({code})");
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause }));
@@ -1625,6 +1670,7 @@ async fn serve_box(
     bs: &BoxStart,
     dir: &std::path::Path,
     zone: wicket_core::ZoneSpec,
+    t: Option<&Timings>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let compiled = Arc::new(wicket_core::CompiledZone::new(zone)?);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
@@ -1711,6 +1757,7 @@ async fn serve_box(
         let (n, run, l2, path) = (node.clone(), bs.run.clone(), l.clone(), dir.join(SPEND_FILE));
         tasks.push(tokio::spawn(async move {
             let mut last = wicket_proxy::llm::Spent::default();
+            let mut last_first = None;
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut i = 0u64;
             loop {
@@ -1720,10 +1767,14 @@ async fn serve_box(
                 if now != last {
                     let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
                 }
-                if now != last || i.is_multiple_of(10) {
-                    n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now }));
+                // When the box's first model request came (#287): reported with its spend, as soon
+                // as there is one.
+                let first = l2.first_request_ms();
+                if now != last || first != last_first || i.is_multiple_of(10) {
+                    n.send_run(&run, Frame::Msg(Msg::Spent { run: run.clone(), spent: now, first_request_ms: first }));
                 }
                 last = now;
+                last_first = first;
             }
         }));
         l
@@ -1790,11 +1841,15 @@ async fn serve_box(
             }
         }));
     }
+    let waited = Instant::now();
     for _ in 0..50 {
         if es.exists() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if let Some(t) = t {
+        t.since("proxies.sockets", waited);
     }
 
     Ok(tasks)
@@ -1918,6 +1973,26 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn docker_timestamps_split_docker_run_into_create_runtime_and_return() {
+        let t = Timings::new();
+        let w0 = humantime::parse_rfc3339("2026-11-14T10:00:00Z").unwrap();
+        let i0 = t.origin() + std::time::Duration::from_millis(10);
+        let end = (w0 + std::time::Duration::from_millis(300), i0 + std::time::Duration::from_millis(300));
+        // Docker's own: nanoseconds, UTC.
+        runtime_spans(&t, (w0, i0), end, "2026-11-14T10:00:00.040000000Z", "2026-11-14T10:00:00.250123456Z");
+        let s = t.spans();
+        let get = |n: &str| s.iter().find(|x| x.name == n).unwrap_or_else(|| panic!("no {n}: {s:?}")).clone();
+        let near = |a: f64, b: f64| (a - b).abs() < 0.01;
+        assert!(near(get("docker.run.create").at_ms, 10.0) && near(get("docker.run.create").ms, 40.0));
+        assert!(near(get("docker.run.runtime").at_ms, 50.0) && near(get("docker.run.runtime").ms, 210.123));
+        assert!(near(get("docker.run.return").ms, 49.877));
+        // Unreadable timestamps: nothing, rather than nonsense.
+        let t = Timings::new();
+        runtime_spans(&t, (w0, i0), end, "garbage", "0001-01-01T00:00:00Z");
+        assert!(t.spans().is_empty());
+    }
+
     use crate::nodeauth::testkit::Install;
     use crate::nodeauth::HsError;
 
@@ -2026,6 +2101,7 @@ mod tests {
                 swap_hosts: vec![],
                 edge: None,
                 image_pin: None,
+                timings: false,
             },
             image_digest: None,
             name: format!("wicket-{run}"),
