@@ -885,7 +885,7 @@ fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_s
         say(format!("warning: {green} predates `self units`: its systemd units aren't checked against {}", dir.display()));
         return Ok(());
     };
-    let units = match crate::units::differing(&dir, &want) {
+    let units = match crate::units::differing(&dir, &v.root, &want) {
         Some(u) if !u.is_empty() => u,
         _ => return Ok(()),
     };
@@ -903,7 +903,7 @@ fn warn_units(v: &Versions, to: &str) {
     let dir = crate::units::systemd_dir();
     let probe = crate::data_dir().join(format!("units-probe-{}", std::process::id()));
     if let Ok(Some(want)) = crate::units::of_build(&v.binary(to), &probe) {
-        if let Some(u) = crate::units::differing(&dir, &want).filter(|u| !u.is_empty()) {
+        if let Some(u) = crate::units::differing(&dir, &v.root, &want).filter(|u| !u.is_empty()) {
             say(format!(
                 "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, `sudo {} self apply-units`",
                 dir.display(),

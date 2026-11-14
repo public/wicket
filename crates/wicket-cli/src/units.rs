@@ -10,8 +10,10 @@
 //! restarts, so a unit change has to work with the previous version too, like an expand step of the
 //! schema. A rollback is never refused over units: it only warns.
 //!
-//! A host without `wicketd.service` in the units directory (the development mode, a node) has no
-//! installed units to compare: nothing is checked.
+//! Only units that run the versions root being updated are compared: the installed
+//! `wicketd.service`'s `ExecStart` binary must resolve into it (`/usr/local/bin/wicket` links to
+//! `<root>/current/wicket`). A host without one (a node), or a development-mode installation on a
+//! host that also has a system install, has no units of its own to compare: nothing is checked.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -38,10 +40,22 @@ pub fn embedded() -> BTreeMap<String, String> {
     UNITS.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect()
 }
 
-/// The units in `want` that are missing from `dir` or differ there; None when `dir` has no
-/// installed wicket (no `wicketd.service`): nothing to compare.
-pub fn differing(dir: &Path, want: &BTreeMap<String, String>) -> Option<Vec<String>> {
-    if !dir.join("wicketd.service").is_file() {
+/// Whether the units in `dir` run the versions under `root`: `wicketd.service`'s `ExecStart`
+/// binary resolves to `<root>/<id>/wicket`.
+pub fn run_versions(dir: &Path, root: &Path) -> bool {
+    let Ok(unit) = std::fs::read_to_string(dir.join("wicketd.service")) else { return false };
+    let Some(bin) = unit.lines().find_map(|l| l.trim().strip_prefix("ExecStart=")).and_then(|c| c.split_whitespace().next()) else {
+        return false;
+    };
+    let bin = bin.trim_start_matches(['-', '@', '+', '!', ':']);
+    let (Ok(bin), Ok(root)) = (std::fs::canonicalize(bin), std::fs::canonicalize(root)) else { return false };
+    bin.parent().and_then(Path::parent) == Some(root.as_path())
+}
+
+/// The units in `want` that are missing from `dir` or differ there; None when the units in `dir`
+/// don't run the versions under `root` ([`run_versions`]): nothing to compare.
+pub fn differing(dir: &Path, root: &Path, want: &BTreeMap<String, String>) -> Option<Vec<String>> {
+    if !run_versions(dir, root) {
         return None;
     }
     Some(want.iter().filter(|(n, c)| std::fs::read(dir.join(n)).ok().as_deref() != Some(c.as_bytes())).map(|(n, _)| n.clone()).collect())
@@ -171,18 +185,35 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let _clean = Remove(d.clone());
         let d = Dir(d);
-        let want = embedded();
+        // A versions root, and the link the units run (as /usr/local/bin/wicket is).
+        let (units, root) = (d.path().join("units"), d.path().join("versions"));
+        std::fs::create_dir_all(root.join("aaaaaaaaaaaa")).unwrap();
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(root.join("aaaaaaaaaaaa/wicket"), "").unwrap();
+        std::os::unix::fs::symlink("aaaaaaaaaaaa", root.join("current")).unwrap();
+        let link = d.path().join("bin-wicket");
+        std::os::unix::fs::symlink(root.join("current/wicket"), &link).unwrap();
+        let ours = |unit: &str| unit.replace("/usr/local/bin/wicket", &link.display().to_string());
+        let want: BTreeMap<String, String> = embedded().into_iter().map(|(n, c)| (n, ours(&c))).collect();
         // No wicketd.service: not an installed host, nothing compared.
-        assert_eq!(differing(d.path(), &want), None);
-        apply(Some(d.path().to_path_buf())).unwrap();
-        assert_eq!(differing(d.path(), &want), Some(vec![]));
-        std::fs::write(d.path().join("wicketd.service"), "[Service]\nExecStart=/bin/true\n").unwrap();
-        std::fs::remove_file(d.path().join("wicket-follow.timer")).unwrap();
-        assert_eq!(differing(d.path(), &want), Some(vec!["wicket-follow.timer".to_string(), "wicketd.service".to_string()]));
-        apply(Some(d.path().to_path_buf())).unwrap();
-        assert_eq!(differing(d.path(), &want), Some(vec![]));
-        let mode = std::fs::metadata(d.path().join("wicketd.service")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(differing(&units, &root, &want), None);
+        apply(Some(units.clone())).unwrap();
+        // The embedded units run /usr/local/bin/wicket, not this root: not ours to compare.
+        assert_eq!(differing(&units, &root, &want), None);
+        for (n, c) in &want {
+            std::fs::write(units.join(n), c).unwrap();
+        }
+        assert_eq!(differing(&units, &root, &want), Some(vec![]));
+        std::fs::write(units.join("wicketd.service"), ours("[Service]\nExecStart=/usr/local/bin/wicket daemon --other\n")).unwrap();
+        std::fs::remove_file(units.join("wicket-follow.timer")).unwrap();
+        assert_eq!(differing(&units, &root, &want), Some(vec!["wicket-follow.timer".to_string(), "wicketd.service".to_string()]));
+        // Another versions root (a development-mode installation on the same host): not compared.
+        std::fs::create_dir_all(d.path().join("other")).unwrap();
+        assert_eq!(differing(&units, &d.path().join("other"), &want), None);
+        apply(Some(units.clone())).unwrap();
+        let mode = std::fs::metadata(units.join("wicketd.service")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
+        assert_eq!(std::fs::read_to_string(units.join("wicket-follow.timer")).unwrap(), embedded()["wicket-follow.timer"]);
     }
 
     struct Dir(PathBuf);
