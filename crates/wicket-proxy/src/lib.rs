@@ -58,6 +58,9 @@ pub struct RunCtx {
     pub fence: Option<Fence>,
     /// Wakes a hibernated agent (a message just arrived for it). Set by the supervisor.
     pub waker: Option<Waker>,
+    /// Where the agent's own lifetime requests go (`finish`, `hibernate`, #249): to its supervisor,
+    /// which acts at the end of the agent's turn. None for programs.
+    pub lifecycle: Option<Lifecycle>,
 }
 
 /// An activation's fencing token: the agent's generation when it was woken.
@@ -69,6 +72,19 @@ pub struct Fence {
 
 /// Asks for an agent to be woken, with what woke it.
 pub type Waker = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// What an agent asks of its own lifetime (#249). wicket never ends or hibernates a run on a turn
+/// boundary by itself: only when the agent (or an operator) asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// Close the session at the end of this turn: the harness exits, and the run ends.
+    Finish,
+    /// Hibernate at the end of this turn, at a quiet point.
+    Hibernate,
+}
+
+/// Sends the agent's lifetime requests to its supervisor.
+pub type Lifecycle = tokio::sync::mpsc::UnboundedSender<Want>;
 
 /// What an agent asks for with `request_capacity` (#7): a node for a while, at most this price.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -543,6 +559,7 @@ mod fence_tests {
             capacity: None,
             fence: Some(Fence { agent, generation: 1 }),
             waker: None,
+            lifecycle: None,
         }
     }
 

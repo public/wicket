@@ -92,16 +92,6 @@ pub struct AgentSpec {
     /// subagent is a wicket child with its own identity.
     #[serde(default = "yes")]
     pub in_box_subagents: bool,
-    /// Keep the session open this long after each turn for follow-up messages from the operator
-    /// (`wicket say <run> …`). "0s" (default) ends the run when the first task is done.
-    #[serde(default = "zero")]
-    pub idle_timeout: String,
-    /// Long-lived agents (#70): once a turn has ended and `idle_timeout` has passed with no follow-up,
-    /// the box is paused (Idle) instead of closed. At `hibernate_after` (from the end of the turn) the
-    /// agent is hibernated: its box is stopped, its writable state bundled, and it is woken later by
-    /// `wicket wake`, `wicket say` or a message. None (default): the session closes at `idle_timeout`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hibernate_after: Option<String>,
     /// Extra environment for the agent: non-secret configuration only. Variables
     /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
     #[serde(default)]
@@ -154,27 +144,9 @@ pub const ADAPTER_SETTINGS_ALLOWED: [&str; 5] = ["includeCoAuthoredBy", "attribu
 /// when it wakes (#70).
 pub const ADAPTER_SETTINGS_OWNED: [&str; 1] = ["cleanupPeriodDays"];
 
-fn zero() -> String {
-    "0s".into()
-}
-
 /// Environment variables a manifest may not set: wicket's routes, trust and placeholders.
 pub const RESERVED_ENV_PREFIXES: [&str; 12] =
     ["ANTHROPIC_", "CLAUDE_", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_", "CURL_", "NODE_", "MCP_", "GIT_SSL", "WICKET_"];
-
-impl AgentSpec {
-    pub fn idle(&self) -> Result<std::time::Duration, ManifestError> {
-        humantime::parse_duration(&self.idle_timeout).map_err(|e| ManifestError::Invalid(format!("agent.idle_timeout: {e}")))
-    }
-
-    /// When to hibernate after a turn ends, if the agent hibernates at all.
-    pub fn hibernate(&self) -> Result<Option<std::time::Duration>, ManifestError> {
-        self.hibernate_after
-            .as_deref()
-            .map(|h| humantime::parse_duration(h).map_err(|e| ManifestError::Invalid(format!("agent.hibernate_after: {e}"))))
-            .transpose()
-    }
-}
 
 fn yes() -> bool {
     true
@@ -656,7 +628,6 @@ impl Manifest {
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
-                a.idle()?;
                 match &a.remote {
                     Some(r) => {
                         let ok = !r.name.trim().is_empty()
@@ -665,21 +636,11 @@ impl Manifest {
                         if !ok {
                             return Err(ManifestError::Invalid("agent.remote.name: 1-64 letters, digits, spaces, '-', '_' or '.'".into()));
                         }
-                        if a.hibernate_after.is_some() {
-                            return Err(ManifestError::Invalid(
-                                "agent.remote can't hibernate: its session lives in the vendor's apps, not in the box (#169)".into(),
-                            ));
-                        }
                     }
                     None if self.task.trim().is_empty() => {
                         return Err(ManifestError::Invalid("task is empty (only an agent.remote session may leave it out)".into()))
                     }
                     None => {}
-                }
-                if let Some(h) = a.hibernate()? {
-                    if h < a.idle()? {
-                        return Err(ManifestError::Invalid("agent.hibernate_after must not be shorter than agent.idle_timeout".into()));
-                    }
                 }
                 if let Some(k) = a.adapter_settings.keys().find(|k| ADAPTER_SETTINGS_OWNED.contains(&k.as_str())) {
                     return Err(ManifestError::Invalid(format!(
@@ -917,17 +878,15 @@ zone:
         for bad in ["HTTPS_PROXY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "SSL_CERT_FILE", "HOME", "lower"] {
             assert!(Manifest::from_yaml(&base(&format!(", env: {{ {bad}: x }}"))).is_err(), "{bad} must be refused");
         }
-        assert!(Manifest::from_yaml(&base(", idle_timeout: 30m")).is_ok());
+        // The harness decides its lifetime (#249): wicket has no turn timers to set.
+        assert!(Manifest::from_yaml(&base(", idle_timeout: 30m")).is_err());
+        assert!(Manifest::from_yaml(&base(", hibernate_after: 10m")).is_err());
         assert!(Manifest::from_yaml(&base(", adapter_settings: { includeCoAuthoredBy: false }")).is_ok());
         for bad in ["hooks", "permissions", "apiKeyHelper", "env", "mcpServers"] {
             assert!(Manifest::from_yaml(&base(&format!(", adapter_settings: {{ {bad}: {{}} }}"))).is_err(), "{bad} must be refused");
         }
-        assert!(Manifest::from_yaml(&base(", idle_timeout: soon")).is_err());
         let e = Manifest::from_yaml(&base(", adapter_settings: { cleanupPeriodDays: 1 }")).unwrap_err().to_string();
         assert!(e.contains("cleanupPeriodDays") && e.contains("wicket sets it"), "{e}");
-        assert!(Manifest::from_yaml(&base(", idle_timeout: 1m, hibernate_after: 10m")).is_ok());
-        assert!(Manifest::from_yaml(&base(", idle_timeout: 10m, hibernate_after: 1m")).is_err());
-        assert!(Manifest::from_yaml(&base(", hibernate_after: later")).is_err());
         let vol = |v: &str| format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, volumes: [{v}] }}\n");
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/data }")).is_ok());
         let m = Manifest::from_yaml(&vol("{ name: data, path: /volumes/data, persist: durable }")).unwrap();
@@ -957,7 +916,7 @@ zone:
     }
 
     #[test]
-    fn a_remote_session_needs_no_task_but_a_good_name_and_never_hibernates() {
+    fn a_remote_session_needs_no_task_but_a_good_name() {
         let y = |agent: &str| Manifest::from_yaml(&format!("agent: {{ name: a{agent} }}\nzone: {{ name: z, llm: {{}} }}\n"));
         let m = y(", remote: { name: my box }").unwrap();
         assert_eq!(m.agent.unwrap().remote.unwrap().name, "my box");
@@ -965,7 +924,6 @@ zone:
         assert!(y(", remote: { name: '' }").is_err());
         assert!(y(", remote: { name: 'a/b' }").is_err());
         assert!(y(", remote: { name: x, mode: y }").is_err(), "unknown fields");
-        assert!(y(", remote: { name: x }, idle_timeout: 1m, hibernate_after: 1h").unwrap_err().to_string().contains("can't hibernate"));
         // Other manifests serialize as before (their identity digests don't change).
         let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
         assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));

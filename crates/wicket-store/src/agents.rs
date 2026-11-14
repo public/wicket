@@ -1,7 +1,7 @@
 //! Long-lived agents (#70, design §13): one row per agent, outliving each of its runs (activations).
 //!
-//! **States** (`state`): `active` (a box runs a turn, or waits for a follow-up), `idle` (the box is
-//! paused), `hibernating` (the box has stopped and its state is being pushed), `hibernated` (no box;
+//! **States** (`state`): `active` (a box runs: a turn, or the agent waiting on its own, #249),
+//! `hibernating` (the box has stopped and its state is being pushed), `hibernated` (no box;
 //! the state is a bundle in the object store), `waking` (a waker holds the claim and is rebuilding
 //! the box), `ended` (the session closed without hibernating: nothing to wake), `failed`.
 //!
@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS agent_runs_agent ON agent_runs (agent, generation);
 "#;
 
 /// States in which a box (or a waker) holds the agent.
-pub const HELD: &[&str] = &["active", "idle", "hibernating", "waking"];
+pub const HELD: &[&str] = &["active", "hibernating", "waking"];
 
 /// A new agent id: `agt_` and 26 lowercase ULID characters.
 pub fn new_agent_id() -> String {
@@ -234,7 +234,7 @@ impl Ledger {
         let n = tx.execute(
             "UPDATE agents SET state = 'waking', generation = generation + 1, run = ?2, lease_until = ?3, want = NULL, updated_at = ?4 \
              WHERE id = ?1 AND restorable = 1 AND head IS NOT NULL \
-             AND (state = 'hibernated' OR (state IN ('active', 'idle', 'hibernating', 'waking') AND COALESCE(lease_until, 0) < ?4))",
+             AND (state = 'hibernated' OR (state IN ('active', 'hibernating', 'waking') AND COALESCE(lease_until, 0) < ?4))",
             params![id, run, lease_until, t],
         )?;
         if n != 1 {
@@ -281,7 +281,7 @@ impl Ledger {
     /// Asks the agent's supervisor for something (`hibernate`). False: the agent isn't held by a box.
     pub fn want_agent(&self, id: &str, want: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE agents SET want = ?2, note = NULL, updated_at = ?3 WHERE id = ?1 AND state IN ('active', 'idle')",
+            "UPDATE agents SET want = ?2, note = NULL, updated_at = ?3 WHERE id = ?1 AND state = 'active'",
             params![id, want, now()],
         )?;
         Ok(n == 1)
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(l.waiting_messages("run_2").unwrap(), 1);
         assert_eq!(l.agent_of_run("run_2").unwrap(), Some((id.clone(), 2)));
         // Generation 1 is stale now: its state changes and pushes are refused.
-        assert!(!l.set_agent_state(&id, 1, "idle", None).unwrap());
+        assert!(!l.set_agent_state(&id, 1, "active", None).unwrap());
         assert!(!l.set_agent_session(&id, 1, "acp-old").unwrap());
         assert!(l.set_agent_session(&id, 2, "acp-new").unwrap());
         assert_eq!(l.agent(&id).unwrap().unwrap().session_id, "acp-new");

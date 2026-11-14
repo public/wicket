@@ -679,7 +679,7 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
     }
     let before = a.updated_at;
     if !l.want_agent(&a.id, "hibernate")? {
-        bail!("agent {} is {}: only an active or idle agent can be hibernated", a.id, a.state);
+        bail!("agent {} is {}: only an active agent can be hibernated", a.id, a.state);
     }
     println!("asked agent {} ({}) to hibernate at its next quiet point", a.id, a.run);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
@@ -697,12 +697,12 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
                 );
                 return Ok(());
             }
-            "idle"
+            "active"
                 if now.want.is_none()
                     && now.updated_at >= before
                     && now.note.as_deref().is_some_and(|n| n.starts_with("not hibernated")) =>
             {
-                println!("agent {} stays idle (paused): {}", a.id, now.note.unwrap_or_default());
+                println!("agent {} goes on running: {}", a.id, now.note.unwrap_or_default());
                 return Ok(());
             }
             "ended" | "failed" => bail!("agent {} {}: {}", a.id, now.state, now.note.unwrap_or_default()),

@@ -1641,6 +1641,7 @@ async fn serve_box(
         capacity: None,
         fence: None,
         waker: None,
+        lifecycle: None,
     };
     let ca = node.ca();
     let minter: Arc<dyn Minter> = match &ca {

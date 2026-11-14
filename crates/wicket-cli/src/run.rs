@@ -28,14 +28,12 @@ pub fn check_run_id(id: &str) -> Result<()> {
     }
 }
 
-/// The run's box, on whichever node it runs: stop it, revoke it, pause it, look inside it.
+/// The run's box, on whichever node it runs: stop it, revoke it, look inside it.
 #[derive(Clone)]
 struct Stopper(Arc<crate::noderun::NodeCtl>);
 
 impl Stopper {
     async fn kill(&self) -> Result<()> {
-        // A paused (Idle) box is unpaused first, so it can be killed.
-        let _ = self.unpause().await;
         self.0.kill();
         Ok(())
     }
@@ -43,16 +41,7 @@ impl Stopper {
     /// The run's identity was revoked: the revocation is published first (the node refuses its
     /// ops as soon as the delta applies), then the box is stopped.
     async fn revoke(&self) {
-        let _ = self.unpause().await;
         self.0.revoke();
-    }
-
-    async fn pause(&self) -> Result<()> {
-        self.0.calls.ctl(&self.0.run, "pause", "", "").await.map(|_| ())
-    }
-
-    async fn unpause(&self) -> Result<()> {
-        self.0.calls.ctl(&self.0.run, "unpause", "", "").await.map(|_| ())
     }
 
     /// Whether the box is at a quiet point (only the agent's runtime running), as `user`.
@@ -437,8 +426,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         None => RunId::new(),
     };
-    // A long-lived agent (#70): one wicket launches itself, here, so its box can be paused,
-    // hibernated and rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
+    // A long-lived agent (#70): one wicket launches itself, here, so it can be hibernated and
+    // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
     // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent.
     let long_lived =
@@ -584,6 +573,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
+    let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
     let escalate = m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
     // Identity (design §3.2): launch is registration. wicket issues this instance's identity from
     // facts it chose, and keeps the instance's key here; the box never sees either.
@@ -885,6 +876,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         capacity,
         fence: fence.clone(),
         waker: long_lived.then(|| Arc::new(|agent: &str, by: &str| crate::hibernate::trigger_wake(agent, by)) as wicket_proxy::Waker),
+        lifecycle: m.program.is_none().then(|| want_tx.clone()),
     };
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     let llm = Llm::new(ctx.clone())?;
@@ -1329,7 +1321,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         _ => None,
     };
     // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
-    // written the same way while the session is open; closing stdin ends it.
+    // written the same way while the session is open. wicket closes stdin only when the agent asked
+    // to finish or hibernate (#249): the harness decides when it is done.
     let mut stdin = stdin;
     // A child its node started (#164) has its task from the node already.
     if let (Some(si), Some(t), None, None) = (stdin.as_mut(), &stdin_task, &record, &adopt) {
@@ -1360,7 +1353,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             acp = Some(c);
         }
     }
-    let idle = m.agent.as_ref().map(|a| a.idle()).transpose()?.unwrap_or_default();
     // Re-attached: between turns if the box's last output line was a turn's result.
     let mut turn_running = match &record {
         Some(_) if acp.is_some() => acp.as_ref().is_some_and(|c| c.busy()),
@@ -1369,7 +1361,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")),
         None => true,
     };
-    let mut last_result = std::time::Instant::now();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     // A wrapped agent's stdout goes straight to its launcher; otherwise wicket reads it.
     let mut lines = stdout.map(|o| BufReader::new(o).lines());
@@ -1408,12 +1399,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut status = "unknown".to_string();
     // A program's last lines of output: its result, when it reports to a parent.
     let mut program_tail: Vec<String> = Vec::new();
-    // Long-lived agents (#70): Idle is a paused box; at a quiet point the agent hibernates.
-    let hib_after = if fence.is_some() { m.agent.as_ref().and_then(|a| a.hibernate().ok().flatten()) } else { None };
-    let mut paused = false;
+    // Long-lived agents (#70) hibernate at a quiet point after their turn, when they or an operator
+    // asked; an agent that asked to finish has its session closed at the end of its turn.
     let mut hibernating = false;
     let mut hib_asked = false;
-    let mut hib_tried = false;
+    let mut finish_asked = false;
     let mut notified_msgs = 0i64;
     let mut superseded = false;
     let mut saw_assistant = false;
@@ -1517,13 +1507,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     audit("run.agent_prompt", serde_json::json!({ "tool": tool, "kind": kind, "answer": answer, "why": why }))
                                 }
                                 E::Refused { method } => audit("run.agent_call_refused", serde_json::json!({ "method": method })),
-                                E::TurnDone { .. } if !c.busy() => {
-                                    turn_running = false;
-                                    last_result = std::time::Instant::now();
-                                    if stdin.is_some() && !idle.is_zero() {
-                                        println!("[wicket] turn done; follow-ups for {}: wicket say {} \"…\"", humantime::format_duration(idle), run);
-                                    }
-                                }
+                                E::TurnDone { .. } if !c.busy() => turn_running = false,
                                 E::Failed { error } => {
                                     // Nothing more can be said to it: end the session.
                                     if status == "unknown" {
@@ -1548,10 +1532,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             }
                             if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
                                 turn_running = false;
-                                last_result = std::time::Instant::now();
-                                if stdin.is_some() && !idle.is_zero() {
-                                    println!("[wicket] turn done; follow-ups for {}: wicket say {} \"…\"", humantime::format_duration(idle), run);
-                                }
                             }
                         }
                         let sub = tracker.lock().ok().and_then(|mut t| t.observe(&l));
@@ -1569,6 +1549,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 None => break,
             },
             Some(ev) = rx.recv() => print_event(&ev),
+            Some(w) = want_rx.recv() => {
+                let when = if turn_running { ": at the end of this turn" } else { "" };
+                match w {
+                    wicket_proxy::Want::Finish if stdin.is_none() => println!("[wicket] the agent asked to finish; its session ends when its process exits"),
+                    wicket_proxy::Want::Finish => {
+                        println!("[wicket] the agent asked to finish{when}");
+                        finish_asked = true;
+                    }
+                    wicket_proxy::Want::Hibernate => {
+                        println!("[wicket] the agent asked to hibernate{when}");
+                        hib_asked = true;
+                    }
+                }
+            }
             _ = progress_tick.tick() => {
                 use std::sync::atomic::Ordering::SeqCst;
                 let (o, e) = stopper.0.offsets();
@@ -1626,14 +1620,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             _ = tick.tick(), if stdin.is_some() => {
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
-                if !msgs.is_empty() && paused {
-                    let _ = stopper.unpause().await;
-                    paused = false;
-                    set_state("active", None);
-                }
                 for (text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
-                    hib_tried = false;
                     println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
                         if si.write_all(turn_input(&mut acp, &acp_state, &text).as_bytes()).await.is_err() {
@@ -1644,95 +1632,57 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     turn_running = true;
                 }
                 if let Some(f) = &fence {
+                    // An operator's `wicket hibernate`.
                     if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
                         hib_asked = true;
                         if turn_running {
                             println!("[wicket] hibernate asked: at the end of this turn");
                         }
                     }
-                    // A peer's message waiting while the agent is between turns: tell it (wicket's
-                    // own words; the message itself is read with await_message).
-                    let waiting = ledger.lock().ok().and_then(|l| l.waiting_messages(&run.0).ok()).unwrap_or(0);
-                    if waiting < notified_msgs {
-                        notified_msgs = waiting;
+                }
+                // A peer's message waiting while the agent is between turns: tell it (wicket's own
+                // words; the message itself is read with await_message). Not once it asked to finish.
+                let waiting = ledger.lock().ok().and_then(|l| l.waiting_messages(&run.0).ok()).unwrap_or(0);
+                if waiting < notified_msgs {
+                    notified_msgs = waiting;
+                }
+                if !turn_running && !finish_asked && waiting > notified_msgs {
+                    use tokio::io::AsyncWriteExt;
+                    let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
+                    println!("{t}");
+                    if let Some(si) = stdin.as_mut() {
+                        let _ = si.write_all(turn_input(&mut acp, &acp_state, &t).as_bytes()).await;
                     }
-                    if !turn_running && waiting > notified_msgs && hib_after.is_some() {
-                        use tokio::io::AsyncWriteExt;
-                        if paused {
-                            let _ = stopper.unpause().await;
-                            paused = false;
-                            set_state("active", None);
-                        }
-                        let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
-                        println!("{t}");
-                        if let Some(si) = stdin.as_mut() {
-                            let _ = si.write_all(turn_input(&mut acp, &acp_state, &t).as_bytes()).await;
-                        }
-                        notified_msgs = waiting;
-                        turn_running = true;
-                        hib_tried = false;
-                    }
-                    if !turn_running && !hibernating {
-                        let since = last_result.elapsed();
-                        if hib_asked || (hib_after.is_some_and(|h| since >= h) && !hib_tried) {
-                            hib_asked = false;
-                            {
-                                if paused {
-                                    let _ = stopper.unpause().await;
-                                    paused = false;
-                                }
-                                match stopper.check_quiet(&box_user, &agent_cmd).await {
-                                    Ok(()) => {
-                                        println!("[wicket] quiet point: hibernating agent {}", f.agent);
-                                        set_state("hibernating", None);
-                                        hibernating = true;
-                                        stdin = None; // EOF: the agent exits, then its state is pushed
-                                    }
-                                    Err(why) => {
-                                        let note = format!("not hibernated: {why}");
-                                        println!("[wicket] {note}; staying idle (paused)");
-                                        let _ = stopper.pause().await;
-                                        paused = true;
-                                        hib_tried = true;
-                                        set_state("idle", Some(&note));
-                                    }
-                                }
+                    notified_msgs = waiting;
+                    turn_running = true;
+                }
+                if !turn_running && !hibernating && hib_asked {
+                    hib_asked = false;
+                    match &fence {
+                        None => println!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
+                        Some(f) => match stopper.check_quiet(&box_user, &agent_cmd).await {
+                            Ok(()) => {
+                                println!("[wicket] quiet point: hibernating agent {}", f.agent);
+                                set_state("hibernating", None);
+                                hibernating = true;
+                                stdin = None; // EOF: the agent exits, then its state is pushed
                             }
-                        } else if hib_after.is_some() && !paused && since >= idle {
-                            match stopper.pause().await {
-                                Ok(()) => {
-                                    paused = true;
-                                    set_state("idle", None);
-                                    println!("[wicket] idle: box paused (follow-ups still reach it: wicket say {run} \"…\")");
-                                }
-                                Err(e) => println!("[wicket] could not pause the box: {e:#}"),
+                            Err(why) => {
+                                // It goes on running, as it was: nothing is paused.
+                                let note = format!("not hibernated: {why}");
+                                println!("[wicket] {note}; the agent goes on running");
+                                set_state("active", Some(&note));
                             }
-                        }
+                        },
                     }
                 }
-                if hibernating || hib_after.is_some() {
-                    continue;
-                }
-                if !turn_running && last_result.elapsed() >= idle {
-                    if !idle.is_zero() {
-                        println!("[wicket] no follow-up for {}; closing the session", humantime::format_duration(idle));
-                    }
+                if !turn_running && !hibernating && finish_asked && stdin.is_some() {
+                    println!("[wicket] closing the session, as the agent asked");
                     stdin = None; // EOF: the agent finishes and exits
                 }
             }
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
-                if let (Some(_), false, false, Some(_)) = (&fence, turn_running, hibernating, &stdin) {
-                    let _ = stopper.unpause().await;
-                    paused = false;
-                    if stopper.check_quiet(&box_user, &agent_cmd).await.is_ok() {
-                        println!("[wicket] timeout after {} while idle: hibernating instead", humantime::format_duration(timeout));
-                        set_state("hibernating", None);
-                        hibernating = true;
-                        stdin = None;
-                        continue;
-                    }
-                }
                 hibernating = false;
                 println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
                 stopper.kill().await?;
