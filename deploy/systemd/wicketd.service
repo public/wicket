@@ -1,5 +1,7 @@
 # wicketd (#12): the only way other users reach wicket. Runs as the wicket system user, which owns
 # /var/lib/wicket (0700) and is the only member of the docker group. Installed by deploy/install.sh.
+# It runs the versions root's current build, which `wicket self update` switches (root runs only its
+# own copies, through /usr/local/bin/wicket: #261).
 [Unit]
 Description=wicket daemon: runs wicket commands for the host's operators
 Documentation=https://github.com/public/wicket
@@ -11,7 +13,7 @@ User=wicket
 Group=wicket
 SupplementaryGroups=docker
 Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
-ExecStart=/usr/local/bin/wicket daemon
+ExecStart=/var/lib/wicket-versions/current/wicket daemon
 # /run/wicket/wicketd.sock. The socket is 0666: each caller is checked by its peer credentials.
 RuntimeDirectory=wicket
 RuntimeDirectoryMode=0755

@@ -11,6 +11,26 @@ Updating is root's alone on an installed host: `self update`, `self rollback`, `
 `self trust-key` are refused for operators, passkeys and the daemon's own uid. An agent can only ask
 (`request_update`).
 
+Root runs only its own copies of wicket (`/usr/local/lib/wicket/<build id>/wicket`, which
+`/usr/local/bin/wicket` links to), never a file in `/var/lib/wicket-versions`, which the `wicket` user
+can write ([why](#on-an-installed-host-why-this-is-safe)).
+
+## Once: on a host installed before #261
+
+Before #261, `/usr/local/bin/wicket` linked into the `wicket` user's versions root, so `sudo wicket`
+ran a binary that user could replace. Update such a host once with `deploy/install.sh` from the new
+release's archive, as root, instead of `self update`:
+
+```sh
+tar -xzf wicket-0.0.2-x86_64-linux.tar.gz && sudo wicket-0.0.2/deploy/install.sh
+```
+
+It makes root's copy from the archive, points `/usr/local/bin/wicket` at it, installs the new units
+(the `wicket` user's services now run `/var/lib/wicket-versions/current/wicket` directly) and
+restarts the services. A `self update` from an older build to this one is refused over those units,
+and the command its refusal prints (`sudo /var/lib/wicket-versions/<id>/wicket self apply-units`)
+is the one not to run: the new build refuses to run as root from there anyway.
+
 ## Once: trust a release key
 
 An update is accepted only if a release key this installation trusts signed it, or a human approved
@@ -57,24 +77,45 @@ sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # control
   over to the new build.
 - Afterwards it prunes, as `wicket self prune` does, where it updated (`--no-prune` to keep
   everything).
+- Root's own side: before the update is forwarded to wicketd, `sudo wicket` copies the artifact's
+  `wicket` into `/usr/local/lib/wicket/<build id>/` (root's; copied, then hashed). It refuses an
+  artifact the `wicket` user could have written (one in its directories, or its own file): pass the
+  artifact as you got it. Once the update commits, `/usr/local/bin/wicket` links to root's copy of
+  the new build.
+
+### A build that came another way
+
+`--from-ci` and `self follow` (below, and [from CI](update-from-ci.md)) download the build as the
+`wicket` user, so root has no copy of it and `/usr/local/bin/wicket` stays on the build root last
+copied (the update says so). wicket's services run the new build either way. To have root run it
+too, give root the artifact yourself:
+
+```sh
+sudo wicket self admit wicket-0.0.2-x86_64-linux.tar.gz   # root's copy; /usr/local/bin/wicket moves to it if it is current
+```
 
 ### When the new version's systemd units differ
 
 Each build carries its own systemd units (`deploy/systemd/`). `self update` runs as the `wicket`
 user, which can't write `/etc/systemd/system`, so it refuses to switch to a build whose units
-differ from the installed ones, and says what to run as root:
+differ from the installed ones, and says what to run as root: root's own copy of that build, which
+`sudo wicket self update ARTIFACT` made before it was refused:
 
 ```sh
-sudo /var/lib/wicket-versions/<build id>/wicket self apply-units   # that build's own units, then daemon-reload
+sudo /usr/local/lib/wicket/<build id>/wicket self apply-units      # that build's own units, then daemon-reload
 sudo wicket self update wicket-0.0.2-x86_64-linux.tar.gz --nodes all   # again: it goes on
 ```
+
+For a build root has no copy of (`--from-ci`, `self follow`), the refusal says to make one first
+with `sudo wicket self admit ARTIFACT`, from the build's artifact (its release archive, downloaded
+yourself).
 
 `apply-units` installs only what differs and restarts nothing (restarting wicketd stops the runs
 started through it): each changed unit takes effect when its service next restarts, which it names.
 Until then the old unit runs the new build, so a release changes its units only in ways the
 previous release also runs under. A new unit is installed but not enabled. A rollback is never
-refused over units; it warns, and `sudo <versions>/<previous id>/wicket self apply-units` puts that
-build's back. `self follow` skips a build whose units aren't applied yet, and takes it once they
+refused over units; it warns, and `sudo /usr/local/lib/wicket/<previous id>/wicket self apply-units`
+puts that build's back. `self follow` skips a build whose units aren't applied yet, and takes it once they
 are. Running `deploy/install.sh` from the new archive does the same, and also restarts the services.
 
 ## Roll back
@@ -85,7 +126,8 @@ sudo wicket self rollback --nodes n1 --only-nodes
 ```
 
 A rollback is a switch to `previous`, so a second rollback goes forward again. It refuses a build
-below the ledger's schema floor: after a contract step, restore the snapshot instead (below).
+below the ledger's schema floor: after a contract step, restore the snapshot instead (below). Root's
+`/usr/local/bin/wicket` moves to root's copy of the build rolled back to, if it has one.
 
 ## Prune
 
@@ -120,7 +162,8 @@ as the snapshot:
 2. As the `wicket` user, copy the snapshot over `/var/lib/wicket/ledger.db`, and remove
    `ledger.db-wal` and `ledger.db-shm`.
 3. Switch `current` back by hand, in `/var/lib/wicket-versions`:
-   `ln -sfn <build id> current.new && mv -T current.new current`.
+   `ln -sfn <build id> current.new && mv -T current.new current`; and root's link, if root has a
+   copy of it: `sudo ln -sfn /usr/local/lib/wicket/<build id>/wicket /usr/local/bin/wicket`.
 4. Start the services again.
 
 Runs started after the snapshot aren't in it, and the reconciler leaves alone boxes of runs its
@@ -139,6 +182,17 @@ restarted.
 ## On an installed host, why this is safe
 
 `sudo wicket self update …` is forwarded to wicketd and runs as the `wicket` user, which owns the
-versions root, so no step needs root inside wicketd. Root then runs a binary the `wicket` user could
-replace; that gives the `wicket` user nothing new, since it is in the `docker` group, which is root
-on the host.
+versions root, so no step needs root inside wicketd. The `wicket` user's services (wicketd, the
+console, the reconciler, the ledger's stream) run `/var/lib/wicket-versions/current/wicket`.
+
+Root never runs a file there (#261): anything that took over wicketd could replace it first, and
+would then run as root the next time root typed `sudo wicket`. So root runs only its own copies,
+in `/usr/local/lib/wicket/` (root's, 0755): `/usr/local/bin/wicket` (what `sudo wicket …`, the
+root `wicket-follow` service and operators run) links to one. Root makes each from an artifact it
+names itself, copying it before hashing or running anything, and refuses an artifact the `wicket`
+user could have written; the build id root reads from the versions root only chooses among root's
+own copies. As root, wicket also refuses to run from a path the `wicket` user can write.
+
+This doesn't make the `wicket` user harmless to root: it is in the `docker` group, and Docker is
+root on the host. It closes the path through root running that user's binaries, so that taking over
+the `wicket` user doesn't also hand over every later `sudo wicket` without going through Docker.

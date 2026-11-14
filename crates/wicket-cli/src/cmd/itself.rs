@@ -49,6 +49,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             SelfCmd::Health { node, canary, image } => update::health(node, canary, image).await,
             SelfCmd::Units => units::print(),
             SelfCmd::ApplyUnits { dir } => units::apply(dir),
+            SelfCmd::Admit { artifact } => rootcopy::admit_cmd(&artifact),
         },
         _ => unreachable!("dispatched to the wrong command group"),
     }
@@ -140,13 +141,19 @@ pub enum SelfCmd {
         artifact: PathBuf,
     },
     /// Install this build's systemd units (#165) where they differ from the installed ones, and
-    /// reload systemd; restarts nothing. Run as root with the version's own binary, as a refused
-    /// `self update` says: `sudo <versions>/<id>/wicket self apply-units`.
+    /// reload systemd; restarts nothing. Run as root with root's own copy of the version, as a
+    /// refused `self update` says: `sudo /usr/local/lib/wicket/<id>/wicket self apply-units`.
     ApplyUnits {
         /// Another units directory (default: /etc/systemd/system, which needs root).
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Make root's own copy of the wicket build in ARTIFACT (a binary or a release archive), in
+    /// /usr/local/lib/wicket/<id>/ (#261). Root runs only these: `sudo wicket self update ARTIFACT`
+    /// makes one itself; this is for a build that came another way (`--from-ci`, `self follow`).
+    /// /usr/local/bin/wicket moves to it if it is the current version. Refuses an artifact the
+    /// wicket user could have written.
+    Admit { artifact: PathBuf },
     /// This build's systemd units (JSON: name to contents).
     #[command(hide = true)]
     Units,

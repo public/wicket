@@ -1,7 +1,8 @@
 # Follows main (#190): one look for the newest build CI signed for main, taken if
 # /var/lib/wicket/ci-builds.yaml's follow policy lets it now (window, soak, only forward along main,
 # never across a schema contract step or a build that failed here). Started by wicket-follow.timer,
-# which the operator enables (docs/how-to/update-from-ci.md); updating wicket is root's.
+# which the operator enables (docs/how-to/update-from-ci.md); updating wicket is root's. As root, so it
+# runs root's own copy (/usr/local/bin/wicket), never the wicket user's versions root (#261).
 [Unit]
 Description=wicket: follow main's signed builds
 Documentation=https://github.com/public/wicket

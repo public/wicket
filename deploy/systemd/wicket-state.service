@@ -12,7 +12,7 @@ User=wicket
 Group=wicket
 SupplementaryGroups=docker
 Environment=HOME=/var/lib/wicket WICKET_HOME=/var/lib/wicket
-ExecStart=/usr/local/bin/wicket state replicate
+ExecStart=/var/lib/wicket-versions/current/wicket state replicate
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full

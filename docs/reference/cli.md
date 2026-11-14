@@ -95,6 +95,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket self keygen`](#wicket-self-keygen)
   - [`wicket self sign`](#wicket-self-sign)
   - [`wicket self apply-units`](#wicket-self-apply-units)
+  - [`wicket self admit`](#wicket-self-admit)
 - [`wicket daemon`](#wicket-daemon)
 
 ## `wicket`
@@ -1361,7 +1362,8 @@ Commands:
   trust-key    Trust a release public key (from `wicket self keygen`) for updates
   keygen       Make a release key pair: KEY (private, keep it offline) and KEY.pub
   sign         Sign an artifact with a release key: writes <artifact>.sig
-  apply-units  Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with the version's own binary, as a refused `self update` says: `sudo <versions>/<id>/wicket self apply-units`
+  apply-units  Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with root's own copy of the version, as a refused `self update` says: `sudo /usr/local/lib/wicket/<id>/wicket self apply-units`
+  admit        Make root's own copy of the wicket build in ARTIFACT (a binary or a release archive), in /usr/local/lib/wicket/<id>/ (#261). Root runs only these: `sudo wicket self update ARTIFACT` makes one itself; this is for a build that came another way (`--from-ci`, `self follow`). /usr/local/bin/wicket moves to it if it is the current version. Refuses an artifact the wicket user could have written
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1488,13 +1490,27 @@ Options:
 ### `wicket self apply-units`
 
 ```text
-Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with the version's own binary, as a refused `self update` says: `sudo <versions>/<id>/wicket self apply-units`
+Install this build's systemd units (#165) where they differ from the installed ones, and reload systemd; restarts nothing. Run as root with root's own copy of the version, as a refused `self update` says: `sudo /usr/local/lib/wicket/<id>/wicket self apply-units`
 
 Usage: wicket self apply-units [OPTIONS]
 
 Options:
       --dir <DIR>  Another units directory (default: /etc/systemd/system, which needs root)
   -h, --help       Print help
+```
+
+### `wicket self admit`
+
+```text
+Make root's own copy of the wicket build in ARTIFACT (a binary or a release archive), in /usr/local/lib/wicket/<id>/ (#261). Root runs only these: `sudo wicket self update ARTIFACT` makes one itself; this is for a build that came another way (`--from-ci`, `self follow`). /usr/local/bin/wicket moves to it if it is the current version. Refuses an artifact the wicket user could have written
+
+Usage: wicket self admit <ARTIFACT>
+
+Arguments:
+  <ARTIFACT>  
+
+Options:
+  -h, --help  Print help
 ```
 
 ## `wicket daemon`
