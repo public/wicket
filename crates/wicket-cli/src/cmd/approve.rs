@@ -33,7 +33,9 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 bail!("not approved");
             }
             let d = Decide { by: operator(), uses: if unlimited { None } else { Some(uses) }, ttl, prefix: prefix.clone(), zone_wide };
-            let Approved { grant: gid, lease, .. } = approve_request(&mut l, &id, &d, serde_json::json!({}))?;
+            let Approved { grant: gid, lease, uses: made_uses, ttl } = approve_request(&mut l, &id, &d, serde_json::json!({}))?;
+            // What the grant was made with: a push gets its window, whatever was picked (#26).
+            let (unlimited, uses) = (made_uses.is_none(), made_uses.unwrap_or(0));
             println!(
                 "approved {id} → grant {gid}: {} {}{} ({}, {}, {})",
                 wicket_agent::clip(&req.method, 16),
@@ -133,6 +135,10 @@ pub struct Decide {
 /// What [`approve_request`] made.
 pub struct Approved {
     pub grant: String,
+    /// The uses and lifetime the grant was made with: the request's own terms for a git push
+    /// (#26, [`wicket_core::git::grant_terms`]), else the decision's.
+    pub uses: Option<u32>,
+    pub ttl: Duration,
     /// The capacity lease the request asked for, if it is a capacity ask: provisioned by the next
     /// reconcile pass (`wicket approve` runs one at once).
     pub lease: Option<String>,
@@ -149,12 +155,16 @@ pub fn approve_request(l: &mut Ledger, id: &str, d: &Decide, extra: serde_json::
     let lease = capacity::lease_of_request(l, &req)?;
     let a = Approval { uses: d.uses, ttl: d.ttl, path_prefix: d.prefix.clone(), decided_by: d.by.clone() };
     let gid = if d.zone_wide { l.approve_zone_wide(id, &a)? } else { l.approve(id, &a)? };
+    let (uses, ttl_secs) = match d.prefix.is_some() || req.scope_prefix {
+        true => (d.uses, d.ttl.as_secs()),
+        false => wicket_core::git::grant_terms(&req.method, &req.path, d.uses, d.ttl.as_secs()),
+    };
     let mut record = serde_json::json!({
         "request": id, "decision": "approve", "grant": gid, "by": d.by,
         "method": req.method, "host": req.host, "path": req.path,
         "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
         "agent_identity": verified_identity(l, &req.run, None),
-        "uses": d.uses, "ttl_secs": d.ttl.as_secs(), "prefix": d.prefix, "scope_prefix": req.scope_prefix,
+        "uses": uses, "ttl_secs": ttl_secs, "prefix": d.prefix, "scope_prefix": req.scope_prefix,
         "scope": if d.zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone, "lease": lease,
     });
     merge(&mut record, extra);
@@ -162,7 +172,7 @@ pub fn approve_request(l: &mut Ledger, id: &str, d: &Decide, extra: serde_json::
         let _ = l.revoke_grant(&gid);
         return Err(anyhow::Error::from(e).context("the approval could not be recorded in the audit log, so its grant was revoked"));
     }
-    Ok(Approved { grant: gid, lease })
+    Ok(Approved { grant: gid, lease, uses, ttl: Duration::from_secs(ttl_secs) })
 }
 
 /// Denies a pending request and records it; a capacity ask's reservation is released at once.
