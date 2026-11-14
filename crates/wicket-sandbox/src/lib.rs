@@ -68,6 +68,84 @@ impl ImageIdentity {
     }
 }
 
+/// How far back [`Docker::watch_images`] asks for events when it (re)subscribes, in seconds: an
+/// image changed while the CLI was starting still empties the cache.
+const EVENTS_SLACK_SECS: u64 = 5;
+
+/// What a Docker's images were when last inspected, by the reference inspected (#287), kept only
+/// while [`Docker::watch_images`] follows its image events and emptied at each one: a reference
+/// moved, an image pulled, loaded or deleted since is always inspected again. Callers still check
+/// what they get (a pin, #192) as they would a fresh inspect.
+#[derive(Debug, Default)]
+pub struct ImageCache {
+    s: std::sync::Mutex<CacheState>,
+}
+
+#[derive(Debug, Default)]
+struct CacheState {
+    /// The image events are being followed: the cache may be used.
+    watching: bool,
+    /// Counts every change (each event, each start or stop of the watch): an inspect is kept only
+    /// if none came while it ran.
+    gen: u64,
+    ids: std::collections::HashMap<String, ImageIdentity>,
+}
+
+impl ImageCache {
+    fn state(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.s.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What `image` was, if known and nothing changed since.
+    pub fn get(&self, image: &str) -> Option<ImageIdentity> {
+        let s = self.state();
+        s.ids.get(image).filter(|_| s.watching).cloned()
+    }
+
+    /// Taken before an inspect: the generation it may be kept under, if the cache is in use.
+    fn ticket(&self) -> Option<u64> {
+        let s = self.state();
+        s.watching.then_some(s.gen)
+    }
+
+    /// Keeps what an inspect said, unless something changed since its ticket was taken.
+    fn put(&self, ticket: u64, image: &str, ident: &ImageIdentity) {
+        let mut s = self.state();
+        if s.watching && s.gen == ticket {
+            s.ids.insert(image.to_string(), ident.clone());
+        }
+    }
+
+    /// Something changed this Docker's images: forget everything.
+    pub fn invalidate(&self) {
+        let mut s = self.state();
+        s.gen += 1;
+        s.ids.clear();
+    }
+
+    /// Whether the image events are followed (when they stop, nothing known is kept).
+    fn watching(&self, on: bool) {
+        let mut s = self.state();
+        s.watching = on;
+        s.gen += 1;
+        s.ids.clear();
+    }
+
+    /// How many references are cached.
+    pub fn len(&self) -> usize {
+        self.state().ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the cache is in use (its image events are being followed).
+    pub fn in_use(&self) -> bool {
+        self.state().watching
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Docker {
     /// Command prefix, e.g. ["docker"] or ["sudo", "docker"] (from WICKET_DOCKER), or an ssh
@@ -191,6 +269,64 @@ impl Docker {
             |k: &str| v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
         let id = v["Id"].as_str().context("docker image inspect: no Id")?.to_string();
         Ok(Some(ImageIdentity { id, repo_digests: strings("RepoDigests"), tags: strings("RepoTags") }))
+    }
+
+    /// [`Docker::image_identity`] through `cache` (#287): what it last said for `image`, while
+    /// nothing has changed this Docker's images since, else asked again (and kept, if nothing
+    /// changed them while it was asked). A cache nobody keeps current ([`Docker::watch_images`]) is
+    /// never used: every call asks.
+    pub async fn image_identity_cached(&self, cache: &ImageCache, image: &str) -> Result<Option<ImageIdentity>> {
+        if let Some(i) = cache.get(image) {
+            let _t = self.span("image_cached");
+            return Ok(Some(i));
+        }
+        let ticket = cache.ticket();
+        let ident = self.image_identity(image).await?;
+        if let (Some(t), Some(i)) = (ticket, &ident) {
+            cache.put(t, image, i);
+        }
+        Ok(ident)
+    }
+
+    /// Keeps `cache` current for as long as it runs (spawn it): follows this Docker's image events
+    /// (`docker events --filter type=image`: pull, load, import, tag, untag, delete, …), and empties
+    /// the cache at each one. It asks for events from a few seconds before it starts, so none is
+    /// missed while the CLI subscribes. The cache is used only while the events are followed: if the
+    /// CLI ends (the daemon restarted, say), it is emptied and set aside until they are again.
+    pub async fn watch_images(self, cache: Arc<ImageCache>) {
+        use tokio::io::AsyncBufReadExt;
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+                .saturating_sub(EVENTS_SLACK_SECS);
+            let args = ["events", "--filter", "type=image", "--format", "{{.Action}}", "--since"].map(String::from);
+            let child = self
+                .command_with(args.into_iter().chain([since.to_string()]))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn();
+            if let Ok(mut child) = child {
+                if let Some(out) = child.stdout.take() {
+                    let began = std::time::Instant::now();
+                    cache.watching(true);
+                    let mut lines = tokio::io::BufReader::new(out).lines();
+                    while let Ok(Some(_)) = lines.next_line().await {
+                        cache.invalidate();
+                    }
+                    cache.watching(false);
+                    if began.elapsed() > std::time::Duration::from_secs(60) {
+                        backoff = std::time::Duration::from_secs(1);
+                    }
+                }
+                let _ = child.kill().await;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+        }
     }
 
     pub async fn image_exists(&self, image: &str) -> Result<bool> {
@@ -734,6 +870,96 @@ mod tests {
         let plain = Docker::with_command(vec!["true".into()]);
         plain.remove("box").await.unwrap();
         assert_eq!(t.spans().len(), 4);
+    }
+
+    fn ident(id: &str) -> ImageIdentity {
+        ImageIdentity { id: id.into(), repo_digests: vec![], tags: vec![] }
+    }
+
+    #[test]
+    fn the_image_cache_keeps_nothing_unwatched_or_across_a_change() {
+        let c = ImageCache::default();
+        assert_eq!(c.ticket(), None, "unwatched: not used");
+        c.watching(true);
+        let t = c.ticket().unwrap();
+        c.put(t, "img", &ident("sha256:a"));
+        assert_eq!(c.get("img"), Some(ident("sha256:a")));
+        // An event while an inspect ran: what it said may be stale, so it isn't kept.
+        let t = c.ticket().unwrap();
+        c.invalidate();
+        assert_eq!(c.get("img"), None, "an event empties it");
+        c.put(t, "img", &ident("sha256:old"));
+        assert_eq!(c.get("img"), None, "an inspect from before the event isn't kept");
+        let t = c.ticket().unwrap();
+        c.put(t, "img", &ident("sha256:b"));
+        assert_eq!(c.get("img"), Some(ident("sha256:b")));
+        // The watch stops: nothing is used, or kept, until it is followed again.
+        let t = c.ticket().unwrap();
+        c.watching(false);
+        assert_eq!((c.get("img"), c.ticket()), (None, None));
+        c.put(t, "img", &ident("sha256:c"));
+        c.watching(true);
+        assert_eq!(c.get("img"), None);
+    }
+
+    /// A fake Docker CLI in `dir`: `image inspect` answers with `dir/ident`'s id (counting calls
+    /// in `dir/inspects`), `events` follows `dir/events`.
+    fn fake_docker(dir: &std::path::Path) -> Docker {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir.display();
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  events) exec tail -n +1 -f {d}/events ;;\n  image) echo . >> {d}/inspects; printf '{{\"Id\":\"%s\"}}' \"$(cat {d}/ident)\" ;;\nesac\n"
+        );
+        let p = dir.join("docker");
+        std::fs::write(&p, script).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("events"), "").unwrap();
+        Docker::with_command(vec![p.display().to_string()])
+    }
+
+    async fn until(what: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if what() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out");
+    }
+
+    #[tokio::test]
+    async fn an_image_is_inspected_once_until_an_image_event() {
+        let dir = std::env::temp_dir().join(format!("wicket-sandbox-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = fake_docker(&dir);
+        let inspects = || std::fs::read_to_string(dir.join("inspects")).map_or(0, |s| s.lines().count());
+        std::fs::write(dir.join("ident"), "sha256:a").unwrap();
+        let cache = Arc::new(ImageCache::default());
+        // Unwatched: every start inspects.
+        for _ in 0..2 {
+            assert_eq!(d.image_identity_cached(&cache, "img").await.unwrap().unwrap().id, "sha256:a");
+        }
+        assert_eq!(inspects(), 2);
+        let watch = tokio::spawn(d.clone().watch_images(cache.clone()));
+        until(|| cache.in_use()).await;
+        let t = Arc::new(Timings::new());
+        let timed = d.timed(t.clone());
+        for _ in 0..3 {
+            assert_eq!(timed.image_identity_cached(&cache, "img").await.unwrap().unwrap().id, "sha256:a");
+        }
+        assert_eq!(inspects(), 3, "inspected once while watched");
+        let names: Vec<String> = t.spans().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["docker.image_inspect", "docker.image_cached", "docker.image_cached"]);
+        // The tag moves: its event empties the cache, and the next start sees the new image.
+        std::fs::write(dir.join("ident"), "sha256:b").unwrap();
+        std::fs::write(dir.join("events"), "tag\n").unwrap();
+        until(|| cache.is_empty()).await;
+        assert_eq!(d.image_identity_cached(&cache, "img").await.unwrap().unwrap().id, "sha256:b");
+        assert_eq!(d.image_identity_cached(&cache, "img").await.unwrap().unwrap().id, "sha256:b");
+        assert_eq!(inspects(), 4);
+        watch.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

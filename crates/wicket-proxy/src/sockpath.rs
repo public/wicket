@@ -95,6 +95,14 @@ fn short_link(dir: &Path) -> io::Result<PathBuf> {
 }
 
 /// Binds a unix listener at `path`, replacing a stale socket there; see [`resolve`].
+/// A proxy's socket at `path`, bound and listening (whatever was at `path` before is replaced):
+/// connections made from here on wait in its backlog until it is served. Bind before starting what
+/// connects, rather than waiting for the socket to appear (#287).
+pub fn listen(path: &Path) -> io::Result<tokio::net::UnixListener> {
+    let _ = std::fs::remove_file(path);
+    bind(path)
+}
+
 pub fn bind(path: &Path) -> io::Result<tokio::net::UnixListener> {
     let p = resolve(path)?;
     let _ = std::fs::remove_file(&p);
@@ -110,6 +118,24 @@ mod tests {
         let d = std::env::temp_dir().join(format!("wicket-sockpath-{tag}-{}", std::process::id())).join("x".repeat(pad));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// #287: a socket `listen` returns takes connections at once, before anything serves it, and
+    /// replaces whatever a previous run left at its path.
+    #[tokio::test]
+    async fn a_listening_socket_is_ready_before_it_is_served() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let d = long_dir("listen", 0);
+        let sock = d.join("llm.sock");
+        std::fs::write(&sock, "left behind").unwrap();
+        let l = listen(&sock).unwrap();
+        let mut c = tokio::net::UnixStream::connect(&sock).await.expect("connects before it is served");
+        c.write_all(b"ping").await.unwrap();
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut b = [0u8; 4];
+        s.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"ping");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

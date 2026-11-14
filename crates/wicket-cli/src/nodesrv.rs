@@ -215,6 +215,9 @@ struct Node {
     audit: Arc<Mutex<Ledger>>,
     root_pem: String,
     docker: Docker,
+    /// What `docker` last said each image reference was (#287), while its image events are
+    /// followed: a box start reuses it until an image changes.
+    idents: Arc<wicket_sandbox::ImageCache>,
     /// Authenticated control connections, by generation.
     links: Mutex<HashMap<u64, Link>>,
     boxes: Mutex<HashMap<String, BoxState>>,
@@ -597,6 +600,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         audit: Arc::new(Mutex::new(audit)),
         root_pem,
         docker: Docker::from_env(),
+        idents: Default::default(),
         links: Mutex::new(HashMap::new()),
         boxes: Mutex::new(HashMap::new()),
         asks: Mutex::new(HashMap::new()),
@@ -623,6 +627,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
     }
+    // Image identities are reused between box starts while nothing changes the images (#287).
+    tokio::spawn(node.docker.clone().watch_images(node.idents.clone()));
     adopt_previous(&node).await;
     {
         // `wicket self update` moves a node to a new build with SIGHUP: it saves where each box's
@@ -912,18 +918,20 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Ti
     // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
     // reference, or the digest alone; a tag moved to another image since changes nothing, and a
     // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
+    // What an image reference is comes from the node's cache while no image has changed since it
+    // was inspected (#287); the pin is checked against it all the same.
     checks.end();
     let ident = match &bs.image_pin {
         Some(pin) => {
-            let by_ref = docker.image_identity(&bs.image).await?.filter(|i| i.is(pin));
+            let by_ref = docker.image_identity_cached(&node.idents, &bs.image).await?.filter(|i| i.is(pin));
             let by_digest = match by_ref {
                 Some(i) => Some(i),
-                None => docker.image_identity(pin).await?.filter(|i| i.is(pin)),
+                None => docker.image_identity_cached(&node.idents, pin).await?.filter(|i| i.is(pin)),
             };
             by_digest.with_context(|| format!("image {} (pinned to {pin}) is not on node {}", bs.image, node.name))?
         }
         None => docker
-            .image_identity(&bs.image)
+            .image_identity_cached(&node.idents, &bs.image)
             .await?
             .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
     };
@@ -1803,29 +1811,28 @@ async fn serve_box(
     // the proxy, which forwards them.
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
-    tasks.push(tokio::spawn({
-        let us = sock.join("udp.sock");
-        async move {
-            if let Err(e) = h3.serve(&us).await {
-                eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
-            }
+    // Each socket is bound and listening before the box can start (#287): the box's forwarder's
+    // connections wait in its backlog until it is served, with no wait for the socket to appear.
+    let waited = Instant::now();
+    let us = wicket_proxy::h3::H3::listen(&sock.join("udp.sock"))?;
+    let el = wicket_proxy::sockpath::listen(&sock.join("egress.sock")).context("the box's egress socket")?;
+    let ll = wicket_proxy::sockpath::listen(&sock.join("llm.sock")).context("the box's model socket")?;
+    if let Some(t) = t {
+        t.since("proxies.sockets", waited);
+    }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = h3.serve_on(us).await {
+            eprintln!("[node] HTTP/3 and DNS ended: {e:#}");
         }
     }));
-    let es = sock.join("egress.sock");
-    tasks.push(tokio::spawn({
-        let es = es.clone();
-        async move {
-            if let Err(e) = egress.serve(&es).await {
-                eprintln!("[node] egress proxy ended: {e:#}");
-            }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = egress.serve_on(el).await {
+            eprintln!("[node] egress proxy ended: {e:#}");
         }
     }));
-    tasks.push(tokio::spawn({
-        let ls = sock.join("llm.sock");
-        async move {
-            if let Err(e) = llm.serve(&ls).await {
-                eprintln!("[node] model proxy ended: {e:#}");
-            }
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = llm.serve_on(ll).await {
+            eprintln!("[node] model proxy ended: {e:#}");
         }
     }));
     // The MCP gateway (#151): served here, each call relayed to the run's gateway on the control
@@ -1859,17 +1866,6 @@ async fn serve_box(
             }
         }));
     }
-    let waited = Instant::now();
-    for _ in 0..50 {
-        if es.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    if let Some(t) = t {
-        t.since("proxies.sockets", waited);
-    }
-
     Ok(tasks)
 }
 
@@ -2036,6 +2032,7 @@ mod tests {
             audit: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())),
             root_pem: String::new(),
             docker: Docker::from_env(),
+            idents: Default::default(),
             links: Mutex::new(HashMap::new()),
             boxes: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
