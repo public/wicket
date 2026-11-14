@@ -839,19 +839,46 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         m.describe.version, m.describe.protocol, m.describe.schema, accepted.source
     ));
     let here = describe()?;
-    if here.protocol.abs_diff(m.describe.protocol) > crate::chan::PROTOCOL_SKEW {
-        bail!("{green} speaks protocol {}, this build {}: update one protocol version at a time", m.describe.protocol, here.protocol);
+    // More than the skew apart (#207): every remote node switches with the control host, or none
+    // may be enrolled. See [`jump_blockers`].
+    let jump = here.protocol.abs_diff(m.describe.protocol) > crate::chan::PROTOCOL_SKEW;
+    if jump {
+        if o.only_nodes {
+            bail!(
+                "{green} speaks protocol {}, this build {}: a jump of more than {} switches the control host and its nodes together; run it without --only-nodes",
+                m.describe.protocol,
+                here.protocol,
+                crate::chan::PROTOCOL_SKEW
+            );
+        }
+        let blockers = jump_blockers(&ledger.lock().expect("ledger"), &nodes)?;
+        if !blockers.is_empty() {
+            bail!(
+                "{green} speaks protocol {}, this build {}: more than {} apart, so every enrolled node must switch with the control host, and {} would not (name them in --nodes, or `--nodes all`; or revoke them)",
+                m.describe.protocol,
+                here.protocol,
+                crate::chan::PROTOCOL_SKEW,
+                blockers.join(", ")
+            );
+        }
+        say(format!(
+            "a jump from protocol {} to {}: the control host and {} node(s) switch together",
+            here.protocol,
+            m.describe.protocol,
+            nodes.len()
+        ));
     }
+    let together: &[String] = if jump { &nodes } else { &[] };
     if !o.only_nodes {
         if blue == green {
             say(format!("the control host already runs {green}"));
         } else {
-            control_switch(&ledger, &v, &blue, &green, &nodes, &o.gate, false).await?;
+            control_switch(&ledger, &v, &blue, &green, &nodes, together, &o.gate, false).await?;
         }
     } else if v.pointer("current").as_deref() != Some(green.as_str()) {
         bail!("--only-nodes: the control host runs {blue}, not {green}; update it first");
     }
-    for (i, n) in nodes.iter().enumerate() {
+    for (i, n) in nodes.iter().enumerate().filter(|_| !jump) {
         node_update(&ledger, &v, n, &green, &o.gate, i == 0).await?;
     }
     // wicketd re-executes itself last, once the commands it is running (this one) have ended.
@@ -870,6 +897,55 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The enrolled remote nodes a protocol jump would leave behind (#207): every active node other than
+/// this host's own that isn't in `together`. A jump is allowed only when there are none: they would
+/// otherwise be more than the skew away from the control host, and refuse it (`chan.rs`). Revoked
+/// nodes don't count. This host's own node always moves with the control host (its `serve`
+/// re-executes in the handover).
+pub fn jump_blockers(ledger: &Ledger, together: &[String]) -> Result<Vec<String>> {
+    Ok(ledger
+        .nodes()?
+        .into_iter()
+        .filter(|n| n.status == "active" && !n.target.starts_with("unix:") && n.name != crate::localnode::NAME)
+        .map(|n| n.name)
+        .filter(|n| !together.contains(n))
+        .collect())
+}
+
+/// Switches node `name` to version `id`, staging it there first when `bytes` (with its sha256) are
+/// given, and restarts its `serve` on it. Returns what was current there. Used for a protocol jump,
+/// where the node switches with the control host and no older build can check it: the new build's
+/// health gate does.
+async fn node_switch_together(
+    ledger: &Mutex<Ledger>,
+    name: &str,
+    id: &str,
+    bytes: Option<(&[u8], &str)>,
+    why: &str,
+) -> Result<Option<String>> {
+    let row = ledger.lock().expect("ledger").node(name)?.with_context(|| format!("node {name} is not enrolled"))?;
+    let node = crate::enrol::resolve_installed(&row.name, None)?;
+    let prev = match bytes {
+        Some((b, sha)) => {
+            ensure_image_on_node(&node, &crate::image::tag_for(id)).await.with_context(|| format!("node {name}"))?;
+            push_version(&node, b, sha).await?
+        }
+        None => {
+            let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
+            node.script("switching", &format!("set -eu\n{NODE_ROOT}\n{}\n", node_switch_sh(id))).await?;
+            valid_id(&cur).then_some(cur)
+        }
+    };
+    let how = restart_node_serve(&node).await?;
+    audit(
+        ledger,
+        why,
+        serde_json::json!({ "target": format!("node:{name}"), "from": prev, "to": id, "with_control_host": true, "by": crate::operator() }),
+    );
+    say(format!("node {name}: switched {} → {id} with the control host; serve {how}", prev.as_deref().unwrap_or("?")));
+    Ok(prev)
 }
 
 /// One update or rollback at a time on a control host, whoever starts it (an operator, `self
@@ -895,12 +971,14 @@ impl Drop for RemoveOnDrop {
 /// Switches the control host from `from` to `to`, hands over, and gates; on a failed gate, switches
 /// back (automatically) and fails. `rollback`: this is `wicket self rollback` (no gate of its own
 /// beyond one health check, and no switching back).
+#[allow(clippy::too_many_arguments)]
 async fn control_switch(
     ledger: &Mutex<Ledger>,
     v: &Versions,
     from: &str,
     to: &str,
     nodes: &[String],
+    together: &[String],
     gate: &Gate,
     rollback: bool,
 ) -> Result<()> {
@@ -928,17 +1006,64 @@ async fn control_switch(
     audit(ledger, kind, serde_json::json!({ "target": "control", "from": from, "to": to, "automatic": false, "by": crate::operator() }));
     say(format!("control host: switched {from} → {to}"));
     let bin = v.binary(to);
+    // A protocol jump (#207): the nodes switch now, before the runs are handed over, so the new
+    // build never has to talk to a node more than the skew away.
+    let mut moved: Vec<(String, Option<String>)> = vec![];
+    if !together.is_empty() {
+        let bytes = std::fs::read(&bin)?;
+        let sha = v.manifest(to)?.describe.build;
+        for n in together {
+            let r = match rollback {
+                false => node_switch_together(ledger, n, to, Some((&bytes, &sha)), "self.switched").await,
+                true => node_switch_together(ledger, n, to, None, "self.rolled_back").await,
+            };
+            match r {
+                Ok(prev) => moved.push((n.clone(), prev)),
+                Err(e) if rollback => say(format!("node {n}: not switched back with the control host: {e:#}")),
+                Err(e) => {
+                    say(format!("node {n}: couldn't switch it with the control host ({e:#}); switching everything back"));
+                    for (m, prev) in &moved {
+                        if let Some(p) = prev {
+                            let _ = node_switch_together(ledger, m, p, None, "self.rolled_back").await;
+                        }
+                    }
+                    v.switch(from)?;
+                    audit(
+                        ledger,
+                        "self.rolled_back",
+                        serde_json::json!({ "target": "control", "from": to, "to": from, "automatic": true, "why": format!("node {n}: {e:#}") }),
+                    );
+                    bail!("the jump to {to} stopped at node {n} and everything was switched back to {from}: {e:#}");
+                }
+            }
+        }
+    }
     handover(&bin).await?;
     let gate = if rollback { Gate { window: Duration::ZERO, canary: None, ..gate.clone() } } else { gate.clone() };
     match run_gate(ledger, &bin, "control", nodes, &gate).await {
         Ok(()) => {
             audit(ledger, "self.committed", serde_json::json!({ "target": "control", "version": to }));
+            for (n, _) in &moved {
+                audit(
+                    ledger,
+                    "self.committed",
+                    serde_json::json!({ "target": format!("node:{n}"), "version": to, "with_control_host": true }),
+                );
+            }
             say(format!("control host: {to} is healthy"));
             Ok(())
         }
         Err(why) if rollback => bail!("control host: rolled back to {to}, but it isn't healthy: {why}"),
         Err(why) => {
             say(format!("control host: {to} failed its health gate ({why}); rolling back to {from}"));
+            // The nodes that switched with it go back first, so `from` meets nodes it can talk to.
+            for (n, prev) in &moved {
+                if let Some(p) = prev {
+                    if let Err(e) = node_switch_together(ledger, n, p, None, "self.rolled_back").await {
+                        say(format!("node {n}: not switched back: {e:#}"));
+                    }
+                }
+            }
             v.switch(from)?;
             audit(
                 ledger,
@@ -1401,13 +1526,29 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         None => vec![],
     };
     let gate = Gate { window: Duration::ZERO, interval: Duration::from_secs(1), checks: vec![], canary: None, image: None };
+    let mut jumped = false;
     if !only_nodes {
         let v = Versions::control();
         let cur = v.pointer("current").context("nothing to roll back: no versions here (wicket self status)")?;
         let prev = v.pointer("previous").context("no previous version to roll back to")?;
-        control_switch(&ledger, &v, &cur, &prev, &nodes, &gate, true).await?;
+        // Back across a protocol jump (#207): the same rule as the jump itself.
+        let (pc, pp) =
+            (v.manifest(&cur).map(|m| m.describe.protocol).unwrap_or(0), v.manifest(&prev).map(|m| m.describe.protocol).unwrap_or(0));
+        if pc.abs_diff(pp) > crate::chan::PROTOCOL_SKEW {
+            let blockers = jump_blockers(&ledger.lock().expect("ledger"), &nodes)?;
+            if !blockers.is_empty() {
+                bail!(
+                    "{prev} speaks protocol {pp}, {cur} {pc}: rolling back across that jump switches every enrolled node with the control host, and {} would not (`--nodes all`)",
+                    blockers.join(", ")
+                );
+            }
+            control_switch(&ledger, &v, &cur, &prev, &nodes, &nodes, &gate, true).await?;
+            jumped = true;
+        } else {
+            control_switch(&ledger, &v, &cur, &prev, &nodes, &[], &gate, true).await?;
+        }
     }
-    for n in &nodes {
+    for n in nodes.iter().filter(|_| !jumped) {
         let row = ledger.lock().expect("ledger").node(n)?.with_context(|| format!("node {n} is not enrolled"))?;
         let node = crate::enrol::resolve_installed(&row.name, None)?;
         let cur = node.sh(&format!("{NODE_ROOT}; readlink \"$vr/current\" 2>/dev/null || true")).await?;
@@ -1719,5 +1860,34 @@ mod tests {
         let _ = running.kill();
         let _ = running.wait();
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// #207: a protocol jump needs every enrolled remote node to switch with the control host;
+    /// this host's own node always does, and revoked nodes don't count.
+    #[test]
+    fn a_protocol_jump_is_blocked_by_the_remote_nodes_left_behind() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let row = |name: &str, target: &str| wicket_store::NodeRow {
+            name: name.into(),
+            tenant: "t0".into(),
+            target: target.into(),
+            host_key: String::new(),
+            host_key_fp: String::new(),
+            node_key: String::new(),
+            ssh_key: None,
+            hosts: vec![],
+            enrolled_at: 0,
+            status: "active".into(),
+            revoked_at: None,
+        };
+        l.enrol_builtin_node(&row(crate::localnode::NAME, "unix:/x/ctl.sock")).unwrap();
+        assert!(jump_blockers(&l, &[]).unwrap().is_empty(), "only this host's own node: a jump is fine");
+        for n in ["n1", "n2", "n3"] {
+            l.enrol_builtin_node(&row(n, &format!("wicket@{n}.example.com"))).unwrap();
+        }
+        assert_eq!(jump_blockers(&l, &[]).unwrap(), ["n1", "n2", "n3"]);
+        assert_eq!(jump_blockers(&l, &["n1".into(), "n3".into()]).unwrap(), ["n2"], "named: the one left behind");
+        l.revoke_node("n2").unwrap();
+        assert!(jump_blockers(&l, &["n1".into(), "n3".into()]).unwrap().is_empty(), "a revoked node is absent");
     }
 }
