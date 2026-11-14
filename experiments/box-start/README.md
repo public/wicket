@@ -39,11 +39,11 @@ On the control host (the supervisor, `wicket run`):
 | `identity` | the agent identity: issued, verified, put in the ledger |
 | `policy.org` | the org policy, compiled into the box's layer (#51) |
 | `zone.compile` | the zone, compiled for the run's proxies |
-| `proxies`, `proxies.sockets` | the run's egress, model and gateway proxies; the wait for their sockets (polled every 20 ms) |
+| `proxies`, `proxies.sockets` | the run's egress, model and gateway proxies; binding their sockets (each listens before it is served, so there is no wait, #287) |
 | `plan` | the harness's or program's plan, the box's spec |
 | `record` | `ctl/run.json` written |
 | `node.local` | making sure this host's own `wicket node serve` runs |
-| `token.keys`, `token.policy`, `token.mint` | the minting keys; block 0 compiled from Cedar; the box's token minted and published |
+| `token.keys`, `token.policy`, `token.mint` | the minting keys and the node's feed, opened (its delta log replayed: only the entries still held are compiled, #287); block 0 compiled from Cedar; the box's token minted and published |
 | `feed.publish` | the token committed to the node's feed |
 | `node.ready` | from starting the node connection until the node is fresh on the feed at the box's epoch, made of `node.dial` (ssh, or the local unix socket), `node.handshake` (hello, authentication, welcome), `feed.catch_up`, `budget.lease` (the budget slice sealed and sent, #152) and `feed.fresh` (a moment) |
 | `trees`, `image.deliver` | the box's trees sent to a remote node; a pinned image sent or pulled there |
@@ -61,9 +61,9 @@ one-way latency late):
 |---|---|
 | `total` | the node's whole start of the box |
 | `checks` | the run's authority in the feed, for its zone |
-| `docker.image_inspect` | `docker image inspect` (twice for a pinned image not found by its reference) |
+| `docker.image_inspect`, `docker.image_cached` | `docker image inspect` (twice for a pinned image not found by its reference); or, instead, the node's cached identity, while no image event has come since it was inspected (#287) |
 | `layout` | the box's directories, CA bundle, hosts file, workspace archive, state files, volumes |
-| `proxies`, `proxies.sockets` | the node's per-box egress, model, HTTP/3 and DNS, gateway proxies; the wait for the egress socket |
+| `proxies`, `proxies.sockets` | the node's per-box egress, model, HTTP/3 and DNS, gateway proxies; binding their sockets (no wait, #287) |
 | `docker.run` | `docker run -d`: the CLI, dockerd, containerd, the shim and runsc |
 | `docker.run.create` | from the CLI starting until Docker had created the container (Docker's `Created`) |
 | `docker.run.runtime` | from then until the runtime had started the box's first process (`State.StartedAt`): containerd, the shim, runsc's sandbox and gofer boot |
