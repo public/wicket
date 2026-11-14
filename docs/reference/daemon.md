@@ -38,7 +38,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |
 | `identity init` | privileged |
-| `reap`, `reconcile` | privileged |
+| `reconcile` | privileged |
 | `node token\|enrol\|revoke\|renew-ca\|install`, `place …` | privileged |
 | `state check --probe`, `state kit`, `state restore`, `keys …` | privileged |
 | `self update\|rollback\|prune\|trust-key` | root only |

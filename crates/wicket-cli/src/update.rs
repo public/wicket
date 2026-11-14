@@ -1273,7 +1273,7 @@ async fn handover(bin: &Path) -> Result<()> {
         let l = Ledger::open(&crate::ledger_path())?;
         for (run, owner) in l.running_runs()? {
             let Some(o) = owner else { continue };
-            if crate::reap::owner_alive(&o) != Some(true) {
+            if crate::owner::owner_alive(&o) != Some(true) {
                 continue;
             }
             let Some(pid) = o.split(':').nth(1).and_then(|p| p.parse::<i32>().ok()) else { continue };

@@ -27,11 +27,11 @@ mod nodecall;
 mod noderun;
 mod nodesecrets;
 mod nodesrv;
+mod owner;
 mod pin;
 mod place;
 mod policy;
 mod program;
-mod reap;
 mod reconcile;
 mod roots;
 mod run;
@@ -300,19 +300,6 @@ enum Cmd {
     Identity {
         #[command(subcommand)]
         cmd: IdentityCmd,
-    },
-    /// Stop orphaned boxes: boxes whose `wicket run` process has died (killed hard, or crashed) and
-    /// that Docker kept running with nothing behind them. Their runs end as "lost".
-    Reap {
-        /// Only list what would be stopped.
-        #[arg(long)]
-        dry_run: bool,
-        /// Reap on a remote node over ssh instead (e.g. wicket@203.0.113.7).
-        #[arg(long)]
-        node: Option<String>,
-        /// ssh identity for --node.
-        #[arg(long)]
-        ssh_key: Option<PathBuf>,
     },
     /// The installation's org policy in Cedar (#51): a ceiling and forbids over every zone, compiled
     /// into each box's token when it is minted.
@@ -606,9 +593,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Image { .. } | Cmd::Doctor { .. }) => cmd::image::dispatch(c).await,
         c @ Cmd::Zone { .. } => cmd::zone::dispatch(c).await,
         c @ (Cmd::Policy { .. } | Cmd::State { .. } | Cmd::Keys { .. }) => cmd::policy::dispatch(c).await,
-        c @ (Cmd::Node { .. } | Cmd::Place { .. } | Cmd::Lease { .. } | Cmd::Reap { .. } | Cmd::Reconcile { .. }) => {
-            cmd::node::dispatch(c).await
-        }
+        c @ (Cmd::Node { .. } | Cmd::Place { .. } | Cmd::Lease { .. } | Cmd::Reconcile { .. }) => cmd::node::dispatch(c).await,
         c @ Cmd::Itself { .. } => cmd::itself::dispatch(c).await,
         c @ (Cmd::Serve { .. } | Cmd::Operator { .. } | Cmd::Program { .. }) => cmd::operator::dispatch(c).await,
         c @ Cmd::Dev { .. } => cmd::dev::dispatch(c).await,
