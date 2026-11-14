@@ -822,6 +822,10 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     }
     let blue = v.pointer("current").context("no current version")?;
     let (green, m) = v.stage(&bin, &accepted.sha256, accepted.source.clone())?;
+    // Its systemd units installed first (#165), before anything is built or switched.
+    if !o.only_nodes && blue != green {
+        units_installed(&ledger, &v, &green, &accepted.sha256, &stage)?;
+    }
     // Each version's own agent image: the new one's for its boxes and its canary, the old one's for
     // a rollback (running boxes keep whatever they started with).
     let image = ensure_image(&v, &green).await?;
@@ -897,6 +901,44 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses (as [`crate::units::UnitsPending`]) when `green`'s systemd units differ from the
+/// installed ones; a build from before #165, which can't say what its units are, is let through with
+/// a warning.
+fn units_installed(ledger: &Mutex<Ledger>, v: &Versions, green: &str, artifact_sha256: &str, stage: &Path) -> Result<()> {
+    let dir = crate::units::systemd_dir();
+    let Some(want) = crate::units::of_build(&v.binary(green), &stage.join("units-probe"))? else {
+        say(format!("warning: {green} predates `self units`: its systemd units aren't checked against {}", dir.display()));
+        return Ok(());
+    };
+    let units = match crate::units::differing(&dir, &v.root, &want) {
+        Some(u) if !u.is_empty() => u,
+        _ => return Ok(()),
+    };
+    let e = crate::units::UnitsPending { version: green.into(), units, dir, binary: v.binary(green) };
+    audit(
+        ledger,
+        "self.update_refused",
+        serde_json::json!({ "artifact_sha256": artifact_sha256, "version": green, "units": e.units, "why": "units", "by": crate::operator() }),
+    );
+    Err(e.into())
+}
+
+/// Warns when a rollback goes to a version whose units aren't the installed ones (never refused).
+fn warn_units(v: &Versions, to: &str) {
+    let dir = crate::units::systemd_dir();
+    let probe = crate::data_dir().join(format!("units-probe-{}", std::process::id()));
+    if let Ok(Some(want)) = crate::units::of_build(&v.binary(to), &probe) {
+        if let Some(u) = crate::units::differing(&dir, &v.root, &want).filter(|u| !u.is_empty()) {
+            say(format!(
+                "warning: {to}'s systemd units differ from those installed in {} ({}): to have its own, `sudo {} self apply-units`",
+                dir.display(),
+                u.join(", "),
+                v.binary(to).display()
+            ));
+        }
+    }
 }
 
 /// The enrolled remote nodes a protocol jump would leave behind (#207): every active node other than
@@ -1531,6 +1573,7 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         let v = Versions::control();
         let cur = v.pointer("current").context("nothing to roll back: no versions here (wicket self status)")?;
         let prev = v.pointer("previous").context("no previous version to roll back to")?;
+        warn_units(&v, &prev);
         // Back across a protocol jump (#207): the same rule as the jump itself.
         let (pc, pp) =
             (v.manifest(&cur).map(|m| m.describe.protocol).unwrap_or(0), v.manifest(&prev).map(|m| m.describe.protocol).unwrap_or(0));
