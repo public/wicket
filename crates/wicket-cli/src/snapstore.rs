@@ -74,9 +74,10 @@ pub fn fetch(st: &dyn ObjectStore, name: &str, out: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         bail!("{name} from the state store isn't a SQLite database");
     }
-    // Not over an existing file.
-    std::fs::hard_link(&tmp, out).with_context(|| format!("{} (it must not exist yet)", out.display()))?;
+    // Not over an existing file; the unsealed copy never stays behind.
+    let linked = std::fs::hard_link(&tmp, out);
     let _ = std::fs::remove_file(&tmp);
+    linked.with_context(|| format!("{} (it must not exist yet)", out.display()))?;
     Ok(())
 }
 
@@ -131,6 +132,7 @@ mod tests {
         fetch(&st, "1700000000-aaaaaaaaaaaa.db", &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&snap).unwrap());
         assert!(fetch(&st, "1700000000-aaaaaaaaaaaa.db", &out).is_err(), "never over an existing file");
+        assert!(!d.join(".back.db.part").exists(), "and no unsealed copy left beside it");
         assert!(fetch(&st, "1-cccccccccccc.db", &d.join("none.db")).is_err());
         assert!(fetch(&st, "../x.db", &d.join("bad.db")).is_err());
         // Another state.key can't read it, and leaves nothing behind.

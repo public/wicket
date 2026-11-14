@@ -1043,8 +1043,15 @@ async fn control_switch(
     let protect: Vec<String> = [Some(from.to_string()), v.pointer("previous")].into_iter().flatten().collect();
     prune_snapshots(&snaps, KEEP_SNAPSHOTS, &protect, false);
     // And off the host, with a state store (#167): an update doesn't switch without it there (the
-    // way back past a contract step must survive losing this host); a rollback only warns.
-    let stored = match push_snapshot(snap.clone(), KEEP_SNAPSHOTS, protect.clone()).await {
+    // way back past a contract step must survive losing this host); a rollback waits for the store
+    // only briefly, and only warns.
+    let push = push_snapshot(snap.clone(), KEEP_SNAPSHOTS, protect.clone());
+    let pushed = if rollback {
+        tokio::time::timeout(ROLLBACK_PUSH_WAIT, push).await.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in {ROLLBACK_PUSH_WAIT:?}")))
+    } else {
+        push.await
+    };
+    let stored = match pushed {
         Ok(k) => k,
         Err(e) if rollback => {
             say(format!("warning: the ledger snapshot isn't in the state store: {e:#}"));
@@ -1056,7 +1063,7 @@ async fn control_switch(
                 "self.snapshot",
                 serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_error": format!("{e:#}") }),
             );
-            bail!("not switching: the ledger snapshot couldn't be pushed to the state store: {e:#}");
+            return Err(SnapshotNotStored(format!("{e:#}")).into());
         }
     };
     audit(
@@ -1180,6 +1187,22 @@ fn snapshots_to_prune(mut names: Vec<String>, keep: usize, protect: &[String]) -
     out.reverse();
     out
 }
+
+/// How long a rollback waits for its snapshot to reach the state store before switching anyway.
+const ROLLBACK_PUSH_WAIT: Duration = Duration::from_secs(15);
+
+/// Why an update didn't switch: its ledger snapshot couldn't be pushed to the state store (#167).
+/// The store's fault, not the build's (`self follow` tries the build again later).
+#[derive(Debug)]
+pub struct SnapshotNotStored(pub String);
+
+impl std::fmt::Display for SnapshotNotStored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not switching: the ledger snapshot couldn't be pushed to the state store: {}", self.0)
+    }
+}
+
+impl std::error::Error for SnapshotNotStored {}
 
 /// Pushes a snapshot to the state store, if there is one, then prunes the store's copies as the
 /// local ones are; returns its key (None: no state store).

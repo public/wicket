@@ -111,7 +111,10 @@ sudo wicket state snapshots                                          # <time>-<b
 sudo wicket state snapshot 1763150400-0a1b2c3d4e5f.db --out /tmp/ledger-before.db
 ```
 
-`--out` must not exist; the file is the wicket user's, 0600. Then, with that file as the snapshot:
+`--out` must not exist; the file is the wicket user's, 0600. The snapshots are sealed under
+`state.key`, which is made on first use: take the recovery kit (`wicket state kit`) after the first
+update with a state store, or after the first hibernation, so it holds that key. Then, with that file
+as the snapshot:
 
 1. Stop wicket's services: `sudo systemctl stop wicketd wicket-console wicket-reconcile wicket-state`.
 2. As the `wicket` user, copy the snapshot over `/var/lib/wicket/ledger.db`, and remove
