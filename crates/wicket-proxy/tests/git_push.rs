@@ -112,6 +112,7 @@ impl World {
             capacity: None,
             fence: None,
             waker: None,
+            lifecycle: None,
         };
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
         let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_push").unwrap()), Arc::new(Central), None, up).unwrap();
