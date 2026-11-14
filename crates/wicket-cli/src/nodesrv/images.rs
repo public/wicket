@@ -126,6 +126,82 @@ async fn receive(
     }
 }
 
+/// `Msg::PullImage`: pulls image `digest` from registry `from` for `run`, host-side, and imports
+/// it once verified; answers on connection `gen`.
+pub(super) fn pull(node: &Arc<Node>, gen: u64, id: u64, run: String, digest: String, name: Option<String>, from: crate::registry::Source) {
+    let n = node.clone();
+    tokio::spawn(async move {
+        let dir = spool(&n.paths.root).join(format!("pull-{id:x}-{}", ulid::Ulid::new()));
+        let r = pull_into(&n, gen, &run, &digest, name.as_deref(), &from, &dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut body = serde_json::json!({ "digest": digest, "name": name, "via": "registry", "registry": from.host, "repository": from.repository });
+        let error = match &r {
+            Ok(u) => {
+                body["bytes"] = u.bytes.into();
+                eprintln!("[node] image {digest} pulled from {} and imported", from.host);
+                None
+            }
+            Err(e) => {
+                body["why"] = format!("{e:#}").into();
+                eprintln!("[node] pulling image {digest} from {} failed: {e:#}", from.host);
+                Some(format!("{e:#}"))
+            }
+        };
+        let kind = if error.is_none() { "image.received" } else { "image.refused" };
+        let _ = n.audit.lock().expect("audit").audit(&wicket_core::TenantId::single(), Some(&wicket_core::RunId(run.clone())), kind, &body);
+        n.send_to(gen, Frame::Msg(Msg::ImagePulled { id, error }));
+    });
+}
+
+async fn pull_into(
+    node: &Arc<Node>,
+    gen: u64,
+    run: &str,
+    digest: &str,
+    name: Option<&str>,
+    from: &crate::registry::Source,
+    dir: &std::path::Path,
+) -> Result<crate::oci::Unpacked> {
+    crate::run::check_run_id(run)?;
+    if let Some(n) = name {
+        if !wicket_core::image::parse(n).is_ok_and(|r| !r.name.is_empty() && r.pin.as_deref() == Some(digest)) {
+            bail!("{n:?} is not a name pinned to {digest}");
+        }
+    }
+    // The registry's credential, fetched for the run like any secret (#152), held only for the pull.
+    let cred = match &from.secret {
+        None => None,
+        Some(s) => Some(fetch_for_pull(node, gen, run, s).await?),
+    };
+    std::fs::create_dir_all(dir)?;
+    let unpacked = crate::registry::pull(from, digest, name, cred.as_ref().map(|f| f.value.as_str()), dir, IMAGE_MAX).await?;
+    drop(cred);
+    node.docker.import_layout(dir).await.context("importing the image")?;
+    match node.docker.image_identity(digest).await? {
+        Some(i) if i.is(digest) => Ok(unpacked),
+        _ => bail!("the runtime does not report {digest} after importing it"),
+    }
+}
+
+/// A secret for a pull, from the control host over connection `gen` (the box isn't started yet,
+/// so it has no owner connection).
+async fn fetch_for_pull(node: &Arc<Node>, gen: u64, run: &str, name: &str) -> Result<crate::nodesecrets::Fetched> {
+    let id = node.id();
+    let (tx, rx) = oneshot::channel();
+    node.asks.lock().expect("asks").insert(id, tx);
+    let sent = node.send_to(gen, Frame::Msg(Msg::SecretFetch { id, run: run.into(), name: name.into() }));
+    let reply = match sent {
+        true => tokio::time::timeout(std::time::Duration::from_secs(10), rx).await.ok().and_then(|r| r.ok()),
+        false => None,
+    };
+    node.asks.lock().expect("asks").remove(&id);
+    match reply {
+        Some(Msg::SecretFetched { secret: Some(f), .. }) => Ok(*f),
+        Some(Msg::SecretFetched { error: Some(e), .. }) => bail!("the registry's credential {name} was refused by the control host: {e}"),
+        _ => bail!("the control host did not release the registry's credential {name}"),
+    }
+}
+
 /// Bytes for an image being received; given back if `stream` isn't one. Out-of-order bytes end it.
 pub(super) fn data(node: &Node, stream: u64, offset: u64, bytes: Vec<u8>) -> Option<Vec<u8>> {
     let mut m = node.images.0.lock().expect("images");
