@@ -471,7 +471,9 @@ impl Gateway {
     /// `finish` and `hibernate` (#249): the agent decides its own lifetime; its supervisor acts at
     /// the end of the agent's turn.
     fn want(&self, w: crate::Want) -> (String, bool) {
-        let Some(tx) = &self.ctx.lifecycle else { return ("this run's lifetime is its process's: it ends when the process exits".into(), true) };
+        let Some(tx) = &self.ctx.lifecycle else {
+            return ("this run's lifetime is its process's: it ends when the process exits".into(), true);
+        };
         if w == crate::Want::Hibernate && self.ctx.fence.is_none() {
             return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped or a remote session); call finish when you are done".into(), true);
         }

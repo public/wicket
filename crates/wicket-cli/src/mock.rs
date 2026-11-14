@@ -156,12 +156,12 @@ async fn handle(req: Request<Incoming>, command: &str) -> Response<Full<Bytes>> 
         (None, true) => Next::Command,
         (Some((id, out)), true) => next_after(id, out),
     };
-    let bash = |id: String, command: &str, description: &str| {
-        json!({ "type": "tool_use", "id": id, "name": "Bash", "input": { "command": command, "description": description, "timeout": BASH_TIMEOUT_MS } })
-    };
+    let bash = |id: String, command: &str, description: &str| json!({ "type": "tool_use", "id": id, "name": "Bash", "input": { "command": command, "description": description, "timeout": BASH_TIMEOUT_MS } });
     let (block, stop, what) = match next {
         Next::Command => (bash(format!("toolu_mock_{n}"), command, "wicket mock step"), "tool_use", "run the command".to_string()),
-        Next::Call(tool) => (bash(format!("{END_ID}{n}"), &gateway_call(tool), "wicket mock: lifetime"), "tool_use", format!("call {tool}")),
+        Next::Call(tool) => {
+            (bash(format!("{END_ID}{n}"), &gateway_call(tool), "wicket mock: lifetime"), "tool_use", format!("call {tool}"))
+        }
         Next::EndTurn => (
             json!({ "type": "text", "text": format!("Done: the mock model finished. The request carried {messages} messages.") }),
             "end_turn",
