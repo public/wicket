@@ -15,6 +15,7 @@ mod daemon;
 mod doctor;
 mod enrol;
 mod exitcause;
+mod grant;
 mod hibernate;
 mod image;
 mod images_policy;

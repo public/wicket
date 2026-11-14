@@ -59,7 +59,7 @@ mod web;
 
 pub use net::ServeOpts;
 
-use crate::{data_dir, ledger_path};
+use crate::{data_dir, grant, ledger_path};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
@@ -1042,7 +1042,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 None | Some(Value::Null) => None,
                 Some(Value::String(p)) if approve => {
                     let p = wicket_core::canonical_path(p).map_err(|e| bad(&format!("prefix: {e}")))?.to_string();
-                    crate::cmd::approve::check_prefix(&req, &p).map_err(|e| bad(&e))?;
+                    crate::grant::check_prefix(&req, &p).map_err(|e| bad(&e))?;
                     Some(p)
                 }
                 Some(Value::String(_)) => None,
@@ -1232,22 +1232,23 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
                 bail!("{request}: the requesting agent's identity no longer verifies; it can be denied, not approved");
             }
-            let d = crate::cmd::approve::Decide {
-                by: by.clone(),
-                uses: *uses,
-                ttl: Duration::from_secs(*ttl_secs),
-                prefix: prefix.clone(),
-                zone_wide: *zone_wide,
+            let t = grant::Terms { uses: *uses, ttl: Duration::from_secs(*ttl_secs), prefix: prefix.clone(), zone_wide: *zone_wide };
+            let grant::Decided::Approved { grant, lease } =
+                grant::decide(&mut l, &grant::Granter::Human(by), request, &grant::Verdict::Approve(t), json!({ "action": "decide", "signed": signed }))?
+            else {
+                unreachable!("an approval approves")
             };
-            let a = crate::cmd::approve::approve_request(&mut l, request, &d, json!({ "action": "decide", "signed": signed }))?;
             let under = prefix.as_deref().map(wicket_core::prefix_dir).or(req.scope_prefix.then(|| req.path.clone()));
             let scope = under.map(|p| format!(" for every path under {}{p}", req.host)).unwrap_or_default();
             let zone = if *zone_wide { format!(", for any run in zone {}", req.zone) } else { String::new() };
-            let lease = a.lease.map(|x| format!("; lease {x} is provisioned by the next reconcile pass")).unwrap_or_default();
-            Ok(format!("approved {request} → {}{scope}{zone}{lease} (signed with {})", a.grant, oc.name))
+            let lease = lease.map(|x| format!("; lease {x} is provisioned by the next reconcile pass")).unwrap_or_default();
+            Ok(format!("approved {request} → {grant}{scope}{zone}{lease} (signed with {})", oc.name))
         }
         Action::Decide { request, approve: false, .. } => {
-            let lease = crate::cmd::approve::deny_request(&l, request, &by, json!({ "action": "decide", "signed": signed }))?;
+            let lease = match grant::decide(&mut l, &grant::Granter::Human(by), request, &grant::Verdict::Deny, json!({ "action": "decide", "signed": signed }))? {
+                grant::Decided::Denied { lease } => lease,
+                grant::Decided::Approved { .. } => unreachable!("a denial denies"),
+            };
             let lease = lease.map(|x| format!("; lease {x}'s reservation is released")).unwrap_or_default();
             Ok(format!("denied {request}{lease} (signed with {})", oc.name))
         }
