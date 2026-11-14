@@ -56,7 +56,7 @@ else
   crates=all suites=all doc_crates=all
 fi
 [ -n "$only_suites" ] && suites=$only_suites
-all_suites="docs cli-ref policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
+all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
 [ "$suites" = all ] && suites=$all_suites
 has() { [[ " $suites " == *" $1 "* ]]; }
 
@@ -91,9 +91,6 @@ fi
 # ---- end to end ----
 build() { cargo build -p wicket-cli --locked; }
 export WICKET=${WICKET:-target/debug/wicket}
-if has cli-ref && [ "$rust" = 1 ]; then
-  step "docs/reference/cli.md matches --help" bash -c 'cargo build -p wicket-cli --locked && ci/gen-cli-reference.sh --check'
-fi
 if has policy && [ "$rust" = 1 ]; then
   step "SymCC policy diffs" ci/policy-diff.sh "$base"
 fi

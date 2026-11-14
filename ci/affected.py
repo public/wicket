@@ -26,11 +26,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-SUITES = ["docs", "cli-ref", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+SUITES = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
           "node-e2e", "acceptance-nodes", "update"]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().
 LIBS = set()
+DIRS = {}
 
 
 def workspace():
@@ -39,8 +40,9 @@ def workspace():
                          check=True, capture_output=True, text=True).stdout
     m = json.loads(out)
     dirs = {p["name"]: str(Path(p["manifest_path"]).parent.relative_to(ROOT)) for p in m["packages"]}
-    global LIBS
+    global LIBS, DIRS
     LIBS = {p["name"] for p in m["packages"] if any("lib" in t["kind"] for t in p["targets"])}
+    DIRS = dirs
     deps = {p["name"]: {d["name"] for d in p["dependencies"] if d["name"] in dirs and d["name"] != p["name"]}
             for p in m["packages"]}
     return dirs, deps
@@ -148,14 +150,44 @@ def cargo_args(crates):
     return " ".join(f"-p {c}" for c in sorted(crates))
 
 
+# Code block languages rustdoc doesn't run as doctests.
+NOT_RUST = {"text", "txt", "ignore", "sh", "bash", "console", "shell", "yaml", "yml", "json", "toml", "markdown", "md",
+            "sql", "html", "xml", "diff", "cedar", "python", "js", "javascript", "dockerfile", "ini", "http"}
+
+
+def has_doctests(crate_dir):
+    """Whether a crate's sources have a doc-comment code block rustdoc would run (or pull docs from a
+    file, which might). Fences are paired, so a closing ``` isn't taken for an opening one."""
+    for src in (ROOT / crate_dir).rglob("*.rs"):
+        if "target" in src.relative_to(ROOT / crate_dir).parts:
+            continue
+        text = src.read_text(errors="replace")
+        if re.search(r"#!?\[doc\s*=\s*include_str!", text):
+            return True
+        open_ = False
+        for line in text.splitlines():
+            m = re.match(r"\s*//[/!]\s?\s*```+\s*(.*)$", line)
+            if not m:
+                continue
+            if open_:
+                open_ = False
+                continue
+            open_ = True
+            langs = {t.strip() for t in m.group(1).split(",") if t.strip()}
+            if not langs or "rust" in langs or not langs & NOT_RUST:
+                return True
+    return False
+
+
 def doc_args(crates):
     """The same for doctests: the tests' own package set, so cargo resolves the same features and
-    reuses what the tests built (a smaller set rebuilds every dependency: 2–6 minutes). Empty when
-    no selected crate has a library, which `cargo test --doc` refuses; a bin-only crate alongside a
-    library is fine."""
-    if crates == ALL:
-        return "--workspace"
-    return cargo_args(crates) if crates & LIBS else ""
+    reuses what the tests built (a smaller set rebuilds dependencies: 1–6 minutes). Empty when no
+    selected crate has a doctest (the workspace has none today: the step would build for nothing),
+    or none has a library, which `cargo test --doc` refuses."""
+    names = set(DIRS) if crates == ALL else crates
+    if not any(c in LIBS and has_doctests(DIRS[c]) for c in names):
+        return ""
+    return "--workspace" if crates == ALL else cargo_args(crates)
 
 
 def git(*args):
@@ -216,7 +248,8 @@ def self_test():
                 fails.append(f"{name}: {what} {show(c, s)[0 if what == 'crates' else 1]!r}")
 
     case("docs only", ["docs/reference/agents.md", "README.md", "experiments/x/RESULTS.md"], set(), {"docs"})
-    case("the CLI reference", ["docs/reference/cli.md"], set(), {"docs", "cli-ref"})
+    # The CLI reference is checked by a wicket-cli unit test (cli_reference.rs).
+    case("the CLI reference", ["docs/reference/cli.md"], {"wicket-cli"}, {"docs"})
     case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-cli"}, {"smoke"})
     # Nearly everything: the crates that don't depend on wicket-core (auth, identity, fwd, placement) aren't.
     case("wicket-core", ["crates/wicket-core/src/op.rs"],
@@ -226,7 +259,7 @@ def self_test():
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
     case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, ALL)
-    case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"cli-ref", "update"})
+    case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"update"})
     case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, ALL)
     case("the lockfile", ["Cargo.lock"], ALL, ALL)
     case("the toolchain", ["rust-toolchain.toml"], ALL, ALL)
@@ -249,13 +282,27 @@ def self_test():
     # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
     for files, want_args, want_doc in (
         (["crates/wicket-cli/src/chan.rs"], "-p wicket-cli", ""),
-        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", "-p wicket-cli -p wicket-fwd -p wicket-proxy"),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", ""),
         (["docs/x.md"], "", ""),
-        (["Cargo.lock"], "--workspace", "--workspace"),
+        (["Cargo.lock"], "--workspace", ""),
     ):
         c, _, _ = select(files, dirs, deps, rules)
         if (cargo_args(c), doc_args(c)) != (want_args, want_doc):
             fails.append(f"cargo arguments for {files}: {cargo_args(c)!r} / {doc_args(c)!r}, want {want_args!r} / {want_doc!r}")
+    # Doctest detection, on synthetic crates: a runnable block is found, a closing fence or a
+    # non-Rust block isn't taken for one.
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        for body, want in (
+            ("/// ```\n/// let x = 1;\n/// ```\nfn f() {}\n", True),
+            ("//! ```rust,no_run\n//! x();\n//! ```\n", True),
+            ("/// ```text\n/// out\n/// ```\n/// ```yaml\n/// a: 1\n/// ```\n", False),
+            ("#![doc = include_str!(\"../README.md\")]\n", True),
+            ("fn f() {} // ``` not a doc comment\n", False),
+        ):
+            Path(t, "lib.rs").write_text(body)
+            if has_doctests(Path(t)) != want:
+                fails.append(f"doctest detection: {body!r} should be {want}")
     # Every file a crate reads from outside its directory is mapped to that crate.
     for crate, path in out_of_crate_inputs(dirs):
         probe = path if (ROOT / path).is_file() else path + "/x"
@@ -300,8 +347,9 @@ def main(argv):
         print(f"affected: {e}; selecting everything", file=sys.stderr)
         crates, suites, why = ALL, ALL, [f"error: {e}"]
     c, s = show(crates, suites)
-    # Doctests run over the tests' crates (the same features), when one of them has a library.
-    docs = "all" if crates == ALL else (" ".join(sorted(crates)) if crates & LIBS else "")
+    # Doctests run over the tests' crates (the same features), when one of them has a doctest.
+    da = doc_args(crates)
+    docs = "" if not da else ("all" if crates == ALL else " ".join(sorted(crates)))
     for w in why:
         print(f"  {w}", file=sys.stderr)
     print(f"crates: {c}")
@@ -316,8 +364,8 @@ def main(argv):
             # Cargo's package arguments, ready to use; empty when nothing is selected.
             f.write(f"args={cargo_args(crates)}\n")
             f.write(f"doc_args={doc_args(crates)}\n")
-            # The Rust job: for the selected crates, and for the CLI reference check (which builds wicket-cli).
-            rust = crates == ALL or bool(crates) or suites == ALL or "cli-ref" in suites
+            # The Rust job: for the selected crates.
+            rust = crates == ALL or bool(crates)
             f.write(f"rust={'true' if rust else 'false'}\n")
             # Space-padded, so a workflow can test ` smoke ` with contains().
             # An empty value means "run everything" to the workflow, so no suite is ` none `.

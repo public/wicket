@@ -28,11 +28,12 @@ ci/affected.py --worktree
   change to `wicket-fwd` or the agent image runs the smoke test. Hibernation and state code runs
   `hibernate.sh` (both modes) and `restore.sh`. Node code runs `node-e2e.sh --local` and
   `acceptance.sh --nodes local`. Update code runs `update.sh`. A CLI command group under
-  `crates/wicket-cli/src/cmd/` runs the CLI reference check plus the suites that call its commands.
+  `crates/wicket-cli/src/cmd/` runs the suites that call its commands.
   The exceptions are `run`, `dev`, `secret`, `identity`, `audit` and `image`: nearly every suite calls
   them, so changing one of those groups runs every suite.
 - **Docs only.** A change to Markdown, `docs/`, `experiments/` or `refs/` runs the doc checks only:
-  `check-public.py`, the Markdown links, and, for `docs/reference/cli.md`, the CLI reference check.
+  `check-public.py` and the Markdown links. A change to `docs/reference/cli.md` also runs
+  `wicket-cli`'s tests, one of which checks that page against every command's `--help`.
 - **Everything.** These select every crate and suite:
   - the workspace's `Cargo.toml` or `Cargo.lock`, any crate's `Cargo.toml`, `third_party/`, or the
     toolchain;
@@ -47,7 +48,9 @@ rustfmt, `check-public.py` and the Markdown link check always run.
 ## Tests with cargo-nextest
 
 When `cargo-nextest` is installed, `ci/gates.sh` runs the tests with it (`--profile ci`, in
-`.config/nextest.toml`), then the doctests with `cargo test --doc`, since nextest doesn't run them.
+`.config/nextest.toml`). Then it runs the doctests with `cargo test --doc`, since nextest doesn't run
+them, over the same crates as the tests, so cargo reuses what the tests built. It runs them only when
+a selected crate has a doc-comment code block rustdoc would run, and the workspace has none today.
 A test that fails and then passes on a retry is reported as `FLAKY` in the summary, and never passes
 silently. Without nextest, `cargo test` runs instead. CI installs the version pinned in
 `.github/workflows/ci.yml`, checksum-verified. nextest is a development tool, not a dependency of
