@@ -30,6 +30,12 @@ pub trait Policy: Clone + Debug + Serialize + DeserializeOwned {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread compiled a [`ZoneSpec`] (the replay tests count them, #287).
+    pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Zones as plain specs: the feed's own tests' policy, with no context to compile. Nodes decide
 /// with tokens ([`crate::token::BoxAuthority`]).
 #[cfg(test)]
@@ -42,6 +48,7 @@ impl Policy for ZoneSpec {
     }
 
     fn compile(&self, _: &(), _: &dyn Fn(RevokeKind, &str) -> bool) -> Result<CompiledZone, String> {
+        COMPILES.with(|c| c.set(c.get() + 1));
         CompiledZone::new(self.clone()).map_err(|e| e.to_string())
     }
 }
@@ -61,6 +68,31 @@ impl Zone<ZoneSpec> {
             Err(e) => Verdict::Forbidden(format!("this zone's policy is invalid: {e}")),
         }
     }
+}
+
+/// The compiled form of a zone a replay skipped compiling: a later change in the replay replaces or
+/// drops it before anything can read it.
+const SUPERSEDED: &str = "superseded later in the replay";
+
+/// For a replay of `deltas` in order: for each delta, which of its changes is a `PutZone` that a
+/// later change replaces (another `PutZone` of the same entry) or drops (`DropZone`), so compiling
+/// it can be skipped (#287). A log of runs puts and drops one entry per run: only the entries still
+/// held at its end are compiled.
+pub fn superseded<P: Policy>(deltas: &[Delta<P>]) -> Vec<Vec<bool>> {
+    let mut later: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<Vec<bool>> = deltas.iter().map(|d| vec![false; d.changes.len()]).collect();
+    for (di, d) in deltas.iter().enumerate().rev() {
+        for (ci, c) in d.changes.iter().enumerate().rev() {
+            match c {
+                Change::PutZone { zone } => out[di][ci] = !later.insert(zone.zone_name()),
+                Change::DropZone { name } => {
+                    later.insert(name);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Zone policies, grants, revocations and the epoch and head they are at.
@@ -94,8 +126,21 @@ impl<P: Policy> State<P> {
 
     /// Applies a delta that has been checked, moving to its epoch and `head`.
     pub fn apply(&mut self, d: &Delta<P>, head: String) {
-        for c in &d.changes {
-            self.change(c);
+        self.apply_replaying(d, head, &[]);
+    }
+
+    /// [`State::apply`] for a replay that knows what comes later (#287): the `PutZone`s at the
+    /// indices `superseded` marks (see [`superseded`]) aren't compiled, as a later change in the
+    /// same replay replaces or drops each one, so nothing reads their compiled form. The state
+    /// reached at the end of the replay is the same as with [`State::apply`].
+    pub fn apply_replaying(&mut self, d: &Delta<P>, head: String, superseded: &[bool]) {
+        for (i, c) in d.changes.iter().enumerate() {
+            match c {
+                Change::PutZone { zone } if superseded.get(i).copied().unwrap_or(false) => {
+                    self.zones.insert(zone.zone_name().to_string(), Zone { spec: zone.clone(), compiled: Err(SUPERSEDED.into()) });
+                }
+                c => self.change(c),
+            }
         }
         self.epoch = d.epoch;
         self.head = head;
@@ -203,5 +248,26 @@ impl<P: Policy> State<P> {
             st.change(&Change::AddGrant { grant: g.clone() });
         }
         st
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(changes: Vec<Change<ZoneSpec>>) -> Delta<ZoneSpec> {
+        Delta { feed: "n".into(), version: 1, epoch: 1, prev: GENESIS.into(), issued_at: 0, changes }
+    }
+
+    fn put(name: &str) -> Change<ZoneSpec> {
+        Change::PutZone { zone: serde_json::from_value(serde_json::json!({ "name": name })).unwrap() }
+    }
+
+    #[test]
+    fn a_put_is_superseded_by_a_later_put_or_drop_of_the_same_entry_only() {
+        let drop = |n: &str| Change::DropZone { name: n.into() };
+        let ds =
+            vec![delta(vec![put("a"), put("b"), put("c")]), delta(vec![drop("a"), put("b")]), delta(vec![put("d"), drop("d"), put("e")])];
+        assert_eq!(superseded(&ds), [vec![true, true, false], vec![false, false], vec![true, false, false]]);
     }
 }
