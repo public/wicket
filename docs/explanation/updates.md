@@ -183,8 +183,12 @@ newest that has opened it) and its **floor** (the oldest that may open it) in `s
   contract step. [Update and roll back](../how-to/update-and-roll-back.md#restore-a-ledger-snapshot)
   has the procedure.
 
-The snapshots are local files (`<data dir>/snapshots/<unix time>-<old build id>.db`). The state store
-(#154) streams the ledger itself off the host, but doesn't hold these snapshots yet.
+The snapshots are local files (`<data dir>/snapshots/<unix time>-<old build id>.db`) and, with a
+state store (#154), objects in it too (#167): `ledger-snapshots/<unix time>-<old build id>.db`,
+sealed under `state.key` like hibernated agents' bundles, pruned by the same rule. An update doesn't
+switch until its snapshot is in the store, so the way back past a contract step survives losing the
+control host (a rollback, which must not wait on the store, only warns). A standby restored from the
+kit and the store fetches one with `wicket state snapshot`.
 
 ## Not yet
 
@@ -192,4 +196,3 @@ The snapshots are local files (`<data dir>/snapshots/<unix time>-<old build id>.
   attach` session delays it (it logs that it is waiting).
 - `self update` doesn't install new systemd units or rebuild the agent image: an update that needs
   either says so in its release notes ([update and roll back](../how-to/update-and-roll-back.md)).
-- Ledger snapshots aren't copied to the state store.

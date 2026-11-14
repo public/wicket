@@ -57,6 +57,8 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket state replicate`](#wicket-state-replicate)
   - [`wicket state kit`](#wicket-state-kit)
   - [`wicket state restore`](#wicket-state-restore)
+  - [`wicket state snapshots`](#wicket-state-snapshots)
+  - [`wicket state snapshot`](#wicket-state-snapshot)
 - [`wicket keys`](#wicket-keys)
   - [`wicket keys roots-offline`](#wicket-keys-roots-offline)
   - [`wicket keys certify`](#wicket-keys-certify)
@@ -830,6 +832,8 @@ Commands:
   replicate  Stream the ledger to the state store until stopped (Litestream): a lost control host loses at most `ledger.sync_interval`. Run it as a service beside wicketd
   kit        Write a recovery kit: what a standby needs besides the state store (keys, state.key, nodes' feed keys and pinned host keys, config files, and the vault's secrets). Keep it offline
   restore    Make this fresh host the control host: the kit's files, then the ledger from the state store (as of now, or of --at), audit records the store has beyond it, agents fenced, and each node feed set to start a new generation
+  snapshots  The ledger snapshots `wicket self update` pushed to the state store before each switch (#167): the way back past a contract step after losing the control host
+  snapshot   Fetch one of them (unsealed with state.key) into a new file, to restore as docs/how-to/update-and-roll-back.md says
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -884,6 +888,32 @@ Options:
       --kit <KIT>  
       --at <AT>    Restore the ledger as it was at this time (RFC 3339, UTC), discarding what came after
       --force      Replace a ledger this host already has
+  -h, --help       Print help
+```
+
+### `wicket state snapshots`
+
+```text
+The ledger snapshots `wicket self update` pushed to the state store before each switch (#167): the way back past a contract step after losing the control host
+
+Usage: wicket state snapshots
+
+Options:
+  -h, --help  Print help
+```
+
+### `wicket state snapshot`
+
+```text
+Fetch one of them (unsealed with state.key) into a new file, to restore as docs/how-to/update-and-roll-back.md says
+
+Usage: wicket state snapshot --out <OUT> <NAME>
+
+Arguments:
+  <NAME>  Its name, as `wicket state snapshots` lists it
+
+Options:
+      --out <OUT>  
   -h, --help       Print help
 ```
 

@@ -27,6 +27,8 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 StateCmd::Replicate => state::replicate(),
                 StateCmd::Kit { out, without_secrets, without_roots } => state::kit(&out, !without_secrets, !without_roots),
                 StateCmd::Restore { kit, at, force } => state::restore(&kit, at.as_deref(), force),
+                StateCmd::Snapshots => snapstore::print_list(),
+                StateCmd::Snapshot { name, out } => snapstore::get(&name, &out),
             })
             .join()
             .map_err(|_| anyhow::anyhow!("wicket state panicked"))?
@@ -105,6 +107,17 @@ pub enum StateCmd {
         /// Replace a ledger this host already has.
         #[arg(long)]
         force: bool,
+    },
+    /// The ledger snapshots `wicket self update` pushed to the state store before each switch
+    /// (#167): the way back past a contract step after losing the control host.
+    Snapshots,
+    /// Fetch one of them (unsealed with state.key) into a new file, to restore as
+    /// docs/how-to/update-and-roll-back.md says.
+    Snapshot {
+        /// Its name, as `wicket state snapshots` lists it.
+        name: String,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 

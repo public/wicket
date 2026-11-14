@@ -38,6 +38,7 @@ mod run;
 mod s3;
 mod serve;
 mod settings;
+mod snapstore;
 mod spawn;
 mod state;
 mod statestore;
