@@ -1,0 +1,9 @@
+   Compiling wicket-cli v0.0.1 (/home/claude/work/wicket-build/crates/wicket-cli)
+   Compiling wicket-proxy v0.0.1 (/home/claude/work/wicket-build/crates/wicket-proxy)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 37s
+  Executable unittests src/main.rs (target-loop/debug/deps/wicket-7eb7c1bf43ca0ad3)
+  Executable unittests src/lib.rs (target-loop/debug/deps/wicket_proxy-440169ac7d21df96)
+  Executable tests/h3.rs (target-loop/debug/deps/h3-6c1a582571d43e3a)
+  Executable tests/remote_session.rs (target-loop/debug/deps/remote_session-ec91ef7e32de83f8)
+  Executable tests/splice.rs (target-loop/debug/deps/splice-5a362dc1677b5826)
+  Executable tests/streaming.rs (target-loop/debug/deps/streaming-1cc8c3b52ff6db5a)

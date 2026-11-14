@@ -1,0 +1,10 @@
+   Compiling wicket-core v0.0.1 (/home/claude/work/wicket-build/crates/wicket-core)
+   Compiling wicket-authz v0.0.1 (/home/claude/work/wicket-build/crates/wicket-authz)
+   Compiling wicket-store v0.0.1 (/home/claude/work/wicket-build/crates/wicket-store)
+   Compiling wicket-sandbox v0.0.1 (/home/claude/work/wicket-build/crates/wicket-sandbox)
+   Compiling wicket-agent v0.0.1 (/home/claude/work/wicket-build/crates/wicket-agent)
+   Compiling wicket-feed v0.0.1 (/home/claude/work/wicket-build/crates/wicket-feed)
+   Compiling wicket-policy v0.0.1 (/home/claude/work/wicket-build/crates/wicket-policy)
+   Compiling wicket-proxy v0.0.1 (/home/claude/work/wicket-build/crates/wicket-proxy)
+   Compiling wicket-cli v0.0.1 (/home/claude/work/wicket-build/crates/wicket-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.91s
