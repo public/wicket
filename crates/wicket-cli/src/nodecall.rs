@@ -153,6 +153,12 @@ impl Calls {
         self.out.lock().expect("out").as_ref().is_some_and(|o| o.send(f).is_ok())
     }
 
+    /// Sends a frame on the connection, if it is up.
+    #[cfg(test)]
+    pub fn send_frame(&self, f: Frame) -> bool {
+        self.send(f)
+    }
+
     fn id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::SeqCst) + 1
     }

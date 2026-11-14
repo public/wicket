@@ -266,6 +266,11 @@ sys.exit(2)
 
     /// The control host's end of a connection: frames in go through `calls`.
     fn pump(s: UnixStream, calls: Arc<crate::nodecall::Calls>) {
+        pump_with(s, calls, None)
+    }
+
+    /// As [`pump`], answering the node's secret fetches with `secret` (name, value), if given.
+    fn pump_with(s: UnixStream, calls: Arc<crate::nodecall::Calls>, secret: Option<(String, String)>) {
         let (mut rd, mut wr) = s.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         calls.set_out(Some(tx));
@@ -277,9 +282,26 @@ sys.exit(2)
                 }
             }
         });
+        let out = calls.clone();
         tokio::spawn(async move {
             while let Ok(Some(f)) = chan::read_frame(&mut rd).await {
-                let _ = calls.handle(f);
+                if let Some(Frame::Msg(Msg::SecretFetch { id, name, .. })) = calls.handle(f) {
+                    let m = match &secret {
+                        Some((n, v)) if *n == name => Msg::SecretFetched {
+                            id,
+                            secret: Some(Box::new(crate::nodesecrets::Fetched {
+                                name,
+                                value: v.clone(),
+                                hosts: vec!["127.0.0.1".into()],
+                                not_after: i64::MAX,
+                                upstream_expiry: None,
+                            })),
+                            error: None,
+                        },
+                        _ => Msg::SecretFetched { id, secret: None, error: Some(format!("no secret {name}")) },
+                    };
+                    out.send_frame(Frame::Msg(m));
+                }
             }
         });
     }
@@ -331,6 +353,44 @@ sys.exit(2)
         assert!(k.iter().any(|(k, b)| k == "image.refused" && b["digest"] == other.index.as_str()), "{k:?}");
         // Nothing is left in the spool.
         assert_eq!(std::fs::read_dir(spool(&node.paths.root)).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn a_node_pulls_an_image_from_its_registry_with_a_credential_it_fetches() {
+        let inst = Install::new("nodesrv-images-pull");
+        let store = inst.dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let fake = inst.dir.join("fake-runtime");
+        std::fs::write(&fake, FAKE_RUNTIME).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = test_node(&inst);
+        Arc::get_mut(&mut node).unwrap().docker =
+            Docker::with_command(vec!["env".into(), format!("FAKE_STORE={}", store.display()), fake.display().to_string()]);
+        let calls = Arc::new(crate::nodecall::Calls::default());
+        pump_with(connect(&node, 1, &inst).await, calls.clone(), Some(("reg".into(), "u:p".into())));
+
+        let img = image_with(b"a pulled layer");
+        let blobs: HashMap<String, Vec<u8>> =
+            img.entries.iter().filter(|(p, _)| p.starts_with("blobs/sha256/")).map(|(p, b)| (format!("sha256:{}", &p[13..]), b.clone())).collect();
+        let reg = crate::registry::testkit::serve("team/agent", blobs, Some("u:p")).await;
+        let src = crate::registry::Source {
+            host: reg.addr.to_string(),
+            repository: "team/agent".into(),
+            secret: Some("reg".into()),
+            ..Default::default()
+        };
+        let name = crate::oci::import_name(&format!("{}/team/agent:1", reg.addr), &img.index).unwrap();
+        calls.pull_image("run_a", &img.index, Some(&name), &src).await.unwrap();
+        assert!(calls.has_image(&img.index).await.unwrap());
+        assert!(node.docker.image_identity(&name).await.unwrap().unwrap().is(&img.index));
+        // Without the credential, the registry's token service refuses.
+        let other = image_with(b"another pulled layer");
+        let src = crate::registry::Source { secret: Some("missing".into()), ..src };
+        let e = calls.pull_image("run_a", &other.index, None, &src).await.unwrap_err();
+        assert!(format!("{e:#}").contains("refused by the control host"), "{e:#}");
+        let k = kinds(&node);
+        assert!(k.iter().any(|(k, b)| k == "image.received" && b["via"] == "registry"), "{k:?}");
+        assert!(k.iter().any(|(k, b)| k == "image.refused" && b["via"] == "registry"), "{k:?}");
     }
 
     /// Removes a test's own image from the real runtime, whatever the test did.
