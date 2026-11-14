@@ -4,8 +4,8 @@
 //! - A push's ref discovery and its upload are one request: the push asks once, and both requests
 //!   (and a retry) pass on one approval.
 //! - That approval covers the push for a short window, which ends: then the push is asked about again.
-//! - A push to a protected ref (a zone forbid on its ref path, or a ref the forge never accepts) is
-//!   refused before anything is asked, granted or sent.
+//! - The request bodies aren't read or judged: which refs a push may update is the forge's to enforce
+//!   (a scoped token, branch rules); the body goes upstream byte for byte.
 //! - A fetch is unaffected: still reads, allowed by reach, never asked about (#179).
 
 use bytes::Bytes;
@@ -36,15 +36,12 @@ fn tmpdir() -> PathBuf {
     d
 }
 
-/// Fetches of acme/app are in reach; `main` is protected by a forbid on its ref path.
+/// Fetches of acme/app are in reach; pushes are not.
 fn zone() -> ZoneSpec {
     serde_json::from_value(serde_json::json!({
         "name": "pushzone",
         "reach": [
             {"host": "github.com", "methods": ["GET", "POST"], "paths": ["/acme/app.git/info/refs", "/acme/app.git/git-upload-pack"]}
-        ],
-        "forbid": [
-            {"host": "github.com", "paths": ["/acme/app.git/git-receive-pack/refs/heads/main"]}
         ]
     }))
     .unwrap()
@@ -233,10 +230,10 @@ async fn a_push_asks_once_and_both_requests_pass_on_one_approval() {
     assert_eq!(p[0].risk, "R4ExecOrPrivilege");
     assert!(p[0].reason.starts_with("git push to github.com/acme/app.git"), "{}", p[0].reason);
     assert!(body.contains(&rid), "{body}");
-    // The upload, unapproved, is the same request (and names its refs on the agent's answer).
+    // The upload, unapproved, is the same request.
     let (st, body) = w.upload(REPO, &["refs/heads/feat"]).await;
     assert_eq!(st, 403, "{body}");
-    assert!(body.contains(&rid) && body.contains("refs/heads/feat"), "{body}");
+    assert!(body.contains(&rid), "{body}");
     assert_eq!(w.pending().len(), 1, "asked once");
     assert!(w.origin_saw().is_empty());
 
@@ -281,43 +278,6 @@ async fn the_push_window_expires() {
     assert_ne!(p[0].id, rid);
     assert_eq!(w.upload(REPO, &["refs/heads/feat"]).await.0, 403);
     assert_eq!(w.origin_saw().len(), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_protected_ref_is_refused_before_it_is_asked_about() {
-    let w = World::new().await;
-    for (repo, refs, says) in [
-        (REPO, vec!["refs/heads/main"], "protected ref refs/heads/main"),
-        // One protected ref among others refuses the push.
-        (REPO, vec!["refs/heads/feat", "refs/heads/main"], "protected ref refs/heads/main"),
-        // The other spelling of the repository is the same repository.
-        ("/acme/app", vec!["refs/heads/main"], "protected ref refs/heads/main"),
-        // Ref names are matched as forbids are, ignoring case.
-        (REPO, vec!["refs/heads/MAIN"], "protected ref refs/heads/MAIN"),
-        // The forge's own rule: GitHub's pull request refs are read-only.
-        (REPO, vec!["refs/pull/7/head"], "read-only"),
-        // A ref name git wouldn't accept can't be spelled around a forbid.
-        (REPO, vec!["refs/heads/x/../main"], "not a valid ref name"),
-    ] {
-        let (st, body) = w.upload(repo, &refs).await;
-        assert_eq!(st, 403, "{refs:?}: {body}");
-        assert!(body.contains("never allowed") || body.contains("never be allowed"), "{refs:?}: {body}");
-        assert!(body.contains(says), "{refs:?}: {body}");
-        assert!(w.pending().is_empty(), "{refs:?}: nothing asked");
-    }
-    // Unreadable commands are refused, not guessed at.
-    let (st, body) = w.send("POST", "/acme/app.git/git-receive-pack", b"not pkt-lines").await;
-    assert_eq!(st, 403, "{body}");
-    assert!(body.contains("can't be read"), "{body}");
-    // Even with the push approved, the protected ref stays refused; other refs go.
-    assert_eq!(w.discover(REPO).await.0, 403);
-    let rid = w.pending()[0].id.clone();
-    w.approve(&rid, Duration::from_secs(3600));
-    let (st, body) = w.upload(REPO, &["refs/heads/main"]).await;
-    assert_eq!(st, 403, "{body}");
-    assert!(body.contains("protected ref refs/heads/main"), "{body}");
-    assert_eq!(w.upload(REPO, &["refs/heads/feat"]).await.0, 200);
-    assert_eq!(w.origin_saw(), [("POST".to_string(), "/acme/app.git/git-receive-pack".to_string())], "only the allowed push went out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

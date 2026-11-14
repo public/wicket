@@ -77,44 +77,26 @@ fn oracle1_single_block_equals_compiled_zone() {
     assert!(kinds.iter().all(|&k| k > 1000), "too few of some kind: {kinds:?}");
 }
 
-/// #26: a push is decided as one op, and its refs as ref paths checked against forbid rules. The
-/// token decides both as the zone does (oracle 1 on a zone protecting refs), so a node refuses a
-/// protected ref from the token exactly where the control host refuses it from the zone.
+/// #26: both requests of a push are decided as one op, the push of its repository; the box's
+/// token decides it as the zone does, so a node asks about it exactly where the control host would.
 #[test]
-fn push_ops_and_protected_refs_decide_as_the_zone() {
+fn push_ops_decide_as_the_zone() {
     let keys = Keys::new(0);
-    let yaml = "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: pushes\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n    - { host: github.com, methods: [POST], paths: [\"/acme/tools.git/git-receive-pack\"], allow_dangerous: true }\n  forbid:\n    - { host: github.com, paths: [\"/acme/app.git/git-receive-pack/refs/heads/main\", \"/**/git-receive-pack/refs/tags/**\"] }\n";
+    let yaml = "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: pushes\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n    - { host: github.com, methods: [POST], paths: [\"/acme/tools.git/git-receive-pack\"], allow_dangerous: true }\n";
     let z = wicket_core::Manifest::from_yaml(yaml).unwrap().zone;
     let mut seen = Oracle1::default();
     oracle1_zone(&z, &keys, &mut seen);
     let c = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
     let l = load_ok(&mint(&keys.root, TENANT, "trigger:t", &c).unwrap(), &keys);
     let cz = CompiledZone::new(z.clone()).unwrap();
-    let mut checked = 0;
     for repo in ["/acme/app.git", "/acme/app", "/ACME/App.git", "/acme/tools.git", "/other/x.git"] {
         let push = op("pushes", "POST", "github.com", &wicket_core::git::push_op_path(repo));
         let want = kind_of_verdict(&cz.evaluate(&push));
         assert_eq!(kind_of(&decide_compiled(&l, &http_request("b0", &push))), want, "push {repo}");
-        for name in ["refs/heads/main", "refs/heads/MAIN", "refs/heads/feat", "refs/tags/v1", "refs/tags/a/b"] {
-            // The proxy refuses a ref if any of its ref paths is forbidden.
-            let mut refused = false;
-            for path in wicket_core::git::ref_paths(repo, name) {
-                let o = op("pushes", "POST", "github.com", &path);
-                let want = kind_of_verdict(&cz.evaluate(&o));
-                assert_eq!(kind_of(&decide_compiled(&l, &http_request("b0", &o))), want, "{path}");
-                refused |= want == 1;
-                checked += 1;
-            }
-            let protected = (repo.eq_ignore_ascii_case("/acme/app.git") || repo == "/acme/app")
-                && name.eq_ignore_ascii_case("refs/heads/main")
-                || name.starts_with("refs/tags/");
-            assert_eq!(refused, protected, "{repo} {name}");
-        }
     }
     // The push of a repository the zone allows pushing to is allowed by reach; others need a grant.
     let push = |r: &str| kind_of_verdict(&cz.evaluate(&op("pushes", "POST", "github.com", &wicket_core::git::push_op_path(r))));
     assert_eq!((push("/acme/tools.git"), push("/acme/app.git")), (0, 2));
-    assert!(checked >= 40, "{checked}");
 }
 
 /// #183: the remote-control-box zone as first written (5 reach rules, 9 globs on api.anthropic.com;

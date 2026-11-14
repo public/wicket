@@ -50,11 +50,6 @@ pub trait Decider: Send + Sync {
     fn host_verdict(&self, ctx: &RunCtx, host: &str) -> HostVerdict;
     /// The outcome for one request.
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome>;
-    /// Why `op` is never allowed, if it is: what [`Decider::decide`] would answer `Forbidden`, found
-    /// without asking anyone, raising a request or spending a grant. A push's ref paths are put
-    /// through this before the push is decided (#26): a protected ref is refused before it is asked
-    /// about. None for anything else, including what can't be decided right now.
-    fn refuses(&self, ctx: &RunCtx, op: &Op) -> Option<String>;
     /// The reach rule that allows `host` wholesale, if connections to it may be spliced through
     /// without inspection (#62): every request to it would be allowed, with no credential. None
     /// (the default) means every request is decided on its own.
@@ -81,16 +76,6 @@ impl Decider for Central {
 
     fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome> {
         Box::pin(async move { central(ctx, op, who) })
-    }
-
-    fn refuses(&self, ctx: &RunCtx, op: &Op) -> Option<String> {
-        if let Some(why) = ctx.org.as_ref().and_then(|o| o.refuses_http(&op.host, &op.method, &op.path, op.risk.rank())) {
-            return Some(why);
-        }
-        match ctx.zone.evaluate(op) {
-            Verdict::Forbidden(why) => Some(why),
-            _ => None,
-        }
     }
 
     /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
@@ -238,15 +223,6 @@ impl Decider for NodeDecider {
                 },
             }
         })
-    }
-
-    /// From the box's token, as `decide` reads it, without recording a grant use ([`Replica::peek`]).
-    fn refuses(&self, _ctx: &RunCtx, op: &Op) -> Option<String> {
-        let now = (self.clock)();
-        match self.replica.lock().expect("replica").peek(op, now) {
-            Decision::Forbidden(why) => Some(why),
-            _ => None,
-        }
     }
 
     fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
@@ -566,10 +542,9 @@ mod tests {
     }
 
     /// #26 at the edge: on a node, from the box's token, a push is one op (its discovery and upload
-    /// share one grant, which covers them until the window ends on the node's clock), and a
-    /// protected ref's path is refused by the token as the zone refuses it, without asking.
+    /// share one grant, which covers them until the window ends on the node's clock).
     #[tokio::test]
-    async fn on_a_node_a_push_is_one_op_with_a_window_and_protected_refs_are_refused_from_the_token() {
+    async fn on_a_node_a_push_is_one_op_with_a_window() {
         let (mut p, replica, dir, authz_root) = feed();
         let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
         let now = Arc::new(AtomicI64::new(1_000_000));
@@ -580,7 +555,7 @@ mod tests {
         let link = Arc::new(Link { up: AtomicBool::new(true), asks: AtomicI64::new(0) });
         let d = NodeDecider { replica: replica.clone(), clock, control: link.clone() };
         let z = Manifest::from_yaml(
-            "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: z\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n  forbid:\n    - { host: github.com, paths: [\"/**/git-receive-pack/refs/heads/main\"] }\n",
+            "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: z\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n",
         )
         .unwrap()
         .zone;
@@ -602,15 +577,6 @@ mod tests {
         assert!(
             matches!(d.decide(&c, &push, None).await, Outcome::Pending { why, .. } if why.starts_with("git push to github.com/acme/app.git"))
         );
-        // Protected refs: refused by the token and by the zone alike; other refs aren't refused.
-        for (name, refused) in [("refs/heads/main", true), ("refs/heads/MAIN", true), ("refs/heads/feat", false)] {
-            for path in wicket_core::git::ref_paths("/acme/app", name) {
-                let o = Op::egress(&tenant, &run, "z", "POST", "github.com", &path);
-                assert_eq!(d.refuses(&c, &o).is_some(), refused, "node {path}");
-                assert_eq!(Central.refuses(&c, &o).is_some(), refused, "zone {path}");
-            }
-        }
-        assert_eq!(link.asks.load(Ordering::SeqCst), 1, "refusing a ref asked nothing");
         // A push grant, as the ledger makes it: no use count, until the window ends.
         let t1 = t0 + 1_000;
         now.store(t1, Ordering::SeqCst);
@@ -632,8 +598,6 @@ mod tests {
         for _ in 0..3 {
             assert!(matches!(d.decide(&c, &push, None).await, Outcome::Allow(t) if t.contains("g-push")));
         }
-        let main = Op::egress(&tenant, &run, "z", "POST", "github.com", "/acme/app.git/git-receive-pack/refs/heads/main");
-        assert!(d.refuses(&c, &main).is_some(), "no grant lifts a protected ref");
         // Past the window, on the node's clock: asked about again.
         now.store(i64::try_from(until + 1).unwrap() * 1000, Ordering::SeqCst);
         replica.lock().unwrap().accept(&p.statement(now.load(Ordering::SeqCst)), now.load(Ordering::SeqCst)).unwrap();

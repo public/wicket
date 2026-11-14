@@ -1460,9 +1460,8 @@ Detail: [04 §7].
 - **Pinned/mTLS clients** get SNI-only tunnels, with no inspection and no credentials. Each such tunnel
   appears in the zone view as an unmediated channel.
 - **Git:** smart HTTP only; SSH is denied. A push (its ref discovery and its receive-pack) is one
-  request and one approval, for a short window (#26). Branch and tag rules come from the receive-pack
-  command list: forbid rules on a ref's path (`{repo}/git-receive-pack/{ref}`) refuse it before it is
-  asked about.
+  request and one approval, for a short window (#26). Which refs it may update is left to the forge:
+  a token scoped to the task's repositories, and the forge's own branch and tag rules.
   Path rules (`.github/workflows/**`) need **store-and-forward**: receive the push into a quarantined local
   mirror, check the diff with the adapter rules, then push upstream with expected old OIDs. `gix` for the
   mirror.
