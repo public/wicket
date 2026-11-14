@@ -906,6 +906,7 @@ mod tests {
             swaps: vec![],
             boxes: None,
             capacity: None,
+            decisions: None,
             fence,
             waker: None,
             lifecycle: None,

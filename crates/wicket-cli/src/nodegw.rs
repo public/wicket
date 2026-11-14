@@ -655,6 +655,10 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
         Err(e) => return (format!("not requested: ambiguous path ({e})"), true),
     };
     let Some((tenant, zone)) = node.tenant_zone(run) else { return ("no authority for this box on its node".into(), true) };
+    // A zone that may not ask (#50), from the zone its token was minted from.
+    if node.replica.lock().expect("replica").zone_of(run).is_some_and(|z| !z.escalation.request) {
+        return (format!("not requested: {}.", wicket_proxy::NEVER_ASKS), false);
+    }
     let verdict = node.replica.lock().expect("replica").host_verdict(run, &host);
     match verdict {
         wicket_core::HostVerdict::Forbidden(why) => {

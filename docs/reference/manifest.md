@@ -122,6 +122,7 @@ A program's zone has no model: a `zone.llm` section is an error.
 | `volumes` | list of [volumes](#volumes) | `[]` | Named directories that persist between runs of the zone. |
 | `images` | list of strings | `[]` | Images boxes in this zone may start children from with `spawn`, besides their own: by tag, or [pinned by digest](#image-pins). |
 | `accept_from` | list of zone names | `[]` | Zones whose agents may message agents in this zone, and connect to its exposed ports, besides parent and children. Senders are identified by wicket, never by their own claim. |
+| `escalation` | `{ request, grant }` | `{ request: true, grant: true }` | Who in this zone may escalate ([#50](https://github.com/public/wicket/issues/50)). `request: false`: anything outside the zone's reach is "never allowed" instead of a pending request (`request_access`, `spawn` with `ask_human`, `request_capacity` and `request_update` ask nobody). `grant: false`: the zone's agents can't [`decide`](mcp-tools.md#decide) their descendants' requests. A spawned zone keeps its parent's unless it narrows them, and can't be given one the parent lacks. |
 | `limits` | [limits](#limits) | see below | Resources, time and output. |
 
 ### `reach`
