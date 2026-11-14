@@ -234,6 +234,7 @@ offline_flow() {
     '[ -n "$kid" ] && grep -q "within your own" "$elog" && [ -n "$(box_of "$kid")" ] && grep -q "\"run\":\"$kid\".*\"box_path\":\"$r/$kid\"" "$nd/runs/$kid/derived.json"'
   sleep 80
   log "restarting acc-n1's serve while cut off: its secret cache goes with it"
+  local old_serve=$node_serve_pid
   kill "$node_serve_pid" 2>/dev/null || true
   wait "$node_serve_pid" 2>/dev/null || true
   HOME=$nodehome "$nodehome/.local/bin/wicket" node serve >>"$work/node-serve.log" 2>&1 &
@@ -250,6 +251,12 @@ offline_flow() {
   mv "$nd/ctl/ctl.sock.off" "$nd/ctl/ctl.sock"
   log "restored after $(( (t_restore - t_cut) / 1000 )) s"
   span() { awk -v a="$1" -v b="$2" -v k="$3" '$1>=a && $1<b && $0 ~ k' "$olog" | wc -l; }
+  # So a failure of the checks below explains itself (#236): what the box's model calls got after the
+  # restart, and whether the serve that answered them is the new one.
+  echo "   serve pid $old_serve → $node_serve_pid (old one $(kill -0 "$old_serve" 2>/dev/null && echo "STILL RUNNING" || echo gone));" \
+    "after the restart the box's model calls got: $(awk -v a=$((t_rs + 5000)) -v b="$t_restore" '$1>=a && $1<b' "$olog" \
+      | grep -o 'model=[^ ]*' | sort | uniq -c | awk '{printf "%s×%s ", $1, $2}')"
+  [ "${ACC_KEEP:-}" = 1 ] && cp "$olog" "$work/offline-box-cut.log" 2>/dev/null
   echo "   before the restart: $(span "$t_cut" "$t_rs" model=200:) model calls ok, $(span "$t_cut" "$t_rs" ' write=') lines;" \
     "after it: $(span $((t_rs + 5000)) "$t_restore" model=503:credential) refused for want of the credential, $(span $((t_rs + 5000)) "$t_restore" 'write=') lines"
   check "  cut off, the box kept calling the model and writing (until the restart)" \
