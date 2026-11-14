@@ -466,8 +466,8 @@ impl Gateway {
             return ("this run's supervisor is gone".into(), true);
         }
         let text = match w {
-            crate::Want::Finish => "wicket ends your session at the end of this turn: your harness exits, and the run ends. Messages sent to you from now on are not delivered to this run.",
-            crate::Want::Hibernate => "wicket hibernates you at the end of this turn, once nothing but you runs in your box: your box stops and its state is kept. A message to you (or your operator) wakes you, with that message as your next turn. If something else still runs, you go on running and are told nothing more.",
+            crate::Want::Finish => "wicket ends your session at the end of this turn: your harness exits, and the run ends. Whatever still runs in your box once your harness has had a grace period to exit (the zone's limits.exit_grace, 30 s by default) is stopped. Messages sent to you from now on are not delivered to this run.",
+            crate::Want::Hibernate => "wicket hibernates you at the end of this turn, once nothing but you runs in your box: your box stops and its state is kept. A message to you (or your operator) wakes you, with that message as your next turn. If something else still runs, wicket waits the zone's limits.exit_grace (30 s by default) for it to end, then stops it and hibernates you: a wake restores files, not processes.",
         };
         (text.into(), false)
     }

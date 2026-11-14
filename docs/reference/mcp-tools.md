@@ -242,7 +242,10 @@ Closes a link the caller opened or is an end of. Live connections over it are dr
 ## `finish`
 
 Ends the agent's session (#249): at the end of the current turn wicket closes the harness's input,
-the harness exits and the run ends. wicket never does this by itself: until the agent calls `finish`
+the harness exits and the run ends. A harness that hasn't exited by the zone's `limits.exit_grace`
+(30 s by default) after its session closed (a background process of its keeps it waiting, say) has
+its box stopped: the workspace is synced back, and the run is recorded as succeeded, with a note
+naming the processes wicket stopped (#293). wicket never ends a session by itself: until the agent calls `finish`
 or exits, its session stays open for follow-ups (`wicket say`) and messages, up to the zone's
 `limits.timeout` or the end of its authority. No arguments. Relayed to the control host on a node.
 
@@ -251,7 +254,9 @@ or exits, its session stays open for follow-ups (`wicket say`) and messages, up 
 Asks to be hibernated at the end of the current turn, once nothing but the agent runs in its box:
 the box stops and its state is kept (workspace, `$HOME`, `/tmp`, durable volumes), and a message to
 the agent or its operator's `wicket say` wakes it, with that as its next turn. If something else
-still runs, the agent goes on running (the reason is in `wicket agents`). Only for a long-lived agent
+still runs, it gets the zone's `limits.exit_grace` (30 s by default) to end; then wicket stops it and
+hibernates the agent, naming what it stopped in `wicket agents` (a wake restores files, not
+processes). Only for a long-lived agent
 wicket started itself: a wrapped or remote session is refused. No arguments. See
 [hibernate and wake](agents.md#hibernate-and-wake).
 

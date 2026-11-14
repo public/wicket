@@ -44,8 +44,9 @@ wicket hibernate run_…            # or the agent's id; --wait SECONDS for the 
 ```
 
 It hibernates at its next quiet point: its turn has ended and nothing but the agent runs in its box.
-A box still running something else (a background build, a dev server) goes on running instead, since
-a rebuild restores files, not processes. The agent can ask for the same itself, with wicket's
+In a box still running something else (a background build, a dev server), that gets the zone's
+`limits.exit_grace` (30 s by default) to end; then wicket stops it and hibernates the agent, naming
+what it stopped in `wicket agents`, since a rebuild restores files, not processes. The agent can ask for the same itself, with wicket's
 `hibernate` tool.
 
 ## Wake it

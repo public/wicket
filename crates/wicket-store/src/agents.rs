@@ -257,12 +257,13 @@ impl Ledger {
     }
 
     /// The commit point of a push: moves the head to the new state manifest, in one statement that
+    /// keeps the note set when hibernation began (why it hibernated, e.g. what wicket stopped), and
     /// checks both the pusher's generation and the head it started from. A stale pusher (a twin, or
     /// a holder that lost its lease) gets false and leaves only orphan objects behind.
     pub fn commit_agent_push(&self, id: &str, generation: i64, from_seq: i64, seq: i64, head: &str, bytes: i64) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE agents SET head = ?5, head_seq = ?4, bundle_bytes = ?6, state = 'hibernated', lease_until = NULL, want = NULL, \
-             note = NULL, updated_at = ?7 WHERE id = ?1 AND generation = ?2 AND head_seq = ?3",
+             updated_at = ?7 WHERE id = ?1 AND generation = ?2 AND head_seq = ?3",
             params![id, generation, from_seq, seq, head, bytes, now()],
         )?;
         Ok(n == 1)
