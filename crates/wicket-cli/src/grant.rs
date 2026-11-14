@@ -174,7 +174,8 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
         let by = Granter::Human("alice@cli".into());
-        let Decided::Approved { grant, lease, .. } = decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap()
+        let Decided::Approved { grant, lease, .. } =
+            decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap()
         else {
             panic!("not approved")
         };
