@@ -599,7 +599,9 @@ mod tests {
         let fetch = Op::egress(&tenant, &run, "z", "POST", "github.com", "/acme/app.git/git-upload-pack");
         // A fetch is a read the token allows; the push is asked about, worded as a push.
         assert!(matches!(d.decide(&c, &fetch, None).await, Outcome::Allow(_)));
-        assert!(matches!(d.decide(&c, &push, None).await, Outcome::Pending { why, .. } if why.starts_with("git push to github.com/acme/app.git")));
+        assert!(
+            matches!(d.decide(&c, &push, None).await, Outcome::Pending { why, .. } if why.starts_with("git push to github.com/acme/app.git"))
+        );
         // Protected refs: refused by the token and by the zone alike; other refs aren't refused.
         for (name, refused) in [("refs/heads/main", true), ("refs/heads/MAIN", true), ("refs/heads/feat", false)] {
             for path in wicket_core::git::ref_paths("/acme/app", name) {

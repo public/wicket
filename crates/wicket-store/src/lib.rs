@@ -1985,11 +1985,14 @@ mod tests {
         let mut l = Ledger::open_in_memory().unwrap();
         let o = op("/o/r.git/git-receive-pack");
         let (id, _) = l.pending_for(&o, "push", None).unwrap();
-        let gid =
-            l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(3600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let gid = l
+            .approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(3600), path_prefix: None, decided_by: "owner".into() })
+            .unwrap();
         let (uses, expires, created): (Option<i64>, i64, i64) = l
             .conn
-            .query_row("SELECT uses_left, expires_at, created_at FROM grants WHERE id = ?1", params![gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row("SELECT uses_left, expires_at, created_at FROM grants WHERE id = ?1", params![gid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
         assert_eq!(uses, None, "not counted");
         assert_eq!(expires - created, wicket_core::git::PUSH_WINDOW_SECS as i64, "the window, not the hour asked for");
@@ -1999,7 +2002,9 @@ mod tests {
         }
         // A shorter ttl than the window is kept.
         let (id2, _) = l.pending_for(&op("/o/s.git/git-receive-pack"), "push", None).unwrap();
-        let g2 = l.approve(&id2, &Approval { uses: Some(1), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        let g2 = l
+            .approve(&id2, &Approval { uses: Some(1), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "owner".into() })
+            .unwrap();
         let e2: i64 = l.conn.query_row("SELECT expires_at - created_at FROM grants WHERE id = ?1", params![g2], |r| r.get(0)).unwrap();
         assert_eq!(e2, 60);
         // The window passes: nothing covers the push, and it is asked about again (a new request).

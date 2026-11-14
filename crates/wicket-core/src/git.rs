@@ -257,7 +257,14 @@ mod tests {
         s.extend(b"0000");
         assert_eq!(commands(&s).unwrap().unwrap().len(), 1);
         let mut cert = pkt("push-cert\0report-status\n");
-        for l in ["certificate version 0.1\n", "pusher x 1 +0000\n", "\n", &format!("{A} {B} refs/heads/y\n"), "-----BEGIN PGP SIGNATURE-----\n", "push-cert-end\n"] {
+        for l in [
+            "certificate version 0.1\n",
+            "pusher x 1 +0000\n",
+            "\n",
+            &format!("{A} {B} refs/heads/y\n"),
+            "-----BEGIN PGP SIGNATURE-----\n",
+            "push-cert-end\n",
+        ] {
             cert.extend(pkt(l));
         }
         cert.extend(b"0000");

@@ -29,7 +29,8 @@ const NEW: &str = "2222222222222222222222222222222222222222";
 
 fn tmpdir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("gitpush-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let d =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("gitpush-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -324,11 +325,13 @@ async fn a_fetch_is_unaffected() {
     let w = World::new().await;
     let (st, body) = w.send("GET", "/acme/app.git/info/refs?service=git-upload-pack", b"").await;
     assert_eq!((st, body.as_str()), (200, "origin got 0"));
-    let (st, _) = w.send("POST", "/acme/app.git/git-upload-pack", b"0032want 1111111111111111111111111111111111111111\n00000009done\n").await;
+    let (st, _) =
+        w.send("POST", "/acme/app.git/git-upload-pack", b"0032want 1111111111111111111111111111111111111111\n00000009done\n").await;
     assert_eq!(st, 200);
     assert!(w.pending().is_empty(), "a fetch is never asked about");
     // Still a read (#179), and not a push.
-    let op = |m: &str, p: &str, q: &str| wicket_core::Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", m, "github.com", p, q);
+    let op =
+        |m: &str, p: &str, q: &str| wicket_core::Op::egress_with_query(&TenantId::single(), &RunId("r".into()), "z", m, "github.com", p, q);
     assert_eq!(op("POST", "/acme/app.git/git-upload-pack", "").risk, wicket_core::RiskClass::R1ReadScoped);
     assert_eq!(op("GET", "/acme/app.git/info/refs", "service=git-upload-pack").risk, wicket_core::RiskClass::R1ReadScoped);
     assert_eq!(wicket_core::git::push_repo("GET", "/acme/app.git/info/refs", "service=git-upload-pack"), None);

@@ -130,6 +130,28 @@ inspected: see [performance](../explanation/performance.md#splice-through-for-ho
 | `host` | string | required | As in `reach`. |
 | `paths` | list of globs | `["/**"]` | As in `reach`, but matched ignoring ASCII case, since many upstreams fold case. `/**` forbids the whole host, which then can't be connected to at all. A glob that doesn't compile forbids everything on the host. |
 
+#### Protected git refs
+
+A git push over smart HTTP is decided as one request, the push of its repository
+(`POST {repo}/git-receive-pack`): its ref discovery (`GET {repo}/info/refs?service=git-receive-pack`)
+and its upload share one pending request, and one approval covers both, with git's retries, for
+5 minutes (whatever uses the approver picked). Fetches are reads, as before.
+
+The refs a push updates are read from its receive-pack commands, and each is checked before the push
+is decided or asked about, as the **ref path** `{repo}/git-receive-pack/{ref}`. A forbid rule on a
+ref path protects that ref: a push updating it is refused outright, and no approval lifts that.
+
+```yaml
+forbid:
+  - { host: github.com, paths: ["/acme/app.git/git-receive-pack/refs/heads/main"] }
+  - { host: github.com, paths: ["/**/git-receive-pack/refs/tags/**"] }  # tags of every repository
+```
+
+A ref is checked as both spellings of its repository (`/acme/app.git/…` and `/acme/app/…`), and like
+every forbid, ignoring ASCII case. Also refused before anything is asked: a ref name git wouldn't accept,
+GitHub's read-only pull request refs (`refs/pull/…`), and a push whose commands can't be read
+(content-encoded, or not pkt-lines).
+
 ### `inject`
 
 | field | type | default | meaning |

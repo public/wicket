@@ -96,15 +96,19 @@ fn push_ops_and_protected_refs_decide_as_the_zone() {
         let want = kind_of_verdict(&cz.evaluate(&push));
         assert_eq!(kind_of(&decide_compiled(&l, &http_request("b0", &push))), want, "push {repo}");
         for name in ["refs/heads/main", "refs/heads/MAIN", "refs/heads/feat", "refs/tags/v1", "refs/tags/a/b"] {
+            // The proxy refuses a ref if any of its ref paths is forbidden.
+            let mut refused = false;
             for path in wicket_core::git::ref_paths(repo, name) {
                 let o = op("pushes", "POST", "github.com", &path);
                 let want = kind_of_verdict(&cz.evaluate(&o));
                 assert_eq!(kind_of(&decide_compiled(&l, &http_request("b0", &o))), want, "{path}");
-                let protected = (repo.eq_ignore_ascii_case("/acme/app.git") || repo == "/acme/app") && name.eq_ignore_ascii_case("refs/heads/main")
-                    || name.starts_with("refs/tags/");
-                assert_eq!(want == 1, protected, "{path}: {:?}", cz.evaluate(&o));
+                refused |= want == 1;
                 checked += 1;
             }
+            let protected = (repo.eq_ignore_ascii_case("/acme/app.git") || repo == "/acme/app")
+                && name.eq_ignore_ascii_case("refs/heads/main")
+                || name.starts_with("refs/tags/");
+            assert_eq!(refused, protected, "{repo} {name}");
         }
     }
     // The push of a repository the zone allows pushing to is allowed by reach; others need a grant.
