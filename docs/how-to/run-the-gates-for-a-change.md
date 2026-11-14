@@ -10,6 +10,14 @@ ci/gates.sh                       # everything
 ci/gates.sh --suites "smoke hibernate"   # these end-to-end suites
 ```
 
+`GATES_SLOT` is a command to run each heavy step through: cargo builds and tests, and the end-to-end
+suites. The light checks run directly. On a shared host, give it the slot command, so a docs-only
+change never waits for a slot:
+
+```sh
+GATES_SLOT="boxslot run --name <session> --mem 4500M -- timeout 3600" ci/gates.sh --affected
+```
+
 `--affected` looks at the change since the merge base with `origin/main` (`--base REF` for another),
 including uncommitted and untracked files, so you can run it before a commit. The script prints what
 it selected and why, file by file. To see the selection without running anything:

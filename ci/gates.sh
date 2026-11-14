@@ -18,8 +18,9 @@
 # target/debug/wicket; they need what each script says (Docker with runsc, the agent image, sudo).
 # Pass WICKET_DOCKER, IMAGE and the like through the environment as for the scripts themselves.
 #
-# Sessions on the shared build host wrap it as they wrap any check:
-#   boxslot run --name <session> -- timeout 3600 ci/gates.sh --affected
+# Sessions on the shared build host give it their slot command, so only the heavy steps take a slot
+# (a docs-only change then never waits for one):
+#   GATES_SLOT="boxslot run --name <session> --mem 4500M -- timeout 3600" ci/gates.sh --affected
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
@@ -45,6 +46,12 @@ step() {
   local t0=$SECONDS
   if "$@"; then ran+=("ok   $name ($((SECONDS - t0)) s)"); else ran+=("FAIL $name ($((SECONDS - t0)) s)"); failed+=("$name"); fi
 }
+# A heavy step (a cargo build or test, an end-to-end suite): through $GATES_SLOT when it is set, so
+# the light checks don't wait for a slot. On the shared development host:
+#   GATES_SLOT="boxslot run --name <session> --mem 4500M -- timeout 3600" ci/gates.sh --affected
+# Without it, every step runs directly (wrap the whole script as before).
+read -r -a slot <<<"${GATES_SLOT:-}"
+hstep() { local name=$1; shift; step "$name" "${slot[@]}" "$@"; }
 
 if [ "$affected" = 1 ]; then
   sel=$(python3 ci/affected.py --base "$base" --worktree)
@@ -77,22 +84,21 @@ fi
 
 # ---- Rust ----
 if [ "$rust" = 1 ] && [ ${#pkgs[@]} -gt 0 ]; then
-  step "clippy (${crates})" cargo clippy "${pkgs[@]}" --all-targets --locked -- -D warnings
+  hstep "clippy (${crates})" cargo clippy "${pkgs[@]}" --all-targets --locked -- -D warnings
   if cargo nextest --version >/dev/null 2>&1; then
-    step "tests (${crates}, nextest)" cargo nextest run "${pkgs[@]}" --locked --profile ci
+    hstep "tests (${crates}, nextest)" cargo nextest run "${pkgs[@]}" --locked --profile ci
     # nextest doesn't run doctests. They run over the tests' own crates (ci/affected.py), so cargo
     # resolves the same features and reuses what the tests built.
-    if [ ${#doc_pkgs[@]} -gt 0 ]; then step "doctests (${doc_crates})" cargo test "${doc_pkgs[@]}" --locked --doc; fi
+    if [ ${#doc_pkgs[@]} -gt 0 ]; then hstep "doctests (${doc_crates})" cargo test "${doc_pkgs[@]}" --locked --doc; fi
   else
-    step "tests (${crates})" cargo test "${pkgs[@]}" --locked
+    hstep "tests (${crates})" cargo test "${pkgs[@]}" --locked
   fi
 fi
 
 # ---- end to end ----
-build() { cargo build -p wicket-cli --locked; }
 export WICKET=${WICKET:-target/debug/wicket}
 if has policy && [ "$rust" = 1 ]; then
-  step "SymCC policy diffs" ci/policy-diff.sh "$base"
+  hstep "SymCC policy diffs" ci/policy-diff.sh "$base"
 fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()
@@ -100,19 +106,19 @@ if [ "$e2e" = 1 ]; then
     has "$s" && e2e_suites+=("$s")
   done
   if [ ${#e2e_suites[@]} -gt 0 ]; then
-    step "build wicket-cli" build
+    hstep "build wicket-cli" cargo build -p wicket-cli --locked
     for s in "${e2e_suites[@]}"; do
       case "$s" in
-        smoke) step smoke ci/smoke.sh ;;
-        hibernate) step "hibernate" ci/hibernate.sh; step "hibernate --node" ci/hibernate.sh --node ;;
-        restore) step restore ci/restore.sh ;;
+        smoke) hstep smoke ci/smoke.sh ;;
+        hibernate) hstep "hibernate" ci/hibernate.sh; hstep "hibernate --node" ci/hibernate.sh --node ;;
+        restore) hstep restore ci/restore.sh ;;
         # acceptance --nodes local includes the local flows.
-        acceptance) has acceptance-nodes || step acceptance ci/acceptance.sh ;;
-        acceptance-nodes) step "acceptance --nodes local" ci/acceptance.sh --nodes local ;;
-        daemon-uids) step "wicketd with second uids" ci/daemon-uids.sh "$WICKET" ;;
-        install-test) step "install script in a container" ci/install-test.sh "$WICKET" ubuntu:24.04 ;;
-        node-e2e) step "node e2e" ci/node-e2e.sh --local ;;
-        update) step "self update" ci/update.sh ;;
+        acceptance) has acceptance-nodes || hstep acceptance ci/acceptance.sh ;;
+        acceptance-nodes) hstep "acceptance --nodes local" ci/acceptance.sh --nodes local ;;
+        daemon-uids) hstep "wicketd with second uids" ci/daemon-uids.sh "$WICKET" ;;
+        install-test) hstep "install script in a container" ci/install-test.sh "$WICKET" ubuntu:24.04 ;;
+        node-e2e) hstep "node e2e" ci/node-e2e.sh --local ;;
+        update) hstep "self update" ci/update.sh ;;
       esac
     done
   fi
