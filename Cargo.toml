@@ -99,3 +99,9 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.globset]
 opt-level = 2
+# #51's differential test (wicket-policy's tests/cedar.rs) runs Cedar's parser, validator and
+# authorizer on thousands of generated policies and requests: unoptimized, minutes.
+[profile.dev.package.cedar-policy]
+opt-level = 2
+[profile.dev.package.cedar-policy-core]
+opt-level = 2

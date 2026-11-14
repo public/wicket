@@ -14,11 +14,12 @@
 #
 # The program (ci/node-e2e/probe.sh) probes once a second: an allowed read and write on example.com,
 # an out-of-reach path there (decided on the node), and www.example.org (forwarded to the control
-# host). Its zone's authority lasts AUTH seconds from the run's start (default 300). The script:
+# host). Its zone's authority lasts AUTH seconds from the run's start (default 100; the nightly run uses
+# 300). The script:
 #   1. lets it run connected;
-#   2. cuts the control channel for CUT seconds (default 165, longer than the old 150 s offline
-#      window): the node's control socket is moved aside (so reconnects fail) and the channel's
-#      forwarder (`... wicket node attach`) is killed;
+#   2. cuts the control channel for CUT seconds (default 30; the nightly run uses 165, longer than
+#      the old 150 s offline window): the node's control socket is moved aside (so reconnects fail)
+#      and the channel's forwarder (`... wicket node attach`) is killed;
 #   3. restores it; the out-of-reach request queued on the node meanwhile is raised;
 #   4. approves it (a grant pushed to the node), then revokes the grant;
 #   5. sends the node a tampered and a replayed freshness statement;
@@ -30,7 +31,11 @@ cd "$(dirname "$0")/.."
 WICKET=$(realpath "${WICKET:-target/debug/wicket}")
 MODE=${1:?usage: ci/node-e2e.sh --local | <enrolled node>}
 export WICKET_FEED_TTL_MS=${WICKET_FEED_TTL_MS:-6000} WICKET_FEED_REFRESH_MS=${WICKET_FEED_REFRESH_MS:-1000}
-TTL=$((WICKET_FEED_TTL_MS / 1000)) CUT=${CUT:-165} AUTH=${AUTH:-300}
+# The cut and the authority are short by default (#219): what they show doesn't depend on their
+# length, since a node keeps deciding for as long as the authority lasts. The nightly run
+# (.github/workflows/acceptance.yml) sets CUT=165 AUTH=300, past the old 150 s offline window.
+TTL=$((WICKET_FEED_TTL_MS / 1000)) CUT=${CUT:-30} AUTH=${AUTH:-100}
+[ "$AUTH" -ge $((CUT + 60)) ] || { echo "AUTH ($AUTH s) must outlast the first cut and the steps after it: at least CUT + 60" >&2; exit 2; }
 work=$(mktemp -d)
 pids=()
 cleanup() {
@@ -91,7 +96,12 @@ pids+=($run_pid)
 for _ in $(seq 120); do grep -q ' read=' "$work/run.log" && break; sleep 1; done
 grep -q ' read=' "$work/run.log" || { cat "$work/run.log"; exit 1; }
 run=$(sed -n 's/^wicket run \(run_[a-z0-9]*\).*/\1/p' "$work/run.log" | head -1)
-sleep 8
+transcript="${WICKET_HOME:-$HOME/.local/share/wicket}/runs/$run/transcript.jsonl"
+# Whether the box has printed a probe line at or after $1 (ms) matching $2 (an awk regex); and
+# waiting up to $1 seconds for one, instead of a fixed sleep.
+probed() { awk -v t="$1" -v k="$2" '$1+0 >= t && $0 ~ k {f=1} END {exit !f}' "$transcript" 2>/dev/null; }
+wait_probe() { local n=$1; shift; for _ in $(seq $((n * 2))); do probed "$@" && return 0; sleep 0.5; done; return 1; }
+sleep 3   # a few lines while connected, before the cut
 
 # The channel's forwarder: the run's child (ssh, or the local stand-in) and everything under it.
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
@@ -110,18 +120,22 @@ restore
 t_restore=$(now_ms)
 for _ in $(seq 30); do grep -q 'reconnected' "$work/run.log" && break; sleep 0.5; done
 t_reconnected=$(now_ms)
-sleep 6
+# The out-of-reach request queued on the node while cut off, raised on reconnect.
+# (grep reads all of it: with -q, `pending` could die of SIGPIPE, and pipefail would call that a miss.)
+for _ in $(seq 60); do "$WICKET" pending 2>/dev/null | grep 'example.com/out-of-reach' >/dev/null && break; sleep 0.5; done
 
 log "approving the out-of-reach request (queued on the node while cut off, raised on reconnect)"
 "$WICKET" pending
 rid=$("$WICKET" pending | grep 'example.com/out-of-reach' | grep -o '^r-[a-z0-9]*' | head -1)
 gid=$("$WICKET" approve "$rid" --yes --unlimited --ttl 10m | grep -o '→ grant g-[a-z0-9]*' | grep -o 'g-[a-z0-9]*' | head -1)
 t_approve=$(now_ms)
-sleep 6
+# Until the box sees the grant: the out-of-reach request is let through (anything but a 403).
+wait_probe 30 "$t_approve" ' out=([^4]|4[^0]|40[^3])' || true
 log "revoking grant $gid"
 "$WICKET" grant revoke "$gid"
 t_revoke=$(now_ms)
-sleep 6
+# Until the box sees the revocation: refused again.
+wait_probe 30 "$t_revoke" ' out=403' || true
 
 log "a tampered and a replayed statement"
 if [ "$MODE" = --local ]; then
@@ -159,7 +173,6 @@ for _ in $(seq 20); do
 done
 [ -n "$t_expired" ] || { echo "no authority expiry found; the run's last lines:"; tail -5 "$work/run.log"; grep -i authority "$work/node.log" 2>/dev/null | tail -3; }
 
-transcript="${WICKET_HOME:-$HOME/.local/share/wicket}/runs/$run/transcript.jsonl"
 python3 -I - "$transcript" "$t_cut" "$t_restore" "$t_reconnected" "$t_approve" "$t_revoke" "$t_cut2" "$t_restore2" "${t_expired:-0}" "$CUT" <<'PY' | tee "$work/summary.txt"
 import sys
 path, cut, restore, reconnected, approve, revoke, cut2, restore2, expired, cut_s = sys.argv[1], *map(int, sys.argv[2:])
@@ -193,7 +206,7 @@ c2 = within(cut2, restore2)
 last = max(c2) if c2 else None
 print(f"second cut: {len(c2)} lines; the node stopped the box at its authority's end, {expired} ms; last line {s(last, expired) if expired else '-'}")
 checks = [
-    (f"writes and reads kept working through the {cut_s}s cut, past 155 s", len(c1) > 0 and len(w_ok) >= 0.9 * len(c1) and len(r_ok) >= 0.9 * len(c1) and w_ok and max(w_ok) - cut >= 155_000),
+    (f"writes and reads kept working through the {cut_s}s cut, past {cut_s - 10} s", len(c1) > 0 and len(w_ok) >= 0.9 * len(c1) and len(r_ok) >= 0.9 * len(c1) and w_ok and max(w_ok) - cut >= (cut_s - 10) * 1000),
     ("an out-of-reach request was queued on the node while cut off", any(rows[t]['out'] == "403:queued" for t in c1)),
     ("the forwarded host was refused while cut off", all(not ok(rows[t]['fwd']) for t in c1)),
     ("restored after reconnect", bool(back)),
