@@ -57,6 +57,7 @@ pub async fn run() -> Result<()> {
         capacity: None,
         fence: None,
         waker: None,
+        org: None,
     };
     let pem = format!(
         "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
@@ -80,9 +81,9 @@ fn node_decider(zone: &wicket_core::ZoneSpec, dir: &std::path::Path) -> Result<A
     let key = SigningKey::from_bytes(&[8; 32]);
     let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32])?;
     let approver = wicket_authz::SigningKey::from_bytes(&[10; 32])?;
-    let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000, 120_000);
+    let cert = KeyCert::new(&key.verifying_key(), 1, i64::MAX / 2, 30_000);
     let cert_jws = wicket_feed::sign(&root, wicket_feed::TYP_KEY, &cert);
-    let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 5_000, narrow_ms: 120_000, retain: 100 };
+    let cfg = PublisherConfig { ttl_ms: 30_000, refresh_ms: 5_000, retain: 100 };
     let feed = dir.join("feed");
     let _ = std::fs::remove_dir_all(&feed);
     let mut p = Publisher::open_with(&feed, "n1", &root.verifying_key(), key, &cert_jws, cfg, authz_root.public())?;
