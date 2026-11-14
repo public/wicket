@@ -305,6 +305,16 @@ smuggling surface isn't worth it.
   The README's "identical to picohttpparser" is the right contract for C users. A Rust wrapper would
   also want a strict mode that rejects bare LF and obs-fold, to match httparse and hyper's request
   smuggling posture.
+- **cursed-jwt: where wicket's CPU actually goes.** Possible future work, not gaps in what it does
+  today:
+  - **AES-GCM:** 30–34% of an inspected download. ring's code is already AES-NI and PCLMUL assembly, so
+    a win needs VAES or VPCLMULQDQ, or multi-buffer sealing across connections.
+  - **X25519:** 11% of a new connection. ring runs generic fiat code on x86-64, with no mulx or adx
+    path.
+  - **SHA-384:** 3.6% of a new connection, the TLS 1.3 key schedule.
+
+  wicket would take them through a rustls `CryptoProvider` behind a feature. P-256 signing (about 3%)
+  already uses the same nistz256 code in both, so it is not a gap.
 - **cursed-jwt (Rust port):**
   - `verify_signatures` is documented as "for tests and benchmarks". wicket would depend on it as the
     raw Ed25519 API. Please make it a supported entry point.
