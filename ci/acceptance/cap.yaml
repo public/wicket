@@ -1,11 +1,10 @@
 # Acceptance, multi-host (ci/acceptance/nodes.sh): an agent that asks for a node of its own and
-# starts a box there. Its session stays open (idle_timeout) until it is revoked.
+# starts a box there. Its session stays open (drive.sh says `wicket-mock: stay`) until it is revoked.
 task: Run the command you are given and stop.
 agent:
   name: cap
   max_turns: 4
   max_children: 2
-  idle_timeout: 20m
 zone:
   name: acc-cap
   isolation: gvisor

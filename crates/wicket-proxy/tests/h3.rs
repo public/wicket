@@ -189,6 +189,7 @@ impl World {
             capacity: None,
             fence: Some(wicket_proxy::Fence { agent, generation: 1 }),
             waker: None,
+            lifecycle: None,
         };
         let run_ca = Arc::new(RunCa::generate("run_h3").unwrap());
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false, ..Default::default() };

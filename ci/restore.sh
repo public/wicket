@@ -135,6 +135,7 @@ else
   echo vol-kept > /volumes/data/hib-vol; echo 1 > /workspace/turns; touch /workspace/turn1
   echo '{"status":"first"}' > /workspace/out/result.json
 fi
+echo "wicket-mock: hibernate"
 STEP
 
 echo "== the control host: its state store, and an enrolled node"

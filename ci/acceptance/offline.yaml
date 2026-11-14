@@ -9,7 +9,6 @@ agent:
   name: offline
   max_turns: 4
   max_children: 2
-  idle_timeout: 20m
 zone:
   name: acc-offline
   isolation: gvisor

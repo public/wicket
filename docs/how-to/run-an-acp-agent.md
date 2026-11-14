@@ -52,7 +52,8 @@ plan, and each of wicket's answers to it:
 [agent] finished: end_turn
 ```
 
-Follow-ups (`wicket say`), hibernation (`hibernate_after`) and `wicket wake` work as for any agent. A
+Follow-ups (`wicket say`), hibernation (the `hibernate` tool or `wicket hibernate`), `finish` and
+`wicket wake` work as for any agent. A
 woken agent continues its own ACP session.
 
 ## Claude Code through its ACP adapter
