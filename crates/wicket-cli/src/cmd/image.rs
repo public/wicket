@@ -18,6 +18,10 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Image { tag, dir, .. } => {
+            // An installed version (a control host, or a node after `wicket node install`) builds its own
+            // image, `wicket/claude-code:<build id>`, by default: the one its boxes, and the control
+            // host's runs placed on it, ask for.
+            let tag = image::effective(&tag);
             let ctx = match &dir {
                 Some(d) => image::context(d)?,
                 None => image::embedded_context()?,
