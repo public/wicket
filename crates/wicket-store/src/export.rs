@@ -136,20 +136,18 @@ impl Ledger {
 
     /// After a restore (#154): appends records exported before the control host was lost, as they
     /// were, where they continue the restored chain. Stops at the first that doesn't (its seq, prev
-    /// or hash; a v1 hash after a v2 one), checks the whole chain again before committing, and
+    /// or hash), checks the whole chain again before committing, and
     /// returns how many were appended. The caller decides which records to trust (up to a signed
     /// checkpoint).
     pub fn import_exported_audit(&self, recs: &[crate::AuditRecord]) -> Result<usize> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let r = (|| {
             let (mut seq, mut prev) = self.audit_head()?.unwrap_or((0, crate::CHAIN_ZERO.to_string()));
-            // The chain's version so far: a v1 record may not follow a v2 one.
-            let mut sum = crate::ChainSummary { v1: 0, v2: i64::from(prev.starts_with(crate::CHAIN_V2_PREFIX)) };
             let mut n = 0;
             let start = seq;
             for r in recs.iter().skip_while(|r| r.seq <= start) {
                 let f = crate::ChainFields { seq: r.seq, ts: r.ts, tenant: &r.tenant, run: r.run.as_deref(), kind: &r.kind, body: &r.body };
-                if r.seq != seq + 1 || r.prev != prev || !sum.accept(&prev, &f, &r.hash) {
+                if r.seq != seq + 1 || r.prev != prev || crate::chain_hash_v2(&prev, &f) != r.hash {
                     break;
                 }
                 self.conn.execute(
@@ -160,7 +158,7 @@ impl Ledger {
                 n += 1;
             }
             if n > 0 {
-                self.verify_audit_versions()?;
+                self.verify_audit()?;
             }
             Ok(n)
         })();
