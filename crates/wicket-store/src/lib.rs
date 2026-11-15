@@ -10,7 +10,9 @@ use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
 mod delegations;
+mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
+pub use effect::{EffectUse, EgressSeen, Filed};
 pub mod bundle;
 pub mod cas;
 mod links;
@@ -77,7 +79,10 @@ pub enum StoreError {
 /// Version 7 (expand) adds `agents.claim_until`, the wake claim's end, which `agents.lease_until`
 /// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
-pub const SCHEMA_VERSION: u32 = 7;
+/// Version 8 (expand) binds approvals to their effect (#369): `requests.args_sha256` and
+/// `grants.args_sha256` (the decided-on arguments' hash), `grants.effect_sha256` (the approved
+/// descriptor's), and the `audit_run` index a run's recent egress is read by.
+pub const SCHEMA_VERSION: u32 = 8;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -154,6 +159,9 @@ pub struct Request {
     pub attribution: Vec<serde_json::Value>,
     /// The agent asked for every path under `path` (request_access with scope prefix), not one path.
     pub scope_prefix: bool,
+    /// The sha256 of the arguments it asks with, for the kinds whose effect depends on more than
+    /// the target (spawn, link, capacity, update: #369, [`wicket_core::effect::args_sha256`]).
+    pub args_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,14 +262,14 @@ CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
   method TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, risk TEXT NOT NULL, reason TEXT NOT NULL,
   status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
-  attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0
+  attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0, args_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, args_sha256 TEXT, effect_sha256 TEXT
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -335,7 +343,22 @@ CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq);
 "#;
+
+/// The path and whether it is a prefix that approving `req` with the human's `path_prefix` grants:
+/// what [`Ledger::approve`] records, and what the effect descriptor a decision signs names (#369).
+/// Prefixes cover whole segments (#119): a prefix given by the human must cover the asked path, or
+/// (for a prefix ask) lie within the asked prefix.
+pub fn granted_scope(req: &Request, path_prefix: Option<&str>) -> (String, bool) {
+    match path_prefix {
+        Some(p) if wicket_core::prefix_covers(p, &req.path) => (wicket_core::prefix_dir(p), true),
+        Some(p) if req.scope_prefix && wicket_core::prefix_covers(&req.path, p) => (wicket_core::prefix_dir(p), true),
+        // A prefix ask is granted as asked unless the human narrows it.
+        _ if req.scope_prefix => (wicket_core::prefix_dir(&req.path), true),
+        _ => (req.path.clone(), false),
+    }
+}
 
 /// What a request needs of a grant: the one lookup every request kind's grant is found by
 /// ([`Ledger::consume_grant`] for access, SPAWN and LINK asks, [`Ledger::use_update_approval`] for
@@ -433,6 +456,11 @@ impl Ledger {
         if conn.execute("ALTER TABLE agents ADD COLUMN claim_until INTEGER", []).is_ok() {
             conn.execute("UPDATE agents SET claim_until = lease_until", [])?;
         }
+        // Ledgers created before approvals were bound to their effect (#369).
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN args_sha256 TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN args_sha256 TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN effect_sha256 TEXT", []);
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq)")?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -506,7 +534,7 @@ impl Ledger {
     /// Records a pending request for `op`, or returns the existing one. `who` is the attribution of
     /// this ask; when a *different* asker hits an existing request, it is added, so the human sees
     /// everyone a grant would serve.
-    pub fn pending_for(&self, op: &Op, reason: &str, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
+    pub(crate) fn pending_for_unheld(&self, op: &Op, reason: &str, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
         let digest = op.digest();
         if let Some((id, attr)) = self
             .conn
@@ -945,7 +973,7 @@ impl Ledger {
 
     pub fn request(&self, id: &str) -> Result<Request> {
         self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
     }
@@ -964,7 +992,7 @@ impl Ledger {
     /// Recently decided requests, newest first.
     pub fn decided(&self, tenant: &TenantId, limit: usize) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests
              WHERE tenant = ?1 AND status != 'pending' ORDER BY decided_at DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![tenant.0, limit as i64], row_to_request)?;
@@ -973,7 +1001,7 @@ impl Ledger {
 
     pub fn pending(&self, tenant: &TenantId) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests
              WHERE tenant = ?1 AND status = 'pending' ORDER BY created_at",
         )?;
         let rows = st.query_map(params![tenant.0], row_to_request)?;
@@ -998,21 +1026,14 @@ impl Ledger {
     fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool) -> Result<String> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let req = tx
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))?;
         if req.status != "pending" {
             return Err(StoreError::NotPending(id.into(), req.status));
         }
-        // Prefixes cover whole segments (#119): a prefix given by the human must cover the asked path,
-        // or (for a prefix ask) lie within the asked prefix.
-        let (path, prefix) = match &a.path_prefix {
-            Some(p) if wicket_core::prefix_covers(p, &req.path) => (wicket_core::prefix_dir(p), 1),
-            Some(p) if req.scope_prefix && wicket_core::prefix_covers(&req.path, p) => (wicket_core::prefix_dir(p), 1),
-            // A prefix ask is granted as asked unless the human narrows it.
-            _ if req.scope_prefix => (wicket_core::prefix_dir(&req.path), 1),
-            _ => (req.path.clone(), 0),
-        };
+        let (path, prefix) = granted_scope(&req, a.path_prefix.as_deref());
+        let prefix = prefix as i64;
         // The grant covers nothing riskier than what the human was shown (#119): a prefix approved
         // for an R2 write doesn't also cover the R4 operations under it.
         let max_risk = wicket_core::RiskClass::from_name(&req.risk).map(|r| r.rank()).unwrap_or(0);
@@ -1022,8 +1043,8 @@ impl Ledger {
         let gid = new_grant_id();
         let t = now();
         tx.execute(
-            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, args_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 gid,
                 req.tenant,
@@ -1038,7 +1059,8 @@ impl Ledger {
                 a.decided_by,
                 t,
                 max_risk,
-                (!zone_wide).then_some(&req.run)
+                (!zone_wide).then_some(&req.run),
+                req.args_sha256
             ],
         )?;
         tx.execute("UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1", params![id, t, a.decided_by])?;
@@ -1443,6 +1465,7 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
         created_at: r.get(10)?,
         attribution: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
         scope_prefix: r.get::<_, i64>(12)? != 0,
+        args_sha256: r.get(13)?,
     })
 }
 
