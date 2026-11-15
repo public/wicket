@@ -616,7 +616,7 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     match approval {
         Some((request, grant)) => Ok(Accepted { copy, sha256: sha, source: serde_json::json!({ "approved": { "request": request, "grant": grant } }) }),
         None => Err(refuse(format!(
-            "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no human has approved an update to it (an agent's request_update, approved with `wicket approve`)"
+            "the artifact (sha256 {sha}) is not signed by a release key this installation trusts: {why_not_signed}; and no operator has approved an update to it (an agent's request_update, approved with `wicket approve`)"
         ))),
     }
 }

@@ -12,3 +12,10 @@ docs/explanation/design.md | ## 16. Mandates: acting on a user's behalf
 docs/explanation/design.md | | M11 | mandates | deferred (§22) |
 # The conversation wicket started from, kept as it was.
 docs/explanation/00-origin-conversation.md | *
+# The backend trait is named after the wicket-sandbox crate.
+docs/explanation/design.md | pub trait Sandbox: Send + Sync {
+# Other projects' and papers' own words for their sandboxes.
+docs/explanation/prior-art.md | Quantifying Frontier LLM Capabilities for Container Sandbox Escape
+docs/explanation/prior-art.md | Claude sandbox DNS exfil + DNS shell
+docs/explanation/prior-art.md | per-tool command sandboxes
+docs/explanation/prior-art.md | Codex sandbox crates extract cleanly

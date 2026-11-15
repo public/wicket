@@ -329,7 +329,7 @@ pub struct ZoneSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Escalation {
-    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `ask_human`,
+    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `escalate`,
     /// `request_capacity`, `request_update`). Off: anything outside the zone's reach is "never
     /// allowed" instead of pending.
     #[serde(default = "yes")]
