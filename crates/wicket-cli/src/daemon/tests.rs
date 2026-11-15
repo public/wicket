@@ -15,7 +15,7 @@ impl Drop for Tmp {
 
 fn tmp() -> Tmp {
     let mut n = [0u8; 6];
-    getrandom::getrandom(&mut n).unwrap();
+    getrandom::fill(&mut n).unwrap();
     let d = std::env::temp_dir().join(format!("wicketd-test-{}", hex::encode(n)));
     std::fs::create_dir_all(&d).unwrap();
     Tmp(d)

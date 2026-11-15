@@ -1584,7 +1584,7 @@ impl Ledger {
     /// Makes a join token for node `name`, valid for `ttl_secs`. Returns the token, shown once.
     pub fn create_node_token(&self, tenant: &TenantId, name: &str, ttl_secs: i64) -> Result<String> {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
+        getrandom::fill(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
         let token = format!("wkt_{}", hex::encode(b));
         let t = now();
         self.conn.execute(

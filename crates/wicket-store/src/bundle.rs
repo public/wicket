@@ -243,7 +243,7 @@ pub fn tree_digest(root: &Path, exclude: &[&str]) -> Result<String> {
             Kind::Dir => digest_line(&mut h, Kind::Dir, &it.rel, mode, 0, ""),
             Kind::File => {
                 let mut fh = Sha256::new();
-                io::copy(&mut std::fs::File::open(&it.path)?, &mut fh)?;
+                io::copy(&mut std::fs::File::open(&it.path)?, &mut crate::cas::HashWrite(&mut fh))?;
                 digest_line(&mut h, Kind::File, &it.rel, mode, it.meta.len(), &hex::encode(fh.finalize()));
             }
             Kind::Link => digest_line(&mut h, Kind::Link, &it.rel, 0o777, 0, &std::fs::read_link(&it.path)?.to_string_lossy()),

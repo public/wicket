@@ -43,4 +43,10 @@ zone:
     secret: claude-oauth
     max_requests: 400
     max_output_tokens: 600000
-  limits: { memory: 3g, cpus: 2, timeout: 3h, pids: 4096 }
+  limits:
+    memory: 3g
+    cpus: 2
+    timeout: 3h
+    pids: 4096
+    # Appended to the warning the agent gets near the memory limit (#348).
+    memory_advice: "Build with fewer jobs (CARGO_BUILD_JOBS=1, `make -j1`), one cargo build or test run at a time."
