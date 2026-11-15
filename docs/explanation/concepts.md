@@ -1,11 +1,24 @@
-# Concepts (0.0.1)
+# Concepts
 
-This page explains the concepts behind what wicket 0.0.1 builds and how they fit together. The
-[tutorials](../tutorials/first-box.md) show them at work, and the [reference](../README.md#reference)
-has every command and field. [design.md](design.md) has the full design, much of which is not built yet; the
-Claude Doc "wicket — core concepts" (https://claude.ai/artifact/AATnju2Q7j6j2TvpCJ8XuP) gives that
-design-level overview. [Security model](security-model.md) and [limits](limits.md) say what 0.0.1 protects and what it
-doesn't.
+This page explains the concepts behind what wicket builds (0.0.1, and 0.0.2 as it lands) and how they
+fit together. The [tutorials](../tutorials/first-box.md) show them at work, and the
+[reference](../README.md#reference) has every command and field. [design.md](design.md) has the design
+and the reasons for it, and lists what is [deferred](design.md#22-deferred).
+[Security model](security-model.md) and [limits](limits.md) say what wicket protects and what it doesn't.
+
+## The nouns
+
+- A **principal** is anyone who acts: a human, an agent, a program or a node. Each has an identity,
+  an authority, and audited, signed actions.
+- A **workload** is what runs in a box: an **agent**, or a **program**, which is an agent with no
+  model that may not ask for more.
+- A **harness** is the agent program a box runs and how wicket talks to it: Claude Code or an ACP
+  agent (`agent.harness`). The harness decides when its run is done.
+- A **node** is a machine that runs boxes and decides their requests. The control host is a node too.
+- A **grant** is authority one principal gives another, within its own: a resource, a principal, a
+  lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
+  authority.
+- A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved.
 
 ## The box and the control host
 
@@ -15,7 +28,8 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
 - **The box** is a gVisor container with no network (`--network none`), a read-only root and no
   capabilities. Everything inside it, including the agent and its own settings, is treated as hostile.
   The box holds no secrets, only placeholders.
-- **The control host** runs `wicket`: the ledger (SQLite), the vault, the keys, and per run three proxies
+- **The control host** is the node that also runs the control plane: the ledger (SQLite), the vault,
+  the keys, approvals and the feed. Per run there are three proxies
   the box reaches over bind-mounted unix sockets:
   - the **LLM proxy** swaps the placeholder for the Claude subscription token and enforces the model
     budget;
@@ -74,7 +88,8 @@ Requests that could run as something else are refused: methods other than GET, H
 DELETE and OPTIONS (so TRACE, and CONNECT inside a tunnel), method-override and URL-rewrite headers
 (`X-HTTP-Method-Override`, `X-Original-URL` and the like), and bodies on GET and HEAD.
 
-**The subset rule.** An agent with `max_children` can `spawn` an agent or a program in a zone it writes.
+**The subset rule.** An agent with `max_children` can `spawn` a workload (an agent or a program) in a
+zone it writes.
 That zone must be within the agent's own (`wicket_core::subset`):
 
 - reach covered rule by rule (host, method and path), and every parent `forbid` kept;
@@ -97,7 +112,10 @@ terminal asks before approving (`--yes` skips the question).
 
 ## Grants
 
-A grant is a human's answer to one pending request, kept in the ledger:
+A grant answers one pending request, and is kept in the ledger. A human decides with `wicket approve`
+or in the console. An ancestor agent may decide a descendant's request with the gateway's `decide`
+tool, but only within its own authority, if its zone has `escalation.grant` (on by default). Either way
+it goes through one decide function:
 
 - **Bound to the request.** It covers the method, host and path asked (or, with `--prefix` or a
   `request_access` prefix ask, every path under a prefix, in whole segments), and nothing riskier than
@@ -116,9 +134,11 @@ A grant is a human's answer to one pending request, kept in the ledger:
   run's `timeout`, and its node keeps it past the old one. A box nobody renews stops when its
   authority ends.
 
-wicket's own approvals are grants too: a child zone beyond its parent's (`SPAWN`), a link beyond the
-default policy (`LINK`), a capacity lease (`CAPACITY`), an agent's build (`UPDATE`). Leases are the
-same idea for money: see [placement and leases](#placement-and-leases).
+wicket's own approvals are grants too, and stay with humans: a child zone beyond its parent's
+(`SPAWN`), a link beyond the default policy (`LINK`), a lease (`CAPACITY`), and an agent's build
+(`UPDATE`). A lease is a grant of capacity: see [placement and leases](#placement-and-leases). A zone
+with `escalation: { request: false }` may not ask at all, and anything outside its reach is "never
+allowed".
 
 ## Identities: agents and nodes
 
@@ -141,7 +161,7 @@ On the control host, the proxies decide from the zone (compiled once per run) an
 On a served node, each box's authority is a **Biscuit token**:
 
 - block 0 is the box's zone ceiling, minted by the control host when the run starts;
-- third-party blocks, signed by the approver key, add the grants humans approved (at most 10 live per
+- third-party blocks, signed by the approver key, add the grants approved for it (at most 10 live per
   box).
 
 A Biscuit block can only add checks, so a token can only narrow. Revoking a block's id revokes every
@@ -203,7 +223,7 @@ the connector's, or a human approves. Every link is recorded and audited. It clo
   Vultr. Every node carries the installation's owner tag; nothing without it, or tagged
   `wicket-protected`, is ever listed or destroyed. Spending stays inside an hourly and a total envelope,
   and each paid create is confirmed.
-- **A lease** is how an agent gets a machine without holding a cloud credential. The agent asks with
+- **A lease**, a grant of capacity, is how an agent gets a machine without holding a cloud credential. The agent asks with
   `request_capacity`. The ask becomes a pending lease with its worst-case cost reserved against
   `placement.yaml`'s budget, and only a human approves it. The approval is bound to that lease. The
   agent then places children on it with `spawn` and `placement: {"lease": "l-…"}`.
@@ -246,7 +266,7 @@ what is left, and a spent agent isn't woken.
 
 ## Designed, not built
 
-These are in [design.md](design.md) but not in 0.0.1: labels and handles, typed gates between zones,
-provider adapters and adapter-generated MCP tools, isolated third-party MCP servers, Cedar policy,
-platform (multi-tenant) mode, mandates, other inner agents (Codex, pi), microVM isolation, memory
-promotion and garbage collection.
+These are in [design.md](design.md) but not built: provider adapters and adapter-generated MCP tools,
+platform (multi-tenant) mode, other harnesses (Codex, pi), microVM isolation, memory promotion and
+garbage collection. Labels and handles, service zones, crews, mandates, Kubernetes placement, other
+clouds and the LLM manifest proposer are [deferred](design.md#22-deferred).
