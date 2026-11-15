@@ -81,6 +81,8 @@ jobs:
         run: ci/check-public.py
       - name: relative links in Markdown files
         run: ci/check-doc-links.sh
+      - name: one word per thing in the docs and the CLI's help (#332)
+        run: ci/check-terms.sh
       - name: gitleaks, every commit
         run: |
           f=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz

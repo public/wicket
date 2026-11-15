@@ -10,7 +10,7 @@
 # when a path is safe to narrow, never a catch-all. `*` stays within a directory, `**` crosses
 # them, and a pattern without a slash matches the file name anywhere.
 #
-# Suites: docs (check-public, Markdown links),
+# Suites: docs (check-public, Markdown links, terms),
 # policy (SymCC policy diffs), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
 # install-test, and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update.
@@ -40,6 +40,8 @@ LICENSE                            | -   | docs
 .gitignore                         | -   | docs
 ci/check-public.py                 | -   | docs
 ci/check-doc-links.sh              | -   | docs
+ci/check-terms.sh                  | -   | docs
+ci/check-terms.allow               | -   | docs
 ci/gen-cli-reference.sh            | wicket-cli | docs
 changes/**                         | -   | docs
 ci/changelog.py                    | -   | docs
