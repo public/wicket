@@ -57,8 +57,13 @@ libc = "0.2"
 base64 = "0.22"
 ulid = "1"
 
+# Line tables are enough for symbolized stack traces; full debuginfo made each target's link take
+# up to 3.7 GiB (a 460 MB binary), too close to a 4 GiB box or a CI runner.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
-debug = 1
+debug = "line-tables-only"
 
 [[bin]]
 name = "egress"
