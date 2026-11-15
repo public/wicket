@@ -2,7 +2,7 @@
 
 Every `wicket` command and flag, as `wicket <command> --help` prints it. This page is generated
 from the code by `ci/gen-cli-reference.sh`, and CI checks that it matches: edit the commands' doc
-comments in `crates/wicket-cli/src/main.rs` (and `place.rs`), not this page.
+comments in `crates/wicket-cli/src/main.rs` (and `cmd/` and `nodecreate.rs`), not this page.
 
 On an installed host most commands go through the daemon, which allows each one for some callers
 only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`. Durations are
@@ -76,16 +76,14 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket node token`](#wicket-node-token)
   - [`wicket node enrol`](#wicket-node-enrol)
   - [`wicket node list`](#wicket-node-list)
+  - [`wicket node create`](#wicket-node-create)
+  - [`wicket node release`](#wicket-node-release)
+  - [`wicket node plans`](#wicket-node-plans)
   - [`wicket node revoke`](#wicket-node-revoke)
   - [`wicket node install`](#wicket-node-install)
   - [`wicket node serve`](#wicket-node-serve)
   - [`wicket node top`](#wicket-node-top)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
-- [`wicket place`](#wicket-place)
-  - [`wicket place plans`](#wicket-place-plans)
-  - [`wicket place list`](#wicket-place-list)
-  - [`wicket place create`](#wicket-place-create)
-  - [`wicket place release`](#wicket-place-release)
 - [`wicket dev`](#wicket-dev)
   - [`wicket dev node-feed-probe`](#wicket-dev-node-feed-probe)
   - [`wicket dev mock-llm`](#wicket-dev-mock-llm)
@@ -137,8 +135,7 @@ Commands:
   lease      Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
   zone       The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
   doctor     Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
-  node       Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
-  place      Nodes from a provider (#37): Vultr plans, owned nodes, create inside a money envelope with a terminal approval and enrol with the host key pinned at creation, release
+  node       Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA
   dev        Development helpers
   self       Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
   daemon     wicketd (#12): run as the wicket system user and serve other users' commands over a unix socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving, denying and other privileged commands need root over the socket, or a passkey in the console. Installed and started by deploy/install.sh
@@ -1108,14 +1105,17 @@ Options:
 ## `wicket node`
 
 ```text
-Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
+Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA); listing with leases and cost, revoking, renewing the CA
 
 Usage: wicket node <COMMAND>
 
 Commands:
   token     Print a one-time join token for a node (stored hashed; single use)
-  enrol     Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
-  list      List enrolled nodes
+  enrol     Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
+  list      List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
+  create    Lease a machine from a provider (Vultr) and enrol it: inside a money envelope, after approval on this terminal, with its ssh host key generated here and pinned at creation
+  release   Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+  plans     List a provider's (Vultr's) plans in a region, with their hourly price
   revoke    Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
   install   Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
   serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
@@ -1143,7 +1143,7 @@ Options:
 ### `wicket node enrol`
 
 ```text
-Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
+Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
 
 Usage: wicket node enrol [OPTIONS] --token <TOKEN> --hosts <HOSTS> <TARGET>
 
@@ -1165,12 +1165,108 @@ Options:
 ### `wicket node list`
 
 ```text
-List enrolled nodes
+List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
 
-Usage: wicket node list
+Usage: wicket node list [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --provider
+          Also ask the provider (Vultr) for this installation's instances by owner tag: their state, cost and next paid hour, and any this ledger doesn't record
+      --api-key-secret <API_KEY_SECRET>
+          The vault secret holding the Vultr API key [default: vultr-api-key]
+      --owner <OWNER>
+          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+  -h, --help
+          Print help
+```
+
+### `wicket node create`
+
+```text
+Lease a machine from a provider (Vultr) and enrol it: inside a money envelope, after approval on this terminal, with its ssh host key generated here and pinned at creation
+
+Usage: wicket node create [OPTIONS] --name <NAME> --max-hourly <MAX_HOURLY> --max-total <MAX_TOTAL> --ssh-key-id <SSH_KEY_IDS>
+
+Options:
+      --api-key-secret <API_KEY_SECRET>
+          The vault secret holding the Vultr API key [default: vultr-api-key]
+      --owner <OWNER>
+          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --name <NAME>
+          Node name (hostname, label and enrolled name)
+      --hosts <HOSTS>
+          Host names the node's CA may issue for, as for `wicket node enrol --hosts`
+      --region <REGION>
+          [default: lhr]
+      --plan <PLAN>
+          A plan id (e.g. vc2-1c-2gb); otherwise the cheapest that fits --vcpus and --memory-mib
+      --vcpus <VCPUS>
+          [default: 1]
+      --memory-mib <MEMORY_MIB>
+          [default: 2048]
+      --lifetime <LIFETIME>
+          How long the node is needed: its worst-case cost is reserved for this long, and its lease ends at minute 50 of the last hour [default: 1h]
+      --max-node-hourly <MAX_NODE_HOURLY>
+          Most this node may cost per hour, in dollars
+      --max-hourly <MAX_HOURLY>
+          Envelope: most all owned nodes together may cost per hour, in dollars
+      --max-total <MAX_TOTAL>
+          Envelope: most all owned nodes together may cost through their leases, in dollars
+      --ssh-key-id <SSH_KEY_IDS>
+          Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`)
+      --ssh-key <SSH_KEY>
+          The private half of that key, on this host
+      --os-id <OS_ID>
+          Vultr os_id (default: Ubuntu 24.04 x64) [default: 2284]
+      --idempotency-key <IDEMPOTENCY_KEY>
+          Make a retried create return the same node (default: derived from --name)
+      --no-enrol
+          Create and wait, but don't enrol
+      --ca-ttl <CA_TTL>
+          [default: 24h]
+      --give-up-silent <GIVE_UP_SILENT>
+          Give up on the node, and release it, if nothing answers on its ssh port for this long (every connect times out or is unreachable). Once the port answers (accepted or refused), wait up to 15 minutes for setup [default: 4m]
+  -h, --help
+          Print help
+```
+
+### `wicket node release`
+
+```text
+Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
+
+Usage: wicket node release [OPTIONS] <ID>
+
+Arguments:
+  <ID>  The provider's instance id, or the node's name
+
+Options:
+      --api-key-secret <API_KEY_SECRET>
+          The vault secret holding the Vultr API key [default: vultr-api-key]
+      --owner <OWNER>
+          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+  -h, --help
+          Print help
+```
+
+### `wicket node plans`
+
+```text
+List a provider's (Vultr's) plans in a region, with their hourly price
+
+Usage: wicket node plans [OPTIONS]
+
+Options:
+      --api-key-secret <API_KEY_SECRET>
+          The vault secret holding the Vultr API key [default: vultr-api-key]
+      --owner <OWNER>
+          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
+      --region <REGION>
+          [default: lhr]
+      --plan-type <PLAN_TYPE>
+          [default: vc2]
+  -h, --help
+          Print help
 ```
 
 ### `wicket node revoke`
@@ -1244,129 +1340,6 @@ Options:
       --ca-ttl <CA_TTL>      [default: 24h]
       --cert-ttl <CERT_TTL>  Node identity certificate lifetime [default: 24h]
   -h, --help                 Print help
-```
-
-## `wicket place`
-
-```text
-Nodes from a provider (#37): Vultr plans, owned nodes, create inside a money envelope with a terminal approval and enrol with the host key pinned at creation, release
-
-Usage: wicket place <COMMAND>
-
-Commands:
-  plans    List Vultr plans in a region with their hourly price
-  list     List this installation's nodes (by owner tag) with their paid time
-  create   Create a Vultr node inside a money envelope, after approval on this terminal, and enrol it with its host key pinned at creation
-  release  Destroy an owned node now (refusing anything without the owner tag) and revoke its enrolment
-  help     Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help  Print help
-```
-
-### `wicket place plans`
-
-```text
-List Vultr plans in a region with their hourly price
-
-Usage: wicket place plans [OPTIONS]
-
-Options:
-      --api-key-secret <API_KEY_SECRET>
-          The vault secret holding the Vultr API key [default: vultr-api-key]
-      --owner <OWNER>
-          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
-      --region <REGION>
-          [default: lhr]
-      --plan-type <PLAN_TYPE>
-          [default: vc2]
-  -h, --help
-          Print help
-```
-
-### `wicket place list`
-
-```text
-List this installation's nodes (by owner tag) with their paid time
-
-Usage: wicket place list [OPTIONS]
-
-Options:
-      --api-key-secret <API_KEY_SECRET>
-          The vault secret holding the Vultr API key [default: vultr-api-key]
-      --owner <OWNER>
-          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
-  -h, --help
-          Print help
-```
-
-### `wicket place create`
-
-```text
-Create a Vultr node inside a money envelope, after approval on this terminal, and enrol it with its host key pinned at creation
-
-Usage: wicket place create [OPTIONS] --name <NAME> --max-hourly <MAX_HOURLY> --max-total <MAX_TOTAL> --ssh-key-id <SSH_KEY_IDS>
-
-Options:
-      --api-key-secret <API_KEY_SECRET>
-          The vault secret holding the Vultr API key [default: vultr-api-key]
-      --owner <OWNER>
-          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
-      --name <NAME>
-          Node name (hostname, label and enrolled name)
-      --hosts <HOSTS>
-          Host names the node's CA may issue for, as for `wicket node enrol --hosts`
-      --region <REGION>
-          [default: lhr]
-      --plan <PLAN>
-          A plan id (e.g. vc2-1c-2gb); otherwise the cheapest that fits --vcpus and --memory-mib
-      --vcpus <VCPUS>
-          [default: 1]
-      --memory-mib <MEMORY_MIB>
-          [default: 2048]
-      --lifetime <LIFETIME>
-          How long the node is needed: its worst-case cost is reserved for this long, and its lease ends at minute 50 of the last hour [default: 1h]
-      --max-node-hourly <MAX_NODE_HOURLY>
-          Most this node may cost per hour, in dollars
-      --max-hourly <MAX_HOURLY>
-          Envelope: most all owned nodes together may cost per hour, in dollars
-      --max-total <MAX_TOTAL>
-          Envelope: most all owned nodes together may cost through their leases, in dollars
-      --ssh-key-id <SSH_KEY_IDS>
-          Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`)
-      --ssh-key <SSH_KEY>
-          The private half of that key, on this host
-      --os-id <OS_ID>
-          Vultr os_id (default: Ubuntu 24.04 x64) [default: 2284]
-      --idempotency-key <IDEMPOTENCY_KEY>
-          Make a retried create return the same node (default: derived from --name)
-      --no-enrol
-          Create and wait, but don't enrol
-      --ca-ttl <CA_TTL>
-          [default: 24h]
-      --give-up-silent <GIVE_UP_SILENT>
-          Give up on the node, and release it, if nothing answers on its ssh port for this long (every connect times out or is unreachable). Once the port answers (accepted or refused), wait up to 15 minutes for setup [default: 4m]
-  -h, --help
-          Print help
-```
-
-### `wicket place release`
-
-```text
-Destroy an owned node now (refusing anything without the owner tag) and revoke its enrolment
-
-Usage: wicket place release [OPTIONS] <ID>
-
-Arguments:
-  <ID>  The Vultr instance id
-
-Options:
-      --api-key-secret <API_KEY_SECRET>
-          The vault secret holding the Vultr API key [default: vultr-api-key]
-      --owner <OWNER>
-          The owner tag's installation name (default: this installation's trust domain, else "wicket"). Garbage collection only ever touches instances carrying it, so keep it stable
-  -h, --help
-          Print help
 ```
 
 ## `wicket dev`

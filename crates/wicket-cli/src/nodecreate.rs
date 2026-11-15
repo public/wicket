@@ -1,10 +1,12 @@
-//! `wicket place`: nodes from a provider, through the placement interface (`wicket-placement`, #37).
+//! `wicket node create`, `release` and `plans`: nodes leased from a provider, through the placement
+//! interface (`wicket-placement`, #37), and the provider half of `wicket node list`.
 //!
 //! `create` runs the whole path for one Vultr node: the money envelope and a terminal approval, a
 //! tagged instance whose cloud-init runs `deploy/vultr/node-setup.sh` with an ssh host key generated
 //! here and pinned before boot, the wait for it to be active and set up, and `wicket node enrol` with
 //! that key (no trust on first use). Then the boot host key is scrubbed from the instance's user data.
-//! `release` destroys an owned node and revokes its enrolment. `list` and `plans` only read.
+//! `release` destroys an owned node and revokes its enrolment. `plans` and the provider half of
+//! `list` only read.
 //!
 //! **Its lease is enforced (#294).** `create` records the node in the ledger
 //! ([`wicket_store::PlacedNodeRow`]) with its lease end (minute 50 of the last paid hour of
@@ -38,87 +40,61 @@ pub struct Common {
     owner: Option<String>,
 }
 
-// Parsed once per process; boxing `Create` would buy nothing.
-#[allow(clippy::large_enum_variant)]
-#[derive(clap::Subcommand)]
-pub enum PlaceCmd {
-    /// List Vultr plans in a region with their hourly price.
-    Plans {
-        #[command(flatten)]
-        common: Common,
-        #[arg(long, default_value = "lhr")]
-        region: String,
-        #[arg(long, default_value = "vc2")]
-        plan_type: String,
-    },
-    /// List this installation's nodes (by owner tag) with their paid time.
-    List {
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Create a Vultr node inside a money envelope, after approval on this terminal, and enrol it with
-    /// its host key pinned at creation.
-    Create {
-        #[command(flatten)]
-        common: Common,
-        /// Node name (hostname, label and enrolled name).
-        #[arg(long)]
-        name: String,
-        /// Host names the node's CA may issue for, as for `wicket node enrol --hosts`.
-        #[arg(long, value_delimiter = ',', required_unless_present = "no_enrol")]
-        hosts: Vec<String>,
-        #[arg(long, default_value = "lhr")]
-        region: String,
-        /// A plan id (e.g. vc2-1c-2gb); otherwise the cheapest that fits --vcpus and --memory-mib.
-        #[arg(long)]
-        plan: Option<String>,
-        #[arg(long, default_value_t = 1)]
-        vcpus: u32,
-        #[arg(long, default_value_t = 2048)]
-        memory_mib: u64,
-        /// How long the node is needed: its worst-case cost is reserved for this long, and its lease
-        /// ends at minute 50 of the last hour.
-        #[arg(long, default_value = "1h")]
-        lifetime: String,
-        /// Most this node may cost per hour, in dollars.
-        #[arg(long)]
-        max_node_hourly: Option<String>,
-        /// Envelope: most all owned nodes together may cost per hour, in dollars.
-        #[arg(long)]
-        max_hourly: String,
-        /// Envelope: most all owned nodes together may cost through their leases, in dollars.
-        #[arg(long)]
-        max_total: String,
-        /// Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`).
-        #[arg(long = "ssh-key-id", required = true)]
-        ssh_key_ids: Vec<String>,
-        /// The private half of that key, on this host.
-        #[arg(long)]
-        ssh_key: Option<PathBuf>,
-        /// Vultr os_id (default: Ubuntu 24.04 x64).
-        #[arg(long, default_value_t = wicket_placement::vultr::UBUNTU_2404_OS_ID)]
-        os_id: u32,
-        /// Make a retried create return the same node (default: derived from --name).
-        #[arg(long)]
-        idempotency_key: Option<String>,
-        /// Create and wait, but don't enrol.
-        #[arg(long)]
-        no_enrol: bool,
-        #[arg(long, default_value = "24h")]
-        ca_ttl: String,
-        /// Give up on the node, and release it, if nothing answers on its ssh port for this long (every
-        /// connect times out or is unreachable). Once the port answers (accepted or refused), wait up to
-        /// 15 minutes for setup.
-        #[arg(long, default_value = "4m")]
-        give_up_silent: String,
-    },
-    /// Destroy an owned node now (refusing anything without the owner tag) and revoke its enrolment.
-    Release {
-        #[command(flatten)]
-        common: Common,
-        /// The Vultr instance id.
-        id: String,
-    },
+/// `wicket node create`'s arguments.
+#[derive(clap::Args, Clone)]
+pub struct CreateArgs {
+    #[command(flatten)]
+    common: Common,
+    /// Node name (hostname, label and enrolled name).
+    #[arg(long)]
+    name: String,
+    /// Host names the node's CA may issue for, as for `wicket node enrol --hosts`.
+    #[arg(long, value_delimiter = ',', required_unless_present = "no_enrol")]
+    hosts: Vec<String>,
+    #[arg(long, default_value = "lhr")]
+    region: String,
+    /// A plan id (e.g. vc2-1c-2gb); otherwise the cheapest that fits --vcpus and --memory-mib.
+    #[arg(long)]
+    plan: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    vcpus: u32,
+    #[arg(long, default_value_t = 2048)]
+    memory_mib: u64,
+    /// How long the node is needed: its worst-case cost is reserved for this long, and its lease
+    /// ends at minute 50 of the last hour.
+    #[arg(long, default_value = "1h")]
+    lifetime: String,
+    /// Most this node may cost per hour, in dollars.
+    #[arg(long)]
+    max_node_hourly: Option<String>,
+    /// Envelope: most all owned nodes together may cost per hour, in dollars.
+    #[arg(long)]
+    max_hourly: String,
+    /// Envelope: most all owned nodes together may cost through their leases, in dollars.
+    #[arg(long)]
+    max_total: String,
+    /// Id of an ssh key already in the Vultr account (installed for root, copied to `wicket`).
+    #[arg(long = "ssh-key-id", required = true)]
+    ssh_key_ids: Vec<String>,
+    /// The private half of that key, on this host.
+    #[arg(long)]
+    ssh_key: Option<PathBuf>,
+    /// Vultr os_id (default: Ubuntu 24.04 x64).
+    #[arg(long, default_value_t = wicket_placement::vultr::UBUNTU_2404_OS_ID)]
+    os_id: u32,
+    /// Make a retried create return the same node (default: derived from --name).
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    /// Create and wait, but don't enrol.
+    #[arg(long)]
+    no_enrol: bool,
+    #[arg(long, default_value = "24h")]
+    ca_ttl: String,
+    /// Give up on the node, and release it, if nothing answers on its ssh port for this long (every
+    /// connect times out or is unreachable). Once the port answers (accepted or refused), wait up to
+    /// 15 minutes for setup.
+    #[arg(long, default_value = "4m")]
+    give_up_silent: String,
 }
 
 fn owner_name(c: &Common) -> String {
@@ -160,6 +136,60 @@ pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
     Ok(true)
 }
 
+fn usd(micros: i64) -> String {
+    MicroUsd(micros.max(0) as u64).to_string()
+}
+
+/// What `wicket node list` says about the lease, provider and cost of the node named `name`, if it
+/// has a lease: one from `wicket node create`, or a run's capacity lease. None for a machine that was
+/// only enrolled.
+pub fn lease_summary(l: &Ledger, name: &str, now: i64) -> Result<Option<String>> {
+    if let Some(p) = l.placed_nodes(&["active"])?.into_iter().find(|p| p.name == name) {
+        return Ok(Some(placed_summary(&p, now)));
+    }
+    let lease = l.leases(wicket_store::LIVE_LEASES)?.into_iter().find(|x| x.node_name.as_deref() == Some(name));
+    Ok(lease.map(|x| lease_row_summary(&x)))
+}
+
+fn placed_summary(p: &wicket_store::PlacedNodeRow, now: i64) -> String {
+    let cost = p.hourly.map(|h| format!("{}/h", usd(h))).unwrap_or_else(|| "cost not recorded".into());
+    let end = if p.lease_until <= now {
+        match &p.held_by {
+            Some(runs) => format!("PAST ITS LEASE (ended {}): held by run {runs}, billing until released", fmt_time(p.lease_until)),
+            None => format!("PAST ITS LEASE (ended {}): released at the reconciler's next pass", fmt_time(p.lease_until)),
+        }
+    } else {
+        format!("lease until {}", fmt_time(p.lease_until))
+    };
+    format!("{end}; provider {} instance {}, {cost}; release with: wicket node release {}", p.backend, p.id, p.name)
+}
+
+fn lease_row_summary(x: &wicket_store::LeaseRow) -> String {
+    let end = x.not_after.map(|t| format!("until {}", fmt_time(t))).unwrap_or_else(|| x.status.clone());
+    let cost =
+        if x.reserved == 0 { "no cost".to_string() } else { format!("at most {}/h, {} reserved", usd(x.hourly_cap), usd(x.reserved)) };
+    let instance = x.node_id.as_deref().map(|i| format!(" instance {i}")).unwrap_or_default();
+    format!("capacity lease {} for run {} {end}; provider {}{instance}, {cost}", x.id, x.run, x.provider)
+}
+
+/// Leased nodes that aren't enrolled under their name (made with `--no-enrol`, still being set up,
+/// or whose enrolment was revoked), one line each: they bill all the same.
+pub fn leased_not_enrolled(l: &Ledger, enrolled: &[String], now: i64) -> Result<Vec<String>> {
+    let mut out = vec![];
+    for p in l.placed_nodes(&["active"])? {
+        if !enrolled.contains(&p.name) {
+            out.push(format!("{}  not enrolled  {}", p.name, placed_summary(&p, now)));
+        }
+    }
+    for x in l.leases(wicket_store::LIVE_LEASES)? {
+        if !x.node_name.as_ref().is_some_and(|n| enrolled.contains(n)) {
+            let name = x.node_name.clone().unwrap_or_else(|| "-".into());
+            out.push(format!("{name}  {}  {}", x.status, lease_row_summary(&x)));
+        }
+    }
+    Ok(out)
+}
+
 /// What `list` says about a node's lease at `now`: empty while it lasts.
 fn lease_note(n: &NodeHandle, placed: Option<&wicket_store::PlacedNodeRow>, capacity: bool, now: i64) -> String {
     let Some(until) = placed.filter(|p| p.status == "active").map(|p| p.lease_until).or(n.lease_until) else { return String::new() };
@@ -170,13 +200,13 @@ fn lease_note(n: &NodeHandle, placed: Option<&wicket_store::PlacedNodeRow>, capa
     match placed.filter(|p| p.status == "active") {
         Some(p) => match &p.held_by {
             Some(runs) => format!(
-                "{ended}: still held by run {runs}, so the reconciler keeps it and it bills until released (wicket place release {})",
+                "{ended}: still held by run {runs}, so the reconciler keeps it and it bills until released (wicket node release {})",
                 n.id
             ),
             None => format!("{ended}: the reconciler releases it at its next pass if nothing runs on it"),
         },
         None if capacity => format!("{ended}: its capacity lease ends at the reconciler's next pass"),
-        None => format!("{ended}: not recorded by `wicket place create` here, so nothing releases it: wicket place release {}", n.id),
+        None => format!("{ended}: not recorded by `wicket node create` here, so nothing releases it: wicket node release {}", n.id),
     }
 }
 
@@ -246,198 +276,193 @@ impl SpendApprover for TerminalApprover {
     }
 }
 
-pub async fn run(cmd: PlaceCmd) -> Result<()> {
-    match cmd {
-        PlaceCmd::Plans { common, region, plan_type } => {
-            let p = provider(&common, VultrConfig::default())?;
-            let mut plans: Vec<_> =
-                p.client().list_plans(&plan_type).await?.into_iter().filter(|p| p.locations.contains(&region)).collect();
-            plans.sort_by_key(|p| (p.hourly_rate(), p.id.clone()));
-            for p in plans {
-                println!("{:<24} {:>2} vCPU {:>6} MB  {}/h  (${}/month)", p.id, p.vcpu_count, p.ram, p.hourly_rate(), p.monthly_cost);
-            }
-            Ok(())
-        }
-        PlaceCmd::List { common } => {
-            let o = owner(&common);
-            let p = Placer::new(
-                provider(&common, VultrConfig::default())?,
-                envelope::DenyAll,
-                o.clone(),
-                MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-            );
-            let nodes = p.list().await?;
-            let ledger = Ledger::open(&crate::ledger_path())?;
-            let now = wicket_store::now();
-            for n in &nodes {
-                let placed = ledger.placed_node(&n.id.0)?;
-                let capacity = ledger.leases(wicket_store::LIVE_LEASES)?.iter().any(|l| l.node_id.as_deref() == Some(n.id.0.as_str()));
-                println!(
-                    "{}  {:<16} {:<14} {:<4} {:?}  {}  {}/h  created {}  lease until {}  next paid hour {}",
-                    n.id,
-                    n.name,
-                    n.plan.as_deref().unwrap_or("?"),
-                    n.region.as_deref().unwrap_or("?"),
-                    n.state,
-                    n.ssh_target.as_deref().unwrap_or("-"),
-                    n.billing.hourly_rate(),
-                    fmt_time(n.created_at),
-                    n.lease_until.map(fmt_time).unwrap_or_else(|| "-".into()),
-                    p.next_paid_hour_at(n).map(fmt_time).unwrap_or_else(|| "-".into()),
-                );
-                let note = lease_note(n, placed.as_ref(), capacity, now);
-                if !note.is_empty() {
-                    println!("  ! {note}");
-                }
-            }
-            println!("{} node(s) tagged {}", nodes.len(), o.tag());
-            Ok(())
-        }
-        PlaceCmd::Create {
-            common,
-            name,
-            hosts,
-            region,
-            plan,
-            vcpus,
-            memory_mib,
-            lifetime,
-            max_node_hourly,
-            max_hourly,
-            max_total,
-            ssh_key_ids,
-            ssh_key,
-            os_id,
-            idempotency_key,
-            no_enrol,
-            ca_ttl,
-            give_up_silent,
-        } => {
-            crate::enrol::validate_name(&name)?;
-            if !no_enrol {
-                wicket_proxy::ca::permitted_dns_subtrees(&hosts)?;
-            }
-            // Before anything is created or spent: the node is reached with this key now and on every
-            // later run (enrolment records its path), by whoever runs wicket here. Through wicketd that is
-            // the wicket user, which can't read a key in the caller's home.
-            if let Some(k) = &ssh_key {
-                std::fs::File::open(k).with_context(|| {
-                    format!(
-                        "reading the ssh key {} (on an installed host wicket reaches nodes as the wicket user: keep the key where it can read it, e.g. /var/lib/wicket/ssh/, owned by wicket, mode 0600)",
-                        k.display()
-                    )
-                })?;
-            }
-            let lifetime = humantime::parse_duration(&lifetime)?;
-            let ca_ttl = humantime::parse_duration(&ca_ttl)?;
-            let owner_name = owner_name(&common);
-            let o = Owner::new(&owner_name);
-            let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
-            let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
-            let placer = Placer::new(provider(&common, config)?, TerminalApprover, o.clone(), envelope);
+/// `wicket node plans`: a region's plans with their hourly price.
+pub async fn plans(common: Common, region: String, plan_type: String) -> Result<()> {
+    let p = provider(&common, VultrConfig::default())?;
+    let mut plans: Vec<_> = p.client().list_plans(&plan_type).await?.into_iter().filter(|p| p.locations.contains(&region)).collect();
+    plans.sort_by_key(|p| (p.hourly_rate(), p.id.clone()));
+    for p in plans {
+        println!("{:<24} {:>2} vCPU {:>6} MB  {}/h  (${}/month)", p.id, p.vcpu_count, p.ram, p.hourly_rate(), p.monthly_cost);
+    }
+    Ok(())
+}
 
-            let host_key = boot::generate_host_key(&format!("wicket-node-{name}")).await?;
-            let user_data = boot::cloud_config(boot::NODE_SETUP, &host_key)?;
-            let pinned = host_key.public.clone();
-            drop(host_key);
-            let req = CapacityRequest {
-                resources: Resources { vcpus, memory_mib },
-                min_isolation: IsolationTier::Gvisor,
-                region_hint: Some(region),
-                plan_hint: plan,
-                max_hourly: max_node_hourly.as_deref().map(dollars).transpose()?,
-                lifetime_secs: lifetime.as_secs() as i64,
-                idempotency_key: idempotency_key.unwrap_or_else(|| format!("place-create:{name}")),
-                name: name.clone(),
-                purpose: format!("wicket place create {name}"),
-                boot: Some(Boot { user_data, host_key: pinned.clone() }),
-            };
-            let n = placer.acquire(&req).await?;
-            // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
-            let lease_until = n.lease_until.unwrap_or(n.created_at + req.lifetime_secs);
-            Ledger::open(&crate::ledger_path())?.record_placed_node(&wicket_store::PlacedNodeRow {
-                id: n.id.0.clone(),
-                backend: n.backend.clone(),
-                name: name.clone(),
-                owner: owner_name.clone(),
-                api_key_secret: common.api_key_secret.clone(),
-                created_at: n.created_at,
-                lease_until,
-                status: String::new(),
-                held_by: None,
-                ended_at: None,
-                detail: None,
-            })?;
-            println!(
-                "created {} ({}), {}/h, lease until {}",
-                n.id,
-                name,
-                n.billing.hourly_rate(),
-                n.lease_until.map(fmt_time).unwrap_or_default()
-            );
-            if n.host_key.as_deref() != Some(pinned.as_str()) {
-                bail!(
-                    "{} already existed for this idempotency key and its pinned host key isn't known here: enrol it with `wicket node enrol` and a key from elsewhere, or release it",
-                    n.id
-                );
-            }
-
-            Ledger::open(&crate::ledger_path())?.audit(
-                &TenantId::single(),
-                None,
-                "placement.node_created",
-                &serde_json::json!({ "backend": n.backend, "id": n.id.0, "name": name, "plan": n.plan, "region": n.region,
-                                     "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
-            )?;
-            let hosts = (!no_enrol).then_some(hosts);
-            let wait = boot::ReadyWait { silent_limit: humantime::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
-            let ready = bring_up_or_release::<_, boot::SshProbe>(
-                &placer,
-                &crate::ledger_path(),
-                &n,
-                &name,
-                &pinned,
-                ssh_key,
-                hosts,
-                ca_ttl,
-                &wait,
-                None,
-            )
-            .await?;
-            if let Some(next) = placer.next_paid_hour_at(&ready) {
-                println!("next paid hour starts {}; release before then: wicket place release {}", fmt_time(next), n.id);
-            }
-            println!(
-                "the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it",
-                fmt_time(lease_until)
-            );
-            Ok(())
-        }
-        PlaceCmd::Release { common, id } => {
-            let o = owner(&common);
-            let p = Placer::new(
-                provider(&common, VultrConfig::default())?,
-                envelope::DenyAll,
-                o,
-                MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
-            );
-            let id = NodeId(id);
-            let node = p.get(&id).await?;
-            match p.release(&id, ReleaseMode::Now).await? {
-                Released::AlreadyGone => println!("{id} is already gone"),
-                r => println!("{id}: {r:?}"),
-            }
-            let mut ledger = Ledger::open(&crate::ledger_path())?;
-            ledger.placed_node_ended(&id.0, "released", "released by wicket place release")?;
-            if let Some(n) = node {
-                ledger.audit(&TenantId::single(), None, "placement.node_released", &serde_json::json!({ "id": id.0, "name": n.name }))?;
-                if retire_enrolment(&mut ledger, &n)? {
-                    println!("revoked node {}", n.name);
-                }
-            }
-            Ok(())
+/// The provider half of `wicket node list --provider`: this installation's instances (by owner tag)
+/// as the provider sees them, with their cost, lease and next paid hour.
+pub async fn list_provider(common: &Common) -> Result<()> {
+    let o = owner(common);
+    let p = Placer::new(
+        provider(common, VultrConfig::default())?,
+        envelope::DenyAll,
+        o.clone(),
+        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
+    );
+    let nodes = p.list().await?;
+    let ledger = Ledger::open(&crate::ledger_path())?;
+    let now = wicket_store::now();
+    for n in &nodes {
+        let placed = ledger.placed_node(&n.id.0)?;
+        let capacity = ledger.leases(wicket_store::LIVE_LEASES)?.iter().any(|l| l.node_id.as_deref() == Some(n.id.0.as_str()));
+        println!(
+            "{}  {:<16} {:<14} {:<4} {:?}  {}  {}/h  created {}  lease until {}  next paid hour {}",
+            n.id,
+            n.name,
+            n.plan.as_deref().unwrap_or("?"),
+            n.region.as_deref().unwrap_or("?"),
+            n.state,
+            n.ssh_target.as_deref().unwrap_or("-"),
+            n.billing.hourly_rate(),
+            fmt_time(n.created_at),
+            n.lease_until.map(fmt_time).unwrap_or_else(|| "-".into()),
+            p.next_paid_hour_at(n).map(fmt_time).unwrap_or_else(|| "-".into()),
+        );
+        let note = lease_note(n, placed.as_ref(), capacity, now);
+        if !note.is_empty() {
+            println!("  ! {note}");
         }
     }
+    println!("{} node(s) tagged {}", nodes.len(), o.tag());
+    Ok(())
+}
+
+/// `wicket node create`.
+pub async fn create(args: CreateArgs) -> Result<()> {
+    let CreateArgs {
+        common,
+        name,
+        hosts,
+        region,
+        plan,
+        vcpus,
+        memory_mib,
+        lifetime,
+        max_node_hourly,
+        max_hourly,
+        max_total,
+        ssh_key_ids,
+        ssh_key,
+        os_id,
+        idempotency_key,
+        no_enrol,
+        ca_ttl,
+        give_up_silent,
+    } = args;
+    crate::enrol::validate_name(&name)?;
+    if !no_enrol {
+        wicket_proxy::ca::permitted_dns_subtrees(&hosts)?;
+    }
+    // Before anything is created or spent: the node is reached with this key now and on every
+    // later run (enrolment records its path), by whoever runs wicket here. Through wicketd that is
+    // the wicket user, which can't read a key in the caller's home.
+    if let Some(k) = &ssh_key {
+        std::fs::File::open(k).with_context(|| {
+            format!(
+                "reading the ssh key {} (on an installed host wicket reaches nodes as the wicket user: keep the key where it can read it, e.g. /var/lib/wicket/ssh/, owned by wicket, mode 0600)",
+                k.display()
+            )
+        })?;
+    }
+    let lifetime = humantime::parse_duration(&lifetime)?;
+    let ca_ttl = humantime::parse_duration(&ca_ttl)?;
+    let owner_name = owner_name(&common);
+    let o = Owner::new(&owner_name);
+    let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
+    let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
+    let placer = Placer::new(provider(&common, config)?, TerminalApprover, o.clone(), envelope);
+
+    let host_key = boot::generate_host_key(&format!("wicket-node-{name}")).await?;
+    let user_data = boot::cloud_config(boot::NODE_SETUP, &host_key)?;
+    let pinned = host_key.public.clone();
+    drop(host_key);
+    let req = CapacityRequest {
+        resources: Resources { vcpus, memory_mib },
+        min_isolation: IsolationTier::Gvisor,
+        region_hint: Some(region),
+        plan_hint: plan,
+        max_hourly: max_node_hourly.as_deref().map(dollars).transpose()?,
+        lifetime_secs: lifetime.as_secs() as i64,
+        // What a retry matches on (hashed into the instance's tag): kept from before the rename, so a
+        // create retried across it still finds its node.
+        idempotency_key: idempotency_key.unwrap_or_else(|| format!("place-create:{name}")),
+        name: name.clone(),
+        purpose: format!("wicket node create {name}"),
+        boot: Some(Boot { user_data, host_key: pinned.clone() }),
+    };
+    let n = placer.acquire(&req).await?;
+    // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
+    let lease_until = n.lease_until.unwrap_or(n.created_at + req.lifetime_secs);
+    Ledger::open(&crate::ledger_path())?.record_placed_node(&wicket_store::PlacedNodeRow {
+        id: n.id.0.clone(),
+        backend: n.backend.clone(),
+        name: name.clone(),
+        owner: owner_name.clone(),
+        api_key_secret: common.api_key_secret.clone(),
+        created_at: n.created_at,
+        lease_until,
+        status: String::new(),
+        held_by: None,
+        ended_at: None,
+        detail: None,
+        hourly: Some(n.billing.hourly_rate().0 as i64),
+    })?;
+    println!("created {} ({}), {}/h, lease until {}", n.id, name, n.billing.hourly_rate(), n.lease_until.map(fmt_time).unwrap_or_default());
+    if n.host_key.as_deref() != Some(pinned.as_str()) {
+        bail!(
+            "{} already existed for this idempotency key and its pinned host key isn't known here: enrol it with `wicket node enrol` and a key from elsewhere, or release it",
+            n.id
+        );
+    }
+
+    Ledger::open(&crate::ledger_path())?.audit(
+        &TenantId::single(),
+        None,
+        "placement.node_created",
+        &serde_json::json!({ "backend": n.backend, "id": n.id.0, "name": name, "plan": n.plan, "region": n.region,
+                             "hourly_usd_micros": n.billing.hourly_rate().0, "lease_until": n.lease_until, "owner": o.tag() }),
+    )?;
+    let hosts = (!no_enrol).then_some(hosts);
+    let wait = boot::ReadyWait { silent_limit: humantime::parse_duration(&give_up_silent)?, ..boot::ReadyWait::default() };
+    let ready =
+        bring_up_or_release::<_, boot::SshProbe>(&placer, &crate::ledger_path(), &n, &name, &pinned, ssh_key, hosts, ca_ttl, &wait, None)
+            .await?;
+    if let Some(next) = placer.next_paid_hour_at(&ready) {
+        println!("next paid hour starts {}; release before then: wicket node release {}", fmt_time(next), n.id);
+    }
+    println!("the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it", fmt_time(lease_until));
+    Ok(())
+}
+
+/// The provider's instance id for `arg`: the id of the active node `create` recorded under that
+/// name, else `arg` itself (an instance id).
+fn instance_id(l: &Ledger, arg: &str) -> Result<String> {
+    Ok(l.placed_nodes(&["active"])?.into_iter().find(|r| r.name == arg).map(|r| r.id).unwrap_or_else(|| arg.to_string()))
+}
+
+/// `wicket node release`: destroys an owned node now (by its instance id, or the name `create` gave
+/// it), refusing anything without the owner tag, and revokes its enrolment.
+pub async fn release(common: Common, id: String) -> Result<()> {
+    let o = owner(&common);
+    let p = Placer::new(
+        provider(&common, VultrConfig::default())?,
+        envelope::DenyAll,
+        o,
+        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
+    );
+    let id = NodeId(instance_id(&Ledger::open(&crate::ledger_path())?, &id)?);
+    let node = p.get(&id).await?;
+    match p.release(&id, ReleaseMode::Now).await? {
+        Released::AlreadyGone => println!("{id} is already gone"),
+        r => println!("{id}: {r:?}"),
+    }
+    let mut ledger = Ledger::open(&crate::ledger_path())?;
+    ledger.placed_node_ended(&id.0, "released", "released by wicket node release")?;
+    if let Some(n) = node {
+        ledger.audit(&TenantId::single(), None, "placement.node_released", &serde_json::json!({ "id": id.0, "name": n.name }))?;
+        if retire_enrolment(&mut ledger, &n)? {
+            println!("revoked node {}", n.name);
+        }
+    }
+    Ok(())
 }
 
 /// After a Vultr node is created: waits until it is active and its setup has finished (logging in with
@@ -474,7 +499,7 @@ async fn bring_up_with<Q: boot::Probe>(
 ) -> Result<(NodeHandle, String)> {
     let ready = match p.wait_active(id, wait.poll.min(Duration::from_secs(5)), Duration::from_secs(600)).await {
         Ok(r) => r,
-        Err(e) => return Err(e.context(format!("{id} is still billing: `wicket place release {id}`"))),
+        Err(e) => return Err(e.context(format!("{id} is still billing: `wicket node release {id}`"))),
     };
     let target = ready.ssh_target.clone().context("no address")?;
     println!(
@@ -490,12 +515,17 @@ async fn bring_up_with<Q: boot::Probe>(
         if e.downcast_ref::<boot::Unreachable>().is_some() {
             return Err(e);
         }
-        return Err(e.context(format!("{id} is still billing: `wicket place release {id}`")));
+        return Err(e.context(format!("{id} is still billing: `wicket node release {id}`")));
     }
     if let Some(hosts) = hosts {
         let ledger = Ledger::open(&crate::ledger_path())?;
         let token = ledger.create_node_token(&TenantId::single(), name, 600)?;
-        ledger.audit(&TenantId::single(), None, "node.token", &serde_json::json!({ "name": name, "ttl_secs": 600, "by": "place" }))?;
+        ledger.audit(
+            &TenantId::single(),
+            None,
+            "node.token",
+            &serde_json::json!({ "name": name, "ttl_secs": 600, "by": "node create" }),
+        )?;
         drop(ledger); // enrol opens its own
         crate::enrol::enrol(crate::enrol::EnrolOpts {
             target: target.clone(),
@@ -544,13 +574,13 @@ pub async fn give_up_unreachable<A: envelope::SpendApprover>(
         eprintln!("warning: could not audit giving up on {id}: {e:#}");
     }
     if released.is_ok() {
-        if let Err(e) = ledger.placed_node_ended(&id.0, "released", &format!("released by wicket place create: {why}")) {
+        if let Err(e) = ledger.placed_node_ended(&id.0, "released", &format!("released by wicket node create: {why}")) {
             eprintln!("warning: could not record {id} as released: {e:#}");
         }
     }
     match released {
         Ok(_) => anyhow::anyhow!("{why}: released {id} ({}) rather than leave it billing", node.name),
-        Err(e) => anyhow::anyhow!("{why}, and releasing it failed ({e}): {id} is still billing: `wicket place release {id}`"),
+        Err(e) => anyhow::anyhow!("{why}, and releasing it failed ({e}): {id} is still billing: `wicket node release {id}`"),
     }
 }
 
@@ -663,7 +693,7 @@ mod tests {
             lifetime_secs: 3600,
             idempotency_key: format!("place-create:{name}"),
             name: name.into(),
-            purpose: format!("wicket place create {name}"),
+            purpose: format!("wicket node create {name}"),
             boot: Some(Boot { user_data: "#cloud-config\n{}\n".into(), host_key: PINNED.into() }),
         }
     }
@@ -782,16 +812,74 @@ mod tests {
             held_by: None,
             ended_at: None,
             detail: None,
+            hourly: None,
         };
         assert_eq!(lease_note(&n, Some(&row), false, 2999), "");
         let idle = lease_note(&n, Some(&row), false, 3000);
         assert!(idle.starts_with("PAST ITS LEASE") && idle.contains("releases it at its next pass"), "{idle}");
         row.held_by = Some("run_a".into());
         let held = lease_note(&n, Some(&row), false, 3000);
-        assert!(held.contains("still held by run run_a") && held.contains("wicket place release i-1"), "{held}");
+        assert!(held.contains("still held by run run_a") && held.contains("wicket node release i-1"), "{held}");
         assert!(lease_note(&n, None, true, 3000).contains("capacity lease"));
         assert!(lease_note(&n, None, false, 3000).contains("nothing releases it"));
         n.lease_until = None;
         assert_eq!(lease_note(&n, None, false, 3000), "");
+    }
+
+    /// #358: `node list` shows each node's lease, provider and cost, and the leased nodes not enrolled.
+    #[test]
+    fn node_list_shows_lease_provider_and_cost() {
+        let l = Ledger::open_in_memory().unwrap();
+        let placed = |id: &str, name: &str, until: i64| wicket_store::PlacedNodeRow {
+            id: id.into(),
+            backend: "vultr".into(),
+            name: name.into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: 0,
+            lease_until: until,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+            hourly: Some(14_000),
+        };
+        l.record_placed_node(&placed("i-1", "n1", 3000)).unwrap();
+        l.record_placed_node(&placed("i-2", "n2", 3000)).unwrap();
+        let s = lease_summary(&l, "n1", 100).unwrap().unwrap();
+        assert!(s.starts_with("lease until") && s.contains("provider vultr instance i-1") && s.contains("$0.0140/h"), "{s}");
+        assert!(s.contains("wicket node release n1"), "{s}");
+        assert!(lease_summary(&l, "n1", 3000).unwrap().unwrap().starts_with("PAST ITS LEASE"));
+        // An enrolled machine with no lease has nothing to say.
+        assert_eq!(lease_summary(&l, "own", 100).unwrap(), None);
+        // A run's capacity lease, by its node's enrolled name.
+        let mut l = l;
+        let row = wicket_store::LeaseRow {
+            id: "l-a".into(),
+            tenant: TenantId::single().0,
+            run: "run_a".into(),
+            request_id: None,
+            provider: "vultr".into(),
+            spec: serde_json::json!({}),
+            hourly_cap: 20_000,
+            reserved: 20_000,
+            duration_secs: 1800,
+            created_at: 0,
+            not_after: None,
+            status: "pending".into(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        };
+        l.create_lease(&row, wicket_store::LeaseBudget { max_hourly: 1_000_000, max_total: 1_000_000 }).unwrap().unwrap();
+        // Not enrolled yet: n2 (placed) and the pending lease are listed on their own.
+        let un = leased_not_enrolled(&l, &["n1".to_string()], 100).unwrap();
+        assert_eq!(un.len(), 2, "{un:?}");
+        assert!(un[0].starts_with("n2  not enrolled") && un[0].contains("i-2"), "{un:?}");
+        assert!(un[1].contains("capacity lease l-a for run run_a") && un[1].contains("at most $0.0200/h"), "{un:?}");
     }
 }

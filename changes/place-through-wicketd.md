@@ -2,7 +2,7 @@
 area: Placement
 type: Fixed
 ---
-- `wicket place create` on an installed host asks for the spend on the caller's terminal (through wicketd it
+- `wicket node create` on an installed host asks for the spend on the caller's terminal (through wicketd it
   used to refuse every time: "no terminal to ask on"), and refuses an ssh key the `wicket` user can't read
   before it creates anything. The how-to keeps the placement key under `/var/lib/wicket/ssh/`.
 - `wicket image` on an installed version (a control host, or a node after `wicket node install`) builds

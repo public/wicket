@@ -25,6 +25,7 @@ mod mock;
 mod node;
 mod nodeauth;
 mod nodecall;
+mod nodecreate;
 mod noderun;
 mod nodesecrets;
 mod nodesrv;
@@ -32,7 +33,6 @@ mod oci;
 mod operators;
 mod owner;
 mod pin;
-mod place;
 mod policy;
 mod program;
 mod quotas;
@@ -377,17 +377,12 @@ enum Cmd {
         #[arg(long)]
         image: Option<String>,
     },
-    /// Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node
-    /// key and a name-constrained node CA; listing, revoking, renewing the CA.
+    /// Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or
+    /// your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a
+    /// name-constrained node CA); listing with leases and cost, revoking, renewing the CA.
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
-    },
-    /// Nodes from a provider (#37): Vultr plans, owned nodes, create inside a money envelope with a
-    /// terminal approval and enrol with the host key pinned at creation, release.
-    Place {
-        #[command(subcommand)]
-        cmd: place::PlaceCmd,
     },
     /// Development helpers.
     Dev {
@@ -621,7 +616,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Image { .. } | Cmd::Doctor { .. }) => cmd::image::dispatch(c).await,
         c @ Cmd::Zone { .. } => cmd::zone::dispatch(c).await,
         c @ (Cmd::Policy { .. } | Cmd::State { .. } | Cmd::Keys { .. }) => cmd::policy::dispatch(c).await,
-        c @ (Cmd::Node { .. } | Cmd::Place { .. } | Cmd::Lease { .. } | Cmd::Reconcile { .. }) => cmd::node::dispatch(c).await,
+        c @ (Cmd::Node { .. } | Cmd::Lease { .. } | Cmd::Reconcile { .. }) => cmd::node::dispatch(c).await,
         c @ Cmd::Itself { .. } => cmd::itself::dispatch(c).await,
         c @ (Cmd::Serve { .. } | Cmd::Operator { .. } | Cmd::Program { .. }) => cmd::operator::dispatch(c).await,
         c @ Cmd::Dev { .. } => cmd::dev::dispatch(c).await,

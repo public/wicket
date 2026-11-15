@@ -239,13 +239,13 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
-// A node from `wicket place create` (#294): past its lease it is released by the reconciler, unless
+// A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
   const d = el("div", "row");
   d.append(el("span", "mono", strip(p.name + " " + p.id)));
   if (!p.past_lease) d.append(el("span", "", "lease until " + when(p.lease_until)));
-  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket place release " + strip(p.id) + ")"));
+  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket node release " + strip(p.id) + ")"));
   else d.append(el("span", "pend", "past its lease (" + when(p.lease_until) + "): released at the reconciler's next pass"));
   return d;
 }
