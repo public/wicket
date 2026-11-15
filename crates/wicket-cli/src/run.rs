@@ -1962,11 +1962,22 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         {
             Ok(()) => fetched = true,
             Err(e) => {
-                println!("[wicket] fetching the box's files from node {node_name} failed: {e:#} (they stay there)");
+                // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
+                let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
+                println!("[wicket] {msg}");
+                eprintln!("[wicket] {msg}");
+                let _ = ledger.lock().expect("ledger").audit(
+                    &m.tenant,
+                    Some(&run),
+                    "run.fetch_failed",
+                    &serde_json::json!({ "node": node_name, "error": format!("{e:#}") }),
+                );
                 if hibernating {
                     hibernating = false;
                     set_state("failed", Some(&format!("hibernate failed: fetching its state from node {node_name}: {e:#}")));
                     status = format!("failed (hibernate: fetching its state: {e})");
+                } else {
+                    status = format!("failed (fetching its files from node {node_name}: {e})");
                 }
             }
         }
@@ -2189,16 +2200,47 @@ async fn fetch_trees(stopper: &Stopper, f: Fetch<'_>) -> Result<()> {
     for (tree, _) in &wanted {
         calls.get_tree(run, tree, &staging.join(tree)).await?;
     }
+    // Nothing here is replaced until every tree has come back whole (#300): a node that sends back
+    // less than the box started with fails the fetch, and keeps its copy (it isn't forgotten).
+    let ws_dest = in_place.map_or_else(|| dir.join("workspace"), Path::to_path_buf);
+    if !same_dir {
+        check_fetched("workspace", &ws_dest, &ws_staged, &["out"])?;
+    }
+    for (tree, dest) in &wanted {
+        check_fetched(tree, dest, &staging.join(tree), &[])?;
+    }
     match (in_place, same_dir) {
         (_, true) => {}
         (Some(w), false) => crate::hibernate::sync_dir(&ws_staged, w, &["out"])?,
-        (None, false) => crate::hibernate::sync_dir(&ws_staged, &dir.join("workspace"), &[])?,
+        (None, false) => crate::hibernate::sync_dir(&ws_staged, &ws_dest, &[])?,
     }
     for (tree, dest) in &wanted {
         crate::hibernate::sync_dir(&staging.join(tree), dest, &[])?;
     }
     let _ = std::fs::remove_dir_all(&staging);
     println!("[wicket] fetched the box's files from its node in {} ms", t0.elapsed().as_millis());
+    Ok(())
+}
+
+/// Refuses a fetched tree that came back empty (less the top-level names in `skip`) when the copy
+/// here, the one the box started from, wasn't (#300): a node that lost the box's files, or answered
+/// for a tree it doesn't hold, must not replace them here with nothing. (A box that really emptied
+/// its workspace is told apart by hand: the node keeps its copy.)
+fn check_fetched(tree: &str, here: &Path, got: &Path, skip: &[&str]) -> Result<()> {
+    let names = |d: &Path| -> Vec<std::ffi::OsString> {
+        let Ok(rd) = std::fs::read_dir(d) else { return vec![] };
+        rd.flatten().map(|e| e.file_name()).filter(|n| !skip.iter().any(|s| std::ffi::OsStr::new(s) == n)).collect()
+    };
+    let had = names(here);
+    if names(got).is_empty() && !had.is_empty() {
+        bail!(
+            "the node sent back an empty {tree}{}, but the box started with {} entries in it (such as {}): \
+             nothing here was replaced",
+            if skip.is_empty() { String::new() } else { format!(" (apart from {})", skip.join(", ")) },
+            had.len(),
+            had[0].to_string_lossy()
+        );
+    }
     Ok(())
 }
 
@@ -2322,6 +2364,32 @@ fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fetch_that_brings_back_less_than_the_box_started_with_fails() {
+        let base = std::env::temp_dir().join(format!("wicket-fetch-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (here, got) = (base.join("here"), base.join("got"));
+        std::fs::create_dir_all(here.join("wicket/.git")).unwrap();
+        std::fs::create_dir_all(here.join("out")).unwrap();
+        std::fs::write(here.join("out/result.json"), "{}").unwrap();
+        // #300: the node's copy held only the outbox.
+        std::fs::create_dir_all(got.join("out")).unwrap();
+        std::fs::write(got.join("out/result.json"), "{}").unwrap();
+        let e = check_fetched("workspace", &here, &got, &["out"]).unwrap_err().to_string();
+        assert!(e.contains("empty workspace") && e.contains("wicket"), "{e}");
+        // Nothing at all came back (a tree the node doesn't hold): the same.
+        assert!(check_fetched("workspace", &here, &base.join("missing"), &["out"]).is_err());
+        assert!(check_fetched("state", &here, &base.join("missing"), &[]).is_err());
+        // What the box left, however different: fine.
+        std::fs::write(got.join("NOTES.md"), "x").unwrap();
+        check_fetched("workspace", &here, &got, &["out"]).unwrap();
+        // A box that started from an empty tree may well leave one.
+        let empty = base.join("empty");
+        std::fs::create_dir_all(empty.join("out")).unwrap();
+        check_fetched("workspace", &empty, &base.join("missing"), &["out"]).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_lingering_harness_is_named_in_the_note() {

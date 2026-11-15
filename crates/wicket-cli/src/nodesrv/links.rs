@@ -3,6 +3,7 @@
 use super::*;
 
 /// `Msg::PutTree` (`put`) or `Msg::GetTree`: one of a run's trees as a tar archive on tunnel `stream`.
+/// A get of a tree this node doesn't hold is refused, never answered with an empty archive.
 pub(super) fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u64, run: &str, tree: &str, put: bool) {
     if stream & TUNNEL_BIT == 0 || stream & chan::CONTROL_TUNNEL_BIT == 0 {
         return;
@@ -10,7 +11,14 @@ pub(super) fn transfer(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, stream: u6
     let out = node.links.lock().expect("links").get(&gen).map(|l| l.out.clone());
     let Some(out) = out else { return };
     let spawned = tree_dir(&node.paths, run, tree).and_then(|d| {
-        std::fs::create_dir_all(&d)?;
+        if put {
+            std::fs::create_dir_all(&d)?;
+        } else if !d.is_dir() {
+            // Never made up (#300): an empty archive of a tree this node doesn't hold (forgotten,
+            // or never laid out here) would read as a box that left nothing, and replace the
+            // control host's copy with nothing.
+            bail!("run {run} has no {tree} on node {}", node.name);
+        }
         let mut c = tokio::process::Command::new("tar");
         c.arg("-C").arg(&d).stderr(std::process::Stdio::null()).kill_on_drop(true);
         if put {

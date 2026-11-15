@@ -12,12 +12,22 @@
 //!   root-signed re-genesis that recovers a control plane restored from an old backup.
 //! - **Delta**: the next epoch exactly (`replay` / `gap`), `prev` equal to the head held (`fork`),
 //!   and the same version as the state.
-//! - **Freshness statement**: `issued_at` strictly after the last statement's (`replay`), epoch not
-//!   below the last statement's under the same version (`rollback`), not issued more than
+//! - **Freshness statement**: epoch not below the last statement's under the same version
+//!   (`rollback`), not issued more than
 //!   [`ReplicaConfig::future_tolerance_ms`] in the future, not already expired, TTL within the certificate's cap (`too_long`). A statement naming an epoch the node already holds
 //!   (deltas committed after it was signed arrived first) is accepted only if its head equals the
 //!   node's recorded head at that epoch (a ring of [`crate::HEADS_KEPT`]): a different head is a
 //!   `fork`, an epoch older than the ring a `rollback`.
+//! - **Replay and superseded statements** (#300): a statement whose `issued_at` equals the newest
+//!   one accepted (the floor) is that statement again, refused (`replay`). One that passes every
+//!   check above but was issued *before* the floor is *superseded*: never applied, the
+//!   floor never moves back, and it is not refused either. Several processes publish to one node (each
+//!   run, each link relay), each over its own connection; they sign under one lock, so their times
+//!   are distinct and rise with the epoch, but the node can receive them in any order. A statement
+//!   signed before the newest one held carries nothing the node lacks (its deadlines and epoch are
+//!   at most the newer one's), so dropping it loses nothing, and refusing it would report an honest
+//!   interleaving as a replay. A replayed statement gets the same treatment: it can never take
+//!   effect, which is what replay protection is for. Counted in [`Stats::superseded`].
 //!
 //! # Effective deadlines (clock-skew guard)
 //!
@@ -135,6 +145,8 @@ pub enum Escalation<'a> {
 pub struct Stats {
     pub accepted: BTreeMap<&'static str, u64>,
     pub refused: BTreeMap<&'static str, u64>,
+    /// Statements that verified but were signed before the newest one held: not applied (#300).
+    pub superseded: u64,
     pub last_refusal: Option<String>,
 }
 
@@ -221,9 +233,19 @@ pub struct Replica<P: Policy> {
 enum Plan<P: Policy> {
     None,
     Key(Cert),
-    Snap { s: Snapshot<P>, jws: String, keep_heads: bool },
-    Delta { d: Delta<P>, jws: String, head: String },
+    Snap {
+        s: Snapshot<P>,
+        jws: String,
+        keep_heads: bool,
+    },
+    Delta {
+        d: Delta<P>,
+        jws: String,
+        head: String,
+    },
     Fresh(Statement),
+    /// A valid statement not newer than the one held: nothing to apply.
+    Superseded,
 }
 
 impl<P: Policy> Replica<P>
@@ -442,7 +464,12 @@ impl<P: Policy> Replica<P> {
 
     /// Verifies one frame; if it is acceptable, persists it, then applies it.
     pub fn accept(&mut self, frame: &Frame, now: i64) -> Result<(), Refusal> {
-        let r = self.plan(frame, now).and_then(|p| self.commit(p));
+        let r = self.plan(frame, now).and_then(|p| {
+            if matches!(p, Plan::Superseded) {
+                self.stats.superseded += 1;
+            }
+            self.commit(p)
+        });
         self.count(Some(frame.kind), &r);
         r
     }
@@ -591,10 +618,15 @@ impl<P: Policy> Replica<P> {
         if f.version != cert.version {
             return Err(Refusal::WrongVersion { want: cert.version, got: f.version });
         }
-        if f.issued_at <= self.issued_floor {
-            return Err(Refusal::Replay(format!("statement issued_at {} not after {}", f.issued_at, self.issued_floor)));
+        // Publishers never sign two statements with one time (they share it under the feed's lock),
+        // so one at the floor is the newest statement again: a replay.
+        if f.issued_at == self.issued_floor {
+            return Err(Refusal::Replay(format!("statement issued_at {} already held", f.issued_at)));
         }
-        if let Some(last) = &self.fresh {
+        // Signed before the newest statement held (another publisher's, delivered late, or an older
+        // replay): checked like any other below, then dropped, never applied.
+        let superseded = f.issued_at < self.issued_floor;
+        if let Some(last) = self.fresh.as_ref().filter(|_| !superseded) {
             if f.version == last.f.version && f.epoch < last.f.epoch {
                 return Err(Refusal::Rollback(format!("statement epoch {} < the last statement's {}", f.epoch, last.f.epoch)));
             }
@@ -622,6 +654,9 @@ impl<P: Policy> Replica<P> {
                 }
             }
         }
+        if superseded {
+            return Ok(Plan::Superseded);
+        }
         let cert = cert.clone();
         Ok(Plan::Fresh(Statement::new(f, jws.into(), now, &cert)))
     }
@@ -629,7 +664,7 @@ impl<P: Policy> Replica<P> {
     fn commit(&mut self, plan: Plan<P>) -> Result<(), Refusal> {
         let io = |e: std::io::Error| Refusal::Storage(e.to_string());
         match plan {
-            Plan::None => Ok(()),
+            Plan::None | Plan::Superseded => Ok(()),
             Plan::Key(c) => {
                 if let Some(dir) = &self.dir {
                     write_atomic(&dir.join(CERT), c.jws.as_bytes()).map_err(io)?;
