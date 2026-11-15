@@ -280,13 +280,14 @@ pub fn subtree_permits(subtree: &str, host: &str) -> bool {
 }
 
 /// The node's forwarding rule. It never terminates TLS for:
-/// - a host with an `inject` rule whose secret isn't sealed to the node ([`route_sealed`]), or a
-///   credential swap;
+/// - a host with an `inject` rule whose secret isn't sealed to the node ([`route_sealed`]);
+/// - a host a control host before protocol 10 swaps a credential in for itself (`kept`); since
+///   #257 a node makes a box's swaps itself, and decides their hosts like any other;
 /// - a host outside the node CA's name constraints (e.g. one approved later under
 ///   `unlisted_hosts: escalate`): a leaf for it wouldn't verify anyway;
 /// - anything at all once the node CA has expired, or without one: never mint.
-pub fn route(host: &str, zone: &ZoneSpec, swaps: &[crate::CredentialSwap], ca: Option<(&[String], i64)>, now_secs: i64) -> Route {
-    route_sealed(host, zone, swaps, ca, now_secs, &|_| false)
+pub fn route(host: &str, zone: &ZoneSpec, kept: &[String], ca: Option<(&[String], i64)>, now_secs: i64) -> Route {
+    route_sealed(host, zone, kept, ca, now_secs, &|_| false)
 }
 
 /// [`route`] on a node that holds some secrets sealed to it (#152): a host whose `inject` rules all
@@ -295,7 +296,7 @@ pub fn route(host: &str, zone: &ZoneSpec, swaps: &[crate::CredentialSwap], ca: O
 pub fn route_sealed(
     host: &str,
     zone: &ZoneSpec,
-    swaps: &[crate::CredentialSwap],
+    kept: &[String],
     ca: Option<(&[String], i64)>,
     now_secs: i64,
     held: &dyn Fn(&str) -> bool,
@@ -304,7 +305,7 @@ pub fn route_sealed(
     if zone.inject.iter().any(|r| host_matches(&r.host, host) && !held(&r.secret)) {
         return Route::Forward("the zone injects a credential for this host".into());
     }
-    if swaps.iter().any(|s| host_matches(&s.host, host)) {
+    if kept.iter().any(|h| host_matches(h, host)) {
         return Route::Forward("a credential is swapped for this host".into());
     }
     match ca {
@@ -394,14 +395,9 @@ mod tests {
         let ca = Some((&permitted[..], 2_000));
         assert_eq!(route("api.example.com", &z, &[], ca, 1_000), Route::Terminate);
         assert!(matches!(route("secret.example.com", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("injects")));
-        let swap = crate::CredentialSwap {
-            box_bearers: false,
-            name: "login".into(),
-            host: "api.example.com".into(),
-            placeholder: "p".into(),
-            real: crate::SwapSource::Value("v".into()),
-        };
-        assert!(matches!(route("api.example.com", &z, &[swap], ca, 1_000), Route::Forward(r) if r.contains("swapped")));
+        // A control host before #257 swaps its hosts itself: forwarded to it.
+        let kept = ["api.example.com".to_string()];
+        assert!(matches!(route("api.example.com", &z, &kept, ca, 1_000), Route::Forward(r) if r.contains("swapped")));
         assert!(matches!(route("later.example.net", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("name constraints")));
         assert!(matches!(route("api.example.com", &z, &[], ca, 2_000), Route::Forward(r) if r.contains("expired")));
         assert!(matches!(route("api.example.com", &z, &[], None, 0), Route::Forward(_)));
