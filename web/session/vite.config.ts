@@ -5,7 +5,7 @@ import vue from '@vitejs/plugin-vue';
 // (crates/wicket-cli/build.rs). One script and one stylesheet with fixed names: the binary names them
 // by content hash and serves them with Subresource Integrity under the console's CSP (no inline
 // script or style, no eval). No source maps, no code splitting, nothing inlined.
-export default defineConfig({
+export default defineConfig(({ isSsrBuild }) => ({
   base: '/static/',
   plugins: [vue()],
   build: {
@@ -15,7 +15,8 @@ export default defineConfig({
     assetsInlineLimit: 0,
     sourcemap: false,
     cssCodeSplit: false,
-    rolldownOptions: {
+    // The node check (`npm run check:build`, an SSR build of check/check.ts) keeps its own name.
+    rolldownOptions: isSsrBuild ? {} : {
       output: {
         entryFileNames: 'session.js',
         chunkFileNames: 'session-[name].js',
@@ -24,4 +25,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
