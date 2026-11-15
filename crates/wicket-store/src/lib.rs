@@ -70,8 +70,10 @@ pub enum StoreError {
 /// (expand) adds `messages.to_principal`: messages are addressed to principals, not runs (#250).
 /// Version 5 (expand) adds the agent-to-agent protocol's record (#252): `messages.from_principal`
 /// (the reply address), `messages.priority`, `messages.in_reply_to`, the `message_refusals` table,
-/// and `runs.activity` (busy, idle, waiting) for presence.
-pub const SCHEMA_VERSION: u32 = 5;
+/// and `runs.activity` (busy, idle, waiting) for presence. Version 6 (expand) adds
+/// `runs.uncollected`: the node keeping a run's files that a fetch didn't bring back (#300, #324),
+/// which holds the node.
+pub const SCHEMA_VERSION: u32 = 6;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -242,7 +244,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
-  authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER
+  authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER, uncollected TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -418,6 +420,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity_at INTEGER", []);
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_sent ON messages (from_principal, created_at)")?;
+        // Ledgers created before a run's uncollected files held its node (#300, #324).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 

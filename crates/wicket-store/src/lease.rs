@@ -336,6 +336,27 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Records that node `node` keeps `run`'s files because a fetch didn't bring them back (#300),
+    /// or (None) that they have been collected. While recorded, the run holds the node: the
+    /// reconciler doesn't release it ([`Ledger::uncollected_runs_on_node`], #324).
+    pub fn set_run_uncollected(&self, run: &str, node: Option<&str>) -> Result<()> {
+        self.conn.execute("UPDATE runs SET uncollected = ?2 WHERE id = ?1", params![run, node])?;
+        Ok(())
+    }
+
+    /// Forgets every run's uncollected files on node `node`: a human released the node, files
+    /// and all (`wicket place release`). Returns how many runs had some.
+    pub fn forget_uncollected_on_node(&self, node: &str) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE runs SET uncollected = NULL WHERE uncollected = ?1", params![node])?)
+    }
+
+    /// Runs whose files node `node` (by its enrolled name) keeps uncollected, oldest first.
+    pub fn uncollected_runs_on_node(&self, node: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT id FROM runs WHERE uncollected = ?1 ORDER BY started_at, id")?;
+        let rows = st.query_map(params![node], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- nodes made by `wicket place create` (#294) ----
 
     /// Records a node `wicket place create` made (again: a retried create updates its lease end and
@@ -580,5 +601,15 @@ mod tests {
         assert_eq!(l.running_runs_on_node("n1").unwrap(), vec!["run_a".to_string()]);
         l.run_ended(&RunId("run_a".into()), "succeeded", "").unwrap();
         assert!(l.running_runs_on_node("n1").unwrap().is_empty());
+        // A run whose files a fetch didn't bring back holds its node until they are collected.
+        assert!(l.uncollected_runs_on_node("n1").unwrap().is_empty());
+        l.set_run_uncollected("run_a", Some("n1")).unwrap();
+        assert_eq!(l.uncollected_runs_on_node("n1").unwrap(), vec!["run_a".to_string()]);
+        assert!(l.uncollected_runs_on_node("n2").unwrap().is_empty());
+        l.set_run_uncollected("run_a", None).unwrap();
+        assert!(l.uncollected_runs_on_node("n1").unwrap().is_empty());
+        l.set_run_uncollected("run_a", Some("n1")).unwrap();
+        assert_eq!(l.forget_uncollected_on_node("n1").unwrap(), 1);
+        assert!(l.uncollected_runs_on_node("n1").unwrap().is_empty());
     }
 }

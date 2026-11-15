@@ -83,3 +83,23 @@ fn superseded_statements_never_take_effect_and_replays_are_still_refused() {
     assert_eq!(r.stats.superseded, 1);
     assert_eq!((r.last_statement().cloned(), r.fresh_until()), held);
 }
+
+/// Each run commits its own deltas and sends them over its own connection (#324's simulation found
+/// this): A commits a delta, B (another run, reloading the log) catches the node up through its
+/// connection, carrying A's delta, and A's own copy arrives after. That copy is the delta the node
+/// holds, so it is superseded, not refused as a replay; the chain is unchanged.
+#[test]
+fn a_delta_another_publishers_catch_up_carried_first_is_not_a_replay() {
+    let (mut cp, mut r) = setup();
+    let t = T0 + 1_000;
+    let from_a = cp.p.commit(vec![add(grant("g-a", &read(), T0 + 3_600_000))], t).unwrap();
+    let mut b = other(&cp, cp.p.last_issued());
+    for f in b.catch_up(&r.hello(), t + 1).unwrap() {
+        r.accept(&f, t + 1).unwrap_or_else(|e| panic!("B's catch-up refused: {e}"));
+    }
+    let (epoch, head) = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    r.accept(&from_a, t + 2).expect("A's own copy is superseded");
+    assert_eq!((r.state().unwrap().epoch, r.state().unwrap().head.clone()), (epoch, head));
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    assert!(r.state().unwrap().grants.contains_key("g-a"));
+}

@@ -9,6 +9,7 @@
 //! - `without_the_spend_journal_a_crashed_node_overspends`: the bug this found, still found.
 
 use std::path::PathBuf;
+use wicket_sim::trace::{replay_command, SCENARIOS};
 use wicket_sim::Options;
 
 /// The seeds every pull request runs.
@@ -22,6 +23,14 @@ fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
+/// The scenarios a run covers: all of them, or `WICKET_SIM_SCENARIO`'s.
+fn scenarios() -> Vec<&'static str> {
+    match std::env::var("WICKET_SIM_SCENARIO") {
+        Ok(s) => vec![SCENARIOS.iter().copied().find(|x| *x == s).unwrap_or_else(|| panic!("no scenario {s:?}: one of {SCENARIOS:?}"))],
+        Err(_) => SCENARIOS.to_vec(),
+    }
+}
+
 #[test]
 fn seeds() {
     let seeds: Vec<u64> = match env_u64("WICKET_SIM_SEEDS") {
@@ -32,27 +41,21 @@ fn seeds() {
         None => FIXED.to_vec(),
     };
     let mut failed = vec![];
-    for seed in seeds {
-        let r = wicket_sim::run(seed, &dir());
-        println!(
-            "seed {seed}: {} faults, {} grant actions, {} decisions, {} model calls, hash {:016x}{}",
-            r.plan.faults.len(),
-            r.stats.grant_actions,
-            r.stats.allowed_reach + r.stats.allowed_grant + r.stats.needs_grant + r.stats.forbidden + r.stats.refused,
-            r.stats.model_ok + r.stats.model_refused,
-            r.hash,
-            if r.ok() { "" } else { " FAILED" }
-        );
-        if !r.ok() {
-            eprintln!("{r}");
-            failed.push(seed);
+    for scenario in scenarios() {
+        for &seed in &seeds {
+            let r = wicket_sim::run_scenario(scenario, seed, &dir(), false);
+            println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
+            if !r.ok() {
+                eprintln!("{r}");
+                failed.push(replay_command(scenario, seed));
+            }
         }
     }
     assert!(
         failed.is_empty(),
         "{} seed(s) broke an invariant:\n{}",
         failed.len(),
-        failed.iter().map(|s| format!("  {}", wicket_sim::replay_command(*s))).collect::<Vec<_>>().join("\n")
+        failed.iter().map(|c| format!("  {c}")).collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -61,23 +64,29 @@ fn replay() {
     let Some(seed) = env_u64("WICKET_SIM_SEED") else {
         return;
     };
-    let r = wicket_sim::run_with(seed, &dir(), Options { keep_trace: true, ..Options::default() });
-    for line in &r.trace {
-        println!("{line}");
+    let mut ok = true;
+    for scenario in scenarios() {
+        let r = wicket_sim::run_scenario(scenario, seed, &dir(), true);
+        for line in &r.trace {
+            println!("{line}");
+        }
+        println!("{r}");
+        ok &= r.ok();
     }
-    println!("{r}");
-    assert!(r.ok(), "seed {seed} broke an invariant");
+    assert!(ok, "seed {seed} broke an invariant");
 }
 
 #[test]
 fn deterministic() {
-    let o = Options { keep_trace: true, ..Options::default() };
-    let a = wicket_sim::run_with(7, &dir().join("a"), o);
-    let b = wicket_sim::run_with(7, &dir().join("b"), o);
-    if a.hash != b.hash {
-        let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
-        panic!("seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
+    for scenario in scenarios() {
+        let a = wicket_sim::run_scenario(scenario, 7, &dir().join("a"), true);
+        let b = wicket_sim::run_scenario(scenario, 7, &dir().join("b"), true);
+        if a.hash != b.hash {
+            let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
+            panic!("{scenario}: seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
+        }
     }
+    let a = wicket_sim::run_with(7, &dir().join("a"), Options { keep_trace: true, ..Options::default() });
     assert!(a.stats.allowed_grant > 0 && a.stats.model_ok > 0, "the scenario exercised grants and the budget: {:?}", a.stats);
 }
 

@@ -149,6 +149,19 @@ pub fn release_placer(owner: &str, secret: &str) -> Result<Placer<VultrProvider,
     ))
 }
 
+/// Refuses a new run on a placed node past its lease (#294, #324): one started there would hold
+/// the node, so it would go on billing past its lease for as long as new runs came. A run already
+/// on it keeps it until it ends; the reconciler releases it then.
+pub fn refuse_past_lease(ledger: &Ledger, node: &str, now: i64) -> Result<()> {
+    if let Some(p) = ledger.placed_nodes(&["active"])?.into_iter().find(|p| p.name == node && p.lease_until <= now) {
+        bail!(
+            "node {node} is past its lease (it ended {}): it takes no new runs, and the reconciler releases it once nothing is on it. Place another node (wicket place create)",
+            fmt_time(p.lease_until)
+        );
+    }
+    Ok(())
+}
+
 /// After a placed node is released: revokes its enrolment, if it is still enrolled under its name
 /// at its address. Returns whether it revoked.
 pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
@@ -430,7 +443,17 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             let mut ledger = Ledger::open(&crate::ledger_path())?;
             ledger.placed_node_ended(&id.0, "released", "released by wicket place release")?;
             if let Some(n) = node {
-                ledger.audit(&TenantId::single(), None, "placement.node_released", &serde_json::json!({ "id": id.0, "name": n.name }))?;
+                // Files of runs a fetch didn't bring back went with it (#300): a human chose that.
+                let lost = ledger.forget_uncollected_on_node(&n.name)?;
+                if lost > 0 {
+                    println!("{} run(s)' uncollected files went with it", lost);
+                }
+                ledger.audit(
+                    &TenantId::single(),
+                    None,
+                    "placement.node_released",
+                    &serde_json::json!({ "id": id.0, "name": n.name, "uncollected_runs_lost": lost }),
+                )?;
                 if retire_enrolment(&mut ledger, &n)? {
                     println!("revoked node {}", n.name);
                 }
@@ -582,6 +605,33 @@ async fn bring_up_or_release<A: envelope::SpendApprover, Q: boot::Probe>(
 
 #[cfg(test)]
 mod tests {
+    /// #324: a placed node past its lease takes no new run; one within it does, and so does a
+    /// node `place create` didn't make.
+    #[test]
+    fn a_placed_node_past_its_lease_takes_no_new_run() {
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        l.record_placed_node(&wicket_store::PlacedNodeRow {
+            id: "i-1".into(),
+            backend: "vultr".into(),
+            name: "build5".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr".into(),
+            created_at: 1_000,
+            lease_until: 4_000,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+        })
+        .unwrap();
+        super::refuse_past_lease(&l, "build5", 3_999).unwrap();
+        let e = super::refuse_past_lease(&l, "build5", 4_000).unwrap_err().to_string();
+        assert!(e.contains("past its lease"), "{e}");
+        super::refuse_past_lease(&l, "elsewhere", 9_000).unwrap();
+        l.placed_node_ended("i-1", "released", "lease ended").unwrap();
+        super::refuse_past_lease(&l, "build5", 9_000).unwrap();
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wicket_placement::envelope::{Approval, SpendApprover, SpendRequest};

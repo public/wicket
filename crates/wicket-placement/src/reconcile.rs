@@ -10,6 +10,11 @@
 //!   `warm_pool` says more work may come and enough paid time is left ([`Action::Pool`]); otherwise it
 //!   is destroyed.
 //! - Two nodes for one lease (two processes raced a create): the oldest is kept, the rest destroyed.
+//! - A node no lease asks for that is younger than [`UNRECORDED_GRACE_SECS`] is left alone
+//!   ([`Action::Young`]): the process that created it may not have recorded it yet (#324: `wicket
+//!   place create` records its node as soon as the provider answers, and a pass that listed the
+//!   instance in between destroyed a node its human had just been given). A node a crash left
+//!   unrecorded is destroyed once the grace is over, still early in its first paid hour.
 
 use crate::billing::{release_decision, PoolRules, ReleaseDecision};
 use crate::model::{NodeHandle, NodeId, NodeState, Owner, Timestamp, PROTECTED_TAG};
@@ -39,13 +44,36 @@ pub enum IgnoreReason {
     Protected,
 }
 
+/// How long a node no lease asks for is left alone after its creation, for its creator to record it.
+pub const UNRECORDED_GRACE_SECS: i64 = 10 * 60;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Create { idempotency_key: String },
-    Keep { node: NodeId, idempotency_key: String },
-    Pool { node: NodeId, until: Timestamp },
-    Destroy { node: NodeId, reason: DestroyReason },
-    Ignore { node: NodeId, reason: IgnoreReason },
+    Create {
+        idempotency_key: String,
+    },
+    Keep {
+        node: NodeId,
+        idempotency_key: String,
+    },
+    Pool {
+        node: NodeId,
+        until: Timestamp,
+    },
+    Destroy {
+        node: NodeId,
+        reason: DestroyReason,
+    },
+    Ignore {
+        node: NodeId,
+        reason: IgnoreReason,
+    },
+    /// No lease asks for it, but it was created less than [`UNRECORDED_GRACE_SECS`] ago: left
+    /// until `until`, when its creator has recorded it or it is an orphan.
+    Young {
+        node: NodeId,
+        until: Timestamp,
+    },
 }
 
 pub fn reconcile(
@@ -91,9 +119,13 @@ pub fn reconcile(
             }
         }
     }
-    // Owned nodes no lease asks for.
+    // Owned nodes no lease asks for: an orphan, or one its creator hasn't recorded yet.
     for n in by_tag.into_values().flatten() {
-        actions.push(idle(n, DestroyReason::NoLease));
+        if now - n.created_at < UNRECORDED_GRACE_SECS {
+            actions.push(Action::Young { node: n.id.clone(), until: n.created_at + UNRECORDED_GRACE_SECS });
+        } else {
+            actions.push(idle(n, DestroyReason::NoLease));
+        }
     }
     actions
 }
@@ -187,6 +219,22 @@ mod tests {
                 Action::Keep { node: NodeId("p".into()), idempotency_key: "pinned".into() },
             ]
         );
+    }
+
+    /// #324: a node created moments ago that no lease asks for may be one its creator (`wicket
+    /// place create`) hasn't recorded yet: it is left alone for the grace, then destroyed as an
+    /// orphan.
+    #[test]
+    fn a_node_too_new_to_be_recorded_is_left_alone_until_the_grace_ends() {
+        let me = Owner::new("example");
+        let obs = [node(&me, "fresh", Some("place-create:p0"), 1_000, &[])];
+        let a = reconcile(&me, &[], &obs, 1_000 + 30, false, &PoolRules::default());
+        assert_eq!(a, vec![Action::Young { node: NodeId("fresh".into()), until: 1_000 + UNRECORDED_GRACE_SECS }]);
+        let a = reconcile(&me, &[], &obs, 1_000 + UNRECORDED_GRACE_SECS, false, &PoolRules::default());
+        assert_eq!(a, vec![Action::Destroy { node: NodeId("fresh".into()), reason: DestroyReason::NoLease }]);
+        // A lease's own node is kept, however young.
+        let a = reconcile(&me, &[d("place-create:p0", 9_000, false)], &obs, 1_010, false, &PoolRules::default());
+        assert_eq!(a, vec![Action::Keep { node: NodeId("fresh".into()), idempotency_key: "place-create:p0".into() }]);
     }
 
     #[test]

@@ -4437,6 +4437,7 @@ dependencies = [
 name = "wicket-sim"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "ed25519-dalek 2.2.0",
  "hex",
  "serde",
@@ -4446,6 +4447,7 @@ dependencies = [
  "wicket-authz",
  "wicket-core",
  "wicket-feed",
+ "wicket-placement",
  "wicket-proxy",
  "wicket-store",
 ]

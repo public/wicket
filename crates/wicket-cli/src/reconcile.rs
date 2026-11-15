@@ -15,7 +15,9 @@
 //! - *Machines*: the provider's instances carrying this installation's owner tag, against the approved
 //!   and active leases (`wicket_placement::reconcile`, matching by each lease's idempotency tag). A node
 //!   no live lease asks for is destroyed, or with `warm_pool` kept until minute 50 of its paid hour; a
-//!   duplicate is destroyed; a node that matches a lease the ledger has no node for (a crash between
+//!   duplicate is destroyed; one created less than ten minutes ago that nothing records yet is left
+//!   for its creator to record (`wicket place create` records its node once the provider answers,
+//!   #324); a node that matches a lease the ledger has no node for (a crash between
 //!   create and record) is adopted; an approved lease with no node gets one (acquire, enrol with the
 //!   host key pinned at creation, `wicket node install`). Untagged instances are never listed, so never
 //!   touched; protected ones are reported and left. **Ownership is checked again right before every
@@ -27,7 +29,8 @@
 //!   checks the owner tag and `wicket-protected` first) and its enrolment revoked, with an audit record
 //!   saying why; one a run still holds is kept, audited once per change of holders, and flagged in
 //!   `wicket place list` and the console (asking for a renewal decision is #56; until then it is a
-//!   warning). The machine half above leaves recorded placed nodes to this step.
+//!   warning). A run whose files a fetch didn't bring back (`runs.uncollected`) holds its node the
+//!   same way, so they aren't destroyed with it (#300, #324); so does a capacity lease's run. The machine half above leaves recorded placed nodes to this step.
 //! - *Boxes*: Docker's `wicket=1` containers, here and on every active enrolled node (over its pinned
 //!   ssh), by their `wicket.run` label. A box whose run has ended is stopped; a running run's box is
 //!   left to its run (above). **A box whose run this ledger doesn't know is left alone**: Docker may
@@ -316,7 +319,20 @@ where
     async fn lease_ends(&mut self) -> Result<()> {
         for lease in self.live_leases(&["approved", "active"])? {
             let holder = self.run_status(&lease.run)?;
-            let why = if holder.as_deref() != Some("running") {
+            let uncollected = match lease.node_name.as_deref() {
+                Some(n) => self.ledger.uncollected_runs_on_node(n)?.contains(&lease.run),
+                None => false,
+            };
+            let why = if holder.as_deref() != Some("running") && uncollected {
+                // Its node keeps files of its run a fetch didn't bring back (#300, #324): ending
+                // the lease would destroy them with the node.
+                self.note(
+                    "lease_held",
+                    &lease.id,
+                    &format!("its run {} has ended, but its node keeps files a fetch didn't bring back", lease.run),
+                );
+                None
+            } else if holder.as_deref() != Some("running") {
                 Some(format!("its run {} has ended ({})", lease.run, holder.as_deref().unwrap_or("unknown")))
             } else if lease.status == "active" && lease.not_after.is_some_and(|t| t <= self.now) {
                 Some("its lease end has passed".to_string())
@@ -403,6 +419,14 @@ where
                 plan::Action::Pool { node, until } => {
                     self.note("kept_warm", &node.0, &format!("no lease; paid until {}, destroyed then", capacity::fmt_time(until)))
                 }
+                plan::Action::Young { node, until } => self.note(
+                    "young",
+                    &node.0,
+                    &format!(
+                        "no lease asks for it, but it was just created: left for its creator to record until {}",
+                        capacity::fmt_time(until)
+                    ),
+                ),
                 plan::Action::Destroy { node, reason } => self.destroy(&node, &format!("{reason:?}")).await?,
                 plan::Action::Keep { node, idempotency_key } => {
                     let Some(lease) = by_key.get(&idempotency_key).cloned() else { continue };
@@ -620,12 +644,24 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
             }
             done.push(Done { kind, target: row.id.clone(), detail });
         };
-        let holders = ledger.running_runs_on_node(&row.name)?;
-        if !holders.is_empty() {
-            let runs = holders.join(",");
+        let running = ledger.running_runs_on_node(&row.name)?;
+        // A run whose files a fetch didn't bring back holds the node too (#300, #324): releasing
+        // it would destroy them.
+        let uncollected: Vec<String> = ledger.uncollected_runs_on_node(&row.name)?.into_iter().filter(|r| !running.contains(r)).collect();
+        if !running.is_empty() || !uncollected.is_empty() {
+            let runs = running.iter().chain(&uncollected).cloned().collect::<Vec<_>>().join(",");
+            let mut why = vec![];
+            if !running.is_empty() {
+                why.push(format!("run {} still runs on it", running.join(",")));
+            }
+            if !uncollected.is_empty() {
+                why.push(format!("it keeps the files of run {} that a fetch didn't bring back", uncollected.join(",")));
+            }
             let detail = format!(
-                "placed node {} is past its lease (ended {ended}) but run {runs} still runs on it: kept, and billing until it is released (wicket place release {})",
-                row.name, row.id
+                "placed node {} is past its lease (ended {ended}) but {}: kept, and billing until it is released (wicket place release {})",
+                row.name,
+                why.join(", and "),
+                row.id
             );
             let changed = if dry_run { false } else { ledger.set_placed_node_held(&row.id, Some(&runs))? };
             record(ledger, "placed_held", detail, changed);
