@@ -124,7 +124,7 @@ and box-only:
 The hibernate outbox directory-link test passed this time. One failure is new and is not from
 this branch: wicket-sim's `deterministic` (seed 7 traced differently in two runs, in the model
 budget's slices) fails in some runs, on origin/main as well (1 failure in 5
-runs there, 1 in 3 on this branch).
+runs there; 2 in 4 on this branch, counting the full run).
 
 ### Still open for #219's done-when
 
