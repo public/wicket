@@ -16,6 +16,11 @@
 //! refuses, atomically, a lease that would take the reservations of every `pending`, `approved` or
 //! `active` lease over the installation's limits. Only `ended`, `denied`, `withdrawn` and `failed`
 //! leases give their reservation back.
+//!
+//! **Placed nodes** ([`PlacedNodeRow`], #294) are the other kind of owned node: made by `wicket place
+//! create` for the installation rather than asked for by a run. They have no reservation here (the
+//! placer's money envelope covered them); the reconciler releases one at its `lease_until` unless a
+//! run still placed on it (by its enrolled name) holds it, which it records in `held_by`.
 
 use crate::{now, Ledger, Result, StoreError};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -296,6 +301,107 @@ impl Ledger {
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+
+    /// Runs recorded as `running` on a node (by its enrolled name), oldest first.
+    pub fn running_runs_on_node(&self, node: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT id FROM runs WHERE status = 'running' AND node = ?1 ORDER BY started_at, id")?;
+        let rows = st.query_map(params![node], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    // ---- nodes made by `wicket place create` (#294) ----
+
+    /// Records a node `wicket place create` made (again: a retried create updates its lease end and
+    /// makes it active).
+    pub fn record_placed_node(&self, n: &PlacedNodeRow) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO placed_nodes ({PLACED_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL, NULL, NULL)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, owner = excluded.owner, api_key_secret = excluded.api_key_secret,
+                   lease_until = excluded.lease_until, status = 'active', held_by = NULL, ended_at = NULL, detail = NULL"
+            ),
+            params![n.id, n.backend, n.name, n.owner, n.api_key_secret, n.created_at, n.lease_until],
+        )?;
+        Ok(())
+    }
+
+    pub fn placed_node(&self, id: &str) -> Result<Option<PlacedNodeRow>> {
+        Ok(self.conn.query_row(&format!("SELECT {PLACED_COLS} FROM placed_nodes WHERE id = ?1"), params![id], row_to_placed).optional()?)
+    }
+
+    /// Placed nodes in any of `statuses` (every one if empty), oldest first.
+    pub fn placed_nodes(&self, statuses: &[&str]) -> Result<Vec<PlacedNodeRow>> {
+        let filter = if statuses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE status IN ({})", statuses.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect::<Vec<_>>().join(","))
+        };
+        let mut st = self.conn.prepare(&format!("SELECT {PLACED_COLS} FROM placed_nodes {filter} ORDER BY created_at, id"))?;
+        let rows = st.query_map([], row_to_placed)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Records the runs holding an active placed node past its lease end (None: none). True if that
+    /// changed, so the caller audits a change once rather than every pass.
+    pub fn set_placed_node_held(&self, id: &str, held_by: Option<&str>) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE placed_nodes SET held_by = ?2 WHERE id = ?1 AND status = 'active' AND held_by IS NOT ?2",
+            params![id, held_by],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Ends an active placed node: `released` (destroyed, or found gone) or `left` (the provider
+    /// refused: no longer owned, or protected). False if it had already ended.
+    pub fn placed_node_ended(&self, id: &str, status: &str, detail: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE placed_nodes SET status = ?2, detail = ?3, held_by = NULL, ended_at = ?4 WHERE id = ?1 AND status = 'active'",
+            params![id, status, detail, now()],
+        )?;
+        Ok(n == 1)
+    }
+}
+
+/// A node `wicket place create` made (#294): owned by the installation, not by a run's capacity
+/// lease, and released by the reconciler at `lease_until` unless a run still holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlacedNodeRow {
+    /// The provider's instance id.
+    pub id: String,
+    pub backend: String,
+    /// Its name (label, hostname and enrolled node name).
+    pub name: String,
+    /// The owner tag's installation name it was created under.
+    pub owner: String,
+    /// The vault secret holding the provider's API key it was created with.
+    pub api_key_secret: String,
+    pub created_at: i64,
+    /// When its lease ends (minute 50 of its last paid hour).
+    pub lease_until: i64,
+    /// `active`, `released` or `left`.
+    pub status: String,
+    /// Runs still on it past its lease end, comma-separated.
+    pub held_by: Option<String>,
+    pub ended_at: Option<i64>,
+    pub detail: Option<String>,
+}
+
+const PLACED_COLS: &str = "id, backend, name, owner, api_key_secret, created_at, lease_until, status, held_by, ended_at, detail";
+
+fn row_to_placed(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlacedNodeRow> {
+    Ok(PlacedNodeRow {
+        id: r.get(0)?,
+        backend: r.get(1)?,
+        name: r.get(2)?,
+        owner: r.get(3)?,
+        api_key_secret: r.get(4)?,
+        created_at: r.get(5)?,
+        lease_until: r.get(6)?,
+        status: r.get(7)?,
+        held_by: r.get(8)?,
+        ended_at: r.get(9)?,
+        detail: r.get(10)?,
+    })
 }
 
 #[cfg(test)]
@@ -372,5 +478,43 @@ mod tests {
         assert!(l.running_runs().unwrap().is_empty());
         l.set_run_lease("run_a", &id).unwrap();
         assert_eq!(l.runs_on_lease(&id).unwrap(), vec![("run_a".to_string(), "succeeded".to_string())]);
+    }
+
+    #[test]
+    fn a_placed_node_is_recorded_held_once_and_ended_once() {
+        let l = Ledger::open_in_memory().unwrap();
+        let row = PlacedNodeRow {
+            id: "i-1".into(),
+            backend: "vultr".into(),
+            name: "n1".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: 100,
+            lease_until: 3100,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+        };
+        l.record_placed_node(&row).unwrap();
+        let got = l.placed_node("i-1").unwrap().unwrap();
+        assert_eq!((got.status.as_str(), got.lease_until), ("active", 3100));
+        // A held node's holders are recorded; recording the same holders again is no change.
+        assert!(l.set_placed_node_held("i-1", Some("run_a")).unwrap());
+        assert!(!l.set_placed_node_held("i-1", Some("run_a")).unwrap());
+        assert!(l.set_placed_node_held("i-1", Some("run_a,run_b")).unwrap());
+        assert_eq!(l.placed_nodes(&["active"]).unwrap()[0].held_by.as_deref(), Some("run_a,run_b"));
+        assert!(l.placed_node_ended("i-1", "released", "lease end").unwrap());
+        assert!(!l.placed_node_ended("i-1", "released", "again").unwrap());
+        assert!(!l.set_placed_node_held("i-1", Some("run_c")).unwrap(), "an ended node is not held");
+        let got = l.placed_node("i-1").unwrap().unwrap();
+        assert_eq!((got.status.as_str(), got.held_by, got.detail.as_deref()), ("released", None, Some("lease end")));
+        assert!(l.placed_nodes(&["active"]).unwrap().is_empty());
+        // Runs on a node, by its enrolled name.
+        l.run_started(&TenantId("t".into()), &RunId("run_a".into()), "z", "a").unwrap();
+        l.set_run_node("run_a", "n1").unwrap();
+        assert_eq!(l.running_runs_on_node("n1").unwrap(), vec!["run_a".to_string()]);
+        l.run_ended(&RunId("run_a".into()), "succeeded", "").unwrap();
+        assert!(l.running_runs_on_node("n1").unwrap().is_empty());
     }
 }

@@ -17,7 +17,7 @@ pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
 mod lease;
-pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, LIVE as LIVE_LEASES};
+pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, PlacedNodeRow, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 mod writer;
 pub use writer::{AuditWriter, Ticket, WriterConfig};
@@ -301,6 +301,10 @@ CREATE TABLE IF NOT EXISTS leases (
   ended_at INTEGER, detail TEXT
 );
 CREATE INDEX IF NOT EXISTS leases_status ON leases (tenant, status);
+CREATE TABLE IF NOT EXISTS placed_nodes (
+  id TEXT PRIMARY KEY, backend TEXT NOT NULL, name TEXT NOT NULL, owner TEXT NOT NULL, api_key_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT
+);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL

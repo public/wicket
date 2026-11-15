@@ -6,6 +6,12 @@
 //! that key (no trust on first use). Then the boot host key is scrubbed from the instance's user data.
 //! `release` destroys an owned node and revokes its enrolment. `list` and `plans` only read.
 //!
+//! **Its lease is enforced (#294).** `create` records the node in the ledger
+//! ([`wicket_store::PlacedNodeRow`]) with its lease end (minute 50 of the last paid hour of
+//! `--lifetime`). At that time the reconciler releases it if no run is placed on it, and audits why;
+//! if a run still is, it keeps it, audits that once, and `list` and the console flag it as past its
+//! lease (a renewal decision is #56; until then it is a warning). `list` marks every node past its lease.
+//!
 //! The Vultr API key comes from the vault (`wicket secret set vultr-api-key`) and goes only into the
 //! API's Authorization header.
 
@@ -115,14 +121,63 @@ pub enum PlaceCmd {
     },
 }
 
+fn owner_name(c: &Common) -> String {
+    c.owner.clone().or_else(|| crate::issuer().ok().map(|i| i.trust_domain)).unwrap_or_else(|| "wicket".into())
+}
+
 fn owner(c: &Common) -> Owner {
-    let name = c.owner.clone().or_else(|| crate::issuer().ok().map(|i| i.trust_domain)).unwrap_or_else(|| "wicket".into());
-    Owner::new(&name)
+    Owner::new(&owner_name(c))
 }
 
 fn provider(c: &Common, config: VultrConfig) -> Result<VultrProvider> {
-    let key = Vault::new(Vault::default_dir()).get(&c.api_key_secret)?;
+    vultr_with_secret(&c.api_key_secret, config)
+}
+
+fn vultr_with_secret(secret: &str, config: VultrConfig) -> Result<VultrProvider> {
+    let key = Vault::new(Vault::default_dir()).get(secret)?;
     Ok(VultrProvider::new(Client::new(ApiKey::new(key))?, config))
+}
+
+/// A placer that can only read and release (it approves no spend), for placed nodes made under
+/// `owner` with the API key in `secret`: what the reconciler releases them with.
+pub fn release_placer(owner: &str, secret: &str) -> Result<Placer<VultrProvider, envelope::DenyAll>> {
+    Ok(Placer::new(
+        vultr_with_secret(secret, VultrConfig::default())?,
+        envelope::DenyAll,
+        Owner::new(owner),
+        MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
+    ))
+}
+
+/// After a placed node is released: revokes its enrolment, if it is still enrolled under its name
+/// at its address. Returns whether it revoked.
+pub fn retire_enrolment(ledger: &mut Ledger, n: &NodeHandle) -> Result<bool> {
+    let enrolled = ledger.node(&n.name)?.filter(|r| r.status != "revoked" && n.ssh_target.as_deref() == Some(r.target.as_str()));
+    if enrolled.is_none() {
+        return Ok(false);
+    }
+    crate::enrol::revoke(ledger, &crate::enrol::Paths::installation().nodes_dir, &n.name)?;
+    Ok(true)
+}
+
+/// What `list` says about a node's lease at `now`: empty while it lasts.
+fn lease_note(n: &NodeHandle, placed: Option<&wicket_store::PlacedNodeRow>, capacity: bool, now: i64) -> String {
+    let Some(until) = placed.filter(|p| p.status == "active").map(|p| p.lease_until).or(n.lease_until) else { return String::new() };
+    if until > now {
+        return String::new();
+    }
+    let ended = format!("PAST ITS LEASE (ended {})", fmt_time(until));
+    match placed.filter(|p| p.status == "active") {
+        Some(p) => match &p.held_by {
+            Some(runs) => format!(
+                "{ended}: still held by run {runs}, so the reconciler keeps it and it bills until released (wicket place release {})",
+                n.id
+            ),
+            None => format!("{ended}: the reconciler releases it at its next pass if nothing runs on it"),
+        },
+        None if capacity => format!("{ended}: its capacity lease ends at the reconciler's next pass"),
+        None => format!("{ended}: not recorded by `wicket place create` here, so nothing releases it: wicket place release {}", n.id),
+    }
 }
 
 fn dollars(s: &str) -> Result<MicroUsd> {
@@ -212,7 +267,11 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                 MoneyEnvelope { max_hourly: MicroUsd::ZERO, max_total: MicroUsd::ZERO },
             );
             let nodes = p.list().await?;
+            let ledger = Ledger::open(&crate::ledger_path())?;
+            let now = wicket_store::now();
             for n in &nodes {
+                let placed = ledger.placed_node(&n.id.0)?;
+                let capacity = ledger.leases(wicket_store::LIVE_LEASES)?.iter().any(|l| l.node_id.as_deref() == Some(n.id.0.as_str()));
                 println!(
                     "{}  {:<16} {:<14} {:<4} {:?}  {}  {}/h  created {}  lease until {}  next paid hour {}",
                     n.id,
@@ -226,6 +285,10 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                     n.lease_until.map(fmt_time).unwrap_or_else(|| "-".into()),
                     p.next_paid_hour_at(n).map(fmt_time).unwrap_or_else(|| "-".into()),
                 );
+                let note = lease_note(n, placed.as_ref(), capacity, now);
+                if !note.is_empty() {
+                    println!("  ! {note}");
+                }
             }
             println!("{} node(s) tagged {}", nodes.len(), o.tag());
             Ok(())
@@ -267,7 +330,8 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             }
             let lifetime = humantime::parse_duration(&lifetime)?;
             let ca_ttl = humantime::parse_duration(&ca_ttl)?;
-            let o = owner(&common);
+            let owner_name = owner_name(&common);
+            let o = Owner::new(&owner_name);
             let config = VultrConfig { os_id, sshkey_ids: ssh_key_ids, default_region: region.clone(), ..VultrConfig::default() };
             let envelope = MoneyEnvelope { max_hourly: dollars(&max_hourly)?, max_total: dollars(&max_total)? };
             let placer = Placer::new(provider(&common, config)?, TerminalApprover, o.clone(), envelope);
@@ -289,6 +353,21 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                 boot: Some(Boot { user_data, host_key: pinned.clone() }),
             };
             let n = placer.acquire(&req).await?;
+            // Recorded at once, so the reconciler releases it at its lease end whatever happens next.
+            let lease_until = n.lease_until.unwrap_or(n.created_at + req.lifetime_secs);
+            Ledger::open(&crate::ledger_path())?.record_placed_node(&wicket_store::PlacedNodeRow {
+                id: n.id.0.clone(),
+                backend: n.backend.clone(),
+                name: name.clone(),
+                owner: owner_name.clone(),
+                api_key_secret: common.api_key_secret.clone(),
+                created_at: n.created_at,
+                lease_until,
+                status: String::new(),
+                held_by: None,
+                ended_at: None,
+                detail: None,
+            })?;
             println!(
                 "created {} ({}), {}/h, lease until {}",
                 n.id,
@@ -328,6 +407,10 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
             if let Some(next) = placer.next_paid_hour_at(&ready) {
                 println!("next paid hour starts {}; release before then: wicket place release {}", fmt_time(next), n.id);
             }
+            println!(
+                "the reconciler (wicket reconcile --every) releases it at {} unless a run is still placed on it",
+                fmt_time(lease_until)
+            );
             Ok(())
         }
         PlaceCmd::Release { common, id } => {
@@ -345,12 +428,10 @@ pub async fn run(cmd: PlaceCmd) -> Result<()> {
                 r => println!("{id}: {r:?}"),
             }
             let mut ledger = Ledger::open(&crate::ledger_path())?;
+            ledger.placed_node_ended(&id.0, "released", "released by wicket place release")?;
             if let Some(n) = node {
                 ledger.audit(&TenantId::single(), None, "placement.node_released", &serde_json::json!({ "id": id.0, "name": n.name }))?;
-                let enrolled =
-                    ledger.node(&n.name)?.filter(|r| r.status != "revoked" && n.ssh_target.as_deref() == Some(r.target.as_str()));
-                if enrolled.is_some() {
-                    crate::enrol::revoke(&mut ledger, &crate::enrol::Paths::installation().nodes_dir, &n.name)?;
+                if retire_enrolment(&mut ledger, &n)? {
                     println!("revoked node {}", n.name);
                 }
             }
@@ -461,6 +542,11 @@ pub async fn give_up_unreachable<A: envelope::SpendApprover>(
     );
     if let Err(e) = audited {
         eprintln!("warning: could not audit giving up on {id}: {e:#}");
+    }
+    if released.is_ok() {
+        if let Err(e) = ledger.placed_node_ended(&id.0, "released", &format!("released by wicket place create: {why}")) {
+            eprintln!("warning: could not record {id} as released: {e:#}");
+        }
     }
     match released {
         Ok(_) => anyhow::anyhow!("{why}: released {id} ({}) rather than leave it billing", node.name),
@@ -663,5 +749,49 @@ mod tests {
         assert!(probe.start.elapsed() >= Duration::from_millis(850));
         assert!(deletes(&st).is_empty());
         assert!(Ledger::open(&path).unwrap().audit_of_kind("placement.node_unreachable").unwrap().is_empty());
+    }
+
+    /// #294: `place list` marks a node past its lease, and says what happens to it.
+    #[test]
+    fn list_marks_a_node_past_its_lease() {
+        let mut n = NodeHandle {
+            id: NodeId("i-1".into()),
+            backend: "vultr".into(),
+            name: "n1".into(),
+            ssh_target: None,
+            region: None,
+            plan: None,
+            isolation: IsolationTier::Gvisor,
+            resources: Resources { vcpus: 1, memory_mib: 1024 },
+            billing: BillingModel::vultr(MicroUsd(14_000)),
+            created_at: 0,
+            lease_until: Some(3000),
+            host_key: None,
+            tags: vec![],
+            state: NodeState::Active,
+        };
+        let mut row = wicket_store::PlacedNodeRow {
+            id: "i-1".into(),
+            backend: "vultr".into(),
+            name: "n1".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: 0,
+            lease_until: 3000,
+            status: "active".into(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+        };
+        assert_eq!(lease_note(&n, Some(&row), false, 2999), "");
+        let idle = lease_note(&n, Some(&row), false, 3000);
+        assert!(idle.starts_with("PAST ITS LEASE") && idle.contains("releases it at its next pass"), "{idle}");
+        row.held_by = Some("run_a".into());
+        let held = lease_note(&n, Some(&row), false, 3000);
+        assert!(held.contains("still held by run run_a") && held.contains("wicket place release i-1"), "{held}");
+        assert!(lease_note(&n, None, true, 3000).contains("capacity lease"));
+        assert!(lease_note(&n, None, false, 3000).contains("nothing releases it"));
+        n.lease_until = None;
+        assert_eq!(lease_note(&n, None, false, 3000), "");
     }
 }
