@@ -713,6 +713,23 @@ mod tests {
         assert!(acp_plan(&m, &RunId("run_x".into())).is_none());
     }
 
+    /// #255: the model route's defaults are the adapter's, filled in at load; what the manifest
+    /// names stands, and core alone fills nothing.
+    #[test]
+    fn the_adapter_fills_the_model_route() {
+        let m = crate::load("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        let l = m.zone.llm.unwrap();
+        assert_eq!(wicket_core::ModelRoute { provider: l.provider, secret: l.secret, upstream: l.upstream }, claude::model_route());
+        let m = crate::load("task: hi\nagent: {name: a}\nzone: {name: z, llm: {secret: s, upstream: 'http://127.0.0.1:9'}}").unwrap();
+        let l = m.zone.llm.unwrap();
+        assert_eq!((l.provider.as_str(), l.secret.as_str(), l.upstream.as_str()), (claude::MODEL_PROVIDER, "s", "http://127.0.0.1:9"));
+        let raw = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        assert_eq!(raw.zone.llm.unwrap().missing(), Some("provider"));
+        assert!(crate::load("task: hi\nagent: {name: a}\nzone: {name: z}").unwrap_err().to_string().contains("llm section"));
+        assert_eq!(harness::default_secret_hosts(claude::LOGIN_SECRET), [claude::LOGIN_HOST]);
+        assert!(harness::default_secret_hosts("gh").is_empty());
+    }
+
     #[test]
     fn acp_manifests_are_checked() {
         let bad = |agent: &str| crate::load(&format!("task: hi\nagent: {agent}\nzone: {{name: z}}")).unwrap_err().to_string();
@@ -724,10 +741,11 @@ mod tests {
         assert!(bad("{name: a, harness: acp, acp: {command: [x]}, max_turns: 3}").contains("max_turns"));
         assert!(bad("{name: a, harness: acp, acp: {command: [x], _meta: {}}}").contains("unknown field"));
         assert!(bad("{name: a, harness: gemini}").contains("unknown variant"));
-        // The zone's model route is a Claude subscription: Claude Code only (#174 adds other routes).
+        // The zone's model route is the harness's: a generic ACP agent has none (#174 adds other routes).
         let with_llm = |agent: &str| crate::load(&format!("task: hi\nagent: {agent}\nzone: {{name: z, llm: {{}}}}"));
-        assert!(with_llm("{name: a, harness: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("only Claude Code"));
-        assert!(with_llm("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").is_ok());
+        assert!(with_llm("{name: a, harness: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("takes no model route"));
+        let m = with_llm("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").unwrap();
+        assert_eq!(m.zone.llm.unwrap().secret, claude::LOGIN_SECRET, "Claude Code's route, through its ACP adapter");
         assert!(bad("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").contains("llm section"));
         assert!(crate::load("task: hi\nagent: {name: a, harness: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
     }

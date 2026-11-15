@@ -57,6 +57,8 @@ fn daemon() -> Fixture {
     vault.set("gh", "the-real-token").unwrap();
     vault.set_hosts("gh", &["api.github.com".into()]).unwrap();
     vault.set("claude-oauth", "the-login").unwrap();
+    // As `wicket secret set` binds it: the harness's default model secret, to its model host.
+    crate::cmd::secret::bind(&vault, "claude-oauth", &[]).unwrap();
     let d = Arc::new(Daemon {
         data_dir: data,
         policy_path: policy,
