@@ -1,0 +1,16 @@
+wicket top — control host — 09:46:40Z
+2 running runs   2 pending requests   1 active lease
+
+NODE             CONTROL                    BOXES        CPU          MEM
+local            connected 10m00s               1      1.5/4    2.5G/8.0G
+hyperv1          CUT OFF 1m35s ago              1      1.5/4    2.5G/8.0G
+spare            idle (no runs)                 0          -            -
+old              revoked                        0          -            -
+
+RUN       NODE         AGENT/ZONE           STATUS          UP   REQ TOK in/out
+ABCDEFGH  local        coder/dev            running      1h02m    34  1.2M/40k
+BBBBCCCC  hyperv1      reviewer/ci          cut off        42s     -         -
+01JBZZZZ  -            helper/dev           hibernated       -     3       0/0
+
+LEASE                       PROVIDER RUN       NODE         ENDS IN  RESERVED
+lease_01JCLLLLLLLLLLLLLLL…  vultr    ABCDEFGH  vultr-1       38m00s     $0.12

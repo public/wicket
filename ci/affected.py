@@ -272,7 +272,7 @@ def self_test():
     case("docs only", ["docs/reference/agents.md", "README.md", "experiments/x/RESULTS.md"], set(), {"docs"})
     # The CLI reference is checked by a wicket-cli unit test (cli_reference.rs).
     case("the CLI reference", ["docs/reference/cli.md"], {"wicket-cli"}, {"docs"})
-    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-cli"}, {"smoke"})
+    case("wicket-fwd", ["crates/wicket-fwd/src/copy.rs"], {"wicket-fwd", "wicket-proxy", "wicket-cli", "wicket-sim"}, {"smoke"})
     # Nearly everything: the crates that don't depend on wicket-core (auth, identity, fwd, placement) aren't.
     case("wicket-core", ["crates/wicket-core/src/op.rs"],
          lambda c: c != ALL and len(c) >= 10 and {"wicket-core", "wicket-cli", "wicket-proxy"} <= c and "wicket-fwd" not in c, ALL)
@@ -311,6 +311,8 @@ def self_test():
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
          set())
     case("an acceptance scenario", ["ci/acceptance/acp.yaml"], set(), {"acceptance", "acceptance-nodes"})
+    # #324: the simulation's stand-ins follow the node's run loop, so its seeds run on a change to it.
+    case("the node's run loop", ["crates/wicket-cli/src/nodesrv.rs"], {"wicket-cli", "wicket-sim"}, {"node-e2e", "acceptance-nodes"})
     # A rule naming one path (no wildcard) names one that exists: a rename mustn't leave it behind.
     for pat, _, _ in rules:
         if "/" in pat and not any(ch in pat for ch in "*?[") and not (ROOT / pat).exists():
@@ -318,7 +320,7 @@ def self_test():
     # Cargo's arguments: crates without a library get no doctest arguments, and none selected is none.
     for files, want_args, want_doc in (
         (["crates/wicket-cli/src/chan.rs"], "-p wicket-cli", ""),
-        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy", ""),
+        (["crates/wicket-fwd/src/copy.rs"], "-p wicket-cli -p wicket-fwd -p wicket-proxy -p wicket-sim", ""),
         (["docs/x.md"], "", ""),
         (["Cargo.lock"], "--workspace", ""),
     ):

@@ -60,6 +60,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Install { name, ssh_key, no_service } => enrol::install(&name, ssh_key.as_deref(), no_service).await,
             NodeCmd::Serve { dir, idle_exit } => nodesrv::serve(dir, idle_exit).await,
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
+            NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
         },
         Cmd::Place { cmd } => place::run(cmd).await,
         _ => unreachable!("dispatched to the wrong command group"),
@@ -135,6 +136,21 @@ pub enum NodeCmd {
         /// local node's `serve`, started on demand).
         #[arg(long, hide = true)]
         idle_exit: Option<u64>,
+    },
+    /// On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA,
+    /// its control connections, feed, load, memory and disk; each box's state, uptime, CPU and
+    /// memory, model use and budget slice left, egress counts and queued asks; and the last egress
+    /// decisions. Redrawn every 2 s; q or Ctrl-C quits.
+    Top {
+        /// The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it).
+        #[arg(long)]
+        once: bool,
+        /// Print the node's status once, as JSON.
+        #[arg(long, conflicts_with = "once")]
+        json: bool,
     },
     /// On the node: join stdin and stdout to `node serve`'s control socket (what the control host
     /// runs over ssh).
