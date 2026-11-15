@@ -34,8 +34,8 @@ lays out its boxes, runs their egress proxy, DNS and HTTP/3, and decides from it
 box's token and the grants published to it, splice-through included) exactly as a remote node does; its
 audit records are shipped as `node.audit` like any node's. Its CA is the one difference in kind: a 24-hour
 intermediate with no DNS name constraint (`*`; IP addresses still excluded), since it serves whatever its
-boxes reach, while a remote node's is constrained to `--hosts`. What a node doesn't decide itself (hosts
-with an `inject` rule or a credential swap, the model, the MCP gateway) goes to the run's own proxies
+boxes reach, while a remote node's is constrained to `--hosts`. What a node doesn't decide itself (the
+MCP gateway's relayed tools, and hosts its CA can't cover) goes to the run's own proxies
 (`<run dir>/ctl/`) over the node's channel.
 
 Sharing the filesystem is used only as transport:
@@ -136,8 +136,9 @@ wicket node revoke n1
   from its run record.
 - **Secrets come to a node only when used, and stay in its memory** (#152). A secret reaches a node only
   when one of its runs first needs it: the run's model credential (`llm.secret`) on its first model call,
-  an `inject` rule's secret on the first request to its host. The node asks over that run's own
-  connection; the control host releases it only if the run's zone uses it, the vault holds it and its
+  an `inject` rule's secret on the first request to its host, and a credential swap's (a remote or wrapped
+  session's, #257) on the first request that presents its placeholder. The node asks over that run's own
+  connection; the control host releases it only if the run's zone or one of its swaps uses it, the vault holds it and its
   host binding covers the hosts the zone uses it for, and audits the release (`node.secret_fetch`). It is
   never prefetched, and never sent for another run, zone or node. The Claude login goes as its current
   **access token only**: the refresh token and refreshing stay on the control host. The node keeps each
@@ -227,10 +228,12 @@ wicket node revoke n1
 - **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
   the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
   the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
-  it with the run CA), for: hosts with a credential swap (an `inject` rule's host is terminated and injected on the node, its
-  secret fetched on first use, #152),
+  it with the run CA), for:
   hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
-  every host once the node CA has expired. Grants for those hosts stay in the ledger. While disconnected, they
+  every host once the node CA has expired. Grants for those hosts stay in the ledger. An `inject` rule's host
+  and a credential swap's host are terminated on the node, which injects or swaps the credential itself, its
+  secret fetched on first use (#152, #257). The node forwards a swapped host only for a box that a control host
+  at protocol 9 started. While disconnected, they
   fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`

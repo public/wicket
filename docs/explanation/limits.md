@@ -196,7 +196,7 @@ not a permanent decision.
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's
   own node), plain `http://` to a host the
-  node forwards, credential swaps (forwarded to the control host), and tool decisions on the node: the
+  node forwards, and tool decisions on the node: the
   gateway runs on the node (#151) but relays every call to the control host, which decides the tools;
   while it is away only MCP's own handshake answers. Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),

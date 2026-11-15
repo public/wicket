@@ -104,6 +104,12 @@ struct World {
 
 impl World {
     async fn new(box_bearers: bool) -> World {
+        World::with_vault(box_bearers, None).await
+    }
+
+    /// With `source`, the vault is a node's (#152, #257): the login comes from it, fetched on its
+    /// first use, as a node fetches it from its control host.
+    async fn with_vault(box_bearers: bool, source: Option<Arc<Fetching>>) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let seen: Seen = Arc::default();
@@ -112,6 +118,10 @@ impl World {
         let vault = wicket_proxy::vault::Vault::new(dir.join("vault"));
         vault.set("login", LOGIN).unwrap();
         vault.set_hosts("login", &[HOST.into()]).unwrap();
+        let vault = match source {
+            Some(s) => wicket_proxy::vault::Vault::from_source(s),
+            None => vault,
+        };
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut rx = rx;
@@ -215,6 +225,39 @@ impl Drop for World {
     }
 }
 
+/// A node's view of the login (#257): held only once fetched, bound to the API's host.
+#[derive(Default)]
+struct Fetching {
+    held: Mutex<bool>,
+    fetches: AtomicUsize,
+}
+
+impl wicket_proxy::vault::SecretSource for Fetching {
+    fn get(&self, name: &str) -> anyhow::Result<String> {
+        match (name, *self.held.lock().unwrap()) {
+            ("login", true) => Ok(LOGIN.into()),
+            _ => anyhow::bail!("secret {name:?} is not cached on this node for this run"),
+        }
+    }
+    fn hosts(&self, name: &str) -> Vec<String> {
+        match self.has(name) {
+            true => vec![HOST.into()],
+            false => vec![],
+        }
+    }
+    fn has(&self, name: &str) -> bool {
+        name == "login" && *self.held.lock().unwrap()
+    }
+    fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(name == "login", "no secret {name}");
+            *self.held.lock().unwrap() = true;
+            Ok(())
+        })
+    }
+}
+
 async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> (String, Vec<u8>) {
     let mut head = Vec::new();
     let mut b = [0u8; 1];
@@ -313,4 +356,22 @@ async fn without_box_bearers_a_token_the_box_holds_is_dropped() {
     // The placeholder is still swapped.
     let (st, _) = w.call("POST", "/v1/environments/bridge", PLACEHOLDER).await;
     assert!(st.contains(" 200"), "{st}");
+}
+
+/// #257: on a node, the login isn't held until the box first presents its placeholder; it is then
+/// fetched (once) and swapped in there, the vault's binding checked against the fetched copy's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_node_the_login_is_fetched_on_first_use_and_swapped_there() {
+    let source = Arc::new(Fetching::default());
+    let w = World::with_vault(true, Some(source.clone())).await;
+    // A bearer that isn't the placeholder fetches nothing: it goes up as the box sent it.
+    let (st, _) = w.call("POST", "/v1/code/sessions/cse_1/worker/events", SESSION_TOKEN).await;
+    assert!(st.contains(" 200"), "{st}");
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+    let (st, body) = w.call("POST", "/v1/environments/bridge", PLACEHOLDER).await;
+    assert!(st.contains(" 200") && !body.contains(LOGIN), "{st} {body}");
+    let (st, _) = w.call("GET", "/v1/environments/env_1/work/poll", PLACEHOLDER).await;
+    assert!(st.contains(" 200"), "{st}");
+    assert_eq!(w.seen_at("/v1/environments/bridge"), [Some(format!("Bearer {LOGIN}"))]);
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 1, "fetched on first use, then held");
 }

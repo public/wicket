@@ -1258,7 +1258,7 @@ What a node still sends the control host, and why:
 | tool calls that need a human: `request_capacity`, `request_update`, a spawn or link beyond the box's zone | a human decides; queued on the node while unreachable, made on reconnect, their answers kept for `await_grant` |
 | `SecretFetch` | new authority: a secret released to the node on first use (#152) |
 | the `llm` tunnel | only without the model credential cached on the node, or a protocol-1 control host |
-| the `egress` tunnel | hosts the control host swaps a credential in for (the secret stays there), or outside the node CA |
+| the `egress` tunnel | hosts outside the node CA (credential swaps are made on the node since #257) |
 | `send_message` / `await_message` while connected, and to boxes on other nodes | signed with the agent's identity, whose key never leaves the control host; delivered through the ledger |
 | links between boxes on different nodes | relayed by the control host: nodes don't hold each other's certificates or reach each other (a direct node-to-node transport with mutual TLS is a follow-up) |
 | identity re-issue (every 5 min) | new authority: the issuer key stays on the control host |
