@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
+mod delegations;
+pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub mod bundle;
 pub mod cas;
 mod links;
@@ -70,8 +72,9 @@ pub enum StoreError {
 /// (expand) adds `messages.to_principal`: messages are addressed to principals, not runs (#250).
 /// Version 5 (expand) adds the agent-to-agent protocol's record (#252): `messages.from_principal`
 /// (the reply address), `messages.priority`, `messages.in_reply_to`, the `message_refusals` table,
-/// and `runs.activity` (busy, idle, waiting) for presence.
-pub const SCHEMA_VERSION: u32 = 5;
+/// and `runs.activity` (busy, idle, waiting) for presence. Version 6 (expand) adds the
+/// `delegations` table: what a parent delegated to the children it spawned, and where it is (#252).
+pub const SCHEMA_VERSION: u32 = 6;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -382,6 +385,7 @@ impl Ledger {
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
+        conn.execute_batch(delegations::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -450,6 +454,7 @@ impl Ledger {
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
+        conn.execute_batch(delegations::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 

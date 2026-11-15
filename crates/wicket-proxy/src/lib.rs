@@ -4,6 +4,7 @@
 
 pub mod ca;
 pub mod decide;
+pub mod delegate;
 mod dial;
 pub mod dns;
 pub mod egress;

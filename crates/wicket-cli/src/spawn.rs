@@ -154,6 +154,14 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
         }
         _ => s.image.clone(),
     };
+    // Its task is a delegation (#252), under the id its node's handle gave the parent.
+    if cm.agent.is_some() {
+        let own = c.ledger.lock().ok().and_then(|l| l.identity(&c.run.0).ok().flatten());
+        if let Some(o) = own.and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id)) {
+            let cp = wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, &name);
+            delegate(c, &RunId(s.child.clone()), &cp, &name, &cm.task);
+        }
+    }
     if let Err(e) = launch_as(c, &RunId(s.child.clone()), &s.manifest, &image, None, Some(&adopt)) {
         unrecord_quotas(c, &ids);
         return Err(e);
@@ -511,10 +519,24 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         _ => None,
     };
     drop(reserved);
+    // Its principal (#250): what send_message names it by, the same in every run it has.
+    let child_principal = {
+        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
+        let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
+        own.map(|o| wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name))
+    };
+    // An agent's task is a delegation (#252), recorded before it starts so its first turn's report
+    // finds it: its report comes back as a message, and the parent may continue it by name.
+    if let (Some(cp), true) = (&child_principal, is_agent) {
+        delegate(c, &child, cp, name, &cm.task);
+    }
     let launched = launch_as(c, &child, &yaml, &image, placed.as_ref(), None);
     let child = match launched {
         Ok(child) => child,
         Err(e) => {
+            if let Ok(l) = c.ledger.lock() {
+                let _ = l.delegation_ended(&child.0, None);
+            }
             // Nothing started: give the slots, the budget and its quotas back.
             unrecord_quotas(c, &ids);
             if let Ok(mut r) = c.slots.lock() {
@@ -532,24 +554,46 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let budget =
         cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
     let at = placed.as_ref().map(|p| format!(" on node {}", p.node)).unwrap_or_default();
-    // Its principal (#250): what send_message names it by, the same in every run it has.
-    let principal = {
-        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
-        let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
-        own.map(|o| format!(", principal {}", wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name)))
-            .unwrap_or_default()
+    let principal = child_principal.as_deref().map(|p| format!(", principal {p}")).unwrap_or_default();
+    let handle = match (&child_principal, is_agent) {
+        (Some(cp), true) => format!("\nhandle: {}", wicket_proxy::delegate::handle(cp, &child, name)),
+        _ => String::new(),
     };
     Ok(format!(
-        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}",
+        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}{handle}",
         req.kind,
         child,
         if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
         if is_agent {
-            "Message it with send_message to its principal; use await_message for its messages and its final run_finished."
+            "When its turn on the task ends, its report comes to you as a message (kind report, with a receipt; use await_message); continue_child gives it another brief, its context intact. Its final run_finished comes when its run ends."
         } else {
             "It sends you run_finished when it exits."
         }
     ))
+}
+
+/// Records child `child`'s task as this run's delegation to it (#252), audited. Its record only:
+/// what the child may do is its zone, already checked within this run's.
+fn delegate(c: &SpawnCtx, child: &RunId, child_principal: &str, name: &str, brief: &str) {
+    let Ok(l) = c.ledger.lock() else { return };
+    let Some(parent) = l.identity(&c.run.0).ok().flatten() else { return };
+    let id = wicket_proxy::delegate::delegation_id(&child.0);
+    let recorded = l.record_delegation(&wicket_store::NewDelegation {
+        id: &id,
+        tenant: &c.parent.tenant.0,
+        parent_run: &c.run.0,
+        parent_principal: &parent.spiffe_id,
+        child_run: &child.0,
+        child_principal,
+        name,
+        brief,
+    });
+    let _ = l.audit(
+        &c.parent.tenant,
+        Some(&c.run),
+        "delegation.started",
+        &serde_json::json!({ "delegation": id, "child": child_principal, "child_run": child.0, "name": name, "recorded": recorded.is_ok() }),
+    );
 }
 
 /// What a beyond-parent spawn card says, from wicket's own record of the child (#118): what it
