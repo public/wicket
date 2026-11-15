@@ -21,7 +21,7 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 |---|---|---|
 | [`await_grant`](#await_grant) | Wait for a human's decision on a pending request | |
 | [`pending_requests`](#pending_requests) | List this run's requests still waiting, and descendants' it may decide | |
-| [`decide`](#decide) | Approve or deny a descendant's request within the caller's own reach | `escalation.grant` |
+| [`decide`](#decide) | Approve, deny or renew a descendant's request, grant or box authority within the caller's own reach | `escalation.grant` |
 | [`request_access`](#request_access) | Ask a human for reach ahead of time | |
 | [`whoami`](#whoami) | This box's verified identity | |
 | [`send_message`](#send_message) | Message the parent, a child or a permitted peer | |
@@ -74,11 +74,28 @@ stays pending for a human. It may decide a request only when:
 An approval grants exactly the asked path, to the asking run only, for `uses` uses, and ends no
 later than the caller's own authority.
 
+`decision: renew` ([#56](https://github.com/public/wicket/issues/56)) gives a live grant, or a
+descendant box's authority, a new end `ttl_seconds` from now. It is signed, checked and recorded
+as an approval is:
+
+- a grant (`grant_id`, or `request_id` for the grant made for it) only if the caller could make it
+  now: a descendant's request it may decide, for exactly that path, to that run only, with a
+  number of uses (kept as they are). A push's window, a prefix or zone-wide grant, and an unlimited
+  grant are renewed by a human (`wicket grant renew`);
+- a descendant box's authority (`run`), with `escalation.grant`. The box's token is minted again
+  with the new end, so its node keeps it past its old one. It never goes past the box's run
+  timeout. A box nobody renews stops when its authority ends, as before.
+
+Either way it ends no later than the caller's own authority. A renewal only extends; to end
+something sooner, revoke it.
+
 | argument | type | default | |
 |---|---|---|---|
-| `request_id` | string | required | from `pending_requests` |
-| `decision` | `approve` or `deny` | required | |
-| `uses` | integer, 1–100 | 1 | |
+| `request_id` | string | required, except for `renew` | from `pending_requests`; for `renew`, the request whose grant to renew |
+| `decision` | `approve`, `deny` or `renew` | required | |
+| `grant_id` | string | | `renew`: the grant to renew |
+| `run` | string | | `renew`: the descendant box whose authority to renew |
+| `uses` | integer, 1–100 | 1 | `approve` only |
 | `ttl_seconds` | integer | 600 | at most 24h, and not past the caller's authority |
 
 ## `request_access`

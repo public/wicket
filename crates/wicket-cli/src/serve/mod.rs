@@ -1263,7 +1263,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 json!({ "action": "decide", "signed": signed }),
             )? {
                 grant::Decided::Denied { lease } => lease,
-                grant::Decided::Approved { .. } => unreachable!("a denial denies"),
+                grant::Decided::Approved { .. } | grant::Decided::Renewed { .. } => unreachable!("a denial denies"),
             };
             let lease = lease.map(|x| format!("; lease {x}'s reservation is released")).unwrap_or_default();
             Ok(format!("denied {request}{lease} (signed with {})", oc.name))

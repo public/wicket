@@ -1291,6 +1291,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             ledger: ledger.clone(),
             events: ctx.events.clone(),
             authority_secs,
+            // A renewal (#56) never takes it past what an unset `limits.authority` gives: the
+            // run's timeout.
+            authority_cap_secs: backstop + 30,
+            authority_until: Some(authority_until.clone()),
             start,
             calls: node_calls.clone(),
             trees,

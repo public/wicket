@@ -109,6 +109,12 @@ A grant is a human's answer to one pending request, kept in the ledger:
   usable; a console approval carries the passkey's signature over exactly that decision.
 - **Revocable.** `wicket grant revoke` ends it, on the control host at once and on a node within
   250 ms of its push.
+- **Renewable, never unlimited.** `wicket grant renew <id> --ttl` gives a live grant a new end,
+  up to 24 h from now, as a new decision on the audit record ([#56](https://github.com/public/wicket/issues/56)).
+  An agent may renew what it could grant (the `decide` tool). A running box's authority is
+  renewed the same way, by its run id: its token is minted again with the later end, up to its
+  run's `timeout`, and its node keeps it past the old one. A box nobody renews stops when its
+  authority ends.
 
 wicket's own approvals are grants too: a child zone beyond its parent's (`SPAWN`), a link beyond the
 default policy (`LINK`), a capacity lease (`CAPACITY`), an agent's build (`UPDATE`). Leases are the

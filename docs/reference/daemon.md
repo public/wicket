@@ -33,7 +33,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `agents`, `pending`, `links`, `audit` (and `audit export`), `doctor` | read |
 | `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list`, `state check`, `self status` | read |
 | `unlink`, `grant revoke`, `identity revoke`, `lease release` | revoke |
-| `approve`, `deny` | privileged |
+| `approve`, `deny`, `grant renew` | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
 | `image` | privileged |
 | `operator enrol-link\|reset\|revoke-session` | privileged |

@@ -7,6 +7,13 @@
 //! decides ([`Granter`]) and what a kind does once approved (a capacity lease is provisioned, or its
 //! reservation released). The limits every grant has, such as its lifetime cap, live here, not in
 //! each caller.
+//!
+//! **Renewal (#56).** Every grant has a lifetime, and a grant is extended only by a new decision:
+//! [`Verdict::Renew`] gives a live grant, or a running box's authority, a new end `ttl` from now,
+//! at most [`MAX_TTL`], never past what the renewer could grant, and (for a box) never past its
+//! run's timeout. A renewal is audited as a decision. The run's process publishes it to the node:
+//! a renewed grant's block, or a re-minted block 0 for a renewed authority, in the box's rebuilt
+//! token. A box whose authority nobody renews stops at its end, as before.
 
 use crate::capacity;
 use anyhow::{bail, Result};
@@ -74,21 +81,7 @@ pub fn within_authority(l: &Ledger, a: &AgentAuthority, req: &Request) -> Result
     if req.tenant != a.tenant.0 {
         bail!("request {} is not in your tenant", req.id);
     }
-    let mut chain = vec![req.run.clone()];
-    let mut at = l.identity(&req.run)?.and_then(|i| i.parent_run);
-    loop {
-        match at {
-            Some(p) if p == a.run.0 => {
-                chain.push(p);
-                break;
-            }
-            Some(p) if chain.len() < MAX_CHAIN && !chain.contains(&p) => {
-                at = l.identity(&p)?.and_then(|i| i.parent_run);
-                chain.push(p);
-            }
-            _ => bail!("request {} is not from one of your descendants", req.id),
-        }
-    }
+    let chain = descendant_chain(l, a, &req.run).map_err(|_| anyhow::anyhow!("request {} is not from one of your descendants", req.id))?;
     if !a.zone.escalation.grant {
         bail!("your zone may not grant requests (escalation.grant: false)");
     }
@@ -116,6 +109,26 @@ pub fn within_authority(l: &Ledger, a: &AgentAuthority, req: &Request) -> Result
     }
 }
 
+/// The chain from run `run` up to the agent `a` (`run` first), if `run` is one of `a`'s
+/// descendants (the ledger's identities, `parent_run` upwards), never `a` itself.
+fn descendant_chain(l: &Ledger, a: &AgentAuthority, run: &str) -> Result<Vec<String>> {
+    let mut chain = vec![run.to_string()];
+    let mut at = l.identity(run)?.and_then(|i| i.parent_run);
+    loop {
+        match at {
+            Some(p) if p == a.run.0 => {
+                chain.push(p);
+                return Ok(chain);
+            }
+            Some(p) if chain.len() < MAX_CHAIN && !chain.contains(&p) => {
+                at = l.identity(&p)?.and_then(|i| i.parent_run);
+                chain.push(p);
+            }
+            _ => bail!("{run} is not one of your descendants"),
+        }
+    }
+}
+
 /// What an agent may grant within what it may decide: exactly the asked path, to the asking run
 /// only, for a bounded number of uses, ending no later than its own authority.
 fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
@@ -130,14 +143,7 @@ fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
     if wicket_core::git::grant_terms(&req.method, &req.path, Some(uses), t.ttl.as_secs()) != (Some(uses), t.ttl.as_secs()) {
         bail!("a git push is decided by a human");
     }
-    let now = wicket_store::now();
-    if a.until <= now {
-        bail!("your own authority has ended");
-    }
-    if now.saturating_add(i64::try_from(t.ttl.as_secs()).unwrap_or(i64::MAX)) > a.until {
-        bail!("the grant would outlast your own authority, which ends in {}s", a.until - now);
-    }
-    Ok(())
+    outlasts(a, wicket_store::now().saturating_add(i64::try_from(t.ttl.as_secs()).unwrap_or(i64::MAX)), "grant")
 }
 
 /// What an approval grants, within what was asked.
@@ -154,11 +160,23 @@ pub struct Terms {
     pub zone_wide: bool,
 }
 
-/// A decision on one request.
+/// A decision on one request, or a renewal.
 #[derive(Clone, Debug)]
 pub enum Verdict {
     Approve(Terms),
     Deny,
+    /// A new end `ttl` from now, for a live grant (named by its id, or by the request it answers)
+    /// or a running box's authority (named by its run id): at most [`MAX_TTL`], and only later than
+    /// its end now (revoke it to end it sooner).
+    Renew(Duration),
+}
+
+/// What a renewal renewed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Renewed {
+    Grant(String),
+    /// A running box's authority, by its run id.
+    Authority(String),
 }
 
 /// What [`decide`] did.
@@ -170,12 +188,17 @@ pub enum Decided {
     Approved { grant: String, lease: Option<String>, uses: Option<u32>, ttl: std::time::Duration },
     /// Denied; a capacity ask's reservation was released at once.
     Denied { lease: Option<String> },
+    /// Renewed: it now ends at `until` (Unix seconds).
+    Renewed { what: Renewed, until: i64 },
 }
 
 /// Decides pending request `id` as `by`. An approval is one grant, which exists only if its
 /// decision is on the audit record (otherwise it is revoked again: fail closed). `extra` is merged
 /// into the record (the console's signed decision).
 pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_json::Value) -> Result<Decided> {
+    if let Verdict::Renew(ttl) = v {
+        return renew(l, by, id, *ttl, extra);
+    }
     let mut extra = extra;
     if let Granter::Agent(a) = by {
         let req = l.request(id)?;
@@ -192,17 +215,154 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
     match v {
         Verdict::Approve(t) => approve(l, by, id, t, extra),
         Verdict::Deny => deny(l, by, id, extra),
+        Verdict::Renew(_) => unreachable!("renewed above"),
     }
+}
+
+/// A lifetime any grant may have: above 0 and at most [`MAX_TTL`].
+fn check_ttl(ttl: Duration) -> Result<()> {
+    if ttl > MAX_TTL {
+        bail!("grants last at most {}; renew it with a new decision", humantime::format_duration(MAX_TTL));
+    }
+    if ttl.is_zero() {
+        bail!("a grant needs a lifetime");
+    }
+    Ok(())
+}
+
+/// What a renewal names: a grant (`g-…`), the grant made for a request (`r-…`), or a running
+/// box's authority (its run id).
+enum Target {
+    Grant(Box<wicket_store::GrantRow>),
+    Authority { run: String, until: i64, cap: i64 },
+}
+
+fn target(l: &Ledger, id: &str) -> Result<Target> {
+    if id.starts_with("g-") {
+        return Ok(Target::Grant(Box::new(l.grant(id)?.ok_or_else(|| anyhow::anyhow!("no grant {id}"))?)));
+    }
+    if id.starts_with("r-") {
+        return Ok(Target::Grant(Box::new(l.grant_for_request(id)?.ok_or_else(|| anyhow::anyhow!("request {id} has no live grant"))?)));
+    }
+    match l.run_authority(id)? {
+        Some((until, cap)) => Ok(Target::Authority { run: id.to_string(), until, cap }),
+        None => bail!("no grant, request or box authority {id}"),
+    }
+}
+
+fn renew(l: &mut Ledger, by: &Granter, id: &str, ttl: Duration, extra: serde_json::Value) -> Result<Decided> {
+    check_ttl(ttl)?;
+    let now = wicket_store::now();
+    let until = now.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX));
+    let label = by.label();
+    let mut extra = extra;
+    match target(l, id)? {
+        Target::Grant(g) => {
+            if g.revoked {
+                bail!("grant {} is revoked", g.id);
+            }
+            if g.expires_at <= now {
+                bail!("grant {} has expired: ask again", g.id);
+            }
+            if until <= g.expires_at {
+                bail!("grant {} already lasts {}s more; revoke it to end it sooner", g.id, g.expires_at - now);
+            }
+            if let Granter::Agent(a) = by {
+                let Some(req) = g.request_id.as_deref().map(|r| l.request(r)).transpose()? else {
+                    bail!("grant {} answers no request: a human renews it", g.id);
+                };
+                let chain = within_authority(l, a, &req)?;
+                agent_renews(a, &g, &req, until)?;
+                merge(&mut extra, serde_json::json!({ "granter": "agent", "chain": chain }));
+            }
+            if !l.renew_grant(&g.id, until)? {
+                bail!("grant {} is no longer live", g.id);
+            }
+            let mut record = serde_json::json!({
+                "request": g.request_id, "decision": "renew", "grant": g.id, "by": label,
+                "method": g.method, "host": g.host, "path": g.path, "prefix": g.prefix,
+                "run": g.run, "zone": g.zone, "node": g.node, "uses_left": g.uses_left,
+                "previous_until": g.expires_at, "until": until, "ttl_secs": ttl.as_secs(),
+            });
+            merge(&mut record, extra);
+            if let Err(e) = l.audit(&TenantId::single(), None, "decision", &record) {
+                let _ = l.renew_grant(&g.id, g.expires_at);
+                return Err(anyhow::Error::from(e).context("the renewal could not be recorded in the audit log, so it was undone"));
+            }
+            Ok(Decided::Renewed { what: Renewed::Grant(g.id), until })
+        }
+        Target::Authority { run, until: previous, cap } => {
+            if l.run_status(&run)?.as_deref() != Some("running") {
+                bail!("run {run} is not running");
+            }
+            if until <= previous {
+                bail!("run {run}'s authority already lasts {}s more", previous - now);
+            }
+            if until > cap {
+                bail!("run {run}'s authority can't outlast its timeout, which ends it in {}s", (cap - now).max(0));
+            }
+            if let Granter::Agent(a) = by {
+                if l.identity(&run)?.is_none_or(|i| i.tenant != a.tenant.0) {
+                    bail!("run {run} is not in your tenant");
+                }
+                let chain = descendant_chain(l, a, &run)?;
+                if !a.zone.escalation.grant {
+                    bail!("your zone may not grant (escalation.grant: false)");
+                }
+                outlasts(a, until, "authority")?;
+                merge(&mut extra, serde_json::json!({ "granter": "agent", "chain": chain }));
+            }
+            if !l.renew_run_authority(&run, until)? {
+                bail!("run {run}'s authority could not be renewed (it ended, or is past its cap)");
+            }
+            let mut record = serde_json::json!({
+                "decision": "renew", "authority": run, "run": run, "by": label,
+                "previous_until": previous, "until": until, "ttl_secs": ttl.as_secs(),
+            });
+            merge(&mut record, extra);
+            if let Err(e) = l.audit(&TenantId::single(), Some(&RunId(run.clone())), "decision", &record) {
+                let _ = l.renew_run_authority(&run, previous);
+                return Err(anyhow::Error::from(e).context("the renewal could not be recorded in the audit log, so it was undone"));
+            }
+            Ok(Decided::Renewed { what: Renewed::Authority(run), until })
+        }
+    }
+}
+
+/// Whether an agent's renewal of grant `g` (for `req`, which it may decide) ends within what it
+/// could grant now: a grant to the asking run only, for exactly the asked path, with a number of
+/// uses, not a push's window, ending no later than its own authority.
+fn agent_renews(a: &AgentAuthority, g: &wicket_store::GrantRow, req: &Request, until: i64) -> Result<()> {
+    if g.run.as_deref() != Some(req.run.as_str()) {
+        bail!("an agent renews a grant to the asking run only, not its whole zone");
+    }
+    if g.prefix {
+        bail!("an agent renews a grant for exactly the asked path, not a prefix");
+    }
+    if g.uses_left.is_none() {
+        bail!("an agent renews only a grant with a number of uses");
+    }
+    if wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
+        bail!("a git push is decided by a human");
+    }
+    outlasts(a, until, "grant")
+}
+
+/// Refuses an end past the agent's own authority.
+fn outlasts(a: &AgentAuthority, until: i64, what: &str) -> Result<()> {
+    let now = wicket_store::now();
+    if a.until <= now {
+        bail!("your own authority has ended");
+    }
+    if until > a.until {
+        bail!("the {what} would outlast your own authority, which ends in {}s", a.until - now);
+    }
+    Ok(())
 }
 
 /// Whether terms may be granted for `req` at all, whoever grants them.
 pub fn check_terms(req: &Request, t: &Terms) -> Result<()> {
-    if t.ttl > MAX_TTL {
-        bail!("grants last at most {}; renew it with a new decision", humantime::format_duration(MAX_TTL));
-    }
-    if t.ttl.is_zero() {
-        bail!("a grant needs a lifetime");
-    }
+    check_ttl(t.ttl)?;
     if t.uses == Some(0) {
         bail!("a grant needs at least one use");
     }
@@ -304,8 +464,13 @@ impl wicket_proxy::Decisions for AgentDecisions {
             Some(iat) if (now - iat).abs() <= DECISION_SKEW_SECS => {}
             _ => return Err("the decision is stale".into()),
         }
-        let id = p["request"].as_str().ok_or("the decision names no request")?;
+        let renewing = p["decision"].as_str() == Some("renew");
+        let id = match renewing {
+            false => p["request"].as_str().ok_or("the decision names no request")?,
+            true => p["target"].as_str().ok_or("the renewal names no grant, request or run")?,
+        };
         let verdict = match p["decision"].as_str() {
+            Some("renew") => Verdict::Renew(Duration::from_secs(p["ttl_secs"].as_u64().ok_or("the renewal has no ttl")?)),
             Some("approve") => Verdict::Approve(Terms {
                 uses: Some(p["uses"].as_u64().and_then(|u| u32::try_from(u).ok()).ok_or("the decision has no uses")?),
                 ttl: Duration::from_secs(p["ttl_secs"].as_u64().ok_or("the decision has no ttl")?),
@@ -313,7 +478,7 @@ impl wicket_proxy::Decisions for AgentDecisions {
                 zone_wide: false,
             }),
             Some("deny") => Verdict::Deny,
-            _ => return Err("the decision is neither approve nor deny".into()),
+            _ => return Err("the decision is neither approve, deny nor renew".into()),
         };
         let mut l = self.ledger.lock().map_err(|_| "ledger lock")?;
         if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
@@ -327,6 +492,15 @@ impl wicket_proxy::Decisions for AgentDecisions {
                 ttl.as_secs()
             )),
             Ok(Decided::Denied { .. }) => Ok(format!("denied: {id}.")),
+            Ok(Decided::Renewed { what, until }) => Ok(format!(
+                "renewed: {} now ends in {}s (at {until}).",
+                match what {
+                    Renewed::Grant(g) => format!("grant {g}"),
+                    Renewed::Authority(r) => format!("box {r}'s authority"),
+                },
+                until - wicket_store::now()
+            )),
+            Err(e) if renewing => Err(format!("{e:#}")),
             Err(e) => match l.request(id).map(|r| r.status) {
                 Ok(s) if s == "pending" => Err(format!("{e:#}; {id} stays pending for a human")),
                 _ => Err(format!("{e:#}")),
@@ -533,6 +707,15 @@ mod tests {
             wicket_identity::sign_envelope(&self.key, &self.jws, &p)
         }
 
+        /// What the gateway signs for `decide` with `decision: renew`.
+        fn signed_renew(&self, target: &str, ttl: u64) -> String {
+            let p = serde_json::json!({
+                "jti": "d-2", "iat": wicket_store::now(), "kind": wicket_proxy::DECISION_KIND, "run": "run_p",
+                "target": target, "decision": "renew", "ttl_secs": ttl,
+            });
+            wicket_identity::sign_envelope(&self.key, &self.jws, &p)
+        }
+
         fn status(&self, id: &str) -> String {
             self.ledger.lock().unwrap().request(id).unwrap().status
         }
@@ -654,6 +837,127 @@ mod tests {
         // The first decision wins.
         let e = hook.decide(&t.signed(&id, "deny", 1, 60)).unwrap_err();
         assert!(e.contains("no longer pending") && !e.contains("stays pending"), "{e}");
+    }
+
+    // ---- renewal (#56) ----
+
+    fn renewed(l: &mut Ledger, by: &Granter, id: &str, ttl: u64) -> Result<Decided> {
+        decide(l, by, id, &Verdict::Renew(Duration::from_secs(ttl)), serde_json::json!({}))
+    }
+
+    #[test]
+    fn a_renewed_grant_lasts_its_new_ttl_and_is_audited() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let id = asked(&l, "/v1/x");
+        let by = Granter::Human("alice@cli".into());
+        let Decided::Approved { grant, .. } =
+            decide(&mut l, &by, &id, &Verdict::Approve(Terms { uses: Some(3), ..terms(60) }), serde_json::json!({})).unwrap()
+        else {
+            panic!("not approved")
+        };
+        let before = l.grant(&grant).unwrap().unwrap().expires_at;
+        let Decided::Renewed { what, until } = renewed(&mut l, &by, &grant, 3600).unwrap() else { panic!("not renewed") };
+        assert_eq!(what, Renewed::Grant(grant.clone()));
+        let g = l.grant(&grant).unwrap().unwrap();
+        assert!(until >= wicket_store::now() + 3599 && g.expires_at == until, "{until} {}", g.expires_at);
+        assert_eq!(g.uses_left, Some(3), "uses are kept");
+        let d = decisions(&l);
+        let r = d.iter().find(|d| d["decision"] == "renew").unwrap();
+        assert_eq!(
+            (r["grant"].as_str(), r["by"].as_str(), r["previous_until"].as_i64()),
+            (Some(grant.as_str()), Some("alice@cli"), Some(before))
+        );
+        // Named by the request it answers, too. Every renewal keeps a lifetime, and only extends.
+        assert!(renewed(&mut l, &by, &id, 7200).is_ok());
+        for (ttl, why) in [(0, "needs a lifetime"), (24 * 3600 + 1, "at most 1day"), (60, "already lasts")] {
+            let e = renewed(&mut l, &by, &grant, ttl).unwrap_err();
+            assert!(format!("{e:#}").contains(why), "{e:#} should say {why:?}");
+        }
+        l.revoke_grant(&grant).unwrap();
+        assert!(format!("{:#}", renewed(&mut l, &by, &grant, 9000).unwrap_err()).contains("revoked"));
+        assert!(renewed(&mut l, &by, "g-nosuch", 60).is_err());
+        assert!(renewed(&mut l, &by, "run_nosuch", 60).is_err());
+    }
+
+    #[test]
+    fn an_agent_renews_a_grant_only_within_its_own_authority() {
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        hook.until.store(wicket_store::now() + 300, Ordering::SeqCst);
+        let child = t.ask("run_c", "GET", "/v1/items");
+        assert!(hook.decide(&t.signed(&child, "approve", 2, 60)).is_ok());
+        let grant = t.ledger.lock().unwrap().grant_for_request(&child).unwrap().unwrap().id;
+        let e = hook.decide(&t.signed_renew(&grant, 600)).unwrap_err();
+        assert!(e.contains("outlast your own authority"), "{e}");
+        let text = hook.decide(&t.signed_renew(&grant, 200)).unwrap();
+        assert!(text.starts_with("renewed: grant"), "{text}");
+        assert!(t.ledger.lock().unwrap().grant(&grant).unwrap().unwrap().expires_at >= wicket_store::now() + 199);
+        let d = decisions(&t.ledger.lock().unwrap());
+        let r = d.iter().find(|d| d["decision"] == "renew").unwrap();
+        assert_eq!((r["by"].as_str(), &r["chain"]), (Some("agent:run_p"), &serde_json::json!(["run_c", "run_p"])));
+        assert!(r["signed"].as_str().is_some());
+        // What it couldn't have granted, it can't renew: a stranger's grant, a zone-wide or an
+        // unlimited one a human made, one beyond its reach.
+        let by = Granter::Human("alice@cli".into());
+        let approve = |id: &str, t2: Terms| {
+            let mut l = t.ledger.lock().unwrap();
+            match decide(&mut l, &by, id, &Verdict::Approve(t2), serde_json::json!({})).unwrap() {
+                Decided::Approved { grant, .. } => grant,
+                d => panic!("{d:?}"),
+            }
+        };
+        let stranger = approve(&t.ask("run_x", "GET", "/v1/items"), terms(60));
+        let wide = approve(&t.ask("run_c", "GET", "/v1/wide"), Terms { zone_wide: true, ..terms(60) });
+        let unlimited = approve(&t.ask("run_c", "GET", "/v1/unlimited"), Terms { uses: None, ..terms(60) });
+        let beyond = approve(&t.ask("run_c", "GET", "/v2/items"), terms(60));
+        for (g, why) in [
+            (&stranger, "not from one of your descendants"),
+            (&wide, "asking run only"),
+            (&unlimited, "number of uses"),
+            (&beyond, "outside your own reach"),
+        ] {
+            let e = hook.decide(&t.signed_renew(g, 120)).unwrap_err();
+            assert!(e.contains(why), "{e} should say {why:?}");
+        }
+    }
+
+    #[test]
+    fn a_running_boxs_authority_is_renewed_by_who_may_grant_it_never_past_its_timeout() {
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        hook.until.store(wicket_store::now() + 300, Ordering::SeqCst);
+        let now = wicket_store::now();
+        {
+            let l = t.ledger.lock().unwrap();
+            for run in ["run_c", "run_x"] {
+                l.run_started(&TenantId::single(), &RunId(run.into()), "z", run).unwrap();
+                l.set_run_authority(run, now + 60, now + 3600).unwrap();
+            }
+        }
+        let authority = |run: &str| t.ledger.lock().unwrap().run_authority(run).unwrap().unwrap().0;
+        // Its parent, within its own authority.
+        let e = hook.decide(&t.signed_renew("run_c", 600)).unwrap_err();
+        assert!(e.contains("outlast your own authority"), "{e}");
+        assert_eq!(authority("run_c"), now + 60);
+        assert!(hook.decide(&t.signed_renew("run_c", 200)).unwrap().starts_with("renewed: box run_c's authority"));
+        assert!(authority("run_c") >= now + 200);
+        let e = hook.decide(&t.signed_renew("run_x", 200)).unwrap_err();
+        assert!(e.contains("not one of your descendants"), "{e}");
+        assert_eq!(authority("run_x"), now + 60, "not renewed: it stops at its end");
+        let no_grant = t.hook(&format!("{PARENT_ZONE}escalation: {{ grant: false }}\n"));
+        assert!(no_grant.decide(&t.signed_renew("run_c", 250)).unwrap_err().contains("escalation.grant: false"));
+        // A human, up to the run's timeout and no further; not once it ended.
+        let by = Granter::Human("alice@cli".into());
+        let mut l = t.ledger.lock().unwrap();
+        let e = renewed(&mut l, &by, "run_c", 7200).unwrap_err();
+        assert!(format!("{e:#}").contains("outlast its timeout"), "{e:#}");
+        let Decided::Renewed { what, until } = renewed(&mut l, &by, "run_c", 1800).unwrap() else { panic!() };
+        assert_eq!((what, l.run_authority("run_c").unwrap().unwrap().0), (Renewed::Authority("run_c".into()), until));
+        let d = decisions(&l);
+        let r = d.iter().rev().find(|d| d["authority"] == "run_c").unwrap();
+        assert_eq!((r["decision"].as_str(), r["until"].as_i64()), (Some("renew"), Some(until)));
+        l.run_ended(&RunId("run_x".into()), "succeeded", "").unwrap();
+        assert!(format!("{:#}", renewed(&mut l, &by, "run_x", 600).unwrap_err()).contains("not running"));
     }
 
     #[test]

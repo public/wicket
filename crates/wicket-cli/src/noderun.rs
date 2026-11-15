@@ -264,8 +264,10 @@ pub struct NodeCtl {
     pub run: String,
     link: Mutex<Option<chan::Out>>,
     publisher: Arc<SharedFeed>,
-    /// The box's token's block 0 revocation id (hex), and until when it matters (Unix ms).
-    token_root: (String, i64),
+    /// The box's tokens' block 0 revocation ids (hex), and until when each matters (Unix ms): one
+    /// per mint, the first at the box's start and one more for each renewal of its authority (#56).
+    /// The last is the token the node holds now.
+    token_roots: Mutex<Vec<(String, i64)>>,
     killed: AtomicBool,
     /// Calls on the box (pause, processes, exec, link sockets) over the run's connection.
     pub calls: Arc<Calls>,
@@ -281,6 +283,11 @@ pub struct NodeCtl {
 }
 
 impl NodeCtl {
+    /// When the box's authority ends now (Unix ms): its current token's block 0.
+    fn authority_until(&self) -> i64 {
+        self.token_roots.lock().expect("token roots").last().map_or(0, |r| r.1)
+    }
+
     fn send(&self, f: Frame) -> bool {
         self.link.lock().expect("link").as_ref().is_some_and(|l| l.send(f).is_ok())
     }
@@ -317,20 +324,12 @@ impl NodeCtl {
     /// Revokes the run on the node (every op refused from the moment the delta applies), then stops it.
     pub fn revoke(&self) {
         let now = wicket_feed::now_ms();
-        let frame = self.publisher.lock().and_then(|mut p| {
-            p.commit(
-                vec![
-                    Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 },
-                    Change::Revoke {
-                        kind: RevokeKind::Token,
-                        id: self.token_root.0.clone(),
-                        until: self.token_root.1.max(now + 86_400_000),
-                    },
-                ],
-                now,
-            )
-            .map_err(Into::into)
-        });
+        // Every block 0 the box was minted with: a child derived from an earlier one goes too.
+        let mut changes = vec![Change::Revoke { kind: RevokeKind::Run, id: self.run.clone(), until: now + 86_400_000 }];
+        for (id, until) in self.token_roots.lock().expect("token roots").iter() {
+            changes.push(Change::Revoke { kind: RevokeKind::Token, id: id.clone(), until: (*until).max(now + 86_400_000) });
+        }
+        let frame = self.publisher.lock().and_then(|mut p| p.commit(changes, now).map_err(Into::into));
         match frame {
             Ok(f) => {
                 self.send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
@@ -374,6 +373,11 @@ pub struct Start {
     /// How long the box's authority has left from now (#153): its token's block 0 ends then, and
     /// its node stops the box. Counted from the run's start, so a re-attach doesn't extend it.
     pub authority_secs: u64,
+    /// The latest a renewal may take the box's authority to, from now (#56): its run's hard end.
+    pub authority_cap_secs: u64,
+    /// What the run's agent may grant ends no later than this (Unix seconds): kept at the box's
+    /// authority as it is renewed.
+    pub authority_until: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Calls on boxes over this run's connection (made before the run's proxies, which use them).
     pub calls: Arc<Calls>,
     /// Trees sent to the node before the box starts: (tree, local directory, top-level names left out).
@@ -416,9 +420,14 @@ struct Shared {
     ctl: Arc<NodeCtl>,
     cfg: PublisherConfig,
     issuer: Arc<wicket_identity::Issuer>,
-    /// The box's base token (block 0), and the key that signs its grant blocks.
-    token_issuer: wicket_feed::Issuer,
+    /// The box's base token (block 0), and the key that signs its grant blocks. Re-minted when its
+    /// authority is renewed (#56).
+    token_issuer: Mutex<wicket_feed::Issuer>,
     approver: wicket_authz::SigningKey,
+    /// What block 0 is minted from, for a renewal's re-mint: the box's image and org layer.
+    image: String,
+    org: Option<Arc<wicket_authz::OrgLayer>>,
+    authority_until: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Re-attaching to a box already on the node (#151), and the grants its token carries already.
     attach: bool,
     carried: Vec<LiveGrant>,
@@ -443,6 +452,35 @@ struct Shared {
     first_output: AtomicBool,
 }
 
+/// Mints box `run`'s block 0, until `not_after` (Unix seconds): by the authority root, or by its
+/// certified issuing key while the roots are offline (#154), compiled from Cedar (#51): the zone's
+/// policy and, if the installation has one, the org policy, for this box as it is now (its zone's
+/// groups, its principal, its spawn depth). At the box's start, and again when its authority is
+/// renewed (#56): the same block 0 with a later end.
+#[allow(clippy::too_many_arguments)]
+fn mint_token(
+    tenant: &TenantId,
+    run: &RunId,
+    zone: &ZoneSpec,
+    image: &str,
+    org: Option<&wicket_authz::OrgLayer>,
+    approver: &wicket_authz::SigningKey,
+    not_after: u64,
+    t: Option<&Timings>,
+) -> Result<wicket_feed::Issuer> {
+    let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
+    let (minter, issuer_cert) = crate::roots::minting_key(until_ms)?;
+    let compiled = t.map(|t| t.span("token.policy"));
+    let ceiling = wicket_policy::ceiling(zone, &run.0, not_after, vec![approver.public()], &[image.to_string()], org.cloned())
+        .context("compiling the box's policy")?;
+    drop(compiled);
+    let _minted = t.map(|t| t.span("token.mint"));
+    let mut token_issuer = wicket_feed::Issuer::from_ceiling(&minter, &tenant.0, &format!("run:{run}"), &run.0, 0, zone, &ceiling)
+        .context("minting the box's token")?;
+    token_issuer.issuer_cert = issuer_cert;
+    Ok(token_issuer)
+}
+
 /// Connects to the node, publishes the run's zone, starts the box there, and returns its stdio.
 pub async fn start(s: Start) -> Result<NodeBox> {
     let t = s.timings.clone();
@@ -453,32 +491,26 @@ pub async fn start(s: Start) -> Result<NodeBox> {
     let feed = Arc::new(SharedFeed::open(&name, cfg.clone())?);
     let now = wicket_feed::now_ms();
     let paths = crate::enrol::Paths::installation();
-    // Block 0 is minted by the authority root, or by its certified issuing key while the roots are
-    // offline (#154). Every grant has a lifetime (#153), block 0 included: the zone's
-    // `limits.authority` (default the run's timeout), counted from the run's start. The node works
-    // for the box until then and stops it at that time, whether or not it can reach this host.
-    let not_after = u64::try_from(now / 1000).unwrap_or(0) + s.authority_secs.max(1);
-    let until_ms = i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000;
-    let ((minter, issuer_cert), approver) = (crate::roots::minting_key(until_ms)?, crate::enrol::token_key(&paths.approver_key)?);
+    // Every grant has a lifetime (#153), block 0 included: the zone's `limits.authority` (default
+    // the run's timeout), counted from the run's start. The node works for the box until then and
+    // stops it at that time, whether or not it can reach this host. A renewal (#56) moves it, never
+    // past the run's hard end; a re-attach keeps a renewal made before it.
+    let now_s = now / 1000;
+    let cap = now_s.saturating_add(i64::try_from(s.authority_cap_secs.max(s.authority_secs)).unwrap_or(i64::MAX / 2));
+    let mut until_s = now_s.saturating_add(i64::try_from(s.authority_secs.max(1)).unwrap_or(i64::MAX / 2));
+    if s.attach {
+        if let Some((renewed, _)) = s.ledger.lock().expect("ledger").run_authority(&s.run.0)? {
+            until_s = until_s.max(renewed.min(cap));
+        }
+    }
+    let not_after = u64::try_from(until_s).unwrap_or(0);
+    let approver = crate::enrol::token_key(&paths.approver_key)?;
     keys.end();
-    // Block 0 is compiled from Cedar (#51): the zone's policy and, if the installation has one, the
-    // org policy, for this box as it is now (its zone's groups, its principal, its spawn depth).
-    let compiled = t.span("token.policy");
-    let ceiling = wicket_policy::ceiling(
-        &s.zone,
-        &s.run.0,
-        not_after,
-        vec![approver.public()],
-        std::slice::from_ref(&s.start.image),
-        s.org.as_deref().cloned(),
-    )
-    .context("compiling the box's policy")?;
-    compiled.end();
-    let minted = t.span("token.mint");
-    let mut token_issuer =
-        wicket_feed::Issuer::from_ceiling(&minter, &s.tenant.0, &format!("run:{}", s.run), &s.run.0, 0, &s.zone, &ceiling)
-            .context("minting the box's token")?;
-    token_issuer.issuer_cert = issuer_cert;
+    let token_issuer = mint_token(&s.tenant, &s.run, &s.zone, &s.start.image, s.org.as_deref(), &approver, not_after, Some(t.as_ref()))?;
+    s.ledger.lock().expect("ledger").set_run_authority(&s.run.0, until_s, cap)?;
+    if let Some(a) = &s.authority_until {
+        a.store(until_s, Ordering::SeqCst);
+    }
     s.ledger.lock().expect("ledger").set_run_policy(&s.run.0, s.org.as_ref().map(|o| o.version.as_str()))?;
     // A re-attached run's token carries the grants the ledger already handed this node for it, so
     // nothing a human approved is lost with the supervisor that published them.
@@ -494,7 +526,6 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
     };
     let authority = token_issuer.publish(&approver, &carried).context("the box's token")?;
-    minted.end();
     // What the node attenuates a child's token from, deciding its spawns (#164).
     let mut s = s;
     if let Some(sp) = s.start.edge.as_mut().and_then(|e| e.spawn.as_mut()) {
@@ -524,7 +555,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.epoch()
     };
     published.end();
-    let token_root = (token_issuer.block_ids()[0].clone(), i64::try_from(not_after).unwrap_or(i64::MAX / 1000) * 1000);
+    let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
     // What fences a wake of the agent elsewhere while this box may still run (#153).
     record_authority(&s.dir, &name, token_root.1 + 1000).context("recording the box's authority")?;
     // Records the node ships are filed under this run only once the ledger says it runs there (#120).
@@ -534,7 +565,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         run: s.run.0.clone(),
         link: Mutex::new(None),
         publisher: feed,
-        token_root,
+        token_roots: Mutex::new(vec![token_root]),
         killed: AtomicBool::new(false),
         calls: s.calls.clone(),
         keep: s.keep,
@@ -557,8 +588,11 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         ctl: ctl.clone(),
         cfg,
         issuer,
-        token_issuer,
+        token_issuer: Mutex::new(token_issuer),
         approver,
+        image: s.start.image.clone(),
+        org: s.org.clone(),
+        authority_until: s.authority_until.clone(),
         attribute: s.attribute.clone(),
         llm: s.llm.clone(),
         vault: s.vault.clone(),
@@ -758,6 +792,8 @@ struct Progress {
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
+    /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
+    remint_failed: i64,
 }
 
 async fn manage(
@@ -784,6 +820,7 @@ async fn manage(
         lease_sent: false,
         slice: None,
         fetched: std::collections::HashMap::new(),
+        remint_failed: 0,
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
@@ -1541,9 +1578,9 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     let r = match for_pull {
         Some(src) => {
             let hosts: Vec<String> = std::iter::once(src.host.clone()).chain(src.auth_hosts.iter().cloned()).collect();
-            crate::nodesecrets::release_for_hosts(&sh.vault, name, &hosts, sh.ctl.token_root.1)
+            crate::nodesecrets::release_for_hosts(&sh.vault, name, &hosts, sh.ctl.authority_until())
         }
-        None => crate::nodesecrets::release(&sh.zone, &sh.vault, name, sh.ctl.token_root.1),
+        None => crate::nodesecrets::release(&sh.zone, &sh.vault, name, sh.ctl.authority_until()),
     };
     let (ok, why) = match &r {
         Ok(f) => {
@@ -1573,7 +1610,8 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     let mut out = vec![];
     let names: Vec<String> = p.fetched.keys().cloned().collect();
     for name in names {
-        let now = crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.token_root.1).ok().map(|f| crate::nodesecrets::digest(&f));
+        let now =
+            crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.authority_until()).ok().map(|f| crate::nodesecrets::digest(&f));
         if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
             p.fetched.remove(&name);
             save_holdings(sh, p);
@@ -1645,25 +1683,61 @@ fn check_node_ask(tenant: &TenantId, own: &RunId, zone_spec: &ZoneSpec, run: &st
 /// token is rebuilt from its base with one block per live grant (signed with the approver key) and
 /// published whole, in the same delta as any grant revocations. At most
 /// [`wicket_feed::token::MAX_GRANTS`] are live at once; more stay in the ledger until some expire.
+///
+/// Renewals (#56) go out the same way: a renewed grant's block is rebuilt with its new end, and a
+/// renewed authority re-mints block 0 with its new end (the same ceiling, minted again), so the
+/// node holds the box past its old end. Nothing new on the feed: one `PutZone`, as for any grant.
 fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
-    let (grants, ca) = {
+    let (grants, ca, authority) = {
         let l = sh.ledger.lock().expect("ledger");
         let g = l.grants_for_run(&sh.run.0).unwrap_or_default();
         let now = wicket_store::now();
         let ca = l.node_cas(&sh.node).ok().and_then(|cs| cs.into_iter().find(|c| c.status == "active" && c.not_after > now));
-        (g, ca)
+        (g, ca, l.run_authority(&sh.run.0).ok().flatten())
     };
     let now_s = wicket_store::now();
     let mut changes = vec![];
     let Ok(ctx) = sh.ctl.publisher.lock().map(|p| p.state().ctx) else { return vec![] };
+    // The box's authority, renewed past what its token says: block 0 minted again until then.
+    let held = sh.ctl.authority_until() / 1000;
+    let reminted = match authority {
+        Some((until, _)) if until > held && until > now_s && until != p.remint_failed => {
+            match mint_token(
+                &sh.tenant,
+                &sh.run,
+                &sh.zone,
+                &sh.image,
+                sh.org.as_deref(),
+                &sh.approver,
+                u64::try_from(until).unwrap_or(0),
+                None,
+            ) {
+                Ok(i) => Some((i, until)),
+                Err(e) => {
+                    p.remint_failed = until;
+                    println!(
+                        "[wicket] could not re-mint {}'s token for its renewed authority: {e:#}; the box stops at its old end",
+                        sh.run
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let issuer = match &reminted {
+        Some((i, _)) => i.clone(),
+        None => sh.token_issuer.lock().expect("token issuer").clone(),
+    };
     // Whether the token with these grants would load on a node (the publisher refuses it otherwise).
     let loads = |live: &[LiveGrant]| -> Result<(), String> {
-        let a = sh.token_issuer.publish(&sh.approver, live).map_err(|e| e.to_string())?;
+        let a = issuer.publish(&sh.approver, live).map_err(|e| e.to_string())?;
         wicket_feed::Policy::compile(&a, &ctx, &|_, _| false).map(|_| ())
     };
     let before = p.live.len();
     p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
-    let mut rebuild = p.live.len() != before;
+    let mut rebuild = p.live.len() != before || reminted.is_some();
+    rebuild |= renew_live(&mut p.live, &grants, &sh.node, now_s);
     let mut handed: Vec<String> = vec![];
     for g in grants {
         let mine = g.node.as_deref() == Some(sh.node.as_str());
@@ -1720,7 +1794,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             }
             continue;
         }
-        let live = live_grant(&sh.tenant, &sh.run, &sh.zone.name, &sh.token_issuer, &g);
+        let live = live_grant(&sh.tenant, &sh.run, &sh.zone.name, &issuer, &g);
         let mut trial = p.live.clone();
         trial.push(live.clone());
         if let Err(e) = loads(&trial) {
@@ -1744,18 +1818,27 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     if !rebuild {
         return vec![];
     }
-    match sh.token_issuer.publish(&sh.approver, &p.live) {
-        Ok(a) => changes.push(Change::PutZone { zone: a }),
-        Err(e) => println!("[wicket] could not rebuild the token of {} for node {}: {e}", sh.run, sh.node),
-    }
+    let renewing = match issuer.publish(&sh.approver, &p.live) {
+        Ok(a) => {
+            changes.push(Change::PutZone { zone: a });
+            reminted
+        }
+        Err(e) => {
+            println!("[wicket] could not rebuild the token of {} for node {}: {e}", sh.run, sh.node);
+            None
+        }
+    };
     if changes.is_empty() {
         return vec![];
     }
     let n = p.live.len();
     let revokes: Vec<Change<BoxAuthority>> = changes.iter().filter(|c| matches!(c, Change::Revoke { .. })).cloned().collect();
+    // Whether the rebuilt token went out (not only its revocations): a renewal counts only then.
+    let token_out;
     let committed = {
         let Ok(mut p) = sh.ctl.publisher.lock() else { return vec![] };
         let mut r = p.commit(changes, wicket_feed::now_ms());
+        token_out = r.is_ok();
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
             println!(
@@ -1769,6 +1852,9 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     };
     if let Ok((_, epoch)) = &committed {
         let _ = sh.ledger.lock().expect("ledger").grants_published(&handed, *epoch as i64);
+        if let Some((i, until)) = renewing.filter(|_| token_out) {
+            renewed(sh, i, until);
+        }
     }
     match committed {
         Ok((f, epoch)) => {
@@ -1785,6 +1871,42 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             vec![]
         }
     }
+}
+
+/// Gives each grant the box's token carries the end the ledger has for it now: a renewed grant
+/// (#56) is published with its new end. Whether any changed.
+fn renew_live(live: &mut [LiveGrant], grants: &[wicket_store::GrantRow], node: &str, now_s: i64) -> bool {
+    let mut changed = false;
+    for g in grants.iter().filter(|g| g.node.as_deref() == Some(node) && !g.revoked && g.expires_at > now_s) {
+        let end = u64::try_from(g.expires_at).unwrap_or(0);
+        if let Some(l) = live.iter_mut().find(|l| l.grant.gid == g.id && l.grant.not_after != end) {
+            l.grant.not_after = end;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The box's re-minted token, until `until` (Unix seconds), is on the feed: it is the one revoked
+/// with the box, the one secrets are released until, what fences a wake elsewhere, and what the
+/// run's agent may grant within (#56).
+fn renewed(sh: &Shared, issuer: wicket_feed::Issuer, until: i64) {
+    let until_ms = until.saturating_mul(1000);
+    sh.ctl.token_roots.lock().expect("token roots").push((issuer.block_ids()[0].clone(), until_ms));
+    *sh.token_issuer.lock().expect("token issuer") = issuer;
+    if let Some(a) = &sh.authority_until {
+        a.store(until, Ordering::SeqCst);
+    }
+    if let Err(e) = record_authority(&sh.dir, &sh.node, until_ms + 1000) {
+        println!("[wicket] could not record {}'s renewed authority: {e:#}", sh.run);
+    }
+    println!("[wicket] {}'s authority on node {} renewed until {until}", sh.run, sh.node);
+    let _ = sh.ledger.lock().expect("ledger").audit(
+        &sh.tenant,
+        Some(&sh.run),
+        "node.authority_renewed",
+        &serde_json::json!({ "node": sh.node, "until": until }),
+    );
 }
 
 /// A ledger grant as a block of the box's token. Its use count is the ledger's at handover: a
@@ -1810,6 +1932,42 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #56: a renewed grant the box's token carries is published with its new end; one the token
+    /// doesn't carry (not handed to this node, revoked or expired) changes nothing.
+    #[test]
+    fn a_renewed_grant_is_republished_with_its_new_end() {
+        let tenant = TenantId::single();
+        let run = RunId("run_r".into());
+        let zone: ZoneSpec = serde_yaml::from_str("name: z\nreach: []\n").unwrap();
+        let key = wicket_authz::SigningKey::generate();
+        let issuer = wicket_feed::Issuer::root(&key, &tenant.0, "run:run_r", &run.0, 0, &zone, &[], 2_000_000_000, vec![]).unwrap();
+        let row = |id: &str, node: Option<&str>, expires_at: i64| wicket_store::GrantRow {
+            id: id.into(),
+            tenant: tenant.0.clone(),
+            zone: "z".into(),
+            method: "GET".into(),
+            host: "api.example.com".into(),
+            path: "/v1/x".into(),
+            prefix: false,
+            uses_left: Some(2),
+            expires_at,
+            request_id: Some("r-1".into()),
+            revoked: false,
+            node: node.map(String::from),
+            max_risk: Some(1),
+            run: Some(run.0.clone()),
+        };
+        let now = 1_000_000;
+        let mut live = vec![live_grant(&tenant, &run, "z", &issuer, &row("g-1", Some("n1"), now + 60))];
+        assert!(!renew_live(&mut live, &[row("g-1", Some("n1"), now + 60)], "n1", now), "unchanged");
+        let renewed = [row("g-1", Some("n1"), now + 3600), row("g-2", None, now + 3600)];
+        assert!(renew_live(&mut live, &renewed, "n1", now));
+        assert_eq!((live.len(), live[0].grant.not_after, live[0].uses), (1, (now + 3600) as u64, Some(2)));
+        let revoked = wicket_store::GrantRow { revoked: true, ..row("g-1", Some("n1"), now + 7200) };
+        assert!(!renew_live(&mut live, &[revoked, row("g-1", Some("n2"), now + 7200)], "n1", now));
+        assert_eq!(live[0].grant.not_after, (now + 3600) as u64);
+    }
 
     /// #152: `wicket node list` shows, per run on a node, its authority, the secrets released to it
     /// (by name) and its budget slice.
