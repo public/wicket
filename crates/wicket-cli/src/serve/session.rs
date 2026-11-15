@@ -120,6 +120,7 @@ impl Sockets {
     }
 
     /// How many are open, in all and for `console_session`.
+    #[cfg(test)]
     pub fn open(&self, console_session: &str) -> (usize, usize) {
         (self.total, self.by_session.get(console_session).copied().unwrap_or(0))
     }

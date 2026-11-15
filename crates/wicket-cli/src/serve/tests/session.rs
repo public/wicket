@@ -1,7 +1,7 @@
 //! A run's ACP session socket (#327): who may open it, what it bridges, and what it audits.
 
 use super::*;
-use crate::serve::session::{Bridge, Who, SUBPROTOCOL, TICKET_PREFIX};
+use crate::serve::session::{Bridge, Slot, Sockets, Who, MAX_SOCKETS, MAX_SOCKETS_PER_SESSION, SUBPROTOCOL, TICKET_PREFIX};
 use futures_util::{SinkExt, StreamExt};
 use std::io::Write;
 use std::path::Path;
@@ -427,6 +427,89 @@ async fn the_socket_needs_a_session_the_consoles_origin_and_a_fresh_passkey_tick
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("session.closed was not audited");
+}
+
+#[test]
+fn a_cancel_is_queued_for_the_supervisor_audited_and_limited() {
+    let (t, mut b, _dir) = bridged("sess-cancel");
+    let cancel = |sid: &str| json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": sid } }).to_string();
+    // Another session's id: nothing.
+    assert!(b.on_client(&cancel("run_other")).is_empty());
+    let out = b.on_client(&cancel(RUN));
+    assert_eq!(out.len(), 1, "a notice, and no JSON-RPC answer (it is a notification)");
+    assert!(out[0]["params"]["update"]["content"]["text"].as_str().unwrap().contains("stop its running turn"));
+    assert_eq!(out[0]["params"]["update"]["_meta"]["wicket"]["notice"], true);
+    // At most one a second per socket.
+    assert!(b.on_client(&cancel(RUN)).is_empty());
+    let mut l = t.ledger();
+    assert_eq!(l.take_turn_cancels(RUN, 30).unwrap(), vec!["passkey:laptop".to_string()], "queued once, by the operator's label");
+    let audited: Vec<Value> = t.audit_kinds().into_iter().filter(|(k, _)| k == "session.cancel").map(|(_, b)| b).collect();
+    assert_eq!(audited.len(), 1);
+    assert_eq!(audited[0]["principal"], who().principal);
+    // An ended run: nothing to cancel.
+    l.run_ended(&RunId(RUN.into()), "succeeded", "").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(b.on_client(&cancel(RUN)).is_empty());
+    assert!(l.take_turn_cancels(RUN, 30).unwrap().is_empty());
+}
+
+#[test]
+fn socket_slots_are_capped_per_console_session_and_in_all_and_freed_on_drop() {
+    let socks = Arc::new(std::sync::Mutex::new(Sockets::default()));
+    let mine: Vec<Slot> = (0..MAX_SOCKETS_PER_SESSION).map(|_| Slot::take(&socks, "a").unwrap()).collect();
+    assert!(Slot::take(&socks, "a").unwrap_err().contains("this sign-in"));
+    assert_eq!(socks.lock().unwrap().open("a"), (MAX_SOCKETS_PER_SESSION, MAX_SOCKETS_PER_SESSION));
+    // Other sessions fill the rest, then everyone is refused.
+    let mut others = vec![];
+    for i in 0.. {
+        match Slot::take(&socks, &format!("s{i}")) {
+            Ok(s) => others.push(s),
+            Err(e) => {
+                assert!(e.contains("this console"), "{e}");
+                break;
+            }
+        }
+    }
+    assert_eq!(mine.len() + others.len(), MAX_SOCKETS);
+    drop(mine);
+    assert_eq!(socks.lock().unwrap().open("a"), (MAX_SOCKETS - MAX_SOCKETS_PER_SESSION, 0));
+    let again = Slot::take(&socks, "a").expect("freed");
+    drop((again, others));
+    assert_eq!(socks.lock().unwrap().open("a"), (0, 0));
+}
+
+#[tokio::test]
+async fn over_the_socket_cap_the_upgrade_is_refused_without_spending_its_ticket() {
+    let mut t = setup("sess-caps");
+    t.running(RUN, "lead");
+    std::fs::create_dir_all(t.dir.join("runs").join(RUN).join("ctl")).unwrap();
+    let cookie = t.sid.clone().unwrap();
+    // The console's runs list links an ACP run's session: one whose supervisor keeps the ACP log.
+    let acp = |t: &T| dashboard(&t.state).unwrap()["runs"].as_array().unwrap().iter().find(|r| r["id"] == RUN).unwrap()["acp"].clone();
+    assert_eq!(acp(&t), false);
+    std::fs::write(t.dir.join("runs").join(RUN).join(crate::transcript::ACP_LOG), "").unwrap();
+    assert_eq!(acp(&t), true);
+    let tickets: Vec<String> = (0..=MAX_SOCKETS_PER_SESSION).map(|_| ticket(&mut t, RUN)).collect();
+    let socks = t.state.sockets.clone();
+    let addr = serve(t.state).await;
+    let mut open = vec![];
+    for tk in &tickets[..MAX_SOCKETS_PER_SESSION] {
+        open.push(connect(addr, RUN, &browser(&cookie, tk)).await.expect("under the cap"));
+    }
+    let last = &tickets[MAX_SOCKETS_PER_SESSION];
+    let (status, body) = connect(addr, RUN, &browser(&cookie, last)).await.unwrap_err();
+    assert_eq!(status, 429);
+    assert!(body.contains("too many sessions open"), "{body}");
+    // Closing one frees its place, and the refused ticket still opens.
+    let mut first = open.remove(0);
+    first.close(None).await.unwrap();
+    for _ in 0..100 {
+        if socks.lock().unwrap().open("").0 < MAX_SOCKETS_PER_SESSION {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    connect(addr, RUN, &browser(&cookie, last)).await.expect("the same ticket, once there is room");
 }
 
 // ---- the session view's client against the real endpoint (#327) ----

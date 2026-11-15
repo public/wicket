@@ -340,6 +340,9 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         (None, false) => "HTTP, loopback only",
     };
     println!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
+    if !web::SESSION_VIEW_BUILT {
+        println!("this build has no session view (built without web/session's bundle): runs' session pages say so");
+    }
     for (name, dir) in &state.roots {
         println!("runs can be started from {name}: {}", dir.display());
     }
