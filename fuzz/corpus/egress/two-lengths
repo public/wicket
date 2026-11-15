@@ -1,0 +1,7 @@
+POST /a HTTP/1.1
+host: fuzz.example
+content-length: 3
+content-length: 30
+
+abcGET /x HTTP/1.1
+

@@ -1,0 +1,11 @@
+POST /up{oad HTTP/1.1
+host: fuzz.example
+Transfer-encoding: chunked
+
+6
+hello
+6;ext=1
+ world
+0
+x-tr
+
