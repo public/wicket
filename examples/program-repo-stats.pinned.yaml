@@ -4,7 +4,7 @@ program:
   name: repo-stats
   source: ../programs/repo-stats
   command: [bash, /workspace/stats.sh]
-  digest: sha256:610beeca625a7241e4365649edaeaf2c55ad40fc96efc61f2e741adc9633503c
+  digest: sha256:2f5fbcf38834257f1b401677572ef5b0741a5fe50530984d5d028efc2b2b3abf
 zone:
   name: stats
   # A program's zone may not ask for more (escalation.request defaults to false for a program):

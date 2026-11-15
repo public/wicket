@@ -20,8 +20,11 @@ stored secret github-ro; sent only to api.github.com
 
 **Bind every secret to the hosts it is for.** `--hosts` takes a comma-separated list, and
 `*.example.com` for every host under `example.com`. A secret bound to no hosts is sent nowhere.
-`claude-oauth` defaults to `api.anthropic.com`. Without `--hosts`, `secret set` keeps the hosts the
-secret already had.
+Without `--hosts`, `secret set` keeps the hosts the secret already had. The vault has no defaults of
+its own, but a harness's default model secret stored or linked with no binding is bound to its
+model host, as the harness's adapter says: `claude-oauth` to `api.anthropic.com`. A `claude-oauth`
+stored by an earlier build without `--hosts` has no binding: bind it with `wicket secret hosts
+claude-oauth --hosts api.anthropic.com`.
 
 ## Link a secret instead of copying it
 
