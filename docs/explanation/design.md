@@ -1202,7 +1202,7 @@ Detail: [04 §7].
   `wicket.*` tool, codemode, any `call_tool`). Codemode gets step and call budgets.
 - **Four kinds of tools:**
   1. **Gateway-native tools generated from adapters** (preferred; wicket writes the descriptions).
-  2. **Third-party MCP servers as isolated service workloads (§8.2).** Their descriptions are pinned by
+  2. **Third-party MCP servers as isolated service workloads** (service zones, deferred: §22). Their descriptions are pinned by
      hash *and* treated as taint: hash pinning doesn't catch descriptions that were poisoned from the start
      (MCPTox). A changed definition is a policy change — automatic if it narrows, a decision if it widens.
      Admission is by mechanism (sandbox, egress, no secrets), not by scanner verdict.
@@ -1215,12 +1215,11 @@ Detail: [04 §7].
   agent's own control pipe where supported (Codex `dynamicTools`, ACP MCP-over-ACP, pi extension tools).
   The box then needs no network path to the gateway.
 - **`wicket.*` tools:**
-  - `spawn`, `await_grant(request_id)`, `read_handle`, `request_access(typed)`, `request_capacity(typed)`
-    (§8.5);
+  - `spawn`, `await_grant(request_id)`, `request_access(typed)`, `request_capacity(typed)` (§8.5),
+    `decide` (§11), `finish` and `hibernate` (§13.2); the full list is in
+    [MCP tools](../reference/mcp-tools.md);
   - `check_send(dest)` (a dry run);
   - `restrict(...)`, a zero-risk tool that lets the agent narrow its own policy, applied automatically.
-
-  Sink tools accept **handles as arguments**, and the gateway substitutes the content at dispatch (§4.2).
 
 ### 9.2.1 Decided at the edge: what a node still asks the control host (owner, 2026-11-12, #164)
 
@@ -1293,7 +1292,7 @@ What a node still sends the control host, and why:
   - AWS STS session policies;
   - Stripe restricted keys;
   - Cloudflare scoped tokens.
-- Native scopes are computed by the solver from endpoint coverage (§5.2).
+- Native scopes are computed from endpoint coverage (§10), never from scope names or an LLM.
 - Vault-to-provider auth uses workload identity federation where the provider offers it.
 - No token passthrough (MCP spec).
 
@@ -1379,8 +1378,8 @@ Detail, schema and six worked GitHub endpoints: [04 §4].
   never lower it. Generated rules start at `unknown` (R4).
 - **Resolvers** handle opaque IDs (declared lookups with a TTL, re-verified against the response).
   **Query rewrite** narrows over-broad reads; post-filtering is a marked fallback.
-- **Sink parameters are marked** (recipient, repo/ref, URL host, @mention, amount) for the per-argument
-  provenance check (§4.2). A `triggers` effect declares provider-side reactions (CI runs, notifications,
+- **Sink parameters are marked** (recipient, repo/ref, URL host, @mention, amount), for a per-argument
+  provenance check once labels exist (deferred, §22). A `triggers` effect declares provider-side reactions (CI runs, notifications,
   ChatOps), so `explain` can compute *authority*, not just permission.
 - **Examples are tests.** Every endpoint rule and dangerous pattern ships `examples.allow` and
   `examples.deny` requests, checked at load time and in CI (from Codex execpolicy).
@@ -1415,64 +1414,52 @@ Detail, schema and six worked GitHub endpoints: [04 §4].
 
 ## 11. Escalation
 
-Detail and state machine: [03 §7.4].
+Detail and state machine: [03 §7.4]. Every answer to a request is a **grant**: one record, made by one
+decide function (`grant::decide`), whoever decides and whatever the kind (#256).
 
 ```
-Received → Validated (typed, canonical, bound to Op digest) → Narrowed (narrowest grant covering the call) → Classify
-  ├ forbidden by org/dangerous list ─────────────────────────────────► Denied{reason, narrower_alt?}
-  ├ ⊆ zone ceiling ∧ risk ≤ auto_max ∧ provenance OK ∧ ratchet OK ───► Granted(Auto)
-  ├ ⊆ parent authority ∧ re-derivation(trusted task text) says yes ──► Granted(Parent)      [off in v1]
-  ├ outside parent authority ────────────────────────────────────────► PendingUp(grandparent … Human)
-  └ else ────────────────────────────────────────────────────────────► PendingHuman{binding_code, expires_at}
-PendingHuman → Granted | Denied | Expired          Granted → Active → Closed (uses | expiry | task end | revoke subtree)
+Received → Validated (typed, canonical, bound to the request) → Classify
+  ├ forbidden by org or zone ─────────────────────────────────────────► Denied (never allowed)
+  ├ within the zone's reach ──────────────────────────────────────────► Allowed, no grant needed
+  ├ escalation.request off in the asker's zone ───────────────────────► Denied (never allowed)
+  └ else ─────────────────────────────────────────────────────────────► Pending
+Pending → Granted | Denied | Expired, decided by the first principal whose authority covers it:
+  an ancestor agent with escalation.grant, within its own authority, or a human
+Granted → Active → Closed (uses | expiry | the run ends | revoke) ; renewable before expiry
 ```
 
-- **Field provenance:** each field of the request must trace to the task text, the manifest, a typed gate
-  field or an existing grant. A field that only the agent supplied (say, a repo name that appears nowhere
-  upstream) cannot be auto- or parent-granted. The same check applies to sink arguments on *every* R2+
-  `Op`, not just escalations (§4.2). The highest-success real attacks tamper with a value inside an allowed
-  capability: MCPTox parameter tampering at 72.8%, an out-of-scope parameter in MSB at 76.5% [05, 06].
+- **Who may ask and who may grant is policy** (#50): the zone's `escalation: { request, grant }`, both
+  on by default. A child never gets a right its parent lacks.
+- **Agents grant within their own authority** (#291). An ancestor agent may decide a descendant's
+  request (the `decide` tool) only if its own zone allows the request by reach at the request's risk,
+  and its org layer doesn't refuse it. Its grant is run-scoped, exact-path and bounded in uses, and it
+  ends no later than the granter's own authority. The check is deterministic; no LLM decides. SPAWN,
+  LINK, CAPACITY and UPDATE requests, prefix asks and git pushes stay with humans for now.
+- **Every grant has a lifetime** and may be renewed, never made unlimited (#56). A box's own authority
+  is a grant like the others, renewed the same way.
 - **The justification is `Untrusted<String>`.** It is stored and shown to humans, clearly marked, and never
-  given to an LLM decider.
-- **Grants are narrower than or equal to the ask** (RAR semantics): one file, not the repo; one use, not
-  standing access. Everything expires at task end at the latest.
+  given to an LLM.
+- **Grants are narrower than or equal to the ask** (RAR semantics): one path, not the host; one use, not
+  standing access.
 - **Ledger semantics** [05 §10.2-8, 06]:
-  - The ratchet and use counts are keyed by (task root, policy epoch), not grant id. Past
-    `ratchet_budget`, everything goes to a human with the full diff.
   - A single-use grant is consumed in the same transaction that forwards the request, after re-checking
-    revocation and the epoch. Every policy change bumps the epoch, and decisions carry a Zanzibar-style
-    consistency token against revoke and relabel races.
-  - Relational limits the per-capability check can't express live here: co-possession ("read secret XOR
-    publish") and cardinality.
-  - No standing grants for R3+. Children never inherit live grants or pending requests.
-  - A pre-approved request type is auto-granted only while the agent's taint is ∅.
-  - **Fresh per use** is a grant property (from Codex's `prompt-user` rules), default for R4 and `money`.
-    Such request types never count towards ratchet credit or fatigue promotion.
-- **Fatigue, carefully.** High approval rates measure habituation, not safety. Chrome's SSL warnings were
-  clicked through 70% of the time, and users attended to permission prompts 17% of the time and
-  understood 3% [06]. So a request type humans approve more than 95% of the time becomes a *candidate*
-  auto rule only if all of these hold:
-  - a second reviewer approves the promotion;
-  - it is not R3+ and matches no dangerous pattern;
-  - a shadow metric of seeded bad requests shows humans still catch them.
+    revocation.
+  - Children never inherit live grants or pending requests.
+- **Human channel:** asynchronous, so approval can happen on another device. Decisions come only from
+  wicket's own channels (CLI, console, the gateway's `decide` for agents), each signed: a passkey
+  assertion over the request digest in the console (§14.1). Vendor UIs such as Remote Control can
+  announce a request but never decide it.
 
-  A type humans mostly deny becomes an auto-deny.
-- **Human channel:** CIBA-shaped, so approval is asynchronous and can happen on another device. Decisions
-  come only from wicket-native operator channels (CLI, API, console) with a passkey assertion over the
-  request digest (§14.1). Vendor UIs such as Remote Control can announce a request but never decide it.
-- **v1 starts with the parent tier off** (auto or human only), and measures in shadow mode what it would
-  have decided. The evidence is DRIFT's ablation: letting an LLM validator widen policy raised attack
-  success from 2.14% to 5.41%, for about 15 points of utility [05]. Adaptive attacks break LLM-based
-  defences generally (*The Attacker Moves Second*). (Progent's 3.9% ASB figure, cited in v0.1, measures
-  something else and is inflated by ASB's forced attack-tool injection [06].) If the parent tier is ever
-  turned on, it gets a mechanically checked limit on what it may approve (no endorsement, at most R2),
-  with each ruling bound single-use to the exact call.
+Deferred (§22): an LLM parent tier that re-derives a request from the trusted task text, field
+provenance on sink arguments, ratchets on cumulative grants, and auto rules promoted from approval
+history. DRIFT's ablation is why the LLM tier stays out: letting an LLM validator widen policy raised
+attack success from 2.14% to 5.41% [05].
 
 ### 11.1 Who a request is for (owner, 2026-11-08: "a user can't approve a grant if it doesn't know who it's for")
 
 Every pending request names who asked, and the human sees it before deciding.
 - **Across sandboxes** this is exact: the identity is the socket (§3.2).
-- **Inside one sandbox** (Claude Code's subagents and agent teams, Codex threads, a crew) it is reported,
+- **Inside one sandbox** (Claude Code's subagents and agent teams, Codex threads) it is reported,
   not proven. wicket reads the agent's own event stream outside the box. For Claude Code, every subagent
   tool call carries `parent_tool_use_id`, which points at the `Agent` call that started the subagent, with
   its type and description. wicket matches a blocked request to the calls in flight: exactly one call
@@ -1500,11 +1487,10 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   - the agent's own config directory (`CLAUDE_CONFIG_DIR`, transcripts);
   - the workdir;
   - caches and logs;
-  - provider-side state (the gateway's label store);
+  - provider-side state;
   - wicket's own learned artifacts.
-- Default: everything an activation writes is **staged**. What persists across sleep is decided by the
-  agent's promotion gate (§13.4), and the label stays attached. One-shot agents (`delete_when_done`) keep
-  nothing.
+- What persists is what the box wrote to its workspace, state and durable volumes (§13.5). A promotion
+  gate for memory (§13.4) is designed, not built.
 - **wicket's learned artifacts** (adapters, default manifests, approval history) are produced only from
   trusted inputs or human decisions. The adapter generator never sees agent context; a manifest default
   only changes from a human-approved manifest or grant.
@@ -1515,9 +1501,8 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   view (or exposes them only as handles), per each adapter's `context_files` list.
 - **The agent's own policy stores are memory:** Codex `$CODEX_HOME/rules/*.rules` and config writes, pi
   `trust.json`. They are read-only or discarded, and never fed from approvals.
-- **Taint recovery by forking.** Transcript entries carry labels (`(session, entry)` handles). When an
-  agent gets tainted, wicket can fork its session at the last clean entry (pi, Codex fork/rollback) instead
-  of discarding the run.
+- **Recovery by forking.** A tainted agent's session can be forked at a clean point instead of being
+  discarded (#177).
 - **Covert channels** (timing, sizes, file names, escalation request contents) are not closed. Escalation
   requests are rate- and size-limited, and anomalies are logged.
 
