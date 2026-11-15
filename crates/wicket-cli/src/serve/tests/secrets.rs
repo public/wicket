@@ -85,7 +85,8 @@ async fn the_card_lists_secrets_by_name_kind_hosts_and_users_never_a_value() {
     assert_eq!(missing, ["model-tok", "unset-key"], "names the manifests use that the vault lacks (an injection's, the model proxy's)");
     assert!(s["secrets"]["link_cli_only"].as_str().unwrap().contains("wicket secret link"));
     // Only fields the card names: nothing else of a secret's record reaches the page.
-    let keys: Vec<&String> = gh.as_object().unwrap().keys().collect();
+    let mut keys: Vec<&String> = gh.as_object().unwrap().keys().collect();
+    keys.sort();
     assert_eq!(keys, ["hosts", "kind", "name", "reference", "runs", "set_at", "used_by", "zones"]);
 }
 
