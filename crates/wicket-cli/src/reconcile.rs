@@ -734,7 +734,7 @@ fn run_deadline(run: &str) -> Option<i64> {
     crate::run::check_run_id(run).ok()?;
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(crate::data_dir().join("runs").join(run).join("ctl/run.json")).ok()?).ok()?;
-    let m = wicket_core::Manifest::from_yaml(v["manifest"].as_str()?).ok()?;
+    let m = wicket_agent::load(v["manifest"].as_str()?).ok()?;
     Some(v["started_ms"].as_i64()? / 1000 + m.zone.limits.timeout().ok()?.as_secs() as i64 + FENCE_MARGIN_SECS)
 }
 

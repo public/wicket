@@ -91,7 +91,7 @@ pub fn program_repin(m: &wicket_core::Manifest, base: &Path) -> Result<Option<(S
 
 pub fn pin(manifest: &Path, dry_run: bool) -> Result<()> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
-    let m = wicket_core::Manifest::from_yaml(&text)?;
+    let m = wicket_agent::load(&text)?;
     let tags = tags(&m);
     let repin = program_repin(&m, manifest.parent().unwrap_or(Path::new(".")))?;
     if tags.is_empty() && repin.is_none() {
@@ -113,7 +113,7 @@ pub fn pin(manifest: &Path, dry_run: bool) -> Result<()> {
         want.program.as_mut().expect("a program").digest = Some(new.clone());
     }
     let new = rewrite(&text, &all);
-    let back = wicket_core::Manifest::from_yaml(&new).context("the rewritten manifest")?;
+    let back = wicket_agent::load(&new).context("the rewritten manifest")?;
     if serde_json::to_value(&back)? != serde_json::to_value(want)? {
         bail!("{}: couldn't pin it safely (a tag appears elsewhere in the file as well); pin it by hand", manifest.display());
     }
@@ -139,7 +139,7 @@ mod tests {
     fn tags_are_rewritten_where_they_are_images_and_nowhere_else() {
         let d = format!("sha256:{}", "c".repeat(64));
         let text = "# images: img:dev is ours\ntask: build img:dev's docs\nagent:\n  name: a\n  image: \"img:dev\"\nzone:\n  name: z\n  llm: { secret: m }\n  images: [img:dev, 'other:1']\n";
-        let m = wicket_core::Manifest::from_yaml(text).unwrap();
+        let m = wicket_agent::load(text).unwrap();
         assert_eq!(tags(&m), vec!["img:dev".to_string(), "other:1".to_string()]);
         let pins: BTreeMap<String, String> = [
             ("img:dev".to_string(), wicket_core::image::pinned("img:dev", &d)),
@@ -147,17 +147,14 @@ mod tests {
         ]
         .into();
         let new = rewrite(text, &pins);
-        let back = wicket_core::Manifest::from_yaml(&new).unwrap();
+        let back = wicket_agent::load(&new).unwrap();
         // The task text mentions the tag too: rewritten as well, so the check refuses it.
         assert_ne!(serde_json::to_value(&back).unwrap(), serde_json::to_value(expected(&m, &pins)).unwrap());
         // Without it, the rewrite is exact, and the comment is kept.
         let text2 = text.replace("task: build img:dev's docs", "task: build the docs");
-        let m2 = wicket_core::Manifest::from_yaml(&text2).unwrap();
+        let m2 = wicket_agent::load(&text2).unwrap();
         let new2 = rewrite(&text2, &pins);
-        assert_eq!(
-            serde_json::to_value(wicket_core::Manifest::from_yaml(&new2).unwrap()).unwrap(),
-            serde_json::to_value(expected(&m2, &pins)).unwrap()
-        );
+        assert_eq!(serde_json::to_value(wicket_agent::load(&new2).unwrap()).unwrap(), serde_json::to_value(expected(&m2, &pins)).unwrap());
         assert!(new2.contains(&format!("image: \"img@{d}\"")) && new2.contains(&format!("'other@{d}'")));
         assert!(new2.contains("# images: img:dev is ours") || new2.contains(&format!("# images: img@{d} is ours")));
         // A longer tag that starts with a shorter one isn't touched by it.

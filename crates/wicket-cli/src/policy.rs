@@ -126,7 +126,7 @@ fn zones_to_check() -> Vec<(String, wicket_core::ZoneSpec)> {
             let m = std::fs::read(&rec)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v["manifest"].as_str().and_then(|y| wicket_core::Manifest::from_yaml(y).ok()));
+                .and_then(|v| v["manifest"].as_str().and_then(|y| wicket_agent::load(y).ok()));
             if let Some(m) = m {
                 out.push((format!("run {run}'s zone {}", m.zone.name), m.zone));
             }
@@ -285,7 +285,7 @@ pub async fn apply(file: &Path, entities: Option<&Path>, keep_runs: bool) -> Res
 
 /// `wicket policy zone MANIFEST`: the zone's policy, as Cedar.
 pub fn zone(manifest: &Path) -> Result<()> {
-    let m = wicket_core::Manifest::from_yaml(&std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?)?;
+    let m = wicket_agent::load(&std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?)?;
     let base = wicket_authz::Ceiling::from_zone(&m.zone, "run", 0, vec![])?;
     let (text, _) = wicket_policy::zone_layer(&m.zone, &base).context("the zone's policy doesn't compile")?;
     print!("{text}");

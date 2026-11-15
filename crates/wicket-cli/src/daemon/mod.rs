@@ -456,7 +456,7 @@ fn check_staged(cmd: &Cmd, hello: &Hello, st: &upload::Stage, vault_dir: &Path) 
     }
     let path = st.root("manifest").context("no manifest")?;
     let raw = std::fs::read_to_string(&path).context("the manifest did not arrive")?;
-    let m = wicket_core::manifest::Manifest::from_yaml(&raw)?;
+    let m = wicket_agent::load(&raw)?;
     let source = m.program.as_ref().and_then(|p| p.source.clone());
     if source != hello.program_source {
         bail!("the manifest's program source differs from the one announced");

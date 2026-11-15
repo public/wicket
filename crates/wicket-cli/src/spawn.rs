@@ -57,7 +57,7 @@ pub fn reserved_slots(dir: &std::path::Path, max: u32) -> u32 {
         .map(|e| {
             let kids = std::fs::read_to_string(e.path())
                 .ok()
-                .and_then(|y| Manifest::from_yaml(&y).ok())
+                .and_then(|y| wicket_agent::load(&y).ok())
                 .and_then(|m| m.agent.map(|a| a.max_children))
                 .unwrap_or(0);
             kids.saturating_add(1)
@@ -90,7 +90,7 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
     if yaml_path.exists() {
         return Ok(());
     }
-    let cm = Manifest::from_yaml(&s.manifest).map_err(|e| format!("its manifest: {e}"))?;
+    let cm = wicket_agent::load(&s.manifest).map_err(|e| format!("its manifest: {e}"))?;
     cm.validate().map_err(|e| format!("its manifest is invalid: {e}"))?;
     let name = cm.agent.as_ref().map(|a| a.name.clone()).or_else(|| cm.program.as_ref().map(|p| p.name.clone())).unwrap_or_default();
     let zone_name = format!("{}.{name}.{}", p.zone.name, c.run.0.strip_prefix("run_").unwrap_or(&c.run.0));
@@ -328,8 +328,14 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
                 z.llm = Some(l);
             }
         }
-    } else if z.llm.is_some() {
-        return Err("a program has no model route: remove zone.llm".into());
+    } else {
+        if z.llm.is_some() {
+            return Err("a program has no model route: remove zone.llm".into());
+        }
+        // A program may not ask for more unless the request says so (#255), within what its
+        // parent's zone may (the subset check below).
+        let said = req.zone.as_ref().and_then(|v| v.get("escalation")).and_then(|e| e.get("request")).and_then(|r| r.as_bool());
+        z.escalation.request = said.unwrap_or(false);
     }
     let image = req.image.clone().unwrap_or_else(|| i.image.to_string());
     let images: Vec<String> = std::iter::once(i.image.to_string()).chain(p.zone.images.iter().cloned()).collect();
@@ -356,14 +362,8 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
         }
         cm.task = format!("program {name}");
         cm.agent = None;
-        cm.program = Some(wicket_core::ProgramSpec {
-            name: name.clone(),
-            command: req.command.clone(),
-            source: None,
-            digest: None,
-            on_pending: wicket_core::OnPending::Fail,
-            image: None,
-        });
+        cm.program =
+            Some(wicket_core::ProgramSpec { name: name.clone(), command: req.command.clone(), source: None, digest: None, image: None });
     }
     cm.validate().map_err(|e| format!("the new manifest is invalid: {e}"))?;
     // The org policy's spawn rule is hard: no approval lifts it (#51).
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn a_spawn_is_pinned_by_the_entry_that_allows_its_image() {
         let (a, b) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
-        let p = Manifest::from_yaml(&format!(
+        let p = wicket_agent::load(&format!(
             "task: t\nagent: {{ name: lead, max_children: 4 }}\nzone:\n  name: z\n  llm: {{ secret: m }}\n  images: [tool@{a}, 'other:1']\n  limits: {{ memory: 1g, cpus: 1, timeout: 1h }}\n"
         ))
         .unwrap();
@@ -863,7 +863,7 @@ mod tests {
     fn parent(max: u32, zone: &str) -> Parent {
         let dir = std::env::temp_dir().join(format!("wicket-spawn-test-{}-{}", std::process::id(), wicket_core::new_request_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let m = Manifest::from_yaml(&format!("task: t\nagent: {{ name: lead, max_children: {max} }}\nzone:\n  name: z\n{zone}")).unwrap();
+        let m = wicket_agent::load(&format!("task: t\nagent: {{ name: lead, max_children: {max} }}\nzone:\n  name: z\n{zone}")).unwrap();
         let ctx = SpawnCtx {
             parent: m,
             slots: Default::default(),
@@ -1053,6 +1053,27 @@ mod tests {
             assert!(e.contains(needle) && e.contains("escalation.request: false"), "{e}");
         }
         assert!(p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty(), "nobody asked");
+    }
+
+    /// #255: a program is an agent that may not ask: its zone's `escalation.request` is false unless
+    /// the spawn says true (and the parent may ask), and that survives into its manifest.
+    #[test]
+    fn a_spawned_program_may_not_ask_unless_its_zone_says_so() {
+        let p = parent(2, ZONE);
+        let child = |p: &Parent| {
+            let e =
+                std::fs::read_dir(p.dir.join("children")).unwrap().flatten().find(|e| e.path().extension().is_some_and(|x| x == "yaml"));
+            let y = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            wicket_agent::load(&y).unwrap()
+        };
+        spawn(&p.ctx, program("quiet")).unwrap();
+        let m = child(&p);
+        assert!(m.program.is_some() && !m.zone.escalation.request && m.zone.escalation.grant, "{:?}", m.zone.escalation);
+        let q = parent(2, ZONE);
+        let mut req = program("asks");
+        req.zone.as_mut().unwrap()["escalation"] = json!({ "request": true });
+        spawn(&q.ctx, req).unwrap();
+        assert!(child(&q).zone.escalation.request);
     }
 
     /// #118: a different model route or credential is refused outright; a card for anything else

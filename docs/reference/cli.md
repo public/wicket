@@ -108,12 +108,12 @@ Run agents in least-privilege sandboxes (proof of concept)
 Usage: wicket <COMMAND>
 
 Commands:
-  run        Run a task manifest: one Claude Code agent in one zone
+  run        Run a task manifest: one workload (an agent, or a program) in one zone
   say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   agents     Long-lived agents: state, generation, current run and bundle size
-  wrap       Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+  wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
   pending    List pending escalation requests
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
@@ -149,7 +149,7 @@ Options:
 ## `wicket run`
 
 ```text
-Run a task manifest: one Claude Code agent in one zone
+Run a task manifest: one workload (an agent, or a program) in one zone
 
 Usage: wicket run [OPTIONS] <MANIFEST>
 
@@ -226,7 +226,7 @@ Options:
 ## `wicket wrap`
 
 ```text
-Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
 
 Usage: wicket wrap [OPTIONS] --manifest <MANIFEST> <ARGV>...
 
@@ -414,7 +414,7 @@ Commands:
   list   List secret names and the hosts each may be sent to (never values)
   rm     Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their run's lease next reaches them, within seconds while connected (#152)
   hosts  Bind a secret to the only hosts it may be sent to, replacing its list
-  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt A Claude login's account fields (from ~/.claude.json, never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
+  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for remote-session boxes: re-link to refresh them
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -432,7 +432,7 @@ Arguments:
   <NAME>  
 
 Options:
-      --hosts <HOSTS>  The only hosts it may be sent to (comma-separated; `*.example.com` for every host under it). Without it, the secret keeps the hosts it had; a secret with none is sent nowhere (claude-oauth defaults to api.anthropic.com)
+      --hosts <HOSTS>  The only hosts it may be sent to (comma-separated; `*.example.com` for every host under it). Without it, the secret keeps the hosts it had; a new one with none is sent nowhere, unless it is a harness's default model secret: then it goes to that harness's model host
   -h, --help           Print help
 ```
 
@@ -479,7 +479,7 @@ Options:
 ### `wicket secret link`
 
 ```text
-Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt A Claude login's account fields (from ~/.claude.json, never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
+Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for remote-session boxes: re-link to refresh them
 
 Usage: wicket secret link [OPTIONS] --file <FILE> <NAME>
 
@@ -490,7 +490,7 @@ Options:
       --file <FILE>
           
       --pointer <POINTER>
-          A JSON pointer into the file (e.g. /claudeAiOauth/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file)
+          A JSON pointer into the file (e.g. /login/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file)
       --expires-pointer <EXPIRES_POINTER>
           
       --hosts <HOSTS>
@@ -512,8 +512,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --tag <TAG>  The tag to build, kept as given [default: this installation's own image: wicket/claude-code:<build id> on an installed version, else wicket/claude-code:poc]
-      --dir <DIR>  An image directory to build instead (e.g. images/claude-code, while changing it). If its Dockerfile declares `ARG BASE`, BASE is this installation's own agent image
+      --tag <TAG>  The tag to build, kept as given [default: this installation's own image: the default harness's image repository, tagged with the build id on an installed version, else its default tag]
+      --dir <DIR>  An image directory to build instead (e.g. one under images/, while changing it). If its Dockerfile declares `ARG BASE`, BASE is this installation's own agent image
   -h, --help       Print help
 ```
 
@@ -1086,7 +1086,7 @@ Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
 Usage: wicket doctor [OPTIONS]
 
 Options:
-      --image <IMAGE>  [default: wicket/claude-code:poc]
+      --image <IMAGE>  The agent image to check [default: the default harness's agent image]
   -h, --help           Print help
 ```
 
@@ -1434,7 +1434,7 @@ Options:
       --interval <INTERVAL>      How often within the window [default: 10s]
       --check <CHECK>            A command (sh -c) that must succeed each time; $WICKET is the new build's binary and $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable
       --canary <CANARY>          A task manifest the new build runs once on the control host; it must succeed
-      --image <IMAGE>            The canary's image (default: the new build's own, wicket/claude-code:<build id>)
+      --image <IMAGE>            The canary's image (default: the new build's own agent image, tagged with its build id)
       --no-prune                 Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does, where it updated)
   -h, --help                     Print help
 ```

@@ -12,7 +12,6 @@ program:
   name: repo-stats
   source: ../programs/repo-stats      # relative to the manifest; copied into /workspace
   command: [bash, /workspace/stats.sh]
-  on_pending: fail                    # out-of-reach requests fail; nothing is queued for a human
 zone:
   name: stats
   reach:
@@ -20,8 +19,10 @@ zone:
   limits: { memory: 512m, cpus: 1, timeout: 2m }
 ```
 
-A program zone has no `llm` section. `on_pending: wait` makes out-of-reach requests pending, as an
-agent's are, for a program that waits with `await_grant`. `program.image` runs it in another image
+A program zone has no `llm` section, and a program may not ask for more: its zone's
+`escalation.request` defaults to `false`, so out-of-reach requests fail and nothing is queued for a
+human. `zone.escalation: { request: true }` makes them pending, as an agent's are, for a program
+that waits with `await_grant`. `program.image` runs it in another image
 (the default agent image has bash, curl, jq, git and python3).
 
 ## 2. Run it during development

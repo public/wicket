@@ -721,7 +721,7 @@ pub struct Gate {
     pub checks: Vec<String>,
     /// A manifest the new build runs once on the control host, which must succeed.
     pub canary: Option<PathBuf>,
-    /// The canary's image (default: the new build's own, `wicket/claude-code:<build id>`).
+    /// The canary's image (default: the new build's own agent image, tagged with its build id).
     pub image: Option<String>,
 }
 

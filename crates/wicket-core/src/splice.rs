@@ -26,10 +26,6 @@ use crate::op::{never_reachable, HTTP_METHODS};
 /// The property test in this module checks that `classify` raises risk for no other host.
 pub const RISK_HOSTS: &[&str] = &["github.com", "api.github.com", "*.amazonaws.com", "metadata.google.internal", "169.254.169.254"];
 
-/// The model provider's host: its calls go through the model proxy's budget and checks, so it is
-/// always inspected.
-pub const MODEL_HOST: &str = "api.anthropic.com";
-
 /// How the egress proxy treats connections to a host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inspection {
@@ -70,14 +66,17 @@ fn wholesale(rule: &crate::ReachRule, host: &str) -> bool {
     every_path && every_method && (rule.allow_dangerous || !risky)
 }
 
-/// The model hosts of a zone: the provider's own host, and the zone's model upstream if it names
-/// another one.
+/// The model hosts of a zone: its model route's upstream (filled in from the harness's default when
+/// the manifest is loaded). Its calls go through the model proxy's budget and checks, so it is
+/// always inspected. (The egress proxy also never splices its provider profile's own host while a
+/// model route is set: `wicket-proxy`'s `splice_rule`.)
 fn model_hosts(zone: &ZoneSpec) -> Vec<String> {
-    let mut hosts = vec![MODEL_HOST.to_string()];
-    if let Some(h) = zone.llm.as_ref().and_then(|l| url::Url::parse(&l.upstream).ok()).and_then(|u| u.host_str().map(str::to_string)) {
-        hosts.push(h.to_ascii_lowercase());
-    }
-    hosts
+    zone.llm
+        .as_ref()
+        .and_then(|l| url::Url::parse(&l.upstream).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .into_iter()
+        .collect()
 }
 
 /// How the egress proxy treats `host` (an exact name, or a reach rule's `*.` pattern for the zone
@@ -184,7 +183,6 @@ mod tests {
             assert!(spliced(&format!("  reach: [{{host: '{h}', methods: {ALL}, allow_dangerous: true}}]"), h), "{h}");
         }
         // The model host never.
-        assert!(!spliced(&format!("  reach: [{{host: api.anthropic.com, methods: {ALL}, allow_dangerous: true}}]"), "api.anthropic.com"));
         let mut z = zone(&format!("  reach: [{{host: models.example, methods: {ALL}}}]"));
         assert!(inspection(&z, "models.example").is_spliced());
         z.llm.as_mut().unwrap().upstream = "https://models.example".into();

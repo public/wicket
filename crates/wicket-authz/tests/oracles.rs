@@ -82,7 +82,7 @@ fn oracle1_single_block_equals_compiled_zone() {
 #[test]
 fn push_ops_decide_as_the_zone() {
     let keys = Keys::new(0);
-    let yaml = "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: pushes\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n    - { host: github.com, methods: [POST], paths: [\"/acme/tools.git/git-receive-pack\"], allow_dangerous: true }\n";
+    let yaml = "task: t\nprogram: { name: p, command: [x] }\nzone:\n  name: pushes\n  escalation: { request: true }\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n    - { host: github.com, methods: [POST], paths: [\"/acme/tools.git/git-receive-pack\"], allow_dangerous: true }\n";
     let z = wicket_core::Manifest::from_yaml(yaml).unwrap().zone;
     let mut seen = Oracle1::default();
     oracle1_zone(&z, &keys, &mut seen);

@@ -147,8 +147,8 @@ pub struct RunOpts<'a> {
     pub parent_run: Option<String>,
     /// The capacity lease this run is placed on (recorded, so the reconciler stops it at lease end).
     pub lease: Option<String>,
-    /// Wrap this agent command line (launched by another program, e.g. Claude Code Remote Control
-    /// through CLAUDE_CODE_PROCESS_WRAPPER) instead of launching the agent ourselves. Its stdin and
+    /// Wrap this agent command line (launched by another program: the harness's wrapped mode, e.g.
+    /// its remote sessions' process wrapper) instead of launching the agent ourselves. Its stdin and
     /// stdout stay connected to the launcher; wicket's own output goes to a log file.
     pub wrap: Option<Vec<String>>,
     /// Wake a hibernated agent (#70): its claim, bundle and first turn. The manifest, image and
@@ -247,6 +247,9 @@ fn supervise_lock(dir: &Path) -> Result<SupervisorLock> {
 /// Checked again where each is sent.
 pub fn check_secret_hosts(m: &Manifest, vault: &Vault, wrapped: bool) -> Result<()> {
     if let Some(llm) = &m.zone.llm {
+        if wicket_proxy::provider::profile(&llm.provider).is_none() {
+            bail!("zone.llm.provider {:?}: the model proxy has no profile for it", llm.provider);
+        }
         let url = reqwest::Url::parse(&llm.upstream).with_context(|| format!("llm.upstream {:?}", llm.upstream))?;
         let host = url.host_str().with_context(|| format!("llm.upstream {:?} has no host", llm.upstream))?;
         vault.check(&llm.secret, host).context("the zone's model route")?;
@@ -380,7 +383,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, Some(r)) => r.manifest.clone(),
         (None, None) => std::fs::read_to_string(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
     };
-    let mut m = Manifest::from_yaml(&raw)?;
+    let mut m = wicket_agent::load(&raw)?;
     if let Some(t) = task {
         if m.agent.is_none() {
             bail!("--task applies to agent manifests only");
@@ -674,7 +677,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
     let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
-    let escalate = m.zone.escalation.request && m.program.as_ref().map(|p| p.on_pending == wicket_core::OnPending::Wait).unwrap_or(true);
+    // A program's zone may not ask by default (#255): its manifest says `escalation.request: true` if it may.
+    let escalate = m.zone.escalation.request;
     // Identity (design §3.2): launch is registration. wicket issues this instance's identity from
     // facts it chose, and keeps the instance's key here; the box never sees either.
     // Identities are short-lived (identity_ttl) and re-issued with a fresh key at half-life while the
@@ -2454,24 +2458,24 @@ mod tests {
     /// #171: an agent's box starts from its manifest's agent.image.
     #[test]
     fn a_manifests_agent_image_is_used() {
-        let m = Manifest::from_yaml(AGENT).unwrap();
+        let m = wicket_agent::load(AGENT).unwrap();
         assert_eq!(box_image(None, &m).unwrap(), "img:rust");
         // Unset: the installation's current agent image.
-        let plain = Manifest::from_yaml(&AGENT.replace("  image: img:rust\n", "")).unwrap();
+        let plain = wicket_agent::load(&AGENT.replace("  image: img:rust\n", "")).unwrap();
         assert_eq!(box_image(None, &plain).unwrap(), crate::image::effective(crate::image::DEFAULT));
         // Naming the default image needs no zone.images entry.
         let dflt =
-            Manifest::from_yaml(&AGENT.replace("img:rust\n", &format!("{}\n", crate::image::DEFAULT)).replace("[img:rust]", "[]")).unwrap();
+            wicket_agent::load(&AGENT.replace("img:rust\n", &format!("{}\n", crate::image::DEFAULT)).replace("[img:rust]", "[]")).unwrap();
         assert_eq!(box_image(None, &dflt).unwrap(), crate::image::effective(crate::image::DEFAULT));
         // It round-trips through the effective manifest (what the identity's digest covers).
-        let again = Manifest::from_yaml(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        let again = wicket_agent::load(&serde_yaml::to_string(&m).unwrap()).unwrap();
         assert_eq!(again.agent.unwrap().image.as_deref(), Some("img:rust"));
     }
 
     /// `wicket run --image` overrides agent.image, and without it nothing is named.
     #[test]
     fn the_image_flag_overrides_agent_image() {
-        let m = Manifest::from_yaml(AGENT).unwrap();
+        let m = wicket_agent::load(AGENT).unwrap();
         assert_eq!(box_image(Some("img:other"), &m).unwrap(), "img:other");
         let parse = |args: &[&str]| match <crate::Cli as clap::Parser>::try_parse_from(args).unwrap().cmd {
             crate::Cmd::Run { image, .. } => image,
@@ -2484,9 +2488,9 @@ mod tests {
     /// An agent.image outside zone.images is refused, like a spawn of it.
     #[test]
     fn an_agent_image_outside_zone_images_is_refused() {
-        let m = Manifest::from_yaml(&AGENT.replace("[img:rust]", "[img:python]")).unwrap();
+        let m = wicket_agent::load(&AGENT.replace("[img:rust]", "[img:python]")).unwrap();
         let e = format!("{:#}", box_image(None, &m).unwrap_err());
         assert!(e.contains("img:rust") && e.contains("zone.images"), "{e}");
-        assert!(Manifest::from_yaml(&AGENT.replace("image: img:rust", "image: \"\"")).is_err(), "an empty image is invalid");
+        assert!(wicket_agent::load(&AGENT.replace("image: img:rust", "image: \"\"")).is_err(), "an empty image is invalid");
     }
 }

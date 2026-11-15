@@ -437,7 +437,7 @@ pub fn resolve(l: &Ledger, who: &str) -> Result<AgentRow> {
 /// activations: model requests, output or input tokens, or `limits.timeout` (its total time in a
 /// box). A wake never resets a budget.
 pub fn exhausted(a: &AgentRow) -> Option<String> {
-    let m = match Manifest::from_yaml(&a.manifest) {
+    let m = match wicket_agent::load(&a.manifest) {
         Ok(m) => m,
         Err(e) => return Some(format!("its manifest no longer parses: {e}")),
     };
@@ -641,7 +641,7 @@ pub fn pick(cands: &[Candidate], want: (f32, u64), last: Option<&str>) -> Option
 /// Where a woken agent's box goes: every enrolled, active node that answers within 10 s (this host's
 /// own among them) and isn't held by a capacity lease, bin-packed ([`pick`]).
 async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
-    let m = Manifest::from_yaml(&agent.manifest)?;
+    let m = wicket_agent::load(&agent.manifest)?;
     let want = (m.zone.limits.cpus, m.zone.limits.memory_bytes().unwrap_or(0) >> 20);
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::open(&ledger_path())?));
     crate::localnode::ensure(&ledger).await?;

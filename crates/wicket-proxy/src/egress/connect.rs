@@ -11,7 +11,7 @@ impl Egress {
         if self.ctx.swaps.iter().any(|s| host_matches(&s.host, host)) {
             return None;
         }
-        if self.model_gate.get().is_some() && host == crate::llm::MODEL_HOST {
+        if self.model_gate.get().is_some_and(|l| l.is_model_host(host)) {
             return None;
         }
         // A name under a wildcard is only dialled (so resolved) after a request to it has been

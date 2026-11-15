@@ -117,10 +117,7 @@ mod tests {
     fn required_digests_refuse_tags_but_not_the_installation_s_own_image() {
         let pin = format!("img@sha256:{}", "a".repeat(64));
         let m = |images: &str| {
-            wicket_core::Manifest::from_yaml(&format!(
-                "task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, images: [{images}]}}"
-            ))
-            .unwrap()
+            wicket_agent::load(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, images: [{images}]}}")).unwrap()
         };
         let on = ImagesPolicy { require_digests: true, ..Default::default() };
         assert!(check_with(&ImagesPolicy::default(), &m("img:tag"), "img:tag", "dflt").is_ok(), "off by default");
