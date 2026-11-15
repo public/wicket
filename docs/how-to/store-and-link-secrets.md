@@ -74,6 +74,24 @@ wicket secret rm github-ro
 `secret rm` of a linked secret removes only the reference. Nodes holding a copy delete it when their
 run's lease next reaches them, within seconds while connected.
 
+## From the console
+
+The console's *Secrets* section does the same from a browser or a phone, each change signed with
+your passkey ([console reference](../reference/console.md#secrets)):
+
+- **New secret…** (or **Set…** beside a name a manifest uses that isn't stored yet): type the name,
+  the value and the hosts, then sign. The value field shows nothing and is cleared when you submit;
+  your passkey signs a salted hash of the value, and the value goes to the console only when you
+  sign. It is never shown again, anywhere.
+- **Replace value…** stores a new value; empty hosts keep the ones it had. Running boxes use the
+  new value from their next request.
+- **Hosts…** replaces the hosts a secret may be sent to, as `wicket secret hosts`.
+- **Delete…** first lists the zones and running runs that use it, then asks you to sign.
+
+Each secret shows its kind, hosts, when it was last set, and where it is used (each injection's
+host, header and format). Linking a file (`wicket secret link`) stays on the host, because it names
+a path there: the console lists linked secrets and can change their hosts or remove the link.
+
 ## On nodes
 
 A node fetches a secret only when one of its runs first needs it, keeps it in memory only, and drops

@@ -51,6 +51,9 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 - **register a device for notifications, and show the request on one** (`push_subscribe`,
   `push_details`): see [notifications](#notifications). Removing a device and hiding the request
   need only the session.
+- **store or replace a secret, change its hosts, or delete it** (`set_secret`, `secret_hosts`,
+  `delete_secret`): see [secrets](#secrets). The passkey signs a salted sha256 of a value, never
+  the value.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
@@ -196,6 +199,52 @@ The **Manifests** section lists the manifests runs can be started from (#172). T
 
 Runs keep the manifest they started with: each run records its manifest's text at start, and the
 console's Start signs the manifest's sha256.
+
+## Secrets
+
+The *Secrets* section shows the vault by name, as `wicket secret list` does, and changes it with
+your passkey. It is read-only without a passkey signature.
+
+- **What it shows**, for each secret: its name; its kind, a stored *value* or a *reference* (a link
+  to a file on the host, as `wicket secret link` makes, with the file and JSON pointer it names);
+  the hosts it may be sent to; when it was last set (its file's time); every use in the allowlisted
+  manifests (the zone and manifest, and for an injection its host, `header` and `format`, or that it
+  is a zone's model credential); and the running runs that use it (runs in a zone that uses it, and
+  runs whose node was given it). Names the manifests use that aren't in the vault are listed as
+  *not set*, with a **Set…** button. **Never a value**, nor anything derived from one: no prefix,
+  length or digest. The view is built from names, bindings and file times; the server never reads a
+  value to build it.
+- **Store or replace a value** (`set_secret`): **New secret…**, **Set…** or **Replace value…**
+  open a form with a name, a value and hosts. The value field is a password field
+  (`autocomplete=off`), cleared as soon as you submit. The page picks a random 16-byte salt and
+  sends `value_salt` and `value_sha256` (the sha256 of the salt and the value) with `begin`. The
+  passkey signs those, the name, the hosts and whether it replaces a value, never the value. The
+  value goes only in the body of `finish`, over HTTPS (or loopback), and must hash to what was
+  signed; a `begin` carrying a value is refused. So the value is never kept with a pending
+  challenge, never in a response, a log or the audit (which keeps the salted digest the passkey
+  signed, for `wicket audit --verify`), and the server zeroizes it, and the request body it came
+  in, once stored. A value must be one line (no control characters) of at most 16 KiB. Hosts work
+  as for `wicket secret set --hosts`: those given, else those the secret had, else, for a harness's
+  default model secret, its model host; a new secret with none is sent nowhere.
+- **Change hosts** (`secret_hosts`, **Hosts…**), as `wicket secret hosts`: replaces the list; a
+  secret is sent only to hosts it is bound to. At least one host; `*.example.com` covers every host
+  under it. A reference's hosts can be changed too.
+- **Delete** (`delete_secret`, **Delete…**), as `wicket secret rm`: a first tap shows which zones
+  and running runs use it, and the passkey's confirmation names them again. A reference's deletion
+  removes only the reference, not the file.
+- **References are made on the host.** A reference names a path on the host, so the console can't
+  create one: `wicket secret link NAME --file PATH [--pointer /json/pointer]`. The section says so.
+- **Checked again when applied.** Each action fails if the secret changed between `begin` and
+  `finish` (it appeared or went, became a reference, or was rebound), so you sign what you saw.
+- **Unsigned asks** (`POST /api/secrets/…`) are refused with 403 and audited as `secret.refused`,
+  as is a secret action whose signature fails. Signed actions are audited as `secret.set`,
+  `secret.hosts` and `secret.removed`, by name and hosts, with the passkey and the signed record.
+  Secret actions share the other actions' limits (at most 8 passkey ceremonies pending per session,
+  each expiring after 2 minutes).
+- **Running boxes** use secrets as before: the proxies read the vault at each use, and a node
+  holding a copy is told to drop it when it changes, so a new value is used from the next request.
+- The console writes the vault of the user it runs as (installed: the `wicket` user's,
+  `/var/lib/wicket/.config/wicket/secrets/`), the vault the proxies read.
 
 ## Notifications
 
