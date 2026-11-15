@@ -133,7 +133,7 @@ fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
         bail!("a git push is decided by a human");
     }
     let now = wicket_store::now();
-    outlasts(a, now, i64::try_from(t.ttl.as_secs()).ok().and_then(|ttl| now.checked_add(ttl)), "grant")
+    outlasts(a, now, wicket_core::authority::end_of(now, t.ttl.as_secs()), "grant")
 }
 
 /// What an approval grants, within what was asked.

@@ -119,6 +119,11 @@ fn sum(parts: &[u64]) -> u64 {
     parts.iter().fold(0, |a: u64, &b| a.saturating_add(b))
 }
 
+/// Whether `parts` add up to more than `max`, exactly (in `u128`: no sum saturates to fit).
+fn over(parts: &[u64], max: u64) -> bool {
+    parts.iter().map(|&p| u128::from(p)).sum::<u128>() > u128::from(max)
+}
+
 impl Counts {
     /// Requests counted (refused ones included), handed to children and made by earlier activations.
     pub fn requests_committed(&self) -> u64 {
@@ -325,11 +330,16 @@ impl Counter {
             add_sat(&self.reserved_input_tokens, child.input_tokens.unwrap_or(0)),
         ];
         let c = self.counts();
-        let short = if c.requests_committed() > q.requests {
+        // A claim that saturated wasn't carved in full: refused, whatever the budget.
+        let short = if added[0] < child.requests || over(&[c.requests, c.reserved_requests, c.prior_requests], q.requests) {
             Some(Short::Requests)
-        } else if c.output_committed() > q.output_tokens {
+        } else if added[1] < child.output_tokens
+            || over(&[c.output_tokens, c.reserved_output_tokens, c.prior_output_tokens, c.inflight_output_tokens], q.output_tokens)
+        {
             Some(Short::OutputTokens)
-        } else if q.input_tokens.is_some_and(|m| c.input_committed() > m) {
+        } else if added[2] < child.input_tokens.unwrap_or(0)
+            || q.input_tokens.is_some_and(|m| over(&[c.input_total, c.reserved_input_tokens, c.prior_input_tokens], m))
+        {
             Some(Short::InputTokens)
         } else {
             None

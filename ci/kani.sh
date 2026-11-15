@@ -3,7 +3,11 @@
 # `#[kani::proof]` functions under `crates/*/src/proofs/` (built only by `cargo kani`, `cfg(kani)`).
 # Each names the Lean theorem of #322 (verification/lean) it restates, where there is one.
 #
-#   ci/kani.sh [--list] [HARNESS ...]
+#   ci/kani.sh [--list] [--no-loom] [HARNESS ...]
+#
+# Then, unless harnesses are named or --no-loom is given, the budget counter's loom test
+# (crates/wicket-core/tests/loom_budget.rs: every interleaving of its node's reports, slice leases,
+# model calls and carve-outs), built with `--cfg loom` in its own target directory.
 #
 # Runs every harness (or those named), one `cargo kani` at a time: CBMC's memory is per harness,
 # and one at a time keeps a run within a 4-6 GiB box (the largest needs about 2 GiB; see
@@ -25,7 +29,13 @@ if [ "${1:-}" = --list ]; then
   harnesses
   exit 0
 fi
+loom=1
+if [ "${1:-}" = --no-loom ]; then
+  loom=0
+  shift
+fi
 want=("$@")
+[ $# -gt 0 ] && loom=0
 # `--harness` matches by substring, so no harness name may be part of another's.
 names=$(harnesses | cut -f2)
 for a in $names; do
@@ -54,6 +64,17 @@ done < <(harnesses)
 if [ "$ran" = 0 ]; then
   echo "no harness matched: ${want[*]}" >&2
   exit 2
+fi
+if [ "$loom" = 1 ]; then
+  t0=$SECONDS
+  if out=$(RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/loom" \
+    cargo test --release --locked -p wicket-core --test loom_budget 2>&1); then
+    echo "ok   loom budget counter ($((SECONDS - t0)) s): $(grep -E '^test result' <<<"$out" | tail -n 1)"
+  else
+    echo "FAIL loom budget counter ($((SECONDS - t0)) s)"
+    tail -n 40 <<<"$out"
+    failed+=(loom)
+  fi
 fi
 if [ ${#failed[@]} -gt 0 ]; then
   echo "kani: ${#failed[@]} of $ran harnesses failed: ${failed[*]}"

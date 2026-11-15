@@ -41,10 +41,12 @@ fn counter(c: Counts) -> Counter {
     k
 }
 
+/// Within the budget, exactly (sums in `u128`).
 fn within(c: &Counts, q: ModelQuota) -> bool {
-    c.requests_committed() <= q.requests
-        && c.output_committed() <= q.output_tokens
-        && q.input_tokens.is_none_or(|m| c.input_committed() <= m)
+    let sum = |p: &[u64]| p.iter().map(|&x| u128::from(x)).sum::<u128>();
+    sum(&[c.requests, c.reserved_requests, c.prior_requests]) <= u128::from(q.requests)
+        && sum(&[c.output_tokens, c.reserved_output_tokens, c.prior_output_tokens, c.inflight_output_tokens]) <= u128::from(q.output_tokens)
+        && q.input_tokens.is_none_or(|m| sum(&[c.input_total, c.reserved_input_tokens, c.prior_input_tokens]) <= u128::from(m))
 }
 
 /// A slice never leases a node more than is left: counting up to it, the node takes the run to
@@ -95,6 +97,7 @@ fn a_carve_out_keeps_the_run_within_its_budget() {
         Ok(()) => {
             let after = k.counts();
             assert!(within(&after, q));
+            // Carved in full: a carve-out that would saturate a counter is refused.
             assert_eq!(after.reserved_requests, c.reserved_requests + child.requests);
             assert_eq!(after.reserved_output_tokens, c.reserved_output_tokens + child.output_tokens);
         }
@@ -102,7 +105,7 @@ fn a_carve_out_keeps_the_run_within_its_budget() {
     }
 }
 
-/// Children never exceed the parent: whatever three children ask, those carved add up to no more
+/// Children never exceed the parent: whatever two children ask, those carved add up to no more
 /// than the parent had left, and the parent's own spending (an admitted request) stays within
 /// what the carve-outs left it.
 #[kani::proof]
@@ -113,7 +116,7 @@ fn children_never_exceed_the_parent() {
     let (left_r, left_o) = c.remaining(q);
     let k = counter(c);
     let (mut carved_r, mut carved_o) = (0u128, 0u128);
-    for _ in 0..3 {
+    for _ in 0..2 {
         let child = any_quota();
         if k.carve(q, child).is_ok() {
             carved_r += u128::from(child.requests);

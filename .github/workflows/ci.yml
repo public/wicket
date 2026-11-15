@@ -159,6 +159,29 @@ jobs:
         env:
           BASE: ${{ github.base_ref || 'main' }}
 
+  # #325: Kani proof harnesses (bounded model checking of wicket-core's decision functions, each
+  # naming the Lean theorem of #322 it restates) and the budget counter's loom test, one harness at
+  # a time (ci/kani.sh). Selected by ci/affected.map's kani suite: the harnessed crate's code, the
+  # harnesses, the script.
+  kani:
+    name: Kani proofs and loom
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' kani ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KANI_VERSION: 0.68.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      - run: ci/kani.sh
+
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
   # the crate's tests, whenever ci/affected.py selects it. This runs a few hundred more, a different
   # block each night, and files an issue for each failing seed with its replay command.

@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-SUITES = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+SUITES = ["docs", "policy", "kani", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
           "node-e2e", "acceptance-nodes", "update"]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().

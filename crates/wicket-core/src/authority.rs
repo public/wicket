@@ -46,7 +46,12 @@ pub enum Outlasts {
 /// Whether something an agent grants or renews, ending `ttl_secs` from `now`, ends no later than the
 /// agent's own authority (`until`; all Unix seconds). An end past `i64::MAX` is past every authority.
 pub fn ends_within(now: i64, ttl_secs: u64, until: i64) -> Result<(), Outlasts> {
-    ends_by(now, i64::try_from(ttl_secs).ok().and_then(|t| now.checked_add(t)), until)
+    ends_by(now, end_of(now, ttl_secs), until)
+}
+
+/// `ttl_secs` from `now`, if that is an `i64` (computed in `i128`, so exact).
+pub fn end_of(now: i64, ttl_secs: u64) -> Option<i64> {
+    i64::try_from(i128::from(now) + i128::from(ttl_secs)).ok()
 }
 
 /// As [`ends_within`], for an end already computed (`None`: past `i64::MAX`).

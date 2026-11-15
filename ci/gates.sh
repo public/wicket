@@ -63,7 +63,7 @@ else
   crates=all suites=all doc_crates=all
 fi
 [ -n "$only_suites" ] && suites=$only_suites
-all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
+all_suites="docs policy kani smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
 [ "$suites" = all ] && suites=$all_suites
 has() { [[ " $suites " == *" $1 "* ]]; }
 
@@ -99,6 +99,13 @@ fi
 export WICKET=${WICKET:-target/debug/wicket}
 if has policy && [ "$rust" = 1 ]; then
   hstep "SymCC policy diffs" ci/policy-diff.sh "$base"
+fi
+if has kani && [ "$rust" = 1 ]; then
+  if command -v cargo-kani >/dev/null; then
+    hstep "Kani harnesses and the loom test" ci/kani.sh
+  else
+    log "kani: skipped, Kani is not installed (cargo install --locked kani-verifier && cargo kani setup); CI runs it"
+  fi
 fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()
