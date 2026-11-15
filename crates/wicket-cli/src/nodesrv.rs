@@ -456,7 +456,9 @@ impl Node {
         match loaded {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
-                eprintln!("[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused");
+                eprintln!(
+                    "[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused"
+                );
                 None
             }
         }
@@ -2432,7 +2434,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 llm_prior: (0, 0, 0),
                 output_cap: 64 << 20,
                 output_stop: false,
-                        swaps: vec![],
+                swaps: vec![],
                 edge: None,
                 image_pin: None,
                 timings: false,
@@ -3312,7 +3314,9 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(router.route("rc.api.test"), Route::Terminate);
         assert_eq!(router.route("wrap.api.test"), Route::Terminate);
         assert!(matches!(router.route("elsewhere.test"), Route::Uncovered(r) if r.contains("name constraints")));
-        assert!(matches!(NodeRouter { ca: None, clock: node.clock.clone() }.route("rc.api.test"), Route::Uncovered(r) if r.contains("no CA")));
+        assert!(
+            matches!(NodeRouter { ca: None, clock: node.clock.clone() }.route("rc.api.test"), Route::Uncovered(r) if r.contains("no CA"))
+        );
         let op = |m: &str, p: &str| {
             wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", m, "rc.api.test", p)
         };
@@ -3429,6 +3433,5 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(why.contains("node n1 talks protocol 10") && why.contains("*.example.org") && why.contains("from protocol 11"), "{why}");
         assert!(why.contains("wicket node install n1"), "{why}");
         assert!(refuse_older_node("n1", chan::NO_FORWARDED_EGRESS, &start, false, Some(&host)).is_ok());
-
     }
 }

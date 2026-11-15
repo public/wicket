@@ -17,10 +17,10 @@ use wicket_fwd::frame::{self, Head, HDR, MAX_FRAME};
 use wicket_proxy::ca::RunCa;
 #[path = "support/zone_decider.rs"]
 mod zone_decider;
-use zone_decider::ZoneDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::h3::{Options, H3};
 use wicket_proxy::{Event, RunCtx};
+use zone_decider::ZoneDecider;
 
 fn tmpdir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);

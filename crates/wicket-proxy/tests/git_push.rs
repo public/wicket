@@ -21,10 +21,10 @@ use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
 #[path = "support/zone_decider.rs"]
 mod zone_decider;
-use zone_decider::ZoneDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
 use wicket_store::{Approval, Ledger};
+use zone_decider::ZoneDecider;
 
 const OLD: &str = "1111111111111111111111111111111111111111";
 const NEW: &str = "2222222222222222222222222222222222222222";

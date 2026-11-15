@@ -22,9 +22,9 @@ use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
 #[path = "support/zone_decider.rs"]
 mod zone_decider;
-use zone_decider::ZoneDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
+use zone_decider::ZoneDecider;
 
 fn tmpdir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);

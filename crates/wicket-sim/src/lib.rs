@@ -79,12 +79,8 @@ pub const NODE_PORT: u16 = 8000;
 /// host the node's CA can't cover (which a grant is issued for, and which is never allowed), and
 /// a host outside the CA that the zone allows wholesale (spliced).
 pub const READ_PATH: &str = "/repos/acme/app/issues";
-pub const GRANT_PATHS: [&str; 4] = [
-    "/repos/acme/app/issues/1/comments",
-    "/repos/acme/app/issues/2/comments",
-    "/repos/acme/app/issues/3/comments",
-    UNCOVERED_PATH,
-];
+pub const GRANT_PATHS: [&str; 4] =
+    ["/repos/acme/app/issues/1/comments", "/repos/acme/app/issues/2/comments", "/repos/acme/app/issues/3/comments", UNCOVERED_PATH];
 /// Of [`GRANT_PATHS`], those on [`HOST`]; the last is on [`UNCOVERED_HOST`].
 pub const COVERED_GRANTS: usize = 3;
 /// A host outside the node CA's name constraints ([`NODE_CA`]), out of the zone's reach: asked for,
@@ -222,7 +218,13 @@ impl Plan {
             if u.chance(0.7) {
                 let at = u.range_i(0, DURATION_MS - 15_000);
                 let gid = format!("g_{name}_{COVERED_GRANTS}");
-                grants.push(GrantAction { at_ms: at, run, path: COVERED_GRANTS, gid, kind: GrantKind::Issue { lifetime_s: u.range(5, 30) } });
+                grants.push(GrantAction {
+                    at_ms: at,
+                    run,
+                    path: COVERED_GRANTS,
+                    gid,
+                    kind: GrantKind::Issue { lifetime_s: u.range(5, 30) },
+                });
             }
         }
         grants.sort_by_key(|g| g.at_ms);
@@ -237,7 +239,16 @@ impl fmt::Display for Plan {
             writeln!(f, "  fault at {} ms for {} ms: {:?}", x.at_ms, x.dur_ms, x.kind)?;
         }
         for g in &self.grants {
-            writeln!(f, "  grant at {} ms: {} ({} {}{}) {:?}", g.at_ms, g.gid, RUNS[g.run], grant_host(g.path), GRANT_PATHS[g.path], g.kind)?;
+            writeln!(
+                f,
+                "  grant at {} ms: {} ({} {}{}) {:?}",
+                g.at_ms,
+                g.gid,
+                RUNS[g.run],
+                grant_host(g.path),
+                GRANT_PATHS[g.path],
+                g.kind
+            )?;
         }
         Ok(())
     }

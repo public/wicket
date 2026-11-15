@@ -17,9 +17,9 @@ use wicket_proxy::ca::RunCa;
 #[path = "support/zone_decider.rs"]
 mod zone_decider;
 use wicket_proxy::decide::NodeDecider;
-use zone_decider::ZoneDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{Event, RunCtx};
+use zone_decider::ZoneDecider;
 
 const ALL: [&str; 7] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
@@ -606,10 +606,7 @@ async fn a_node_splices_or_refuses_what_its_ca_cannot_cover() {
     assert!(status.contains("outside the node CA's name constraints") && status.contains("renew-ca"), "{status}");
     settle().await;
     let ev = w.events();
-    assert!(
-        ev.iter().any(|(h, o, d)| h == "checked.test" && o == "forbidden" && d.contains("not served on this node")),
-        "{ev:?}"
-    );
+    assert!(ev.iter().any(|(h, o, d)| h == "checked.test" && o == "forbidden" && d.contains("not served on this node")), "{ev:?}");
     assert!(!ev.iter().any(|(_, o, _)| o == "forwarded"), "{ev:?}");
     let _ = std::fs::remove_dir_all(feed_dir);
 }

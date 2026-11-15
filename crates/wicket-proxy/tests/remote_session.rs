@@ -21,9 +21,9 @@ use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
 #[path = "support/zone_decider.rs"]
 mod zone_decider;
-use zone_decider::ZoneDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{CredentialSwap, RunCtx, SwapSource};
+use zone_decider::ZoneDecider;
 
 const HOST: &str = "rc.api.test";
 const LOGIN: &str = "real-login-token-0f9d";
