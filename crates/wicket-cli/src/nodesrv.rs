@@ -529,14 +529,9 @@ impl Relay for NodeRelay {
         let now = (self.node.clock)() / 1000;
         // Injected and swapped hosts are decided here too, their secret fetched on first use (#152,
         // #257): only what the CA can't cover is forwarded.
-        wicket_proxy::decide::route_sealed(
-            host,
-            &spec,
-            &self.kept,
-            self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
-            now,
-            &|_| true,
-        )
+        wicket_proxy::decide::route_sealed(host, &spec, &self.kept, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now, &|_| {
+            true
+        })
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {

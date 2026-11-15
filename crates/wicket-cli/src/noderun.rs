@@ -1649,8 +1649,9 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     let mut out = vec![];
     let names: Vec<String> = p.fetched.keys().cloned().collect();
     for name in names {
-        let now =
-            crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until()).ok().map(|f| crate::nodesecrets::digest(&f));
+        let now = crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until())
+            .ok()
+            .map(|f| crate::nodesecrets::digest(&f));
         if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
             p.fetched.remove(&name);
             save_holdings(sh, p);
