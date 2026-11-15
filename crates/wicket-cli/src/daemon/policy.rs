@@ -65,7 +65,9 @@ pub fn route(cmd: &Cmd) -> Route {
         // Hibernating and waking steer an agent the way `say` does; waking reruns its stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Say { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } => Forward(Read),
-        Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } => Forward(Read),
+        Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
+            Forward(Read)
+        }
         // Renewing a grant or a box's authority grants more time: a decision, as approving is.
         Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { cmd: GrantCmd::Renew { .. } } => Forward(Privileged),
         Cmd::Unlink { .. } | Cmd::Grant { cmd: GrantCmd::Revoke { .. } } => Forward(Revoke),

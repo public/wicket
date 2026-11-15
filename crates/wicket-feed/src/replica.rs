@@ -99,8 +99,9 @@ pub enum Allowed {
     Ceiling,
     /// By a live grant (one use consumed).
     Grant(String),
-    /// A lease on a grant, until (Unix ms).
-    Lease {
+    /// A time-bounded hold on a replicated grant (not a lease: "lease" is a grant of capacity),
+    /// until (Unix ms).
+    GrantHold {
         grant: String,
         until: i64,
     },
@@ -132,8 +133,8 @@ impl Decision {
 /// Things only a fresh node may do.
 #[derive(Clone, Debug)]
 pub enum Escalation<'a> {
-    /// A lease on a replicated grant, for up to `ttl_ms` (never past the grant's `not_after`).
-    Lease { zone: &'a str, grant: &'a str, ttl_ms: i64 },
+    /// A hold on a replicated grant, for up to `ttl_ms` (never past the grant's `not_after`).
+    GrantHold { zone: &'a str, grant: &'a str, ttl_ms: i64 },
     /// Starting a box in `child` from a box in `parent`.
     Spawn { parent: &'a str, child: &'a str },
     /// Signing an agent's approval in `zone`.
@@ -872,19 +873,19 @@ impl Replica<ZoneSpec> {
 }
 
 impl<P: Policy> Replica<P> {
-    /// Whether the node may issue a lease, start a spawn or sign an approval at `now`: only when
+    /// Whether the node may hold a grant, start a spawn or sign an approval at `now`: only when
     /// fresh, and never for revoked or expired grants.
     pub fn escalate(&self, e: &Escalation<'_>, now: i64) -> Decision {
         let mode = self.mode(now);
         if mode != Mode::Fresh {
-            return Decision::Refused { mode, why: format!("{mode:?}: no leases, spawns or approvals until fresh").to_lowercase() };
+            return Decision::Refused { mode, why: format!("{mode:?}: no grant holds, spawns or approvals until fresh").to_lowercase() };
         }
         let st = self.state.as_ref().expect("fresh");
         let zone_known = |z: &str| st.zones.contains_key(z);
         match *e {
-            Escalation::Lease { zone, grant, ttl_ms } => match st.grants.get(grant) {
+            Escalation::GrantHold { zone, grant, ttl_ms } => match st.grants.get(grant) {
                 Some(g) if g.zone == zone && g.not_after > now && !st.is_revoked(RevokeKind::Grant, grant) => {
-                    Decision::Allow(Allowed::Lease { grant: g.id.clone(), until: g.not_after.min(now.saturating_add(ttl_ms.max(1))) })
+                    Decision::Allow(Allowed::GrantHold { grant: g.id.clone(), until: g.not_after.min(now.saturating_add(ttl_ms.max(1))) })
                 }
                 _ => Decision::NeedsGrant(format!("no live grant {grant} in zone {zone}")),
             },

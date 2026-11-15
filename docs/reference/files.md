@@ -72,7 +72,7 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `ctl/authority.json` | When the box's authority ends, and whether its node confirmed the box stopped. |
 | `ctl/holdings.json` | The secrets released to the run's node and its budget slice. |
 | `ctl/attach.log` | The log of a supervisor that adopted the run (`wicket attach`). |
-| `ctl/egress.sock`, `ctl/llm.sock`, `ctl/gateway.sock` | The run's own proxies and gateway, which its node reaches for what it doesn't decide itself. |
+| `ctl/egress.sock`, `ctl/gateway.sock` | The run's own egress proxy and gateway, which its node reaches for what it doesn't decide itself (forwarded hosts, the gateway tools it relays). The model proxy runs only on the node. |
 | `sock/` | The box's sockets: egress, model, gateway, QUIC, links, `stdin.sock`. |
 | `tmp/`, `state/` | A long-lived agent's `/tmp` and `/wicket/state` (`$HOME` and Claude Code's config). |
 | `children/` | Logs of the children it started. |

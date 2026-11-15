@@ -85,8 +85,9 @@ exchanged, for the logs and for the health gate.
 | 6 | Images pinned by digest (#192): `BoxStart.image_pin`, which the node checks against the image it starts (then started by its id), and the digest it started in `Started` and `Spawned`. A pinned box goes only to a node talking 6. |
 | 7 | Images delivered over the channel (#191): `ImageHave` (does the node have this digest), and `PutImage`, an OCI image layout archive on a control-host stream whose data frames the node acknowledges (`Ack`) as it takes them, ended by `Close` and answered by `ImagePut` once the node has verified and imported it, or refused it. With an older node, the image must be there already. |
 | 8 | Images pulled by the node from an allowlisted registry, host-side (#191): `PullImage` (the digest, the registry and repository, the hosts the pull may reach and the name of the registry's secret, which the node fetches for the run) and `ImagePulled`. With a node talking 7, the image is sent instead. |
+| 9 | A run's budget slice is `BudgetSlice` (it was `Lease`, #256: "lease" names only a grant of capacity). No alias: a node talking 8 is sent no slice, and a box with a model budget doesn't start on it. |
 
-wicket speaks version 8.
+wicket speaks version 9.
 
 ## Ledger schema
 
