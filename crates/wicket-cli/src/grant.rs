@@ -26,6 +26,11 @@ use wicket_store::{Approval, Ledger, Request};
 /// The longest lifetime a grant may have. Every grant has one; renewal is a new decision.
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// The most uses an agent's grant may have (#291): an agent's grants are always bounded. The
+/// gateway's `decide` tool refuses more before signing, but the bound is held here (#342), where
+/// every grant is made, whatever a signed decision envelope says.
+pub const MAX_AGENT_USES: u32 = wicket_proxy::gateway::MAX_DECIDE_USES;
+
 /// The principal deciding.
 #[derive(Clone, Debug)]
 pub enum Granter {
@@ -190,6 +195,9 @@ pub enum Decided {
 /// refused, and the refusal is on the audit record (`decision.refused`) with who tried and why.
 pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_json::Value) -> Result<Decided> {
     let mut extra = extra;
+    if let Err(why) = bounds(by, v) {
+        return Err(refused(l, by, id, v, why));
+    }
     if let Granter::Human(o) = by {
         if let Err(why) = asked(l, id, v).and_then(|a| o.may_decide(&a).map_err(anyhow::Error::msg)) {
             return Err(refused(l, by, id, v, why));
@@ -220,6 +228,26 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
         Verdict::Approve(t) => approve(l, by, id, t, extra),
         Verdict::Deny => deny(l, by, id, extra),
         Verdict::Renew(_) => unreachable!("renewed above"),
+    }
+}
+
+/// The bounds every grant is made within, whoever decides and however the decision arrived (#342):
+/// a lifetime above 0 and at most [`MAX_TTL`], at least one use if counted, and for an agent a
+/// number of uses at most [`MAX_AGENT_USES`].
+fn bounds(by: &Granter, v: &Verdict) -> Result<()> {
+    let (ttl, uses) = match v {
+        Verdict::Approve(t) => (t.ttl, Some(t.uses)),
+        Verdict::Renew(ttl) => (*ttl, None),
+        Verdict::Deny => return Ok(()),
+    };
+    check_ttl(ttl)?;
+    match (by, uses) {
+        (_, Some(Some(0))) => bail!("a grant needs at least one use"),
+        (Granter::Agent(_), Some(None)) => bail!("an agent's grant needs a number of uses"),
+        (Granter::Agent(_), Some(Some(n))) if n > MAX_AGENT_USES => {
+            bail!("an agent's grant has at most {MAX_AGENT_USES} uses, not {n}")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -513,7 +541,9 @@ impl wicket_proxy::Decisions for AgentDecisions {
         let verdict = match p["decision"].as_str() {
             Some("renew") => Verdict::Renew(Duration::from_secs(p["ttl_secs"].as_u64().ok_or("the renewal has no ttl")?)),
             Some("approve") => Verdict::Approve(Terms {
-                uses: Some(p["uses"].as_u64().and_then(|u| u32::try_from(u).ok()).ok_or("the decision has no uses")?),
+                // Saturated, not dropped: a count past `u32` is over the cap, refused and audited
+                // by `decide` (#342).
+                uses: Some(p["uses"].as_u64().map(|u| u32::try_from(u).unwrap_or(u32::MAX)).ok_or("the decision has no uses")?),
                 ttl: Duration::from_secs(p["ttl_secs"].as_u64().ok_or("the decision has no ttl")?),
                 prefix: None,
                 zone_wide: false,
@@ -669,8 +699,13 @@ mod tests {
             assert!(format!("{e:#}").contains(why), "{e:#} should say {why:?}");
         }
         assert!(decisions(&l).is_empty(), "nothing recorded");
+        assert_eq!(refusals(&l).len(), 3, "each refusal is on the audit record (#342)");
         assert_eq!(l.request(&id).unwrap().status, "pending", "a refused approval decides nothing");
         assert!(decide(&mut l, &by, &id, &Verdict::Approve(terms(24 * 3600)), serde_json::json!({})).is_ok());
+    }
+
+    fn refusals(l: &Ledger) -> Vec<serde_json::Value> {
+        l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "decision.refused").map(|r| serde_json::from_str(&r.4).unwrap()).collect()
     }
 
     #[test]
@@ -927,6 +962,46 @@ mod tests {
         // The first decision wins.
         let e = hook.decide(&t.signed(&id, "deny", 1, 60)).unwrap_err();
         assert!(e.contains("no longer pending") && !e.contains("stays pending"), "{e}");
+    }
+
+    /// #342: the uses and ttl caps on an agent's grant hold in `grant::decide`, not only in the
+    /// gateway's argument parsing: a signed envelope over them is refused and audited.
+    #[test]
+    fn an_agents_decision_over_the_caps_is_refused_and_audited() {
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        let id = t.ask("run_c", "GET", "/v1/items");
+        let over = u64::from(MAX_AGENT_USES) + 1;
+        for (uses, ttl, why) in [
+            (over, 60, format!("at most {MAX_AGENT_USES} uses, not {over}")),
+            (4_000_000_000, 60, format!("at most {MAX_AGENT_USES} uses, not 4000000000")),
+            (u64::MAX, 60, format!("at most {MAX_AGENT_USES} uses, not {}", u32::MAX)),
+            (1, MAX_TTL.as_secs() + 1, "at most 1day".to_string()),
+            (0, 60, "at least one use".to_string()),
+        ] {
+            let e = hook.decide(&t.signed(&id, "approve", uses, ttl)).unwrap_err();
+            assert!(e.contains(&why) && e.contains("stays pending for a human"), "{e} should say {why:?}");
+        }
+        assert_eq!(t.status(&id), "pending", "nothing was granted");
+        let l = t.ledger.lock().unwrap();
+        assert!(decisions(&l).is_empty(), "no decision was made");
+        assert!(l.grant_for_request(&id).unwrap().is_none(), "no grant was made");
+        let r = refusals(&l);
+        assert_eq!(r.len(), 5, "every refusal is on the audit record");
+        assert!(r.iter().all(|r| r["by"] == "agent:run_p" && r["decision"] == "approve" && r["target"] == id.as_str()), "{r:?}");
+        assert!(r[0]["why"].as_str().unwrap().contains("at most 100 uses"), "{:?}", r[0]);
+        drop(l);
+        // Straight through `decide`, without an envelope, the same holds.
+        let a = Granter::Agent(hook.authority());
+        let mut l = t.ledger.lock().unwrap();
+        let e = decide(&mut l, &a, &id, &Verdict::Approve(Terms { uses: Some(MAX_AGENT_USES + 1), ..terms(60) }), serde_json::json!({}))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("on the audit record"), "{e:#}");
+        assert_eq!(refusals(&l).len(), 6);
+        drop(l);
+        // At the cap, it is granted.
+        assert!(hook.decide(&t.signed(&id, "approve", u64::from(MAX_AGENT_USES), 60)).unwrap().starts_with("approved:"));
+        assert_eq!(t.ledger.lock().unwrap().grant_for_request(&id).unwrap().unwrap().uses_left, Some(i64::from(MAX_AGENT_USES)));
     }
 
     // ---- renewal (#56) ----

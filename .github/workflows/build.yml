@@ -20,6 +20,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # The session view's build (#327): a pinned Node, checksum-verified (ci/install-node.sh).
+  NODE_VERSION: 22.23.5
+  NODE_SHA256: "cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8" # node-v22.23.5-linux-x64.tar.xz, from nodejs.org/dist/v22.23.5/SHASUMS256.txt
 
 jobs:
   build:
@@ -36,6 +39,15 @@ jobs:
           persist-credentials: false
       # No cache: what is signed is built from the commit and the pinned toolchain alone.
       - run: rustup show active-toolchain
+      # The console's session view (#327), built from its lockfile and embedded by build.rs.
+      - name: Node (pinned)
+        run: ci/install-node.sh
+      - name: The session view's bundle
+        run: |
+          d=$(ci/session-view.sh)
+          echo "WICKET_SESSION_VIEW=$d" >>"$GITHUB_ENV"
+          # The serve tests then check that the binary has the view, not the placeholder.
+          echo "WICKET_SESSION_VIEW_REQUIRED=1" >>"$GITHUB_ENV"
       - name: No secrets or machine details
         run: ci/check-public.py
       - run: cargo fmt --all -- --check

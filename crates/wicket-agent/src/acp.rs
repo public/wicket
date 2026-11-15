@@ -3,7 +3,7 @@
 //!
 //! - it offers no `fs`, `terminal` or `auth.terminal` capability, and answers any agent request it
 //!   didn't offer (`fs/*`, `terminal/*`, elicitation, anything else) with `-32601`;
-//! - wicket's gateway is the only MCP server, and the sandbox notice goes in as a `systemPrompt` append;
+//! - wicket's gateway is the only MCP server, and the box notice goes in as a `systemPrompt` append;
 //! - it answers `session/request_permission` only with an `allow_once` or `reject_once` option it was
 //!   offered, chosen by the tool call's `kind` and its paths, never by a title, a name or a command
 //!   string; with no such option it answers `cancelled`. It never selects an "always" option, which
@@ -123,7 +123,7 @@ pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings
 pub struct AcpConfig {
     /// The session's working directory in the box (absolute).
     pub cwd: String,
-    /// Appended to the agent's system prompt: the sandbox notice.
+    /// Appended to the agent's system prompt: the box notice.
     pub system_prompt: String,
     /// Agent-specific `_meta` for `session/new`, `load` and `resume`, built by wicket for a known
     /// adapter (e.g. the Claude adapter's `claudeCode.options`). Never taken from a manifest or editor.
@@ -444,7 +444,7 @@ impl AcpClient {
                 if !self.caps.system_prompt {
                     self.notice_in_prompt = true;
                     st.events.push(SessionEvent::Notice {
-                        text: "the agent takes no system prompt: the sandbox notice goes in front of the first prompt".into(),
+                        text: "the agent takes no system prompt: the box notice goes in front of the first prompt".into(),
                     });
                 }
                 self.open(st);

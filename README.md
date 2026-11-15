@@ -1,8 +1,8 @@
 # wicket
 
-wicket runs AI agents, Claude Code first, in sandboxes that have no network and hold no secrets. Every
+wicket runs AI agents, Claude Code first, in boxes that have no network and hold no secrets. Every
 request an agent makes leaves the box through wicket. wicket decides it against the agent's **zone**,
-the hosts, methods and paths it may reach. Anything outside the zone waits for a human, who approves or
+the host names, methods and paths it may reach. Anything outside the zone waits for an operator, who approves or
 denies it with a passkey. wicket is a meta-harness: it doesn't run an agent loop of its own, it builds and
 polices the environment the agent runs in.
 

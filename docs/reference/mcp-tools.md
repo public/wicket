@@ -11,7 +11,7 @@ Every tool answers with one text block; a refusal or failure sets `isError`.
 `whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, `spawn` and
 `spawn_agent` within the box's zone (the child starts on the node, its token attenuated there, and
 the control host takes it over when it can be reached), and `send_message`, `await_message` and
-`link` between boxes on that node, and push delivery of messages (see [Push delivery](#push-delivery)). While the control host is unreachable, what needs a human
+`link` between boxes on that node, and push delivery of messages (see [Push delivery](#push-delivery)). While the control host is unreachable, what needs an operator
 (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the zone) is
 queued on the node under a node-local id `q-…`; `await_grant` with that id follows it once it is
 raised. Every other call is relayed to the control host, and fails clearly while it is away. What a
@@ -19,10 +19,10 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 
 | tool | what it does | needs |
 |---|---|---|
-| [`await_grant`](#await_grant) | Wait for a human's decision on a pending request | |
+| [`await_grant`](#await_grant) | Wait for an operator's decision on a pending request | |
 | [`pending_requests`](#pending_requests) | List this run's requests still waiting, and descendants' it may decide | |
 | [`decide`](#decide) | Approve, deny or renew a descendant's request, grant or box authority within the caller's own reach | `escalation.grant` |
-| [`request_access`](#request_access) | Ask a human for reach ahead of time | |
+| [`request_access`](#request_access) | Ask an operator for reach ahead of time | |
 | [`whoami`](#whoami) | This box's verified identity | |
 | [`send_message`](#send_message) | Message the parent, a child or a permitted peer, by principal | |
 | [`await_message`](#await_message) | Wait for the next message | |
@@ -30,6 +30,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`receipts`](#receipts) | What became of the messages this box sent | |
 | [`spawn_agent`](#spawn_agent) | Start a child agent in a narrowed copy of this zone | `max_children` |
 | [`spawn`](#spawn) | Start an agent or program in a zone the caller writes | `max_children` |
+| [`continue_child`](#continue_child) | Give a child agent the caller delegated to another brief, its context intact | |
+| [`delegations`](#delegations) | The caller's delegations: each child's state and its latest report's receipt | |
 | [`request_capacity`](#request_capacity) | Ask for a machine of its own (a lease) | `placement.yaml` |
 | [`request_update`](#request_update) | Ask the operator to update wicket to a build | |
 | [`expose`](#expose) | Offer a TCP port to other boxes | |
@@ -42,7 +44,7 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 
 ## `await_grant`
 
-Waits for a human to decide a pending request (the `request_id` from a 403 `pending-approval`
+Waits for an operator to decide a pending request (the `request_id` from a 403 `pending-approval`
 response, or from `request_access`, `spawn`, `connect` or `link`). Returns `granted`, `denied`,
 `withdrawn`, or still pending after the timeout. After `granted`, the agent retries the original
 request once. A run can only wait on its own requests.
@@ -62,14 +64,14 @@ decide with [`decide`](#decide). No arguments.
 
 Approves or denies a pending request from one of the caller's descendants (a box it started, or
 one they started; [#50](https://github.com/public/wicket/issues/50)). The decision is signed with
-the caller's wicket identity and recorded, with the chain from the asking run to the caller, as a
-human's is; the first decision on a request wins. Only the caller's own call decides: nothing sent
+the caller's wicket identity and recorded, with the chain from the asking run to the caller, as an
+operator's is; the first decision on a request wins. Only the caller's own call decides: nothing sent
 with `send_message` can make one. A request the caller may not decide is refused, saying why, and
-stays pending for a human. It may decide a request only when:
+stays pending for an operator. It may decide a request only when:
 
 - the caller's zone has `escalation.grant` ([manifest](manifest.md#zone));
 - it is an HTTP request for one path (SPAWN, LINK, CAPACITY, UPDATE, prefix requests and git
-  pushes stay with humans);
+  pushes stay with operators);
 - the caller's own zone allows it by reach at the request's risk, and the org policy doesn't
   refuse it: what the caller could do itself, never by one of its own grants.
 
@@ -83,7 +85,7 @@ as an approval is:
 - a grant (`grant_id`, or `request_id` for the grant made for it) only if the caller could make it
   now: a descendant's request it may decide, for exactly that path, to that run only, with a
   number of uses (kept as they are). A push's window, a prefix or zone-wide grant, and an unlimited
-  grant are renewed by a human (`wicket grant renew`);
+  grant are renewed by an operator (`wicket grant renew`);
 - a descendant box's authority (`run`), with `escalation.grant`. The box's token is minted again
   with the new end, so its node keeps it past its old one. It never goes past the box's run
   timeout. A box nobody renews stops when its authority ends, as before.
@@ -102,8 +104,8 @@ something sooner, revoke it.
 
 ## `request_access`
 
-Asks a human for reach the agent needs but doesn't have, before trying or after a "needs human
-approval" block. Returns a `request_id` for `await_grant`. Asking again for what a human just denied
+Asks an operator for reach the agent needs but doesn't have, before trying or after a "needs human
+approval" block. Returns a `request_id` for `await_grant`. Asking again for what an operator just denied
 is refused, saying so.
 
 | argument | type | default | |
@@ -113,7 +115,7 @@ is refused, saying so.
 | `scope` | `exact` or `prefix` | `exact` | `prefix`: every path under the URL's path, in whole segments (`/repos/acme/app` covers `/repos/acme/app/…`, not `/repos/acme/app-secrets`). |
 | `reason` | string | required | One sentence: what it is for. |
 
-A grant never covers anything riskier than the request the human was shown: approving an R2 prefix
+A grant never covers anything riskier than the request the operator was shown: approving an R2 prefix
 doesn't allow the R4 operations under it. On a node, a prefix grant is honoured for the asked path
 only.
 
@@ -168,7 +170,8 @@ its receipt is `delivered`, or `refused` with why (on the node's audit log, `nod
 Waits for the next message to this agent's principal, from its parent, a child or a permitted peer,
 with the sender's identity (`from.id`, its principal) verified by wicket. Messages held while the
 agent wasn't running arrive first, in the order they were sent. An envelope addressed to another
-principal is dropped. A child also sends a final `run_finished` message (its `status`, a
+principal is dropped. A child agent's report on each brief arrives as a `report` message (see
+[delegation](#delegation)), and a parent's next brief as a `brief`. A child also sends a final `run_finished` message (its `status`, a
 `cause` when its box ended abnormally, e.g. out of memory, and its `result`) when it
 ends.
 
@@ -256,7 +259,8 @@ A receipt is readable only by its sender.
 
 Starts a child agent in its own box with its own identity, in the caller's own zone, optionally
 narrowed to some of its hosts. Returns the child's run id and its principal, which `send_message`
-addresses it by; its messages and result come through `await_message`. Refused when `max_children` is 0 or spent.
+addresses it by, and a [handle](#delegation): its task is a delegation, whose report comes back as a
+message. Refused when `max_children` is 0 or spent.
 
 | argument | type | |
 |---|---|---|
@@ -273,7 +277,7 @@ budget (carved out of the caller's), memory, CPUs, PIDs, time, isolation, images
 becomes a pending R4 request, `SPAWN wicket.internal/zones/<zone>/<digest>`, for exactly that zone:
 the caller waits with `await_grant` and calls `spawn` again with the same arguments. A different
 model route or a credential the caller doesn't have is refused outright, with no approval path.
-Returns the new run id.
+Returns the new run id, and for an agent a [handle](#delegation).
 
 | argument | type | default | |
 |---|---|---|---|
@@ -284,7 +288,7 @@ Returns the new run id.
 | `image` | string | the caller's | from the caller's image or its zone's `images` |
 | `zone` | object | see below | a [manifest zone](manifest.md#zone): `reach`, `forbid`, `unlisted_hosts`, `wildcards`, `inject`, `volumes`, `llm` (`max_requests`, `max_output_tokens`), `limits`, `isolation`, `images`, `accept_from` |
 | `max_children` | integer ≥ 0 | 0 | at most 64; counts against the caller's |
-| `ask_human` | boolean | false | put a zone beyond the caller's to a human |
+| `ask_human` | boolean | false | put a zone beyond the caller's to an operator |
 | `placement` | `{"lease": "l-…"}` or `{"node": "<name>"}` | where the caller runs | an active lease from `request_capacity`, or the node the caller runs on |
 
 What `zone` leaves out: no reach and no credentials; the caller's limits, isolation,
@@ -293,11 +297,65 @@ caller's `escalation`. A program may not ask for more (`escalation.request: fals
 says `escalation: { request: true }`, which the caller's zone must allow too. The spawned zone is named
 `<caller's zone>.<name>.<caller's run>`.
 
+## Delegation
+
+An agent `spawn` (or `spawn_agent`) starts is a delegation (#252): its task is its first brief.
+`spawn` ends its answer with the child's handle, one line of JSON:
+
+```text
+handle: {"principal":"spiffe://<domain>/t/<tenant>/z/<zone>.<name>.<run>/a/<name>","delegation":"d-…","run":"run_…","name":"<name>"}
+```
+
+- **Reports are messages.** When a top-level turn of the child's on its brief ends, wicket sends the
+  turn's result to the parent's principal as a message of kind `report`, signed with the child's
+  identity: `body` is `{ delegation, turn, status, report }` (`status` is `turn_ended` or
+  `turn_failed`; `report` is the turn's result, its last 12 KiB). The parent reads it with
+  `await_message`, and it has a receipt like any message (the child reads it with `receipts`; the
+  parent sees it in `delegations`). The child's session stays open after it: wicket never ends it.
+  When the child's run ends, its `run_finished` names the delegation too.
+- **Continuing a child.** `continue_child` gives the same child another brief, in the same run, so
+  its context is intact: a `brief` message the child's session wakes with (its next turn), and its
+  report on it comes back as the next `report`. A child is continued only once it has reported on
+  its last brief; one still working is refused (add to its brief with `send_message`), and one
+  whose run ended is refused (spawn a new one).
+- **What holds.** A brief or a report is a message: data, which grants nothing. The child keeps the
+  zone it was spawned with, within its parent's (#256): continuing it changes no authority. Only the
+  agent that delegated (its principal) may continue a child: anyone else, by name, principal or
+  delegation id, is refused, and isn't told whose child it is. Every step is audited:
+  `delegation.started`, `delegation.reported`, `delegation.continued`, `delegation.refused` and
+  `delegation.ended`.
+
+## `continue_child`
+
+Another brief for a child agent the caller delegated to, once it has reported on its last one.
+Returns the brief's message id, the handle and the brief's first receipt.
+
+| argument | type | default | |
+|---|---|---|---|
+| `child` | string, required | | the child's name, principal or delegation id (`d-…`); the newest of the caller's by that name |
+| `brief` | string or object, required | | what to do next, at most 16 KB |
+| `priority` | `now`, `next` or `later` | `next` | as for `send_message` |
+
+Refused, with why: no child by that name (`no child`), another agent's child (`is not your
+child`), a child still working on its brief, or one whose run has ended.
+
+## `delegations`
+
+The caller's delegations, newest first (at most 50): each one's `delegation` id, `name`,
+`principal`, `run`, `run_status`, `presence` (as [`principals`](#principals) says it), `state`, `turn`
+(1 for the task, one more per continuation), and the receipts of its latest `report` and `brief`.
+
+| state | meaning |
+|---|---|
+| `working` | on its brief: its first turn, or a continuation |
+| `reported` | its turn ended and its report was sent to the parent: `continue_child` may give it another brief |
+| `ended` | its run is over |
+
 ## `request_capacity`
 
-Asks a human for a machine of the agent's own for a while: more CPU or memory, another isolation
-tier, a region. It costs money, so a human always decides, within the budget in `placement.yaml`;
-an ask over budget is refused before a human sees it. Without `placement.yaml` the tool is off.
+Asks an operator for a machine of the agent's own for a while: more CPU or memory, another isolation
+tier, a region. It costs money, so an operator always decides, within the budget in `placement.yaml`;
+an ask over budget is refused before an operator sees it. Without `placement.yaml` the tool is off.
 Returns a lease id; calling again with `{lease}` waits until its node is ready. Then `spawn` with
 `placement: {"lease": …}` places boxes there. The node is destroyed when the lease ends, and what
 runs on it stops.
@@ -317,7 +375,7 @@ runs on it stops.
 ## `request_update`
 
 Asks the operator to update the installation to a build the agent made. It files an R4 request,
-`UPDATE wicket.internal/self/<sha256>`, and nothing else: once a human approves it, the operator's
+`UPDATE wicket.internal/self/<sha256>`, and nothing else: once an operator approves it, the operator's
 `wicket self update` accepts that artifact once. See
 [run wicket in wicket](../how-to/run-wicket-in-wicket.md).
 
@@ -329,7 +387,7 @@ Asks the operator to update the installation to a build the agent made. It files
 ## `expose`
 
 Offers a TCP port of this box (a server on 127.0.0.1 or 0.0.0.0) to other boxes. The parent may
-connect without it; other boxes may if this zone's `accept_from` lists theirs, or a human approves.
+connect without it; other boxes may if this zone's `accept_from` lists theirs, or an operator approves.
 
 | argument | type | default |
 |---|---|---|
@@ -341,7 +399,7 @@ connect without it; other boxes may if this zone's `accept_from` lists theirs, o
 Reaches a TCP port of another box: one of the caller's children (by name or run id; no `expose`
 needed), its parent, or a box that exposed the port. Returns the address to use in the caller's box,
 `<name>.wicket.internal:<port>`, relayed by wicket. Connecting lends the caller the target's
-authority, so a target whose reach isn't within the caller's needs a human: the answer is then a
+authority, so a target whose reach isn't within the caller's needs an operator: the answer is then a
 request id for `await_grant`, after which the caller calls `connect` again.
 
 | argument | type | |
@@ -353,7 +411,7 @@ request id for `await_grant`, after which the caller calls `connect` again.
 
 Wires two boxes the caller controls (itself, `"self"`, or its own children): box `from` gets
 `<name>.wicket.internal:<port>`, reaching `port` of box `to`. The policy is `connect`'s: `to`'s
-reach must be within `from`'s, or a human approves.
+reach must be within `from`'s, or an operator approves.
 
 | argument | type |
 |---|---|
@@ -376,18 +434,18 @@ the harness exits and the run ends. A harness that hasn't exited by the zone's `
 (30 s by default) after its session closed (a background process of its keeps it waiting, say) has
 its box stopped: the workspace is synced back, and the run is recorded as succeeded, with a note
 naming the processes wicket stopped (#293). wicket never ends a session by itself: until the agent calls `finish`
-or exits, its session stays open for follow-ups (`wicket say`) and messages, up to the zone's
+or exits, its session stays open for prompts (`wicket session`, the console's session page) and messages, up to the zone's
 `limits.timeout` or the end of its authority. No arguments. Relayed to the control host on a node.
 
 ## `hibernate`
 
 Asks to be hibernated at the end of the current turn, once nothing but the agent runs in its box:
 the box stops and its state is kept (workspace, `$HOME`, `/tmp`, durable volumes), and a message to
-the agent or its operator's `wicket say` wakes it, with that as its next turn. If something else
+the agent or its operator's prompt (`wicket session`) wakes it, with that as its next turn. If something else
 still runs, it gets the zone's `limits.exit_grace` (30 s by default) to end; then wicket stops it and
 hibernates the agent, naming what it stopped in `wicket agents` (a wake restores files, not
 processes). Only for a long-lived agent
-wicket started itself: a wrapped or remote session is refused. No arguments. See
+wicket started itself: a wrapped or Remote Control session is refused. No arguments. See
 [hibernate and wake](agents.md#hibernate-and-wake).
 
 ## `links`

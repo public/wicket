@@ -11,7 +11,7 @@ fn verdict(z: &CompiledZone, method: &str, path: &str) -> Verdict {
 
 #[test]
 fn the_remote_control_example_refuses_the_mcp_paths_and_reaches_the_session() {
-    let m = Manifest::from_yaml(include_str!("../../../examples/remote-control-box.yaml")).expect("the example parses");
+    let m = Manifest::from_yaml(include_str!("../../../../examples/remote-control-box.yaml")).expect("the example parses");
     assert!(m.agent.as_ref().and_then(|a| a.remote.as_ref()).is_some(), "a remote agent");
     let z = CompiledZone::new(m.zone).unwrap();
     let allowed = [

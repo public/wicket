@@ -64,6 +64,7 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 |---|---|
 | `workspace/` | The box's `/workspace` (copied in, or the `--workdir`); `workspace/out/result.json` is the result wicket reads after the run. |
 | `transcript.jsonl`, `transcript.1.jsonl` | The agent's stream (or a program's output), the newest `limits.output` kept. |
+| `acp-client.jsonl` | An ACP run's other side: what wicket wrote to the agent, each line at its transcript offset, up to `limits.output`. The console's [session view](console.md#sessions) reads it with the transcript. |
 | `agent.stderr.log` | The agent's stderr, the newest `limits.output` kept. |
 | `console.log` | The output of a run the console started. |
 | `ctl/run.json` | The run's record: what another supervisor needs to take it over. |

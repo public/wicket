@@ -104,7 +104,7 @@ pub struct AgentSpec {
     /// other image must be listed in `zone.images`, as for `spawn`. `wicket run --image` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// How many child agents this agent may start with `spawn_agent`, each in its own sandbox with
+    /// How many child agents this agent may start with `spawn_agent`, each in its own box with
     /// its own identity (design §3.2, §5.1). 0 = none.
     #[serde(default)]
     pub max_children: u32,
@@ -626,7 +626,17 @@ pub struct Limits {
     /// (Left out when it is the default, so a node of an earlier version reads the manifest.)
     #[serde(default = "default_exit_grace", skip_serializing_if = "is_default_exit_grace")]
     pub exit_grace: String,
+    /// Advice for this zone's work, appended to the warning its agent gets near its memory limit
+    /// (#348): operator text from the manifest, one line of at most [`MEMORY_ADVICE_MAX`]
+    /// characters ("for example CARGO_BUILD_JOBS=1, `make -j1`"). A spawned zone inherits it, and
+    /// may replace it (empty: none). (Left out when unset, so a node of an earlier version reads
+    /// the manifest.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_advice: Option<String>,
 }
+
+/// The longest `limits.memory_advice`, in characters.
+pub const MEMORY_ADVICE_MAX: usize = 300;
 
 /// What happens when a box's output passes its zone's `limits.output`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +658,7 @@ impl Default for Limits {
             output: default_output(),
             on_output_full: OnOutputFull::default(),
             exit_grace: default_exit_grace(),
+            memory_advice: None,
         }
     }
 }
@@ -698,6 +709,11 @@ impl Limits {
         }
     }
 
+    /// [`Limits::memory_advice`], if set and not empty.
+    pub fn memory_advice(&self) -> Option<&str> {
+        self.memory_advice.as_deref().map(str::trim).filter(|a| !a.is_empty())
+    }
+
     /// The memory limit in bytes, if readable.
     pub fn memory_bytes(&self) -> Option<u64> {
         crate::subset::parse_bytes(&self.memory)
@@ -727,6 +743,13 @@ impl Limits {
         }
         if self.timeout()?.is_zero() {
             return bad(format!("timeout {:?}", self.timeout));
+        }
+        if let Some(a) = &self.memory_advice {
+            if a.chars().count() > MEMORY_ADVICE_MAX || a.chars().any(char::is_control) {
+                return Err(ManifestError::Invalid(format!(
+                    "limits.memory_advice: one line of at most {MEMORY_ADVICE_MAX} characters, without control characters"
+                )));
+            }
         }
         Ok(())
     }
@@ -787,7 +810,9 @@ impl Manifest {
                             return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
                         }
                         if a.remote.is_some() {
-                            return Err(ManifestError::Invalid("agent.remote: an ACP agent has no remote session of its own".into()));
+                            return Err(ManifestError::Invalid(
+                                "agent.remote: an ACP agent has no Remote Control session of its own".into(),
+                            ));
                         }
                         if a.max_turns.is_some() {
                             return Err(ManifestError::Invalid(
@@ -1023,6 +1048,24 @@ mod tests {
         let back: Limits = serde_json::from_str(&serde_json::to_string(&s.zone.limits).unwrap()).unwrap();
         assert_eq!(back.exit_grace, "5s");
         assert!(with("exit_grace: soon").is_err());
+    }
+
+    /// #348: a zone's memory advice is optional, written only when set, one line, and capped.
+    #[test]
+    fn memory_advice_is_optional_one_line_and_capped() {
+        let with =
+            |l: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, limits: {{ {l} }} }}\n"));
+        let d = with("cpus: 1").unwrap();
+        assert_eq!(d.zone.limits.memory_advice(), None);
+        assert!(!serde_json::to_string(&d.zone.limits).unwrap().contains("memory_advice"));
+        let s = with("memory_advice: 'CARGO_BUILD_JOBS=1, `make -j1`'").unwrap();
+        assert_eq!(s.zone.limits.memory_advice(), Some("CARGO_BUILD_JOBS=1, `make -j1`"));
+        let back: Limits = serde_json::from_str(&serde_json::to_string(&s.zone.limits).unwrap()).unwrap();
+        assert_eq!(back.memory_advice, s.zone.limits.memory_advice);
+        assert_eq!(with("memory_advice: ''").unwrap().zone.limits.memory_advice(), None, "empty: none");
+        assert!(with(&format!("memory_advice: {}", "x".repeat(MEMORY_ADVICE_MAX))).is_ok());
+        assert!(with(&format!("memory_advice: {}", "x".repeat(MEMORY_ADVICE_MAX + 1))).is_err(), "capped");
+        assert!(with("memory_advice: \"a\\nb\"").is_err(), "one line");
     }
 
     /// #126: a zero limit means no limit to Docker, so a manifest can't set one.

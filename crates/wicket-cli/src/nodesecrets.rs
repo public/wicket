@@ -435,7 +435,7 @@ impl wicket_proxy::vault::SecretSource for RunSecrets {
     }
 }
 
-/// Budget slices as last leased, per run, under `<node dir>/slices/` (not secret).
+/// Budget slices as last sent, per run, under `<node dir>/slices/` (not secret).
 pub struct Slices {
     dir: PathBuf,
 }

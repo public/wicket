@@ -381,12 +381,29 @@ pub struct Grant {
     pub host: String,
     pub method: String,
     pub path: String,
-    /// Unix seconds.
+    /// Unix seconds, inclusive: the block's check is `time($t), $t <= not_after`, with the
+    /// request's time in whole seconds. A ledger grant ending at `expires_at` is published with
+    /// [`Grant::not_after_for`].
     pub not_after: u64,
     /// Who approved, e.g. `human:alex@acme` or `box:b0/b1`.
     pub approver: String,
     /// The approved op's digest (wicket-core `Op::digest`), for audit.
     pub digest: Vec<u8>,
+}
+
+impl Grant {
+    /// The `not_after` a grant the ledger ends at `expires_at` (Unix seconds) is published with
+    /// (#342). A grant is live while `now < expires_at` (#337: half-open, in ms); the token's check
+    /// is `floor(now_ms / 1000) <= not_after`, so `expires_at - 1` allows exactly while
+    /// `now_ms < expires_at * 1000`: through `expires_at * 1000 - 1` ms, never at `expires_at`.
+    ///
+    /// The bound is moved here, not the check made strict, so the token's shape is unchanged and
+    /// an older node (within `PROTOCOL_SKEW`) reads the same block, vets it, and agrees with the
+    /// ledger too: a strict `$t < not_after` would be a new rule shape such a node's structure
+    /// check refuses, and its inclusive reading of an unchanged `expires_at` is the bug itself.
+    pub fn not_after_for(expires_at: i64) -> u64 {
+        u64::try_from(expires_at.saturating_sub(1)).unwrap_or(0)
+    }
 }
 
 /// One request as the node sees it. Every field comes from the node (transport identity, its clock,

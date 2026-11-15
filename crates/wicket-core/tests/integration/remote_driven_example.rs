@@ -5,7 +5,7 @@
 use wicket_core::{CompiledZone, Manifest, Op, RunId, TenantId, Verdict};
 
 fn zone() -> CompiledZone {
-    let m = Manifest::from_yaml(include_str!("../../../examples/remote-driven-box.yaml")).expect("the example parses");
+    let m = Manifest::from_yaml(include_str!("../../../../examples/remote-driven-box.yaml")).expect("the example parses");
     let r = m.agent.as_ref().and_then(|a| a.remote.as_ref()).expect("a remote agent");
     assert!(r.drive, "the example is driven");
     CompiledZone::new(m.zone).unwrap()

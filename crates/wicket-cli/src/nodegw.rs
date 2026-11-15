@@ -734,13 +734,28 @@ async fn start_child(
     let name = m.agent.as_ref().map(|a| a.name.clone()).or(m.program.as_ref().map(|p| p.name.clone())).unwrap_or_default();
     let budget =
         m.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
+    // An agent's handle (#252): its principal, from its parent's, and the delegation its control
+    // host records under the same id when it adopts it.
+    let handle = node
+        .edge_start(run)
+        .and_then(|e| e.who.get("id").and_then(|v| v.as_str()).and_then(wicket_identity::Principal::parse))
+        .filter(|_| plan.is_agent)
+        .map(|o| {
+            let cp = wicket_identity::spiffe_id(o.trust_domain(), &parent.tenant, &plan.zone_name, &name);
+            format!("\nhandle: {}", wicket_proxy::delegate::handle(&cp, &child.0, &name))
+        })
+        .unwrap_or_default();
     Ok(format!(
-        "started {kind} {name} as run {} on node {}: its own box, zone {}, within your own{budget}. Your node decided it from your token; wicket's control host records it {}. {}",
+        "started {kind} {name} as run {} on node {}: its own box, zone {}, within your own{budget}. Your node decided it from your token; wicket's control host records it {}. {}{handle}",
         child.0,
         node.name,
         plan.zone_name,
         if connected(node, run) { "now" } else { "when it can be reached" },
-        if plan.is_agent { "Use await_message for its messages and its final run_finished." } else { "It sends you run_finished when it exits." }
+        if plan.is_agent {
+            "When its turn on the task ends, its report comes to you as a message (kind report; use await_message); continue_child gives it another brief, its context intact."
+        } else {
+            "It sends you run_finished when it exits."
+        }
     ))
 }
 

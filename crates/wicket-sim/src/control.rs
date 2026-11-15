@@ -120,7 +120,7 @@ async fn grants(env: Rc<Env>, st: Rc<RefCell<State>>) {
             apply(&env, &mut st.borrow_mut(), a.run, Some((a.path, &a.gid, &a.kind)), t);
             env.control_disk.borrow_mut().done += 1;
         }
-        // Expired grants leave the token (noderun's `p.live.retain(not_after > now)`).
+        // Expired grants leave the token (noderun's `p.live.retain`: live while `now < expires_at`).
         for (run, name) in RUNS.iter().enumerate() {
             let expired = env.control_disk.borrow().live.get(*name).is_some_and(|l| l.values().any(|(_, na)| *na as i64 <= t / 1000));
             if expired {
@@ -182,7 +182,11 @@ fn apply(env: &Env, st: &mut State, run_i: usize, action: Option<(usize, &str, &
                     host: op.host.clone(),
                     method: op.method.clone(),
                     path: op.path.clone(),
-                    not_after: *na,
+                    // As noderun's `live_grant` publishes the ledger's end (#342).
+                    not_after: match env.options.grant_end_fix {
+                        true => wicket_authz::Grant::not_after_for(*na as i64),
+                        false => *na,
+                    },
                     approver: "human:sim".into(),
                     digest: hex::decode(op.digest()).unwrap_or_default(),
                 },
@@ -244,7 +248,11 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_rx = tokio::time::Instant::now();
     loop {
+        // `biased`: unbiased, `select!` picks among ready branches with tokio's own RNG, which
+        // the seed doesn't reach, so a frame and a tick due at the same simulated instant ran in
+        // either order (#324). What has arrived is handled before the tick acts on it.
         tokio::select! {
+            biased;
             f = rx.recv() => {
                 let Some((kind, body)) = f else { return };
                 last_rx = tokio::time::Instant::now();

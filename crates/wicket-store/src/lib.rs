@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
+mod delegations;
+pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub mod bundle;
 pub mod cas;
 mod links;
@@ -70,8 +72,9 @@ pub enum StoreError {
 /// (expand) adds `messages.to_principal`: messages are addressed to principals, not runs (#250).
 /// Version 5 (expand) adds the agent-to-agent protocol's record (#252): `messages.from_principal`
 /// (the reply address), `messages.priority`, `messages.in_reply_to`, the `message_refusals` table,
-/// and `runs.activity` (busy, idle, waiting) for presence.
-pub const SCHEMA_VERSION: u32 = 5;
+/// and `runs.activity` (busy, idle, waiting) for presence. Version 6 (expand) adds the
+/// `delegations` table: what a parent delegated to the children it spawned, and where it is (#252).
+pub const SCHEMA_VERSION: u32 = 6;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -272,6 +275,10 @@ CREATE TABLE IF NOT EXISTS operator_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, text TEXT NOT NULL, by TEXT NOT NULL,
   created_at INTEGER NOT NULL, consumed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS turn_cancels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, by TEXT NOT NULL,
+  created_at INTEGER NOT NULL, consumed_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS identity_history (
   run TEXT NOT NULL, jws TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
 );
@@ -384,6 +391,7 @@ impl Ledger {
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
+        conn.execute_batch(delegations::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -452,6 +460,7 @@ impl Ledger {
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
+        conn.execute_batch(delegations::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
@@ -530,9 +539,9 @@ impl Ledger {
         Ok((id, true))
     }
 
-    // ---- operator follow-ups to a running agent ----
+    // ---- operator messages to a running agent: session prompts and wicket's own notices ----
 
-    /// Queues a follow-up from the operator for a running agent. Operator text is trusted task text
+    /// Queues a message from the operator (a session prompt, #198) or wicket for a running agent. Operator text is trusted task text
     /// (it comes from the principal), unlike anything an agent or a web page says.
     pub fn add_operator_message(&self, run: &str, text: &str, by: &str) -> Result<i64> {
         self.conn
@@ -540,8 +549,14 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Takes every queued follow-up for `run`, oldest first: (text, by). Each is handed out once.
+    /// Takes every queued message for `run`, oldest first: (text, by). Each is handed out once.
     pub fn take_operator_messages(&mut self, run: &str) -> Result<Vec<(String, String)>> {
+        Ok(self.take_operator_messages_with_ids(run)?.into_iter().map(|(_, t, b)| (t, b)).collect())
+    }
+
+    /// [`Ledger::take_operator_messages`] with each message's id (what [`Ledger::add_operator_message`]
+    /// returned), so a session that queued one can tell when the agent took it up (#327).
+    pub fn take_operator_messages_with_ids(&mut self, run: &str) -> Result<Vec<(i64, String, String)>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, String, String)> = {
             let mut st = tx.prepare("SELECT id, text, by FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL ORDER BY id")?;
@@ -552,7 +567,39 @@ impl Ledger {
             tx.execute("UPDATE operator_messages SET consumed_at = ?2 WHERE id = ?1", params![id, now()])?;
         }
         tx.commit()?;
-        Ok(rows.into_iter().map(|(_, t, b)| (t, b)).collect())
+        Ok(rows)
+    }
+
+    /// Whether operator message `id` was handed to its run yet (None: there is no such message).
+    pub fn operator_message_taken(&self, id: i64) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row("SELECT consumed_at IS NOT NULL FROM operator_messages WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Asks `run`'s supervisor to cancel the agent's running turn (#327: `session/cancel` from the
+    /// console's session view). The supervisor takes it within a second or so; with no turn running
+    /// then, it does nothing.
+    pub fn request_turn_cancel(&self, run: &str, by: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO turn_cancels (run, by, created_at) VALUES (?1, ?2, ?3)", params![run, by, now()])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Takes `run`'s cancel requests: who asked, oldest first, of those made within the last
+    /// `fresh_secs` (older ones are dropped: a supervisor that was away mustn't cancel a later turn).
+    pub fn take_turn_cancels(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<String>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let t = now();
+        let by: Vec<String> = {
+            let mut st =
+                tx.prepare("SELECT by FROM turn_cancels WHERE run = ?1 AND consumed_at IS NULL AND created_at >= ?2 ORDER BY id")?;
+            let rows = st.query_map(params![run, t - fresh_secs], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        tx.execute("UPDATE turn_cancels SET consumed_at = ?2 WHERE run = ?1 AND consumed_at IS NULL", params![run, t])?;
+        tx.commit()?;
+        Ok(by)
     }
 
     // ---- identities and messages (design §3.2) ----
@@ -1539,7 +1586,7 @@ impl Ledger {
     /// Makes a join token for node `name`, valid for `ttl_secs`. Returns the token, shown once.
     pub fn create_node_token(&self, tenant: &TenantId, name: &str, ttl_secs: i64) -> Result<String> {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
+        getrandom::fill(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
         let token = format!("wkt_{}", hex::encode(b));
         let t = now();
         self.conn.execute(
@@ -2053,6 +2100,18 @@ mod tests {
         let got = l.take_operator_messages("run_a").unwrap();
         assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
         assert!(l.take_operator_messages("run_a").unwrap().is_empty());
+        let id = l.add_operator_message("run_a", "third", "owner").unwrap();
+        assert_eq!(l.operator_message_taken(id).unwrap(), Some(false));
+        l.take_operator_messages("run_a").unwrap();
+        assert_eq!(l.operator_message_taken(id).unwrap(), Some(true));
+        assert_eq!(l.operator_message_taken(id + 100).unwrap(), None);
+        // Turn cancels (#327): taken once, for their run only, stale ones dropped.
+        l.request_turn_cancel("run_a", "passkey:phone").unwrap();
+        l.request_turn_cancel("run_b", "passkey:laptop").unwrap();
+        assert_eq!(l.take_turn_cancels("run_a", 30).unwrap(), vec!["passkey:phone".to_string()]);
+        assert!(l.take_turn_cancels("run_a", 30).unwrap().is_empty());
+        l.conn.execute("UPDATE turn_cancels SET created_at = created_at - 60 WHERE run = 'run_b'", []).unwrap();
+        assert!(l.take_turn_cancels("run_b", 30).unwrap().is_empty());
     }
 
     #[test]

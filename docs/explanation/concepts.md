@@ -8,17 +8,49 @@ and the reasons for it, and lists what is [deferred](design.md#22-deferred).
 
 ## The nouns
 
+One word for each thing, used the same way in the CLI's help, the docs and wicket's messages
+(`ci/check-terms.sh` checks the commonest slips).
+
 - A **principal** is anyone who acts: a human, an agent, a program or a node. Each has an identity,
   an authority, and audited, signed actions.
+- An **operator** is a human principal of an installation: someone who runs `wicket` on the control
+  host or signs in to the console, and decides requests within the authority `operators.yaml` gives
+  them ([configuration](../reference/configuration.md#operatorsyaml)).
 - A **workload** is what runs in a box: an **agent**, or a **program**, which is an agent with no
   model that may not ask for more.
+- A **box** is the isolated environment one workload runs in: a container with no network, a
+  read-only root and no secrets ([the box](#the-box-and-the-control-host), [box reference](../reference/box.md)).
+  Say "box", not "sandbox" or "container": **sandbox** names only the gVisor layer under it, and
+  **container** only the runtime object a box is made of.
 - A **harness** is the agent program a box runs and how wicket talks to it: Claude Code or an ACP
   agent (`agent.harness`). The harness decides when its run is done.
-- A **node** is a machine that runs boxes and decides their requests. The control host is a node too.
+- A **node** is a machine that runs boxes and decides their requests ([nodes](../reference/nodes.md)).
+- The **control host** is the machine wicket's state lives on: the node that also runs the control
+  plane. The **control plane** is the role, not the machine: the ledger, the vault, the keys,
+  approvals and the feed ([#197](https://github.com/public/wicket/issues/197) would let it run
+  elsewhere).
+- A **host** is a machine. A **host name** is a name in HTTP: what a zone's `reach`, `forbid` and
+  `inject` match ([manifest](../reference/manifest.md#reach)).
+- A **request** is what a box asks for that its zone doesn't already allow: reach, a child zone, a
+  link, capacity or an update. **Escalation** is the act of asking, not a thing of its own (the
+  zone's `escalation` field says who may). A request is **pending** until it is decided, by a grant
+  or a denial; its id is `r-…` ([grants](#grants), [the 403 a box sees](../reference/protocol.md)).
 - A **grant** is authority one principal gives another, within its own: a resource, a principal, a
   lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
   authority.
-- A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved.
+- A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved
+  ([placement and leases](#placement-and-leases)). Nothing else is a lease.
+- A **run** is one box running one workload, from start to end, with its own id (`run_…`). For a
+  long-lived agent (`agt_…`), each run is one **activation** of it: starting and every wake begin a
+  new one. Its **generation** counts those activations; a stale one is refused
+  ([hibernate and generations](#hibernate-and-generations)).
+- A **session** is always qualified, because the word names four things:
+  - a **harness session**, the harness's own conversation, which a wake resumes;
+  - a **Remote Control session**, that conversation registered with the vendor's apps
+    ([drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md));
+  - a **console session**, an operator signed in to the console with a passkey
+    ([console](../reference/console.md#passkeys));
+  - an **ACP session**, an ACP agent's `session/new` ([ACP agents](../reference/agents.md#acp-agents)).
 
 ## The box and the control host
 
@@ -44,11 +76,11 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
 
 A **zone** is the boundary a box runs in. It is declared in the manifest:
 
-- **reach:** the hosts, methods and paths requests may go to without asking;
+- **reach:** the host names, methods and paths requests may go to without asking;
 - **forbid:** hosts or paths refused outright, with no request and no grant (forbid paths match ignoring
   ASCII case, since many upstreams fold it; request paths with another spelling of a path, such as
   `%64` for `d`, a `;` parameter or a dot segment, are refused before any decision);
-- **`unlisted_hosts`:** what happens to a host the zone doesn't name (`escalate`, or `hide` to make it
+- **`unlisted_hosts`:** what happens to a host name the zone doesn't name (`escalate`, or `hide` to make it
   look like it doesn't exist);
 - **inject:** credentials added to requests for a host, from the vault (only ever over HTTPS: plain HTTP
   to a host with a credential is refused with a 403);
@@ -71,7 +103,7 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
 
 Every request from the box is decided one of three ways: allowed by reach, forbidden, or **needs a
 grant**. A request that needs a grant becomes a pending request. The agent gets a 403 with a request id,
-can wait with `await_grant`, and a human approves or denies it in the console or with `wicket approve`. A
+can wait with `await_grant`, and an operator approves or denies it in the console or with `wicket approve`. A
 grant is bound to the exact request, single-use and expiring by default, and kept in the ledger.
 
 Whatever the zone says, some destinations are **never reachable**: cloud metadata endpoints, `localhost`
@@ -99,8 +131,8 @@ That zone must be within the agent's own (`wicket_core::subset`):
   from the parent's list;
 - `max_children` within the parent's: a child's own `max_children` counts against the parent's.
 
-A zone that isn't within it is refused, with every violation listed. With `ask_human`, it goes to a
-human as exactly that zone, on an R4 card that lists what the child gets (its model route, credential
+A zone that isn't within it is refused, with every violation listed. With `ask_human`, it goes to an
+operator as exactly that zone, on an R4 card that lists what the child gets (its model route, credential
 injections, reach and limits). A different model route or credential is refused outright, with no
 approval path. Globs whose containment can't be proven (a character class under `*`, for example) are
 refused, so the check errs on the side of refusing. A spawned zone is named `<parent zone>.<name>.<parent
@@ -112,7 +144,7 @@ terminal asks before approving (`--yes` skips the question).
 
 ## Grants
 
-A grant answers one pending request, and is kept in the ledger. A human decides with `wicket approve`
+A grant answers one pending request, and is kept in the ledger. An operator decides with `wicket approve`
 or in the console. An ancestor agent may decide a descendant's request with the gateway's `decide`
 tool, but only within its own authority, if its zone has `escalation.grant` (on by default). Either way
 it goes through one decide function:
@@ -134,7 +166,7 @@ it goes through one decide function:
   run's `timeout`, and its node keeps it past the old one. A box nobody renews stops when its
   authority ends.
 
-wicket's own approvals are grants too, and stay with humans: a child zone beyond its parent's
+wicket's own approvals are grants too, and stay with operators: a child zone beyond its parent's
 (`SPAWN`), a link beyond the default policy (`LINK`), a lease (`CAPACITY`), and an agent's build
 (`UPDATE`). A lease is a grant of capacity: see [placement and leases](#placement-and-leases). A zone
 with `escalation: { request: false }` may not ask at all, and anything outside its reach is "never
@@ -145,7 +177,7 @@ allowed".
 - **Agents.** Every box gets an identity from the installation's issuer:
   `spiffe://<trust domain>/t/<tenant>/z/<zone>/a/<agent>`, an EdDSA-signed document whose key wicket
   holds, never the box. Identities last 10 minutes and are re-issued every 5 with a fresh key. Each
-  names who it acts for, back to the human (`acting for: alice (cli, unix-user) → lead → fetcher`). The
+  names who it acts for, back to the operator (`acting for: alice (cli, unix-user) → lead → fetcher`). The
   trust domain is set once per installation (`wicket identity init`).
 - **What identity is for.** Messages between agents go through wicket, which sets and signs the sender.
   Approvals show the requesting agent's verified identity, and the console won't approve for one that
@@ -213,8 +245,8 @@ Boxes have no network, so they reach each other's ports only through **links**, 
 - `link(from, to, port)` wires two boxes the caller controls.
 
 A box's own children can be connected to without `expose`. Anyone else needs the target's `expose` and
-its zone's `accept_from`, or a human. Connecting carries authority, so the target's reach must be within
-the connector's, or a human approves. Every link is recorded and audited. It closes when it is cut
+its zone's `accept_from`, or an operator. Connecting carries authority, so the target's reach must be within
+the connector's, or an operator approves. Every link is recorded and audited. It closes when it is cut
 (`unlink`), when either end or an ancestor is revoked, or when either run ends.
 
 ## Placement and leases
@@ -225,7 +257,7 @@ the connector's, or a human approves. Every link is recorded and audited. It clo
   and each paid create is confirmed.
 - **A lease**, a grant of capacity, is how an agent gets a machine without holding a cloud credential. The agent asks with
   `request_capacity`. The ask becomes a pending lease with its worst-case cost reserved against
-  `placement.yaml`'s budget, and only a human approves it. The approval is bound to that lease. The
+  `placement.yaml`'s budget, and only an operator approves it. The approval is bound to that lease. The
   agent then places children on it with `spawn` and `placement: {"lease": "l-…"}`.
 - **The reconciler** (`wicket reconcile`, or `--every 30s` as a service) makes the world match the
   ledger. It ends runs whose process died, ends leases at their end or when their holder ends, destroys
@@ -235,17 +267,17 @@ the connector's, or a human approves. Every link is recorded and audited. It clo
 ## Hibernate and generations
 
 Every Claude Code agent wicket launches on the control host is **long-lived**: an id (`agt_…`), its own
-session, and a **generation** number. Each run is one activation of it.
+harness session, and a **generation** number. Each run is one activation of it.
 
 - **Active:** the box runs, during a turn and between turns. wicket never ends, pauses or hibernates
   it on a turn boundary (#249): the agent's harness decides, and the run ends when it exits, at its
-  timeout, or when its authority ends. The agent ends its session with wicket's `finish` tool.
+  timeout, or when its authority ends. The agent ends its harness session with wicket's `finish` tool.
 - **Active → Hibernated:** when the agent asks (`hibernate` tool) or on `wicket hibernate`, at the end
   of its turn, if the box is at a quiet point (nothing else running). The box stops, and its whole writable state is bundled into
   wicket's object store: the workspace, `$HOME` and the agent's config, `/tmp`, and `persist: durable`
   volumes.
-- **Wake:** `wicket wake`, `wicket say`, or a message from another agent rebuilds the box with a new
-  identity, restores the state, and resumes the session at the same path.
+- **Wake:** `wicket wake`, opening its session (`wicket session`, or a prompt in the console), or a message from another agent rebuilds the box with a new
+  identity, restores the state, and resumes the harness session at the same path.
 
 A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly one wins.
 The proxies, wicket's DNS and the state push all refuse a stale generation, so a box woken twice can't

@@ -43,6 +43,7 @@ mod roots;
 mod run;
 mod s3;
 mod serve;
+mod session;
 mod settings;
 mod snapstore;
 mod spawn;
@@ -81,7 +82,7 @@ use wicket_proxy::vault::Vault;
 use wicket_store::Ledger;
 
 #[derive(Parser)]
-#[command(name = "wicket", version, about = "Run agents in least-privilege sandboxes (proof of concept)")]
+#[command(name = "wicket", version, about = "Run agents in least-privilege boxes (proof of concept)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -125,10 +126,23 @@ enum Cmd {
         #[arg(long, hide = true)]
         adopt: Option<String>,
     },
-    /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
-    /// turn; the session stays open until the agent finishes or exits. A long-lived agent can be
-    /// named by its id or any of its runs; a hibernated one is woken.
-    Say { run: String, text: Vec<String> },
+    /// Open a running agent's session in this terminal, as its operator: what it says and does, live.
+    /// An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's
+    /// messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop`
+    /// cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on.
+    /// With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named
+    /// by its id or any of its runs; a hibernated one is woken.
+    Session {
+        run: String,
+        /// A prompt to send; then only its turn shows.
+        text: Vec<String>,
+        /// With TEXT: queue it and exit at once.
+        #[arg(long)]
+        no_wait: bool,
+        /// With TEXT: stop following its turn after this many seconds (it stays queued).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
     /// and nothing but the agent runs in its box. What else runs is stopped after the zone's
     /// limits.exit_grace.
@@ -138,8 +152,8 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         wait: u64,
     },
-    /// Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the
-    /// woken activation in the foreground, like `wicket run`. Text, if given, is the operator's
+    /// Wake a hibernated agent: rebuild its box, restore its state and resume its harness session.
+    /// Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's
     /// message to it.
     Wake {
         agent: String,
@@ -166,7 +180,7 @@ enum Cmd {
     #[command(hide = true)]
     Attach { run: String },
     /// Run an agent command line that another program launches, inside a wicket box: the harness's
-    /// wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the
+    /// wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
     Wrap {
         #[arg(long)]
@@ -178,7 +192,8 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
-    /// List pending escalation requests.
+    /// List pending requests: what boxes asked for that their zones don't allow, waiting for a grant
+    /// or a denial.
     Pending,
     /// Approve a pending request. The grant is never wider than the request.
     Approve {
@@ -351,8 +366,8 @@ enum Cmd {
         #[arg(long)]
         every: Option<String>,
     },
-    /// Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the ask with
-    /// `wicket approve`/`deny` (see `wicket pending`).
+    /// Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the
+    /// request with `wicket approve`/`deny` (see `wicket pending`).
     Lease {
         #[command(subcommand)]
         cmd: LeaseCmd,
@@ -376,7 +391,7 @@ enum Cmd {
         #[arg(long)]
         image: Option<String>,
     },
-    /// Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node
+    /// Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node
     /// key and a name-constrained node CA; listing, revoking, renewing the CA.
     Node {
         #[command(subcommand)]
@@ -395,7 +410,7 @@ enum Cmd {
     },
     /// Update this installation to another wicket build (#162): blue/green, with a health gate and
     /// automatic rollback, on the control host and then its nodes. Only artifacts signed by a
-    /// release key this installation trusts, or whose sha256 a human approved (an agent's
+    /// release key this installation trusts, or whose sha256 an operator approved (an agent's
     /// `request_update`), are accepted. See docs/explanation/updates.md.
     #[command(name = "self")]
     Itself {
@@ -606,7 +621,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Run { .. }
         | Cmd::Wrap { .. }
         | Cmd::Attach { .. }
-        | Cmd::Say { .. }
+        | Cmd::Session { .. }
         | Cmd::Hibernate { .. }
         | Cmd::Wake { .. }
         | Cmd::Agents { .. }) => cmd::run::dispatch(c).await,

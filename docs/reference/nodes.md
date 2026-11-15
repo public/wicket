@@ -15,7 +15,7 @@ box keeps working while the control host is unreachable, for exactly as long as 
 #153; below), and the MCP gateway's tools too (#164): it answers them from the box's token, starts
 narrower children itself and carries links between its own boxes. The ledger and the keys that matter
 stay on the control host, which issues authority (tokens, grants, leases, secrets, identities), takes
-human approvals, and reconciles counts and audit afterwards; it isn't asked during a request. A
+operators' approvals, and reconciles counts and audit afterwards; it isn't asked during a request. A
 `--node` target must be enrolled: there is no other way to run a box.
 
 ## The control host is a node too
@@ -189,7 +189,7 @@ wicket node revoke n1
   more.
 - **Decisions at the edge** (#164; protocol 5, the list of what a node still asks the control host and why:
   [design §9.2.1](../explanation/design.md)). The node answers `whoami`, `request_access`, `await_grant` and
-  `pending_requests` from the box's token, connected or not. Cut off, what needs a human
+  `pending_requests` from the box's token, connected or not. Cut off, what needs an operator
   (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the box's
   zone) is queued on the node (`edge.json`, `q-…` ids, like #153's asks) and made when the control host
   is back; `await_grant` on a `q-…` id then follows the request it became.
@@ -215,8 +215,8 @@ wicket node revoke n1
   |---|---|---|
   | fresh (a statement within the TTL, 30 s) | the box's token and its live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
   | offline (no live statement) | the same, each until its own expiry | queued on the node (`asks.json`; a node-local id `q-…` in the 403) and raised when the control host is back, saying how old it is; no approvals on the node alone |
-  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 403, retry |
-  | closed (no verified state, or the feed key's certificate expired) | nothing | 403 |
+  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 503 with `Retry-After` (a model call is held up to 3 s first) |
+  | closed (no verified state, or the feed key's certificate expired) | nothing | 503 with `Retry-After` |
 
   Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
   counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
@@ -234,7 +234,7 @@ wicket node revoke n1
   and a credential swap's host are terminated on the node, which injects or swaps the credential itself, its
   secret fetched on first use (#152, #257). The node forwards a swapped host only for a box that a control host
   at protocol 9 started. While disconnected, they
-  fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
+  fail with a 503 and `Retry-After` (temporary; clients retry). The LLM proxy and the MCP gateway are reached the same way, through tunnels.
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
   recomputes each node's chain. The control host, not the node, decides where a shipped record is filed. It
@@ -343,13 +343,13 @@ region, duration, an hourly price cap, a reason). Capacity is a **lease**, never
 
 1. The ask becomes a pending lease in the ledger with its worst case reserved (every started hour at the
    agent's own cap), atomically against `max_hourly_usd`/`max_total_usd` in `placement.yaml`
-   (`examples/placement/placement.yaml`; without it the tool is off). Over budget is refused before a human sees it.
+   (`examples/placement/placement.yaml`; without it the tool is off). Over budget is refused before an operator sees it.
    Its money is also recorded, in the same transaction, as two quota grants bound to the asking run (#256):
    `QUOTA wicket.internal /quota/money.hourly/<lease>` (the hourly cap) and `/quota/money.reserved/<lease>` (the
    worst case), micro-USD, made by `wicket:lease-budget`, lasting the lease's duration plus an hour (at most 24h,
    renewable), and revoked when the lease ends. `wicket grant list` shows them; they decide nothing and never go to a
    node. The check stays the budget over the live leases' reservations.
-2. A human decides it like any escalation (`wicket pending`, `wicket approve`/`deny`, or the console). The
+2. An operator decides it like any request (`wicket pending`, `wicket approve`/`deny`, or the console). The
    approval is bound to that lease: the placer may spend only on its node, and only up to its reservation.
 3. The reconciler acquires the node (a static host, or a fresh Vultr node with its host key pinned before it
    boots), enrols it and runs `wicket node install`. The agent waits with `request_capacity {lease}`, then

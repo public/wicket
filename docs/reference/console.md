@@ -39,7 +39,7 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   is you, the passkey-signed-in operator (`passkey:<name>, via console`, with your operator identity
   `spiffe://<domain>/t/<tenant>/op/passkey/<name>` as its `sub`), not the host's unix user. What you may
   approve is your authority in [`operators.yaml`](configuration.md#operatorsyaml) (anything by default);
-- **send a follow-up** to a running agent (`wicket say`);
+- **open a run's session** (an ACP agent's: the row's *session* link), below;
 - **revoke an identity** with a reason (`wicket identity revoke`);
 - **answer `request_access` asks**, including prefix asks: the passkey signs that the grant covers every path
   under the prefix, and, as for every approval, the agent's verified identity. A prefix covers whole path
@@ -47,9 +47,94 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   and every grant covers nothing riskier than the request you were shown: approving an R2 prefix doesn't
   allow the R4 operations (workflow edits, merges, access changes) under it. An agent whose identity
   doesn't verify (or was revoked since you were shown the ask) can be denied, not approved.
+- **register a device for notifications, and show the request on one** (`push_subscribe`,
+  `push_details`): see [notifications](#notifications). Removing a device and hiding the request
+  need only the session.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
+
+## Sessions
+
+A running ACP agent's session, live, on its own page (#327): `/session?run=<run>`, opened from the
+run's *session* link in **Runs** (shown for running ACP runs, whose supervisor keeps
+`acp-client.jsonl`). How-to: [work with a running agent in the console](../how-to/work-with-a-running-agent-in-the-console.md).
+
+**What the page shows,** as it streams:
+- the agent's messages and thoughts (thoughts folded), as plain text: no markdown or HTML is
+  rendered, so nothing the agent writes becomes page markup;
+- its tool calls with their arguments and results (text and diffs), and how wicket's policy answered
+  each of the agent's own permission requests ("allowed by wicket's policy");
+- its plan, with each entry's status;
+- other principals' prompts (the task, other operators, wicket's notices), each with who sent it;
+- **wicket's escalations** for the run, inline: what was asked (method, host, path, risk, reason)
+  with **Approve once (passkey)** and **Deny (passkey)**. A tap asks `/api/decide/begin` for the
+  decision, the confirmation at the top states it (as on the front page), and its own button has the
+  passkey sign it through `/api/decide/finish`: the same signed decide action as the front page's
+  cards (#256), approving once for 10 minutes. An escalation decided elsewhere (the front page,
+  another device) updates in place.
+
+**Prompts** typed on the page are ACP `session/prompt`s on the endpoint: each becomes an operator
+message from your principal (`passkey:<name>`), which the supervisor hands to the agent as its next
+turn (queued if a turn is running). **Stop** sends `session/cancel`: the supervisor cancels the
+agent's running turn within a second or so (ACP's own `session/cancel`), the turn ends with
+`cancelled`, and prompts queued behind it stay queued. With no turn running, Stop does nothing (and
+says so in the audit).
+
+**Opening** takes your passkey: a tap on *Open session* shows the `open_session` action (run,
+agent, your principal), and signing it gets a single-use ticket for that run and this console
+session, valid 60 s. The page then opens the WebSocket `GET /api/runs/<run>/acp` (ACP v1, wicket as
+the agent, the session id being the run id) with the `acp.v1` subprotocol and the ticket as a
+`wicket.ticket.<hex>` subprotocol, never in the URL. The upgrade needs the session cookie, the
+console's own `Origin` and the ticket; the cookie alone opens nothing. A reload or a reconnect signs
+a new open; the session replays from the start of the kept transcript. The socket closes when your
+console session ends (sign-out, idle, expiry, a revoked passkey) or the run ends.
+
+**What the endpoint filters** (`crates/wicket-cli/src/serve/session.rs` is the reference): the
+agent's `_meta` is dropped everywhere and only ACP v1's `session/update` kinds pass; the agent's
+own requests are never forwarded; tool-call ids starting `wicket:` are reserved for wicket's
+escalations, so nothing the agent sends can raise one. **An ACP answer to an escalation prompt
+decides nothing**: only the signed decide action does; the endpoint records what the client said
+next to the ledger's status (`session.escalation_answered`).
+
+**Limits:** prompts of up to 16 KiB of text (no images or resources yet), 16 waiting per socket,
+messages from the browser up to 256 KiB, one cancel a second per socket. Session sockets are capped
+at **4 per console session** and **32 in all** (upgraded sockets leave `--max-connections`): over a
+cap the open is refused before a ticket is issued, and an upgrade gets 429 without spending its
+ticket, which still works within its 60 s once a socket closes.
+
+**In a terminal,** `wicket session <run>` opens the same session at the host's shell, through the same
+bridge (`crates/wicket-cli/src/session.rs`): it runs as the operator wicketd names, with no passkey
+(as `wicket approve` does), shows what the page shows as text, and sends each line typed as a prompt;
+`/stop` is Stop. Escalations are decided with `wicket approve` or `wicket deny`, or here. It also
+opens a Claude Code agent's session (stream-json, which has no ACP stream): its messages, tool calls
+and turn ends from the transcript. Its records carry `via: terminal`. `wicket say` and the console's
+**Follow-up** box are gone (#198): prompts are sent in a session.
+
+**Audit:** `session.opened` (with the signed assertion), `session.attached`, `session.prompt` (by
+principal, with the operator message it queued and the text's length and sha256), `session.cancel`
+and the supervisor's `run.turn_cancel` (whether a turn was running), `session.escalation_answered`,
+and `session.closed`; decisions are `decision` records, as from anywhere.
+
+**The view** is `web/session/` in the repository: a Vue fork of
+[acp-ui](https://github.com/formulahendry/acp-ui) (MIT; `web/session/FORK.md` says what was kept and
+changed), about 33 KB gzipped. CI builds it from its committed lockfile (`ci/session-view.sh`:
+`npm ci --ignore-scripts`, a licence check, then the build twice from fresh installs, which must give
+the same bytes; then a UI check under jsdom and the view's client against the real endpoint) and
+the binary embeds it (`crates/wicket-cli/build.rs`, from the directory in
+`WICKET_SESSION_VIEW`), served as `/static/session.<hash>.js` and `.css` with Subresource Integrity
+under the console's CSP. A build without `WICKET_SESSION_VIEW` (a plain `cargo build`) embeds a
+placeholder page saying the view wasn't built, and `wicket serve` says so at start-up. To build one
+with the view:
+
+```sh
+ci/session-view.sh                                  # needs Node 20.19+ or 22.12+ and npm; prints the dist path
+WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
+```
+
+Not yet: answering the agent's own permission requests from the page (wicket's policy answers
+them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
+next to the session (#327's later slices).
 
 ## Authority views
 
@@ -119,6 +204,79 @@ The **Manifests** section lists the manifests runs can be started from (#172). T
 Runs keep the manifest they started with: each run records its manifest's text at start, and the
 console's Start signs the manifest's sha256.
 
+## Notifications
+
+The console can notify your devices when a request is waiting for you (Web Push: RFC 8030, with
+RFC 8291 message encryption and RFC 8292 VAPID). This covers egress asks and wicket's own capacity,
+update, spawn and link asks. It works in desktop browsers and in the console added to an iPhone or
+iPad home screen (iOS 16.4 or later; Safari tabs can't get pushes). [Get notified of
+approvals](../how-to/get-notified-of-approvals.md) sets it up.
+
+- **Registering a device is a signed action**, `push_subscribe`, like approving or starting a run:
+  a stolen session cookie alone can't add a device that receives notifications. The **Enable
+  notifications** button in the *Notifications* section asks for the browser's permission (only on
+  that tap, as iOS requires), registers the service worker at `/sw.js` with scope `/`, subscribes
+  with the console's VAPID public key, and asks your passkey to sign the registration. The
+  confirmation, and the JSON the passkey signs, name the device by its id (the first 16 hex digits
+  of the endpoint's sha256), its label and push service and whether it shows details, with the
+  sha256 of its endpoint and of its keys (never the endpoint or keys themselves). The endpoint and
+  keys are checked at `begin`, before anything is signed.
+- **Showing the request on a device is signed too**, `push_details` (ticking *Show the agent and
+  what it asks for*), as it widens what the device's lock screen shows.
+- **What a session alone may do**: list devices (`GET /api/push`), remove one
+  (`POST /api/push/remove`) and turn a device's details off (`POST /api/push/details` with
+  `"details": false`). These only narrow what a device receives. `POST /api/push/subscribe`, and
+  `POST /api/push/details` with `"details": true`, are refused with 403 and audited as
+  `operator.push_refused` (with the passkey the session belongs to and the reason).
+- **Whose devices.** Each device belongs to the passkey that was signed in when it was registered
+  (any of the operator's passkeys may sign). An operator sees and changes only their own devices,
+  and a passkey that is no longer enrolled gets no pushes.
+- **Audit.** Every change is audited with the device's id, never its endpoint:
+  `operator.push_subscribed` and `operator.push_details` (details on) with the passkey and the signed
+  record, which `wicket audit --verify` re-verifies offline; `operator.push_details` (details off)
+  and `operator.push_removed` with the session's passkey; `operator.push_refused` for an unsigned
+  attempt to widen.
+- **Where pushes go.** A subscription's endpoint must be an `https://` URL on the default port with
+  no user info, on a known push service: `fcm.googleapis.com` (Chrome, Edge on Android),
+  `*.push.apple.com` (Safari, iOS), `updates.push.services.mozilla.com` (Firefox) or
+  `*.notify.windows.com` (Edge on Windows). Any other URL is refused when the device subscribes, and
+  checked again before each push. The console's client is reqwest (rustls), HTTPS only, and follows
+  no redirects. The console host needs outbound HTTPS to these hosts.
+- **When.** The console checks the ledger every 3 seconds. A new pending request is owed to every
+  subscribed device. A device gets at most one push every 30 seconds, and requests that arrive in
+  between are coalesced into its next push. Nothing is sent if everything was decided before the
+  push was due, and requests already waiting when the console starts are not announced. Each push
+  is `aes128gcm`-encrypted for that device, with `TTL: 3600`, `Urgency: high` and
+  `Topic: wicket-pending`, so a push service holding undelivered pushes for a device keeps only the
+  latest. The device shows one notification at a time, replaced by the next.
+- **What it says.** By default only "N requests waiting" and the id of the newest request, because
+  lock screens show notifications. A device opted in with *Show the agent and what it asks for*
+  also gets that request's agent and method, host and path (`lead asks GET api.example.com/x`,
+  cleaned of control and bidi characters and cut to 200 characters). Reasons, attributions and
+  identities are never sent. Push services see only ciphertext, its size and when it was sent.
+- **Tapping a notification** focuses the console if it is open and marks that request's card, or
+  opens `/#pending/<id>`. Approving still needs a sign-in and a passkey signature, as always.
+- **A replaced subscription.** A browser may replace a device's subscription (Chrome and Firefox
+  fire `pushsubscriptionchange`; Safari doesn't). The service worker can't register the new one: a
+  registration is signed, and only the page can ask for the passkey. So it subscribes again with the
+  same VAPID key if the browser hasn't already, tells any open console, and shows one notification
+  ("Notifications on this device need renewing"); tapping it opens `/#notifications`. Whenever the
+  console is open and this browser holds a subscription it doesn't know, *Notifications* says so and
+  offers **Re-register this device**, a signed `push_subscribe`. Until then the device gets nothing;
+  the old subscription is dropped when its push service answers 404 or 410.
+- **Gone devices.** A push service that answers 404 or 410 has dropped the subscription. The
+  console removes it and audits `operator.push_removed` with `"by": "push service"`. Other failures
+  are logged with the device id and push service host, never the endpoint.
+- **State.** The VAPID key pair is made once, at the first start, in `$WICKET_HOME/console/vapid.key`
+  (0600, in a 0700 directory). Its private half is never logged or shown, and replacing it means
+  every device has to subscribe again. Subscriptions are in `$WICKET_HOME/console/push-subscriptions.json`
+  (0600): endpoint, `p256dh` and `auth` keys, label, setting, when made, last delivery. At most 10
+  devices per passkey and 100 in all.
+- **CSP.** Unchanged. The service worker is a same-origin script, allowed by `script-src 'self'`
+  (with no `worker-src`, workers fall back to it). It is served at `/sw.js` with `Cache-Control:
+  no-cache` so a new build reaches devices. It fetches and caches nothing, and shows the payload as
+  notification text only.
+
 ## On the internet
 
 The console is built to be reachable directly from the internet, with no VPN or access proxy in front
@@ -134,7 +292,8 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (submitting the domain to the
   preload list is your step). ACME keeps its account and certificate in `$WICKET_HOME/acme` (0700/0600) and
   renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
-- **Before sign-in** a client can fetch only the page, its static files (script, stylesheet, manifest, icons)
+- **Before sign-in** a client can fetch only the page and the session page (`/session`, the same
+  for every run, with no data in it), their static files (scripts, stylesheets, service worker, manifest, icons)
   and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
   no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
@@ -148,7 +307,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
   host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately
-  passkey-signed, so a stolen cookie alone approves nothing.
+  passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
@@ -156,7 +315,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
   handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB
-  bodies. A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
+  bodies. Session WebSockets have their own caps, 4 per console session and 32 in all ([sessions](#sessions)). A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
   checks it never panics and never reaches a signed-in handler.
 - **Installable:** the console has a web app manifest and icons, so it can be added to a phone's home screen.
 - **Privilege separation** is #12: the console is meant to run as the unprivileged wicket system user. Nothing

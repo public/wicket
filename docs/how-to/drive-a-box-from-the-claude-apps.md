@@ -2,16 +2,16 @@
 
 Three ways to chat with an agent in a wicket box from the Claude apps (desktop, web, phone):
 
-- **A remote session** (`agent.remote`, #169): wicket starts the box, and the harness in it
+- **A Remote Control session** (`agent.remote`, #169): wicket starts the box, and the harness in it
   registers its own session with the vendor. The task is optional, and wicket can't give it one: the
   session starts working when its owner sends the first message from the app.
-- **A driven remote session** (`agent.remote.drive`, #285): wicket drives the agent as in any box
+- **A driven Remote Control session** (`agent.remote.drive`, #285): wicket drives the agent as in any box
   (the manifest's task is its first turn), and its session is also in the app, where you watch it
   and can send it messages.
 - **A wrapped session** (`wicket wrap`): Claude Code's Remote Control on your host launches each
   session process, and wicket puts it in a box.
 
-## A remote session
+## A Remote Control session
 
 1. Link the account login by reference, bound to the provider's host (on an installed host, with
    `sudo`):
@@ -40,7 +40,7 @@ Three ways to chat with an agent in a wicket box from the Claude apps (desktop, 
    wicket run examples/remote-control-box.yaml
    ```
 
-   When the session is up, wicket prints `[wicket] remote session: <url>` and records it as
+   When the session is up, wicket prints `[wicket] Remote Control session: <url>` and records it as
    `run.remote_session`; the session shows up in the Claude apps, and the console links it on the
    run's card.
 4. Decide what the zone doesn't allow as usual (`wicket pending`, or the console). Deny what a
@@ -52,7 +52,7 @@ Harness adapters that have no remote mode refuse the manifest, saying so.
 
 What it protects, and how:
 
-- **The account login never enters the box.** A remote session needs the owner's full login (for
+- **The account login never enters the box.** A Remote Control session needs the owner's full login (for
   Claude, the claude.ai OAuth login: it can list and drive the account's sessions), not an inference
   token. The box gets a placeholder login (a credentials file whose access token is a placeholder,
   expiring far ahead, and a refresh token that refreshes nothing). The egress proxy swaps the
@@ -68,15 +68,15 @@ What it protects, and how:
   events, reading its own metadata back, model calls, the profile, validating the login's scopes),
   forbids the account's connectors (`mcp-proxy.anthropic.com`, `/v1/mcp_servers` and everything
   under it, a session's remote MCP at `/v2/ccr-sessions/<id>/mcp`) and token refresh outright, and
-  leaves everything else (other sessions, triggers, memory) to a human's decision, as in any zone:
-  deny those. It also forbids, so that nothing waits for a human at each start, the background
+  leaves everything else (other sessions, triggers, memory) to an operator's decision, as in any zone:
+  deny those. It also forbids, so that nothing waits for an operator at each start, the background
   reads a box has no use for: the consumer-terms notice (`/api/claude_code_grove`), the
   organization's fast mode (`/api/claude_code_penguin_mode`) and guest-pass referral eligibility.
   Claude Code carries on without each. A forbid glob ending `/**` doesn't match the bare path
   before it: forbid both, as the example does for `/v1/mcp_servers`.
 - **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the
   workspace is trusted, Remote Control's one-time prompt is answered, wicket's gateway is the only MCP
-  server, and the sandbox notice is the user memory.
+  server, and the box notice is the user memory.
 - **Permission mode.** `agent.remote.permission_mode` is passed to `claude remote-control
   --permission-mode` (`acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`).
   The default, `default`, asks in the app before each action, so a box nobody is watching stalls on
@@ -89,7 +89,7 @@ What it protects, and how:
   ```
 
   The mode only decides whether Claude Code asks you first. wicket's proxies decide what the box can
-  reach whatever the mode: egress outside the zone's reach is still a decision for a human, and the
+  reach whatever the mode: egress outside the zone's reach is still a decision for an operator, and the
   login is still only a placeholder in the box. An unknown mode is refused, and a harness with no
   permission modes refuses any but `default`.
 - **Nodes.** It runs on any node at protocol 10 or later. The node swaps the login in itself
@@ -101,31 +101,31 @@ What it protects, and how:
 - **It waits for you.** `claude remote-control` takes its messages from the app only, so the
   manifest's `task` isn't delivered (wicket has no channel into the session): the box idles until
   its owner sends the first message. For a box that starts on its task by itself, use a driven
-  remote session.
+  Remote Control session.
 
-## A driven remote session
+## A driven Remote Control session
 
 `agent.remote` with `drive: true` is a driven box whose Claude Code session is also a Remote
-Control session. wicket gives it the manifest's task, `wicket say` follow-ups, peers' messages and
+Control session. wicket gives it the manifest's task, session prompts (`wicket session`), peers' messages and
 wakes as turns, as in any driven box; in the app you see the same conversation as it happens, and a
 message you send there is the agent's next turn.
 
-1. Link the login as for a remote session (step 1 above).
+1. Link the login as for a Remote Control session (step 1 above).
 2. Start from `examples/remote-driven-box.yaml`: it has a `task`, `agent.remote: { name: ...,
    drive: true }`, and a zone whose reach is what a driven session calls.
-3. `wicket run examples/remote-driven-box.yaml`. wicket prints `[wicket] remote session: <url>` and
+3. `wicket run examples/remote-driven-box.yaml`. wicket prints `[wicket] Remote Control session: <url>` and
    records it as `run.remote_session` once Remote Control is on; if it can't start (no claude.ai
    subscription, a zone that refuses its calls), wicket prints why, records
    `run.remote_session_failed`, and the agent carries on, driven only.
 
-How it works, and what differs from a remote session:
+How it works, and what differs from a Remote Control session:
 
 - **Claude Code** runs as in the driven mode (`claude -p --input-format stream-json`). `claude -p`
   takes no Remote Control flag (`--remote-control` starts an interactive session only, and
   `claude remote-control` takes its messages from the app only); instead its stdin host can turn
   Remote Control on with a `remote_control` control request, which wicket writes before the task.
   Its answer has the session's address.
-- **The login** is a placeholder, as for a remote session, and Remote Control runs only against
+- **The login** is a placeholder, as for a Remote Control session, and Remote Control runs only against
   `api.anthropic.com` with a claude.ai login: so the model calls go there through the egress proxy
   (with `zone.llm`'s budget and accounting), not to wicket's model proxy with an inference token.
 - **Permission mode.** `agent.remote.permission_mode` defaults to `bypassPermissions`, as in any
