@@ -276,6 +276,14 @@ impl Ledger {
         Ok(())
     }
 
+    /// Sets `run`'s activity back to `to` if it is still `from`: the end of a wait, unless its
+    /// supervisor has said something newer meanwhile.
+    pub fn restore_run_activity(&self, run: &str, from: &str, to: Option<&str>) -> Result<()> {
+        self.conn
+            .execute("UPDATE runs SET activity = ?3, activity_at = ?4 WHERE id = ?1 AND activity = ?2", params![run, from, to, now()])?;
+        Ok(())
+    }
+
     /// What `run` is doing, if its supervisor or gateway said.
     pub fn run_activity(&self, run: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row("SELECT activity FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?.flatten())
@@ -404,6 +412,11 @@ mod tests {
             l.set_run_activity("run_1", Some(a)).unwrap();
             assert_eq!(l.presence(&t.0, p).unwrap(), a);
         }
+        l.restore_run_activity("run_1", "waiting", Some("idle")).unwrap();
+        assert_eq!(l.presence(&t.0, p).unwrap(), "idle", "the wait is over");
+        l.set_run_activity("run_1", Some("busy")).unwrap();
+        l.restore_run_activity("run_1", "waiting", Some("idle")).unwrap();
+        assert_eq!(l.presence(&t.0, p).unwrap(), "busy", "newer news wins");
         l.run_ended(&RunId("run_1".into()), "succeeded", "{}").unwrap();
         assert_eq!(l.presence(&t.0, p).unwrap(), "offline");
         l.run_started(&t, &RunId("run_2".into()), "z", "peer").unwrap();

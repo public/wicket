@@ -1376,7 +1376,10 @@ mod tests {
         let p = v["principals"].as_array().unwrap().iter().find(|p| p["relation"] == "parent").cloned().expect("its parent");
         assert_eq!((p["id"].as_str(), p["state"].as_str()), (Some(id_of(&lead).as_str()), Some("waiting")));
         waiting.await.unwrap();
-        assert_eq!(w.ledger.lock().unwrap().presence("t0", &id_of(&lead)).unwrap(), "busy", "back in its turn");
+        assert_eq!(w.ledger.lock().unwrap().presence("t0", &id_of(&lead)).unwrap(), "running", "as it was before its wait");
+        w.ledger.lock().unwrap().set_run_activity("run_lead", Some("idle")).unwrap();
+        let (_, _) = tool(&lead, "await_message", json!({ "timeout_seconds": 1 })).await;
+        assert_eq!(w.ledger.lock().unwrap().presence("t0", &id_of(&lead)).unwrap(), "idle");
     }
 
     /// #252: every message carries a reply address and gets a receipt: delivered, then read; held

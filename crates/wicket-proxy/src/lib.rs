@@ -335,23 +335,26 @@ impl From<&str> for SendError {
     }
 }
 
-/// While a run waits (`await_message`, `await_grant`), its presence is `waiting`; then `busy` again:
-/// a tool call is made in a turn (#252).
-pub(crate) struct Waiting<'a>(&'a RunCtx);
+/// While a run waits (`await_message`, `await_grant`), its presence is `waiting` (#252); then what
+/// it was, unless its supervisor has said something newer meanwhile (a node's push stream waits
+/// between turns, not in one).
+pub(crate) struct Waiting<'a>(&'a RunCtx, Option<String>);
 
 impl<'a> Waiting<'a> {
     pub(crate) fn start(ctx: &'a RunCtx) -> Waiting<'a> {
-        if let Ok(l) = ctx.ledger.lock() {
+        let before = ctx.ledger.lock().ok().and_then(|l| {
+            let before = l.run_activity(&ctx.run.0).ok().flatten();
             let _ = l.set_run_activity(&ctx.run.0, Some("waiting"));
-        }
-        Waiting(ctx)
+            before
+        });
+        Waiting(ctx, before.filter(|b| b != "waiting"))
     }
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         if let Ok(l) = self.0.ledger.lock() {
-            let _ = l.set_run_activity(&self.0.run.0, Some("busy"));
+            let _ = l.restore_run_activity(&self.0.run.0, "waiting", self.1.as_deref());
         }
     }
 }
