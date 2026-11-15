@@ -62,9 +62,15 @@ What it protects, and how:
 - **Reach is the authority.** Everything the zone reaches on the provider's host is reached with the
   owner's login, so the example names only what a session needs (registering, reconnecting and
   deregistering its environment, its work and worker channel, creating its session and posting its
-  events, model calls, the profile, validating the login's scopes), forbids the account's connectors
-  (`mcp-proxy.anthropic.com`, `/v1/mcp_servers`) and token refresh outright, and leaves everything
-  else (other sessions, triggers, memory) to a human's decision, as in any zone: deny those.
+  events, reading its own metadata back, model calls, the profile, validating the login's scopes),
+  forbids the account's connectors (`mcp-proxy.anthropic.com`, `/v1/mcp_servers` and everything
+  under it, a session's remote MCP at `/v2/ccr-sessions/<id>/mcp`) and token refresh outright, and
+  leaves everything else (other sessions, triggers, memory) to a human's decision, as in any zone:
+  deny those. It also forbids, so that nothing waits for a human at each start, the background
+  reads a box has no use for: the consumer-terms notice (`/api/claude_code_grove`), the
+  organization's fast mode (`/api/claude_code_penguin_mode`) and guest-pass referral eligibility.
+  Claude Code carries on without each. A forbid glob ending `/**` doesn't match the bare path
+  before it: forbid both, as the example does for `/v1/mcp_servers`.
 - **Inside the box** Claude Code is set up so nothing waits on a terminal that isn't there: the
   workspace is trusted, Remote Control's one-time prompt is answered, wicket's gateway is the only MCP
   server, and the sandbox notice is the user memory.
