@@ -182,6 +182,20 @@ jobs:
         env:
           BASE: ${{ github.base_ref || 'main' }}
 
+  # #321: TLC on the TLA+ models under verification/tla/, at the bounds their .cfg files state
+  # (a few minutes), when they or the code they model change. A pinned, checksum-verified JRE.
+  tla:
+    name: TLA+ models (TLC)
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/tla.sh
+
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
   # the crate's tests, whenever ci/affected.py selects it. This runs a few hundred more, a different
   # block each night, and files an issue for each failing seed with its replay command.

@@ -63,7 +63,7 @@ else
   crates=all suites=all doc_crates=all
 fi
 [ -n "$only_suites" ] && suites=$only_suites
-all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
+all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update tla"
 [ "$suites" = all ] && suites=$all_suites
 has() { [[ " $suites " == *" $1 "* ]]; }
 
@@ -99,6 +99,9 @@ fi
 export WICKET=${WICKET:-target/debug/wicket}
 if has policy && [ "$rust" = 1 ]; then
   hstep "SymCC policy diffs" ci/policy-diff.sh "$base"
+fi
+if has tla; then
+  hstep "TLA+ models (TLC)" ci/tla.sh
 fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()
