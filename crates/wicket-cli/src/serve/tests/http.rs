@@ -75,6 +75,10 @@ const ROUTES: &[&str] = &[
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
     "/api/explain/1",
+    "/api/push",
+    "/api/push/subscribe",
+    "/api/push/remove",
+    "/api/push/details",
     "/api",
     "/admin",
     "/.env",
@@ -180,7 +184,8 @@ async fn every_response_carries_the_security_headers() {
     let mut t = setup("headers");
     let sid = t.sid.clone().unwrap();
     let cookie = format!("__Host-wicket_sid={sid}");
-    let js = ASSETS.files.keys().find(|k| k.ends_with(".js")).unwrap().clone();
+    // The hashed console.js (not the service worker, which isn't immutable).
+    let js = ASSETS.files.keys().find(|k| k.ends_with(".js") && *k != "/sw.js").unwrap().clone();
     for https in [false, true] {
         t.state.hsts = https;
         type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);

@@ -34,6 +34,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Export audit](how-to/export-audit.md)
 - [Inspect a run's authority in the console](how-to/inspect-authority-in-the-console.md), and explain a decision
 - [Edit a manifest in the console](how-to/edit-a-manifest-in-the-console.md), with its authority diff
+- [Get notified of approvals](how-to/get-notified-of-approvals.md) on your phone or desktop (Web Push)
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
 - [Update from CI-signed builds](how-to/update-from-ci.md), and follow main

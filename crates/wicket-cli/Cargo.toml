@@ -63,10 +63,13 @@ getrandom.workspace = true
 time.workspace = true
 # Release signatures (#162), as the identity issuer's.
 ed25519-dalek = "2"
+# Console Web Push (serve/push.rs): ECDH and ES256 on P-256 (as wicket-auth's passkeys), and ring
+# (already in the tree through rustls) for HKDF-SHA-256 and AES-128-GCM.
+p256 = { version = "0.13", features = ["ecdsa"] }
+ring = "0.17"
 
 [dev-dependencies]
 rusqlite.workspace = true
 ciborium = "0.2"
 wicket-placement = { workspace = true, features = ["mock"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

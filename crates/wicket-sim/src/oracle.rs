@@ -3,8 +3,9 @@
 //!
 //! - **No egress allow without a live grant.** An op that needs a grant is allowed only by a grant
 //!   that was issued for exactly that op and box. The allow must come before the grant's lifetime
-//!   ends by the node's clock, cut off or not: the token's grant check is `time <= not_after`, in
-//!   Unix seconds, so it ends at `(not_after + 1) * 1000` ms. A node that holds the delta revoking
+//!   ends by the node's clock, cut off or not: a grant is live while `now < expires_at`, half-open
+//!   and in ms (#337), on the node as in the ledger, so an allow at `expires_at * 1000` ms or later
+//!   is a violation (#342: no whole-second grace). A node that holds the delta revoking
 //!   the grant never allows by it. A fresh node does so for at most one statement TTL (plus clock
 //!   skew) after the revocation: a fresh node holds every epoch a live statement names. A forbidden
 //!   op, or one no grant covers, is never allowed.
@@ -30,7 +31,8 @@ pub enum OpClass {
 struct GrantTruth {
     run: String,
     path: String,
-    /// (true time it was published, the lifetime it was published with, Unix seconds), in order.
+    /// (true time it was published, the ledger's `expires_at` it was published with, Unix
+    /// seconds), in order.
     versions: Vec<(i64, u64)>,
     /// (true time, the epoch whose delta carries it).
     revoked: Option<(i64, u64)>,
@@ -114,14 +116,15 @@ impl Oracle {
         self.violations.push(format!("at {} ms: {what}", t - crate::EPOCH_MS));
     }
 
-    /// The control host published grant `gid` (for `run`'s `path`) with lifetime `not_after_s`.
-    pub fn published(&mut self, t: i64, gid: &str, run: &str, path: &str, not_after_s: u64) {
+    /// The control host published grant `gid` (for `run`'s `path`), which the ledger ends at
+    /// `expires_at_s`.
+    pub fn published(&mut self, t: i64, gid: &str, run: &str, path: &str, expires_at_s: u64) {
         let g = self.grants.entry(gid.into()).or_default();
         g.run = run.into();
         g.path = path.into();
-        g.versions.push((t, not_after_s));
+        g.versions.push((t, expires_at_s));
         self.stats.grant_actions += 1;
-        self.note(t, format!("publish {gid} {run} {path} until {not_after_s}"));
+        self.note(t, format!("publish {gid} {run} {path} until {expires_at_s}"));
     }
 
     /// The control host revoked `gid` in the delta of `epoch`.
@@ -171,11 +174,12 @@ impl Oracle {
             return self.violate(t, format!("{run}: {path} allowed by grant {gid}, issued for {} {}", g.run, g.path));
         }
         // The lifetime the node could have seen: the latest version published before now.
-        let Some(&(_, not_after_s)) = g.versions.iter().rev().find(|(at, _)| *at <= t) else {
+        let Some(&(_, expires_at_s)) = g.versions.iter().rev().find(|(at, _)| *at <= t) else {
             return self.violate(t, format!("{run}: {path} allowed by grant {gid} before it was published"));
         };
-        let max_na = g.versions.iter().filter(|(at, _)| *at <= t).map(|(_, na)| *na).max().unwrap_or(not_after_s);
-        let end = (max_na as i64 + 1) * 1000;
+        let max_end = g.versions.iter().filter(|(at, _)| *at <= t).map(|(_, e)| *e).max().unwrap_or(expires_at_s);
+        // Strict and half-open: the grant is dead at `expires_at` (#337, #342).
+        let end = max_end as i64 * 1000;
         if node_now >= end {
             self.violate(t, format!("{run}: {path} allowed by grant {gid} at node time {node_now}, past its lifetime (ends {end})"));
         }

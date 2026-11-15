@@ -48,6 +48,9 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   and every grant covers nothing riskier than the request you were shown: approving an R2 prefix doesn't
   allow the R4 operations (workflow edits, merges, access changes) under it. An agent whose identity
   doesn't verify (or was revoked since you were shown the ask) can be denied, not approved.
+- **register a device for notifications, and show the request on one** (`push_subscribe`,
+  `push_details`): see [notifications](#notifications). Removing a device and hiding the request
+  need only the session.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
@@ -194,6 +197,79 @@ The **Manifests** section lists the manifests runs can be started from (#172). T
 Runs keep the manifest they started with: each run records its manifest's text at start, and the
 console's Start signs the manifest's sha256.
 
+## Notifications
+
+The console can notify your devices when a request is waiting for you (Web Push: RFC 8030, with
+RFC 8291 message encryption and RFC 8292 VAPID). This covers egress asks and wicket's own capacity,
+update, spawn and link asks. It works in desktop browsers and in the console added to an iPhone or
+iPad home screen (iOS 16.4 or later; Safari tabs can't get pushes). [Get notified of
+approvals](../how-to/get-notified-of-approvals.md) sets it up.
+
+- **Registering a device is a signed action**, `push_subscribe`, like approving or starting a run:
+  a stolen session cookie alone can't add a device that receives notifications. The **Enable
+  notifications** button in the *Notifications* section asks for the browser's permission (only on
+  that tap, as iOS requires), registers the service worker at `/sw.js` with scope `/`, subscribes
+  with the console's VAPID public key, and asks your passkey to sign the registration. The
+  confirmation, and the JSON the passkey signs, name the device by its id (the first 16 hex digits
+  of the endpoint's sha256), its label and push service and whether it shows details, with the
+  sha256 of its endpoint and of its keys (never the endpoint or keys themselves). The endpoint and
+  keys are checked at `begin`, before anything is signed.
+- **Showing the request on a device is signed too**, `push_details` (ticking *Show the agent and
+  what it asks for*), as it widens what the device's lock screen shows.
+- **What a session alone may do**: list devices (`GET /api/push`), remove one
+  (`POST /api/push/remove`) and turn a device's details off (`POST /api/push/details` with
+  `"details": false`). These only narrow what a device receives. `POST /api/push/subscribe`, and
+  `POST /api/push/details` with `"details": true`, are refused with 403 and audited as
+  `operator.push_refused` (with the passkey the session belongs to and the reason).
+- **Whose devices.** Each device belongs to the passkey that was signed in when it was registered
+  (any of the operator's passkeys may sign). An operator sees and changes only their own devices,
+  and a passkey that is no longer enrolled gets no pushes.
+- **Audit.** Every change is audited with the device's id, never its endpoint:
+  `operator.push_subscribed` and `operator.push_details` (details on) with the passkey and the signed
+  record, which `wicket audit --verify` re-verifies offline; `operator.push_details` (details off)
+  and `operator.push_removed` with the session's passkey; `operator.push_refused` for an unsigned
+  attempt to widen.
+- **Where pushes go.** A subscription's endpoint must be an `https://` URL on the default port with
+  no user info, on a known push service: `fcm.googleapis.com` (Chrome, Edge on Android),
+  `*.push.apple.com` (Safari, iOS), `updates.push.services.mozilla.com` (Firefox) or
+  `*.notify.windows.com` (Edge on Windows). Any other URL is refused when the device subscribes, and
+  checked again before each push. The console's client is reqwest (rustls), HTTPS only, and follows
+  no redirects. The console host needs outbound HTTPS to these hosts.
+- **When.** The console checks the ledger every 3 seconds. A new pending request is owed to every
+  subscribed device. A device gets at most one push every 30 seconds, and requests that arrive in
+  between are coalesced into its next push. Nothing is sent if everything was decided before the
+  push was due, and requests already waiting when the console starts are not announced. Each push
+  is `aes128gcm`-encrypted for that device, with `TTL: 3600`, `Urgency: high` and
+  `Topic: wicket-pending`, so a push service holding undelivered pushes for a device keeps only the
+  latest. The device shows one notification at a time, replaced by the next.
+- **What it says.** By default only "N requests waiting" and the id of the newest request, because
+  lock screens show notifications. A device opted in with *Show the agent and what it asks for*
+  also gets that request's agent and method, host and path (`lead asks GET api.example.com/x`,
+  cleaned of control and bidi characters and cut to 200 characters). Reasons, attributions and
+  identities are never sent. Push services see only ciphertext, its size and when it was sent.
+- **Tapping a notification** focuses the console if it is open and marks that request's card, or
+  opens `/#pending/<id>`. Approving still needs a sign-in and a passkey signature, as always.
+- **A replaced subscription.** A browser may replace a device's subscription (Chrome and Firefox
+  fire `pushsubscriptionchange`; Safari doesn't). The service worker can't register the new one: a
+  registration is signed, and only the page can ask for the passkey. So it subscribes again with the
+  same VAPID key if the browser hasn't already, tells any open console, and shows one notification
+  ("Notifications on this device need renewing"); tapping it opens `/#notifications`. Whenever the
+  console is open and this browser holds a subscription it doesn't know, *Notifications* says so and
+  offers **Re-register this device**, a signed `push_subscribe`. Until then the device gets nothing;
+  the old subscription is dropped when its push service answers 404 or 410.
+- **Gone devices.** A push service that answers 404 or 410 has dropped the subscription. The
+  console removes it and audits `operator.push_removed` with `"by": "push service"`. Other failures
+  are logged with the device id and push service host, never the endpoint.
+- **State.** The VAPID key pair is made once, at the first start, in `$WICKET_HOME/console/vapid.key`
+  (0600, in a 0700 directory). Its private half is never logged or shown, and replacing it means
+  every device has to subscribe again. Subscriptions are in `$WICKET_HOME/console/push-subscriptions.json`
+  (0600): endpoint, `p256dh` and `auth` keys, label, setting, when made, last delivery. At most 10
+  devices per passkey and 100 in all.
+- **CSP.** Unchanged. The service worker is a same-origin script, allowed by `script-src 'self'`
+  (with no `worker-src`, workers fall back to it). It is served at `/sw.js` with `Cache-Control:
+  no-cache` so a new build reaches devices. It fetches and caches nothing, and shows the payload as
+  notification text only.
+
 ## On the internet
 
 The console is built to be reachable directly from the internet, with no VPN or access proxy in front
@@ -210,7 +286,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   preload list is your step). ACME keeps its account and certificate in `$WICKET_HOME/acme` (0700/0600) and
   renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
 - **Before sign-in** a client can fetch only the page and the session page (`/session`, the same
-  for every run, with no data in it), their static files (scripts, stylesheets, manifest, icons)
+  for every run, with no data in it), their static files (scripts, stylesheets, service worker, manifest, icons)
   and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
   no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
@@ -224,7 +300,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
   host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately
-  passkey-signed, so a stolen cookie alone approves nothing.
+  passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
