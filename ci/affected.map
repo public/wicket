@@ -49,6 +49,10 @@ ci/changelog_test.py               | -   | docs
 examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
+# The console's session view (#327): embedded by crates/wicket-cli/build.rs, checked by its job.
+web/**                             | wicket-cli | -
+ci/session-view.sh                 | wicket-cli | -
+ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
