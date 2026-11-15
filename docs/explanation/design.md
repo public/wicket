@@ -1012,74 +1012,29 @@ Full mediation is the default, but some zones need raw speed. `zone.network` tak
 
 Measure before reaching for `direct`.
 
-## 8. Infrastructure: hosts, placement and isolated services
+## 8. Infrastructure: nodes, placement and money
 
-*Draft. Owner requirement 2026-11-08. Kubernetes, provider and billing research is in
-[`research/10-infrastructure.md`](research/10-infrastructure.md); the details here firm up once it lands.*
+*Owner requirement 2026-11-08. Provider and billing research is in
+[`research/10-infrastructure.md`](research/10-infrastructure.md). What is built is in
+[nodes](../reference/nodes.md) and `crates/wicket-placement`.*
 
-**Requirement.** wicket provisions and manages what code runs on:
-- hosts: this machine, cloud VMs, bare metal, hosted sandbox services;
-- the sandboxes on those hosts;
-- long-running **isolated services**, for example third-party MCP servers, each in its own container or
-  VM, isolated from each other.
+**Requirement.** wicket provisions and manages what code runs on: **nodes** (the control host, the
+operator's own machines, cloud VMs) and the boxes on them. The control host is a node like any other.
 
 Provisioning costs money and adds attack surface, so it is an authority domain like any other: it goes
 through `Op`s, policy, budgets and escalation.
 
 ### 8.1 Everything that runs is a workload
 
-```rust
-pub enum WorkloadKind {
-    AgentSandbox { zone: ZoneId },
-    McpServer   { server: McpServerRef, scope: InstanceScope },   // third-party server, pinned image + tool hashes
-    Codemode    { zone: ZoneId },
-    NodeService (NodeService),                                     // per-host egress/LLM proxy, gateway shard
-    Fixture     { purpose: SmolStr },                              // e.g. adapter test org runners
-}
-pub enum InstanceScope { PerTask, PerZone, Shared }
-pub struct Workload {
-    pub id: WorkloadId, pub kind: WorkloadKind,
-    pub sandbox: SandboxRequirement,           // isolation floor, snapshot need (§7)
-    pub reach: CapabilitySet,                  // its OWN egress, via the proxy and adapters
-    pub placement: Vec<PlacementConstraint>,   // §8.3
-    pub lease: Lease,                          // TTL; nothing runs without one
-    pub label: Label,                          // join of everything it has served
-}
-```
+A **workload** is what runs in a box: an agent, or a program, which is an agent with no model that may
+not ask (#255). Every workload gets the same box, proxies, identity and audit. It runs on a node chosen
+by placement (§8.3), under a lease or the control host's own capacity, and never without a lifetime.
+Third-party MCP servers as their own workloads (service zones) are deferred (§8.2, §22).
 
-Agent sandboxes from §7 are one kind of workload. Every kind is placed the same way, through Kubernetes (§8.3).
+### 8.2 Links between boxes
 
-### 8.2 Isolated MCP servers (service zones)
-
-No surveyed project combines all four of: a server with no network route of its own, egress only through
-an inspecting proxy, credentials injected only at that proxy, and a gateway-owned non-TCP transport.
-ToolHive comes closest, and secrets go in environment variables everywhere [07 a.4, 08 §6 a3]. wicket's
-contract for a third-party MCP server:
-1. **One sandbox per (server, task, zone)**, under the same `Sandbox` trait as agents, with gVisor as the
-   floor. Its own UID, netns, mount view and cgroup; default limits 1 CPU and 512 MiB. Its own *server
-   zone*, whose reach is the server's manifest ∩ the calling zone's reach. It is pinned by image digest
-   next to its tool-description hashes. It is never shared across tasks or zones.
-2. **An empty netns.** The only route out is the egress proxy, with the sandbox's own CA. There is no
-   path to other servers, the agent, the host, the API server, metadata services or DNS.
-3. **Placeholders only.** The server is launched with an explicit minimal env; nothing is inherited.
-   Credential→host bindings come only from the vault and adapter, never from a caller (microsandbox-mcp
-   lets the calling agent choose which secret goes to which host: a confused deputy). A non-HTTP server
-   that must hold a secret gets a short-lived, narrowest-scope one, and the zone view marks it.
-4. **A gateway-owned transport, never TCP.**
-   - For stdio servers, `wicket-jail` hands the server's stdin/stdout fds to the gateway.
-   - For HTTP-only servers, streamable HTTP runs over a UDS bind-mounted out of the sandbox, or vsock on
-     Firecracker.
-
-   The gateway terminates MCP on both sides and forwards re-encoded messages.
-5. **The server's own egress is an `Op` of its server zone, carrying the invoking agent's label.**
-   Otherwise the server becomes a label-laundering deputy. With concurrent calls, the labels of all
-   in-flight callers are joined, which is another reason for per-task instances.
-6. **No runtime additions.** The server set is part of the approved manifest. Adding a server is an
-   escalation.
-
-Instance state is memory (§12). `PerTask` is the default. `PerZone` is for servers with expensive
-startup. `Shared` is only for servers declared stateless *and* restored from a clean template per task.
-Warm pools and snapshot clones (§7.1) make per-task instances cheap.
+Service zones, which run each third-party MCP server in its own sandbox with no route of its own, are
+deferred (§22). This section covers links.
 
 **Links between boxes (PoC, #6).** Boxes reach each other's ports only through links wicket relays:
 `expose(port)`, `connect(box, port)` (which returns `<name>.wicket.internal:<port>`), and `link(from, to,
@@ -1089,112 +1044,41 @@ lends the connector the target's authority, so the target's reach must be within
 (`subset::reach_within`), or a human approves. Each linked name gets an address from 198.18.1.1–32, added
 at box start, and a line in a hosts file wicket owns. Under gVisor the box can't offer a socket to the host,
 so wicket reaches into the target with `docker exec` per connection. Every link is audited and closes when
-cut, revoked at either end, or when either run ends. Labels don't cross links yet (no label mechanism).
+cut, revoked at either end, or when either run ends. Labels don't cross links (labels are deferred, §22).
 See `examples/links/`.
 
-### 8.3 Substrate: Kubernetes for capacity, direct launch for the hot path
+### 8.3 Placement
 
-*Owner direction (2026-11-08): use Kubernetes rather than build our own scheduler. Research 10 refines this
-into a hybrid, because the pod path is too slow and too limited for per-zone and per-task churn (§7.1).*
+Placement (`wicket-placement`) chooses the node a box runs on. Its backends are `Provider`s: the
+operator's own static hosts, reached over SSH, and Vultr. `Placer` enforces the same rules over any of
+them: owner tags (nothing untagged, or tagged `wicket-protected`, is ever listed or destroyed),
+idempotent creates, the money envelope and worst-case reservation (§8.5). A node runs boxes itself, by
+direct launch (§7.1), and decides their requests at the edge (§9.2.1).
 
-| Kubernetes does | `wicket-node` does (direct launch, inside reserved capacity) | wicket keeps |
-|---|---|---|
-| Nodes, node pools, autoscaling (cluster-autoscaler or Karpenter), node lifecycle and upgrades | Agent sandboxes and per-task MCP instances on the hot path: process jail, `runsc` or Firecracker launched directly, in under 300 ms | `Op`s, policy, ledger, escalation, labels, handles |
-| wicket's own services, and long-lived shared MCP services as gVisor pods | gVisor checkpoint/restore and Firecracker snapshots for parking, which the pod API can't do | Placement *compilation and verification*: which isolation, separation and region each workload requires |
-| L3/L4 policy for pods (Cilium default-deny) | Interface-less netns for direct-launched boxes, so there is no CNI to bypass | The money envelope, leases and billing-aligned release |
+Kubernetes placement, a `kube-rs` operator and reservation pods are deferred (#45, §22). Kubernetes would
+be one more `Provider`, and the ledger would stay the authority.
 
-- **How capacity is held.** `wicket-node` asks Kubernetes for capacity as **reservation pods**: pause pods
-  requesting the CPU and memory of N sandbox slots, including each tier's fixed overhead. The scheduler
-  and autoscaler then see the real load and add nodes. Inside a reservation, `wicket-node` launches and
-  recycles sandboxes freely.
-- **wicket is a `kube-rs` operator** for its CRDs (`NodePool`, `Workload`, `WarmPool`). The CRDs are desired
-  state, **never authority**: admission accepts only specs whose digest the ledger has approved, so editing
-  a CR can't skip human approval. The operator can't read Secrets cluster-wide.
-- **Untrusted pods**, where the pod path is used at all, run under a sandboxed `RuntimeClass` (gVisor, or
-  Kata on KVM pools), enforced by a `ValidatingAdmissionPolicy`. They get no service-account token, no
-  Kubernetes Secrets and no host mounts. Their only egress is the node-local proxy under Cilium
-  default-deny (`policyEnforcementMode=always`); `toFQDNs` rules would bypass TLS inspection. Payloads start
-  only after the endpoint's policy is realised. MCP pods get per-namespace deny-all, with ingress only from
-  the gateway.
-- **`kubernetes-sigs/agent-sandbox`** is an optional `Sandbox` backend: v1.0.10 but a `v1beta1` API with
-  near-weekly breaking changes, and default egress to the whole public internet. It runs with its network
-  policy unmanaged and Cilium in charge, for clusters where pod-path latency is acceptable (GKE warm pools
-  claim in about 200 ms).
-- Kubernetes adds a large TCB (API server, kubelet, CNI, runc; there were runc escape CVEs in November
-  2025). The privileged `wicket-node` DaemonSet is TCB too, as `wicket-jail` already is.
+### 8.4 Providers and billing
 
-### 8.4 Many clouds
+wicket must be able to run on anything from Vultr or Hetzner to GCP or AWS (owner, 2026-11-08), and
+clouds differ in the ways that matter to it: billing granule, idempotent create, signed node identity
+[10 §3]. So a provider's differences are **data** (`BillingModel`, in `wicket-placement::billing`) and the
+rest of wicket reasons about them:
+- **Idempotency** uses the provider's token where one exists. Otherwise it is tag-then-list-before-create
+  (Vultr).
+- **Billing** is modelled per provider, so leases end before the next paid unit (§8.5).
+- **Node trust** comes from enrolment: a one-time join token, a pinned host key, a node key and a
+  short-lived node certificate (§3.2 "Node identity"). The handshake is the same on every provider.
+- **Nodes hold no cloud credentials** and no long-lived upstream credentials. They keep in memory only
+  the secrets their runs fetched (#152).
 
-wicket must run on **anything from Vultr or Hetzner to GCP or AWS** (owner, 2026-11-08). Clouds differ in
-exactly the ways that matter to wicket [10 §3]:
-
-| | Vultr | Hetzner | AWS | GCP | Azure | Fly | E2B |
-|---|---|---|---|---|---|---|---|
-| Billing granule | per started hour | hourly | per second (60 s min) | per second (1 min min) | per second | per second | per second |
-| KVM | no | dedicated only | nested (Intel C7i/M7i/…) | nested (N4D and others) | nested (Dsv5/6, …) | no | — |
-| Idempotent create | no (tag + list) | no | `ClientToken` | `requestId` | named PUT | — | — |
-| Signed node identity | no | no | IID document, NitroTPM | identity JWT | attested data | no | — |
-| Confidential VMs | no | no | SEV-SNP (limited regions) | SEV-SNP/TDX (not London) | SEV-SNP, TDX | no | — |
-| Managed Kubernetes | VKE (no scale to zero) | — | EKS | GKE | AKS | — | — |
-
-So providers are **plugins behind one trait**, and their differences are **data** the rest of wicket
-reasons about:
-
-```rust
-#[async_trait]
-pub trait HostProvider: Send + Sync {             // wicket-provisioner: the ONLY holder of cloud credentials
-    fn id(&self) -> ProviderId;
-    fn catalog(&self) -> &[HostClass];           // plan, region, $/h, features {kvm, arch, gpu}, attestation level
-    fn billing(&self, class: &HostClass) -> BillingModel;   // granule, rounding, monthly cap, stopped-bills, min lease
-    async fn create(&self, intent: &Intent, class: &HostClass, boot: &BootConfig) -> Result<HostRef>; // idempotent by intent
-    async fn get(&self, h: &HostRef) -> Result<Option<ObservedHost>>;
-    async fn list_owned(&self) -> Result<Vec<ObservedHost>>;   // by owner tag only
-    async fn destroy(&self, h: &HostRef) -> Result<()>;        // refuses unowned or protected resources
-    async fn attest(&self, h: &HostRef, ev: &NodeEvidence) -> Result<AttestationLevel>;
-    async fn charges_since(&self, t: Timestamp) -> Result<Vec<ChargeLine>>;   // daily money reconcile
-}
-// impls, in order: Local (this host / a Mac), Vultr (via the provisioning broker on the control host), AWS, GCP, Hetzner,
-// then Azure, OVH, Scaleway, Latitude; Fly and E2B as "hosts of one" / hosted Sandbox backends
-```
-
-- **Idempotency** uses the provider's token where one exists (`ClientToken`, `requestId`). Otherwise it is
-  tag-then-list-before-create.
-- **Cluster modes are per pool**, not per installation:
-  - *managed* Kubernetes (GKE, EKS, AKS, VKE) where its pools fit;
-  - *k3s self-managed* on VMs from any provider. That is the default on Vultr and Hetzner, and wherever
-    pools must scale to zero.
-  - One wicket installation can span several clouds. Nodes join over **WireGuard + mTLS**, so wicket
-    doesn't depend on any provider's VPC.
-- **Node trust is graded.** Bootstrap uses cloud-init with a single-use, CA-pinned join token. The node
-  dials out (no inbound port) and refuses to register if any preflight probe fails (Landlock ABI,
-  seccomp, KVM, runsc). Trust is then graded by `AttestationLevel`:
-  - `ProviderApi`: Vultr and Hetzner, trust on first use, checked against the provider API;
-  - `InstanceIdentity`: signed documents on AWS, GCP and Azure;
-  - `Tpm`, `SevSnp`, `Tdx`: hardware attestation, later.
-
-  Whatever the level, a node then proves itself on every control connection with its node key and a
-  short-lived identity certificate from the issuer, and the control host proves the issuer key back
-  (§3.2 "Node identity"). That handshake is the same on every cloud and transport, so a stronger level
-  changes how the first certificate is earned, not how it is used.
-
-  Measured boot of `wicket-node`'s own image is the first hardware attestation worth building, because
-  it is what lets the vault release credentials to a node. High-sensitivity zones can demand
-  `AttestationAtLeast(SevSnp)`, which today means Azure, or AWS outside London.
-- **Credentials to nodes.** Nodes hold no cloud credentials and no long-lived upstream credentials.
-  Per-task native credentials are delivered only to that task's node, audience-bound to the node's
-  identity and held in memory. In v1 multi-host, the **LLM proxy is central**, so the model key isn't on
-  every node.
-- **Placement vocabulary** gains `Provider{allow, deny}`, `Region`, `Residency(jurisdiction)`,
-  `AttestationAtLeast`, `MaxCostPerHour` and `MaxLifetime`. Each constraint carries its provenance (org
-  policy, manifest, derived from labels, grant), so `explain` can say *why* a workload landed where it did.
-  Labels derive constraints automatically: for example, `customer.pii` ⇒ `Residency(UK)`.
-- **Upstream native credentials** use each cloud's narrowing mechanism: AWS STS session policies, GCP
-  credential access boundaries, Azure scoped role assignments (§9.4).
+Only Vultr and static hosts are built. A `HostProvider` across six clouds, graded attestation levels
+(instance identity documents, TPM, SEV-SNP, TDX) and placement by residency are deferred (§22).
 
 ### 8.5 Capacity, leases and money
 
-- **The provisioner is the only holder of cloud credentials.** It is a reconciler over desired state
-  (`NodePool` CRDs, or SQLite in local mode) with idempotent creates and owner-tagged resources.
+- **Placement is the only holder of cloud credentials.** The reconciler (`wicket reconcile`) makes the
+  provider match the ledger, the desired state, with idempotent creates and owner-tagged resources.
   Garbage collection only ever touches resources that carry wicket's owner tag.
 - **Leases snap to the billing granule.** Under per-started-hour billing (Vultr), a host's
   `granted_until` stops at the paid-hour boundary ("minute 50" rule). Hosts are pooled within the paid
@@ -1203,38 +1087,24 @@ pub trait HostProvider: Send + Sync {             // wicket-provisioner: the ONL
 - **Money is reserved at the worst case.** A provisioning `Op` reserves `BillingModel::worst_case(rate,
   lifetime)` in the ledger before creating anything. A pool's `max × rate × 672 h` must fit the budget.
   A daily reconcile matches the ledger against `charges_since` from every provider, to the cent.
-- **The money envelope:**
-  - the auto tier applies only inside the pre-approved envelope (plans, providers, max $/h, max lifetime,
-    monthly cap);
-  - anything beyond it goes to a human, with the cost on the approval card;
-  - the monthly cap is a hard stop in the ledger.
+- **The money envelope** (`placement.yaml`: a maximum hourly rate over every owned node, and a maximum
+  total) is a hard limit. A request beyond it is refused, and no approval widens it. Inside it, every
+  paid node needs a human's approval, with the plan, rate and worst case shown.
 - **Agents can ask for capacity, never for credentials.** A cloud key would be an egress bypass,
-  persistence and money all at once. `wicket.request_capacity{isolation, kvm, gpu, duration}` is a typed
-  escalation; a grant is a *lease on capacity* inside the requesting zone.
+  persistence and money all at once. `request_capacity` is a typed request. A **lease** is a grant of
+  capacity (#253): a node for a time, its worst case reserved, held by the requesting run.
 - **On the control host during development**, the Vultr provider goes through provisioning-broker grants. wicket
   automates what the broker script does by hand, inside the existing $20/month cap.
 
-### 8.6 Modes and v1 scope
+### 8.6 Modes and scope
 
-| Mode | Where | Backends |
+| Mode | Where | State |
 |---|---|---|
-| **Single host, no Kubernetes** | laptops, this box, M1 | `process`, `gvisor` (Linux), `seatbelt` (macOS); same reconcilers on SQLite |
-| **Single-node k3s** | this box on demand (about 1.6 GB with gVisor and Cilium; agree with the host's operator, stop when idle) | direct launch + gVisor pods |
-| **Multi-cloud clusters** | production | per-pool managed or k3s; gVisor everywhere, Kata/Firecracker on KVM pools |
+| **Single host** | a laptop or one server; the control host is the only node | built (gVisor) |
+| **Control host and nodes** | static hosts and Vultr nodes, enrolled, over SSH | built |
+| **Kubernetes pools, many clouds** | production clusters | deferred (#45, §22) |
 
-v1 steps [10 §13]:
-
-| Step | Build | Where | Spend |
-|---|---|---|---|
-| I0 | placement vocabulary, compiler and verifier for local mode; `BillingModel` data for Vultr, AWS, GCP, Hetzner and Fly; leases; ledger `money` effect | this box | $0 |
-| I1 | `wicket-node` local: direct launch, unbound warm pools with claim-then-bind, per-task MCP instances; **measure every tier** | this box via the host's job-slot limits | $0 |
-| I2 | Vultr provider through the provisioning broker, host reconciler (adopt-or-destroy after a crash), WireGuard + mTLS join of a second node | Vultr London | ~$1–3/month |
-| I3 | operator, reservation pods, Cilium default-deny, gVisor RuntimeClass, optional agent-sandbox backend | k3s on this box, on demand | $0 |
-| I4 | Firecracker tier, snapshot clones with RNG reseeding | a Mac (M3 or later, macOS 15+) or an AWS `c7i-flex.large` with nested virtualization in London (~$0.10/h) | $0–1 |
-
-Later: GCP and Hetzner providers, managed Kubernetes pools, hosted Fly and E2B capacity, hardware
-attestation. Vultr bare metal waits until its billing is confirmed: the API says monthly ($185), the docs
-say hourly ($0.25).
+Later isolation tiers (Firecracker #64, macOS #47–#49) are per node and change nothing above it.
 
 ---
 
