@@ -30,6 +30,8 @@ pub struct SealedStore<S> {
     inner: S,
     raw: [u8; 32],
     kid: [u8; 8],
+    /// Whether objects written before sealing (plain, under their own key) are read.
+    plain: bool,
 }
 
 fn kid(key: &[u8; 32]) -> [u8; 8] {
@@ -72,7 +74,15 @@ fn fill(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
 
 impl<S: ObjectStore> SealedStore<S> {
     pub fn new(inner: S, key: &[u8; 32]) -> SealedStore<S> {
-        SealedStore { inner, raw: *key, kid: kid(key) }
+        SealedStore { inner, raw: *key, kid: kid(key), plain: true }
+    }
+
+    /// Like [`SealedStore::new`], but only sealed objects exist: nothing plain under a key is read,
+    /// listed or counted. Anyone who can write the backend could otherwise plant a plain object
+    /// that is read as if wicket had written it. The content-addressed store ([`crate::cas`]) uses
+    /// this.
+    pub fn sealed_only(inner: S, key: &[u8; 32]) -> SealedStore<S> {
+        SealedStore { plain: false, ..SealedStore::new(inner, key) }
     }
 
     /// `data`, sealed for object `object`, as it is read.
@@ -211,7 +221,7 @@ impl Read for Opener {
 impl<S: ObjectStore> ObjectStore for SealedStore<S> {
     fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
         let name = format!("{PREFIX}{key}");
-        if self.inner.get(&name)?.is_some() {
+        if self.inner.has(&name)? {
             return Ok(false);
         }
         let mut sealed = self.sealer(key, data)?;
@@ -221,7 +231,7 @@ impl<S: ObjectStore> ObjectStore for SealedStore<S> {
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
         let Some(mut r) = self.inner.get(&format!("{PREFIX}{key}"))? else {
             // Written before objects were sealed.
-            return self.inner.get(key);
+            return if self.plain { self.inner.get(key) } else { Ok(None) };
         };
         let mut head = [0u8; 20];
         if fill(&mut *r, &mut head)? != 20 || &head[..4] != MAGIC {
@@ -235,15 +245,24 @@ impl<S: ObjectStore> ObjectStore for SealedStore<S> {
         Ok(Some(Box::new(Opener { inner: r, key: key2, object: key.into(), prefix, i: 0, buf: vec![], pos: 0, done: false })))
     }
 
+    fn has(&self, key: &str) -> io::Result<bool> {
+        Ok(self.inner.has(&format!("{PREFIX}{key}"))? || (self.plain && self.inner.has(key)?))
+    }
+
     fn delete(&self, key: &str) -> io::Result<()> {
         self.inner.delete(&format!("{PREFIX}{key}"))?;
-        self.inner.delete(key)
+        if self.plain {
+            self.inner.delete(key)?;
+        }
+        Ok(())
     }
 
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut out: Vec<String> =
             self.inner.list_prefix(&format!("{PREFIX}{prefix}"))?.into_iter().map(|k| k[PREFIX.len()..].to_string()).collect();
-        out.extend(self.inner.list_prefix(prefix)?.into_iter().filter(|k| !k.starts_with(PREFIX)));
+        if self.plain {
+            out.extend(self.inner.list_prefix(prefix)?.into_iter().filter(|k| !k.starts_with(PREFIX)));
+        }
         out.sort();
         out.dedup();
         Ok(out)
@@ -331,6 +350,24 @@ mod tests {
         // Written again from now on: sealed, under its sealed name.
         assert!(s.put_if_absent("old/blob", &mut &b"plain"[..]).unwrap());
         assert!(std::fs::read(d.join("sealed/old/blob")).unwrap().starts_with(MAGIC));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_sealed_only_store_never_reads_a_plain_object() {
+        let (_, d) = store("strict");
+        let s = SealedStore::sealed_only(DirStore::new(&d), &[7u8; 32]);
+        DirStore::new(&d).put_if_absent("r/planted", &mut &b"plain"[..]).unwrap();
+        assert!(s.get("r/planted").unwrap().is_none());
+        assert!(!s.has("r/planted").unwrap());
+        assert!(s.list_prefix("r/").unwrap().is_empty());
+        assert!(s.put_if_absent("r/mine", &mut &b"sealed"[..]).unwrap());
+        assert!(s.has("r/mine").unwrap());
+        assert_eq!(read(&s, "r/mine").unwrap(), b"sealed");
+        assert_eq!(s.list_prefix("r/").unwrap(), ["r/mine"]);
+        // Deleting leaves what isn't its own alone.
+        s.delete("r/planted").unwrap();
+        assert!(DirStore::new(&d).has("r/planted").unwrap());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

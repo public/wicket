@@ -289,6 +289,13 @@ impl ObjectStore for S3Store {
         Ok(Some(Box::new(io::BufReader::new(f))))
     }
 
+    fn has(&self, key: &str) -> io::Result<bool> {
+        if !valid_key(key) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad object key {key:?}")));
+        }
+        self.exists(key)
+    }
+
     fn delete(&self, key: &str) -> io::Result<()> {
         let req = self.request(reqwest::Method::DELETE, key, &[], EMPTY_SHA256).map_err(io_err)?;
         let key2 = key.to_string();

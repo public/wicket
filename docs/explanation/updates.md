@@ -210,8 +210,9 @@ newest that has opened it) and its **floor** (the oldest that may open it) in `s
   has the procedure.
 
 The snapshots are local files (`<data dir>/snapshots/<unix time>-<old build id>.db`) and, with a
-state store (#154), objects in it too (#167): `ledger-snapshots/<unix time>-<old build id>.db`,
-sealed under `state.key` like hibernated agents' bundles, pruned by the same rule. An update doesn't
+state store (#154), in it too (#167): a blob in its content-addressed store ([the store](store.md)),
+named by a ref `ledger-snapshots/<unix time>-<old build id>.db`, sealed under `state.key` like
+hibernated agents' bundles, verified by its digest when it is fetched, and pruned by the same rule. An update doesn't
 switch until its snapshot is in the store, so the way back past a contract step survives losing the
 control host (a rollback waits for the store at most 15 s, then switches anyway and warns; `self
 follow` tries a build whose snapshot the store didn't take again later). A standby restored from the
