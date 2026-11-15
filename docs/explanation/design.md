@@ -276,7 +276,7 @@ pub struct Op {
     pub effects: EffectSet,             // read.scoped, notify.external, exec.ci, ...
     pub risk: RiskClass,                // max(floor(effects)), raised by dangerous patterns
     pub args: BTreeMap<SmolStr, Value>, // declared args only
-    pub digest: [u8; 32],               // canonical hash; escalation requests bind to it
+    pub digest: [u8; 32],               // canonical hash; requests bind to it
 }
 ```
 
@@ -1503,8 +1503,8 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   `trust.json`. They are read-only or discarded, and never fed from approvals.
 - **Recovery by forking.** A tainted agent's session can be forked at a clean point instead of being
   discarded (#177).
-- **Covert channels** (timing, sizes, file names, escalation request contents) are not closed. Escalation
-  requests are rate- and size-limited, and anomalies are logged.
+- **Covert channels** (timing, sizes, file names, request contents) are not closed. Requests
+  are rate- and size-limited, and anomalies are logged.
 
 ---
 
@@ -2009,7 +2009,7 @@ level, with stricter rules:
   Single-tenant mode is tenant `t0`; the PoC already works this way. The authority check becomes
   platform ∧ plan ∧ tenant ∧ workspace ∧ zones ∧ grant ∧ labels ∧ ledger, and tenant admins can only narrow.
   The prover checks that on save, and evaluation enforces it anyway.
-- **Pooled nodes hold no credentials.** On nodes that run several tenants' code, sandbox nodes run a plain
+- **Pooled nodes hold no credentials.** On nodes that run several tenants' code, the nodes running their boxes run a plain
   forwarder and hold no tokens, CA keys or model keys. Per-tenant enforcement runs on separate enforcement
   nodes, which also own each tenant's static egress IPs. The PoC's remote node already has this shape: its
   sockets are forwarded to proxies on the control host.

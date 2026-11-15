@@ -1,6 +1,6 @@
 [package]
 name = "wicket-cli"
-description = "The wicket command: run a task in a sandbox, approve escalations, read the audit log."
+description = "The wicket command: run a task in a box, decide its requests, read the audit log."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -52,6 +52,7 @@ http-body-util.workspace = true
 http.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+tokio-tungstenite.workspace = true
 url.workspace = true
 ulid.workspace = true
 tar = "0.4"
@@ -62,6 +63,10 @@ getrandom.workspace = true
 time.workspace = true
 # Release signatures (#162), as the identity issuer's.
 ed25519-dalek = "3"
+# Console Web Push (serve/push.rs): ECDH and ES256 on P-256 (as wicket-auth's passkeys), and ring
+# (already in the tree through rustls) for HKDF-SHA-256 and AES-128-GCM.
+p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
+ring = "0.17"
 
 [dev-dependencies]
 rusqlite.workspace = true

@@ -61,7 +61,7 @@ port stay the agent's.
 ## What the box holds
 
 - No secrets: placeholders only. The model credential is a placeholder `CLAUDE_CODE_OAUTH_TOKEN` (or,
-  for a remote session, a placeholder login file); the proxies swap in the real value on the hosts
+  for a Remote Control session, a placeholder login file); the proxies swap in the real value on the hosts
   the secret is bound to.
 - The run's CA (or, on a node, the installation root for the node CA's leaves and the run's CA), in
   the trust store and `SSL_CERT_FILE`.

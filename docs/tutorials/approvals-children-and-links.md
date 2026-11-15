@@ -164,7 +164,7 @@ wicket audit --verify
 
 The audit log has `spawn.beyond_parent` for `hn`, and `link.open` and `link.close` for the link.
 
-You have seen an agent build its own team inside its authority, a human widen it exactly once, and
+You have seen an agent build its own team inside its authority, an operator widen it exactly once, and
 two boxes talk with neither having a network.
 
 Next: [write a zone for a project](../how-to/write-a-zone-for-a-project.md), or read about

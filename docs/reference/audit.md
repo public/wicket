@@ -18,7 +18,7 @@ transaction and one fsync per batch, with the ledger in WAL mode and `synchronou
   cost 0.65–0.71 ms, under the ledger lock.
 - **Records that must be on disk before they take effect** wait for their batch's commit. This
   covers every `Ledger::audit` call (decisions, approvals, revocations, leases, links, messages) and
-  egress requests allowed by a human's grant. Waiting is a shared flush: when 16 threads append
+  egress requests allowed by an operator's grant. Waiting is a shared flush: when 16 threads append
   durably at once, each record costs about 80 µs instead of an fsync each.
 - **Order and the chain.** Each batch reads the chain head and appends its records under one
   `BEGIN IMMEDIATE` write lock. Processes that share the ledger interleave whole batches, so the
@@ -148,8 +148,9 @@ for a kind to see its body):
 | area | kinds |
 |---|---|
 | requests | `op` (an egress or model decision), `decision` (an approve, deny or renewal), `decision.refused` (a decision outside the decider's authority: an operator's `operators.yaml`, or an agent's own reach), `grant.revoked`, `daemon.refused` |
-| runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.remote_session_failed`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.reaped`, `box.exit_cause`, `box.memory_pressure` |
+| runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.remote_session_failed`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `run.turn_cancel`, `box.output`, `box.output.gap`, `box.reaped`, `box.exit_cause`, `box.memory_pressure` |
 | agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `spawn.beyond_parent`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
+| sessions | `session.opened`, `session.attached`, `session.prompt`, `session.cancel`, `session.escalation_answered`, `session.closed` (the console's session view, [console](console.md#sessions)) |
 | links | `link.expose`, `link.open`, `link.close`, `link.cut` |
 | operators | `operator.signed_in`, `operator.lockout`, `operator.passkey_added`, `operator.enrol_link_issued`, `operator.enrol_link_used`, `operator.reset`, `operator.sessions_revoked`, `operator.message` |
 | nodes | `node.token`, `node.enrolled`, `node.ca_renewed`, `node.revoked`, `node.audit`, `node.audit.restart`, `node.ask_queued`, `node.authority_expired`, `node.secret_fetch`, `node.secret_fetched`, `node.secret_unavailable`, `feed.refused`, `image.received`, `image.refused` |

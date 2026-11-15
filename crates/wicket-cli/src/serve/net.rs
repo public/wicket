@@ -309,9 +309,15 @@ pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, 
 
 async fn serve_conn<I: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: I, peer: SocketAddr, state: Arc<State>) {
     let limits = state.limits.clone();
-    let svc = service_fn(move |req| {
+    let svc = service_fn(move |mut req| {
         let state = state.clone();
-        async move { Ok::<_, std::convert::Infallible>(super::route(req, &state, peer).await) }
+        async move {
+            // A run's ACP session socket (#327) takes the connection over.
+            if let Some(r) = super::ws_route(&mut req, &state, peer) {
+                return Ok::<_, std::convert::Infallible>(r);
+            }
+            Ok::<_, std::convert::Infallible>(super::route(req, &state, peer).await)
+        }
     });
     let mut b = hyper::server::conn::http1::Builder::new();
     b.timer(TokioTimer::new())
@@ -320,7 +326,7 @@ async fn serve_conn<I: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: I, p
         .max_buf_size(limits.max_header_bytes.max(8192))
         .half_close(false)
         .keep_alive(true);
-    let conn = b.serve_connection(TokioIo::new(io), svc);
+    let conn = b.serve_connection(TokioIo::new(io), svc).with_upgrades();
     tokio::pin!(conn);
     tokio::select! {
         _ = conn.as_mut() => {}

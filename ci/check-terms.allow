@@ -1,0 +1,14 @@
+# Lines ci/check-terms.sh lets use a word the glossary replaced: `<path> | <text>`, where the flagged
+# line contains <text>, or `<path> | *` for the whole file. Say why above each entry.
+
+# The glossary itself names the words it replaces.
+docs/explanation/concepts.md | Say "box", not "sandbox" or "container"
+# Points at what is deferred.
+docs/explanation/concepts.md | service zones, crews, mandates, Kubernetes placement
+docs/explanation/design.md | research/15-mandates-user-delegation.md
+docs/explanation/design.md | A separate mandate subsystem is deferred
+docs/explanation/design.md | Crews, several agents sharing one box, are deferred
+docs/explanation/design.md | ## 16. Mandates: acting on a user's behalf
+docs/explanation/design.md | | M11 | mandates | deferred (§22) |
+# The conversation wicket started from, kept as it was.
+docs/explanation/00-origin-conversation.md | *

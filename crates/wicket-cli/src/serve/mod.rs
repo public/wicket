@@ -19,8 +19,11 @@
 //!    `sha256(nonce || canonical action JSON)`. The actions: approve or deny a request (its id,
 //!    method, host, path, whether it is a prefix ask, decision, uses, lifetime and the agent's
 //!    verified identity), start a run (the allowlisted manifest, its content digest, the task
-//!    override, the run id and the principal it will carry), send a follow-up (run and text) and
-//!    revoke an identity (run and reason). The server builds the JSON from its own reading of the
+//!    override, the run id and the principal it will carry), send a follow-up (run and text),
+//!    revoke an identity (run and reason), and the two that widen what a device receives from Web
+//!    Push ([`push`]): register a device (its id, label, push service and digests of its endpoint and
+//!    keys) and turn its details on (removing a device or turning details off only narrow, and need
+//!    only the session). The server builds the JSON from its own reading of the
 //!    ledger and disk at `begin`, keeps it with the challenge, and at `finish` verifies the signature,
 //!    consumes the challenge (single use, 2-minute expiry, bound to the session that asked for it),
 //!    re-checks what may have changed in between (the manifest's bytes, the run still running, the
@@ -54,6 +57,8 @@ mod authority;
 mod limits;
 mod manifests;
 mod net;
+mod push;
+mod session;
 mod tls;
 mod web;
 
@@ -142,6 +147,10 @@ enum Action {
         run: String,
         reason: String,
     },
+    /// Open a run's ACP session socket as the operator (#327): issues a single-use ticket.
+    OpenSession {
+        run: String,
+    },
     /// Save (or restore) a manifest in the installation's manifests directory (#172).
     SaveManifest(Box<manifests::Save>),
     Start {
@@ -154,6 +163,15 @@ enum Action {
         principal: Value,
         /// An agent's image, passed to its run (a program's comes from its manifest).
         image: Option<String>,
+    },
+    /// Register a device for notifications (Web Push), as checked at `begin`: signed, so a stolen
+    /// session cookie can't add a device that receives them.
+    PushSubscribe(Box<push::Subscription>),
+    /// Turn on a device's details (the agent and what it asks for, shown on its lock screen):
+    /// signed, as it widens what the device receives. Turning them off is session-only.
+    PushDetails {
+        operator: String,
+        device: String,
     },
 }
 
@@ -216,6 +234,12 @@ struct State {
     vault_dir: PathBuf,
     /// The authority root's public key, which runs' tokens load against (`authority.rs`).
     authz_root: Option<wicket_authz::PublicKey>,
+    /// Signed `open_session` tickets waiting for their WebSocket ([`session`]).
+    tickets: Mutex<HashMap<String, session::Ticket>>,
+    /// Open session WebSockets, overall and per console session ([`session::Sockets`]).
+    sockets: Arc<Mutex<session::Sockets>>,
+    /// Web Push to the operators' devices ([`push`]); None if its state couldn't be opened.
+    push: Option<push::Push>,
 }
 
 impl State {
@@ -233,6 +257,13 @@ impl State {
     ) -> State {
         let authority = rp.origin.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
         let hsts = rp.origin.starts_with("https://");
+        let push = match push::Push::open(&data.join("console"), &rp.origin, push::reqwest_transport()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("console notifications are off: {e:#}");
+                None
+            }
+        };
         State {
             rp,
             tenant: TenantId::single(),
@@ -250,6 +281,9 @@ impl State {
             authed: AtomicU64::new(0),
             vault_dir: wicket_proxy::vault::Vault::default_dir(),
             authz_root: crate::roots::authz_root_public().ok(),
+            tickets: Mutex::new(HashMap::new()),
+            sockets: Arc::new(Mutex::new(session::Sockets::default())),
+            push,
         }
     }
 }
@@ -307,6 +341,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     state.hsts = plan.hsts;
     state.limits.max_connections = plan.max_connections;
     let state = Arc::new(state);
+    spawn_notifier(state.clone());
     let listener = TcpListener::bind(plan.addr).await.with_context(|| format!("listening on {}", plan.addr))?;
     let resolver = Arc::new(tls::CertResolver::default());
     let acceptor = match &plan.tls {
@@ -329,6 +364,9 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         (None, false) => "HTTP, loopback only",
     };
     println!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
+    if !web::SESSION_VIEW_BUILT {
+        println!("this build has no session view (built without web/session's bundle): runs' session pages say so");
+    }
     for (name, dir) in &state.roots {
         println!("runs can be started from {name}: {}", dir.display());
     }
@@ -640,9 +678,19 @@ where
         if path == "/" {
             return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
         }
+        // A run's session view (#327): a static page, as `/` is; it asks for a passkey to open.
+        if path == "/session" {
+            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.session_page.clone());
+        }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
-            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "public, max-age=3600" };
+            let cache = if a.immutable {
+                "public, max-age=31536000, immutable"
+            } else if path == "/sw.js" {
+                "no-cache"
+            } else {
+                "public, max-age=3600"
+            };
             r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
             return r;
         }
@@ -670,6 +718,11 @@ where
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
                 },
+                _ => denied(),
+            },
+            // Notifications: the VAPID public key and this operator's devices.
+            "/api/push" => match &sess {
+                Some((_, SessionKind::Operator { cred })) => to_response(push_view(state, cred)),
                 _ => denied(),
             },
             // A manifest, viewed (#172): an operator's session only.
@@ -708,6 +761,56 @@ where
         Some(r) => to_response(r),
         None => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
     }
+}
+
+/// A WebSocket upgrade for a run's ACP session (#327), if `req` is one: the same origin and
+/// session checks as every request, then [`session::check_upgrade`]. The connection is served
+/// once hyper hands it over.
+fn ws_route<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer: SocketAddr) -> Option<Response<Full<Bytes>>> {
+    let run = session::run_of(req.uri().path())?.to_string();
+    let mut r = ws_upgrade(req, state, peer, run);
+    web::secure_headers(r.headers_mut(), state.hsts);
+    Some(r)
+}
+
+fn ws_upgrade<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer: SocketAddr, run: String) -> Response<Full<Bytes>> {
+    let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).or(req.uri().authority().map(|a| a.as_str()));
+    if !host.is_some_and(|h| h.eq_ignore_ascii_case(&state.authority)) {
+        return denied();
+    }
+    let forwarded: Vec<Option<&str>> = req.headers().get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect();
+    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), &forwarded, &state.trusted) };
+    if req.method() != Method::GET {
+        return denied();
+    }
+    let Some(sess) = session(state, &ctx.sid) else { return denied() };
+    state.authed.fetch_add(1, Ordering::Relaxed);
+    let (ticket, accept, slot) = match session::check_upgrade(state, req.headers(), &run, &sess) {
+        Ok(x) => x,
+        Err((status, msg)) => return to_response(err(status, msg)),
+    };
+    let who = match crate::operators::Operator::console(&state.tenant.0, &ticket.name) {
+        Ok(op) => session::Who { principal: op.id, label: op.label, token: ctx.sid.clone() },
+        Err(e) => return to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    };
+    let on = hyper::upgrade::on(req);
+    let state = state.clone();
+    tokio::spawn(async move {
+        // The slot is held for as long as the socket is served, and freed when it ends or the
+        // upgrade fails.
+        let _slot = slot;
+        if let Ok(up) = on.await {
+            session::serve(hyper_util::rt::TokioIo::new(up), state, run, who, ctx.client).await;
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", accept)
+        .header("sec-websocket-protocol", session::SUBPROTOCOL)
+        .body(Full::new(Bytes::new()))
+        .expect("response")
 }
 
 /// The one-time enrolment link. Any failure (no enrolment open, wrong or used token, throttled)
@@ -788,6 +891,10 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
                 Ok(v) => ok(v),
                 Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
             },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
+        "/api/push/subscribe" | "/api/push/remove" | "/api/push/details" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => push_post(state, cred, path, body),
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
         "/api/logout" => {
@@ -1098,6 +1205,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             });
             Ok((Action::Say { run: run.into(), text: text.into() }, v))
         }
+        Some("open_session") => {
+            let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
+            check_running(&l, run)?;
+            let identity = (state.identity)(&l, run);
+            let v = json!({
+                "v": 1, "action": "open_session", "tenant": state.tenant.0, "run": run,
+                "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
+                "principal": console_principal(oc),
+            });
+            Ok((Action::OpenSession { run: run.into() }, v))
+        }
         Some("revoke") => {
             let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
             let reason = str_field(body, "reason").map(str::trim).filter(|r| !r.is_empty()).unwrap_or("revoked by the operator");
@@ -1152,7 +1270,47 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 manifests::prepare(state, kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             Ok((Action::SaveManifest(Box::new(save)), v))
         }
-        _ => Err(bad("action must be decide, say, revoke, start_run, save_manifest or restore_manifest")),
+        Some("push_subscribe") => {
+            let Some(p) = &state.push else { return Err(err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF)) };
+            let (Some(endpoint), Some(p256dh), Some(auth)) =
+                (str_field(body, "endpoint"), str_field(body, "p256dh"), str_field(body, "auth"))
+            else {
+                return Err(bad("endpoint, p256dh and auth are required"));
+            };
+            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
+            let label = str_field(body, "label").unwrap_or("");
+            let sub = push::Subscription::new(&oc.id, &push::NewDevice { endpoint, p256dh, auth, label, details }, wicket_store::now())
+                .map_err(|e| bad(&format!("{e:#}")))?;
+            let view = sub.view();
+            // The device as the operator sees it, and digests binding the signature to the exact
+            // endpoint and keys (the endpoint is a capability: it is never shown or logged).
+            let v = json!({
+                "v": 1, "action": "push_subscribe", "tenant": state.tenant.0, "credential": oc.id,
+                "device": sub.id, "label": sub.label, "service": view["service"], "details": sub.details,
+                "endpoint_sha256": hex::encode(sha2::Sha256::digest(sub.endpoint.as_bytes())),
+                "keys_sha256": hex::encode(sha2::Sha256::digest(format!("{}.{}", sub.p256dh, sub.auth).as_bytes())),
+                "replaces": p.store.all().iter().any(|s| s.id == sub.id),
+            });
+            Ok((Action::PushSubscribe(Box::new(sub)), v))
+        }
+        Some("push_details") => {
+            let Some(p) = &state.push else { return Err(err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF)) };
+            let Some(id) = str_field(body, "id") else { return Err(bad("id required")) };
+            if body.get("details").and_then(Value::as_bool) != Some(true) {
+                return Err(bad("only turning details on is signed; turn them off with /api/push/details"));
+            }
+            let Some(d) = p.store.list(&oc.id).into_iter().find(|s| s.id == id) else {
+                return Err(err(StatusCode::NOT_FOUND, "no such device"));
+            };
+            let v = json!({
+                "v": 1, "action": "push_details", "tenant": state.tenant.0, "credential": oc.id,
+                "device": d.id, "label": d.label, "service": d.view()["service"], "details": true,
+            });
+            Ok((Action::PushDetails { operator: oc.id.clone(), device: d.id }, v))
+        }
+        _ => Err(bad(
+            "action must be decide, say, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe or push_details",
+        )),
     }
 }
 
@@ -1185,6 +1343,12 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
         Ok(x) => x,
         Err(r) => return r,
     };
+    // A session socket over its caps is refused before the passkey is asked for (#327).
+    if matches!(action, Action::OpenSession { .. }) {
+        if let Some(why) = session::over_cap(state, &sid) {
+            return err(StatusCode::TOO_MANY_REQUESTS, why);
+        }
+    }
     let action_json = v.to_string();
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();
@@ -1201,6 +1365,7 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Some(ch) = body.get("challenge").and_then(|c| c.as_str()) else { return err(StatusCode::BAD_REQUEST, "challenge required") };
     let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown, used or expired challenge") };
     let same_session = p.session.is_some() && p.session == sess.as_ref().map(|s| s.0.clone());
+    let console_session = p.session.clone().unwrap_or_default();
     let Purpose::Action { action_json, nonce, action } = p.purpose else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
@@ -1218,6 +1383,12 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     // Decisions keep the field name they have always had, so older records and verifiers agree.
     let field = if matches!(*action, Action::Decide { .. }) { "decision_json" } else { "action_json" };
     signed[field] = action_json.into();
+    if let Action::OpenSession { run } = &*action {
+        return match session::open(state, run, &a.oc, &console_session, signed) {
+            Ok(v) => ok(v),
+            Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
     match apply(state, &action, &a.oc, signed) {
         Ok(msg) => ok(json!({ "ok": msg })),
         Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
@@ -1293,6 +1464,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 oc.name
             ))
         }
+        Action::OpenSession { .. } => unreachable!("action_finish opens sessions"),
         Action::SaveManifest(save) => {
             manifests::apply(state, save)?;
             let signed_action: Value =
@@ -1340,7 +1512,153 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             })?;
             Ok(format!("started {run} from {root}/{name} as {} (log: runs/{run}/console.log)", wicket_identity::principal_label(principal)))
         }
+        Action::PushSubscribe(sub) => {
+            let Some(p) = &state.push else { bail!(PUSH_OFF) };
+            let sub = p.store.insert(push::Subscription { created: wicket_store::now(), ..(**sub).clone() })?;
+            let v = sub.view();
+            l.audit(
+                t,
+                None,
+                "operator.push_subscribed",
+                &json!({ "action": "push_subscribe", "credential": sub.operator, "device": v["id"], "label": v["label"],
+                         "service": v["service"], "details": sub.details, "by": by, "signed": signed }),
+            )?;
+            Ok(format!("notifications on for {} (signed with {})", sub.label, oc.name))
+        }
+        Action::PushDetails { operator, device } => {
+            let Some(p) = &state.push else { bail!(PUSH_OFF) };
+            if !p.store.set_details(operator, device, true)? {
+                bail!("no such device (it was removed after you were shown it)");
+            }
+            l.audit(
+                t,
+                None,
+                "operator.push_details",
+                &json!({ "action": "push_details", "credential": operator, "device": device, "details": true, "by": by, "signed": signed }),
+            )?;
+            Ok(format!("notifications on this device show the request (signed with {})", oc.name))
+        }
     }
+}
+
+/// Why there are no notifications: the push state couldn't be opened at start-up.
+const PUSH_OFF: &str = "notifications are off on this console (see its log)";
+
+/// The VAPID public key browsers subscribe with, and the signed-in operator's devices.
+fn push_view(state: &State, cred: &str) -> Reply {
+    match &state.push {
+        Some(p) => ok(json!({
+            "public_key": p.vapid.public_b64(),
+            "devices": p.store.list(cred).iter().map(|s| s.view()).collect::<Vec<_>>(),
+            "min_interval_secs": push::MIN_INTERVAL,
+        })),
+        None => err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF),
+    }
+}
+
+/// The session-only changes to a device, which only narrow what it receives: remove one, or turn
+/// its details off. A signed-in operator only, and only their own devices; each change is audited.
+/// Registering a device and turning its details on widen it, so they are passkey-signed actions
+/// (`push_subscribe`, `push_details`); asked for here without a signature, they are refused and
+/// the refusal is audited (a stolen session cookie alone adds no receiver).
+fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
+    let Some(p) = &state.push else { return err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF) };
+    let audit = |kind: &str, v: Value| {
+        if let Ok(l) = state.ledger() {
+            let _ = l.audit(&state.tenant, None, kind, &v);
+        }
+    };
+    let id = str_field(body, "id").unwrap_or("");
+    let found = |done: Result<bool>| match done {
+        Ok(true) => None,
+        Ok(false) => Some(err(StatusCode::NOT_FOUND, "no such device")),
+        Err(e) => Some(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+    };
+    match path {
+        "/api/push/subscribe" => {
+            audit("operator.push_refused", json!({ "credential": cred, "path": path, "reason": "unsigned subscribe" }));
+            err(StatusCode::FORBIDDEN, "registering a device is a signed action: sign it with your passkey (action push_subscribe)")
+        }
+        "/api/push/remove" => {
+            if let Some(r) = found(p.store.remove(cred, id)) {
+                return r;
+            }
+            audit("operator.push_removed", json!({ "credential": cred, "device": id, "by": "operator" }));
+            ok(json!({ "ok": "device removed" }))
+        }
+        _ => {
+            if body.get("details").and_then(Value::as_bool).unwrap_or(false) {
+                audit("operator.push_refused", json!({ "credential": cred, "path": path, "device": id, "reason": "unsigned details on" }));
+                return err(
+                    StatusCode::FORBIDDEN,
+                    "showing the request on a device is a signed action: sign it with your passkey (action push_details)",
+                );
+            }
+            if let Some(r) = found(p.store.set_details(cred, id, false)) {
+                return r;
+            }
+            audit(
+                "operator.push_details",
+                json!({ "action": "push_details", "credential": cred, "device": id, "details": false, "by": "operator" }),
+            );
+            ok(json!({ "ok": "notifications show only the count" }))
+        }
+    }
+}
+
+/// What is waiting for a decision, for the notifier: every pending request (egress asks, and
+/// wicket's own capacity, update, spawn and link asks), oldest first.
+fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
+    let l = state.ledger()?;
+    Ok(l.pending(&state.tenant)?
+        .into_iter()
+        .map(|r| {
+            let agent = l.identity(&r.run).ok().flatten().map(|i| i.agent).unwrap_or_else(|| r.run.clone());
+            let ask = format!("{} {}{}{}", r.method, r.host, r.path, if r.scope_prefix { "…" } else { "" });
+            push::Waiting { id: r.id, summary: format!("{agent} asks {ask}") }
+        })
+        .collect())
+}
+
+/// How often the notifier looks at the ledger for new requests.
+const NOTIFY_EVERY: Duration = Duration::from_secs(3);
+
+/// Watches the ledger and pushes to subscribed devices when a new request is waiting. Pushes go
+/// only to devices of passkeys still enrolled.
+fn spawn_notifier(state: Arc<State>) {
+    if state.push.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut n = push::Notifier::default();
+        loop {
+            tokio::time::sleep(NOTIFY_EVERY).await;
+            notify_once(&state, &mut n, wicket_store::now()).await;
+        }
+    });
+}
+
+/// One look at the ledger: pushes for what is new, if any is due. Returns what each push service said.
+async fn notify_once(state: &State, n: &mut push::Notifier, now: i64) -> Vec<(String, u16)> {
+    let Some(p) = &state.push else { return Vec::new() };
+    let (waiting, creds) = match (waiting(state), creds(state)) {
+        (Ok(w), Ok(c)) => (w, c),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("notifier: reading the ledger: {e:#}");
+            return Vec::new();
+        }
+    };
+    let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
+    let results = p.deliver(n.tick(&waiting, &subs, now), now).await;
+    for (id, status) in &results {
+        if *status == 404 || *status == 410 {
+            if let Ok(l) = state.ledger() {
+                let _ =
+                    l.audit(&state.tenant, None, "operator.push_removed", &json!({ "device": id, "by": "push service", "status": status }));
+            }
+        }
+    }
+    results
 }
 
 fn dashboard(state: &State) -> Result<Value> {
@@ -1359,6 +1677,11 @@ fn dashboard(state: &State) -> Result<Value> {
             let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
             v["has_identity"] = l.identity(&id).ok().flatten().is_some().into();
             v["revoked"] = l.revoked(&id).ok().flatten().is_some().into();
+            // An ACP run's session can be opened in the console (#327): its supervisor keeps the log
+            // the session view reads.
+            v["acp"] = (session::run_of(&format!("/api/runs/{id}/acp")).is_some()
+                && state.data.join("runs").join(&id).join(crate::transcript::ACP_LOG).is_file())
+            .into();
             // A remote session's address (#169), as its run recorded it.
             if let Some(u) = l
                 .audit_latest(&id, "run.remote_session")
@@ -1568,6 +1891,8 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod notify;
+    mod session;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);

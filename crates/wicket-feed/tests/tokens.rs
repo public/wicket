@@ -287,6 +287,49 @@ fn authz_grant(gid: &str, method: &str, path: &str, not_after_ms: i64) -> AuthzG
     }
 }
 
+/// #342: a grant is live while `now < expires_at` (#337: half-open, in ms), on the node as in the
+/// ledger. Published with `not_after = expires_at - 1`, the token's inclusive whole-second check
+/// allows it at `expires_at - 1 ms` and refuses it at `expires_at`, fresh or cut off.
+#[test]
+fn a_grant_is_allowed_until_expires_at_on_the_node_and_refused_at_it() {
+    let mut cp = Cp::new();
+    let z = zone("z", &["/repos/acme/**"]);
+    let issuer = cp.issue("r1", &z);
+    let mut r = cp.replica();
+    cp.put(issuer.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    sync(&mut cp.p, &mut r, T0);
+    let hook = gh("z", "r1", "POST", "/repos/acme/app/hooks"); // R4: needs a grant
+                                                               // The ledger's grant ends at `expires_at` (Unix seconds), as `GrantRow::expires_at`.
+    let expires_at = secs(T0) as i64 + 60;
+    let end_ms = expires_at * 1000;
+    let mut g = authz_grant("g1", "POST", "/repos/acme/app/hooks", 0);
+    g.not_after = AuthzGrant::not_after_for(expires_at);
+    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: g, uses: None }]).unwrap();
+    r.accept(&cp.put(a, T0 + 10), T0 + 10).unwrap();
+    // A node cut off from T0 + 20 on (offline, #153).
+    let mut cut = cp.replica();
+    sync(&mut cp.p, &mut cut, T0 + 20);
+    // Fresh, near the end (statements keep the replica fresh up to it).
+    r.accept(&cp.p.statement(end_ms - 1_000), end_ms - 1_000).unwrap();
+    assert_eq!(r.decide(&hook, end_ms - 1_000), Decision::Allow(Allowed::Grant("g1".into())));
+    assert_eq!(r.decide(&hook, end_ms - 1), Decision::Allow(Allowed::Grant("g1".into())), "allowed at expires_at - 1 ms");
+    assert_eq!(kind(&r.decide(&hook, end_ms)), "needs-grant", "refused at expires_at");
+    assert_eq!(kind(&r.decide(&hook, end_ms + 999)), "needs-grant", "and within the second after it");
+    // The same on the node cut off: the grant's end is the ledger's.
+    assert_eq!(cut.mode(end_ms - 1), Mode::Offline);
+    assert_eq!(cut.decide(&hook, end_ms - 1), Decision::Allow(Allowed::Grant("g1".into())));
+    assert_eq!(kind(&cut.decide(&hook, end_ms)), "needs-grant");
+    // What #337's F1 found: `not_after = expires_at` honours the grant up to 999 ms past it.
+    let mut late = authz_grant("g2", "POST", "/repos/acme/app/hooks", 0);
+    late.not_after = u64::try_from(expires_at).unwrap();
+    let a = issuer.publish(&cp.approver, &[LiveGrant { grant: late, uses: None }]).unwrap();
+    let mut old = cp.replica();
+    let now = end_ms - 500;
+    cp.put(a, now);
+    sync(&mut cp.p, &mut old, now);
+    assert_eq!(old.decide(&hook, end_ms + 999), Decision::Allow(Allowed::Grant("g2".into())), "the old publication outlives the ledger");
+}
+
 #[test]
 fn a_grant_reaches_the_node_and_its_use_count_is_enforced_there() {
     let mut cp = Cp::new();
