@@ -57,6 +57,10 @@ pub static ASSETS: LazyLock<Assets> = LazyLock::new(|| {
     };
     add(&js, "text/javascript; charset=utf-8", JS.as_bytes(), true);
     add(&css, "text/css; charset=utf-8", CSS.as_bytes(), true);
+    // The service worker (Web Push): at the root so its scope is the whole console, and not cached
+    // for long so a new build's reaches devices. The CSP's `script-src 'self'` allows it (with no
+    // `worker-src`, workers fall back to `script-src`).
+    add("/sw.js", "text/javascript; charset=utf-8", include_bytes!("static/sw.js"), false);
     add("/manifest.webmanifest", "application/manifest+json", include_bytes!("static/manifest.webmanifest"), false);
     add("/static/icon.svg", "image/svg+xml", include_bytes!("static/icon.svg"), false);
     add("/static/icon-192.png", "image/png", include_bytes!("static/icon-192.png"), false);

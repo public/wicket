@@ -54,6 +54,7 @@ mod authority;
 mod limits;
 mod manifests;
 mod net;
+mod push;
 mod tls;
 mod web;
 
@@ -216,6 +217,8 @@ struct State {
     vault_dir: PathBuf,
     /// The authority root's public key, which runs' tokens load against (`authority.rs`).
     authz_root: Option<wicket_authz::PublicKey>,
+    /// Web Push to the operators' devices ([`push`]); None if its state couldn't be opened.
+    push: Option<push::Push>,
 }
 
 impl State {
@@ -233,6 +236,13 @@ impl State {
     ) -> State {
         let authority = rp.origin.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default();
         let hsts = rp.origin.starts_with("https://");
+        let push = match push::Push::open(&data.join("console"), &rp.origin, push::reqwest_transport()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("console notifications are off: {e:#}");
+                None
+            }
+        };
         State {
             rp,
             tenant: TenantId::single(),
@@ -250,6 +260,7 @@ impl State {
             authed: AtomicU64::new(0),
             vault_dir: wicket_proxy::vault::Vault::default_dir(),
             authz_root: crate::roots::authz_root_public().ok(),
+            push,
         }
     }
 }
@@ -307,6 +318,7 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
     state.hsts = plan.hsts;
     state.limits.max_connections = plan.max_connections;
     let state = Arc::new(state);
+    spawn_notifier(state.clone());
     let listener = TcpListener::bind(plan.addr).await.with_context(|| format!("listening on {}", plan.addr))?;
     let resolver = Arc::new(tls::CertResolver::default());
     let acceptor = match &plan.tls {
@@ -642,7 +654,13 @@ where
         }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
-            let cache = if a.immutable { "public, max-age=31536000, immutable" } else { "public, max-age=3600" };
+            let cache = if a.immutable {
+                "public, max-age=31536000, immutable"
+            } else if path == "/sw.js" {
+                "no-cache"
+            } else {
+                "public, max-age=3600"
+            };
             r.headers_mut().insert("cache-control", http::HeaderValue::from_static(cache));
             return r;
         }
@@ -670,6 +688,11 @@ where
                     Ok(v) => to_response(ok(v)),
                     Err(e) => to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
                 },
+                _ => denied(),
+            },
+            // Notifications: the VAPID public key and this operator's devices.
+            "/api/push" => match &sess {
+                Some((_, SessionKind::Operator { cred })) => to_response(push_view(state, cred)),
                 _ => denied(),
             },
             // A manifest, viewed (#172): an operator's session only.
@@ -788,6 +811,10 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
                 Ok(v) => ok(v),
                 Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
             },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
+        "/api/push/subscribe" | "/api/push/remove" | "/api/push/details" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => push_post(state, cred, path, body),
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
         "/api/logout" => {
@@ -1341,6 +1368,126 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             Ok(format!("started {run} from {root}/{name} as {} (log: runs/{run}/console.log)", wicket_identity::principal_label(principal)))
         }
     }
+}
+
+/// The VAPID public key browsers subscribe with, and the signed-in operator's devices.
+fn push_view(state: &State, cred: &str) -> Reply {
+    match &state.push {
+        Some(p) => ok(json!({
+            "public_key": p.vapid.public_b64(),
+            "devices": p.store.list(cred).iter().map(|s| s.view()).collect::<Vec<_>>(),
+            "min_interval_secs": push::MIN_INTERVAL,
+        })),
+        None => err(StatusCode::SERVICE_UNAVAILABLE, "notifications are off on this console (see its log)"),
+    }
+}
+
+/// Subscribe a device, remove one, or set whether its notifications show the request. A signed-in
+/// operator only, and only their own devices; each change is audited.
+fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
+    let Some(p) = &state.push else { return err(StatusCode::SERVICE_UNAVAILABLE, "notifications are off on this console (see its log)") };
+    let now = wicket_store::now();
+    let audit = |kind: &str, v: Value| {
+        if let Ok(l) = state.ledger() {
+            let _ = l.audit(&state.tenant, None, kind, &v);
+        }
+    };
+    let id = str_field(body, "id").unwrap_or("");
+    let found = |done: Result<bool>| match done {
+        Ok(true) => None,
+        Ok(false) => Some(err(StatusCode::NOT_FOUND, "no such device")),
+        Err(e) => Some(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+    };
+    match path {
+        "/api/push/subscribe" => {
+            let (Some(endpoint), Some(p256dh), Some(auth)) =
+                (str_field(body, "endpoint"), str_field(body, "p256dh"), str_field(body, "auth"))
+            else {
+                return err(StatusCode::BAD_REQUEST, "endpoint, p256dh and auth are required");
+            };
+            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
+            match p.store.add(cred, endpoint, p256dh, auth, str_field(body, "label").unwrap_or(""), details, now) {
+                Ok(s) => {
+                    let v = s.view();
+                    audit(
+                        "operator.push_subscribed",
+                        json!({ "credential": cred, "device": v["id"], "label": v["label"], "service": v["service"], "details": s.details }),
+                    );
+                    ok(json!({ "ok": "notifications on for this device", "device": v }))
+                }
+                Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            }
+        }
+        "/api/push/remove" => {
+            if let Some(r) = found(p.store.remove(cred, id)) {
+                return r;
+            }
+            audit("operator.push_removed", json!({ "credential": cred, "device": id, "by": "operator" }));
+            ok(json!({ "ok": "device removed" }))
+        }
+        _ => {
+            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(r) = found(p.store.set_details(cred, id, details)) {
+                return r;
+            }
+            audit("operator.push_details", json!({ "credential": cred, "device": id, "details": details }));
+            ok(json!({ "ok": if details { "notifications show the request" } else { "notifications show only the count" } }))
+        }
+    }
+}
+
+/// What is waiting for a decision, for the notifier: every pending request (egress asks, and
+/// wicket's own capacity, update, spawn and link asks), oldest first.
+fn waiting(state: &State) -> Result<Vec<push::Waiting>> {
+    let l = state.ledger()?;
+    Ok(l.pending(&state.tenant)?
+        .into_iter()
+        .map(|r| {
+            let agent = l.identity(&r.run).ok().flatten().map(|i| i.agent).unwrap_or_else(|| r.run.clone());
+            let ask = format!("{} {}{}{}", r.method, r.host, r.path, if r.scope_prefix { "…" } else { "" });
+            push::Waiting { id: r.id, summary: format!("{agent} asks {ask}") }
+        })
+        .collect())
+}
+
+/// How often the notifier looks at the ledger for new requests.
+const NOTIFY_EVERY: Duration = Duration::from_secs(3);
+
+/// Watches the ledger and pushes to subscribed devices when a new request is waiting. Pushes go
+/// only to devices of passkeys still enrolled.
+fn spawn_notifier(state: Arc<State>) {
+    if state.push.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut n = push::Notifier::default();
+        loop {
+            tokio::time::sleep(NOTIFY_EVERY).await;
+            let Some(p) = &state.push else { return };
+            let (waiting, creds) = match (waiting(&state), creds(&state)) {
+                (Ok(w), Ok(c)) => (w, c),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("notifier: reading the ledger: {e:#}");
+                    continue;
+                }
+            };
+            let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
+            let now = wicket_store::now();
+            let out = n.tick(&waiting, &subs, now);
+            for (id, status) in p.deliver(out, now).await {
+                if status == 404 || status == 410 {
+                    if let Ok(l) = state.ledger() {
+                        let _ = l.audit(
+                            &state.tenant,
+                            None,
+                            "operator.push_removed",
+                            &json!({ "device": id, "by": "push service", "status": status }),
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn dashboard(state: &State) -> Result<Value> {
