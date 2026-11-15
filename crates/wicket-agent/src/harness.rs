@@ -319,7 +319,8 @@ impl Adapter for ClaudeCode {
     }
 
     fn message_push(&self, _m: &Manifest) -> Option<MessagePush> {
-        claude::CHANNELS_IN_BOX.then(|| MessagePush { capability: claude::CHANNEL_CAPABILITY.into(), method: claude::CHANNEL_NOTIFICATION.into() })
+        claude::CHANNELS_IN_BOX
+            .then(|| MessagePush { capability: claude::CHANNEL_CAPABILITY.into(), method: claude::CHANNEL_NOTIFICATION.into() })
     }
 
     fn is_runtime(&self, _m: &Manifest, cmd: &str) -> bool {

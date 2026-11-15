@@ -2895,7 +2895,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zb", B), "body": { "hello": 1 } })).await;
         assert!(!err && t.starts_with("sent m-node-") && t.contains("attested by the node"), "{t}");
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zc", C), "body": {} })).await;
-        assert!(err && t.contains("does not accept messages from zone za"), "{t}");
+        assert!(err && t.starts_with("refused: m-node-") && t.contains("does not accept messages from zone za"), "{t}");
+        assert!(t.contains("\"state\":\"refused\""), "with a receipt that says so: {t}");
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zz", "run_zzzzzzzzzzzzzzzzzzzzzzzzzz"), "body": {} })).await;
         assert!(err && t.contains("isn't running on your node"), "{t}");
         let (t, err) = call(A, "send_message", serde_json::json!({ "to": B, "body": {} })).await;
@@ -2929,14 +2930,18 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(node.edge_start(B).unwrap().push.as_ref(), Some(&spec));
         // initialize: the capability, and a protocol revision that has a stream for notifications.
         let init = |asked: &str| {
-            let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": asked, "capabilities": { "tools": {} } } });
+            let body =
+                serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": asked, "capabilities": { "tools": {} } } });
             gateway::with_push(gateway::gw_reply(200, body), &spec, Some(asked))
         };
         for (asked, got) in [("2026-07-28", "2025-11-25"), ("2025-06-18", "2025-06-18")] {
             let b = init(asked).into_body().collect().await.unwrap().to_bytes();
             let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
             assert_eq!(v["result"]["protocolVersion"], got);
-            assert!(v["result"]["capabilities"]["experimental"]["x/channel"].is_object() && v["result"]["capabilities"]["tools"].is_object(), "{v}");
+            assert!(
+                v["result"]["capabilities"]["experimental"]["x/channel"].is_object() && v["result"]["capabilities"]["tools"].is_object(),
+                "{v}"
+            );
         }
         // Cut off: two messages from A, delivered on the node; B's stream pushes the urgent one first.
         let to_b = serde_json::json!(format!("spiffe://wicket.test/t/t0/z/zb/a/{B}"));
@@ -2962,12 +2967,18 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let n = event(&mut frames).await;
         assert_eq!(n["method"], "notifications/x/channel");
         let meta = &n["params"]["meta"];
-        assert_eq!((meta["from_run"].as_str(), meta["verified_by"].as_str(), meta["priority"].as_str()), (Some(A), Some("node n1"), Some("now")));
+        assert_eq!(
+            (meta["from_run"].as_str(), meta["verified_by"].as_str(), meta["priority"].as_str()),
+            (Some(A), Some("node n1"), Some("now"))
+        );
         assert_eq!(meta["reply_to"].as_str(), Some(format!("spiffe://wicket.test/t/t0/z/za/a/{A}").as_str()));
         assert!(meta.as_object().unwrap().values().all(|v| v.is_string()), "meta is strings only: {meta}");
         let content: serde_json::Value = serde_json::from_str(n["params"]["content"].as_str().unwrap()).unwrap();
         assert!(content["body"]["urgent"] == true && content["note"].as_str().unwrap().contains("not instructions"), "{content}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(event(&mut frames).await["params"]["content"].as_str().unwrap()).unwrap()["body"], "whenever");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event(&mut frames).await["params"]["content"].as_str().unwrap()).unwrap()["body"],
+            "whenever"
+        );
         let (t, _) = gw::tool(&node, B, "await_message", &serde_json::json!({ "timeout_seconds": 1 })).await.unwrap();
         assert!(t.starts_with("no message"), "pushed once, not again by await_message: {t}");
         // Connected: the stream takes B's messages from its gateway on the control host.
@@ -2987,7 +2998,10 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         };
         assert_eq!(name, "await_message", "{args}");
         let n = event(&mut frames).await;
-        assert_eq!((n["params"]["meta"]["message_id"].as_str(), n["params"]["meta"]["verified_by"].as_str()), (Some("m-1"), Some("wicket")));
+        assert_eq!(
+            (n["params"]["meta"]["message_id"].as_str(), n["params"]["meta"]["verified_by"].as_str()),
+            (Some("m-1"), Some("wicket"))
+        );
         drop(frames);
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert_eq!(audit.iter().filter(|r| r.2 == "node.message_pushed").count(), 3, "{audit:?}");

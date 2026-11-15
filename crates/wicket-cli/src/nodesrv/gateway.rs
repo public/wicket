@@ -46,7 +46,11 @@ pub(super) fn push_stream(rx: tokio::sync::mpsc::Receiver<serde_json::Value>) ->
 
 /// `initialize`'s answer with push on (#252): the harness's capability declared, and MCP's
 /// protocol held at a revision with a stream for server notifications (2026-07-28's has none).
-pub(super) fn with_push(resp: hyper::Response<GwBody>, p: &wicket_agent::harness::MessagePush, asked: Option<&str>) -> hyper::Response<GwBody> {
+pub(super) fn with_push(
+    resp: hyper::Response<GwBody>,
+    p: &wicket_agent::harness::MessagePush,
+    asked: Option<&str>,
+) -> hyper::Response<GwBody> {
     const LAST_WITH_STREAM: &str = "2025-11-25";
     let (parts, body) = resp.into_parts();
     let bytes = futures_util::FutureExt::now_or_never(http_body_util::BodyExt::collect(body)).map(|b| b.expect("infallible").to_bytes());

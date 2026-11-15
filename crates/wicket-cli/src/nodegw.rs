@@ -11,6 +11,8 @@
 //! | `await_grant` | this node's queue (`q-…`) | the human's decision (read where it is taken) |
 //! | `pending_requests` | this node's queue | the human's open requests |
 //! | `request_capacity`, `request_update` | (a human decides) | the request; queued while unreachable |
+//! | `send_message`, `await_message` (cut off) | both boxes' tokens, delivered on this node | nothing |
+//! | push delivery (#252, the session's `GET` stream) | this node's inbox, cut off | `await_message`, connected |
 //!
 //! A call that needs a human while the control host can't be reached is queued on this node's disk
 //! (`edge.json`, beside #153's `asks.json`) under a node-local id `q-…`, made when the run's
@@ -326,13 +328,12 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
     {
         "peer"
     } else {
-        return (
-            format!("not sent: zone {} does not accept messages from zone {my_zone} (its accept_from does not list it)", to_zone.name),
-            true,
-        );
+        let why = format!("zone {} does not accept messages from zone {my_zone} (its accept_from does not list it)", to_zone.name);
+        return refused_here(node, run, to, &why);
     };
     if let Some(o) = org.filter(|o| !o.allows_message_from(&my_zone)) {
-        return (format!("not sent: the org policy ({}) doesn't let zone {} hear from zone {my_zone}", o.version, to_zone.name), true);
+        let why = format!("the org policy ({}) doesn't let zone {} hear from zone {my_zone}", o.version, to_zone.name);
+        return refused_here(node, run, to, &why);
     }
     let id = format!("m-node-{}", ulid::Ulid::new().to_string().to_lowercase());
     node.edge.post(LocalMessage {
@@ -353,6 +354,15 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         format!("sent {id} to {to_run}, delivered by your node (wicket's control host is unreachable, so it is attested by the node, not signed with your identity)\nreceipt: {receipt}"),
         false,
     )
+}
+
+/// A message refused on this node while cut off (#252): on its audit log, with a receipt for the
+/// sender that says why.
+fn refused_here(node: &Node, run: &str, to: &str, why: &str) -> (String, bool) {
+    let id = format!("m-node-{}", ulid::Ulid::new().to_string().to_lowercase());
+    node.audit_note(run, "node.message_refused", json!({ "id": id, "to": to, "why": why }));
+    let receipt = json!({ "message_id": id, "to": to, "state": "refused", "why": why, "verified_by": format!("node {}", node.name) });
+    (format!("refused: {id} was not delivered: {why}\nreceipt: {receipt}"), true)
 }
 
 /// Waits for a message: one delivered on this node first, else (connected) the control host's.
