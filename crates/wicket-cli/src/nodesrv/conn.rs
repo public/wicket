@@ -307,14 +307,12 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     }
                 }
             }
-            Msg::Lease { run, lease } => {
-                if let Some(sl) = &lease.slice {
-                    if let Err(e) = node.slices.put(&run, sl) {
-                        eprintln!("[node] {run}: keeping its budget slice: {e:#}");
-                    }
+            Msg::BudgetSlice { run, slice } => {
+                if let Err(e) = node.slices.put(&run, &slice) {
+                    eprintln!("[node] {run}: keeping its budget slice: {e:#}");
                 }
                 if let Some(l) = node.llms.lock().expect("llms").get(&run) {
-                    l.set_slice(lease.slice);
+                    l.set_slice(Some(slice));
                 }
             }
             Msg::SecretRevoke { run, name } => node.secrets.revoke(&run, &name),

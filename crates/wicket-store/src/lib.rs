@@ -13,6 +13,8 @@ pub mod bundle;
 pub mod cas;
 mod links;
 mod node;
+mod quota;
+pub use quota::{GrantListing, Quota, QUOTA_HOST, QUOTA_METHOD};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
@@ -61,8 +63,9 @@ pub enum StoreError {
 ///
 /// Version 1 is every migration up to #162 (all of them expand steps: `CREATE ... IF NOT EXISTS`
 /// and `ADD COLUMN`). Version 2 (expand) adds `runs.authority_until` and `runs.authority_cap`, a
-/// running box's renewable authority (#56).
-pub const SCHEMA_VERSION: u32 = 2;
+/// running box's renewable authority (#56). Version 3 (expand) adds `grants.amount`: a quota
+/// grant's amount (model budget, children, bytes), recorded as a grant (#256).
+pub const SCHEMA_VERSION: u32 = 3;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -242,7 +245,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -314,6 +317,48 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 "#;
 
+/// What a request needs of a grant: the one lookup every request kind's grant is found by
+/// ([`Ledger::consume_grant`] for access, SPAWN and LINK asks, [`Ledger::use_update_approval`] for
+/// UPDATE). `None` matches any tenant, zone or run.
+struct GrantMatch<'a> {
+    tenant: Option<&'a str>,
+    zone: Option<&'a str>,
+    run: Option<&'a str>,
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    /// The op's risk rank: the grant must cover at least it (#119).
+    min_risk: i64,
+    /// Only an exact-path grant (not a prefix).
+    exact: bool,
+    /// Only a grant made for a request whose own method, host and path are these.
+    answers_request: bool,
+}
+
+/// The oldest live grant matching `m` (exact paths before prefixes), with its uses left: not
+/// revoked or expired, not handed to a node (the node counts its uses then), with a use left, and
+/// never a quota grant (#256), which records an amount and decides no op.
+fn live_grant(tx: &rusqlite::Transaction<'_>, m: &GrantMatch<'_>) -> Result<Option<(String, Option<i64>)>> {
+    Ok(tx
+        .query_row(
+            // `d`: the prefix ending in '/' (older ledgers stored it without), so it covers whole
+            // segments only (#119).
+            "SELECT g.id, g.uses_left FROM (SELECT *, CASE WHEN substr(path, -1) = '/' THEN path ELSE path || '/' END AS d FROM grants) g
+             LEFT JOIN requests r ON r.id = g.request_id
+             WHERE (?1 IS NULL OR g.tenant = ?1) AND (?2 IS NULL OR g.zone = ?2) AND g.method = ?3 AND g.host = ?4
+               AND g.revoked = 0 AND g.expires_at > ?5 AND g.amount IS NULL
+               AND g.node IS NULL AND (g.run IS NULL OR ?8 IS NULL OR g.run = ?8)
+               AND (g.uses_left IS NULL OR g.uses_left > 0)
+               AND COALESCE(g.max_risk, 0) >= ?7
+               AND ((g.prefix = 0 AND g.path = ?6) OR (?9 = 0 AND g.prefix = 1 AND (?6 || '/' = g.d OR substr(?6, 1, length(g.d)) = g.d)))
+               AND (?10 = 0 OR (r.method = ?3 AND r.host = ?4 AND r.path = ?6))
+             ORDER BY g.prefix ASC, g.created_at ASC LIMIT 1",
+            params![m.tenant, m.zone, m.method, m.host, now(), m.path, m.min_risk, m.run, m.exact as i64, m.answers_request as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
 impl Ledger {
     pub fn open(path: &Path) -> Result<Ledger> {
         if let Some(dir) = path.parent() {
@@ -340,6 +385,8 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN run TEXT", []);
         // The feed epoch that carries a grant handed to a node, until the node reports it applied.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN node_epoch INTEGER", []);
+        // Ledgers created before quotas were grants (#256): NULL for every other grant.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN amount INTEGER", []);
         // Ledgers created before runs recorded their supervising process.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN owner TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN lease TEXT", []);
@@ -851,22 +898,20 @@ impl Ledger {
     /// grant bound to a run covers only that run's ops (#127).
     pub fn consume_grant(&mut self, op: &Op) -> Result<Option<String>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let t = now();
-        let found: Option<(String, Option<i64>)> = tx
-            .query_row(
-                // `d`: the prefix ending in '/' (older ledgers stored it without), so it covers whole
-                // segments only (#119).
-                "SELECT id, uses_left FROM (SELECT *, CASE WHEN substr(path, -1) = '/' THEN path ELSE path || '/' END AS d FROM grants)
-                 WHERE tenant = ?1 AND zone = ?2 AND method = ?3 AND host = ?4 AND revoked = 0 AND expires_at > ?5
-                   AND node IS NULL AND (run IS NULL OR run = ?8)
-                   AND (uses_left IS NULL OR uses_left > 0)
-                   AND COALESCE(max_risk, 0) >= ?7
-                   AND ((prefix = 0 AND path = ?6) OR (prefix = 1 AND (?6 || '/' = d OR substr(?6, 1, length(d)) = d)))
-                 ORDER BY prefix ASC, created_at ASC LIMIT 1",
-                params![op.tenant.0, op.zone, op.method, op.host, t, op.path, op.risk.rank(), op.run.0],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let found = live_grant(
+            &tx,
+            &GrantMatch {
+                tenant: Some(&op.tenant.0),
+                zone: Some(&op.zone),
+                run: Some(&op.run.0),
+                method: &op.method,
+                host: &op.host,
+                path: &op.path,
+                min_risk: op.risk.rank(),
+                exact: false,
+                answers_request: false,
+            },
+        )?;
         let Some((gid, uses)) = found else {
             tx.commit()?;
             return Ok(None);
@@ -879,25 +924,35 @@ impl Ledger {
     }
 
     /// An operator's approval of an agent's `request_update` for the artifact with this sha256
-    /// (#162): a live grant made for such a request. It is used up here (revoked, whatever uses it
-    /// had left), so one approval accepts one update. Returns (request id, grant id).
+    /// (#162): a live grant made for such a request, found by the same lookup as every other
+    /// request kind's ([`Ledger::consume_grant`]), for exactly `UPDATE wicket.internal
+    /// /self/<sha256>`, from any run. It is used up here (revoked, whatever uses it had left), so
+    /// one approval accepts one update. Returns (request id, grant id).
     pub fn use_update_approval(&mut self, sha256: &str) -> Result<Option<(String, String)>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found: Option<(String, String)> = tx
-            .query_row(
-                "SELECT r.id, g.id FROM grants g JOIN requests r ON r.id = g.request_id
-                 WHERE r.method = 'UPDATE' AND r.host = 'wicket.internal' AND r.path = ?1 AND g.path = ?1 AND g.prefix = 0
-                   AND g.revoked = 0 AND g.expires_at > ?2 AND (g.uses_left IS NULL OR g.uses_left > 0)
-                 ORDER BY g.created_at ASC LIMIT 1",
-                params![format!("/self/{sha256}"), now()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((_, gid)) = &found {
-            tx.execute("UPDATE grants SET revoked = 1 WHERE id = ?1", params![gid])?;
-        }
+        let path = format!("/self/{sha256}");
+        let found = live_grant(
+            &tx,
+            &GrantMatch {
+                tenant: None,
+                zone: None,
+                run: None,
+                method: "UPDATE",
+                host: "wicket.internal",
+                path: &path,
+                min_risk: 0,
+                exact: true,
+                answers_request: true,
+            },
+        )?;
+        let Some((gid, _)) = found else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let rid: String = tx.query_row("SELECT request_id FROM grants WHERE id = ?1", params![gid], |r| r.get(0))?;
+        tx.execute("UPDATE grants SET revoked = 1 WHERE id = ?1", params![gid])?;
         tx.commit()?;
-        Ok(found)
+        Ok(Some((rid, gid)))
     }
 
     pub fn denied_recently(&self, op: &Op) -> Result<Option<String>> {

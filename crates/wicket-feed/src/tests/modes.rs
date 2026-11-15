@@ -5,8 +5,8 @@ use super::*;
 fn spawn() -> Escalation<'static> {
     Escalation::Spawn { parent: "z", child: "z2" }
 }
-fn lease() -> Escalation<'static> {
-    Escalation::Lease { zone: "z", grant: "keep-1", ttl_ms: 60_000 }
+fn hold() -> Escalation<'static> {
+    Escalation::GrantHold { zone: "z", grant: "keep-1", ttl_ms: 60_000 }
 }
 fn approval() -> Escalation<'static> {
     Escalation::Approval { zone: "z" }
@@ -37,12 +37,12 @@ fn fresh_then_offline_at_ttl_and_offline_until_each_grant_expires() {
     assert_eq!(r.decide(&granted(), t), Decision::Allow(Allowed::Grant("keep-1".into())));
     assert!(matches!(r.decide(&evil(), t), Decision::NeedsGrant(_)));
     assert!(matches!(r.decide(&forbidden(), t), Decision::Forbidden(_)));
-    assert!(matches!(r.escalate(&lease(), t), Decision::Allow(Allowed::Lease { .. })));
+    assert!(matches!(r.escalate(&hold(), t), Decision::Allow(Allowed::GrantHold { .. })));
     assert_eq!(r.escalate(&spawn(), t), Decision::Allow(Allowed::Spawn));
     assert_eq!(r.escalate(&approval(), t), Decision::Allow(Allowed::Approval));
 
     // Offline from fresh_until (#153): the same decisions, for as long as what is held is valid,
-    // hours after the last statement; nothing new is leased, spawned or approved.
+    // hours after the last statement; nothing new is held, spawned or approved.
     for t in [fresh_until, fresh_until + 150_000, T0 + 3_599_999] {
         assert_eq!(r.mode(t), Mode::Offline, "{t}");
         assert_eq!(r.decide(&read(), t), Decision::Allow(Allowed::Reach(0)));
@@ -50,7 +50,7 @@ fn fresh_then_offline_at_ttl_and_offline_until_each_grant_expires() {
         assert_eq!(r.decide(&granted(), t), Decision::Allow(Allowed::Grant("keep-1".into())));
         assert!(matches!(r.decide(&evil(), t), Decision::NeedsGrant(_)), "the caller queues it");
         assert!(matches!(r.decide(&forbidden(), t), Decision::Forbidden(_)), "forbidden stays forbidden");
-        refused_in(r.escalate(&lease(), t), Mode::Offline);
+        refused_in(r.escalate(&hold(), t), Mode::Offline);
         refused_in(r.escalate(&spawn(), t), Mode::Offline);
         refused_in(r.escalate(&approval(), t), Mode::Offline);
     }
@@ -120,12 +120,15 @@ fn grant_expiry_is_by_the_node_clock_in_every_mode() {
     r.accept(&d, T0 + 1).unwrap();
     assert!(allowed(&mut r, &evil(), T0 + 1_499));
     assert!(matches!(r.decide(&evil(), T0 + 1_500), Decision::NeedsGrant(_)), "expired while still fresh, with no update");
-    assert!(matches!(r.escalate(&Escalation::Lease { zone: "z", grant: "short", ttl_ms: 60_000 }, T0 + 1_500), Decision::NeedsGrant(_)));
-    // A lease never outlives its grant.
-    let Decision::Allow(Allowed::Lease { until, .. }) =
-        r.escalate(&Escalation::Lease { zone: "z", grant: "short", ttl_ms: 60_000 }, T0 + 1_000)
+    assert!(matches!(
+        r.escalate(&Escalation::GrantHold { zone: "z", grant: "short", ttl_ms: 60_000 }, T0 + 1_500),
+        Decision::NeedsGrant(_)
+    ));
+    // A hold never outlives its grant.
+    let Decision::Allow(Allowed::GrantHold { until, .. }) =
+        r.escalate(&Escalation::GrantHold { zone: "z", grant: "short", ttl_ms: 60_000 }, T0 + 1_000)
     else {
-        panic!("lease")
+        panic!("hold")
     };
     assert_eq!(until, T0 + 1_500);
 }

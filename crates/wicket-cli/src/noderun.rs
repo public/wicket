@@ -649,6 +649,15 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
             start.edge = None;
         }
+        // A node before #256 would take no budget slice: a box with a model budget goes only where
+        // its node is bounded by one.
+        if shared.llm.is_some() && ctl.proto.load(Ordering::SeqCst) < crate::chan::BUDGET_SLICE {
+            bail!(
+                "node {name} talks protocol {}, and this box has a model budget, whose slice needs {}: update the node (`wicket node install {name}`)",
+                ctl.proto.load(Ordering::SeqCst),
+                crate::chan::BUDGET_SLICE
+            );
+        }
         // A node before #192 wouldn't check a pin: a pinned box goes only where it is checked.
         if start.image_pin.is_some() && ctl.proto.load(Ordering::SeqCst) < crate::chan::IMAGE_PINS {
             bail!(
@@ -788,7 +797,7 @@ struct Progress {
     /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
     proto: u32,
     /// Whether a lease went on this connection, and the slice in the last one (#152).
-    lease_sent: bool,
+    slice_sent: bool,
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
     fetched: std::collections::HashMap<String, String>,
@@ -817,7 +826,7 @@ async fn manage(
         renewing: None,
         renew_after: 0,
         proto: 0,
-        lease_sent: false,
+        slice_sent: false,
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
@@ -960,8 +969,8 @@ async fn session(
         sh.timings.record("feed.catch_up", catching, leasing);
     }
     // The run's secrets and budget slice, sealed to the node (#152), before anything the box does.
-    p.lease_sent = false;
-    if let Some(f) = lease_due(sh, p) {
+    p.slice_sent = false;
+    if let Some(f) = slice_due(sh, p) {
         send(f);
     }
     if first {
@@ -1035,7 +1044,7 @@ async fn session(
                 }
             }
             _ = leases.tick() => {
-                if let Some(f) = lease_due(sh, p) {
+                if let Some(f) = slice_due(sh, p) {
                     send(f);
                 }
                 for f in secrets_changed(sh, p) {
@@ -1538,10 +1547,15 @@ fn slice_fraction() -> f64 {
     std::env::var("WICKET_NODE_BUDGET_SLICE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| *f > 0.0 && *f <= 1.0).unwrap_or(0.25)
 }
 
-/// The run's lease for its node (#152), if it differs from the last one sent on this connection:
-/// its budget slice, renewed once less than half a slice is left, and lowered at once if what is
+/// The run's budget slice for its node (#152), if it differs from the last one sent on this
+/// connection: renewed once less than half a slice is left, and lowered at once if what is
 /// left of the budget shrinks below it (a spawn's carve-out).
-fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
+fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
+    // A node before #256 knows the slice by its old name: it gets none (and no box with a model
+    // budget starts there, `start_box`).
+    if p.proto < crate::chan::BUDGET_SLICE {
+        return None;
+    }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
     let spent = l.spent();
@@ -1559,16 +1573,16 @@ fn lease_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
         }
         _ => next,
     };
-    if p.lease_sent && p.slice == Some(slice) {
+    if p.slice_sent && p.slice == Some(slice) {
         return None;
     }
-    if !p.lease_sent {
-        println!("[wicket] leasing node {} a budget slice for {}: {slice:?}", sh.node, sh.run);
+    if !p.slice_sent {
+        println!("[wicket] sending node {} a budget slice for {}: {slice:?}", sh.node, sh.run);
     }
-    p.lease_sent = true;
+    p.slice_sent = true;
     p.slice = Some(slice);
     save_holdings(sh, p);
-    Some(Frame::Msg(Msg::Lease { run: sh.run.0.clone(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }))
+    Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
 /// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone
@@ -1960,6 +1974,7 @@ mod tests {
             node: node.map(String::from),
             max_risk: Some(1),
             run: Some(run.0.clone()),
+            amount: None,
         };
         let now = 1_000_000;
         let mut live = vec![live_grant(&tenant, &run, "z", &issuer, &row("g-1", Some("n1"), now + 60))];

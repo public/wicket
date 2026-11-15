@@ -230,8 +230,9 @@ pub fn never_reachable(host: &str) -> Option<String> {
 
 /// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
 /// its parent's zone, a link beyond the default policy, a capacity lease, and accepting a wicket
-/// build (`request_update`, #162).
-pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE"];
+/// build (`request_update`, #162); and the quota grants wicket records when it carves a run's
+/// budget, children and bytes (#256), which no request makes.
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE", "QUOTA"];
 
 /// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
 pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];

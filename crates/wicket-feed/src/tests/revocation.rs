@@ -13,7 +13,7 @@ fn a_revoked_grant_stops_as_soon_as_the_delta_applies() {
     let d = cp.p.commit(vec![revoke(RevokeKind::Grant, "keep-1", T0 + 3_600_000)], T0 + 2).unwrap();
     r.accept(&d, T0 + 2).unwrap();
     assert!(matches!(r.decide(&granted(), T0 + 2), Decision::NeedsGrant(_)));
-    assert!(matches!(r.escalate(&Escalation::Lease { zone: "z", grant: "keep-1", ttl_ms: 1_000 }, T0 + 2), Decision::NeedsGrant(_)));
+    assert!(matches!(r.escalate(&Escalation::GrantHold { zone: "z", grant: "keep-1", ttl_ms: 1_000 }, T0 + 2), Decision::NeedsGrant(_)));
     // Re-adding a revoked id does nothing.
     let d = cp.p.commit(vec![add(grant("keep-1", &granted(), T0 + 3_600_000))], T0 + 3).unwrap();
     r.accept(&d, T0 + 3).unwrap();
