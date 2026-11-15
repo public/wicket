@@ -1,16 +1,28 @@
-//! Canonical paths (`canon::canonical_path`, `check_plain`, `check_escapes`): Wicket/Canon.lean.
+//! Canonical paths (`canon::canonical_path`: `plain_fault`, `escape_fault`, `npm_scoped`):
+//! Wicket/Canon.lean.
+//!
+//! Lean's `canonicalPath_plain` holds of the Rust by construction: `canonical_path` returns a path
+//! only once `check_plain` (whose decision is `plain_fault`, proved here to be `plainOk`) accepted
+//! exactly that path. Not harnessed: `npm_scoped` (#143), whose `str` splitting and searching took
+//! CBMC past 4 GiB at 7 bytes; its unit tests cover it.
 //! The Lean definitions are restated here over bytes, as Rust checks them, and Kani checks the Rust
 //! against them.
 
-use super::{canonical_path, check_plain};
+use super::{escape_fault, plain_fault};
 use crate::proofs::AnyStr;
 
-/// Enough to spell every rule: `/`, `.`, an escape's `%` and hex digits of both cases (`%2E`,
-/// `%2f`, `%4A` is unreserved `J`, `%24` is `$`, `%AA` a non-ASCII byte), `;`, `\` and a letter.
-const PATH: &[u8] = b"/.%24AEFa;\\";
+/// Segments: `/`, `.`, a letter, `;`, `\`, and the escape `%2E` (an encoded dot) and `%22` (a byte
+/// that may be escaped). Paths of up to [`N`] bytes: `/a/./`, `/../a`, `//`, `/%2E/a`, `/a;\`.
+const PATH: &[u8] = b"/.%2Ea;\\";
 
-/// Longest path checked: room for `/a/%2E/` and `/%2E%2E`.
-const N: usize = 7;
+/// Longest path checked.
+const N: usize = 6;
+
+/// Escapes: hex digits of both cases, so `%2E` (a dot), `%2f` (lower case), `%4A` (unreserved
+/// `J`), `%24` (`$`, which may be escaped) and `%AA` (a non-ASCII byte) are all spelled; and a
+/// letter and `/` around them. Up to [`E`] bytes: two escapes, or one cut short.
+const ESC: &[u8] = b"%24AEFa/";
+const E: usize = 6;
 
 fn is_hex(c: u8) -> bool {
     c.is_ascii_digit() || (b'A'..=b'F').contains(&c)
@@ -79,25 +91,23 @@ fn plain_ok(p: &[u8]) -> bool {
     !p.iter().any(|&c| c == b'\\' || c < 0x20 || c == 0x7f) && !p.contains(&b';') && escapes_ok(p) && segs_ok(p)
 }
 
+/// `check_escapes` is exactly Lean's `escapesOk`, on the escapes' own alphabet (the segment
+/// checks below then need only one escape spelling).
+#[kani::proof]
+#[kani::unwind(10)]
+fn check_escapes_is_escapes_ok() {
+    let p = AnyStr::<E>::new(ESC);
+    assert_eq!(escape_fault(p.bytes()).is_none(), escapes_ok(p.bytes()));
+}
+
 /// `check_plain` is exactly Lean's `plainOk` (on paths starting with `/`, as `canonical_path` passes
 /// it): the definitions the Lean theorems are about are the Rust's.
 #[kani::proof]
-#[kani::unwind(9)]
+#[kani::unwind(10)]
 fn check_plain_is_plain_ok() {
     let p = AnyStr::<N>::new(PATH);
     kani::assume(p.bytes().first() == Some(&b'/'));
-    assert_eq!(check_plain(p.as_str()).is_ok(), plain_ok(p.bytes()));
-}
-
-/// `canonicalPath_plain`: a path `canonical_path` accepts is plain, with or without a query and
-/// npm's scoped form (`@` is in the alphabet, so `/@a%2Fa` is decided as `/@a/a`).
-#[kani::proof]
-#[kani::unwind(9)]
-fn canonical_path_plain() {
-    let pq = AnyStr::<N>::new(b"/.%2Fa@?;");
-    if let Ok(p) = canonical_path(pq.as_str()) {
-        assert!(plain_ok(p.as_bytes()));
-    }
+    assert_eq!(plain_fault(p.bytes()).is_none(), plain_ok(p.bytes()));
 }
 
 /// `upstream_eq`: an upstream that percent-decodes a canonical path and resolves its dot segments
@@ -106,11 +116,11 @@ fn canonical_path_plain() {
 /// Wicket/Subset.lean's matching this gives `reach_no_escape` and `forbid_no_escape`: no escape or
 /// dot segment takes a path out from under (or into) a rule `Q/**`.
 #[kani::proof]
-#[kani::unwind(9)]
+#[kani::unwind(10)]
 fn upstream_reads_the_same_segments() {
     let p = AnyStr::<N>::new(PATH);
     kani::assume(p.bytes().first() == Some(&b'/'));
-    if check_plain(p.as_str()).is_err() {
+    if plain_fault(p.bytes()).is_some() {
         return;
     }
     let b = p.bytes();

@@ -82,36 +82,68 @@ pub fn canonical_path(path_and_query: &str) -> Result<Cow<'_, str>, CanonError> 
     Ok(path)
 }
 
-/// The checks every decided path passes: no odd characters, parameters, escapes or segments. On
-/// bytes, and allocating only for an error's text: the Kani harnesses (#325, proofs/canon.rs) check
-/// this function itself.
+/// The checks every decided path passes: no odd characters, parameters, escapes or segments.
 fn check_plain(path: &str) -> Result<(), CanonError> {
-    let b = path.as_bytes();
+    plain_fault(path.as_bytes()).map_or(Ok(()), |f| Err(f.error(path)))
+}
+
+/// What is wrong with a path, without the error's text: [`check_plain`]'s and [`escape_fault`]'s
+/// decisions, on bytes and allocation-free, so the Kani harnesses (#325, proofs/canon.rs) check
+/// them themselves. Escapes carry where they start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    BadCharacter,
+    Parameter,
+    EncodedSeparator(usize),
+    NonCanonicalEscape(usize),
+    EmptySegment,
+    DotSegment,
+}
+
+impl Fault {
+    fn error(self, path: &str) -> CanonError {
+        // The escape as written (all of the rest if it isn't three characters).
+        let esc = |at: usize| path.get(at..at + 3).unwrap_or(&path[at..]);
+        match self {
+            Fault::BadCharacter => CanonError::BadCharacter,
+            Fault::Parameter => CanonError::Parameter,
+            Fault::EncodedSeparator(at) => CanonError::EncodedSeparator(esc(at).to_ascii_lowercase()),
+            Fault::NonCanonicalEscape(at) => CanonError::NonCanonicalEscape(esc(at).to_string()),
+            Fault::EmptySegment => CanonError::EmptySegment,
+            Fault::DotSegment => CanonError::DotSegment,
+        }
+    }
+}
+
+/// [`check_plain`]'s decision (`b` starts with `/`).
+fn plain_fault(b: &[u8]) -> Option<Fault> {
     if b.iter().any(|&c| c == b'\\' || c < 0x20 || c == 0x7f) {
-        return Err(CanonError::BadCharacter);
+        return Some(Fault::BadCharacter);
     }
     // `;` starts a path parameter for some servers (`/a;x/b`, `/..;/`): not one spelling per resource.
     if b.contains(&b';') {
-        return Err(CanonError::Parameter);
+        return Some(Fault::Parameter);
     }
-    check_escapes(path)?;
+    if let Some(f) = escape_fault(b) {
+        return Some(f);
+    }
     // Skip the leading empty segment; a single trailing slash is allowed.
     let body = &b[1..];
     if body.first() == Some(&b'/') {
-        return Err(CanonError::EmptySegment); // "//", which the trailing-slash rule below would accept
+        return Some(Fault::EmptySegment); // "//", which the trailing-slash rule below would accept
     }
     let body = body.strip_suffix(b"/").unwrap_or(body);
     if body.is_empty() {
-        return Ok(());
+        return None;
     }
     for seg in body.split(|&c| c == b'/') {
         match seg {
-            b"" => return Err(CanonError::EmptySegment),
-            b"." | b".." => return Err(CanonError::DotSegment),
+            b"" => return Some(Fault::EmptySegment),
+            b"." | b".." => return Some(Fault::DotSegment),
             _ => {}
         }
     }
-    Ok(())
+    None
 }
 
 /// npm asks a registry for a scoped package as `GET /@scope%2fname` (#143). If `path`'s first
@@ -119,7 +151,7 @@ fn check_plain(path: &str) -> Result<(), CanonError> {
 /// on `/@scope/name` or `/@scope/**` decides it as it would the unencoded spelling. Scope and name
 /// are npm's lower-case URL-safe characters and don't start with `.` (so neither can be a dot
 /// segment); anything else in the segment (another escape, a second `%2f`, `%252f`) is not this
-/// shape and is left for `check_escapes` to refuse.
+/// shape and is left for `escape_fault` to refuse.
 fn npm_scoped(path: &str) -> Option<String> {
     let first = path[1..].split('/').next().unwrap_or("");
     let rest = &path[1 + first.len()..];
@@ -146,16 +178,13 @@ fn npm_scoped(path: &str) -> Option<String> {
 
 /// Every `%` must start an escape of two upper-case hex digits, for a byte that has to be escaped:
 /// not an unreserved character (`/pro%64` is `/prod` to most servers, so a forbid on `/prod/**`
-/// would miss it), and not a separator, dot, NUL or `%` itself.
-fn check_escapes(path: &str) -> Result<(), CanonError> {
-    let b = path.as_bytes();
+/// would miss it), and not a separator, dot, NUL or `%` itself. The first that isn't, if any.
+fn escape_fault(b: &[u8]) -> Option<Fault> {
     let hex = |c: u8| match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     };
-    // The escape as written, for an error (all of the rest if it isn't three characters).
-    let esc = |at: usize| path.get(at..at + 3).unwrap_or(&path[at..]);
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'%' {
@@ -171,21 +200,18 @@ fn check_escapes(path: &str) -> Result<(), CanonError> {
                     (lower(1), lower(2)),
                     (Some(b'2'), Some(b'f' | b'e' | b'5')) | (Some(b'5'), Some(b'c')) | (Some(b'0'), Some(b'0'))
                 );
-                if sep && esc(i).len() == 3 {
-                    return Err(CanonError::EncodedSeparator(esc(i).to_ascii_lowercase()));
-                }
-                return Err(CanonError::NonCanonicalEscape(esc(i).to_string()));
+                return Some(if sep { Fault::EncodedSeparator(i) } else { Fault::NonCanonicalEscape(i) });
             }
         };
         if matches!(byte, b'/' | b'\\' | b'.' | 0 | b'%') {
-            return Err(CanonError::EncodedSeparator(esc(i).to_ascii_lowercase()));
+            return Some(Fault::EncodedSeparator(i));
         }
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
-            return Err(CanonError::NonCanonicalEscape(esc(i).to_string()));
+            return Some(Fault::NonCanonicalEscape(i));
         }
         i += 3;
     }
-    Ok(())
+    None
 }
 
 #[cfg(test)]
