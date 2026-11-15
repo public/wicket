@@ -1508,77 +1508,66 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
 
 ---
 
-## 13. Agent lifecycle: long-lived by default
+## 13. Agent lifecycle: long-lived, and the harness decides
 
-*Owner direction (2026-11-08): long-lived agents are the default. Agents are active for a while, go to
-sleep, hibernate, and are woken later. Agent garbage collection permanently removes agents and state no
-longer deemed useful. Refined by research 12 (OpenClaw) and 13 (Hermes), the two long-lived assistants
-studied.*
+*Owner direction (2026-11-08): long-lived agents are the default. Refined by research 12 (OpenClaw) and
+13 (Hermes), and by #249: the harness, not a wicket timer, decides when a run is done.*
 
 ### 13.1 Agent ≠ process ≠ task
 
 ```rust
 pub struct Agent {                       // the durable identity: outlives every process
     pub id: AgentId, pub tenant: TenantId, pub owner: PrincipalId,
-    pub home_zone: ZoneId,               // standing ceiling: reach, clearance, send
+    pub home_zone: ZoneId,               // standing ceiling: reach, limits
     pub charter: Versioned<TrustedText>, // standing instructions, operator-signed
-    pub kind: AgentKind, pub adapter_pin: semver::Version,
-    pub memory: Vec<MemoryStoreId>,      // versioned, labelled (§13.4)
-    pub subscriptions: Vec<Subscription>,// what may wake it (§13.2)
-    pub retention: RetentionPolicy,      // §13.6
+    pub harness: Harness, pub adapter_pin: semver::Version,   // the manifest's agent.harness (#255)
+    pub memory: Vec<MemoryStoreId>,      // versioned (§13.4)
     pub key: AgentKeyRef,                // per-agent data key, wrapped by the tenant key
     pub state: LifecycleState,
 }
 pub struct Activation {                  // one period of activity in one sandbox
-    pub id: ActivationId, pub agents: Vec<AgentId> /* one, or a crew (§13.7) */, pub woke_by: Wake,
-    pub work: Vec<WorkItemId>, pub sandbox: InstanceRef, pub lease: Lease,
+    pub id: ActivationId, pub agent: AgentId, pub woke_by: Wake,
+    pub work: Vec<WorkItemId>, pub sandbox: InstanceRef, pub authority: GrantId,  // renewable (#56)
 }
 pub struct WorkItem {                    // what used to be a "task": a unit of work delivered to an agent
     pub id: WorkItemId, pub assignees: Vec<AgentId>,   // collaboration on one work item is first-class
     pub text: TrustedText,               // from an authenticated operator or an operator-created subscription
-    pub payload: Vec<Handle>,            // event data: untrusted, labelled
+    pub payload: Vec<Digest>,            // event data: untrusted, in the store
     pub deadline: Option<Timestamp>,
 }
-pub enum Wake { OperatorMessage, Schedule(CronSpec), Event(SubscriptionId), AgentMessage(GateId), GrantDecided(RequestId) }
-pub enum LifecycleState { Active, Idle, Sleeping, Hibernated, Archived, Deleted(Tombstone) }
+pub enum Wake { OperatorMessage, AgentMessage(PrincipalId), GrantDecided(RequestId) }  // schedules and events are messages
+pub enum LifecycleState { Active, Hibernated, Archived, Deleted(Tombstone) }
 ```
 
-The old one-shot task is the special case: an agent whose retention is `delete_when_done`, with one work
-item. Manifests (§5) now describe an agent's home zone and its gates, or a team of long-lived agents; a
-work item runs inside that standing structure.
+The one-shot task is the special case: an agent that finishes after one work item. The sketch above is
+the design; what is built is the agent row described in §13.5.
 
 ### 13.2 Lifecycle
 
 ```
-            message / schedule / event / grant decided
-   ┌────────────────────────────────────────────────────────────────┐
-   ▼                                                                │
- Active ──no activity N s──► Idle ──M min──► Sleeping ──H h──► Hibernated ──D days──► Archived ──policy──► Deleted
- sandbox running             freeze; RAM      checkpoint or      snapshot, workdir,      snapshot dropped;   crypto-shred;
- model calls flowing         held; ~ms wake   snapshot on node   session, staged memory  charter, memory and  tombstone in
-                                              disk; ~s wake      pushed to object store; transcript handles  ledger + audit
-                                                                 node released           kept; cold rebuild
+            message (from an operator, another agent, or a decided request)
+   ┌──────────────────────────────────────────────┐
+   ▼                                              │
+ Active ──agent calls hibernate, or `wicket hibernate`──► Hibernated ──retention──► Archived ──► Deleted
+ box running, between turns too                         bundle in the store,       (designed, not built:
+                                                        node released              §13.6)
+ Active ──process exits (agent calls finish) | timeout | authority ends──► Ended
 ```
 
-- **Each step down frees resources and costs more to wake.** The thresholds are per plan and per agent,
-  and billing-aware (§8.5): a sleeping agent pins its node, a hibernated one pins only storage.
-- **Wake = restore or rebuild.** A snapshot is restored when it is compatible (same runtime version, CPU
-  features and lower-layer digests, §7). Otherwise the agent is **rebuilt**: a fresh sandbox from the base
-  image, plus the durable workdir, the approved memory version, and the agent's own session resume (Claude
-  `--resume`, Codex `thread/resume`, pi `--session-id`). Rebuild must always work; snapshots are an
-  optimisation. Every wake re-binds identity (claim-then-bind, §7.1). A **rebuild** gets new placeholders,
-  a new listener and a CA from the ceiling. A **memory restore** re-binds the old placeholders, and the
-  run's CA must outlive the snapshot, because the restored process already trusts it (research 22).
-- **Wake sources are explicit and authenticated:**
-  - an operator message (any operator channel, origin-labelled, §14.1.2);
-  - a schedule;
-  - an event subscription (a GitHub webhook received through the gateway, a queue);
-  - a message from another agent through a gate;
-  - a pending grant being decided.
-
-  Subscriptions are created by operators or granted like any capability. An agent can't subscribe itself
-  to arbitrary inputs.
-- **Vendor remote UIs:** an RC session past its resumability window is re-served on wake (§14.1.4).
+- **The harness decides when it is done** (#249). A run ends when its process exits, at its zone's
+  `limits.timeout`, or when its authority ends. wicket never ends, pauses or hibernates a run on a turn
+  boundary or an idle timer. The agent ends its session with the gateway's `finish` tool, which takes
+  effect at the end of its turn.
+- **Hibernation is asked for**, by the agent (`hibernate`) or an operator (`wicket hibernate`). It
+  happens at a quiet point. If something else still runs in the box, the agent goes on running, with
+  the reason recorded.
+- **A message wakes a hibernated agent**, so there is no separate wake source to configure. A schedule
+  or an event is a message from the principal that set it up (#250).
+- **Lifetimes are one renewable authority grant plus a hard timeout** (#56). A box nobody renews stops
+  when its authority ends.
+- **Wake = rebuild**: a fresh box from the base image, the bundle restored, and the agent's own session
+  resume (Claude `--resume`). Every wake re-binds identity and bumps the generation (§13.5). Restoring a
+  memory snapshot instead (gVisor checkpoint, #71) is an optimisation.
 
 ### 13.3 Authority across a long life
 
@@ -1586,20 +1575,12 @@ work item runs inside that standing structure.
   do is still decided per `Op`.
 - **Grants are scoped to a work item, not to the agent's lifetime.**
   - Standing grants exist only up to the auto tier, within the ceiling, and are listed in the manifest.
-  - R3+ is always fresh per use (§11).
-  - There are two ratchets: one per work item, and a lifetime ratchet per agent. The lifetime ratchet
-    counts cumulative escalations since a human last reviewed the charter, and forces that review when
-    exceeded.
+  - Every grant has a lifetime, and the agent's own authority does too (§11).
 - **Trusted text** is the charter (operator-signed, versioned) plus the current work item's text. For
   event-triggered work only the *subscription* is trusted, never the event. "Wake on a new issue and triage
   it" is trusted; the issue's content is a labelled handle.
-- **Sleep is a declassification checkpoint, on rebuild only.** A memory restore keeps the agent's full label;
-  a rebuild or a forked session declassifies (research 22). Across a rebuilding sleep, the agent's floating
-  label resets to the join
-  of what it *keeps*: approved memory versions, the workdir and its session handles. Ephemeral context is
-  discarded at sleep unless it is promoted (§13.4). So a long life doesn't mean unbounded taint creep, and
-  a run tainted by one bad page can be ended by sleeping past it, or by forking the session at the last
-  clean entry.
+- **A rebuild starts from what the agent keeps** (§13.4), not from its whole past context. With labels
+  deferred (§22), that is a recovery point, not a declassification.
 
 ### 13.4 What an agent keeps
 
@@ -1609,7 +1590,7 @@ work item runs inside that standing structure.
 | Memory stores: facts, notes, preferences, **skills** | yes, versioned | Writes during an activation land in a **staging layer**. A **promotion gate** decides what joins the next version: automatic for typed, low-risk facts within the label ceiling; quarantined-reader or human review for anything instruction-like (skills, procedures, "remember to…"). Every version is labelled, can be forked and rolled back, and each activation starts from a fork, so poison is undoable. |
 | Session and transcript | yes, as labelled handles; resumed on wake | Compaction is allowed; entries keep their labels |
 | Workdir | yes | Copy-on-write upper layer made durable; git-backed where it's a repo |
-| Process and RAM state | only in the Idle and Sleeping tiers, and in hibernated snapshots | Dropped at archive |
+| Process and RAM state | only while Active (a memory snapshot, #71, would keep it) | Dropped at hibernation |
 | Caches | no | Rebuilt |
 | The agent's own config and policy files | no | Regenerated from the LaunchPlan on every wake |
 | Live grants, pending requests | no | Work-item-scoped; a pending request survives sleep only as a ledger entry that can wake the agent when decided |
@@ -1642,7 +1623,7 @@ its label is the join of everything that shaped it.
   input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
-**Hibernate and wake (#70, 2026-11-12).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0), with `docker pause` for Idle.
+**Hibernate and wake (#70, 2026-11-12; #249).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0). The Idle tier and its `docker pause` were removed by #249.
 - The ledger has an agent row for each long-lived agent: its state, generation, session, manifest and head
   bundle.
   - A wake is a compare-and-set claim that bumps the generation.
@@ -1661,15 +1642,15 @@ its label is the join of everything that shaped it.
   (`experiments/bundle-formats/RESULTS.md`) measured the restic format storing 5–18× less after many
   sessions and saving incrementals 2–6× faster for Rust and Node trees, at the cost of a 0.x dependency,
   more memory, and restore safety wicket would have to add itself. Revisit if bundle size or save time
-  becomes the bottleneck.
+  becomes the bottleneck. Bundles, snapshots and versions are moving onto one content-addressed store
+  (#258, [store](store.md)).
 - The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
   recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
   messages can't buy it a fresh budget.
 - Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
-  box stays Idle.
+  agent goes on running, with the reason recorded.
 - Not built:
   - per-agent data keys and a signed `StateManifest` (sealing today uses the installation's one state key);
-  - the Sleeping tier (a stopped box with its state cached on the node);
   - the gVisor checkpoint (H2);
   - garbage collection;
   - hibernation for node and wrapped boxes.
@@ -1678,63 +1659,30 @@ Volumes inherit the zone's taint like any store (§12): whatever one run leaves 
 
 ### 13.6 Garbage collection
 
-- **Policy decides; the agent never does.** `RetentionPolicy` sets each tier's threshold (`idle_to_sleep` …
-  `archive_to_delete`), a storage cap, and whether the agent is `delete_when_done`. It comes from the plan,
-  the tenant and the agent, narrowest wins. Quota pressure can push agents down the ladder early.
-- **"No longer useful"** is computed from signals:
-  - no wake in N days;
-  - no inbound references: subscriptions, schedules, other agents' gates, handles shared with others;
-  - the owner is gone;
-  - the charter has expired;
-  - an explicit delete.
-- **Reversible until the last step.** Hibernate → archive (drops the snapshot) → delete. Before delete,
-  the owner is notified with a grace period, and inbound references are listed. A legal hold, or a live
-  cross-tenant gate that promised retention (§15), blocks deletion.
-- **Delete is crypto-shredding:**
-  - destroy the agent's data key, so every durable blob becomes unreadable, then delete the blobs;
-  - revoke grants, cancel schedules and subscriptions;
-  - write a tombstone into the ledger and audit log, keeping the hash chain intact without the content.
+Not built. **Ending, hibernating and waking are the harness's or an operator's decision** (#249), never
+a retention timer's. Garbage collection only reclaims what nothing needs any more:
+- **Bundles and blobs** go by mark and sweep from the digests the ledger and the store's refs name
+  ([store](store.md)).
+- **An agent** is archived (its bundle dropped) and then deleted when its owner or policy says so. That
+  is an explicit request, or a retention grant expiring, with a grace period and a notice to the owner
+  first.
+- **Delete is crypto-shredding** once per-agent data keys exist: destroy the key, then the blobs, revoke
+  grants, and write a tombstone into the ledger and audit log, keeping the hash chain intact.
 
-  GDPR erasure uses the same path. Shared derived copies follow their gate's terms.
+### 13.7 Several agents in one zone
 
-### 13.7 Several agents in one zone: teams and crews
+A zone can hold any number of agents, and several collaborating on one piece of work is a normal case
+(owner, 2026-11-08). Each runs in its own box, with its own identity, and they talk through messages
+and links (§4.3). They share the zone's ceiling, not their grants. An agent's own sub-agents (Claude
+Code's subagents and agent teams) are processes inside its box; to wicket they are part of that agent.
 
-A zone can hold any number of agents, and **several agents collaborating on one work item is a normal
-case** (owner, 2026-11-08), including several Claudes on one machine. Two layouts, chosen per zone:
-
-| Layout | What's shared | When |
-|---|---|---|
-| **Team:** one sandbox per agent | A zone-scoped shared workdir (copy-on-write branches merged by wicket, or a shared volume), a zone message channel through wicket, the work item's grants | Default where members need separate attribution, different agent kinds, or independent sleep and wake |
-| **Crew:** several agents in **one sandbox** | Filesystem, processes and the network listener; each agent keeps its own adapter session | Cheapest and closest collaboration: pair programming, an agent and its reviewer, Claude Code agent teams |
-
-Rules for both:
-- **One ceiling.** Members share the zone's reach and the work item's grants. Members who need different
-  ceilings belong in different zones joined by gates, as before.
-- **Free flow inside the zone** means plain messages between members are fine. That is the definition of a
-  zone. It also means **taint is shared**: one member reading a poisoned page taints whatever state the
-  others read. In a crew that's the whole sandbox; in a team, the shared workdir and channel. Containing
-  taint is done by splitting the agents into separate zones, not by trusting them to keep it to themselves.
-- **Attribution.** In a team, each agent has its own transport identity. In a crew, members can impersonate
-  each other inside the box, so authority and labels are per crew (the join of its members). Per-agent
-  attribution is best effort: per-agent placeholders and listener fds, tagged in the audit log.
-- **Escalations** are judged per zone and work item. A grant made for the work item serves every assignee.
-- **Lifecycle.** A crew is one activation: it sleeps and wakes as one. Team members sleep and wake
-  independently.
-- **An agent's own sub-agents** (Claude Code's subagents and agent teams, Codex threads) are processes
-  inside its sandbox. To wicket they are part of that agent; it doesn't need to know about them.
-- **Budgets:** §7.1's per-instance overhead is per sandbox, so a crew of N agents costs one sandbox plus N
-  agent processes.
+Crews, several agents sharing one box, are deferred (§22).
 
 ### 13.8 Lifecycle budgets
 
-These extend §7.1:
-
 | Transition | Budget (p95) |
 |---|---|
-| Wake from Idle | ≤ 50 ms |
-| Wake from Sleeping | ≤ 2 s |
-| Wake from Hibernated | ≤ 10 s by restore, or a rebuild |
-| Active checkpoint RPO | 60 s by default |
+| Wake from Hibernated | ≤ 10 s by rebuild |
 
 ---
 
