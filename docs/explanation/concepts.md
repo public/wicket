@@ -45,7 +45,8 @@ A **zone** is the boundary a box runs in. It is declared in the manifest:
   `/v1/messages/count_tokens` take a body, which must be uncompressed JSON; only known request fields and
   client tools (custom, bash, text editor, memory, computer use) are forwarded, and URL sources in content
   blocks are refused, since server tools, URL sources, the MCP connector and containers make the provider
-  reach hosts the zone never allowed (`llm.allow_server_tools` lets them through). A wrapped Claude Code session's model calls, which reach the model host through the
+  reach hosts the zone never allowed (`llm.allow_server_tools` lets them through). The call's `[llm]` line
+  and its `op` audit record name what was stripped (field names and tool types, never their values). A wrapped Claude Code session's model calls, which reach the model host through the
   egress proxy, get the same budget, checks and accounting there;
 - **limits, isolation, images, volumes:** memory, CPUs and time; how much of the box's output its
   node's host and the control host's transcript keep (`limits.output`, default `64m` of each, the newest
