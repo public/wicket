@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use wicket_core::link::{self as policy, Decision, End, Named};
 use wicket_core::{Op, ZoneSpec};
-use wicket_store::LinkRow;
+use wicket_store::{EffectUse, Filed, LinkRow};
 
 /// How often a relay checks that its link may stay open.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -309,13 +309,27 @@ async fn open(
     if !d.allowed() {
         let op =
             Op::egress(&ctx.tenant, &ctx.run, &ctx.zone.name, "LINK", policy::DOMAIN, &format!("/links/{}/{}/{port}", from.run, to.run));
+        // The approval is for this link under this name (#369): the name it was asked under is the
+        // argument a grant binds, so it can't be used to open the link under another.
+        let args = wicket_core::effect::args_sha256(&serde_json::json!({ "name": wanted }));
         let mut l = ledger(ctx);
-        match l.consume_grant(&op).map_err(|e| e.to_string())? {
-            Some(g) => {
+        match l.use_effect_grant(&op, Some(&args)).map_err(|e| e.to_string())? {
+            EffectUse::Granted(g) => {
                 basis = Some(format!("approved ({g})"));
                 grant = Some(g);
             }
-            None => {
+            EffectUse::Held { pending } => {
+                return Ok(format!("waiting: request {pending} for this link is not decided yet. Call await_grant with {pending}; once granted, make the same call again."));
+            }
+            EffectUse::ArgsChanged { grant } => {
+                return Err(format!(
+                    "refused: this link was approved ({grant}) under another name, and the name changed after the approval (this is recorded). Make the call with the name that was approved."
+                ));
+            }
+            EffectUse::Spent { grant } => {
+                return Err(format!("this link was already opened under its approval ({grant}), which allowed it once"));
+            }
+            EffectUse::None => {
                 if let Ok(Some(rid)) = l.denied_recently(&op) {
                     return Err(format!("exactly this link ({rid}) was denied a few minutes ago; don't ask again"));
                 }
@@ -327,7 +341,14 @@ async fn open(
                     to.zone_name,
                     d.needs_human.join("; ")
                 );
-                let (rid, _) = l.pending_for(&op, &reason, None).map_err(|e| e.to_string())?;
+                let rid = match l.file_request(&op, Some(&args), &reason, None).map_err(|e| e.to_string())? {
+                    Filed::Held { pending } => {
+                        return Ok(format!(
+                            "waiting: request {pending} for this link under another name is not decided yet. Call await_grant with {pending}."
+                        ))
+                    }
+                    f => f.id().to_string(),
+                };
                 return Ok(format!(
                     "needs approval: request {rid} ({}). Call await_grant with {rid}; once granted, make the same call again.",
                     d.needs_human.join("; ")

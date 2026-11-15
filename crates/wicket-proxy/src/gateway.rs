@@ -585,8 +585,9 @@ impl Gateway {
         if let Ok(Some(rid)) = l.denied_recently(&op) {
             return (format!("an operator denied exactly this update ({rid}) a few minutes ago; don't ask again"), true);
         }
-        match l.pending_for(&op, &format!("update wicket to the build with sha256 {sha}: {reason}"), None) {
-            Ok((rid, _)) => (
+        // The artifact's hash is the argument the approval is for (#369), as well as its path.
+        match l.file_request(&op, Some(&sha), &format!("update wicket to the build with sha256 {sha}: {reason}"), None).map(|f| f.id().to_string()) {
+            Ok(rid) => (
                 format!(
                     "needs an operator: request {rid}. This does not update wicket, and nothing you can call does. If an operator approves it, they run `wicket self update <artifact>` on the control host, which accepts the artifact with sha256 {sha} once. Call await_grant with {rid} to wait for the decision."
                 ),
@@ -638,7 +639,21 @@ impl Gateway {
                 Ok(v) if !v.is_empty() => {
                     let lines: Vec<String> = v
                         .iter()
-                        .map(|r| format!("- {} {} {}{} ({}), from run {}: {}", r.id, r.method, r.host, r.path, r.risk, r.run, r.reason))
+                        .map(|r| {
+                            // The effect it asks for (#369): what a decision on it is made on.
+                            let e = wicket_store::descriptor(r, None);
+                            format!(
+                                "- {} {} {}{} ({}), from run {}, effect {}: {}",
+                                r.id,
+                                r.method,
+                                r.host,
+                                r.path,
+                                r.risk,
+                                r.run,
+                                &e.sha256()[..16],
+                                r.reason
+                            )
+                        })
                         .collect();
                     out.push_str(&format!(
                         "\n\nYour descendants' requests you may decide with the decide tool (within your own reach; anything you leave stays pending for an operator):\n{}",
@@ -710,6 +725,16 @@ impl Gateway {
                 "run": self.ctx.run.0, "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
             }),
         };
+        // An approval signs the effect it grants (#369), as the ledger's row is now: if the request
+        // changes before the decision is recorded, the decision is refused.
+        let mut payload = payload;
+        if decision == "approve" {
+            let req = self.ctx.ledger.lock().ok().and_then(|l| l.request(id).ok());
+            if let Some(req) = req {
+                let t = wicket_store::DecisionTerms { uses: u32::try_from(uses).ok(), ttl_secs: ttl, prefix: None, zone_wide: false };
+                payload["effect_sha256"] = wicket_store::descriptor(&req, Some(&t)).sha256().into();
+            }
+        }
         let signed = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         match hook.decide(&signed) {
             Ok(text) => (text, false),

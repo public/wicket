@@ -3,13 +3,12 @@
 //! its model budget is carved out of the parent's, and it inherits the parent's forbid rules. A zone
 //! beyond the parent's starts only if a human approved exactly that zone (bound by its digest).
 
-use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wicket_core::{subset, Manifest, Op, RunId, ZoneSpec};
 use wicket_proxy::{llm::Llm, SpawnRequest};
-use wicket_store::Ledger;
+use wicket_store::{EffectUse, Filed, Ledger};
 
 pub struct SpawnCtx {
     pub parent: Manifest,
@@ -408,7 +407,8 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     if let Some(p) = &req.placement {
         stated["placement"] = p.clone();
     }
-    let digest = hex::encode(sha2::Sha256::digest(stated.to_string().as_bytes()));
+    // Its canonical JSON's hash (#369): the arguments in the effect descriptor the approval signs.
+    let digest = wicket_core::effect::args_sha256(&stated);
 
     // Within the parent's authority, or approved by a human for exactly this zone. A different model
     // route or credential is never approvable (#118).
@@ -465,13 +465,27 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     };
     let mut beyond = false;
     if !violations.is_empty() {
-        let mut op =
-            Op::egress(&p.tenant, &c.run, &p.zone.name, "SPAWN", "wicket.internal", &format!("/zones/{zone_name}/{}", &digest[..16]));
+        // The effect is this child, by zone and name; its arguments' hash is the rest of what the
+        // approval is for (#369): a grant is used only with exactly those arguments.
+        let mut op = Op::egress(&p.tenant, &c.run, &p.zone.name, "SPAWN", "wicket.internal", &format!("/zones/{zone_name}/{name}"));
         // Beyond the parent's authority is never a one-click "allow for an hour" (#118).
         op.risk = wicket_core::RiskClass::R4ExecOrPrivilege;
         let mut l = c.ledger.lock().map_err(|_| "ledger lock")?;
-        match l.consume_grant(&op).map_err(|e| e.to_string())? {
-            Some(gid) => {
+        match l.use_effect_grant(&op, Some(&digest)).map_err(|e| e.to_string())? {
+            EffectUse::Held { pending } => {
+                return Ok(format!(
+                    "waiting: request {pending} for starting {name} is not decided yet, and nothing for it runs before it is. Call await_grant with {pending}; once granted, call spawn again with exactly the arguments it was asked with."
+                ));
+            }
+            EffectUse::ArgsChanged { grant } => {
+                return Err(format!(
+                    "refused: starting {name} was approved ({grant}) for other arguments, and these changed after the approval (this is recorded). Call spawn with exactly the arguments that were approved."
+                ));
+            }
+            EffectUse::Spent { grant } => {
+                return Err(format!("{name} was already started under its approval ({grant}), which allowed it once; it is not started again"));
+            }
+            EffectUse::Granted(gid) => {
                 beyond = true;
                 let _ = l.audit(
                     &p.tenant,
@@ -481,24 +495,31 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 );
             }
             // A zone that may not ask (#50): nobody is asked, whatever the caller says.
-            None if !p.zone.escalation.request => {
+            EffectUse::None if !p.zone.escalation.request => {
                 return Err(format!(
                     "this zone is not within yours:\n- {}\nYour zone may not ask for more (escalation.request: false), so this will never be allowed from here; narrow it.",
                     violations.join("\n- ")
                 ));
             }
-            None if !req.escalate => {
+            EffectUse::None if !req.escalate => {
                 return Err(format!(
                     "this zone is not within yours:\n- {}\nNarrow it, or call spawn again with escalate: true to ask for exactly this zone to be approved.",
                     violations.join("\n- ")
                 ));
             }
-            None => {
+            EffectUse::None => {
                 if let Ok(Some(rid)) = l.denied_recently(&op) {
-                    return Err(format!("exactly this zone ({rid}) was denied a few minutes ago; don't ask again"));
+                    return Err(format!("starting {name} in this zone ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = card(&req.kind, name, &image, &cm, &violations);
-                let (rid, _) = l.pending_for(&op, &reason, None).map_err(|e| e.to_string())?;
+                let rid = match l.file_request(&op, Some(&digest), &reason, None).map_err(|e| e.to_string())? {
+                    Filed::Held { pending } => {
+                        return Ok(format!(
+                            "waiting: request {pending} to start {name} with other arguments is not decided yet; nothing else for {name} is asked or started before it is. Call await_grant with {pending}."
+                        ))
+                    }
+                    f => f.id().to_string(),
+                };
                 return Ok(format!(
                     "needs approval: request {rid} (this zone exceeds yours: {}). Call await_grant with {rid}; once granted, call spawn again with exactly the same arguments.",
                     violations.join("; ")

@@ -138,6 +138,9 @@ enum Action {
         prefix: Option<String>,
         /// Usable by any run in the request's zone (as `wicket approve --zone-wide`).
         zone_wide: bool,
+        /// The sha256 of the effect descriptor the passkey signed (#369): the decision is made
+        /// only if the request is still that effect.
+        effect_sha256: String,
     },
     Revoke {
         run: String,
@@ -1152,11 +1155,21 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 Some(_) => return Err(bad("prefix must be a path")),
             };
             let zone_wide = approve && body.get("zone_wide").and_then(|z| z.as_bool()).unwrap_or(false);
+            let t = grant::Terms { uses, ttl: Duration::from_secs(ttl_secs), prefix: prefix.clone(), zone_wide };
             if approve {
                 // Refused before the passkey is asked for, by the same rule `decide` applies.
-                let t = grant::Terms { uses, ttl: Duration::from_secs(ttl_secs), prefix: prefix.clone(), zone_wide };
                 grant::check_terms(&req, &t).map_err(|e| bad(&format!("{e:#}")))?;
             }
+            // The effect the decision is about (#369), and for an approval that widens, what else
+            // it would allow: both shown before the passkey is asked for, and signed with it.
+            let effect = crate::effect::descriptor(&req, approve.then_some(&t));
+            let effect_sha256 = effect.sha256();
+            let blast = if approve {
+                let zone = crate::effect::zone_of_run(&l, &state.data, &req.run);
+                crate::effect::blast_radius(&l, zone.as_ref(), &req, &t).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            } else {
+                None
+            };
             let identity = (state.identity)(&l, &req.run);
             if approve && !identity_approvable(&identity) {
                 return Err(err(
@@ -1180,8 +1193,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
                 "identity_verified": identity.get("verified"),
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
+                "effect": effect, "effect_sha256": effect_sha256, "blast": blast,
             });
-            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide }, v))
+            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256 }, v))
         }
         // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
         Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
@@ -1382,7 +1396,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
     let t = &state.tenant;
     let rid = |r: &str| RunId(r.to_string());
     match action {
-        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide } => {
+        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256 } => {
             // The agent may have been revoked since the operator was shown it.
             let req = l.request(request)?;
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
@@ -1394,7 +1408,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 &grant::Granter::Human(crate::operators::Operator::console(&state.tenant.0, &oc.name)?),
                 request,
                 &grant::Verdict::Approve(t),
-                json!({ "action": "decide", "signed": signed }),
+                json!({ "action": "decide", "signed": signed, crate::effect::SHOWN_EFFECT: effect_sha256 }),
             )?
             else {
                 unreachable!("an approval approves")

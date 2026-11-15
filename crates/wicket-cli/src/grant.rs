@@ -587,7 +587,12 @@ impl wicket_proxy::Decisions for AgentDecisions {
         if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
             return Err(format!("this agent's identity was revoked (revoked: {r})"));
         }
-        let extra = serde_json::json!({ "signed": signed, "granter_identity": claims.sub });
+        let mut extra = serde_json::json!({ "signed": signed, "granter_identity": claims.sub });
+        // The effect the signed decision was made on (#369), checked against the request now.
+        if let Verdict::Approve(_) = &verdict {
+            let e = p["effect_sha256"].as_str().ok_or("the approval names no effect (effect_sha256)")?;
+            extra[crate::effect::SHOWN_EFFECT] = e.into();
+        }
         match decide(&mut l, &Granter::Agent(self.authority()), id, &verdict, extra) {
             Ok(Decided::Approved { grant, uses, ttl, .. }) => Ok(format!(
                 "approved: {id} is granted as {grant} ({} use(s), for {}s). The asking run may retry its request now.",
