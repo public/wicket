@@ -47,9 +47,31 @@ pub struct Llm {
     /// On a node (#152): the slice of the budget the control host has leased it, as caps on this
     /// activation's own counters. None: no slice (the zone's budget alone bounds it).
     slice: std::sync::Mutex<Option<Slice>>,
+    /// The model budget this proxy enforces (#256): on the control host, the amounts of the run's
+    /// quota grants ([`Llm::with_quota`]); on a node, the zone its token carries, its slices
+    /// bounding it. None: the zone has no model route.
+    quota: Option<ModelQuota>,
     last_activity: std::sync::Mutex<Instant>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
+}
+
+/// A run's model budget, as its model proxy enforces it (#256): the limits every check here reads,
+/// and the only ones. On the control host they are the amounts of the run's live quota grants
+/// (`model.requests`, `model.output_tokens`, `model.input_tokens`); on a node, its token's zone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelQuota {
+    pub requests: u64,
+    pub output_tokens: u64,
+    /// Input tokens, cached ones included; None: uncapped.
+    pub input_tokens: Option<u64>,
+}
+
+impl ModelQuota {
+    /// The budget a zone states.
+    pub fn of_zone(l: &wicket_core::manifest::LlmSpec) -> ModelQuota {
+        ModelQuota { requests: l.max_requests, output_tokens: l.max_output_tokens, input_tokens: l.max_input_tokens }
+    }
 }
 
 /// A budget slice sent to a node (#152): this activation may count up to these totals of its own
@@ -89,11 +111,11 @@ impl Spent {
 impl Llm {
     /// Model requests and output tokens this run has left to spend or hand on.
     pub fn remaining(&self) -> Option<(u64, u64)> {
-        let spec = self.ctx.zone.llm.as_ref()?;
+        let spec = self.quota()?;
         let used_r = self.requests.load(Ordering::SeqCst)
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(self.output_committed())))
+        Some((spec.requests.saturating_sub(used_r), spec.output_tokens.saturating_sub(self.output_committed())))
     }
 
     /// Output tokens spent, handed to children, spent by earlier activations, or reserved by calls
@@ -144,13 +166,27 @@ impl Llm {
 
     /// Input tokens this run has left to spend or hand on, if its zone caps them.
     pub fn remaining_input(&self) -> Option<u64> {
-        let max = self.ctx.zone.llm.as_ref()?.max_input_tokens?;
+        let max = self.quota()?.input_tokens?;
         Some(max.saturating_sub(
             self.input_total() + self.reserved_input_tokens.load(Ordering::SeqCst) + self.prior_input_tokens.load(Ordering::SeqCst),
         ))
     }
 
+    /// The model budget this proxy enforces: see [`ModelQuota`].
+    pub fn quota(&self) -> Option<ModelQuota> {
+        self.quota
+    }
+
+    /// A model proxy enforcing its zone's budget: a node's, whose slices bound it.
     pub fn new(ctx: RunCtx) -> Result<Arc<Llm>> {
+        let quota = ctx.zone.llm.as_ref().map(ModelQuota::of_zone);
+        Self::with_quota(ctx, quota)
+    }
+
+    /// A model proxy enforcing `quota` (#256): the control host's, from the run's quota grants. A
+    /// zone with a model route and no quota is given none to spend.
+    pub fn with_quota(ctx: RunCtx, quota: Option<ModelQuota>) -> Result<Arc<Llm>> {
+        let quota = ctx.zone.llm.as_ref().map(|_| quota.unwrap_or_default());
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(Arc::new(Llm {
             ctx,
@@ -168,6 +204,7 @@ impl Llm {
             prior_output_tokens: AtomicU64::new(0),
             inflight_output_tokens: AtomicU64::new(0),
             slice: std::sync::Mutex::new(None),
+            quota,
             last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
         }))
@@ -206,14 +243,14 @@ impl Llm {
     /// The slice this activation may be leased next (#152): what it has counted plus `fraction` of
     /// the zone's budget, never past what is left of it.
     pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
-        let spec = self.ctx.zone.llm.as_ref()?;
+        let spec = self.quota()?;
         let part = |max: u64| ((max as f64) * fraction).ceil().max(1.0) as u64;
         let (left_r, left_o) = self.remaining()?;
         let s = self.spent();
         Some(Slice {
-            requests: s.requests + left_r.min(part(spec.max_requests)),
-            output_tokens: s.output_tokens + left_o.min(part(spec.max_output_tokens)),
-            input_tokens: spec.max_input_tokens.map(|m| self.input_total() + self.remaining_input().unwrap_or(0).min(part(m))),
+            requests: s.requests + left_r.min(part(spec.requests)),
+            output_tokens: s.output_tokens + left_o.min(part(spec.output_tokens)),
+            input_tokens: spec.input_tokens.map(|m| self.input_total() + self.remaining_input().unwrap_or(0).min(part(m))),
         })
     }
 
@@ -357,28 +394,29 @@ impl Llm {
             + 1
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        let spec = spec?;
-        if n > spec.max_requests {
+        spec?;
+        let spec = self.quota()?;
+        if n > spec.requests {
             self.event(None, 429, Usage::default(), "budget: request cap reached");
             return Some(problem(
                 429,
                 "budget",
                 "Model request budget exhausted",
-                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
+                &format!("{} may make at most {} model requests", self.whose(), spec.requests),
                 None,
             ));
         }
-        if self.output_committed() >= spec.max_output_tokens {
+        if self.output_committed() >= spec.output_tokens {
             self.event(None, 429, Usage::default(), "budget: output token cap reached");
             return Some(problem(
                 429,
                 "budget",
                 "Model token budget exhausted",
-                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.output_tokens),
                 None,
             ));
         }
-        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
+        if let (Some(max), Some(0)) = (spec.input_tokens, self.remaining_input()) {
             self.event(None, 429, Usage::default(), "budget: input token cap reached");
             return Some(problem(
                 429,
@@ -560,15 +598,15 @@ impl Llm {
             let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) else {
                 return Err(refuse(400, "a messages request without an integer max_tokens".into()));
             };
-            if let Some(spec) = spec {
+            if let (Some(_), Some(q)) = (spec, self.quota()) {
                 // A node's slice (#152) caps this activation's own output, in flight included.
                 let cap = match self.slice() {
-                    Some(sl) => spec.max_output_tokens.min(
+                    Some(sl) => q.output_tokens.min(
                         sl.output_tokens
                             + self.reserved_output_tokens.load(Ordering::SeqCst)
                             + self.prior_output_tokens.load(Ordering::SeqCst),
                     ),
-                    None => spec.max_output_tokens,
+                    None => q.output_tokens,
                 };
                 let Some(r) = self.reserve_output(cap, asked) else {
                     self.event(model.clone(), 429, Usage::default(), "budget: output token cap reached");
@@ -576,7 +614,7 @@ impl Llm {
                         429,
                         "budget",
                         "Model token budget exhausted",
-                        &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                        &format!("{} may generate at most {} output tokens", self.whose(), q.output_tokens),
                         None,
                     )));
                 };
@@ -1188,6 +1226,31 @@ mod tests {
         llm.spent_before(1, 0, 100);
         let (status, _) = post(llm, "tokens").await;
         assert_eq!(status, 429);
+    }
+
+    /// #256: on the control host the run's quota grants are its budget: their amounts are the
+    /// limits every check reads, with the same refusals, whatever the zone says.
+    #[tokio::test]
+    async fn the_quota_grants_amounts_are_the_budget() {
+        let zone = "{max_requests: 50, max_output_tokens: 1000, max_input_tokens: 9000}";
+        let q = super::ModelQuota { requests: 2, output_tokens: 100, input_tokens: Some(500) };
+        let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), Some(q)).unwrap();
+        assert_eq!(llm.quota(), Some(q));
+        assert_eq!((llm.remaining(), llm.remaining_input()), (Some((2, 100)), Some(500)));
+        let sl = llm.next_slice(0.5).unwrap();
+        assert_eq!((sl.requests, sl.output_tokens, sl.input_tokens), (1, 50, Some(250)), "slices are cut from the grant's amount");
+        llm.spent_before(2, 0, 0);
+        let (status, body) = post(llm.clone(), "quota").await;
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("at most 2 model requests"), "{body}");
+        // A zone with a model route and no quota granted has nothing to spend.
+        let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), None).unwrap();
+        assert_eq!(llm.remaining(), Some((0, 0)));
+        let (status, _) = post(llm, "none").await;
+        assert_eq!(status, 429);
+        // A node's proxy enforces the zone in its token, as before.
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone)).unwrap();
+        assert_eq!(llm.quota(), Some(super::ModelQuota { requests: 50, output_tokens: 1000, input_tokens: Some(9000) }));
     }
 
     /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing

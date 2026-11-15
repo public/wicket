@@ -35,6 +35,7 @@ mod pin;
 mod place;
 mod policy;
 mod program;
+mod quotas;
 mod reconcile;
 mod registry;
 mod rootcopy;
