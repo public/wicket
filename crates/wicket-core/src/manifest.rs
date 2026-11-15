@@ -18,7 +18,7 @@ pub enum ManifestError {
     Invalid(String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]
@@ -35,7 +35,41 @@ pub struct Manifest {
     pub zone: ZoneSpec,
 }
 
-/// A deterministic workload: no model, same sandbox and enforcement (design §17).
+/// As derived, except that a program's zone always writes its `escalation`: a program's default is
+/// `request: false` (#255), so a `request: true` left out as the zone's default would read back as
+/// false.
+impl Serialize for Manifest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            tenant: &'a TenantId,
+            task: &'a String,
+            agent: &'a Option<AgentSpec>,
+            program: &'a Option<ProgramSpec>,
+            zone: ZoneOut<'a>,
+        }
+        #[derive(Serialize)]
+        struct ZoneOut<'a> {
+            #[serde(flatten)]
+            zone: &'a ZoneSpec,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            escalation: Option<&'a Escalation>,
+        }
+        let escalation = (self.program.is_some() && self.zone.escalation.is_default()).then_some(&self.zone.escalation);
+        Out {
+            tenant: &self.tenant,
+            task: &self.task,
+            agent: &self.agent,
+            program: &self.program,
+            zone: ZoneOut { zone: &self.zone, escalation },
+        }
+        .serialize(s)
+    }
+}
+
+/// A deterministic workload: an agent with no model, in the same sandbox under the same enforcement
+/// (design §17). Its zone may not ask for more unless it says so (`escalation.request` defaults to
+/// false for a program, #255).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramSpec {
@@ -48,22 +82,9 @@ pub struct ProgramSpec {
     /// The approved source digest. When set, a run refuses any other source.
     #[serde(default)]
     pub digest: Option<String>,
-    /// What happens when the program needs something outside its reach.
-    #[serde(default)]
-    pub on_pending: OnPending,
     /// Runtime image (default: the agent image, which has bash, curl, jq, git, python3).
     #[serde(default)]
     pub image: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum OnPending {
-    /// Out-of-reach requests fail outright; nothing is queued for a human. The default for programs.
-    #[default]
-    Fail,
-    /// Queue an escalation like an agent would, and let the program wait (e.g. via await_grant).
-    Wait,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,13 +140,10 @@ pub struct AcpSpec {
     /// nothing is installed at start.
     pub command: Vec<String>,
     /// A wicket profile for a known adapter: what wicket itself sets for it (environment, `_meta`).
-    /// `claude-agent-acp`: Claude Code through its ACP adapter. None: a generic ACP agent.
+    /// The profiles are the harness adapter's (`wicket-agent`). None: a generic ACP agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 }
-
-/// The adapter profiles wicket knows (`agent.acp.profile`).
-pub const ACP_PROFILES: [&str; 1] = ["claude-agent-acp"];
 
 /// `agent.remote`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -518,14 +536,15 @@ fn default_format() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmSpec {
-    #[serde(default = "default_provider")]
+    /// The model provider (the model proxy's profile for its API). Empty: the harness's own, filled
+    /// in by its adapter when the manifest is loaded ([`LlmSpec::fill`]).
+    #[serde(default)]
     pub provider: String,
-    /// Vault secret holding the Claude subscription token (from `claude setup-token`). wicket never
-    /// uses Anthropic API keys: the inner agent is the Claude Code CLI on the owner's subscription.
-    #[serde(default = "default_llm_secret")]
+    /// Vault secret holding the model credential. Empty: the harness's own default secret.
+    #[serde(default)]
     pub secret: String,
-    /// Upstream base URL; override for a mock in tests.
-    #[serde(default = "default_upstream")]
+    /// Upstream base URL (override for a mock in tests). Empty: the harness's provider's.
+    #[serde(default)]
     pub upstream: String,
     #[serde(default = "default_max_requests")]
     pub max_requests: u64,
@@ -540,15 +559,36 @@ pub struct LlmSpec {
     pub allow_server_tools: bool,
 }
 
-fn default_provider() -> String {
-    "anthropic".into()
+/// A harness's default model route: what its adapter fills into a zone's `llm` where the manifest
+/// leaves a field out. Core and the proxies take it as data; only the adapter knows its values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRoute {
+    pub provider: String,
+    pub secret: String,
+    pub upstream: String,
 }
-fn default_llm_secret() -> String {
-    "claude-oauth".into()
+
+impl LlmSpec {
+    /// Fills the route's fields the manifest left empty from the harness's default.
+    pub fn fill(&mut self, route: &ModelRoute) {
+        for (field, default) in
+            [(&mut self.provider, &route.provider), (&mut self.secret, &route.secret), (&mut self.upstream, &route.upstream)]
+        {
+            if field.trim().is_empty() {
+                *field = default.clone();
+            }
+        }
+    }
+
+    /// The first route field still empty, if any: a run needs all three.
+    pub fn missing(&self) -> Option<&'static str> {
+        [("provider", &self.provider), ("secret", &self.secret), ("upstream", &self.upstream)]
+            .into_iter()
+            .find(|(_, v)| v.trim().is_empty())
+            .map(|(k, _)| k)
+    }
 }
-fn default_upstream() -> String {
-    "https://api.anthropic.com".into()
-}
+
 fn default_max_requests() -> u64 {
     300
 }
@@ -696,8 +736,29 @@ impl Limits {
 pub const MIN_CPUS: f32 = 0.01;
 
 impl Manifest {
+    /// Parses and checks a manifest. A program's zone may not ask for more unless the manifest says
+    /// `escalation.request: true` (#255). The model route's defaults are the harness adapter's: load
+    /// an agent's manifest through `wicket_agent::load` to fill them.
     pub fn from_yaml(s: &str) -> Result<Self, ManifestError> {
-        let m: Manifest = serde_yaml::from_str(s)?;
+        let mut m: Manifest = serde_yaml::from_str(s)?;
+        if m.program.is_some() {
+            #[derive(Deserialize)]
+            struct Probe {
+                zone: ProbeZone,
+            }
+            #[derive(Deserialize)]
+            struct ProbeZone {
+                #[serde(default)]
+                escalation: Option<ProbeEscalation>,
+            }
+            #[derive(Deserialize)]
+            struct ProbeEscalation {
+                #[serde(default)]
+                request: Option<bool>,
+            }
+            let said = serde_yaml::from_str::<Probe>(s)?.zone.escalation.and_then(|e| e.request);
+            m.zone.escalation.request = said.unwrap_or(false);
+        }
         m.validate()?;
         Ok(m)
     }
@@ -725,13 +786,6 @@ impl Manifest {
                         if acp.command.is_empty() || acp.command.iter().any(|c| c.is_empty() || c.contains('\0')) {
                             return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
                         }
-                        let claude = match acp.profile.as_deref() {
-                            None => false,
-                            Some(p) if ACP_PROFILES.contains(&p) => true,
-                            Some(p) => {
-                                return Err(ManifestError::Invalid(format!("agent.acp.profile {p:?}: known profiles are {ACP_PROFILES:?}")))
-                            }
-                        };
                         if a.remote.is_some() {
                             return Err(ManifestError::Invalid("agent.remote: an ACP agent has no remote session of its own".into()));
                         }
@@ -740,31 +794,10 @@ impl Manifest {
                                 "agent.max_turns isn't part of ACP; set it in the agent's own configuration".into(),
                             ));
                         }
-                        if !claude && (a.model.is_some() || !a.adapter_settings.is_empty()) {
-                            return Err(ManifestError::Invalid(
-                                "agent.model and agent.adapter_settings need an ACP profile wicket knows; set them in the agent's own configuration".into(),
-                            ));
-                        }
                     }
                 }
-                // The zone's model route is a Claude subscription, which backs Claude Code only (its
-                // own CLI, or through its ACP adapter). A generic ACP agent gets no model route until
-                // routes per provider exist (#174).
-                let claude =
-                    a.harness == Harness::ClaudeCode || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp");
-                match &self.zone.llm {
-                    Some(_) if !claude => {
-                        return Err(ManifestError::Invalid(
-                            "zone.llm: a generic ACP agent gets no model route yet. The zone's llm is a Claude subscription, which only Claude Code may use; \
-                             leave llm out (routes per provider are #174)"
-                                .into(),
-                        ))
-                    }
-                    Some(l) if l.provider == "anthropic" => {}
-                    Some(_) => return Err(ManifestError::Invalid("only the anthropic LLM provider is supported in the PoC".into())),
-                    None if claude => return Err(ManifestError::Invalid("an agent zone needs an llm section".into())),
-                    None => {}
-                }
+                // Whether the agent's harness takes a model route (`zone.llm`), its default route, and
+                // which ACP profiles exist are its adapter's: `wicket_agent::load` checks them.
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
@@ -1029,13 +1062,27 @@ zone:
         assert_eq!(m.tenant, TenantId::single());
         assert_eq!(m.zone.isolation, Isolation::Gvisor);
         assert_eq!(m.zone.reach[0].methods, vec!["GET", "HEAD"]);
-        assert_eq!(m.zone.llm.as_ref().unwrap().upstream, "https://api.anthropic.com");
+        assert_eq!(m.zone.llm.as_ref().unwrap().upstream, "", "the harness adapter fills the route in");
     }
 
     #[test]
-    fn programs_have_no_model_and_fail_on_pending_by_default() {
+    fn programs_have_no_model_and_may_not_ask_by_default() {
         let m = Manifest::from_yaml("task: t\nprogram: {name: p, command: [bash, run.sh]}\nzone: {name: z}").unwrap();
-        assert_eq!(m.program.unwrap().on_pending, OnPending::Fail);
+        assert!(!m.zone.escalation.request && m.zone.escalation.grant);
+        let back = Manifest::from_yaml(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        assert!(!back.zone.escalation.request, "the default survives a round trip");
+        let asks = Manifest::from_yaml("task: t\nprogram: {name: p, command: [x]}\nzone: {name: z, escalation: {request: true}}").unwrap();
+        assert!(asks.zone.escalation.request);
+        let back = Manifest::from_yaml(&serde_yaml::to_string(&asks).unwrap()).unwrap();
+        assert!(back.zone.escalation.request, "so does a program's request: true");
+        let back = Manifest::from_yaml(&serde_json::to_string(&asks).unwrap()).unwrap();
+        assert!(back.zone.escalation.request, "in JSON too");
+        let agent = Manifest::from_yaml("task: t\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        assert!(agent.zone.escalation.request, "an agent's zone asks by default");
+        assert!(
+            Manifest::from_yaml("task: t\nprogram: {name: p, command: [x], on_pending: wait}\nzone: {name: z}").is_err(),
+            "on_pending is gone"
+        );
         assert!(Manifest::from_yaml("task: t\nprogram: {name: p, command: [x]}\nzone: {name: z, llm: {}}").is_err());
         assert!(Manifest::from_yaml("task: t\nzone: {name: z}").is_err());
     }

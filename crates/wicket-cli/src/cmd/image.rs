@@ -39,7 +39,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Doctor { image } => doctor::doctor(&image).await,
+        Cmd::Doctor { image: i } => doctor::doctor(i.as_deref().unwrap_or(image::DEFAULT)).await,
         _ => unreachable!("dispatched to the wrong command group"),
     }
 }

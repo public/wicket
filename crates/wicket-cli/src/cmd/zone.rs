@@ -11,9 +11,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Zone { cmd: Some(ZoneCmd::Pin { manifest, dry_run }), .. } => pin::pin(&manifest, dry_run),
         Cmd::Zone { manifest, json, .. } => {
             let manifest = manifest.context("a manifest: wicket zone MANIFEST, or wicket zone pin MANIFEST")?;
-            let m = wicket_core::Manifest::from_yaml(
-                &std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?,
-            )?;
+            let m = wicket_agent::load(&std::fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?)?;
             print!("{}", zone_view(&m.zone, json));
             Ok(())
         }
@@ -94,7 +92,7 @@ pub(crate) fn zone_view(zone: &wicket_core::ZoneSpec, json: bool) -> String {
 #[cfg(test)]
 mod tests {
     fn zone(body: &str) -> wicket_core::ZoneSpec {
-        wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, {body} }}\n")).unwrap().zone
+        wicket_agent::load(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{}}, {body} }}\n")).unwrap().zone
     }
 
     /// #20: the zone view warns about each wildcard reach rule, in text and JSON, and not otherwise.

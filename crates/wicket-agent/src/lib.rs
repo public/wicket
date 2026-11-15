@@ -7,6 +7,14 @@ pub mod attribution;
 pub mod claude;
 pub mod harness;
 
+/// Loads a manifest: core's parse and checks, then its harness's ([`harness::resolve`]): the model
+/// route's defaults filled in. Everything that runs or places a manifest loads it this way.
+pub fn load(yaml: &str) -> Result<Manifest, wicket_core::ManifestError> {
+    let mut m = Manifest::from_yaml(yaml)?;
+    harness::resolve(&mut m).map_err(wicket_core::ManifestError::Invalid)?;
+    Ok(m)
+}
+
 use serde_json::Value;
 use wicket_core::{Harness, Manifest, RunId};
 
@@ -516,9 +524,9 @@ fn claude_env(m: &Manifest, run: &RunId) -> Vec<(String, String)> {
 /// Whether wicket writes Claude Code's settings.json for this agent (allowlisted adapter settings
 /// plus the keys wicket owns): Claude Code, driven directly or through its ACP adapter.
 pub fn uses_claude_settings(m: &Manifest) -> bool {
-    m.agent
-        .as_ref()
-        .is_some_and(|a| a.harness == Harness::ClaudeCode || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some("claude-agent-acp"))
+    m.agent.as_ref().is_some_and(|a| {
+        a.harness == Harness::ClaudeCode || a.acp.as_ref().and_then(|p| p.profile.as_deref()) == Some(crate::claude::ACP_PROFILE)
+    })
 }
 
 /// An ACP agent (#66): its command in the box, and how wicket opens its session. The task becomes
@@ -528,7 +536,7 @@ pub fn uses_claude_settings(m: &Manifest) -> bool {
 pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     let agent = m.agent.as_ref().filter(|a| a.harness == Harness::Acp)?;
     let spec = agent.acp.as_ref()?;
-    let claude = spec.profile.as_deref() == Some("claude-agent-acp");
+    let claude = spec.profile.as_deref() == Some(crate::claude::ACP_PROFILE);
     let env = if claude {
         claude_env(m, run)
     } else {
@@ -680,7 +688,7 @@ mod tests {
         let y = |extra: &str, llm: &str| {
             format!("task: hi\nagent: {{name: a, harness: acp, acp: {{command: [my-agent, --acp]{extra}}}, env: {{FOO: bar}}}}\nzone: {{name: z{llm}}}")
         };
-        let m = Manifest::from_yaml(&y("", "")).unwrap();
+        let m = crate::load(&y("", "")).unwrap();
         let p = acp_plan(&m, &RunId("run_x".into())).unwrap();
         assert_eq!(p.argv, ["wicket-entry", "my-agent", "--acp"]);
         assert!(p.stdin_task.is_none());
@@ -693,7 +701,7 @@ mod tests {
         assert!(cfg.system_prompt.starts_with(SANDBOX_NOTICE));
         assert!(!uses_claude_settings(&m));
         // The Claude adapter: Claude Code's placeholders, and wicket's lockdown in _meta.
-        let m = Manifest::from_yaml(&y(", profile: claude-agent-acp", ", llm: {}")).unwrap();
+        let m = crate::load(&y(", profile: claude-agent-acp", ", llm: {}")).unwrap();
         let p = acp_plan(&m, &RunId("run_x".into())).unwrap();
         assert!(p.env.iter().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.contains("placeholder")));
         let o = &p.acp.unwrap().meta.unwrap()["claudeCode"]["options"];
@@ -701,13 +709,13 @@ mod tests {
         assert_eq!(o["settingSources"], serde_json::json!(["user", "project"]));
         assert!(uses_claude_settings(&m));
         // Not an ACP agent: no plan.
-        let m = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        let m = crate::load("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
         assert!(acp_plan(&m, &RunId("run_x".into())).is_none());
     }
 
     #[test]
     fn acp_manifests_are_checked() {
-        let bad = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z}}")).unwrap_err().to_string();
+        let bad = |agent: &str| crate::load(&format!("task: hi\nagent: {agent}\nzone: {{name: z}}")).unwrap_err().to_string();
         assert!(bad("{name: a, harness: acp}").contains("acp.command"));
         assert!(bad("{name: a, harness: acp, acp: {command: []}}").contains("acp.command"));
         assert!(bad("{name: a, acp: {command: [x]}}").contains("harness: acp"));
@@ -717,16 +725,16 @@ mod tests {
         assert!(bad("{name: a, harness: acp, acp: {command: [x], _meta: {}}}").contains("unknown field"));
         assert!(bad("{name: a, harness: gemini}").contains("unknown variant"));
         // The zone's model route is a Claude subscription: Claude Code only (#174 adds other routes).
-        let with_llm = |agent: &str| Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{name: z, llm: {{}}}}"));
+        let with_llm = |agent: &str| crate::load(&format!("task: hi\nagent: {agent}\nzone: {{name: z, llm: {{}}}}"));
         assert!(with_llm("{name: a, harness: acp, acp: {command: [x]}}").unwrap_err().to_string().contains("only Claude Code"));
         assert!(with_llm("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").is_ok());
         assert!(bad("{name: a, harness: acp, acp: {command: [x], profile: claude-agent-acp}}").contains("llm section"));
-        assert!(Manifest::from_yaml("task: hi\nagent: {name: a, harness: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
+        assert!(crate::load("task: hi\nagent: {name: a, harness: acp, acp: {command: [x]}}\nzone: {name: z}").is_ok());
     }
 
     #[test]
     fn a_wrapped_session_gets_placeholders_and_keeps_its_own_settings() {
-        let m = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        let m = crate::load("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
         let dir = std::env::temp_dir().join(format!("wicket-wrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let prompt = dir.join("p.txt");
@@ -786,7 +794,7 @@ mod tests {
 
     #[test]
     fn plan_has_no_real_credentials_and_routes_through_proxies() {
-        let m = Manifest::from_yaml("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
+        let m = crate::load("task: hi\nagent: {name: a}\nzone: {name: z, llm: {}}").unwrap();
         let s = AgentSession::new();
         assert!(AgentSession::valid(&s.id), "{}", s.id);
         assert!(!AgentSession::valid("../../etc") && !AgentSession::valid(&s.id.to_uppercase()));
@@ -796,7 +804,7 @@ mod tests {
         let r = claude_code_plan(&m, &RunId("run_y".into()), &AgentSession { resume: true, ..s.clone() });
         assert!(r.argv.windows(2).any(|w| w[0] == "--resume" && w[1] == s.id) && !r.argv.contains(&"--session-id".to_string()));
         let set = claude_settings(
-            &Manifest::from_yaml("task: hi\nagent: {name: a, adapter_settings: {language: fr}}\nzone: {name: z, llm: {}}").unwrap(),
+            &crate::load("task: hi\nagent: {name: a, adapter_settings: {language: fr}}\nzone: {name: z, llm: {}}").unwrap(),
         );
         assert_eq!(set["cleanupPeriodDays"], CLEANUP_PERIOD_DAYS);
         assert_eq!(set["language"], "fr");
@@ -824,7 +832,7 @@ mod tests {
     }
 
     fn remote_manifest_with(extra: &str) -> Manifest {
-        Manifest::from_yaml(&format!(
+        crate::load(&format!(
             "agent: {{ name: rc, remote: {{ name: my box{extra} }} }}\nzone: {{ name: z, llm: {{ secret: claude-login }} }}\n"
         ))
         .unwrap()
@@ -851,14 +859,14 @@ mod tests {
             assert_eq!(permission_mode_of(&rc.remote_plan(&m, &run, &Value::Null).unwrap()), mode.as_str());
         }
         // An unknown mode never makes a manifest.
-        let e = Manifest::from_yaml("agent: { name: rc, remote: { name: b, permission_mode: yolo } }\nzone: { name: z, llm: {} }\n")
+        let e = crate::load("agent: { name: rc, remote: { name: b, permission_mode: yolo } }\nzone: { name: z, llm: {} }\n")
             .unwrap_err()
             .to_string();
         assert!(e.contains("unknown variant `yolo`") && e.contains("bypassPermissions"), "{e}");
     }
 
     fn driven_remote_manifest(extra: &str) -> Manifest {
-        Manifest::from_yaml(&format!(
+        crate::load(&format!(
             "task: fix the bug\nagent: {{ name: rc, remote: {{ name: my box, drive: true{extra} }} }}\nzone: {{ name: z, llm: {{ secret: claude-login }} }}\n"
         ))
         .unwrap()

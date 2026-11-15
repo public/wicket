@@ -109,6 +109,17 @@ pub trait Adapter: Send + Sync {
         false
     }
 
+    /// The model route a zone's `llm` gets where the manifest leaves a field out: provider, secret and
+    /// upstream. None: this agent takes no model route (a zone with `llm` is refused).
+    fn model_route(&self, _m: &Manifest) -> Option<wicket_core::ModelRoute> {
+        None
+    }
+
+    /// Checks what only this harness knows about the agent's manifest (beyond core's checks).
+    fn check(&self, _m: &Manifest) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The account login a remote or wrapped session's box holds as a placeholder.
     fn login(&self, _m: &Manifest) -> Option<Login> {
         None
@@ -187,6 +198,67 @@ pub fn link_login_meta(file: &std::path::Path, pointer: Option<&str>) -> Option<
     adapters().into_iter().find_map(|a| a.link_login_meta(file, pointer))
 }
 
+/// The ACP adapter profiles wicket knows (`agent.acp.profile`).
+pub const ACP_PROFILES: [&str; 1] = [claude::ACP_PROFILE];
+
+/// A harness's default model secret, for `wicket doctor`.
+pub struct ModelSecret {
+    pub harness: Harness,
+    pub secret: String,
+    /// How its owner gets the credential.
+    pub how: &'static str,
+}
+
+/// Every harness's default model secret (one per secret name).
+pub fn model_secrets() -> Vec<ModelSecret> {
+    vec![ModelSecret { harness: Harness::ClaudeCode, secret: claude::LOGIN_SECRET.into(), how: claude::LOGIN_HOW }]
+}
+
+/// The hosts a harness's default model secret is bound to when `wicket secret set` or `link` stores
+/// it with no binding of its own: its default route's upstream host. Empty for any other name.
+pub fn default_secret_hosts(name: &str) -> Vec<String> {
+    let routes = [claude::model_route()];
+    routes.iter().filter(|r| r.secret == name).filter_map(|r| url_host(&r.upstream)).fold(vec![], |mut v, h| {
+        if !v.contains(&h) {
+            v.push(h);
+        }
+        v
+    })
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    let host = host.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Fills in and checks what a manifest's harness decides (#255): the zone's model route defaults
+/// (an agent whose harness takes a route needs `zone.llm`; one that takes none may not have it), and
+/// the harness's own checks. A program takes no model route (core refuses `zone.llm` for it).
+pub fn resolve(m: &mut Manifest) -> Result<(), String> {
+    let Some(a) = of(m) else { return Ok(()) };
+    a.check(m)?;
+    let route = a.model_route(m);
+    match (m.zone.llm.as_mut(), route) {
+        (Some(_), None) => {
+            return Err(format!(
+                "zone.llm: this agent's harness ({}) takes no model route yet; leave llm out (routes per provider are #174)",
+                a.harness()
+            ))
+        }
+        (None, Some(_)) => return Err("an agent zone needs an llm section".into()),
+        (Some(l), Some(r)) => {
+            l.fill(&r);
+            if let Some(f) = l.missing() {
+                return Err(format!("zone.llm.{f} is empty"));
+            }
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
 /// The adapter for a manifest's agent; None for a program.
 pub fn of(m: &Manifest) -> Option<&'static dyn Adapter> {
     m.agent.as_ref().map(|a| adapter(a.harness))
@@ -231,6 +303,10 @@ impl Adapter for ClaudeCode {
 
     fn is_runtime(&self, _m: &Manifest, cmd: &str) -> bool {
         claude::is_runtime(cmd)
+    }
+
+    fn model_route(&self, _m: &Manifest) -> Option<wicket_core::ModelRoute> {
+        Some(claude::model_route())
     }
 
     fn login(&self, m: &Manifest) -> Option<Login> {
@@ -388,6 +464,27 @@ impl Adapter for Acp {
     fn is_runtime(&self, m: &Manifest, cmd: &str) -> bool {
         runs_claude_code(m) && claude::is_runtime(cmd)
     }
+
+    fn model_route(&self, m: &Manifest) -> Option<wicket_core::ModelRoute> {
+        // Claude Code through its ACP adapter has Claude Code's route; a generic ACP agent gets none
+        // until routes per provider exist (#174).
+        runs_claude_code(m).then(claude::model_route)
+    }
+
+    fn check(&self, m: &Manifest) -> Result<(), String> {
+        let Some(a) = m.agent.as_ref() else { return Ok(()) };
+        let known = match a.acp.as_ref().and_then(|p| p.profile.as_deref()) {
+            None => false,
+            Some(p) if ACP_PROFILES.contains(&p) => true,
+            Some(p) => return Err(format!("agent.acp.profile {p:?}: known profiles are {ACP_PROFILES:?}")),
+        };
+        if !known && (a.model.is_some() || !a.adapter_settings.is_empty()) {
+            return Err(
+                "agent.model and agent.adapter_settings need an ACP profile wicket knows; set them in the agent's own configuration".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -395,7 +492,7 @@ mod tests {
     use super::*;
 
     fn manifest(agent: &str) -> Manifest {
-        Manifest::from_yaml(&format!("task: hi\nagent: {agent}\nzone: {{ name: z, llm: {{}} }}\n")).unwrap()
+        crate::load(&format!("task: hi\nagent: {agent}\nzone: {{ name: z, llm: {{}} }}\n")).unwrap()
     }
 
     #[test]
@@ -409,8 +506,7 @@ mod tests {
         let r = rc.agent.as_ref().unwrap();
         assert!(matches!(Mode::of(r, None), Ok(Mode::Remote(s)) if s.name == "box"));
         assert!(Mode::of(r, Some(&argv)).is_err());
-        let d =
-            Manifest::from_yaml("task: hi\nagent: { name: a, remote: { name: box, drive: true } }\nzone: { name: z, llm: {} }\n").unwrap();
+        let d = crate::load("task: hi\nagent: { name: a, remote: { name: box, drive: true } }\nzone: { name: z, llm: {} }\n").unwrap();
         let d = d.agent.as_ref().unwrap();
         assert!(matches!(Mode::of(d, None), Ok(Mode::DrivenRemote(s)) if s.name == "box" && s.drive));
         assert!(Mode::of(d, Some(&argv)).is_err());
@@ -435,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_generic_acp_agent_has_no_claude_and_no_remote_or_wrapped_mode() {
-        let m = Manifest::from_yaml("task: hi\nagent: { name: a, harness: acp, acp: { command: [x] } }\nzone: { name: z }\n").unwrap();
+        let m = crate::load("task: hi\nagent: { name: a, harness: acp, acp: { command: [x] } }\nzone: { name: z }\n").unwrap();
         let a = of(&m).unwrap();
         assert!(a.state_dirs(&m).is_empty() && a.state_files(&m).is_empty() && a.login(&m).is_none());
         assert!(!a.is_runtime(&m, "claude -p"));
@@ -448,7 +544,7 @@ mod tests {
         let e = a.remote_permission_mode(RemotePermissionMode::BypassPermissions).unwrap_err();
         assert_eq!(e, "agent.remote.permission_mode \"bypassPermissions\": the acp harness has no permission modes");
         assert!(a.wrapped_plan(&m, &run, &[], &[], std::path::Path::new("/")).err().unwrap().contains("no wrapped mode"));
-        let claude = Manifest::from_yaml(
+        let claude = crate::load(
             "task: hi\nagent: { name: a, harness: acp, acp: { command: [claude-agent-acp], profile: claude-agent-acp } }\nzone: { name: z, llm: {} }\n",
         )
         .unwrap();

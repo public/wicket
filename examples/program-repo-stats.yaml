@@ -4,10 +4,11 @@ program:
   name: repo-stats
   source: ../programs/repo-stats
   command: [bash, /workspace/stats.sh]
-  on_pending: fail          # out-of-reach requests fail; nothing is queued for a human
   # digest: sha256:...      # pin the approved source (see: wicket program digest programs/repo-stats)
 zone:
   name: stats
+  # A program's zone may not ask for more (escalation.request defaults to false for a program):
+  # out-of-reach requests fail, and nothing is queued for a human.
   isolation: gvisor
   reach:
     - { host: api.github.com, paths: ["/repos/octocat/Hello-World"] }

@@ -37,7 +37,8 @@ pub struct RunCtx {
     pub ledger: Arc<Mutex<Ledger>>,
     pub vault: vault::Vault,
     pub events: UnboundedSender<Event>,
-    /// False for programs with `on_pending: fail`: out-of-reach requests fail without a pending request.
+    /// The zone's `escalation.request` (false by default for a program, #255): when false,
+    /// out-of-reach requests fail without a pending request.
     pub escalate: bool,
     /// Who inside the box is making a request to (host, path), as reported by the agent's event
     /// stream: the attribution as JSON, plus a one-line summary. Untrusted; for humans only.
@@ -508,11 +509,8 @@ pub(crate) const FORWARD_REQUEST: &[&str] = &[
 pub(crate) fn provider_request_header(host: &str, name: &str) -> bool {
     match host {
         "api.github.com" | "uploads.github.com" => name == "x-github-api-version",
-        // Claude Code's model and Remote Control traffic (wrapped sessions).
-        "api.anthropic.com" => {
-            name.starts_with("anthropic-") || name.starts_with("x-stainless-") || name.starts_with("x-claude-") || name == "x-app"
-        }
-        _ => false,
+        // A model provider's host: its profile's headers (wrapped sessions' model and remote traffic).
+        _ => crate::provider::for_host(host).is_some_and(|p| (p.request_header)(name)),
     }
 }
 

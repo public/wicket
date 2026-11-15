@@ -5,9 +5,9 @@ program:
   name: node-e2e
   command: [bash, probe.sh, "110"]
   source: .
-  on_pending: wait
 zone:
   name: node-e2e
+  escalation: { request: true }   # a program may not ask by default
   isolation: gvisor
   reach:
     - { host: example.com, methods: [GET, POST], paths: ["/"] }

@@ -370,7 +370,7 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
             false => Some(queue_call(node, run, tool, args)),
         };
     }
-    let parent = match wicket_core::Manifest::from_yaml(&sp.manifest) {
+    let parent = match wicket_agent::load(&sp.manifest) {
         Ok(m) => m,
         Err(e) => return Some((format!("not started: the box's manifest is unreadable on its node ({e})"), true)),
     };

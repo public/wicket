@@ -109,7 +109,7 @@ mod tests {
     fn the_pinned_example_pins_its_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let text = std::fs::read_to_string(root.join("examples/program-repo-stats.pinned.yaml")).unwrap();
-        let m = wicket_core::Manifest::from_yaml(&text).unwrap();
+        let m = wicket_agent::load(&text).unwrap();
         let p = m.program.unwrap();
         let src = root.join("examples").join(p.source.unwrap());
         assert_eq!(p.digest.unwrap(), digest_dir(&src).unwrap());

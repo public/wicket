@@ -1452,7 +1452,7 @@ pub fn fenced_in(run_dir: &Path, now_ms: i64) -> Option<(String, i64)> {
 /// its start, its zone's timeout, and a long-lived agent's node backstop (120 s).
 fn timeout_end(run_dir: &Path) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(run_dir.join("ctl/run.json")).ok()?).ok()?;
-    let m = wicket_core::Manifest::from_yaml(v["manifest"].as_str()?).ok()?;
+    let m = wicket_agent::load(v["manifest"].as_str()?).ok()?;
     let secs = i64::try_from(m.zone.limits.timeout().ok()?.as_secs()).ok()?;
     Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
 }
@@ -2032,7 +2032,7 @@ mod tests {
     #[test]
     fn a_node_cannot_choose_what_its_ask_shows() {
         let (t, run) = (TenantId::single(), RunId("run_a".into()));
-        let zone = wicket_core::Manifest::from_yaml(
+        let zone = wicket_agent::load(
             "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach:\n    - { host: api.example.com, methods: [GET], paths: [\"/ok\"] }\n  forbid:\n    - { host: secret.example.com }\n",
         )
         .unwrap()

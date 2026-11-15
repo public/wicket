@@ -28,7 +28,7 @@ pub enum Outcome {
     Allow(String),
     /// Never allowed.
     Forbidden(String),
-    /// Out of reach, and this run doesn't escalate (a program with `on_pending: fail`).
+    /// Out of reach, and this run doesn't escalate (its zone's `escalation.request` is false).
     NoEscalation(String),
     /// A human denied exactly this request recently.
     Denied { request: String },
@@ -326,7 +326,7 @@ mod tests {
 
     fn zone() -> ZoneSpec {
         Manifest::from_yaml(
-            "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: z\n  reach:\n    - { host: api.example.com, methods: [GET, POST], paths: [\"/v1/**\"] }\n  inject:\n    - { host: secret.example.com, header: authorization, format: \"Bearer {secret}\", secret: s }\n",
+            "task: t\nprogram: { name: p, command: [x] }\nzone:\n  name: z\n  escalation: { request: true }\n  reach:\n    - { host: api.example.com, methods: [GET, POST], paths: [\"/v1/**\"] }\n  inject:\n    - { host: secret.example.com, header: authorization, format: \"Bearer {secret}\", secret: s }\n",
         )
         .unwrap()
         .zone
@@ -557,7 +557,7 @@ mod tests {
         let link = Arc::new(Link { up: AtomicBool::new(true), asks: AtomicI64::new(0) });
         let d = NodeDecider { replica: replica.clone(), clock, control: link.clone() };
         let z = Manifest::from_yaml(
-            "task: t\nprogram: { name: p, command: [x], on_pending: wait }\nzone:\n  name: z\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n",
+            "task: t\nprogram: { name: p, command: [x] }\nzone:\n  name: z\n  escalation: { request: true }\n  reach:\n    - { host: github.com, methods: [GET, POST], paths: [\"/acme/app.git/info/refs\", \"/acme/app.git/git-upload-pack\"] }\n",
         )
         .unwrap()
         .zone;

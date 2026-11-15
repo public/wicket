@@ -235,11 +235,12 @@ enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: Option<ImageCmd>,
-        /// The tag to build, kept as given [default: this installation's own image:
-        /// wicket/claude-code:<build id> on an installed version, else wicket/claude-code:poc].
+        /// The tag to build, kept as given [default: this installation's own image: the default
+        /// harness's image repository, tagged with the build id on an installed version, else its
+        /// default tag].
         #[arg(long)]
         tag: Option<String>,
-        /// An image directory to build instead (e.g. images/claude-code, while changing it). If its
+        /// An image directory to build instead (e.g. one under images/, while changing it). If its
         /// Dockerfile declares `ARG BASE`, BASE is this installation's own agent image.
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -360,8 +361,9 @@ enum Cmd {
     },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
-        #[arg(long, default_value = crate::image::DEFAULT)]
-        image: String,
+        /// The agent image to check [default: the default harness's agent image].
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node
     /// key and a name-constrained node CA; listing, revoking, renewing the CA.
