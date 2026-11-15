@@ -230,6 +230,17 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
+// A node from `wicket place create` (#294): past its lease it is released by the reconciler, unless
+// a run still holds it, which is a warning until renewals exist (#56).
+function placedRow(p) {
+  const d = el("div", "row");
+  d.append(el("span", "mono", strip(p.name + " " + p.id)));
+  if (!p.past_lease) d.append(el("span", "", "lease until " + when(p.lease_until)));
+  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket place release " + strip(p.id) + ")"));
+  else d.append(el("span", "pend", "past its lease (" + when(p.lease_until) + "): released at the reconciler's next pass"));
+  return d;
+}
+
 // A running agent can be sent a follow-up or have its identity revoked; both are signed.
 function renderRun(s, x) {
   const d = el("div", "row");
@@ -569,6 +580,7 @@ async function refresh() {
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderStart(s);
     renderManifests(s);
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");

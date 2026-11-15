@@ -1384,8 +1384,21 @@ fn dashboard(state: &State) -> Result<Value> {
         "runs": runs,
         "manifests": list_manifests(state),
         "passkeys": l.operator_credentials(t)?,
+        "placed": placed_view(&l, wicket_store::now())?,
         "audit": audit,
     }))
+}
+
+/// Nodes `wicket place create` made that are still owned (#294), each with whether its lease has
+/// ended and the runs still holding it past then (the reconciler keeps those and warns).
+pub(crate) fn placed_view(l: &wicket_store::Ledger, now: i64) -> Result<Vec<Value>> {
+    Ok(l.placed_nodes(&["active"])?
+        .into_iter()
+        .map(|p| {
+            json!({ "id": p.id, "name": p.name, "backend": p.backend, "lease_until": p.lease_until,
+                    "past_lease": p.lease_until <= now, "held_by": p.held_by })
+        })
+        .collect())
 }
 
 #[cfg(test)]
