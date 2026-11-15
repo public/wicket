@@ -6,7 +6,7 @@ everything down, on failure too. It covers:
 
 - an agent's egress, over HTTP/1.1 and HTTP/3, in reach and out of it;
 - one request approved and one denied;
-- `spawn` of a narrower zone, and of a wider one with `ask_human`;
+- `spawn` of a narrower zone, and of a wider one with `escalate`;
 - a `link` between two boxes and a fetch across it;
 - revoking the agent and its whole subtree;
 - hibernate and wake;

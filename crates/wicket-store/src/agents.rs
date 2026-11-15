@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS agents (
   bundle_bytes INTEGER NOT NULL DEFAULT 0, lease_until INTEGER, restorable INTEGER NOT NULL DEFAULT 1,
   want TEXT, note TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   used_requests INTEGER NOT NULL DEFAULT 0, used_input_tokens INTEGER NOT NULL DEFAULT 0,
-  used_output_tokens INTEGER NOT NULL DEFAULT 0, used_secs INTEGER NOT NULL DEFAULT 0
+  used_output_tokens INTEGER NOT NULL DEFAULT 0, used_secs INTEGER NOT NULL DEFAULT 0, claim_until INTEGER
 );
 CREATE TABLE IF NOT EXISTS agent_runs (
   run TEXT PRIMARY KEY, agent TEXT NOT NULL, generation INTEGER NOT NULL, started_at INTEGER NOT NULL
@@ -67,8 +67,9 @@ pub struct AgentRow {
     /// Bytes stored for the head bundle (compressed, all trees).
     pub bundle_bytes: i64,
     /// Until when the current holder's claim is good (wicket's clock). A holder renews it while it
-    /// runs; an expired one (its supervisor died) can be claimed by a waker.
-    pub lease_until: Option<i64>,
+    /// runs; an expired one (its supervisor died) can be claimed by a waker. Column `claim_until`
+    /// (schema 7); the old `lease_until` is written alongside it until a contract step drops it.
+    pub claim_until: Option<i64>,
     /// False once revoked: a sleeping agent that may not be woken again.
     pub restorable: bool,
     /// What an operator asked of the running agent (`hibernate`), taken by its supervisor.
@@ -96,7 +97,7 @@ pub struct AgentUsage {
 }
 
 const COLS: &str = "id, tenant, zone, name, state, generation, run, session_id, manifest, image, workspace, head, head_seq, \
-                    bundle_bytes, lease_until, restorable, want, note, created_at, updated_at, used_requests, used_input_tokens, \
+                    bundle_bytes, claim_until, restorable, want, note, created_at, updated_at, used_requests, used_input_tokens, \
                     used_output_tokens, used_secs";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
@@ -115,7 +116,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         head: r.get(11)?,
         head_seq: r.get(12)?,
         bundle_bytes: r.get(13)?,
-        lease_until: r.get(14)?,
+        claim_until: r.get(14)?,
         restorable: r.get::<_, i64>(15)? != 0,
         want: r.get(16)?,
         note: r.get(17)?,
@@ -139,7 +140,8 @@ pub struct NewAgent<'a> {
     pub manifest: &'a str,
     pub image: &'a str,
     pub workspace: Option<&'a str>,
-    pub lease_until: i64,
+    /// Until when the first activation's claim is good.
+    pub claim_until: i64,
 }
 
 impl Ledger {
@@ -148,8 +150,8 @@ impl Ledger {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         tx.execute(
-            &format!("INSERT INTO agents ({COLS}) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0)"),
-            params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.lease_until, t],
+            &format!("INSERT INTO agents ({COLS}, lease_until) VALUES (?1, ?2, ?3, ?4, 'active', 1, ?5, ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, 1, NULL, NULL, ?11, ?11, 0, 0, 0, 0, ?10)"),
+            params![a.id, a.tenant, a.zone, a.name, a.run, a.session_id, a.manifest, a.image, a.workspace, a.claim_until, t],
         )?;
         tx.execute("INSERT INTO agent_runs (run, agent, generation, started_at) VALUES (?1, ?2, 1, ?3)", params![a.run, a.id, t])?;
         tx.commit()?;
@@ -218,24 +220,26 @@ impl Ledger {
     }
 
     /// Renews the holder's claim until `until`, if `generation` is still current.
-    pub fn renew_agent_lease(&self, id: &str, generation: i64, until: i64) -> Result<bool> {
-        let n =
-            self.conn.execute("UPDATE agents SET lease_until = ?3 WHERE id = ?1 AND generation = ?2", params![id, generation, until])?;
+    pub fn renew_agent_claim(&self, id: &str, generation: i64, until: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agents SET claim_until = ?3, lease_until = ?3 WHERE id = ?1 AND generation = ?2",
+            params![id, generation, until],
+        )?;
         Ok(n == 1)
     }
 
     /// The wake claim: one conditional update that moves a hibernated agent (or one whose holder's
-    /// lease ran out) to `waking`, bumps its generation and names `run` as its activation. Exactly
+    /// claim ran out) to `waking`, bumps its generation and names `run` as its activation. Exactly
     /// one of any number of concurrent claims succeeds; the others get None. Revoked agents and
     /// agents with nothing to restore can't be claimed.
-    pub fn claim_wake(&mut self, id: &str, run: &str, lease_until: i64) -> Result<Option<i64>> {
+    pub fn claim_wake(&mut self, id: &str, run: &str, claim_until: i64) -> Result<Option<i64>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now();
         let n = tx.execute(
-            "UPDATE agents SET state = 'waking', generation = generation + 1, run = ?2, lease_until = ?3, want = NULL, updated_at = ?4 \
+            "UPDATE agents SET state = 'waking', generation = generation + 1, run = ?2, claim_until = ?3, lease_until = ?3, want = NULL, updated_at = ?4 \
              WHERE id = ?1 AND restorable = 1 AND head IS NOT NULL \
-             AND (state = 'hibernated' OR (state IN ('active', 'hibernating', 'waking') AND COALESCE(lease_until, 0) < ?4))",
-            params![id, run, lease_until, t],
+             AND (state = 'hibernated' OR (state IN ('active', 'hibernating', 'waking') AND COALESCE(claim_until, 0) < ?4))",
+            params![id, run, claim_until, t],
         )?;
         if n != 1 {
             return Ok(None);
@@ -265,10 +269,10 @@ impl Ledger {
     /// The commit point of a push: moves the head to the new state manifest, in one statement that
     /// keeps the note set when hibernation began (why it hibernated, e.g. what wicket stopped), and
     /// checks both the pusher's generation and the head it started from. A stale pusher (a twin, or
-    /// a holder that lost its lease) gets false and leaves only orphan objects behind.
+    /// a holder that lost its claim) gets false and leaves only orphan objects behind.
     pub fn commit_agent_push(&self, id: &str, generation: i64, from_seq: i64, seq: i64, head: &str, bytes: i64) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE agents SET head = ?5, head_seq = ?4, bundle_bytes = ?6, state = 'hibernated', lease_until = NULL, want = NULL, \
+            "UPDATE agents SET head = ?5, head_seq = ?4, bundle_bytes = ?6, state = 'hibernated', claim_until = NULL, lease_until = NULL, want = NULL, \
              updated_at = ?7 WHERE id = ?1 AND generation = ?2 AND head_seq = ?3",
             params![id, generation, from_seq, seq, head, bytes, now()],
         )?;
@@ -279,7 +283,7 @@ impl Ledger {
     /// woken again. Only by the claim's own generation.
     pub fn release_failed_wake(&self, id: &str, generation: i64, why: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE agents SET state = 'hibernated', lease_until = NULL, note = ?3, updated_at = ?4 WHERE id = ?1 AND generation = ?2",
+            "UPDATE agents SET state = 'hibernated', claim_until = NULL, lease_until = NULL, note = ?3, updated_at = ?4 WHERE id = ?1 AND generation = ?2",
             params![id, generation, why, now()],
         )?;
         Ok(n == 1)
@@ -348,9 +352,40 @@ mod tests {
             manifest: "m",
             image: "img",
             workspace: None,
-            lease_until: now() + 30,
+            claim_until: now() + 30,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_ledger_from_before_schema_7_keeps_its_claims_and_both_columns_are_written() {
+        let dir = std::env::temp_dir().join(format!("wicket-store-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        let id = new_agent_id();
+        let until = now() + 600;
+        {
+            // The agents table as schema 6 made it: the claim's end in `lease_until`.
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(&SCHEMA.replace(", claim_until INTEGER\n", "\n")).unwrap();
+            c.execute(
+                "INSERT INTO agents (id, tenant, zone, name, state, generation, run, session_id, manifest, image, head, lease_until, \
+                 created_at, updated_at) VALUES (?1, 't0', 'z', 'a', 'active', 1, 'run_1', 's', 'm', 'img', 'h', ?2, 0, 0)",
+                params![id, until],
+            )
+            .unwrap();
+        }
+        let mut l = Ledger::open(&path).unwrap();
+        assert_eq!(l.agent(&id).unwrap().unwrap().claim_until, Some(until), "copied over");
+        assert_eq!(l.claim_wake(&id, "run_2", now() + 30).unwrap(), None, "its holder's claim is still live");
+        assert!(l.renew_agent_claim(&id, 1, until + 60).unwrap());
+        let old: Option<i64> = l.conn.query_row("SELECT lease_until FROM agents WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(old, Some(until + 60), "an older build still sees the claim");
+        l.conn.execute("UPDATE agents SET lease_until = 1 WHERE id = ?1", params![id]).unwrap();
+        drop(l);
+        assert_eq!(Ledger::open(&path).unwrap().agent(&id).unwrap().unwrap().claim_until, Some(until + 60), "copied only once");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -359,7 +394,7 @@ mod tests {
         let id = new_agent_id();
         assert!(valid_agent_id(&id));
         agent(&mut l, &id);
-        // Nothing to restore yet, and its holder's lease is live: no claim.
+        // Nothing to restore yet, and its holder's claim is live: no claim.
         assert_eq!(l.claim_wake(&id, "run_2", now() + 30).unwrap(), None);
         assert!(l.commit_agent_push(&id, 1, 0, 1, "a/x/m/1.1", 10).unwrap());
         let a = l.agent(&id).unwrap().unwrap();

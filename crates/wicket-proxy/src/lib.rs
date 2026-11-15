@@ -206,8 +206,8 @@ pub struct SpawnRequest {
     /// time it has left, isolation, unlisted_hosts) or to nothing (reach, inject, volumes).
     pub zone: Option<serde_json::Value>,
     pub max_children: u32,
-    /// If the zone isn't a subset of the parent's, put exactly this zone to a human instead of refusing.
-    pub ask_human: bool,
+    /// If the zone isn't a subset of the parent's, put exactly this zone up for approval instead of refusing.
+    pub escalate: bool,
     /// spawn_agent's shorthand: the parent's zone, narrowed to these hosts.
     pub reach_hosts: Option<Vec<String>>,
     /// Where to run it: `{"lease": "l-…"}` (a capacity lease this run holds) or `{"node": "<name>"}`.
@@ -707,7 +707,7 @@ mod fence_tests {
                 manifest: "m",
                 image: "i",
                 workspace: None,
-                lease_until: 0,
+                claim_until: 0,
             })
             .unwrap();
         assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());

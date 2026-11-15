@@ -74,7 +74,10 @@ pub enum StoreError {
 /// (the reply address), `messages.priority`, `messages.in_reply_to`, the `message_refusals` table,
 /// and `runs.activity` (busy, idle, waiting) for presence. Version 6 (expand) adds the
 /// `delegations` table: what a parent delegated to the children it spawned, and where it is (#252).
-pub const SCHEMA_VERSION: u32 = 6;
+/// Version 7 (expand) adds `agents.claim_until`, the wake claim's end, which `agents.lease_until`
+/// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
+/// contract step drops `lease_until`, so a build from before it still sees every claim.
+pub const SCHEMA_VERSION: u32 = 7;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -426,6 +429,10 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity_at INTEGER", []);
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_sent ON messages (from_principal, created_at)")?;
+        // Ledgers created before the wake claim had its own name (#349): its end was `lease_until`.
+        if conn.execute("ALTER TABLE agents ADD COLUMN claim_until INTEGER", []).is_ok() {
+            conn.execute("UPDATE agents SET claim_until = lease_until", [])?;
+        }
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 

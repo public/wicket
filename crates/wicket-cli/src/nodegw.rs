@@ -571,12 +571,12 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
     }
     if !plan.violations.is_empty() {
         // Beyond the box's authority: a human's, on the control host.
-        return match (up, req.ask_human) {
+        return match (up, req.escalate) {
             (true, _) => None,
             (false, true) => Some(queue_call(node, run, tool, args)),
             (false, false) => Some((
                 format!(
-                    "not started: this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask for exactly this zone to be approved (queued while wicket's control host is unreachable).",
+                    "not started: this zone is not within yours:\n- {}\nNarrow it, or call spawn again with escalate: true to ask for exactly this zone to be approved (queued while wicket's control host is unreachable).",
                     plan.violations.join("\n- ")
                 ),
                 true,

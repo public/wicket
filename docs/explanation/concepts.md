@@ -131,7 +131,7 @@ That zone must be within the agent's own (`wicket_core::subset`):
   from the parent's list;
 - `max_children` within the parent's: a child's own `max_children` counts against the parent's.
 
-A zone that isn't within it is refused, with every violation listed. With `ask_human`, it goes to an
+A zone that isn't within it is refused, with every violation listed. With `escalate`, it goes to an
 operator as exactly that zone, on an R4 card that lists what the child gets (its model route, credential
 injections, reach and limits). A different model route or credential is refused outright, with no
 approval path. Globs whose containment can't be proven (a character class under `*`, for example) are

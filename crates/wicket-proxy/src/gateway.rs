@@ -305,11 +305,11 @@ impl Gateway {
                 "may_send_to": may_send, "may_hear_from": may_receive,
             }));
         }
-        // Humans your accept_from names (#11): they reach you through the CLI and console.
+        // Operators your accept_from names (#11): they reach you through the CLI and console.
         for a in &self.ctx.zone.accept_from {
             if let Some(wicket_identity::Principal::Operator { .. }) = wicket_identity::Principal::parse(a) {
                 out.push(json!({
-                    "id": a, "kind": "human", "relation": "operator", "state": "offline",
+                    "id": a, "kind": "operator", "relation": "operator", "state": "offline",
                     "may_send_to": false, "may_hear_from": true,
                 }));
             }
@@ -876,7 +876,7 @@ pub fn spawn_request(tool: &str, args: &Value) -> Result<crate::SpawnRequest, St
         image: s("image"),
         zone: args.get("zone").cloned().filter(|z| z.is_object()),
         max_children: args.get("max_children").and_then(|v| v.as_u64()).unwrap_or(0).min(64) as u32,
-        ask_human: args.get("ask_human").and_then(|v| v.as_bool()).unwrap_or(false),
+        escalate: args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false),
         reach_hosts: None,
         placement: args.get("placement").cloned().filter(|p| p.is_object()),
     })
@@ -979,7 +979,7 @@ fn tools() -> Value {
         },
         {
             "name": "spawn",
-            "description": "Start a new box: an agent (with a task) or a program (a command, e.g. a long-running service), in a zone you describe. The zone must be within yours: reach, credentials, model budget (carved out of yours), memory, cpus, time, isolation and images can only narrow. If it isn't, you get the list of what exceeds yours; set ask_human to put exactly that zone to a human instead, then await_grant and call spawn again with the same arguments. Returns the new run id, and for an agent a handle: its principal and a delegation id. An agent's report on its task comes to you as a message (kind report) when its turn ends; continue_child gives it another brief, its context intact.",
+            "description": "Start a new box: an agent (with a task) or a program (a command, e.g. a long-running service), in a zone you describe. The zone must be within yours: reach, credentials, model budget (carved out of yours), memory, cpus, time, isolation and images can only narrow. If it isn't, you get the list of what exceeds yours; set escalate to put exactly that zone up for approval instead, then await_grant and call spawn again with the same arguments. Returns the new run id, and for an agent a handle: its principal and a delegation id. An agent's report on its task comes to you as a message (kind report) when its turn ends; continue_child gives it another brief, its context intact.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -993,7 +993,7 @@ fn tools() -> Value {
                         "description": "manifest-style zone: reach [{host, methods, paths}], forbid, unlisted_hosts, wildcards {forbid, max_names}, inject, volumes [{name, path}], llm {max_requests, max_output_tokens}, limits {memory, cpus, timeout, pids}, isolation, images, accept_from. Omitted: reach and credentials none; limits, isolation, unlisted_hosts and wildcards yours; an agent's model budget half of what you have left."
                     },
                     "max_children": { "type": "integer", "minimum": 0, "default": 0 },
-                    "ask_human": { "type": "boolean", "default": false },
+                    "escalate": { "type": "boolean", "default": false },
                     "placement": {
                         "type": "object",
                         "description": "where it runs: {\"lease\": \"l-…\"} (an active lease from request_capacity) or {\"node\": \"<name>\"} (the node you run on). Default: where you run.",
@@ -1232,7 +1232,7 @@ mod tests {
                 manifest: "m",
                 image: "i",
                 workspace: None,
-                lease_until: 0,
+                claim_until: 0,
             })
             .unwrap();
             assert!(l.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());
@@ -1390,7 +1390,7 @@ mod tests {
             (Some(false), Some(true), Some("offline"))
         );
         let h = by("spiffe://test.local/t/t0/op/unix/alice").expect("an operator its accept_from names");
-        assert_eq!(h["kind"], "human");
+        assert_eq!(h["kind"], "operator");
         assert!(by("spiffe://test.local/t/t0/z/elsewhere/a/stranger").is_none(), "{text}");
         assert!(!text.contains("/t/t1/"), "another tenant's principals are never listed: {text}");
         assert!(by(&id_of(&lead)).is_none(), "not itself");
@@ -1942,14 +1942,14 @@ mod spawn_request_tests {
     fn spawn_agent_reads_only_its_own_arguments() {
         let wide = json!({
             "name": "x", "task": "t", "kind": "program", "command": ["sh"], "image": "i:1",
-            "zone": { "name": "z" }, "max_children": 3, "ask_human": true, "placement": { "node": "n" },
+            "zone": { "name": "z" }, "max_children": 3, "escalate": true, "placement": { "node": "n" },
         });
         let a = spawn_request("spawn_agent", &wide).unwrap();
         assert_eq!(a.kind, "agent");
         assert!(a.command.is_empty() && a.image.is_none() && a.zone.is_none() && a.placement.is_none());
-        assert_eq!((a.max_children, a.ask_human), (0, false));
+        assert_eq!((a.max_children, a.escalate), (0, false));
         let s = spawn_request("spawn", &wide).unwrap();
-        assert_eq!((s.kind.as_str(), s.command.len(), s.max_children, s.ask_human), ("program", 1, 3, true));
+        assert_eq!((s.kind.as_str(), s.command.len(), s.max_children, s.escalate), ("program", 1, 3, true));
         assert!(s.image.is_some() && s.zone.is_some() && s.placement.is_some());
     }
 

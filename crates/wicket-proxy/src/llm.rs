@@ -1109,7 +1109,7 @@ mod tests {
                 manifest: "m",
                 image: "i",
                 workspace: None,
-                lease_until: 0,
+                claim_until: 0,
             })
             .unwrap();
         assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());

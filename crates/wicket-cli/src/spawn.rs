@@ -482,9 +482,9 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                     violations.join("\n- ")
                 ));
             }
-            None if !req.ask_human => {
+            None if !req.escalate => {
                 return Err(format!(
-                    "this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask for exactly this zone to be approved.",
+                    "this zone is not within yours:\n- {}\nNarrow it, or call spawn again with escalate: true to ask for exactly this zone to be approved.",
                     violations.join("\n- ")
                 ));
             }
@@ -956,7 +956,7 @@ mod tests {
             image: None,
             zone: Some(json!({ "reach": [{ "host": "api.example.com", "methods": ["GET"] }] })),
             max_children: 0,
-            ask_human: false,
+            escalate: false,
             reach_hosts: None,
             placement: None,
         }
@@ -1118,7 +1118,7 @@ mod tests {
         for (esc, needle) in [(json!({ "grant": true, "request": false }), "escalation.grant"), (json!({}), "escalation.request")] {
             let mut req = program("wider");
             req.zone.as_mut().unwrap()["escalation"] = esc;
-            req.ask_human = true;
+            req.escalate = true;
             let e = spawn(&p.ctx, req).unwrap_err();
             assert!(e.contains(needle) && e.contains("escalation.request: false"), "{e}");
         }
@@ -1157,7 +1157,7 @@ mod tests {
             task: Some("work".into()),
             command: vec![],
             zone: Some(z),
-            ask_human: true,
+            escalate: true,
             ..program("x")
         };
         for (z, needle) in [

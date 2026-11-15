@@ -231,7 +231,7 @@ one of:
 | `hibernated` | a long-lived agent asleep: a message wakes it |
 | `offline` | no live run: a message is held for its next one |
 
-Humans that `accept_from` names are listed as `kind: human`, `state: offline`: they don't receive
+Operators that `accept_from` names are listed as `kind: operator`, `state: offline`: they don't receive
 agents' messages yet (they will through the CLI and the console). Principals of other tenants are
 never listed.
 
@@ -273,7 +273,7 @@ message. Refused when `max_children` is 0 or spent.
 Starts a new box, an agent (with a task) or a program (a command, such as a long-running service),
 in a zone the caller describes. The zone must be within the caller's: reach, credentials, model
 budget (carved out of the caller's), memory, CPUs, PIDs, time, isolation, images and
-`max_children` can only narrow. If it isn't, the answer lists every violation; with `ask_human` it
+`max_children` can only narrow. If it isn't, the answer lists every violation; with `escalate` it
 becomes a pending R4 request, `SPAWN wicket.internal/zones/<zone>/<digest>`, for exactly that zone:
 the caller waits with `await_grant` and calls `spawn` again with the same arguments. A different
 model route or a credential the caller doesn't have is refused outright, with no approval path.
@@ -288,7 +288,7 @@ Returns the new run id, and for an agent a [handle](#delegation).
 | `image` | string | the caller's | from the caller's image or its zone's `images` |
 | `zone` | object | see below | a [manifest zone](manifest.md#zone): `reach`, `forbid`, `unlisted_hosts`, `wildcards`, `inject`, `volumes`, `llm` (`max_requests`, `max_output_tokens`), `limits`, `isolation`, `images`, `accept_from` |
 | `max_children` | integer ≥ 0 | 0 | at most 64; counts against the caller's |
-| `ask_human` | boolean | false | put a zone beyond the caller's to an operator |
+| `escalate` | boolean | false | put a zone beyond the caller's to an operator |
 | `placement` | `{"lease": "l-…"}` or `{"node": "<name>"}` | where the caller runs | an active lease from `request_capacity`, or the node the caller runs on |
 
 What `zone` leaves out: no reach and no credentials; the caller's limits, isolation,

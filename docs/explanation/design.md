@@ -561,7 +561,7 @@ agent's own; a human with that much access can approve an extension). Built:
   - `accept_from` and child slots.
 - **Inherited without asking:** the parent's `forbid` rules, `unlisted_hosts: hide`, and defaults no wider
   than the parent's.
-- **With `ask_human`, a wider zone becomes a pending request** bound to the request as the agent stated it.
+- **With `escalate`, a wider zone becomes a pending request** bound to the request as the agent stated it.
   A human approves, and the agent's identical retry starts exactly that zone. It's audited as
   `spawn.beyond_parent`.
 - **Every box gets an identity,** programs included, chained to its creator and the human. Programs report

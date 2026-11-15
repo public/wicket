@@ -24,7 +24,7 @@
 #     and out of it, a forbidden host that doesn't resolve;
 #   - one request is approved and another denied (`wicket approve` / `wicket deny`), and the agent's
 #     await_grant and retry see each decision;
-#   - `spawn` of a narrower zone starts at once; a wider one with ask_human waits for a human, then
+#   - `spawn` of a narrower zone starts at once; a wider one with escalate waits for an operator, then
 #     starts;
 #   - `link` wires two of the agent's boxes, and one fetches a page from the other across it;
 #   - revoking the agent's identity stops its whole subtree (children and a grandchild);
@@ -266,7 +266,7 @@ check "  and its retry got through" '[ -n "$(lf approve_retry)" ] && [ "$(lf app
 check "wicket deny: the agent's await_grant saw it denied" 'lf deny_wait | grep -q "^denied"'
 check "  and its retry is still refused" '[ "$(lf deny_retry)" = 403 ]'
 check "spawn of a narrower zone starts at once" 'lf narrow | grep -q "^started program narrow .*within your own"'
-check "spawn of a wider zone (ask_human) waits for an operator" 'lf wide_first | grep -q "^needs approval: request r-"'
+check "spawn of a wider zone (escalate) waits for an operator" 'lf wide_first | grep -q "^needs approval: request r-"'
 check "  and starts once approved" 'lf wide_wait | grep -q "^granted" && lf wide | grep -q "^started program wide .*approved beyond your own zone"'
 check "link wires the two children" 'lf link | grep -q "narrow.wicket.internal:8000"'
 # A child's output: its log (the supervisor's lines) and its transcript (a program's own output).
