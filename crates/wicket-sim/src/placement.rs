@@ -613,7 +613,7 @@ async fn machine(env: Rc<Env>, k: usize) -> turmoil::Result {
 /// One run's connection to its node.
 async fn serve_run(env: Rc<Env>, k: usize, replica: Rc<RefCell<Replica<BoxAuthority>>>, s: turmoil::net::TcpStream) {
     let up = |w: &World| !w.machines[k].gone && w.machines[k].inst.is_some();
-    if !up(&*env.world.lock().expect("world")) {
+    if !up(&env.world.lock().expect("world")) {
         return;
     }
     let (mut rd, mut wr) = s.into_split();
@@ -629,7 +629,7 @@ async fn serve_run(env: Rc<Env>, k: usize, replica: Rc<RefCell<Replica<BoxAuthor
         return;
     }
     while let Ok(Some((kind, body))) = wire::read_frame(&mut rd).await {
-        if !up(&*env.world.lock().expect("world")) {
+        if !up(&env.world.lock().expect("world")) {
             return;
         }
         if kind == wire::KIND_FEED {
@@ -1212,7 +1212,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
     CLOUD_LATENCY.store(plan.cloud_latency_s, std::sync::atomic::Ordering::SeqCst);
     let world = Arc::new(Mutex::new(World {
         machines: (0..MACHINES).map(|_| Machine::default()).collect(),
-        rng: Rng::new(seed ^ 0x636c_6f75_64),
+        rng: Rng::new(seed ^ 0x0063_6c6f_7564),
         next_id: 0,
         trace: Trace::new(EPOCH_S, options.keep_trace),
         stats: Stats::default(),
@@ -1289,7 +1289,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
             next += 1;
         }
         steps += 1;
-        if steps % 10 == 0 {
+        if steps.is_multiple_of(10) {
             world.lock().expect("world").check_leases(now);
         }
         if now >= EPOCH_S + END_S {
