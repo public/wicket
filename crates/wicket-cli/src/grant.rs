@@ -610,7 +610,7 @@ mod tests {
             .map(|r| serde_json::from_str(&r.4).unwrap())
             .collect();
         assert_eq!(refusals.len(), 2);
-        let r = &refusals[1];
+        let r = &refusals[0];
         assert_eq!((r["target"].as_str(), r["decision"].as_str(), r["by"].as_str()), (Some(id.as_str()), Some("approve"), Some("bob@cli")));
         assert!(r["granter_identity"].as_str().unwrap().ends_with("/op/unix/bob"), "{r}");
         assert!(r["why"].as_str().unwrap().contains("its hosts: docs.example.com"), "{r}");

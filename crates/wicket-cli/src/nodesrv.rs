@@ -2820,7 +2820,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             async move { gw::tool(&node, RUN, &name, &args).await.expect("decided on the node") }
         };
         let (who, err) = call("whoami", serde_json::json!({})).await;
-        assert!(!err && who.contains(&format!("spiffe://wicket.test/t0/{RUN}")) && who.contains("node n1"), "{who}");
+        assert!(!err && who.contains(&format!("spiffe://wicket.test/t/t0/z/z/a/{RUN}")) && who.contains("node n1"), "{who}");
         let access = |path: &str, scope: &str| serde_json::json!({ "url": format!("https://api.example{path}"), "reason": "to read the docs", "scope": scope });
         let (t, _) = call("request_access", access("/ok/a", "exact")).await;
         assert!(t.contains("already allowed"), "{t}");

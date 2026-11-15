@@ -1240,7 +1240,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             let t = grant::Terms { uses: *uses, ttl: Duration::from_secs(*ttl_secs), prefix: prefix.clone(), zone_wide: *zone_wide };
             let grant::Decided::Approved { grant, lease, .. } = grant::decide(
                 &mut l,
-                &grant::Granter::Human(crate::operators::Operator::console(&t.0, &oc.name)?),
+                &grant::Granter::Human(crate::operators::Operator::console(&state.tenant.0, &oc.name)?),
                 request,
                 &grant::Verdict::Approve(t),
                 json!({ "action": "decide", "signed": signed }),
@@ -1257,7 +1257,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::Decide { request, approve: false, .. } => {
             let lease = match grant::decide(
                 &mut l,
-                &grant::Granter::Human(crate::operators::Operator::console(&t.0, &oc.name)?),
+                &grant::Granter::Human(crate::operators::Operator::console(&state.tenant.0, &oc.name)?),
                 request,
                 &grant::Verdict::Deny,
                 json!({ "action": "decide", "signed": signed }),
