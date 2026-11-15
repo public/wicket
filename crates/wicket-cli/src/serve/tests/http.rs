@@ -509,7 +509,7 @@ async fn a_sign_in_flood_never_blocks_signed_actions() {
             }
         }
     }
-    let b = t.begin(json!({ "action": "say", "run": "run_a", "text": "still here" }));
+    let b = t.begin(json!({ "action": "revoke", "run": "run_a", "reason": "still here" }));
     assert_eq!(b.status, StatusCode::OK, "the flood blocked a signed action: {:?}", b.body);
     let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
     assert_eq!(t.post("/api/action/finish", a).status, StatusCode::OK);
@@ -521,9 +521,9 @@ async fn a_sign_in_flood_never_blocks_signed_actions() {
     }
     // And repeatedly: a session's own ceremonies replace its oldest rather than running out.
     for _ in 0..(MAX_CHALLENGES_PER_OWNER * 3) {
-        assert_eq!(t.begin(json!({ "action": "say", "run": "run_a", "text": "x" })).status, StatusCode::OK);
+        assert_eq!(t.begin(json!({ "action": "revoke", "run": "run_a", "reason": "x" })).status, StatusCode::OK);
     }
-    let r = t.act(json!({ "action": "say", "run": "run_a", "text": "and again" }));
+    let r = t.act(json!({ "action": "revoke", "run": "run_a", "reason": "and again" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     // Expired challenges free their room.
     for p in t.state.challenges.lock().unwrap().values_mut() {
@@ -669,7 +669,7 @@ async fn the_enrolment_link_is_single_use_and_its_failures_look_like_any_401() {
     let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &c)], b"").await;
     assert_eq!((status, json_of(&body)["who"]["state"].as_str()), (StatusCode::OK, Some("bootstrap")));
     assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &c)], b"").await.0, StatusCode::UNAUTHORIZED);
-    let say = json!({ "action": "say", "run": "r", "text": "hi" });
+    let say = json!({ "action": "revoke", "run": "r", "reason": "hi" });
     assert_eq!(post_json(&t.state, "/api/action/begin", Some(&boot), &say).await.0, StatusCode::UNAUTHORIZED);
     // Used: the same link is now just another 401, from anywhere.
     assert!(open_link(&t, PEER, &link).await.is_none());
@@ -729,7 +729,7 @@ async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
 async fn posts_need_the_csrf_header_and_the_consoles_origin() {
     let t = setup("origin");
     let cookie = format!("__Host-wicket_sid={}", t.sid.clone().unwrap());
-    let body = br#"{"action":"say","run":"run_x","text":"hi"}"#;
+    let body = br#"{"action":"revoke","run":"run_x","reason":"hi"}"#;
     let base = [("cookie", cookie.as_str()), ("content-type", "application/json")];
     let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
         (vec![("origin", ORIGIN)], StatusCode::FORBIDDEN),

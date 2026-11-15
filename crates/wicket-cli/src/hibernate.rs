@@ -13,7 +13,7 @@
 //!   placeholders, the bundle restored and verified, and Claude Code resumed with `--resume` on the
 //!   agent's own session, at the same workspace path (Claude Code keys sessions by directory). Its
 //!   first turn says it was woken, by what, and carries the operator's message if there is one.
-//!   Sources: `wicket wake`, `wicket say`, a message from another agent.
+//!   Sources: `wicket wake`, opening its session (`wicket session`), a message from another agent.
 //! - **Fencing.** Waking is a compare-and-set claim in the ledger that bumps the agent's generation;
 //!   the proxies refuse a stale generation and a push commits only under the current one
 //!   (`wicket_store::agents`).
@@ -979,8 +979,8 @@ mod tests {
 
     #[test]
     fn the_wake_turn_says_what_woke_the_agent() {
-        let t = wake_text("wicket say by op", &[("carry on".into(), "op".into())], 2);
-        assert!(t.contains("woken (wicket say by op)") && t.contains("carry on") && t.contains("2 message(s)"));
+        let t = wake_text("wicket session by op", &[("carry on".into(), "op".into())], 2);
+        assert!(t.contains("woken (wicket session by op)") && t.contains("carry on") && t.contains("2 message(s)"));
         assert!(!wake_text("x", &[], 0).contains("message(s)"));
     }
 

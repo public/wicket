@@ -38,7 +38,7 @@ What `examples/self-hosting/manifest.yaml` gives the agent:
 ```sh
 wicket run examples/self-hosting/manifest.yaml --image wicket-self:dev \
   --workspace-dir ../wicket-self --task "Fix …, run the tests, and commit on a new branch."
-wicket say <run> "Also …"          # follow-ups while it runs
+wicket session <run>               # its session, live: type prompts while it runs
 ```
 
 ## 3. Update the installation to the agent's build

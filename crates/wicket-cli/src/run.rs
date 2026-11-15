@@ -1487,7 +1487,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         _ => None,
     };
-    // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
+    // The task is the first user turn on stdin; prompts from the operator's session (#198) are
     // written the same way while the session is open. wicket closes stdin only when the agent asked
     // to finish or hibernate (#249): the harness decides when it is done.
     let mut stdin = stdin;

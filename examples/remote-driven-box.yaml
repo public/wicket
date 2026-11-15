@@ -1,5 +1,5 @@
 # A box wicket drives that is also a Remote Control session (#285): Claude Code runs driven, as in
-# any wicket box (the task below is its first turn; `wicket say`, messages and wakes are its next
+# any wicket box (the task below is its first turn; session prompts, messages and wakes are its next
 # ones; it hibernates and wakes), and registers its session in your Claude apps, where you watch it
 # and can send it messages. See docs/how-to/drive-a-box-from-the-claude-apps.md.
 #
