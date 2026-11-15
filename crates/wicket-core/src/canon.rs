@@ -17,6 +17,8 @@ pub enum CanonError {
     EncodedSeparator(String),
     #[error("path contains a backslash, control character or NUL")]
     BadCharacter,
+    #[error("path contains {0:?} unescaped, which a URL parser would percent-encode on the way upstream; send it percent-encoded")]
+    Unescaped(char),
     #[error("path is longer than {0} bytes")]
     TooLong(usize),
     #[error("path contains a percent-escape that isn't canonical ({0}): unreserved characters must not be escaped, and escapes are two upper-case hex digits")]
@@ -86,6 +88,12 @@ pub fn canonical_path(path_and_query: &str) -> Result<Cow<'_, str>, CanonError> 
 fn check_plain(path: &str) -> Result<(), CanonError> {
     if path.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f) {
         return Err(CanonError::BadCharacter);
+    }
+    // The request goes upstream through a URL parser, which percent-encodes these (WHATWG's path
+    // percent-encode set, and every non-ASCII character): `/a{b` would be decided as itself and sent
+    // as `/a%7Bb`. Refused, so the decided path is the one sent.
+    if let Some(c) = path.chars().find(|c| matches!(c, ' ' | '"' | '#' | '<' | '>' | '?' | '`' | '{' | '}') || !c.is_ascii()) {
+        return Err(CanonError::Unescaped(c));
     }
     // `;` starts a path parameter for some servers (`/a;x/b`, `/..;/`): not one spelling per resource.
     if path.contains(';') {
@@ -185,6 +193,15 @@ mod tests {
         assert!(matches!(canonical_path("/a/%2e%2e/b"), Err(CanonError::EncodedSeparator(_))));
         assert!(matches!(canonical_path("/a%2Fb"), Err(CanonError::EncodedSeparator(_))));
         assert_eq!(canonical_path("/a\\b"), Err(CanonError::BadCharacter));
+        // What a URL parser would escape on the way upstream (found by fuzzing, #323).
+        for (p, c) in
+            [("/up{oad", '{'), ("/a}", '}'), ("/a b", ' '), ("/a\"b", '"'), ("/a<b>", '<'), ("/a`b", '`'), ("/caf\u{e9}", '\u{e9}')]
+        {
+            assert_eq!(canonical_path(p), Err(CanonError::Unescaped(c)), "{p}");
+        }
+        // Their escapes are canonical, and go upstream as they are.
+        assert!(canonical_path("/up%7Boad").is_ok());
+        assert!(canonical_path("/caf%C3%A9").is_ok());
         assert_eq!(canonical_path("a/b"), Err(CanonError::NotAbsolute));
     }
 
