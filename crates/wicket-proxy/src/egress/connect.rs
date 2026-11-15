@@ -99,7 +99,7 @@ impl Egress {
             });
             crate::unavailable(&format!(
                 "{host} is served by wicket's control host ({why}), which this node can't reach right now; retry later. {}",
-                crate::SANDBOX_FACT
+                crate::BOX_FACT
             ))
         };
         let Some(relay) = self.relay.clone() else { return unreachable(&self) };

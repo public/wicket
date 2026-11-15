@@ -221,8 +221,8 @@ asked=$(cat "$WICKET_HOME/runs/$r_asker/workspace/out/result.json" 2>/dev/null |
 echo "   request_update: $(jq -r '.content[0].text' <<<"$asked" 2>/dev/null | cut -c1-160)"
 req=$(w pending 2>/dev/null | grep -o 'r-[a-z0-9]*' | head -1 || true)
 check "an agent's request_update files an R4 request and updates nothing" \
-  'jq -r ".content[0].text" <<<"$asked" | grep -q "needs a human" && w pending | grep -q "UPDATE wicket.internal/self/$C_SHA" && [ "$(current "$WICKET_HOME/versions" 2>/dev/null)" != "$C_ID" ]'
-check "while the request is pending, its artifact is still refused" '! w self update "$work/C" >"$work/u-pending.log" 2>&1 && grep -q "no human has approved" "$work/u-pending.log"'
+  'jq -r ".content[0].text" <<<"$asked" | grep -q "needs an operator" && w pending | grep -q "UPDATE wicket.internal/self/$C_SHA" && [ "$(current "$WICKET_HOME/versions" 2>/dev/null)" != "$C_ID" ]'
+check "while the request is pending, its artifact is still refused" '! w self update "$work/C" >"$work/u-pending.log" 2>&1 && grep -q "no operator has approved" "$work/u-pending.log"'
 
 # The state store, for the ledger snapshots each switch pushes (ci/update/snapshot-store.sh).
 . ci/update/snapshot-store.sh
@@ -271,7 +271,7 @@ st=${PIPESTATUS[0]}
 set -e
 check "the approved build was accepted, failed the injected check, and the update failed" '[ "$st" != 0 ] && grep -q "approved" "$work/u-c.log" && grep -q "rolled back to $A_ID" "$work/u-c.log"'
 check "  the control host and its node run A" '[ "$(current "$WICKET_HOME/versions")" = "$A_ID" ] && [ "$(serve_runs "$local_serve")" = "$A_ID" ]'
-check "  the approval was used up: C is refused again" '! w self update "$work/C" >"$work/u-c2.log" 2>&1 && grep -q "no human has approved" "$work/u-c2.log"'
+check "  the approval was used up: C is refused again" '! w self update "$work/C" >"$work/u-c2.log" 2>&1 && grep -q "no operator has approved" "$work/u-c2.log"'
 another_turn "the automatic rollback"
 
 # ---- 5. prune ----

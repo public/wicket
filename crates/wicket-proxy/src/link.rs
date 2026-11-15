@@ -98,9 +98,9 @@ pub fn expose(ctx: &RunCtx, port: u16, name: Option<&str>) -> Reply {
         return (format!("not exposed: the audit record could not be written ({e})"), true);
     }
     let who = if ctx.zone.accept_from.is_empty() {
-        "your parent (always), and boxes a human approves".to_string()
+        "your parent (always), and boxes an operator approves".to_string()
     } else {
-        format!("your parent, boxes in zones {} (your accept_from), and boxes a human approves", ctx.zone.accept_from.join(", "))
+        format!("your parent, boxes in zones {} (your accept_from), and boxes an operator approves", ctx.zone.accept_from.join(", "))
     };
     (
         format!(
@@ -317,7 +317,7 @@ async fn open(
             }
             None => {
                 if let Ok(Some(rid)) = l.denied_recently(&op) {
-                    return Err(format!("a human denied exactly this link ({rid}) a few minutes ago; don't ask again"));
+                    return Err(format!("exactly this link ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = format!(
                     "link box {} ({}) to port {port} of box {} ({}): {}",
@@ -329,7 +329,7 @@ async fn open(
                 );
                 let (rid, _) = l.pending_for(&op, &reason, None).map_err(|e| e.to_string())?;
                 return Ok(format!(
-                    "needs human approval: request {rid} ({}). Call await_grant with {rid}; once granted, make the same call again.",
+                    "needs approval: request {rid} ({}). Call await_grant with {rid}; once granted, make the same call again.",
                     d.needs_human.join("; ")
                 ));
             }
@@ -821,8 +821,8 @@ mod tests {
         // carol exposes, but doesn't accept alice's zone: pending a human, then allowed once.
         expose(&carol, 6379, None);
         let (text, err) = connect(&alice, "run_carol", Some(6379)).await;
-        assert!(!err && text.starts_with("needs human approval"), "{text}");
-        let rid = text.split_whitespace().nth(4).unwrap().to_string();
+        assert!(!err && text.starts_with("needs approval"), "{text}");
+        let rid = text.split_whitespace().nth(3).unwrap().to_string();
         {
             let mut l = w.ledger.lock().unwrap();
             let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() };

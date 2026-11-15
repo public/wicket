@@ -21,7 +21,7 @@ task: |
      messages with await_message.
   2. spawn a program named "hn" with command ["curl", "-sS", "https://news.ycombinator.com/"] in
      a zone that reaches news.ycombinator.com. If it is refused, call spawn again with the same
-     arguments and ask_human true, wait with await_grant, then call spawn once more.
+     arguments and escalate true, wait with await_grant, then call spawn once more.
   3. spawn a program named "web" with command ["python3", "-m", "http.server", "8000"] and an
      empty zone, then connect to it on port 8000 and fetch http://<the address connect gives>/
      with curl. Then unlink the link.
@@ -78,7 +78,7 @@ exceeds the lead's zone:
 [wicket-tool] spawn: … not within your zone: …news.ycombinator.com…
 ```
 
-The lead calls `spawn` again with `ask_human`, which files exactly that zone as a request. In
+The lead calls `spawn` again with `escalate`, which files exactly that zone as a request. In
 another terminal:
 
 ```sh
