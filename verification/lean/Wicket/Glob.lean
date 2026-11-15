@@ -122,6 +122,29 @@ def parseSeg (s : Str) : Seg := if s = ['*', '*'] then .any else .one s
 
 def parse (g : Str) : List Seg := (split g).map parseSeg
 
+def globstar : Str := ['*', '*']
+
+/-- A glob made only of `**` segments (`**`, `**/`, `**/**/`, …): globset reads it as one
+recursive prefix, which matches everything (even `**/`, which segment by segment would match only
+paths ending in `/`). -/
+def recursiveOnly (g : Str) : Bool :=
+  match split g with
+  | s :: rest => s == globstar &&
+      (rest.all (· == globstar) || (rest.dropLast.all (· == globstar) && rest.getLast? == some []))
+  | [] => false
+
+/-- A glob's segments, as the matcher reads them. -/
+def globParse (g : Str) : List Seg := if recursiveOnly g then [.any] else parse g
+
+theorem globParse_of_head {g : Str} (h : (split g).head? ≠ some globstar) : globParse g = parse g := by
+  unfold globParse recursiveOnly
+  cases hs : split g with
+  | nil => rfl
+  | cons s rest =>
+    rw [hs] at h
+    have : s ≠ globstar := fun e => h (by simp [e])
+    simp [this]
+
 /-- Characters the spec's language leaves out (`[`, `]`, `{`, `}`, `\`). -/
 def unsupportedChars : List Char := ['[', ']', '{', '}', '\\']
 
@@ -155,7 +178,7 @@ inductive SegsM (eq : CharEq) : List Seg → List Str → Prop where
   | anyEat {ps s ss} : ps ≠ [] → SegsM eq (.any :: ps) ss → SegsM eq (.any :: ps) (s :: ss)
 
 /-- The spec's language of a glob: the paths it matches. -/
-def Lang (eq : CharEq) (g p : Str) : Prop := SegsM eq (parse g) (split p)
+def Lang (eq : CharEq) (g p : Str) : Prop := SegsM eq (globParse g) (split p)
 
 /-! ## The executable matcher -/
 
@@ -176,7 +199,7 @@ def segsB (eq : CharEq) : List Seg → List Str → Bool
   | .any :: (q :: ps), [] => segsB eq (q :: ps) []
   | .any :: (q :: ps), s :: ss => segsB eq (q :: ps) (s :: ss) || segsB eq (.any :: q :: ps) ss
 
-def globB (eq : CharEq) (g p : Str) : Bool := segsB eq (parse g) (split p)
+def globB (eq : CharEq) (g p : Str) : Bool := segsB eq (globParse g) (split p)
 
 theorem tokM_star_nil {eq ts} : TokM eq (.star :: ts) [] ↔ TokM eq ts [] := by
   constructor
@@ -353,6 +376,18 @@ theorem plain_of_split {q : Str} (h : q.all plainChar) : ∀ s ∈ split q, s.al
   intro x hx
   exact h x (mem_of_mem_split hs hx)
 
+theorem head_split_append (a b : Str) : (split (a ++ '/' :: b)).head? = (split a).head? := by
+  rw [split_append_slash]
+  cases h : split a with
+  | nil => exact absurd h (split_ne_nil a)
+  | cons s r => rfl
+
+theorem head_plain {q : Str} (hq : q.all plainChar) : (split q).head? ≠ some globstar := by
+  intro h
+  have hm : globstar ∈ split q := List.mem_of_mem_head? h
+  have := plain_of_split hq _ hm
+  revert this; decide
+
 /-- **`*` stays within a segment.** A glob without a `**` segment matches only paths with exactly
 as many `/` as it has: no `*` or `?` ever matches a `/`. -/
 theorem no_globstar_same_slashes {eq g p} (hg : ∀ s ∈ split g, s ≠ ['*', '*']) (h : Lang eq g p) :
@@ -372,6 +407,9 @@ theorem no_globstar_same_slashes {eq g p} (hg : ∀ s ∈ split g, s ≠ ['*', '
     unfold parseSeg; split
     · exact absurd ‹_› (hg s hs)
     · simp
+  have hhead : (split g).head? ≠ some globstar := fun e => hg _ (List.mem_of_mem_head? e) rfl
+  unfold Lang at h
+  rw [globParse_of_head hhead] at h
   have := this _ _ hno h
   simp only [parse, List.length_map, length_split] at this
   omega
@@ -380,7 +418,9 @@ theorem no_globstar_same_slashes {eq g p} (hg : ∀ s ∈ split g, s ≠ ['*', '
 anything, `/` included. -/
 theorem globstar_crosses {q : Str} (hq : q.all plainChar) (w : Str) :
     Lang csEq (q ++ ['/', '*', '*']) (q ++ '/' :: w) := by
-  unfold Lang parse
+  unfold Lang
+  rw [globParse_of_head (by rw [head_split_append]; exact head_plain hq)]
+  unfold parse
   rw [split_append_slash, split_append_slash]
   have hs : split ['*', '*'] = [['*', '*']] := by decide
   rw [hs, List.map_append]

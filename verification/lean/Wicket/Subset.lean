@@ -185,7 +185,7 @@ theorem parse_globstar (q : Str) : parse (q ++ globstarSuffix) = parse q ++ [.an
 /-- **`path_covered` is sound**: on a canonical path, a covered child glob matches nothing none of
 the parent's globs match. -/
 theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = true) :
-    ∀ ss, AbsSegs ss → SegsM csEq (parse c) ss → ∃ g ∈ ps, SegsM csEq (parse g) ss := by
+    ∀ ss, AbsSegs ss → SegsM csEq (globParse c) ss → ∃ g ∈ ps, SegsM csEq (globParse g) ss := by
   intro ss habs hm
   unfold pathCovered at hcov
   simp only [Bool.or_eq_true, List.any_eq_true, beq_iff_eq] at hcov
@@ -193,12 +193,14 @@ theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = t
   · exact ⟨g, hg, hm⟩
   · refine ⟨_, hg, ?_⟩
     obtain ⟨t, rfl, ht⟩ := habs
+    rw [show globParse globstarSuffix = [.one [], .any] by decide]
     exact .one .nil (.anyLast ht)
   · split at hcov
     · rename_i hmeta
       simp only [Bool.not_eq_true', Bool.not_eq_eq_eq_not, Bool.not_true] at hmeta
       obtain ⟨g, hg, hgm⟩ := List.any_eq_true.mp hcov
       have hplain := plain_of_split (all_plain_of_not_hasMeta hmeta)
+      rw [globParse_of_head (head_plain (all_plain_of_not_hasMeta hmeta))] at hm
       have := (segsM_plain_append hplain [] ss).mp (by simpa [parse] using hm)
       obtain ⟨t, rfl, ht⟩ := this
       cases ht
@@ -207,7 +209,7 @@ theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = t
       exact ⟨g, hg, by simpa using h2⟩
     · obtain ⟨g, hg, hgm⟩ := List.any_eq_true.mp hcov
       refine ⟨g, hg, ?_⟩
-      have viaSegs : segsCover g c = true → SegsM csEq (parse g) ss := by
+      have viaSegs : segsCover g c = true → SegsM csEq (globParse g) ss := by
         intro hsc
         unfold segsCover at hsc
         split at hsc
@@ -218,8 +220,8 @@ theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = t
             simp [parse, split_cons_slash, parseSeg]
           have hpg : parse ('/' :: gb) = .one [] :: parse gb := by
             simp [parse, split_cons_slash, parseSeg]
-          rw [hpc] at hm
-          rw [hpg]
+          rw [globParse_of_head (by simp [split_cons_slash, globstar]), hpc] at hm
+          rw [globParse_of_head (by simp [split_cons_slash, globstar]), hpg]
           cases hm with
           | one h0 hrest => exact .one h0 (cover_sound _ _ hsc _ hrest)
         · simp at hsc
@@ -231,10 +233,11 @@ theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = t
           rw [List.isPrefixOf_iff_prefix] at hpre
           obtain ⟨rest, hrest⟩ := hpre.trans (List.takeWhile_prefix _)
           have hc : c = q ++ '/' :: rest := by rw [← hrest]; simp
-          rw [hc, parse_append_slash] at hm
+          have hqh := head_plain (all_plain_of_not_hasMeta hqm)
+          rw [hc, globParse_of_head (by rw [head_split_append]; exact hqh), parse_append_slash] at hm
           have hqplain := plain_of_split (all_plain_of_not_hasMeta hqm)
           obtain ⟨t, rfl, ht⟩ := (segsM_plain_append hqplain _ ss).mp hm
-          rw [hg', parse_globstar]
+          rw [hg', globParse_of_head (by rw [globstarSuffix, head_split_append]; exact hqh), parse_globstar]
           have hne : parse rest ≠ [] := by simp [parse, split_ne_nil]
           exact (segsM_plain_append hqplain _ _).mpr ⟨t, rfl, .anyLast (ht.ne_nil hne)⟩
         · exact viaSegs hsc
@@ -304,7 +307,7 @@ theorem reach_covered {p c : Zone} (h : reachCovered p c = true) {o : Op} (hp : 
   simp only [ruleCovered, List.any_eq_true, Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true'] at this
   obtain ⟨q, hq, ⟨⟨hqh, hqm⟩, hqp⟩, hqd⟩ := this
   obtain ⟨qm, hqm1, hqm2⟩ := hqm
-  obtain ⟨g', hg', hm'⟩ := pathCovered_sound hqp _ (absSegs_of_absPath hp) ((globB_iff _ _ _).mp hgm)
+  obtain ⟨g', hg', hm'⟩ := pathCovered_sound hqp _ (absSegs_of_absPath hp) ((globB_iff csEq g o.path).mp hgm)
   refine ⟨q, hq, ⟨⟨hostCovers_sound hqh hh, ⟨qm, hqm1, methodEq_trans hqm2 hmo⟩⟩,
     ⟨g', hg', (globB_iff csEq g' o.path).mpr hm'⟩⟩, ?_⟩
   rcases hrisk with h | h

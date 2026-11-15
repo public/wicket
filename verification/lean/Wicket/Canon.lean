@@ -78,12 +78,11 @@ def npmScoped (p : Str) : Option Str :=
     | none => none
   | _ => none
 
-def utf8Len (p : Str) : Nat := (String.ofList p).utf8ByteSize
-
-/-- `canonical_path(path_and_query)`: the path decided on, or `none` (an error). -/
+/-- `canonical_path(path_and_query)`: the path decided on, or `none` (an error). The symbols are
+bytes, as Rust checks them (the oracle passes UTF-8 bytes; `MAX_PATH` is in bytes). -/
 def canonicalPath (pq : Str) : Option Str :=
   let path := pq.takeWhile (· != '?')
-  if utf8Len path > 4096 then none
+  if path.length > 4096 then none
   else if path.head? != some '/' then none
   else
     let p := (npmScoped path).getD path
@@ -319,7 +318,7 @@ as the upstream reads it, under `Q/` still. -/
 theorem reach_no_escape {p q : Str} (hp : plainOk p = true) (hq : q.all plainChar) (hpct : '%' ∉ q)
     (hm : Lang csEq (q ++ globstarSuffix) p) : ∃ t, t ≠ [] ∧ resolve (split (decode p)) = split q ++ t := by
   unfold Lang at hm
-  rw [parse_globstar] at hm
+  rw [globParse_of_head (by rw [globstarSuffix, head_split_append]; exact head_plain hq), parse_globstar] at hm
   obtain ⟨t, ht, hrest⟩ := (segsM_plain_append (plain_of_split hq) _ _).mp hm
   have hne : t ≠ [] := hrest.ne_nil (by simp)
   refine ⟨t.map decode, by simpa using hne, ?_⟩
@@ -371,8 +370,14 @@ theorem forbid_no_escape {p q : Str} (hp : plainOk p = true) (hq : ∀ c ∈ q, 
           rw [decode_eq_unreserved (hA a List.mem_cons_self) (hq q List.mem_cons_self) h.1,
             ih qs (fun x hx => hA x (List.mem_cons_of_mem _ hx)) (fun s hs => hq s (List.mem_cons_of_mem _ hs)) h.2]
     exact key A (split q) hAe hqs hA
+  have hqall : q.all plainChar := by
+    simp only [List.all_eq_true]
+    intro c hc
+    rcases hq c hc with rfl | h
+    · decide
+    · exact unreserved_plain h
   unfold Lang
-  rw [parse_globstar, hAB, hAq]
+  rw [globParse_of_head (by rw [globstarSuffix, head_split_append]; exact head_plain hqall), parse_globstar, hAB, hAq]
   have hplain : ∀ s ∈ split q, s.all plainChar := by
     intro s hs
     simp only [List.all_eq_true]
