@@ -8,15 +8,23 @@
 //! nothing overflows, a slice never exceeds what is left, and a carve-out never takes a run past its
 //! budget.
 //!
-//! The rule for concurrent claims on one budget is **add, then check**: a model request, an output
-//! reservation and a carve-out each add their claim first and then check the total, taking it back
-//! if that is over. Of two claims racing for the last of a budget, the later to add sees both, so
-//! they can't both succeed; at worst both are refused, which fails closed.
+//! Concurrent claims on one budget (a model request, a call's output reservation, a spawn's
+//! carve-out) are each checked and made under one lock, [`Counter`]'s `claims`: of two racing for
+//! the last of a budget, one goes first and the other sees it. What only raises counts after the
+//! fact (a node's `Spent` merged, a call settled) takes no lock. (#325 first had each claim add and
+//! then check, lock-free; loom, which models `SeqCst` as acquire/release, found both claims of a
+//! race succeeding, and correctness that rests on the hardware's store order is not worth it.)
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use loom::sync::{
+    atomic::{AtomicU64, Ordering::SeqCst},
+    Mutex, MutexGuard,
+};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::{
+    atomic::{AtomicU64, Ordering::SeqCst},
+    Mutex, MutexGuard,
+};
 
 /// A run's model budget, as its model proxy enforces it (#256): the limits every check reads, and
 /// the only ones. On the control host they are the amounts of the run's live quota grants
@@ -188,9 +196,11 @@ impl std::fmt::Display for Short {
 }
 
 /// A run's model budget counters, shared by its model proxy's calls, its spawns' carve-outs and its
-/// node's `Spent` reports. Counters only go up, except a claim taken back.
-#[derive(Debug, Default)]
+/// node's `Spent` reports. Counters only go up, except a claim given back.
+#[derive(Default)]
 pub struct Counter {
+    /// Held while a claim is checked and made (see the module's documentation).
+    claims: Mutex<()>,
     pub requests: AtomicU64,
     /// Uncached input tokens.
     pub input_tokens: AtomicU64,
@@ -229,7 +239,19 @@ fn sub_sat(a: &AtomicU64, v: u64) {
     }
 }
 
+impl std::fmt::Debug for Counter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Counter").field(&self.counts()).finish()
+    }
+}
+
 impl Counter {
+    /// Held while a claim is checked and made. A panic elsewhere while it was held leaves the
+    /// counters consistent (each is one atomic), so a poisoned lock is still taken.
+    fn claim(&self) -> MutexGuard<'_, ()> {
+        self.claims.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Every counter, each read once.
     pub fn counts(&self) -> Counts {
         Counts {
@@ -287,28 +309,23 @@ impl Counter {
     }
 
     /// Counts one model request, and returns the requests committed with it: the request may go if
-    /// that is within the budget (add, then check; a refused one stays counted).
+    /// that is within the budget (a refused one stays counted).
     pub fn admit_request(&self) -> u64 {
+        let _claim = self.claim();
         add_sat(&self.requests, 1);
         self.counts().requests_committed()
     }
 
     /// Reserves up to `want` output tokens for one call, within `max` committed: what is left, if
-    /// less. None when nothing is left. Add, then check: a carve-out racing it can't also take the
-    /// same tokens.
+    /// less. None when nothing is left. Under the claims lock: a carve-out racing it can't also take
+    /// the same tokens.
     pub fn reserve_output(&self, max: u64, want: u64) -> Option<u64> {
-        loop {
-            let left = max.saturating_sub(self.counts().output_committed());
-            if left == 0 {
-                return None;
-            }
-            let take = add_sat(&self.inflight_output_tokens, want.min(left));
-            if self.counts().output_committed() <= max {
-                return Some(take);
-            }
-            // Another claim came in between: give this one back and look again.
-            sub_sat(&self.inflight_output_tokens, take);
+        let _claim = self.claim();
+        let left = max.saturating_sub(self.counts().output_committed());
+        if left == 0 {
+            return None;
         }
+        Some(add_sat(&self.inflight_output_tokens, want.min(left)))
     }
 
     /// Settles a call's reservation: releases it and charges what the call used.
@@ -321,36 +338,27 @@ impl Counter {
     }
 
     /// Carves `child` out of this run's budget `q` for a child it starts (#11, #256), if it still
-    /// fits once added: else takes it back and says which limit it would pass. The budget a spawn
-    /// checked earlier (`subset::check`) may have been spent since; this is the check that holds.
+    /// fits: else says which limit it would pass, and carves nothing. The budget a spawn checked
+    /// earlier (`subset::check`) may have been spent since; this is the check that holds.
     pub fn carve(&self, q: ModelQuota, child: ModelQuota) -> Result<(), Short> {
-        let added = [
-            add_sat(&self.reserved_requests, child.requests),
-            add_sat(&self.reserved_output_tokens, child.output_tokens),
-            add_sat(&self.reserved_input_tokens, child.input_tokens.unwrap_or(0)),
-        ];
+        let _claim = self.claim();
         let c = self.counts();
-        // A claim that saturated wasn't carved in full: refused, whatever the budget.
-        let short = if added[0] < child.requests || over(&[c.requests, c.reserved_requests, c.prior_requests], q.requests) {
-            Some(Short::Requests)
-        } else if added[1] < child.output_tokens
-            || over(&[c.output_tokens, c.reserved_output_tokens, c.prior_output_tokens, c.inflight_output_tokens], q.output_tokens)
-        {
-            Some(Short::OutputTokens)
-        } else if added[2] < child.input_tokens.unwrap_or(0)
-            || q.input_tokens.is_some_and(|m| over(&[c.input_total, c.reserved_input_tokens, c.prior_input_tokens], m))
-        {
-            Some(Short::InputTokens)
-        } else {
-            None
-        };
-        match short {
-            None => Ok(()),
-            Some(s) => {
-                self.uncarve(ModelQuota { requests: added[0], output_tokens: added[1], input_tokens: Some(added[2]) });
-                Err(s)
-            }
+        // Exact sums (`over`): a count saturated at u64::MAX can't make a carve-out fit.
+        if over(&[c.requests, c.reserved_requests, c.prior_requests, child.requests], q.requests) {
+            return Err(Short::Requests);
         }
+        let output = [c.output_tokens, c.reserved_output_tokens, c.prior_output_tokens, c.inflight_output_tokens, child.output_tokens];
+        if over(&output, q.output_tokens) {
+            return Err(Short::OutputTokens);
+        }
+        let input = [c.input_total, c.reserved_input_tokens, c.prior_input_tokens, child.input_tokens.unwrap_or(0)];
+        if q.input_tokens.is_some_and(|m| over(&input, m)) {
+            return Err(Short::InputTokens);
+        }
+        add_sat(&self.reserved_requests, child.requests);
+        add_sat(&self.reserved_output_tokens, child.output_tokens);
+        add_sat(&self.reserved_input_tokens, child.input_tokens.unwrap_or(0));
+        Ok(())
     }
 
     /// Gives a carve-out back: its child didn't start.

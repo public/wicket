@@ -501,8 +501,8 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let ids = record_quotas(c, &cm, &child.0, weight)?;
     *reserved += weight;
     // The budget checked above may have been spent since (a model call isn't under this lock): the
-    // carve-out is checked again as it is made, add-then-check, so the two can't both take the
-    // last of it (#325, wicket_core::budget).
+    // carve-out is checked again as it is made, under the counter's claims lock, so the two can't
+    // both take the last of it (#325, wicket_core::budget).
     let carve = match (&cm.zone.llm, c.llm.get()) {
         (Some(cl), Some(llm)) => {
             let child_quota = wicket_proxy::llm::ModelQuota::of_zone(cl);

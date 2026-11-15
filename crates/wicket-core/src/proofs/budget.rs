@@ -88,7 +88,7 @@ fn a_renewed_slice_is_the_next_or_no_more_than_it() {
 /// Carving: a child's budget is carved only if it fits in what is left, so a run within its
 /// budget stays within it (all three limits), and a refused carve-out changes nothing.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(7)]
 fn a_carve_out_keeps_the_run_within_its_budget() {
     let (c, q, child) = (any_counts(), any_quota(), any_quota());
     kani::assume(within(&c, q));
@@ -109,7 +109,7 @@ fn a_carve_out_keeps_the_run_within_its_budget() {
 /// than the parent had left, and the parent's own spending (an admitted request) stays within
 /// what the carve-outs left it.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(7)]
 fn children_never_exceed_the_parent() {
     let (c, q) = (any_counts(), any_quota());
     kani::assume(within(&c, q));

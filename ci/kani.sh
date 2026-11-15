@@ -7,7 +7,8 @@
 #
 # Then, unless harnesses are named or --no-loom is given, the budget counter's loom test
 # (crates/wicket-core/tests/loom_budget.rs: every interleaving of its node's reports, slice leases,
-# model calls and carve-outs), built with `--cfg loom` in its own target directory.
+# model calls and carve-outs, up to 3 preemptions per run), built with `--cfg loom` in its own
+# target directory.
 #
 # Runs every harness (or those named), one `cargo kani` at a time: CBMC's memory is per harness,
 # and one at a time keeps a run within a 4-6 GiB box (the largest needs about 2 GiB; see
@@ -67,7 +68,7 @@ if [ "$ran" = 0 ]; then
 fi
 if [ "$loom" = 1 ]; then
   t0=$SECONDS
-  if out=$(RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/loom" \
+  if out=$(RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=${LOOM_MAX_PREEMPTIONS:-3} CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/loom" \
     cargo test --release --locked -p wicket-core --test loom_budget 2>&1); then
     echo "ok   loom budget counter ($((SECONDS - t0)) s): $(grep -E '^test result' <<<"$out" | tail -n 1)"
   else

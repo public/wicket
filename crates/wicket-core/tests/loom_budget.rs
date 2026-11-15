@@ -2,7 +2,7 @@
 //! order its threads' atomic operations can take, and checks the budget in each. Built only with
 //! `--cfg loom`:
 //!
-//!   RUSTFLAGS="--cfg loom" cargo test -p wicket-core --test loom_budget --release
+//!   RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p wicket-core --test loom_budget --release
 //!
 //! (ci/kani.sh runs it after the Kani harnesses). The threads are what share a run's counter: its
 //! node's `Spent` reports (merged as they arrive, `noderun`), the slice leased to the node
@@ -23,27 +23,21 @@ fn counter(requests: u64, output_tokens: u64) -> Arc<Counter> {
     Arc::new(c)
 }
 
-/// Two node reports, the later one first, merged while a slice is leased: the counts end at the
-/// larger report (none lowers them), and the slice never leases more than the budget. Before #325
-/// `next_slice` read `requests` twice; a report merged in between leased 8 + 3 = 11 of 10.
+/// A node's report merged while a slice is leased: the count ends at the report (merging never
+/// lowers it: Kani's `merging_spent_only_raises_the_counts` covers stale and reordered reports),
+/// and the slice never leases more than the budget. Before #325 `next_slice` read `requests` twice;
+/// a report merged in between leased 8 + 3 = 11 of 10.
 #[test]
-fn merged_reports_and_a_lease_stay_within_the_budget() {
+fn a_merged_report_and_a_lease_stay_within_the_budget() {
     loom::model(|| {
         let c = counter(6, 40);
-        let reports =
-            [Spent { requests: 8, output_tokens: 70, ..Spent::default() }, Spent { requests: 7, output_tokens: 50, ..Spent::default() }];
-        let merges: Vec<_> = reports
-            .into_iter()
-            .map(|s| {
-                let c = c.clone();
-                thread::spawn(move || c.merge_spent(s))
-            })
-            .collect();
+        let merge = {
+            let c = c.clone();
+            thread::spawn(move || c.merge_spent(Spent { requests: 8, output_tokens: 70, ..Spent::default() }))
+        };
         let slice = c.next_slice(Q, 0.25);
-        for m in merges {
-            m.join().unwrap();
-        }
-        assert_eq!((c.requests.load(SeqCst), c.output_tokens.load(SeqCst)), (8, 70), "the larger report wins");
+        merge.join().unwrap();
+        assert_eq!((c.requests.load(SeqCst), c.output_tokens.load(SeqCst)), (8, 70));
         assert!(slice.requests <= Q.requests && slice.output_tokens <= Q.output_tokens, "{slice:?}");
     });
 }
