@@ -8,7 +8,7 @@
 # Steps:
 #   - `npm ci --ignore-scripts` (exact versions with integrity hashes; nothing from a package runs at
 #     install), `npm run build` (type-check, then vite) into web/session/dist;
-#   - the licences in the lockfile: permissive for what ships (MIT, ISC, BSD, Apache-2.0, 0BSD,
+#   - the licences in the lockfile: permissive for what ships (MIT, MIT-0, CC0, ISC, BSD, Apache-2.0, 0BSD,
 #     BlueOak); build tools may also be MPL-2.0;
 #   - the bundle is exactly session.js and session.css (and vite's index.html, not embedded), with
 #     no eval (the console's CSP refuses it) and no source maps;
@@ -39,7 +39,7 @@ first=$(digest)
 # must be permissive; the build tools (dev) may also be MPL-2.0 (lightningcss, vite's CSS minifier).
 node -e '
   const lock = require(process.argv[1]);
-  const ok = /^(MIT|ISC|0BSD|BSD-2-Clause|BSD-3-Clause|Apache-2\.0|BlueOak-1\.0\.0|\(MIT OR Apache-2\.0\)|MIT OR Apache-2\.0)$/;
+  const ok = /^(MIT|MIT-0|CC0-1\.0|ISC|0BSD|BSD-2-Clause|BSD-3-Clause|Apache-2\.0|BlueOak-1\.0\.0|\(MIT OR Apache-2\.0\)|MIT OR Apache-2\.0)$/;
   const allowed = (p) => ok.test(String(p.license ?? "")) || (p.dev === true && p.license === "MPL-2.0");
   const bad = Object.entries(lock.packages).filter(([k, p]) => k && !allowed(p));
   if (bad.length) { for (const [k, p] of bad) console.error(`licence: ${k}: ${p.license ?? "none"}`); process.exit(1); }

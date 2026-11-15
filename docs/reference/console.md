@@ -118,7 +118,7 @@ placeholder page saying the view wasn't built, and `wicket serve` says so at sta
 with the view:
 
 ```sh
-ci/session-view.sh                                  # needs Node 22.12+ and npm; prints the dist path
+ci/session-view.sh                                  # needs Node 20.19+ or 22.12+ and npm; prints the dist path
 WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
 ```
 
