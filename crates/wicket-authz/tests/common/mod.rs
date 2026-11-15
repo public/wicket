@@ -5,7 +5,7 @@
 use wicket_authz::*;
 use wicket_core::{CompiledZone, Manifest, RiskClass, RunId, TenantId, Verdict, ZoneSpec};
 
-#[path = "../../../wicket-core/tests/subset_cases.rs"]
+#[path = "../../../wicket-core/tests/integration/subset_cases.rs"]
 pub mod subset_cases;
 
 pub const T0: u64 = 1_800_000_000;

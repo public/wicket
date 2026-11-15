@@ -5,8 +5,7 @@
 //! - a child box can't shed it (block 0's checks carry into every spawn link);
 //! - no org policy: block 0 is what it was.
 
-mod common;
-use common::*;
+use crate::common::*;
 use wicket_authz::*;
 use wicket_core::RiskClass;
 

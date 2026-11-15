@@ -56,7 +56,7 @@ pub fn state_key() -> Result<[u8; 32]> {
         return Ok(k);
     }
     let mut k = [0u8; 32];
-    getrandom::getrandom(&mut k).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    getrandom::fill(&mut k).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     std::fs::create_dir_all(data_dir())?;
     // Made once: a run racing this one keeps whichever key was written first.
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p) {

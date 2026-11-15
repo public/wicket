@@ -627,7 +627,7 @@ fn attestation(challenge: &str, key: &SigningKey, id: &[u8]) -> Value {
     ad.extend_from_slice(&[0u8; 16]);
     ad.extend_from_slice(&(id.len() as u16).to_be_bytes());
     ad.extend_from_slice(id);
-    let p = key.verifying_key().to_encoded_point(false);
+    let p = key.verifying_key().to_sec1_point(false);
     let cose = ciborium::Value::Map(vec![
         (1.into(), 2.into()),
         (3.into(), (-7).into()),
@@ -687,7 +687,7 @@ async fn a_host_link_enrols_one_passkey_audited_with_the_link_and_client() {
     let boot = open_link(&t, "192.0.2.44:1", &link).await.unwrap();
     let (status, ch) = register_begin_as(&t, &boot).await;
     assert_eq!(status, StatusCode::OK);
-    let key = SigningKey::random(&mut rand_core::OsRng);
+    let key = SigningKey::generate();
     let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch.unwrap(), &key, b"cred-2")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let creds = t.ledger().operator_credentials(&TenantId::single()).unwrap();
@@ -715,7 +715,7 @@ async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
     // Finish: refused, even with a valid registration challenge (issued to an enrolment session).
     let boot = open_link(&t, PEER, &host_link(&t, 600)).await.unwrap();
     let ch = register_begin_as(&t, &boot).await.1.unwrap();
-    let key = SigningKey::random(&mut rand_core::OsRng);
+    let key = SigningKey::generate();
     let (status, _, _) = post_json(&t.state, "/api/register/finish", Some(&op), &attestation(&ch, &key, b"stolen")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // And without any session: the uniform 401.
