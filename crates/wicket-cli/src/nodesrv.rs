@@ -2526,6 +2526,29 @@ mod tests {
         assert!(!out("run_b", b"later\n"));
     }
 
+    #[tokio::test]
+    async fn a_tree_the_node_does_not_hold_is_refused_not_sent_empty() {
+        let inst = Install::new("nodesrv-get-tree");
+        let node = test_node(&inst);
+        let run = "run_00000000000000000000000000";
+        let mut c = connect_run(&node, 1, &inst, run).await;
+        let stream = TUNNEL_BIT | chan::CONTROL_TUNNEL_BIT | 7;
+        // Never laid out (or forgotten): refused, and nothing is made up for it.
+        c.write_all(&Frame::Msg(Msg::GetTree { stream, run: run.into(), tree: "workspace".into() }).encode()).await.unwrap();
+        match next_msg(&mut c).await {
+            Frame::Msg(Msg::TunnelOpened { stream: s, error: Some(e) }) => {
+                assert_eq!(s, stream);
+                assert!(e.contains("has no workspace"), "{e}");
+            }
+            f => panic!("expected a refusal, got {f:?}"),
+        }
+        assert!(!inst.dir.join("runs").join(run).join("workspace").exists(), "a get doesn't create the tree");
+        // Held: sent.
+        std::fs::create_dir_all(inst.dir.join("runs").join(run).join("workspace/out")).unwrap();
+        c.write_all(&Frame::Msg(Msg::GetTree { stream: stream + 1, run: run.into(), tree: "workspace".into() }).encode()).await.unwrap();
+        assert!(matches!(next_msg(&mut c).await, Frame::Msg(Msg::TunnelOpened { error: None, .. })));
+    }
+
     /// A box on this node whose token the replica holds: `zone` (YAML), minted for `run` until an
     /// hour from now, with the node's #164 edge start.
     fn fed_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {

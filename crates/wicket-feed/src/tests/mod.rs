@@ -4,6 +4,7 @@ mod attacks;
 mod fuzz;
 mod modes;
 mod persistence;
+mod publishers;
 mod revocation;
 mod skew;
 
