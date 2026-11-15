@@ -46,7 +46,13 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   segments (`/repos/acme/app/…` covers `/repos/acme/app` and what's under it, not `/repos/acme/app-secrets`),
   and every grant covers nothing riskier than the request you were shown: approving an R2 prefix doesn't
   allow the R4 operations (workflow edits, merges, access changes) under it. An agent whose identity
-  doesn't verify (or was revoked since you were shown the ask) can be denied, not approved.
+  doesn't verify (or was revoked since you were shown the ask) can be denied, not approved. The
+  passkey also signs the request's [effect descriptor](../explanation/approvals-bound-to-effects.md)
+  (`effect`, `effect_sha256`): who asks, the target, the risk, the terms and the arguments' hash. If
+  the request is no longer that effect when the decision is applied, it is refused. Before an
+  approval that widens (a prefix, more than one use, over an hour, or zone-wide), the confirmation
+  shows its blast radius: what else it would allow, with requests this run made, and how many of
+  the run's last 200 egress requests it would have covered.
 - **register a device for notifications, and show the request on one** (`push_subscribe`,
   `push_details`): see [notifications](#notifications). Removing a device and hiding the request
   need only the session.

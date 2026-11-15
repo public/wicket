@@ -76,7 +76,9 @@ stays pending for an operator. It may decide a request only when:
   refuse it: what the caller could do itself, never by one of its own grants.
 
 An approval grants exactly the asked path, to the asking run only, for `uses` uses, and ends no
-later than the caller's own authority.
+later than the caller's own authority. It signs the request's effect descriptor as it is then
+(`pending_requests` lists each request's `effect` hash): if the request changed before the decision
+is recorded, the decision is refused ([#369](../explanation/approvals-bound-to-effects.md)).
 
 `decision: renew` ([#56](https://github.com/public/wicket/issues/56)) gives a live grant, or a
 descendant box's authority, a new end `ttl_seconds` from now. It is signed, checked and recorded
@@ -274,8 +276,12 @@ Starts a new box, an agent (with a task) or a program (a command, such as a long
 in a zone the caller describes. The zone must be within the caller's: reach, credentials, model
 budget (carved out of the caller's), memory, CPUs, PIDs, time, isolation, images and
 `max_children` can only narrow. If it isn't, the answer lists every violation; with `escalate` it
-becomes a pending R4 request, `SPAWN wicket.internal/zones/<zone>/<digest>`, for exactly that zone:
-the caller waits with `await_grant` and calls `spawn` again with the same arguments. A different
+becomes a pending R4 request, `SPAWN wicket.internal/zones/<zone>/<name>`, for exactly that zone
+and those arguments (their sha256 is in the request's [effect](../explanation/approvals-bound-to-effects.md)):
+the caller waits with `await_grant` and calls `spawn` again with the same arguments. While it is
+pending, a call for the same child with other arguments waits on it ("waiting: request …"); once
+it is granted, other arguments are refused and audited (`effect.refused`), and a second call with
+the approved ones, after the child started, is refused too: an approval starts one child. A different
 model route or a credential the caller doesn't have is refused outright, with no approval path.
 Returns the new run id, and for an agent a [handle](#delegation).
 
