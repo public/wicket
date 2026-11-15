@@ -480,7 +480,7 @@ pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> 
                 trace: r.trace,
             }
         }
-        "placement" => placement::run(seed, dir, placement::Options { keep_trace }),
+        "placement" => placement::run(seed, dir, placement::Options { keep_trace, ..placement::Options::default() }),
         other => panic!("no scenario {other:?}: one of {:?}", trace::SCENARIOS),
     }
 }

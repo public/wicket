@@ -103,3 +103,32 @@ fn without_the_spend_journal_a_crashed_node_overspends() {
     );
     assert!(r.violations.iter().all(|v| v.contains("billed, budget")), "and breaks nothing else: {r}");
 }
+
+/// What the placement scenario found (#324), each still found with its fix turned off: the seeds
+/// that found them, run without the fix, break the invariant it restored.
+fn placement_without(seed: u64, options: wicket_sim::placement::Options, expect: &str) {
+    let r = wicket_sim::placement::run(seed, &dir().join("without"), options);
+    assert!(r.violations.iter().any(|v| v.contains(expect)), "placement seed {seed} no longer finds {expect:?}: {r}");
+}
+
+/// `wicket run --node` started boxes on a placed node past its lease, each run then holding it.
+#[test]
+fn without_the_lease_check_runs_start_on_a_node_past_its_lease() {
+    let o = wicket_sim::placement::Options { refuse_past_lease: false, ..Default::default() };
+    placement_without(2, o, "past its lease");
+}
+
+/// A run whose fetch failed left its files on its node, and the reconciler released the node with them.
+#[test]
+fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
+    let o = wicket_sim::placement::Options { hold_uncollected: false, ..Default::default() };
+    placement_without(2, o, "work on it uncollected");
+}
+
+/// A reconciler pass listed a node `place create` had just made, before it was recorded, and
+/// destroyed it as having no lease.
+#[test]
+fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
+    let o = wicket_sim::placement::Options { young_grace: false, ..Default::default() };
+    placement_without(20, o, "before its lease ends");
+}

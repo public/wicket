@@ -561,6 +561,7 @@ pub struct Env {
     pub feed_key: ed25519_dalek::SigningKey,
     pub cert: String,
     pub zone: ZoneSpec,
+    pub options: Options,
     pub authz_root: wicket_authz::SigningKey,
     pub approver: wicket_authz::SigningKey,
     /// Each run's box token issuer (`Issuer::root`, as the run's supervisor mints it).
@@ -797,8 +798,8 @@ async fn runs(env: Rc<Env>) {
             let l = env.ledger();
             // `place::refuse_past_lease` (#324): a placed node past its lease takes no new run.
             let now = now_s();
-            if let Some(p) = l.placed_nodes(&["active"]).expect("placed nodes").into_iter().find(|p| p.name == name && p.lease_until <= now)
-            {
+            let past = l.placed_nodes(&["active"]).expect("placed nodes").into_iter().find(|p| p.name == name && p.lease_until <= now);
+            if let Some(p) = past.filter(|_| env.options.refuse_past_lease) {
                 env.stat(|s| s.runs_refused += 1);
                 env.note(format!("wicket run {} --node {name}: refused, past its lease (ended {})", r.run, p.lease_until));
                 continue;
@@ -1081,7 +1082,7 @@ async fn reconcile_pass(env: &Rc<Env>) {
     for a in plan::reconcile(&owner, &[], &observed, now, false, &PoolRules::default()) {
         // `reconcile_machines`: nothing records it, and it is new, so its creator may not have
         // recorded it yet (#324). (No capacity leases here: no lease records any node.)
-        if let plan::Action::Destroy { node, .. } = &a {
+        if let (plan::Action::Destroy { node, .. }, true) = (&a, env.options.young_grace) {
             if let Some(until) = observed.iter().find(|n| n.id == *node).and_then(|n| plan::too_new_to_judge(n, now)) {
                 env.note(format!("reconcile.young {node} until {until}"));
                 continue;
@@ -1113,7 +1114,11 @@ async fn placed_pass<A: SpendApprover>(env: &Rc<Env>, ledger: &mut Ledger, place
         }
         let mut holders = ledger.running_runs_on_node(&row.name).expect("runs on the node");
         // Runs whose files a fetch didn't bring back hold it too (#300, #324).
-        for r in ledger.uncollected_runs_on_node(&row.name).expect("uncollected runs") {
+        let uncollected = match env.options.hold_uncollected {
+            true => ledger.uncollected_runs_on_node(&row.name).expect("uncollected runs"),
+            false => vec![],
+        };
+        for r in uncollected {
             if !holders.contains(&r) {
                 holders.push(r);
             }
@@ -1157,9 +1162,24 @@ async fn placed_pass<A: SpendApprover>(env: &Rc<Env>, ledger: &mut Ledger, place
 
 // ---- the run ----
 
-#[derive(Clone, Copy, Debug, Default)]
+/// How a run is made. Each fix this scenario found (#324) can be turned off, to show it still finds
+/// what it fixed (`tests/scenario.rs`).
+#[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub keep_trace: bool,
+    /// `wicket run --node` refuses a placed node past its lease (`place::refuse_past_lease`).
+    pub refuse_past_lease: bool,
+    /// A run whose files a fetch didn't bring back holds its node (`runs.uncollected`).
+    pub hold_uncollected: bool,
+    /// The machine half leaves a node nothing records alone while it is new
+    /// (`reconcile::too_new_to_judge`).
+    pub young_grace: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { keep_trace: false, refuse_past_lease: true, hold_uncollected: true, young_grace: true }
+    }
 }
 
 /// Runs the placement scenario for `seed`, with the hosts' directories under `dir` (removed after).
@@ -1211,6 +1231,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         feed_key,
         cert,
         zone,
+        options,
         authz_root,
         approver,
         issuers,
