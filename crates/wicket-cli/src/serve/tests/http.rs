@@ -319,7 +319,7 @@ async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
     assert_eq!(ASSETS.files.keys().filter(|k| k.starts_with("/static/session.")).count(), 2);
     // In CI's session-view job the bundle must be in (ci/session-view.sh sets this).
     if std::env::var_os("WICKET_SESSION_VIEW_REQUIRED").is_some() {
-        assert!(SESSION_VIEW_BUILT, "WICKET_SESSION_VIEW_REQUIRED: this build has the placeholder");
+        assert!(std::hint::black_box(SESSION_VIEW_BUILT), "WICKET_SESSION_VIEW_REQUIRED: this build has the placeholder");
     }
 }
 
