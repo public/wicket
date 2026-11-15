@@ -318,7 +318,7 @@ impl Ledger {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM messages WHERE to_run = ?1 AND delivered_at IS NULL", params![run], |r| r.get(0))?)
     }
 
-    /// Operator follow-ups queued for `run` and not yet handed to it.
+    /// Operator messages queued for `run` and not yet handed to it.
     pub fn waiting_operator_messages(&self, run: &str) -> Result<i64> {
         Ok(self
             .conn

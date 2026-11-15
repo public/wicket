@@ -8,6 +8,7 @@
 //! - a forbidden path never reaches the origin, and one outside reach waits for a human;
 //! - nothing that comes back to the box holds the login.
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,11 +20,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-#[path = "support/zone_decider.rs"]
-mod zone_decider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{CredentialSwap, RunCtx, SwapSource};
-use zone_decider::ZoneDecider;
 
 const HOST: &str = "rc.api.test";
 const LOGIN: &str = "real-login-token-0f9d";

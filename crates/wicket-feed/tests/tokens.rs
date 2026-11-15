@@ -73,7 +73,8 @@ impl Cp {
     }
 
     fn new_with_authz_root(authz_root: SigningKey) -> Cp {
-        let (root, feed_key) = (FeedKey::generate(&mut rand_core::OsRng), FeedKey::generate(&mut rand_core::OsRng));
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (root, feed_key) = (FeedKey::generate(&mut rng), FeedKey::generate(&mut rng));
         let dir = TempDir::new("cp");
         let p = Publisher::open_with(
             dir.path(),

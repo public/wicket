@@ -43,6 +43,7 @@ mod roots;
 mod run;
 mod s3;
 mod serve;
+mod session;
 mod settings;
 mod snapstore;
 mod spawn;
@@ -125,10 +126,23 @@ enum Cmd {
         #[arg(long, hide = true)]
         adopt: Option<String>,
     },
-    /// Send a follow-up message to a running agent, as its operator. It arrives as the agent's next
-    /// turn; its harness session stays open until the agent finishes or exits. A long-lived agent can be
-    /// named by its id or any of its runs; a hibernated one is woken.
-    Say { run: String, text: Vec<String> },
+    /// Open a running agent's session in this terminal, as its operator: what it says and does, live.
+    /// An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's
+    /// messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop`
+    /// cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on.
+    /// With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named
+    /// by its id or any of its runs; a hibernated one is woken.
+    Session {
+        run: String,
+        /// A prompt to send; then only its turn shows.
+        text: Vec<String>,
+        /// With TEXT: queue it and exit at once.
+        #[arg(long)]
+        no_wait: bool,
+        /// With TEXT: stop following its turn after this many seconds (it stays queued).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended
     /// and nothing but the agent runs in its box. What else runs is stopped after the zone's
     /// limits.exit_grace.
@@ -607,7 +621,7 @@ async fn main() -> Result<()> {
         c @ (Cmd::Run { .. }
         | Cmd::Wrap { .. }
         | Cmd::Attach { .. }
-        | Cmd::Say { .. }
+        | Cmd::Session { .. }
         | Cmd::Hibernate { .. }
         | Cmd::Wake { .. }
         | Cmd::Agents { .. }) => cmd::run::dispatch(c).await,

@@ -339,7 +339,7 @@ pub fn token(name: Option<String>, ttl: Duration) -> Result<()> {
         Some(n) => n,
         None => {
             let mut b = [0u8; 3];
-            getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+            getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             format!("node-{}", hex::encode(b))
         }
     };

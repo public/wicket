@@ -8,6 +8,7 @@
 //! - The request's `content-length` goes upstream as sent; the response's comes back to the box.
 //! - Requests from several box connections share one pooled HTTP/2 upstream connection.
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::collections::HashMap;
@@ -20,11 +21,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-#[path = "support/zone_decider.rs"]
-mod zone_decider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
-use zone_decider::ZoneDecider;
 
 fn tmpdir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);

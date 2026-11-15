@@ -3,6 +3,7 @@
 //! wholesale is spliced (the box sees the origin's own certificate); any other host is intercepted
 //! (the box sees a leaf from the run's CA).
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,12 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-#[path = "support/zone_decider.rs"]
-mod zone_decider;
 use wicket_proxy::decide::NodeDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{Event, RunCtx};
-use zone_decider::ZoneDecider;
 
 const ALL: [&str; 7] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 

@@ -109,6 +109,11 @@ pub fn resume_offset(dir: &Path) -> u64 {
     resumed(dir).cur + std::fs::metadata(dir.join(FILE)).map(|m| m.len()).unwrap_or(0)
 }
 
+/// The absolute offset after the transcript's last byte, as a reader sees it (repairs nothing).
+pub fn end_offset(dir: &Path) -> u64 {
+    resumed_readonly(dir).cur + std::fs::metadata(dir.join(FILE)).map(|m| m.len()).unwrap_or(0)
+}
+
 /// The transcript's last non-empty line (from the previous file if the current one is empty).
 pub fn last_line(dir: &Path) -> Option<String> {
     [FILE, PREVIOUS]

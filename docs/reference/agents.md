@@ -52,7 +52,7 @@ These are general features for any workload:
   only when the agent's process exits, at the zone's `limits.timeout`, or when its authority ends. The
   agent ends it with wicket's `finish` tool (wicket closes its input at the end of the turn, and the
   harness exits; one that hasn't exited by the zone's `limits.exit_grace` has what is left in its box
-  stopped, and the run is recorded as succeeded with the processes named). **`wicket say <run> "…"`** sends the agent a follow-up, which becomes its next turn.
+  stopped, and the run is recorded as succeeded with the processes named). **`wicket session <run>`** opens its session in the terminal (the console's session page in a browser), and each prompt becomes its next turn.
   `/workspace/out/result.json` is an optional output: wicket prints it at the end of the run if the
   agent wrote one.
 - **Long-lived agents hibernate and wake** (below; [how to](../how-to/hibernate-and-wake-an-agent.md)).
@@ -85,7 +85,7 @@ their state, generation and bundle size.
   zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
   background build, a dev server) has its other processes stopped after the zone's `limits.exit_grace` (30 s
   by default), named in `wicket agents`, then hibernates, because a rebuild restores files, not processes.
-- **Wake.** `wicket wake <agent> ["…"]`, `wicket say <run or agent> "…"`, or a message from another agent
+- **Wake.** `wicket wake <agent> ["…"]`, `wicket session <run or agent> ["…"]`, or a message from another agent
   rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
   `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,
   and by what. A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly
@@ -159,7 +159,7 @@ What wicket sends:
   box notice as a `systemPrompt` append. For an agent that takes no system prompt, the notice
   leads the first prompt instead. Agent-specific `_meta` comes from wicket only, for a known
   `acp.profile`.
-- The task as the first `session/prompt`, and each follow-up (`wicket say`, a peer's message notice,
+- The task as the first `session/prompt`, and each prompt after it (`wicket session`, the console's session page, a peer's message notice,
   a wake's message) as the next one. A prompt sent while a turn runs waits for it to end.
 
 What wicket checks: the agent speaks version 1 and can use an HTTP MCP server, or the run fails. Its

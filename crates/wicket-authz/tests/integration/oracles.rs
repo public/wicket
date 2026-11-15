@@ -5,8 +5,7 @@
 //! 3. the compiled evaluator decides as the fork's generic engine (stock `AuthorizerBuilder` path),
 //!    failed checks included, on random chains, grants and requests of every kind.
 
-mod common;
-use common::*;
+use crate::common::*;
 use std::time::Instant;
 use wicket_authz::*;
 use wicket_core::{CompiledZone, RiskClass, ZoneSpec};
@@ -510,7 +509,7 @@ fn oracle3_compiled_equals_generic_engine() {
 }
 
 /// 100k requests, every one through both the generic engine and the AuthorizerBuilder path (a few
-/// minutes): `cargo test -p wicket-authz --test oracles -- --ignored`. Run on every change to the
+/// minutes): `cargo test -p wicket-authz --test integration -- --ignored oracles::`. Run on every change to the
 /// fork or rebase onto upstream.
 #[test]
 #[ignore]

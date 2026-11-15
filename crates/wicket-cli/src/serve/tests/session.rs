@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 const RUN: &str = "run_s";
 
 fn who() -> Who {
-    Who { principal: "spiffe://wicket.local/t/default/op/passkey/laptop".into(), label: "passkey:laptop".into(), token: None }
+    Who { principal: "spiffe://wicket.local/t/default/op/passkey/laptop".into(), label: "passkey:laptop".into(), token: None, via: "acp" }
 }
 
 /// A running run with a run directory, and a bridge for it, opened with `session/new`.

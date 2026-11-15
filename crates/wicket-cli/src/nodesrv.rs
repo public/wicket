@@ -1339,6 +1339,7 @@ fn child_start(
         edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None })),
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
+        memory_advice: m.zone.limits.memory_advice().map(str::to_string),
     })
 }
 
@@ -2126,9 +2127,15 @@ type BoxMem = (Option<std::path::PathBuf>, crate::exitcause::Mem, bool);
 /// Samples every running box's memory from its cgroup (#185), keeping its peak, and warns its agent
 /// once it nears its limit (an event to its run, which tells the agent).
 async fn sample_memory(n: &Arc<Node>) {
-    let running: Vec<(String, String)> =
-        n.boxes.lock().expect("boxes").iter().filter(|(_, b)| b.exited.is_none()).map(|(r, b)| (r.clone(), b.name.clone())).collect();
-    for (run, name) in running {
+    let running: Vec<(String, String, Option<String>)> = n
+        .boxes
+        .lock()
+        .expect("boxes")
+        .iter()
+        .filter(|(_, b)| b.exited.is_none())
+        .map(|(r, b)| (r.clone(), b.name.clone(), b.record.start.memory_advice.clone()))
+        .collect();
+    for (run, name, advice) in running {
         let known = n.mem.lock().expect("mem").get(&run).and_then(|e| e.0.clone());
         let dir = match known {
             Some(d) => Some(d),
@@ -2140,7 +2147,7 @@ async fn sample_memory(n: &Arc<Node>) {
         let Some(dir) = dir else { continue };
         let (prev, warned) = n.mem.lock().expect("mem").get(&run).map(|e| (e.1, e.2)).unwrap_or_default();
         let Some(m) = crate::exitcause::sample(&dir, prev) else { continue };
-        let (warned2, text) = crate::exitcause::pressure(&m, warned);
+        let (warned2, text) = crate::exitcause::pressure(&m, warned, advice.as_deref());
         n.mem.lock().expect("mem").insert(run.clone(), (Some(dir), m, warned2));
         if let Some(text) = text {
             eprintln!("[node] {run}: memory at {} of {}", crate::exitcause::human(m.current), crate::exitcause::human(m.max.unwrap_or(0)));
@@ -2438,6 +2445,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 edge: None,
                 image_pin: None,
                 timings: false,
+                memory_advice: None,
             },
             image_digest: None,
             name: format!("wicket-{run}"),
@@ -2825,7 +2833,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let why = refused(handshake(&node, 8, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("no identity certificate"), "{why}");
         // A node whose key isn't the enrolled one (re-keyed or replaced), with a certificate for it.
-        let other = wicket_identity::SigningKey::generate(&mut rand_core::OsRng);
+        let other = wicket_identity::SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
         let (theirs, _) = inst.issuer.issue_node_cert("n1", &other.verifying_key(), wicket_store::now(), 3600);
         std::fs::write(&cert_path, &theirs).unwrap();
         let why = refused(handshake(&node, 9, chan::PROTOCOL, &inst, &inst.issuer).await.1);

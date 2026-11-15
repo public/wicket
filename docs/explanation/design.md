@@ -475,7 +475,7 @@ authenticates both ends whatever carries it:
   never takes over the control connection.
 
 Built since (#24): the console starts runs (from allowlisted manifest directories, the manifest's digest
-signed), sends follow-ups, revokes identities and answers prefix asks, each with a passkey assertion over
+signed), opens runs' sessions (prompts are sent there, #198), revokes identities and answers prefix asks, each with a passkey assertion over
 exactly that action. A console-started run's principal is the passkey-authenticated operator
 (`{type: human, id: passkey:<name>, via: console, assurance: passkey (user verification)}`), handed to
 the detached `wicket run` in `WICKET_PRINCIPAL`; the signed audit record binds operator, run id and
@@ -1617,8 +1617,8 @@ gate exists for. A skill is an instruction to every future activation, so it is 
   host runs the box and persist across runs.
 - **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
   mounted over its `out/`.
-- **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
-  input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
+- **Follow-up messages to a running agent** (`wicket say <run> …`, since replaced by sessions: `wicket
+  session` and the console's session page, #198), carried over Claude Code's stream-json input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
 **Hibernate and wake (#70, 2026-11-12; #249).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0). The Idle tier and its `docker pause` were removed by #249.

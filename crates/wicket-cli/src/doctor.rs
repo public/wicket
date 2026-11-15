@@ -15,6 +15,28 @@ fn stale_box(l: &Ledger, b: &wicket_sandbox::BoxInfo) -> bool {
     b.run.as_deref().and_then(|r| l.run_status(r).ok().flatten()).is_some_and(|s| s != "running")
 }
 
+/// Whether a linked secret can be read now (#350): through its helper (reachable, the right uid, a
+/// current value), or from its file. Never the value.
+fn linked_secret(v: &Vault, name: &str) -> std::result::Result<String, String> {
+    let until = |ms: Option<i64>| match ms {
+        Some(ms) => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+            format!(", valid for {} more minutes", (ms - now) / 60_000)
+        }
+        None => String::new(),
+    };
+    match v.helper_of(name) {
+        Some(h) => match h.fetch(name) {
+            Ok(a) => Ok(format!("read through the secret helper of uid {} at {}: reachable{}", h.uid, h.socket, until(a.expires_at))),
+            Err(e) => Err(format!("{e:#}")),
+        },
+        None => match v.get(name) {
+            Ok(_) => Ok(format!("linked file readable{}", until(v.expires_at(name)))),
+            Err(e) => Err(format!("{e:#}")),
+        },
+    }
+}
+
 /// Where deploy/install.sh keeps the console's arguments.
 pub const CONSOLE_ENV: &str = "/etc/wicket/console.env";
 
@@ -84,6 +106,12 @@ pub async fn doctor(image: &str) -> Result<()> {
                 if system { "sudo " } else { "" }
             )),
             h => r.good(format!("  {base}: sent only to {}", h.join(", "))),
+        }
+        if n.ends_with(" (reference)") {
+            match linked_secret(&v, base) {
+                Ok(s) => r.good(format!("  {base}: {s}")),
+                Err(s) => r.bad(format!("  {base}: NOT OK: {s}")),
+            }
         }
     }
     for s in wicket_agent::harness::model_secrets().iter().filter(|s| !v.has(&s.secret)) {
@@ -278,5 +306,33 @@ mod tests {
         assert_eq!(super::console_args(f), ["--listen", "127.0.0.1:8787", "--no-bootstrap-link"]);
         assert_eq!(super::console_args("WICKET_CONSOLE_ARGS=--origin https://c.example.com"), ["--origin", "https://c.example.com"]);
         assert!(super::console_args("OTHER=1").is_empty());
+    }
+
+    /// `wicket doctor` checks a helper-linked secret through its helper (#350): reachable, and not
+    /// when it has gone.
+    #[test]
+    fn doctor_checks_the_secret_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        use wicket_proxy::secret_helper as h;
+        let d = std::env::temp_dir().join(format!("wicket-doctor-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("creds.json");
+        std::fs::write(&f, r#"{"o":{"accessToken":"sk","expiresAt":32503680000000}}"#).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // SAFETY: a plain getter.
+        let me = unsafe { libc::geteuid() };
+        let sock = d.join("helper.sock").to_str().unwrap().to_string();
+        let l = h::bind(&sock).unwrap();
+        let served = vec![format!("login={}#/o/accessToken#/o/expiresAt", f.display()).parse().unwrap()];
+        std::thread::spawn(move || h::serve(l, vec![me], served));
+        let v = super::Vault::new(d.join("vault"));
+        v.link_via_helper("login", &h::HelperRef { uid: me, socket: sock.clone() }, None, None).unwrap();
+        let ok = super::linked_secret(&v, "login").unwrap();
+        assert!(ok.contains("reachable") && ok.contains("valid for") && !ok.contains("sk\""), "{ok}");
+        std::fs::remove_file(&sock).unwrap();
+        let bad = super::linked_secret(&v, "login").unwrap_err();
+        assert!(bad.contains("isn't reachable"), "{bad}");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

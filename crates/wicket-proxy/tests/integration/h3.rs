@@ -3,6 +3,7 @@
 //! destination, as `wicket-fwd` does from `IP_PKTINFO`), wicket's DNS and QUIC termination, the
 //! egress proxy's decisions, and local origins (HTTP/3 + HTTP/1.1, and HTTP/1.1 only) with their own CA.
 
+use crate::zone_decider::ZoneDecider;
 use bytes::{Buf, Bytes};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -15,12 +16,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_fwd::frame::{self, Head, HDR, MAX_FRAME};
 use wicket_proxy::ca::RunCa;
-#[path = "support/zone_decider.rs"]
-mod zone_decider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::h3::{Options, H3};
 use wicket_proxy::{Event, RunCtx};
-use zone_decider::ZoneDecider;
 
 fn tmpdir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);

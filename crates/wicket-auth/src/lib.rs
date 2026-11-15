@@ -13,7 +13,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -72,8 +72,8 @@ pub struct Credential {
 
 impl Credential {
     fn key(&self) -> Result<VerifyingKey> {
-        let point = EncodedPoint::from_affine_coordinates(&self.x.into(), &self.y.into(), false);
-        VerifyingKey::from_encoded_point(&point).map_err(|_| AuthError::UnsupportedKey)
+        let point = Sec1Point::from_affine_coordinates(&self.x.into(), &self.y.into(), false);
+        VerifyingKey::from_sec1_point(&point).map_err(|_| AuthError::UnsupportedKey)
     }
 }
 
@@ -203,6 +203,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::Generate;
 
     const ORIGIN: &str = "http://localhost:8787";
 
@@ -222,7 +223,7 @@ mod tests {
             a.extend_from_slice(&[0u8; 16]);
             a.extend_from_slice(&(id.len() as u16).to_be_bytes());
             a.extend_from_slice(id);
-            let p = key.verifying_key().to_encoded_point(false);
+            let p = key.verifying_key().to_sec1_point(false);
             let cose = ciborium::Value::Map(vec![
                 (1.into(), 2.into()),
                 (3.into(), (-7).into()),
@@ -259,7 +260,7 @@ mod tests {
 
     #[test]
     fn registration_then_bound_decision_verifies() {
-        let key = SigningKey::random(&mut rand_core::OsRng);
+        let key = SigningKey::generate();
         let cred = register(&key);
         assert_eq!(cred.id, b"cred-1");
         let ch = decision_challenge(b"nonce-1", r#"{"request":"r-1","decision":"approve","uses":1}"#);
@@ -269,7 +270,7 @@ mod tests {
 
     #[test]
     fn a_signature_for_one_decision_does_not_approve_another() {
-        let key = SigningKey::random(&mut rand_core::OsRng);
+        let key = SigningKey::generate();
         let cred = register(&key);
         let signed = decision_challenge(b"n", r#"{"request":"r-1","decision":"approve","uses":1}"#);
         let wanted = decision_challenge(b"n", r#"{"request":"r-1","decision":"approve","uses":1000}"#);
@@ -279,14 +280,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_uv_wrong_origin_bad_sig_and_counter_regression() {
-        let key = SigningKey::random(&mut rand_core::OsRng);
+        let key = SigningKey::generate();
         let mut cred = register(&key);
         let ch = [1u8; 32];
         let (c, ad, sig) = assert_with(&key, &ch, UP, 1, ORIGIN);
         assert_eq!(rp().verify_assertion(&ch, &cred, &c, &ad, &sig), Err(AuthError::NoUserVerification));
         let (c, ad, sig) = assert_with(&key, &ch, UP | UV, 1, "https://evil.example");
         assert!(matches!(rp().verify_assertion(&ch, &cred, &c, &ad, &sig), Err(AuthError::OriginMismatch(_, _))));
-        let other = SigningKey::random(&mut rand_core::OsRng);
+        let other = SigningKey::generate();
         let (c, ad, sig) = assert_with(&other, &ch, UP | UV, 1, ORIGIN);
         assert_eq!(rp().verify_assertion(&ch, &cred, &c, &ad, &sig), Err(AuthError::BadSignature));
         cred.sign_count = 5;

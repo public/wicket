@@ -8,6 +8,7 @@
 //!   (a scoped token, branch rules); the body goes upstream byte for byte.
 //! - A fetch is unaffected: still reads, allowed by reach, never asked about (#179).
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::net::SocketAddr;
@@ -19,12 +20,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-#[path = "support/zone_decider.rs"]
-mod zone_decider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
 use wicket_store::{Approval, Ledger};
-use zone_decider::ZoneDecider;
 
 const OLD: &str = "1111111111111111111111111111111111111111";
 const NEW: &str = "2222222222222222222222222222222222222222";
