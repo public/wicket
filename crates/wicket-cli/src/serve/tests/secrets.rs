@@ -77,7 +77,10 @@ async fn the_card_lists_secrets_by_name_kind_hosts_and_users_never_a_value() {
     assert_eq!(gh["zones"], json!(["docs"]));
     assert_eq!(gh["runs"][0]["run"], "run_docs", "a running run in a zone that uses it");
     let u = &gh["used_by"][0];
-    assert_eq!((u["host"].as_str(), u["header"].as_str(), u["format"].as_str()), (Some("api.github.com"), Some("authorization"), Some("Bearer {secret}")));
+    assert_eq!(
+        (u["host"].as_str(), u["header"].as_str(), u["format"].as_str()),
+        (Some("api.github.com"), Some("authorization"), Some("Bearer {secret}"))
+    );
     let l = list.iter().find(|x| x["name"] == "linked").unwrap();
     assert_eq!(l["kind"], "reference");
     assert!(l["hosts"].as_array().unwrap().is_empty());
@@ -207,7 +210,11 @@ async fn hosts_change_as_signed_and_a_stale_change_is_refused() {
     // Bad patterns and an empty list are refused, as by `wicket secret hosts`.
     assert_refused(&t.begin(json!({ "action": "secret_hosts", "name": "gh", "hosts": ["*"] })), StatusCode::BAD_REQUEST, "not a host");
     assert_refused(&t.begin(json!({ "action": "secret_hosts", "name": "gh", "hosts": [] })), StatusCode::BAD_REQUEST, "hosts required");
-    assert_refused(&t.begin(json!({ "action": "secret_hosts", "name": "nope", "hosts": ["a.example"] })), StatusCode::NOT_FOUND, "no secret");
+    assert_refused(
+        &t.begin(json!({ "action": "secret_hosts", "name": "nope", "hosts": ["a.example"] })),
+        StatusCode::NOT_FOUND,
+        "no secret",
+    );
     // Rebound on the host between begin and finish: what was signed is no longer what it replaces.
     let b = t.begin(json!({ "action": "secret_hosts", "name": "gh", "hosts": ["evil.example"] }));
     v.set_hosts("gh", &["api.github.com".into()]).unwrap();

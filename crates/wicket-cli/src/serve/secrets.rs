@@ -140,7 +140,8 @@ fn runs_using(state: &State, running: &[(String, String)], zones: &[String], nam
         .filter(|(run, zone)| {
             zones.contains(zone)
                 || (crate::run::check_run_id(run).is_ok()
-                    && crate::noderun::read_holdings(&state.data.join("runs").join(run)).is_some_and(|h| h.secrets.iter().any(|s| s == name)))
+                    && crate::noderun::read_holdings(&state.data.join("runs").join(run))
+                        .is_some_and(|h| h.secrets.iter().any(|s| s == name)))
         })
         .map(|(run, zone)| json!({ "run": run, "zone": zone }))
         .collect()
@@ -208,7 +209,9 @@ pub fn prepare(state: &State, kind: &str, body: &Value) -> Result<(Change, Value
             }
             let digest = str_field(body, "value_sha256").unwrap_or("");
             let salt = str_field(body, "value_salt").unwrap_or("");
-            let hex_of = |s: &str, n: usize| s.len() >= n * 2 && s.len() <= 128 && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit());
+            let hex_of = |s: &str, n: usize| {
+                s.len() >= n * 2 && s.len() <= 128 && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
+            };
             if digest.len() != 64 || !hex_of(digest, 32) || !hex_of(salt, MIN_SALT) {
                 return Err(bad("value_sha256 (hex sha256 of salt || value) and value_salt (at least 16 random bytes, hex) are required"));
             }
