@@ -8,17 +8,49 @@ and the reasons for it, and lists what is [deferred](design.md#22-deferred).
 
 ## The nouns
 
+One word for each thing, used the same way in the CLI's help, the docs and wicket's messages
+(`ci/check-terms.sh` checks the commonest slips).
+
 - A **principal** is anyone who acts: a human, an agent, a program or a node. Each has an identity,
   an authority, and audited, signed actions.
+- An **operator** is a human principal of an installation: someone who runs `wicket` on the control
+  host or signs in to the console, and decides requests within the authority `operators.yaml` gives
+  them ([configuration](../reference/configuration.md#operatorsyaml)).
 - A **workload** is what runs in a box: an **agent**, or a **program**, which is an agent with no
   model that may not ask for more.
+- A **box** is the isolated environment one workload runs in: a container with no network, a
+  read-only root and no secrets ([the box](#the-box-and-the-control-host), [box reference](../reference/box.md)).
+  Say "box", not "sandbox" or "container": **sandbox** names only the gVisor layer under it, and
+  **container** only the runtime object a box is made of.
 - A **harness** is the agent program a box runs and how wicket talks to it: Claude Code or an ACP
   agent (`agent.harness`). The harness decides when its run is done.
-- A **node** is a machine that runs boxes and decides their requests. The control host is a node too.
+- A **node** is a machine that runs boxes and decides their requests ([nodes](../reference/nodes.md)).
+- The **control host** is the machine wicket's state lives on: the node that also runs the control
+  plane. The **control plane** is the role, not the machine: the ledger, the vault, the keys,
+  approvals and the feed ([#197](https://github.com/public/wicket/issues/197) would let it run
+  elsewhere).
+- A **host** is a machine. A **host name** is a name in HTTP: what a zone's `reach`, `forbid` and
+  `inject` match ([manifest](../reference/manifest.md#reach)).
+- A **request** is what a box asks for that its zone doesn't already allow: reach, a child zone, a
+  link, capacity or an update. **Escalation** is the act of asking, not a thing of its own (the
+  zone's `escalation` field says who may). A request is **pending** until it is decided, by a grant
+  or a denial; its id is `r-…` ([grants](#grants), [the 403 a box sees](../reference/protocol.md)).
 - A **grant** is authority one principal gives another, within its own: a resource, a principal, a
   lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
   authority.
-- A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved.
+- A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved
+  ([placement and leases](#placement-and-leases)). Nothing else is a lease.
+- A **run** is one box running one workload, from start to end, with its own id (`run_…`). For a
+  long-lived agent (`agt_…`), each run is one **activation** of it: starting and every wake begin a
+  new one. Its **generation** counts those activations; a stale one is refused
+  ([hibernate and generations](#hibernate-and-generations)).
+- A **session** is always qualified, because four things have one:
+  - a **harness session**, the harness's own conversation, which a wake resumes;
+  - a **Remote Control session**, that conversation registered with the vendor's apps
+    ([drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md));
+  - a **console session**, an operator signed in to the console with a passkey
+    ([console](../reference/console.md#passkeys));
+  - an **ACP session**, an ACP agent's `session/new` ([ACP agents](../reference/agents.md#acp-agents)).
 
 ## The box and the control host
 
