@@ -75,6 +75,10 @@ const ROUTES: &[&str] = &[
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
     "/api/explain/1",
+    "/api/push",
+    "/api/push/subscribe",
+    "/api/push/remove",
+    "/api/push/details",
     "/api",
     "/admin",
     "/.env",
@@ -234,7 +238,8 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
     assert!(scripts[0].starts_with("<script src=\"/static/console.") && scripts[0].contains("></script>"), "{}", scripts[0]);
     assert!(!page.contains("{{"), "every placeholder filled");
     for (path, a) in &ASSETS.files {
-        if path.ends_with(".js") || path.ends_with(".css") {
+        // The service worker keeps one URL (browsers re-fetch it there to update it; it isn't cached).
+        if (path.ends_with(".js") || path.ends_with(".css")) && path != "/sw.js" {
             let digest = sha2::Sha256::digest(&a.body);
             assert!(path.contains(&hex::encode(digest)[..16]), "{path} is named by its hash");
             let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));

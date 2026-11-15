@@ -187,6 +187,7 @@ function renderPending(s) {
   if (empty) return;
   box.replaceChildren(...nodes);
   layoutAt = performance.now();
+  if (openId) for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
 }
 
 function renderRows(id, rows, f, emptyText) {
@@ -339,6 +340,108 @@ function renderOperator(s) {
   box.append(el("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
 }
 
+// ---- notifications (Web Push) ----
+// The service worker (/sw.js) shows what the server pushes; a tap on a notification opens the console
+// at "#pending/<id>" or, if it is open, tells it which request to show. Permission is asked only from
+// the button's click (iOS home-screen apps allow nothing else), and only a signed-in session can
+// subscribe, list or remove devices. Each device's notifications show only how many requests are
+// waiting unless it opts in to the request itself (lock screens show them).
+const pushSupported = () => typeof navigator !== "undefined" && "serviceWorker" in navigator &&
+  typeof window !== "undefined" && "PushManager" in window && "Notification" in window;
+function deviceLabel() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  const os = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Mac OS X/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "device";
+  const br = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "";
+  return br ? os + " · " + br : os;
+}
+async function pushInfo() {
+  const r = await fetch("/api/push");
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+// This browser's current subscription, if it has one.
+async function currentSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration("/");
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+async function subId(sub) {
+  if (!sub || !crypto.subtle) return "";
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sub.endpoint)));
+  return Array.from(h.slice(0, 8), b => b.toString(16).padStart(2, "0")).join("");
+}
+async function enablePush() {
+  // First, while the click still counts as the user's gesture.
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast(perm === "denied" ? "Notifications are blocked for this site in the browser's settings." : "Notifications not allowed."); return; }
+  try {
+    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    await navigator.serviceWorker.ready;
+    const info = await pushInfo();
+    let sub = await reg.pushManager.getSubscription();
+    const key = sub && sub.options && sub.options.applicationServerKey ? b2a(sub.options.applicationServerKey) : null;
+    if (sub && key && key !== info.public_key) { await sub.unsubscribe(); sub = null; }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: a2b(info.public_key) });
+    const j = sub.toJSON();
+    const r = await post("/api/push/subscribe", { endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, label: deviceLabel(), details: false });
+    toast(r.ok);
+  } catch (e) { toast("notifications: " + e.message); }
+  renderPush();
+}
+async function removeDevice(id, mine) {
+  try {
+    await post("/api/push/remove", { id });
+    if (mine) { const sub = await currentSub(); if (sub) await sub.unsubscribe(); }
+    toast("Device removed");
+  } catch (e) { toast("notifications: " + e.message); }
+  renderPush();
+}
+async function setDetails(id, details) {
+  try { toast((await post("/api/push/details", { id, details })).ok); } catch (e) { toast("notifications: " + e.message); }
+  renderPush();
+}
+async function renderPush() {
+  const box = document.getElementById("push");
+  if (!box) return;
+  let info;
+  try { info = await pushInfo(); } catch (e) { box.replaceChildren(el("div", "note", "Notifications: " + e.message)); return; }
+  const mine = await subId(await currentSub().catch(() => null));
+  box.replaceChildren();
+  const b = el("div", "buttons");
+  if (!pushSupported()) {
+    box.append(el("div", "note", "This browser can't receive notifications here. On an iPhone or iPad, add the console to the home screen (Share → Add to Home Screen) and open it from there."));
+  } else if (!info.devices.some(d => d.id === mine)) {
+    const go = el("button", "approve", "Enable notifications"); go.onclick = enablePush; b.append(go); box.append(b);
+  }
+  for (const d of info.devices) {
+    const row = el("div", "row push-dev");
+    row.append(el("span", "", strip(d.label) + (d.id === mine ? " (this device)" : "")),
+      el("span", "meta", strip(d.service) + " · " + (d.last_success ? "last delivered " + ago(Math.floor(Date.now() / 1000), d.last_success) : "nothing delivered yet")));
+    const lab = el("label", "details"); const cb = el("input"); cb.type = "checkbox"; cb.checked = !!d.details;
+    cb.onchange = () => setDetails(d.id, cb.checked);
+    lab.append(cb, document.createTextNode("Show the agent and what it asks for"));
+    const rm = el("button", "deny", "Remove"); rm.onclick = () => removeDevice(d.id, d.id === mine);
+    row.append(lab, rm);
+    box.append(row);
+  }
+  if (!info.devices.length) box.append(el("div", "empty", "No device gets notifications yet."));
+  box.append(el("div", "note", "A notification says how many requests are waiting (lock screens show it); tick a device to also show the agent and what it asks for. At most one per device every " + (info.min_interval_secs || 30) + " s."));
+}
+// Opened from a notification: scroll to the pending list and mark the request (if still waiting).
+let openId = "";
+function openPending(id) {
+  openId = id || "";
+  const box = document.getElementById("pending");
+  if (box && box.scrollIntoView) box.scrollIntoView();
+  for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
+}
+function fromHash() {
+  const h = (typeof location !== "undefined" && location.hash) || "";
+  const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
+  if (m) openPending(m[1]);
+}
+
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
@@ -346,7 +449,7 @@ async function boot() {
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; refresh(); return; }
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; await refresh(); fromHash(); renderPush(); return; }
   con.hidden = true; auth.hidden = false;
   document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
@@ -595,6 +698,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
   document.getElementById("mfedit-close").addEventListener("click", () => { document.getElementById("mfedit").hidden = true; });
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
+  if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => { if (e.data && typeof e.data.open === "string") openPending(e.data.open); });
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("hashchange", fromHash);
   boot();
   setInterval(() => { if (!document.getElementById("console").hidden) refresh(); }, 2000);
 });

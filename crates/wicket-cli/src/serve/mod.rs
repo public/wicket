@@ -1463,31 +1463,32 @@ fn spawn_notifier(state: Arc<State>) {
         let mut n = push::Notifier::default();
         loop {
             tokio::time::sleep(NOTIFY_EVERY).await;
-            let Some(p) = &state.push else { return };
-            let (waiting, creds) = match (waiting(&state), creds(&state)) {
-                (Ok(w), Ok(c)) => (w, c),
-                (Err(e), _) | (_, Err(e)) => {
-                    tracing::warn!("notifier: reading the ledger: {e:#}");
-                    continue;
-                }
-            };
-            let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
-            let now = wicket_store::now();
-            let out = n.tick(&waiting, &subs, now);
-            for (id, status) in p.deliver(out, now).await {
-                if status == 404 || status == 410 {
-                    if let Ok(l) = state.ledger() {
-                        let _ = l.audit(
-                            &state.tenant,
-                            None,
-                            "operator.push_removed",
-                            &json!({ "device": id, "by": "push service", "status": status }),
-                        );
-                    }
-                }
-            }
+            notify_once(&state, &mut n, wicket_store::now()).await;
         }
     });
+}
+
+/// One look at the ledger: pushes for what is new, if any is due. Returns what each push service said.
+async fn notify_once(state: &State, n: &mut push::Notifier, now: i64) -> Vec<(String, u16)> {
+    let Some(p) = &state.push else { return Vec::new() };
+    let (waiting, creds) = match (waiting(state), creds(state)) {
+        (Ok(w), Ok(c)) => (w, c),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("notifier: reading the ledger: {e:#}");
+            return Vec::new();
+        }
+    };
+    let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
+    let results = p.deliver(n.tick(&waiting, &subs, now), now).await;
+    for (id, status) in &results {
+        if *status == 404 || *status == 410 {
+            if let Ok(l) = state.ledger() {
+                let _ =
+                    l.audit(&state.tenant, None, "operator.push_removed", &json!({ "device": id, "by": "push service", "status": status }));
+            }
+        }
+    }
+    results
 }
 
 fn dashboard(state: &State) -> Result<Value> {
@@ -1714,6 +1715,7 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod notify;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);

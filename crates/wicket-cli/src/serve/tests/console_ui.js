@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -39,6 +39,13 @@ const authority = { status: "running", node: "local", policy: { version: null },
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
   against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
 let nextAction = null;
+// Web Push: a fake browser (permission, service worker, push manager) and server (devices).
+let permAsked = 0, permAskedAt = -1, swRegistered = null, swListener = null, subscribed = null, pushDevices = [];
+const fakeSub = { endpoint: "https://fcm.googleapis.com/fcm/send/dev1", options: { applicationServerKey: null },
+  toJSON() { return { endpoint: this.endpoint, keys: { p256dh: "BPK", auth: "AU" } }; }, unsubscribe: async () => { subscribed = null; return true; } };
+const swReg = { pushManager: { getSubscription: async () => subscribed,
+  subscribe: async o => { assert.strictEqual(o.userVisibleOnly, true); assert.deepStrictEqual(Array.from(o.applicationServerKey), [4, 1, 2]); fakeSub.options.applicationServerKey = o.applicationServerKey.buffer; subscribed = fakeSub; return fakeSub; } } };
+const devId = ep => require("crypto").createHash("sha256").update(ep).digest("hex").slice(0, 16);
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
   calls.push({ path, body: opts && opts.body ? JSON.parse(opts.body) : null });
@@ -51,6 +58,10 @@ const fetch = async (path, opts) => {
     fields: [{ path: "task", value: "<b>hi</b>", default: false }, { path: "zone.isolation", value: "gvisor", default: true }],
     grants: { task: "<b>hi</b>", image: { Ok: "img" }, isolation: "Gvisor", unlisted_hosts: "escalate", reach: [], hosts: [], forbid: [], inject: [{ secret: "gh", host: "h", header: "authorization", secret_set: false, bound_to_host: true }], volumes: [], limits: {}, org_policy: null } });
 
+  if (path === "/api/push") return reply({ public_key: "BAEC", devices: pushDevices, min_interval_secs: 30 });
+  if (path === "/api/push/subscribe") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== devId(b.endpoint)).concat([{ id: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, created: 1, last_success: null }]); return reply({ ok: "notifications on for this device" }); }
+  if (path === "/api/push/remove") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== b.id); return reply({ ok: "device removed" }); }
+  if (path === "/api/push/details") return reply({ ok: "ok" });
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
   if (path.endsWith("/authority")) return reply(authority);
   if (path.startsWith("/api/explain/")) return reply(explained);
@@ -60,7 +71,13 @@ let ceremonies = 0;
 const sandbox = {
   document: { createElement: t => new Node(t), createTextNode: t => new Text(t), getElementById: id => ids[id], addEventListener: (k, f) => { if (k === "DOMContentLoaded") sandbox.ready = f; } },
   fetch,
-  navigator: { credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
+  window: { PushManager: function () {}, Notification: {}, addEventListener() {} },
+  Notification: { requestPermission: async () => { permAsked++; permAskedAt = calls.length; return "granted"; } },
+  crypto: require("crypto").webcrypto, TextEncoder,
+  navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+    serviceWorker: { register: async (u, o) => { swRegistered = [u, o.scope]; return swReg; }, ready: Promise.resolve(swReg),
+      getRegistration: async () => (swRegistered ? swReg : undefined), addEventListener: (k, f) => { if (k === "message") swListener = f; } },
+    credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
   performance: { now: () => now },
   setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
   clearTimeout: () => {},
@@ -176,4 +193,40 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.startsWith("Save manifests/a.yaml") && ids["confirm-what"].textContent.includes("WIDENS authority: reach api.example.com"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console manifest editor: ok");
+
+  const settle = async () => { for (let i = 0; i < 20; i++) await flush(); };
+  // Notifications: permission is asked only from the button's click, and first (iOS); then the
+  // service worker is registered at the root, the browser subscribes with the server's key, and the
+  // subscription is posted. Devices are listed as text, and can be removed.
+  pushDevices = [];
+  await run("renderPush()"); await flush();
+  assert.strictEqual(permAsked, 0, "nothing asks for permission by itself");
+  const enable = ids.push.all(n => n.tagName === "button" && n.textContent === "Enable notifications")[0];
+  assert.ok(enable, ids.push.textContent);
+  const callsBefore = calls.length;
+  await enable.click(); await settle();
+  assert.strictEqual(permAsked, 1);
+  assert.strictEqual(permAskedAt, callsBefore, "permission is asked before anything else happens");
+  assert.deepStrictEqual(swRegistered, ["/sw.js", "/"]);
+  const sp = calls.find(c => c.path === "/api/push/subscribe");
+  assert.deepStrictEqual([sp.body.endpoint, sp.body.p256dh, sp.body.auth, sp.body.details, sp.body.label], [fakeSub.endpoint, "BPK", "AU", false, "iPhone · Safari"]);
+  await settle();
+  assert.ok(ids.push.textContent.includes("iPhone · Safari (this device)"), ids.push.textContent);
+  assert.strictEqual(ids.push.all(n => n.textContent === "Enable notifications").length, 0);
+  pushDevices.push({ id: "other", label: HOSTILE, service: "web.push.apple.com", details: false, created: 1, last_success: null });
+  await run("renderPush()"); await settle();
+  assert.ok(ids.push.textContent.includes(HOSTILE) && ids.push.all(n => n.tagName === "img").length === 0, "a label stays text");
+  const otherRow = ids.push.all(n => n.className === "row push-dev" && n.textContent.includes(HOSTILE))[0];
+  await otherRow.all(n => n.tagName === "button" && n.textContent === "Remove")[0].click(); await settle();
+  assert.deepStrictEqual(calls.filter(c => c.path === "/api/push/remove").map(c => c.body), [{ id: "other" }]);
+  assert.ok(subscribed, "removing another device leaves this one subscribed");
+  const mineRow = ids.push.all(n => n.className === "row push-dev" && n.textContent.includes("(this device)"))[0];
+  await mineRow.all(n => n.tagName === "button" && n.textContent === "Remove")[0].click(); await settle();
+  assert.strictEqual(subscribed, null, "removing this device unsubscribes the browser");
+  // A tap on a notification while the console is open marks that request's card.
+  state = { ...base, pending: [A, B] };
+  await run("refresh()"); await flush();
+  swListener({ data: { open: "q-b" } });
+  assert.deepStrictEqual(cardsIn().map(c => c.className), ["card req", "card req opened"]);
+  console.log("console notifications: ok");
 })().catch(e => { console.error(e); process.exit(1); });
