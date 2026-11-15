@@ -75,8 +75,38 @@ pub fn zone_secrets(zone: &wicket_core::ZoneSpec) -> BTreeMap<String, Vec<String
 /// The control host's side: whether run `run` (in `zone`) may have `name` on its node, and if so the
 /// secret, until `not_after` (Unix ms). Refused unless the zone names it, the vault holds it, and its
 /// binding covers every host the zone uses it for.
+#[cfg(test)]
 pub fn release(zone: &wicket_core::ZoneSpec, vault: &wicket_proxy::vault::Vault, name: &str, not_after: i64) -> Result<Fetched, String> {
-    let uses = zone_secrets(zone);
+    release_run(zone, &[], vault, name, not_after)
+}
+
+/// [`release`] for a run with credential swaps (#257), which its node makes: a vault secret a swap
+/// names is released as one the zone uses for the swap's hosts (its binding must cover them), and a
+/// swap's value (`chan::SwapReal::Value`, fetched by its key) is released bound to its swap's hosts
+/// alone. Nothing else of the run's swaps is ever released.
+pub fn release_run(
+    zone: &wicket_core::ZoneSpec,
+    swaps: &[wicket_proxy::CredentialSwap],
+    vault: &wicket_proxy::vault::Vault,
+    name: &str,
+    not_after: i64,
+) -> Result<Fetched, String> {
+    let value = swaps.iter().enumerate().find_map(|(i, s)| match &s.real {
+        wicket_proxy::SwapSource::Value(v) if crate::chan::swap_value_key(i) == name => Some((s, v)),
+        _ => None,
+    });
+    if let Some((s, value)) = value {
+        if value.is_empty() {
+            return Err(format!("the {} swap has no value", s.name));
+        }
+        return Ok(Fetched { name: name.into(), value: value.clone(), hosts: vec![s.host.clone()], not_after, upstream_expiry: None });
+    }
+    let mut uses = zone_secrets(zone);
+    for s in swaps {
+        if let wicket_proxy::SwapSource::Vault(n) = &s.real {
+            uses.entry(n.clone()).or_default().push(s.host.clone());
+        }
+    }
     let Some(hosts_used) = uses.get(name) else { return Err(format!("zone {} doesn't use secret {name}", zone.name)) };
     for h in hosts_used {
         vault.check(name, h).map_err(|e| e.to_string())?;
@@ -581,6 +611,39 @@ mod tests {
         assert_eq!((f.value.as_str(), f.hosts.clone()), ("u:p", vec!["registry.example.com".to_string(), "auth.example.com".to_string()]));
         assert!(release_for_hosts(&v, "reg", &["registry.example.com".into(), "elsewhere.example.com".into()], 1).is_err());
         assert!(release_for_hosts(&v, "missing", &["registry.example.com".into()], 1).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// #257: a run's swaps are released to its node for their hosts only: a vault secret a swap
+    /// names if its binding covers the swap's host, a swap's value by its key (bound to its host),
+    /// and nothing for another run's key or a swap the binding doesn't cover.
+    #[test]
+    fn a_swap_is_released_only_for_its_hosts() {
+        let d = tmp("swaps");
+        let v = control(&d);
+        let z = zone("name: z\n");
+        let swap = |host: &str, real: wicket_proxy::SwapSource| wicket_proxy::CredentialSwap {
+            name: "login".into(),
+            host: host.into(),
+            placeholder: "ph".into(),
+            real,
+            box_bearers: false,
+        };
+        let swaps = vec![
+            swap("api.github.com", wicket_proxy::SwapSource::Vault("gh".into())),
+            swap("sessions.example.com", wicket_proxy::SwapSource::Value("sess-1".into())),
+        ];
+        let f = release_run(&z, &swaps, &v, "gh", 1).unwrap();
+        assert_eq!((f.value.as_str(), f.hosts.clone()), (VALUE, vec!["api.github.com".to_string()]));
+        let f = release_run(&z, &swaps, &v, "swap.1", 1).unwrap();
+        assert_eq!((f.value.as_str(), f.hosts.clone(), f.upstream_expiry), ("sess-1", vec!["sessions.example.com".to_string()], None));
+        // Not a value's key: swap 0 is a vault secret's, and there is no swap 2.
+        assert!(release_run(&z, &swaps, &v, "swap.0", 1).is_err());
+        assert!(release_run(&z, &swaps, &v, "swap.2", 1).is_err());
+        // Without the swap, the zone doesn't use it; with it toward a host its binding doesn't cover, refused.
+        assert!(release(&z, &v, "gh", 1).unwrap_err().contains("doesn't use"));
+        let wide = vec![swap("elsewhere.example.com", wicket_proxy::SwapSource::Vault("gh".into()))];
+        assert!(release_run(&z, &wide, &v, "gh", 1).unwrap_err().contains("elsewhere.example.com"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

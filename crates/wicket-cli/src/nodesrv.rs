@@ -12,9 +12,10 @@
 //!   adopt the boxes the last one started (`adopt_previous`).
 //! - **It decides egress.** Each box gets its own egress proxy on a unix socket, deciding from the
 //!   node's verified feed replica (`wicket_proxy::decide::NodeDecider`) and terminating TLS with the
-//!   node's name-constrained CA. Hosts the node must not terminate (an `inject` rule, a credential
-//!   swap, outside the CA's constraints, or an expired CA) are tunnelled to the control host's egress
-//!   proxy for the run.
+//!   node's name-constrained CA. It injects the zone's secrets and makes the box's credential swaps
+//!   itself, each secret fetched on first use (#152, #257). Hosts it can't terminate (outside the
+//!   CA's constraints, an expired CA, or swapped by a control host before protocol 10) are tunnelled
+//!   to the control host's egress proxy for the run.
 //! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy is the box's only
 //!   one (#257): it checks each call and makes it itself, with the credential fetched from the
 //!   control host on first use (#152). The gateway decides the tools it can from the box's token
@@ -512,8 +513,9 @@ struct NodeRelay {
     run: String,
     zone: Arc<wicket_core::CompiledZone>,
     ca: Option<Arc<NodeCa>>,
-    /// Hosts the control host swaps a credential in for (routing only): always forwarded.
-    swaps: Vec<wicket_proxy::CredentialSwap>,
+    /// Hosts a control host before protocol 10 swaps a credential in for itself (#169): always
+    /// forwarded to it. A box started since #257 has its swaps made here and none of these.
+    kept: Vec<String>,
 }
 
 impl Relay for NodeRelay {
@@ -525,16 +527,11 @@ impl Relay for NodeRelay {
         };
         let spec = spec.unwrap_or_else(|| (*self.zone).clone());
         let now = (self.node.clock)() / 1000;
-        // Injected hosts are decided here too, their secret fetched on first use (#152). Hosts the
-        // control host swaps a credential in for (#169) are always forwarded: swaps stay there.
-        wicket_proxy::decide::route_sealed(
-            host,
-            &spec,
-            &self.swaps,
-            self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)),
-            now,
-            &|_| true,
-        )
+        // Injected and swapped hosts are decided here too, their secret fetched on first use (#152,
+        // #257): only what the CA can't cover is forwarded.
+        wicket_proxy::decide::route_sealed(host, &spec, &self.kept, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now, &|_| {
+            true
+        })
     }
 
     fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {
@@ -1223,6 +1220,7 @@ fn child_start(
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swap_hosts: vec![],
+        swaps: vec![],
         edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None })),
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
@@ -1802,6 +1800,22 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause, timings: t.done() }));
 }
 
+/// A box's credential swaps as its node makes them (#257): the real credential is the node's
+/// cached copy of what its start names (a vault secret, or a swap's value by its key), fetched on
+/// first use.
+fn node_swaps(swaps: &[chan::SwapStart]) -> Vec<wicket_proxy::CredentialSwap> {
+    swaps
+        .iter()
+        .map(|s| wicket_proxy::CredentialSwap {
+            name: s.name.clone(),
+            host: s.host.clone(),
+            placeholder: s.placeholder.clone(),
+            real: wicket_proxy::SwapSource::Vault(s.real.fetch_name().to_string()),
+            box_bearers: s.box_bearers,
+        })
+        .collect()
+}
+
 /// The box's enforcement points: egress and the model proxy decided here; the MCP gateway's tools
 /// this node doesn't decide yet, and hosts it forwards, reached on the control host (#257). Started
 /// for a new box, and again for one a restarted `serve` adopts.
@@ -1828,19 +1842,9 @@ async fn serve_box(
         attribute: None,
         identity: None,
         spawner: None,
-        // Routing only: hosts the control host swaps a credential in for are forwarded to it (no
-        // placeholder or value here, so nothing is ever swapped on the node).
-        swaps: bs
-            .swap_hosts
-            .iter()
-            .map(|h| wicket_proxy::CredentialSwap {
-                box_bearers: false,
-                name: "the control host's".into(),
-                host: h.clone(),
-                placeholder: String::new(),
-                real: wicket_proxy::SwapSource::Value(String::new()),
-            })
-            .collect(),
+        // The box's credential swaps, made here (#257): each fetched from the control host on first
+        // use, like an injected secret, under the name its start gives, and bound to its hosts.
+        swaps: node_swaps(&bs.swaps),
         boxes: None,
         capacity: None,
         decisions: None,
@@ -1858,7 +1862,7 @@ async fn serve_box(
         clock: node.clock.clone(),
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
-    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, swaps: ctx.swaps.clone() });
+    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, kept: bs.swap_hosts.clone() });
     let mut tasks = vec![];
     // The model proxy (#151, #152), the box's only one (#257): the run's checks here (allowed routes
     // and models, server tools, the budget and this node's slice of it). It calls the model itself
@@ -1916,6 +1920,10 @@ async fn serve_box(
         l
     };
     let egress = Egress::with(ctx, minter, decider, Some(relay))?;
+    // A wrapped session's model calls reach the model host through egress, their login swapped here
+    // (#257): they get this node's budget, filter and accounting, as they did on the control host
+    // (#112).
+    egress.set_model_gate(llm.clone());
     // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
     // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
     // the proxy, which forwards them.
@@ -2282,6 +2290,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 output_cap: 64 << 20,
                 output_stop: false,
                 swap_hosts: vec![],
+                swaps: vec![],
                 edge: None,
                 image_pin: None,
                 timings: false,
@@ -3005,5 +3014,152 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         drop(frames);
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert_eq!(audit.iter().filter(|r| r.2 == "node.message_pushed").count(), 3, "{audit:?}");
+    }
+
+    /// #257: a box's swapped host is decided on its node, terminated there with the node's CA (not
+    /// forwarded, unless a control host before protocol 10 keeps it), and its credentials are
+    /// fetched over the run's own connection on first use: a vault secret released for the swap's
+    /// host only, a value by its key. Neither is in the box's start, so neither is in the node's
+    /// box record.
+    #[tokio::test]
+    async fn a_swapped_host_is_decided_on_the_node_and_its_credential_fetched_there() {
+        const RUN: &str = "run_ssssssssssssssssssssssssss";
+        const LOGIN: &str = "real-login-0f9d";
+        const VALUE: &str = "real-session-77";
+        let inst = Install::new("nodesrv-swaps");
+        let node = test_node(&inst);
+        let zone = "name: z\nreach: [{ host: rc.api.test, methods: [GET, POST], paths: ['/v1/**'] }, { host: wrap.api.test, methods: [POST], paths: ['/**'] }]\n";
+        fed_box(&node, &inst, RUN, zone);
+        // The node's CA covers the swapped hosts (as an enrolled node's does its zones').
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+        let root = wicket_proxy::ca::InstallationCa::generate().unwrap();
+        let cert = root.issue_node_ca(&csr, "n1", &["rc.api.test".into(), "wrap.api.test".into()], time::Duration::hours(1)).unwrap();
+        std::fs::write(inst.dir.join("ca.pem"), &cert.pem).unwrap();
+        std::fs::write(inst.dir.join("ca.key"), key.serialize_pem()).unwrap();
+        // The control host's side: the run's swaps, with their real sources.
+        let vault = wicket_proxy::vault::Vault::new(inst.dir.join("vault"));
+        vault.set("login", LOGIN).unwrap();
+        vault.set_hosts("login", &["rc.api.test".into()]).unwrap();
+        let swaps = vec![
+            wicket_proxy::CredentialSwap {
+                name: "account login".into(),
+                host: "rc.api.test".into(),
+                placeholder: "ph-login".into(),
+                real: wicket_proxy::SwapSource::Vault("login".into()),
+                box_bearers: true,
+            },
+            wicket_proxy::CredentialSwap {
+                name: "session".into(),
+                host: "wrap.api.test".into(),
+                placeholder: "ph-session".into(),
+                real: wicket_proxy::SwapSource::Value(VALUE.into()),
+                box_bearers: false,
+            },
+        ];
+        let start = chan::swap_starts(&swaps);
+        {
+            let mut boxes = node.boxes.lock().unwrap();
+            let rec = &mut boxes.get_mut(RUN).unwrap().record;
+            rec.start.swaps = start.clone();
+            let kept = serde_json::to_string(&*rec).unwrap();
+            assert!(kept.contains("ph-login") && !kept.contains(LOGIN) && !kept.contains(VALUE), "{kept}");
+        }
+        // Decided here: both swapped hosts are terminated by the node's own egress proxy, which
+        // decides them from the box's token in the feed; a host outside the CA is still forwarded.
+        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+        let relay = |kept: Vec<String>| NodeRelay {
+            node: node.clone(),
+            run: RUN.into(),
+            zone: Arc::new(wicket_core::CompiledZone::new(z.clone()).unwrap()),
+            ca: node.ca(),
+            kept,
+        };
+        assert_eq!(relay(vec![]).route("rc.api.test"), Route::Terminate);
+        assert_eq!(relay(vec![]).route("wrap.api.test"), Route::Terminate);
+        assert!(matches!(relay(vec![]).route("elsewhere.test"), Route::Forward(r) if r.contains("name constraints")));
+        assert!(matches!(relay(vec!["rc.api.test".into()]).route("rc.api.test"), Route::Forward(r) if r.contains("swapped")));
+        let op = |m: &str, p: &str| {
+            wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", m, "rc.api.test", p)
+        };
+        let decide = |o: &wicket_core::Op| node.replica.lock().unwrap().decide(o, (node.clock)());
+        assert!(matches!(decide(&op("GET", "/v1/environments")), wicket_feed::Decision::Allow(_)));
+        assert!(matches!(decide(&op("GET", "/admin")), wicket_feed::Decision::NeedsGrant(_)), "outside reach: a grant, from the feed");
+        // The node's vault for the box: nothing held until first use, then fetched over the run's
+        // connection, the control host answering as `noderun::fetch_secret` does.
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..500 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let theirs = wicket_proxy::vault::Vault::from_source(node.secrets.source(RUN, node.fetcher()));
+        let made = node_swaps(&start);
+        assert_eq!(made.iter().map(|s| s.placeholder.as_str()).collect::<Vec<_>>(), ["ph-login", "ph-session"]);
+        let names: Vec<String> = made
+            .iter()
+            .map(|s| match &s.real {
+                wicket_proxy::SwapSource::Vault(n) => n.clone(),
+                wicket_proxy::SwapSource::Value(_) => panic!("a node holds no value of its own"),
+            })
+            .collect();
+        assert_eq!(names, ["login", "swap.1"]);
+        assert!(!theirs.has("login") && !theirs.has("swap.1"));
+        let spec = z.clone();
+        let answering = tokio::spawn(async move {
+            let mut asked = vec![];
+            while asked.len() < 3 {
+                if let Frame::Msg(Msg::SecretFetch { id, name, .. }) = next_msg(&mut c).await {
+                    let r = crate::nodesecrets::release_run(&spec, &swaps, &vault, &name, i64::MAX / 2);
+                    let (secret, error) = match r {
+                        Ok(f) => (Some(Box::new(f)), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    c.write_all(&Frame::Msg(Msg::SecretFetched { id, secret, error }).encode()).await.unwrap();
+                    asked.push(name);
+                }
+            }
+            asked
+        });
+        theirs.ensure("login").await.unwrap();
+        theirs.ensure("swap.1").await.unwrap();
+        let other = theirs.ensure("other").await.unwrap_err().to_string();
+        assert!(other.contains("doesn't use secret other"), "{other}");
+        assert_eq!(answering.await.unwrap(), ["login", "swap.1", "other"]);
+        // Each bound to its swap's host alone, as the control host's binding says.
+        assert_eq!(theirs.get_for("login", "rc.api.test").unwrap(), LOGIN);
+        assert!(theirs.get_for("login", "wrap.api.test").is_err());
+        assert_eq!(theirs.get_for("swap.1", "wrap.api.test").unwrap(), VALUE);
+        assert!(theirs.get_for("swap.1", "rc.api.test").is_err());
+        let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
+        assert_eq!(audit.iter().filter(|r| r.2 == "node.secret_fetched").count(), 2, "{audit:?}");
+        assert!(!format!("{audit:?}").contains(LOGIN) && !format!("{audit:?}").contains(VALUE));
+    }
+
+    /// #257: a box with credential swaps starts only on a node talking protocol 10 or later; an
+    /// older one is refused, saying why and what to do, as for a pin or a model budget.
+    #[test]
+    fn a_box_with_swaps_is_refused_by_a_node_before_protocol_10() {
+        let mut start = fake_record("run_a").start;
+        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true).is_ok(), "no swaps: protocol 9 will do");
+        start.swaps = chan::swap_starts(&[wicket_proxy::CredentialSwap {
+            name: "account login".into(),
+            host: "rc.api.test".into(),
+            placeholder: "ph".into(),
+            real: wicket_proxy::SwapSource::Vault("login".into()),
+            box_bearers: true,
+        }]);
+        let why = crate::noderun::refuse_older_node("n1", 9, &start, true).unwrap_err().to_string();
+        assert!(why.contains("node n1 talks protocol 9") && why.contains("credential swaps") && why.contains("from protocol 10"), "{why}");
+        assert!(why.contains("wicket node install n1"), "{why}");
+        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true).is_ok());
+        // The others still hold: a pin below 6, a budget below 9.
+        start.swaps.clear();
+        start.image_pin = Some("sha256:00".into());
+        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false).unwrap_err().to_string().contains("pinned"));
+        start.image_pin = None;
+        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true).unwrap_err().to_string().contains("model budget"));
     }
 }

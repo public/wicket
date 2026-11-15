@@ -846,13 +846,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     timings.since("policy.org", lap);
+    // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as
+    // its own first, made by who started it; a child's its parent recorded before starting it.
+    let limits = {
+        let start = match (&record, &parent_run) {
+            (Some(_), _) => crate::quotas::Start::Reattached,
+            (None, Some(_)) => crate::quotas::Start::Child,
+            (None, None) => crate::quotas::Start::Root { by: &principal },
+        };
+        crate::quotas::at_start(&ledger.lock().expect("ledger"), &m, &run, start)?
+    };
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(Arc::new(crate::spawn::SpawnCtx {
             parent: m.clone(),
             // A re-attached run (#151) starts from the slots its children already hold.
-            slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, a.max_children))),
+            slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, limits.max_children))),
+            max_children: limits.max_children,
             exe: None,
             run: run.clone(),
             dir: dir.clone(),
@@ -1000,7 +1011,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
     // of record (#152, #257), whose reports are merged in here and whose slices are leased from here.
     // Nothing listens for model calls on this side.
-    let llm = Llm::new(ctx.clone())?;
+    // Its budget is its quota grants' amounts (#256), whatever its zone says.
+    let llm = Llm::with_quota(ctx.clone(), limits.model)?;
     let _ = llm_slot.set(llm.clone());
     // A wrapped session's model calls reach the model host through the egress proxy: they get the
     // model proxy's budget, filter and accounting there (#112).
@@ -1245,7 +1257,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm_prior: llm.spent_total(),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
-            swap_hosts: ctx.swaps.iter().map(|s| s.host.clone()).collect(),
+            // Swapped on the node (#257): their names and placeholders only, the credentials
+            // fetched by the node on first use.
+            swap_hosts: vec![],
+            swaps: crate::chan::swap_starts(&ctx.swaps),
             durable: match long_lived {
                 true => m
                     .zone
@@ -1318,6 +1333,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             attribute: ctx.attribute.clone(),
             llm: Some(llm.clone()),
             vault: ctx.vault.clone(),
+            swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
             adopt: adopter.clone(),
             timings: timings.clone(),
@@ -1407,6 +1423,21 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket wake {}", f.agent, session.id, run, f.agent);
         }
     }
+    // Its quota grants are its limits (#256): kept live while it runs, at most a day ahead each
+    // time, never past its timeout. A revoked one is not brought back.
+    let quota_task = {
+        let (ledger, run2) = (ledger.clone(), run.0.clone());
+        let end = wicket_store::now() + i64::try_from(m.zone.limits.timeout()?.as_secs()).unwrap_or(i64::MAX / 2);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::quotas::RENEW_EVERY);
+            loop {
+                tick.tick().await;
+                if let Ok(l) = ledger.lock() {
+                    let _ = l.renew_quota_grants(&run2, end);
+                }
+            }
+        })
+    };
     // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rotate_task = match (&identity, id_spec) {
@@ -1988,6 +2019,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let Some(t) = &rotate_task {
         t.abort();
     }
+    quota_task.abort();
     if revoked.load(std::sync::atomic::Ordering::SeqCst) {
         status = "revoked".into();
     }

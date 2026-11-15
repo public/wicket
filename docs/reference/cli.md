@@ -318,7 +318,7 @@ Grants made by approvals
 Usage: wicket grant <COMMAND>
 
 Commands:
-  list    List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
+  list    List grants, newest first: approvals, and runs' quotas (#256): model budget, children and bytes (a root run's own zone budget, or what its parent carved for a child: the limits its run enforces), and money (a capacity lease's hourly cap and reservation, micro-USD shown as USD). Every grant has a lifetime; only live ones unless --all
   revoke  Revoke a grant. A grant handed to a node is revoked there through its feed by the run that published it (at once if the node is reachable)
   renew   Renew a live grant, or a running box's authority, so it lasts --ttl from now (#56): a grant by its id (or the request it answers), a box's authority by its run id. Every grant keeps a lifetime: at most 24h, and a box's authority never past its run's timeout. Audited as a decision; the run publishes it to the box's node
   help    Print this message or the help of the given subcommand(s)
@@ -330,7 +330,7 @@ Options:
 ### `wicket grant list`
 
 ```text
-List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
+List grants, newest first: approvals, and runs' quotas (#256): model budget, children and bytes (a root run's own zone budget, or what its parent carved for a child: the limits its run enforces), and money (a capacity lease's hourly cap and reservation, micro-USD shown as USD). Every grant has a lifetime; only live ones unless --all
 
 Usage: wicket grant list [OPTIONS]
 

@@ -15,7 +15,11 @@
 //! started hour for its whole duration), from the moment it is asked for. [`Ledger::create_lease`]
 //! refuses, atomically, a lease that would take the reservations of every `pending`, `approved` or
 //! `active` lease over the installation's limits. Only `ended`, `denied`, `withdrawn` and `failed`
-//! leases give their reservation back.
+//! leases give their reservation back. A lease's money is also recorded as two quota grants bound
+//! to the run that asked (#256): `QUOTA wicket.internal /quota/money.hourly/<lease>` (its
+//! `hourly_cap`) and `/quota/money.reserved/<lease>` (its `reserved`), made by
+//! [`LEASE_QUOTA_BY`] in the same transaction, revoked when the lease ends. They are the record;
+//! the check stays the installation's limits over the live leases' reservations, here.
 //!
 //! **Placed nodes** ([`PlacedNodeRow`], #294) are the other kind of owned node: made by `wicket place
 //! create` for the installation rather than asked for by a run. They have no reservation here (the
@@ -25,6 +29,12 @@
 use crate::{now, Ledger, Result, StoreError};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+
+/// Who a lease's money quota grants are recorded as made by: the installation's lease budget.
+pub const LEASE_QUOTA_BY: &str = "wicket:lease-budget";
+/// How much longer than its duration a lease's money quotas last: it waits for a human and for its
+/// node first (renewable past that, and at most a day, as every grant).
+const LEASE_QUOTA_SLACK_SECS: i64 = 3600;
 
 /// The statuses whose reservation counts against the budget.
 pub const LIVE: &[&str] = &["pending", "approved", "active"];
@@ -155,6 +165,20 @@ impl Ledger {
             &format!("INSERT INTO leases ({LEASE_COLS}) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'pending', NULL, NULL, NULL, NULL, NULL, NULL, NULL)"),
             params![l.id, l.tenant, l.run, l.provider, l.spec.to_string(), l.hourly_cap, l.reserved, l.duration_secs, now()],
         )?;
+        // Its money, recorded as quota grants bound to the run that asked (#256), in the same
+        // transaction: what it reserves is a grant of the installation's lease budget.
+        let zone: Option<String> = tx.query_row("SELECT zone FROM runs WHERE id = ?1", params![l.run], |r| r.get(0)).optional()?;
+        let [hp, rp] = crate::quota::lease_quota_paths(&l.id);
+        let amount = |m: i64| u64::try_from(m).unwrap_or(0);
+        crate::quota::insert_quotas(
+            &tx,
+            &l.tenant,
+            zone.as_deref().unwrap_or(""),
+            &l.run,
+            LEASE_QUOTA_BY,
+            &[(hp, amount(l.hourly_cap)), (rp, amount(l.reserved))],
+            crate::quota::quota_until(l.duration_secs.saturating_add(LEASE_QUOTA_SLACK_SECS)),
+        )?;
         tx.commit()?;
         Ok(Ok(()))
     }
@@ -260,6 +284,9 @@ impl Ledger {
             ),
             params![id, status, detail, billed, now()],
         )?;
+        if n == 1 {
+            crate::quota::revoke_lease_quotas(&self.conn, id)?;
+        }
         Ok(n == 1)
     }
 
@@ -434,6 +461,43 @@ mod tests {
         };
         let r = l.create_lease(&row, budget).unwrap();
         (id, r)
+    }
+
+    #[test]
+    fn a_leases_money_is_recorded_as_quota_grants_until_it_ends() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let b = LeaseBudget { max_hourly: 50_000, max_total: 100_000 };
+        let (a, r) = ask(&mut l, "run_a", 20_000, 40_000, b);
+        r.unwrap();
+        let (c, r) = ask(&mut l, "run_a", 10_000, 30_000, b);
+        r.unwrap();
+        let gs = l.quota_grants("run_a").unwrap();
+        let got: Vec<(&str, &str, Option<i64>)> = gs.iter().map(|g| (g.quota().unwrap(), g.path.as_str(), g.amount)).collect();
+        let (ah, ar) = (format!("/quota/money.hourly/{a}"), format!("/quota/money.reserved/{a}"));
+        assert_eq!(&got[..2], &[("money.hourly", ah.as_str(), Some(20_000)), ("money.reserved", ar.as_str(), Some(40_000))]);
+        for g in &gs {
+            assert_eq!((g.run.as_deref(), g.request_id.as_deref()), (Some("run_a"), None));
+            assert!(g.expires_at > now() && g.expires_at - now() <= crate::MAX_QUOTA_TTL_SECS, "every grant has a lifetime");
+        }
+        // A run's money quotas add up over its leases.
+        let q = l.quota_amounts("run_a").unwrap();
+        assert_eq!((q.get("money.hourly"), q.get("money.reserved")), (Some(30_000), Some(70_000)));
+        // They decide nothing, and no node is handed them.
+        assert!(l.grants_for_run("run_a").unwrap().is_empty());
+        // A refused ask records none.
+        let (_, r) = ask(&mut l, "run_b", 40_000, 10_000, b);
+        assert!(r.is_err());
+        assert!(l.quota_grants("run_b").unwrap().is_empty());
+        // The lease ends: its money quotas are revoked, the other lease's kept.
+        assert!(l.lease_ended(&a, "denied", "no", None).unwrap());
+        let q = l.quota_amounts("run_a").unwrap();
+        assert_eq!((q.get("money.hourly"), q.get("money.reserved")), (Some(10_000), Some(30_000)));
+        assert!(l.lease_ended(&c, "ended", "lease end", Some(1)).unwrap());
+        assert_eq!(l.quota_amounts("run_a").unwrap(), crate::QuotaAmounts::default());
+        // A lease with no cost (the operator's own machines) records nothing.
+        let (_, r) = ask(&mut l, "run_c", 0, 0, b);
+        r.unwrap();
+        assert!(l.quota_grants("run_c").unwrap().is_empty());
     }
 
     #[test]
