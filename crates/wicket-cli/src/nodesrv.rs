@@ -819,7 +819,13 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     {
         let n = node.clone();
         tokio::spawn(async move {
-            while let Ok((mut c, _)) = status_listener.accept().await {
+            loop {
+                // A failed accept (out of descriptors, say) is tried again: the view is never what
+                // stops the node.
+                let Ok((mut c, _)) = status_listener.accept().await else {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                };
                 let body = serde_json::to_vec(&n.status()).unwrap_or_default();
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c.write_all(&body)).await;
