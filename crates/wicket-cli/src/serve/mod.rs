@@ -412,7 +412,7 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut b = vec![0u8; n];
-    getrandom::getrandom(&mut b).expect("the OS random source");
+    getrandom::fill(&mut b).expect("the OS random source");
     b
 }
 
@@ -1729,6 +1729,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::Generate;
 
     const ORIGIN: &str = "http://localhost:8787";
     const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -1785,8 +1786,8 @@ mod tests {
         let dir = tmp.0.clone();
         std::fs::create_dir_all(dir.join("manifests")).unwrap();
         std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
-        let key = SigningKey::random(&mut rand_core::OsRng);
-        let p = key.verifying_key().to_encoded_point(false);
+        let key = SigningKey::generate();
+        let p = key.verifying_key().to_sec1_point(false);
         let cred = b64u(b"cred-1");
         let ledger = dir.join("ledger.db");
         let l = Ledger::open(&ledger).unwrap();
@@ -1956,7 +1957,7 @@ mod tests {
         let b = t.begin(say.clone());
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let mut a = t.sign(&ch);
-        t.key = SigningKey::random(&mut rand_core::OsRng);
+        t.key = SigningKey::generate();
         let forged = t.sign(&ch);
         a["signature"] = forged["signature"].clone();
         a["authenticatorData"] = forged["authenticatorData"].clone();
