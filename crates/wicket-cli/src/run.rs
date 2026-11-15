@@ -147,8 +147,8 @@ pub struct RunOpts<'a> {
     pub parent_run: Option<String>,
     /// The capacity lease this run is placed on (recorded, so the reconciler stops it at lease end).
     pub lease: Option<String>,
-    /// Wrap this agent command line (launched by another program, e.g. Claude Code Remote Control
-    /// through CLAUDE_CODE_PROCESS_WRAPPER) instead of launching the agent ourselves. Its stdin and
+    /// Wrap this agent command line (launched by another program: the harness's wrapped mode, e.g.
+    /// its remote sessions' process wrapper) instead of launching the agent ourselves. Its stdin and
     /// stdout stay connected to the launcher; wicket's own output goes to a log file.
     pub wrap: Option<Vec<String>>,
     /// Wake a hibernated agent (#70): its claim, bundle and first turn. The manifest, image and

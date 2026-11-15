@@ -1,4 +1,4 @@
-//! The LLM proxy (design §9.3): holds the Claude subscription token (never an API key), strips
+//! The LLM proxy (design §9.3): holds the zone's model credential (a subscription login, never an API key), strips
 //! whatever credential the agent sends,
 //! enforces request and token budgets, strips server-side tools the zone doesn't allow (they would
 //! bypass the egress proxy), and is the run's liveness sensor.
@@ -517,7 +517,7 @@ impl Llm {
                 rb = rb.header(n, value.as_bytes());
             }
         }
-        // The real subscription token, injected into the one slot Claude Code uses for it.
+        // The real credential, attached as the provider's profile says (the one slot it uses).
         // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
         let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
         let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;

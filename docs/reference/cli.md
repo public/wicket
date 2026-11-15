@@ -107,12 +107,12 @@ Run agents in least-privilege sandboxes (proof of concept)
 Usage: wicket <COMMAND>
 
 Commands:
-  run        Run a task manifest: one Claude Code agent in one zone
+  run        Run a task manifest: one workload (an agent, or a program) in one zone
   say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   agents     Long-lived agents: state, generation, current run and bundle size
-  wrap       Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+  wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
   pending    List pending escalation requests
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
@@ -148,7 +148,7 @@ Options:
 ## `wicket run`
 
 ```text
-Run a task manifest: one Claude Code agent in one zone
+Run a task manifest: one workload (an agent, or a program) in one zone
 
 Usage: wicket run [OPTIONS] <MANIFEST>
 
@@ -225,7 +225,7 @@ Options:
 ## `wicket wrap`
 
 ```text
-Run an agent command line that another program launches, inside a wicket box: e.g. as Claude Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
 
 Usage: wicket wrap [OPTIONS] --manifest <MANIFEST> <ARGV>...
 
@@ -1419,7 +1419,7 @@ Options:
       --interval <INTERVAL>      How often within the window [default: 10s]
       --check <CHECK>            A command (sh -c) that must succeed each time; $WICKET is the new build's binary and $WICKET_UPDATE_TARGET `control` or `node:<name>`. Repeatable
       --canary <CANARY>          A task manifest the new build runs once on the control host; it must succeed
-      --image <IMAGE>            The canary's image (default: the new build's own, wicket/claude-code:<build id>)
+      --image <IMAGE>            The canary's image (default: the new build's own agent image, tagged with its build id)
       --no-prune                 Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does, where it updated)
   -h, --help                     Print help
 ```

@@ -94,7 +94,7 @@ pub enum SelfCmd {
         /// A task manifest the new build runs once on the control host; it must succeed.
         #[arg(long)]
         canary: Option<PathBuf>,
-        /// The canary's image (default: the new build's own, wicket/claude-code:<build id>).
+        /// The canary's image (default: the new build's own agent image, tagged with its build id).
         #[arg(long)]
         image: Option<String>,
         /// Keep what the update leaves unneeded (by default it prunes as `wicket self prune` does,

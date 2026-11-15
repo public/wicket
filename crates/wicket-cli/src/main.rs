@@ -86,7 +86,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a task manifest: one Claude Code agent in one zone.
+    /// Run a task manifest: one workload (an agent, or a program) in one zone.
     Run {
         manifest: PathBuf,
         /// Copy this directory into the box's /workspace first.
@@ -154,8 +154,8 @@ enum Cmd {
     /// still running on its node.
     #[command(hide = true)]
     Attach { run: String },
-    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
-    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
+    /// Run an agent command line that another program launches, inside a wicket box: the harness's
+    /// wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
     Wrap {
         #[arg(long)]

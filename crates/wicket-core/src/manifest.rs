@@ -108,7 +108,7 @@ pub struct AgentSpec {
     /// its own identity (design §3.2, §5.1). 0 = none.
     #[serde(default)]
     pub max_children: u32,
-    /// Whether the agent may also run its own in-box subagents (Claude Code's Agent tool). Their
+    /// Whether the agent may also run its own in-box subagents (its harness's own, e.g. an Agent tool). Their
     /// requests are attributed but not provably identified; set false to require that every
     /// subagent is a wicket child with its own identity.
     #[serde(default = "yes")]

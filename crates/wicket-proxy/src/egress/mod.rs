@@ -215,7 +215,7 @@ impl Egress {
         }))
     }
 
-    /// Model calls to the model host that come through this proxy (a wrapped Claude Code session's)
+    /// Model calls to the model host that come through this proxy (a wrapped harness session's)
     /// go through `llm`'s budget, body filter and accounting (#112).
     pub fn set_model_gate(&self, llm: Arc<crate::llm::Llm>) {
         let _ = self.model_gate.set(llm);
