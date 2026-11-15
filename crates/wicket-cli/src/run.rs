@@ -1600,6 +1600,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
     let mut remote_url: Option<String> = None;
+    // A woken driven remote box's session before it hibernated (#330): Claude Code reattaches to it
+    // if it can, and otherwise starts a new one, which the owner has to be told of.
+    let prior_remote_url = match &wake {
+        Some(w) if driven_remote => ledger.lock().ok().and_then(|l| prior_remote_session(&l, &w.agent.id, &run.0)),
+        _ => None,
+    };
     loop {
         tokio::select! {
             ex = child.exited(), if lines.is_none() => {
@@ -1703,13 +1709,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if driven_remote && remote_url.is_none() {
                             match harness.and_then(|h| h.driven_remote_status(&l)) {
                                 Some(Ok(u)) => {
-                                    println!("[wicket] Remote Control session: {u}");
+                                    let mut body = serde_json::json!({ "url": u });
+                                    match prior_remote_url.as_deref() {
+                                        Some(old) if same_remote_session(old, &u) => {
+                                            println!("[wicket] Remote Control session resumed: {u}");
+                                            body["resumed"] = true.into();
+                                        }
+                                        // A new session, as at the start, and the old one is no longer
+                                        // this box's: said as loudly as the start's address.
+                                        Some(old) => {
+                                            println!("[wicket] the woken box couldn't reattach to its Remote Control session {old}; it started a new one");
+                                            println!("[wicket] Remote Control session (NEW): {u}");
+                                            body["resumed"] = false.into();
+                                            body["previous"] = old.into();
+                                        }
+                                        None => println!("[wicket] Remote Control session: {u}"),
+                                    }
                                     if let Ok(lg) = ledger.lock() {
-                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &body);
                                     }
                                     remote_url = Some(u);
                                 }
                                 Some(Err(why)) => {
+                                    if let Some(old) = &prior_remote_url {
+                                        println!("[wicket] the woken box's Remote Control session {old} wasn't resumed");
+                                    }
                                     println!("[wicket] the Remote Control session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
@@ -2339,29 +2363,28 @@ fn check_fetched(tree: &str, here: &Path, got: &Path, skip: &[&str]) -> Result<(
     Ok(())
 }
 
+/// An egress decision's line, as the run log prints it (and `wicket node top` shows it). A node sends
+/// these events, and an agent chose the method, host and path: printed only stripped (#128).
+pub fn egress_line(ev: &Event) -> Option<String> {
+    let Event::Egress { method, host, path, risk, outcome, detail } = ev else { return None };
+    let tag = match outcome.as_str() {
+        "allow" => "ALLOW  ",
+        "pending" => "PENDING",
+        "denied" => "DENIED ",
+        "forwarded" => "FORWARD",
+        "spliced" => "SPLICE ",
+        "unavailable" => "STALE  ",
+        _ => "BLOCKED",
+    };
+    let clip = wicket_agent::clip;
+    Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
+}
+
 fn print_event(ev: &Event) {
     match ev {
-        Event::Egress { method, host, path, risk, outcome, detail } => {
-            let tag = match outcome.as_str() {
-                "allow" => "ALLOW  ",
-                "pending" => "PENDING",
-                "denied" => "DENIED ",
-                "forwarded" => "FORWARD",
-                "spliced" => "SPLICE ",
-                "unavailable" => "STALE  ",
-                _ => "BLOCKED",
-            };
-            // A node sends these events, and an agent chose the method, host and path: printed only
-            // stripped (#128), and the hint only for what is shaped like a request id (#121).
-            let clip = wicket_agent::clip;
-            println!(
-                "[egress] {tag} {} {}{}  ({}; {})",
-                clip(method, 16),
-                clip(host, 120),
-                clip(path, 120),
-                clip(risk, 24),
-                clip(detail, 240)
-            );
+        Event::Egress { outcome, detail, .. } => {
+            println!("{}", egress_line(ev).unwrap_or_default());
+            // The hint only for what is shaped like a request id (#121).
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
                     println!("         → an operator decides: wicket approve {id}   or   wicket deny {id}");
@@ -2456,9 +2479,41 @@ fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text
     }
 }
 
+/// The remote session an agent's earlier activations last recorded (`run.remote_session`), newest
+/// first, not counting the run `now`.
+fn prior_remote_session(l: &Ledger, agent: &str, now: &str) -> Option<String> {
+    let runs = l.agent_runs(agent).ok()?;
+    runs.iter().rev().filter(|(r, _)| r != now).find_map(|(r, _)| {
+        let body = l.audit_latest(r, "run.remote_session").ok()??;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        v["url"].as_str().filter(|u| u.starts_with("https://")).map(String::from)
+    })
+}
+
+/// Whether two remote session addresses are the same session: the last path segment, without a
+/// query, and with Claude's two forms of a session id (`session_…`, `cse_…`) taken as one.
+fn same_remote_session(a: &str, b: &str) -> bool {
+    fn id(u: &str) -> &str {
+        let path = u.split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+        let last = path.rsplit('/').next().unwrap_or("");
+        last.strip_prefix("session_").or_else(|| last.strip_prefix("cse_")).unwrap_or(last)
+    }
+    let (a, b) = (id(a), id(b));
+    !a.is_empty() && a == b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_woken_remote_session_is_the_same_one_whichever_form_its_id_takes() {
+        let old = "https://claude.ai/code/session_01abc";
+        assert!(same_remote_session(old, "https://claude.ai/code/session_01abc?from=cli"));
+        assert!(same_remote_session(old, "https://claude.ai/code/cse_01abc/"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/session_01def"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/"));
+    }
 
     #[test]
     fn a_fetch_that_brings_back_less_than_the_box_started_with_fails() {

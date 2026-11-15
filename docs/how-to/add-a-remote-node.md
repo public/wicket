@@ -84,6 +84,37 @@ wicket node revoke n1         # refuse it from now on
 - After a deliberate clock step on the node, restart `wicket-node` (`systemctl --user restart
   wicket-node`, as `wicket`) so it reads the wall clock again.
 
+## Watch it
+
+On the node's console (a Hyper-V VM's, say), leave a live view running as the node's `wicket` user:
+
+```sh
+sudo -u wicket -i wicket node top      # q or Ctrl-C quits; --once prints one frame
+```
+
+It redraws every 2 s and changes nothing. It shows:
+
+- the node: its identity certificate and CA and when they expire, whether a control host is connected
+  or the node is cut off (and since when), the feed's mode and how long its last freshness statement
+  has left, and the machine's load, memory and disk;
+- one row per box (its run id's last 8 characters, agent and zone, state, uptime, CPU% and
+  memory/limit from Docker's stats), and under it what its model proxy has counted (requests, input
+  and output tokens), what is left of the node's budget slice for it, its egress decisions (allowed,
+  refused) and the asks the node is holding for its control host. `running*` is a box whose control
+  host is not connected: it is deciding from what the node holds;
+- the last 10 egress decisions across the boxes, newest first, as the run log prints them.
+
+It reads what `wicket node serve` answers on its status socket (`ctl/status.sock`, beside the control
+socket, reachable by the `wicket` user only): names, deadlines, states and counts, never a secret, a
+request body or anything from inside a box beyond what the run log already prints. Counts start
+again when `serve` restarts. `wicket node top --json` prints that status once.
+
+On the control host, `wicket top` (`sudo` not needed: it is a read, like `wicket agents`) shows every
+node, local and enrolled, with whether the runs on it are connected, its boxes and what they are
+given; the running runs with their node, agent, status, uptime and model use; pending requests and
+active leases. When stdout isn't a terminal, both print plain frames, cut to `$COLUMNS` (80 by
+default).
+
 ## Check it end to end
 
 `ci/node-e2e.sh n1` runs a probe on the node and cuts the control channel twice, to show the box
