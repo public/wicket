@@ -49,7 +49,7 @@ fn seeds() {
     let mut failed = vec![];
     for scenario in scenarios() {
         for &seed in &seeds {
-            let r = wicket_sim::run_scenario(scenario, seed, &dir(), false);
+            let r = wicket_sim::run_scenario(scenario, seed, &dir().join("seeds"), false);
             println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
             for k in &r.known {
                 println!("  KNOWN {k}");
@@ -75,7 +75,7 @@ fn replay() {
     };
     let mut ok = true;
     for scenario in scenarios() {
-        let r = wicket_sim::run_scenario(scenario, seed, &dir(), true);
+        let r = wicket_sim::run_scenario(scenario, seed, &dir().join("replay"), true);
         for line in &r.trace {
             println!("{line}");
         }
@@ -95,7 +95,7 @@ fn deterministic() {
             panic!("{scenario}: seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
         }
     }
-    let a = wicket_sim::run_with(7, &dir().join("a"), Options { keep_trace: true, ..Options::default() });
+    let a = wicket_sim::run_with(7, &dir().join("stats"), Options { keep_trace: true, ..Options::default() });
     assert!(a.stats.allowed_grant > 0 && a.stats.model_ok > 0, "the scenario exercised grants and the budget: {:?}", a.stats);
 }
 
@@ -114,9 +114,10 @@ fn without_the_spend_journal_a_crashed_node_overspends() {
 }
 
 /// What the placement scenario found (#324), each still found with its fix turned off: the seeds
-/// that found them, run without the fix, break the invariant it restored.
-fn placement_without(seed: u64, options: wicket_sim::placement::Options, expect: &str) {
-    let r = wicket_sim::placement::run(seed, &dir().join("without"), options);
+/// that found them, run without the fix, break the invariant it restored. Each test has its own
+/// directory (`name`): a run clears its directory first.
+fn placement_without(name: &str, seed: u64, options: wicket_sim::placement::Options, expect: &str) {
+    let r = wicket_sim::placement::run(seed, &dir().join(format!("without-{name}")), options);
     assert!(r.violations.iter().any(|v| v.contains(expect)), "placement seed {seed} no longer finds {expect:?}: {r}");
 }
 
@@ -124,14 +125,14 @@ fn placement_without(seed: u64, options: wicket_sim::placement::Options, expect:
 #[test]
 fn without_the_lease_check_runs_start_on_a_node_past_its_lease() {
     let o = wicket_sim::placement::Options { refuse_past_lease: false, ..Default::default() };
-    placement_without(2, o, "past its lease");
+    placement_without("lease", 2, o, "past its lease");
 }
 
 /// A run whose fetch failed left its files on its node, and the reconciler released the node with them.
 #[test]
 fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
     let o = wicket_sim::placement::Options { hold_uncollected: false, ..Default::default() };
-    placement_without(2, o, "work on it uncollected");
+    placement_without("uncollected", 2, o, "work on it uncollected");
 }
 
 /// A reconciler pass listed a node `place create` had just made, before it was recorded, and
@@ -139,7 +140,7 @@ fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
 #[test]
 fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
     let o = wicket_sim::placement::Options { young_grace: false, ..Default::default() };
-    placement_without(20, o, "before its lease ends");
+    placement_without("grace", 20, o, "before its lease ends");
 }
 
 /// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
