@@ -295,6 +295,67 @@ pub struct Sent {
     pub woke: bool,
 }
 
+/// How a message is sent (#252): how soon the sender wants it read, and the message it answers.
+/// A reply to a message the recipient sent this principal needs no `accept_from`: the recipient
+/// gave its reply address when it wrote.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendOpts<'a> {
+    pub priority: wicket_store::Priority,
+    pub in_reply_to: Option<&'a str>,
+}
+
+/// Why a message wasn't sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendError {
+    /// wicket refused it (#252): it has an id and a receipt that says why, and the refusal is on
+    /// the record.
+    Refused { id: String, to: String, why: String },
+    /// It couldn't be sent at all (no such principal, too large, no identity): no receipt.
+    Failed(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Refused { why, .. } => f.write_str(why),
+            SendError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for SendError {
+    fn from(e: String) -> SendError {
+        SendError::Failed(e)
+    }
+}
+
+impl From<&str> for SendError {
+    fn from(e: &str) -> SendError {
+        SendError::Failed(e.to_string())
+    }
+}
+
+/// While a run waits (`await_message`, `await_grant`), its presence is `waiting`; then `busy` again:
+/// a tool call is made in a turn (#252).
+pub(crate) struct Waiting<'a>(&'a RunCtx);
+
+impl<'a> Waiting<'a> {
+    pub(crate) fn start(ctx: &'a RunCtx) -> Waiting<'a> {
+        if let Ok(l) = ctx.ledger.lock() {
+            let _ = l.set_run_activity(&ctx.run.0, Some("waiting"));
+        }
+        Waiting(ctx)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if let Ok(l) = self.0.ledger.lock() {
+            let _ = l.set_run_activity(&self.0.run.0, Some("busy"));
+        }
+    }
+}
+
 impl RunCtx {
     /// Why this activation may no longer act, if a newer one has superseded it (or its agent is
     /// gone). Checked by every proxy on every request.
@@ -320,6 +381,12 @@ impl RunCtx {
     /// woken to read it, and otherwise the principal's next run takes it ([`wicket_store::MESSAGE_HOLD_SECS`]).
     /// A message never grants authority: it is data for the recipient.
     pub fn send_message(&self, to: &Recipient, kind: &str, body: serde_json::Value) -> std::result::Result<Sent, String> {
+        self.send(to, kind, body, SendOpts::default()).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::send_message`], with a priority and the message it answers (#252). A message
+    /// `accept_from` doesn't allow is refused on the record, with a receipt that says so.
+    pub fn send(&self, to: &Recipient, kind: &str, body: serde_json::Value, opts: SendOpts) -> std::result::Result<Sent, SendError> {
         let me = self.identity.as_ref().ok_or("this run has no wicket identity")?.current();
         let now = wicket_store::now();
         if me.claims.exp <= now {
@@ -327,11 +394,11 @@ impl RunCtx {
         }
         let size = body.to_string().len();
         if size > MAX_MESSAGE_BYTES {
-            return Err(format!("message body is {size} bytes; the limit is {MAX_MESSAGE_BYTES}"));
+            return Err(format!("message body is {size} bytes; the limit is {MAX_MESSAGE_BYTES}").into());
         }
         let mut l = self.ledger.lock().map_err(|_| "ledger lock")?;
         if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
-            return Err(format!("this agent's identity was revoked (revoked: {r})"));
+            return Err(format!("this agent's identity was revoked (revoked: {r})").into());
         }
         // Who it is for, and the run it should reach first (a child's parent is that run).
         let (principal, prefer) = match to {
@@ -345,18 +412,19 @@ impl RunCtx {
             Recipient::Principal(id) => match wicket_identity::Principal::parse(id) {
                 Some(wicket_identity::Principal::Agent { .. }) => (id.to_string(), None),
                 Some(wicket_identity::Principal::Operator { .. }) => {
-                    return Err(format!("{id} is an operator: operators don't receive messages from agents yet (#250); write to your result instead"))
+                    return Err(format!("{id} is an operator: operators don't receive messages from agents yet (#250); write to your result instead").into())
                 }
                 None => {
                     return Err(format!(
                         "{id:?} is not a principal: name one by its identity (spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>, as whoami and spawn show it), or \"parent\""
-                    ))
+                    )
+                    .into())
                 }
             },
         };
         let rec = match l.principal_identity(&self.tenant.0, &principal).map_err(|e| e.to_string())? {
             Some(r) if r.tenant == self.tenant.0 => r,
-            _ => return Err(format!("no agent {principal}: none has run as it in this tenant")),
+            _ => return Err(format!("no agent {principal}: none has run as it in this tenant").into()),
         };
         // The run it is for: the preferred one while it runs, else the principal's live run. A
         // long-lived agent (#70) with none is woken to read it if it is hibernated; any other
@@ -378,6 +446,23 @@ impl RunCtx {
                 _ => {}
             }
         }
+        // A reply (#252): to a message this principal sent us, which gave its reply address.
+        let replies = match opts.in_reply_to {
+            None => false,
+            Some(m) => match l.message_row(m).map_err(|e| e.to_string())? {
+                Some(r)
+                    if r.tenant == self.tenant.0
+                        && r.to_principal.as_deref() == Some(me.claims.sub.as_str())
+                        && (r.from_principal.as_deref() == Some(principal.as_str())
+                            || (r.from_principal.is_none()
+                                && l.identity(&r.from_run).ok().flatten().is_some_and(|i| i.spiffe_id == principal))) =>
+                {
+                    true
+                }
+                _ => return Err(format!("in_reply_to {m} is not a message {principal} sent you").into()),
+            },
+        };
+        let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
         let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
             "child"
         } else if prefer.is_some()
@@ -386,19 +471,37 @@ impl RunCtx {
             "parent"
         } else if rec.accept_from.iter().any(|a| a == &self.zone.name || a == &me.claims.sub) {
             "peer"
+        } else if replies {
+            "reply"
         } else {
-            return Err(format!(
+            // Refused on the record (#252): the sender has a receipt that says so, and nothing
+            // reaches the recipient.
+            let why = format!(
                 "{principal} does not accept messages from you ({}, zone {}): its accept_from lists neither",
                 me.claims.sub, self.zone.name
-            ));
+            );
+            l.refuse_message(&id, &self.tenant.0, &self.run.0, Some(&me.claims.sub), &principal, &why).map_err(|e| e.to_string())?;
+            let audited = l.audit(
+                &self.tenant,
+                Some(&self.run),
+                "message.refused",
+                &serde_json::json!({ "id": id, "kind": kind, "from": me.claims.sub, "to": principal, "why": "accept_from", "bytes": size }),
+            );
+            if let Err(e) = audited {
+                return Err(format!("not sent: the audit record could not be written ({e})").into());
+            }
+            return Err(SendError::Refused { id, to: principal, why });
         };
-        let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
         let payload = serde_json::json!({
             "jti": id, "iat": now, "kind": kind, "to": principal, "body": body,
+            "reply_to": me.claims.sub, "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
         });
         let env = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
+        let meta =
+            wicket_store::MessageMeta { from_principal: Some(&me.claims.sub), priority: opts.priority, in_reply_to: opts.in_reply_to };
         // A wake's claim moves the message to the new run, as the new run's identity does a held one.
-        let routed = l.post_message(&id, &self.tenant, &self.run.0, &principal, to_run.as_deref(), &env).map_err(|e| e.to_string())?;
+        let routed =
+            l.post_message(&id, &self.tenant, &self.run.0, &principal, to_run.as_deref(), &env, &meta).map_err(|e| e.to_string())?;
         // A message is delivered only once its audit record is on disk (fail closed).
         let audited = l.audit(
             &self.tenant,
@@ -406,12 +509,12 @@ impl RunCtx {
             "message",
             &serde_json::json!({
                 "id": id, "kind": kind, "from": me.claims.sub, "to": principal, "to_run": routed, "relation": relation, "bytes": size,
-                "wakes": wake, "held": routed.is_none(),
+                "wakes": wake, "held": routed.is_none(), "priority": opts.priority.as_str(), "in_reply_to": opts.in_reply_to,
             }),
         );
         if let Err(e) = audited {
             let _ = l.withdraw_message(&id);
-            return Err(format!("not sent: the audit record could not be written ({e})"));
+            return Err(format!("not sent: the audit record could not be written ({e})").into());
         }
         drop(l);
         // Wake the recipient only once the message and its audit record are on disk.
