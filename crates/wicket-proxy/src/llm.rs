@@ -1634,6 +1634,28 @@ mod tests {
         assert_eq!(llm.spent().requests, 7);
     }
 
+    /// #324: what a node persists counts the calls in flight at their whole reservation, so a node
+    /// restarted mid-call never counts less than its upstream billed. The journal reads the count
+    /// when it is told, not when its caller looked.
+    #[test]
+    fn the_journal_charges_calls_in_flight_in_full() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 1000}")).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let s = seen.clone();
+        llm.set_journal(move |sp| s.lock().unwrap().push(sp.output_tokens));
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        assert!(llm.admit(Some(&spec)).is_none());
+        let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let f =
+            llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":300,"messages":[]}"#)).ok().unwrap();
+        assert_eq!((llm.spent().output_tokens, llm.spent_charged().output_tokens), (0, 300));
+        llm.journal();
+        llm.settle(f.reserved, Usage { output: 40, ..Usage::default() }, true);
+        llm.journal();
+        assert_eq!(*seen.lock().unwrap(), vec![300, 40], "in flight: its reservation; settled: what it used");
+        assert_eq!(llm.spent_charged(), llm.spent());
+    }
+
     #[test]
     fn reservations_are_carved_from_what_is_left() {
         let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 100}")).unwrap();
