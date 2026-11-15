@@ -254,6 +254,30 @@ pub fn login_placeholder(run: &RunId) -> String {
     format!("sk-ant-oat01-wicket-placeholder-{}", run.0.replace('_', "-"))
 }
 
+/// A Remote Control box's Claude config (#169): the placeholder login (with the login's non-secret
+/// fields, `login_meta`), and the account's fields Remote Control won't start without. `/workspace`
+/// is trusted and the one-time prompts are seen, so nothing waits on a terminal that isn't there.
+/// `mcp_servers`: the MCP servers, for a session that takes them from its config.
+fn remote_login_files(run: &RunId, login_placeholder: &str, login_meta: &Value, mcp_servers: Option<&Value>) -> Vec<(String, Vec<u8>)> {
+    let tag = run.0.replace('_', "-");
+    let mut files = vec![placeholder_login(login_placeholder, &tag, login_meta)];
+    let mut config = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        // The owner chose Remote Control by asking for a remote session: no one-time prompt, which
+        // a box without a terminal can't answer.
+        "remoteDialogSeen": true,
+        "projects": { WORKSPACE: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
+    });
+    if let Some(m) = mcp_servers {
+        config["mcpServers"] = m.clone();
+    }
+    if let Some(a) = login_meta.get("oauthAccount").filter(|a| a.is_object()) {
+        config["oauthAccount"] = a.clone();
+    }
+    files.push(("claude/.claude.json".into(), serde_json::to_vec_pretty(&config).unwrap_or_default()));
+    files
+}
+
 /// What a Remote Control agent is told, besides the sandbox notice: its messages come from the app.
 const RC_NOTICE: &str = "- You are a Remote Control session: the user talks to you from the Claude app. Work in /workspace.";
 
@@ -272,22 +296,9 @@ pub fn claude_code_remote_control_plan(
 ) -> anyhow_free::Result<WrappedPlan> {
     let agent = m.agent.as_ref().ok_or_else(|| anyhow_free::Error("not an agent manifest".into()))?;
     let rc = agent.remote.as_ref().ok_or_else(|| anyhow_free::Error("no agent.remote".into()))?;
-    let tag = run.0.replace('_', "-");
     let login_placeholder = login_placeholder(run);
-    let mut files = vec![placeholder_login(&login_placeholder, &tag, login_meta)];
     let mcp: Value = serde_json::from_str(WICKET_MCP).unwrap_or_default();
-    let mut config = serde_json::json!({
-        "hasCompletedOnboarding": true,
-        // The owner chose Remote Control by asking for a remote session: no one-time prompt, which
-        // a box without a terminal can't answer.
-        "remoteDialogSeen": true,
-        "projects": { WORKSPACE: { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
-        "mcpServers": mcp["mcpServers"],
-    });
-    if let Some(a) = login_meta.get("oauthAccount").filter(|a| a.is_object()) {
-        config["oauthAccount"] = a.clone();
-    }
-    files.push(("claude/.claude.json".into(), serde_json::to_vec_pretty(&config).unwrap_or_default()));
+    let mut files = remote_login_files(run, &login_placeholder, login_meta, Some(&mcp["mcpServers"]));
     files.push(("claude/CLAUDE.md".into(), format!("{SANDBOX_NOTICE}\n{RC_NOTICE}\n").into_bytes()));
     let argv = [
         "wicket-entry",
@@ -334,6 +345,79 @@ pub fn claude_code_remote_control_plan(
         login_placeholder,
         swaps: vec![],
     })
+}
+
+/// The id of the control request that turns Remote Control on in a driven session (#285).
+pub const REMOTE_CONTROL_REQUEST_ID: &str = "wicket-remote-control";
+
+/// What a driven Remote Control agent is told, besides the sandbox and lifetime notices.
+const DRIVEN_RC_NOTICE: &str = "- Your session is also a Remote Control session: the user can watch it in the Claude app and send you messages from there, which arrive as turns like your operator's.";
+
+/// A driven Remote Control agent (#285 part 2, `agent.remote.drive`): Claude Code driven by wicket as
+/// in [`claude_code_plan`] (the task and follow-ups are its stream-json turns, the session is
+/// long-lived), that also registers its session in the owner's Claude apps. `claude -p` takes no
+/// Remote Control flag (`--remote-control` starts an interactive session only); it turns it on when
+/// its stdin host asks, with a `remote_control` control request, which wicket writes before the
+/// first turn. The answer carries the session's address ([`driven_remote_status`]).
+///
+/// The box holds the account login as a placeholder, as in [`claude_code_remote_control_plan`]:
+/// Remote Control runs only against api.anthropic.com with a claude.ai login, so the model calls go
+/// there through the egress proxy (which gates them as the model proxy would), not to wicket's model
+/// proxy with an inference token. Nonessential traffic stays on: Remote Control doesn't initialise
+/// without it.
+///
+/// `permission_mode` is `agent.remote.permission_mode` as `--permission-mode` takes it. In `-p`,
+/// Claude Code asks its stdin host (wicket), not the app, before an action that needs approval, and
+/// wicket answers no such prompt, so `default` is refused by the adapter.
+pub fn claude_code_driven_remote_plan(
+    m: &Manifest,
+    run: &RunId,
+    session: &AgentSession,
+    first: &str,
+    login_meta: &Value,
+    permission_mode: &str,
+) -> anyhow_free::Result<WrappedPlan> {
+    let agent = m.agent.as_ref().ok_or_else(|| anyhow_free::Error("not an agent manifest".into()))?;
+    let rc = agent.remote.as_ref().ok_or_else(|| anyhow_free::Error("no agent.remote".into()))?;
+    let mut plan = claude_code_plan(m, run, session);
+    plan.env.retain(|(k, _)| {
+        !["ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].contains(&k.as_str())
+    });
+    let at = plan.argv.iter().position(|a| a == "--permission-mode").expect("the driven plan sets a permission mode");
+    plan.argv[at + 1] = permission_mode.into();
+    if let Some(p) = plan.argv.iter().position(|a| a == "--append-system-prompt") {
+        plan.argv[p + 1] = format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}\n{DRIVEN_RC_NOTICE}");
+    }
+    let on = serde_json::json!({
+        "type": "control_request",
+        "request_id": REMOTE_CONTROL_REQUEST_ID,
+        "request": { "subtype": "remote_control", "enabled": true, "name": rc.name },
+    });
+    // One line each: Remote Control first, so the session in the app has the task from its start.
+    plan.stdin_task = Some(format!("{on}\n{}", user_message(first)));
+    let login_placeholder = login_placeholder(run);
+    let files = remote_login_files(run, &login_placeholder, login_meta, None);
+    Ok(WrappedPlan { plan, files, session_token: None, session_placeholder: String::new(), login_placeholder, swaps: vec![] })
+}
+
+/// What a driven Remote Control session's output line says of its Remote Control (the answer to
+/// wicket's control request): Ok(the session's address in the app), or Err(why it didn't start; the
+/// session carries on driven only). None for any other line.
+pub fn driven_remote_status(line: &str) -> Option<Result<String, String>> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let r = v.get("response").filter(|_| v.get("type").and_then(|t| t.as_str()) == Some("control_response"))?;
+    if r.get("request_id").and_then(|i| i.as_str()) != Some(REMOTE_CONTROL_REQUEST_ID) {
+        return None;
+    }
+    if r.get("subtype").and_then(|s| s.as_str()) == Some("success") {
+        let url = r.pointer("/response/session_url").and_then(|u| u.as_str()).unwrap_or("");
+        return Some(if url.starts_with("https://") {
+            Ok(clip(url, 300))
+        } else {
+            Err("Remote Control started, but its answer has no session address".into())
+        });
+    }
+    Some(Err(clip(r.get("error").and_then(|e| e.as_str()).unwrap_or("no reason given"), 300)))
 }
 
 /// A tiny error type, so this crate stays free of anyhow.
@@ -527,6 +611,11 @@ pub fn render_event(line: &str) -> Option<String> {
                 let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("?");
                 let tools = v.get("tools").and_then(|t| t.as_array()).map(|t| t.len()).unwrap_or(0);
                 Some(format!("[agent] started: model {model}, {tools} tools"))
+            } else if sub == "bridge_state" {
+                // A driven session's Remote Control (#285): connected, reconnecting, failed.
+                let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("?");
+                let detail = v.get("detail").and_then(|s| s.as_str()).map(|d| format!(": {}", clip(d, 300))).unwrap_or_default();
+                Some(format!("[remote] Remote Control {}{detail}", clip(state, 40)))
             } else {
                 None
             }
@@ -766,6 +855,93 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("unknown variant `yolo`") && e.contains("bypassPermissions"), "{e}");
+    }
+
+    fn driven_remote_manifest(extra: &str) -> Manifest {
+        Manifest::from_yaml(&format!(
+            "task: fix the bug\nagent: {{ name: rc, remote: {{ name: my box, drive: true{extra} }} }}\nzone: {{ name: z, llm: {{ secret: claude-login }} }}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_driven_remote_session_is_driven_and_turns_remote_control_on_first() {
+        let m = driven_remote_manifest("");
+        let run = RunId("run_rd1".into());
+        let meta = serde_json::json!({ "subscriptionType": "max", "oauthAccount": { "organizationUuid": "org-1" } });
+        let a = harness::of(&m).unwrap();
+        let session = AgentSession::new();
+        let w = a.driven_remote_plan(&m, &run, &session, "fix the bug", &meta).unwrap();
+        // Driven: print mode over stream-json, wicket's session id, wicket's MCP gateway only.
+        assert_eq!(&w.plan.argv[..3], ["wicket-entry", "claude", "-p"]);
+        assert!(w.plan.argv.windows(2).any(|p| p == ["--input-format", "stream-json"]));
+        assert!(w.plan.argv.windows(2).any(|p| p == ["--session-id", session.id.as_str()]));
+        assert!(w.plan.argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(!w.plan.argv.iter().any(|a| a.contains("remote-control")), "-p takes no Remote Control flag");
+        assert_eq!(permission_mode_of(&w), "bypassPermissions", "unset: as in any driven box");
+        let prompt = &w.plan.argv[w.plan.argv.iter().position(|a| a == "--append-system-prompt").unwrap() + 1];
+        assert!(
+            prompt.contains("wicket sandbox") && prompt.contains("call the wicket MCP tool finish") && prompt.contains("Remote Control")
+        );
+        // Remote Control is asked for first, then the task is the first turn.
+        let stdin = w.plan.stdin_task.as_deref().unwrap();
+        let lines: Vec<Value> = stdin.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "control_request");
+        assert_eq!(lines[0]["request_id"], REMOTE_CONTROL_REQUEST_ID);
+        assert_eq!(lines[0]["request"], serde_json::json!({ "subtype": "remote_control", "enabled": true, "name": "my box" }));
+        assert_eq!(lines[1]["message"]["content"][0]["text"], "fix the bug");
+        // The login is a placeholder, as in a remote session; there is no inference token, and model
+        // calls go to api.anthropic.com (Remote Control runs only there) through the egress proxy.
+        let file = |rel: &str| -> Value { serde_json::from_slice(&w.files.iter().find(|(r, _)| r == rel).unwrap().1).unwrap() };
+        assert_eq!(file("claude/.credentials.json")["claudeAiOauth"]["accessToken"], w.login_placeholder);
+        let cfg = file("claude/.claude.json");
+        assert_eq!(cfg["oauthAccount"]["organizationUuid"], "org-1");
+        assert!(cfg.get("mcpServers").is_none(), "the driven session's MCP config is its --mcp-config");
+        assert!(!w.files.iter().any(|(r, _)| r == "claude/CLAUDE.md"));
+        let env: HashMap<_, _> = w.plan.env.iter().cloned().collect();
+        assert_eq!(env["HTTPS_PROXY"], "http://wicket.internal:3128");
+        for k in ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] {
+            assert!(!env.contains_key(k), "{k}");
+        }
+        assert_eq!(env["CLAUDE_CONFIG_DIR"], "/wicket/state/claude");
+        // A wake resumes the conversation, and turns Remote Control on again.
+        let woken = AgentSession { id: session.id.clone(), resume: true };
+        let w = a.driven_remote_plan(&m, &run, &woken, "a message woke you", &meta).unwrap();
+        assert!(w.plan.argv.windows(2).any(|p| p == ["--resume", session.id.as_str()]));
+        let stdin = w.plan.stdin_task.unwrap();
+        assert!(stdin.lines().next().unwrap().contains("\"remote_control\""));
+        assert!(stdin.lines().nth(1).unwrap().contains("a message woke you"));
+    }
+
+    #[test]
+    fn a_driven_remote_session_takes_a_mode_that_needs_no_prompt_answered() {
+        let run = RunId("run_rd2".into());
+        let a = harness::adapter(Harness::ClaudeCode);
+        for mode in ["acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"] {
+            let m = driven_remote_manifest(&format!(", permission_mode: {mode}"));
+            assert_eq!(permission_mode_of(&a.driven_remote_plan(&m, &run, &AgentSession::new(), "t", &Value::Null).unwrap()), mode);
+        }
+        let m = driven_remote_manifest(", permission_mode: default");
+        let e = a.driven_remote_plan(&m, &run, &AgentSession::new(), "t", &Value::Null).err().unwrap();
+        assert!(e.contains("asks wicket, not the Claude app") && e.contains("leave the mode out"), "{e}");
+    }
+
+    #[test]
+    fn reads_a_driven_session_s_remote_control_answer() {
+        let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"wicket-remote-control","response":{"session_url":"https://claude.ai/code/session_01x","connect_url":"https://claude.ai/code?environment=","bridge_session_id":"cse_01x"}}}"#;
+        assert_eq!(driven_remote_status(ok), Some(Ok("https://claude.ai/code/session_01x".into())));
+        let failed = r#"{"type":"control_response","response":{"subtype":"error","request_id":"wicket-remote-control","error":"Remote Control requires a claude.ai subscription."}}"#;
+        assert_eq!(driven_remote_status(failed), Some(Err("Remote Control requires a claude.ai subscription.".into())));
+        let no_url = r#"{"type":"control_response","response":{"subtype":"success","request_id":"wicket-remote-control","response":{}}}"#;
+        assert!(matches!(driven_remote_status(no_url), Some(Err(_))));
+        // Anyone else's answer, the agent's own words, and non-JSON are not it.
+        assert!(driven_remote_status(&ok.replace("wicket-remote-control", "r1")).is_none());
+        let said = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"https://claude.ai/code/session_evil"}]}}"#;
+        assert!(driven_remote_status(said).is_none());
+        assert!(driven_remote_status("https://claude.ai/code/session_1").is_none());
+        let state = r#"{"type":"system","subtype":"bridge_state","state":"failed","detail":"Session creation failed"}"#;
+        assert_eq!(render_event(state).unwrap(), "[remote] Remote Control failed: Session creation failed");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{claude, AgentSession, LaunchPlan, WrappedPlan};
 use serde_json::Value;
 use wicket_core::{AgentSpec, Harness, Manifest, RemotePermissionMode, RemoteSpec, RunId};
 
-/// How a harness runs in its box. One workload kind, the agent, in one of three modes.
+/// How a harness runs in its box. One workload kind, the agent, in one of four modes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode<'a> {
     /// wicket starts the harness and drives it: the task, follow-ups and messages are its turns. Only
@@ -16,6 +16,10 @@ pub enum Mode<'a> {
     /// `agent.remote` (#169): the harness registers its own session with its vendor's apps, and the
     /// owner drives it from there (Claude Code: Remote Control).
     Remote(&'a RemoteSpec),
+    /// `agent.remote` with `drive: true` (#285): driven by wicket as [`Mode::Driven`] (and as
+    /// long-lived), with its session also registered in its vendor's apps, where the owner watches
+    /// it and can send it messages.
+    DrivenRemote(&'a RemoteSpec),
     /// `wicket wrap`: a command line another program launched (Claude Code: Remote Control's
     /// session process), run in a box. Its launcher keeps its stdio.
     Wrapped(&'a [String]),
@@ -26,6 +30,7 @@ impl<'a> Mode<'a> {
     pub fn of(agent: &'a AgentSpec, wrap: Option<&'a [String]>) -> Result<Mode<'a>, String> {
         match (&agent.remote, wrap) {
             (Some(_), Some(_)) => Err("agent.remote boots its own session in the box: it isn't wrapped".into()),
+            (Some(r), None) if r.drive => Ok(Mode::DrivenRemote(r)),
             (Some(r), None) => Ok(Mode::Remote(r)),
             (None, Some(argv)) => Ok(Mode::Wrapped(argv)),
             (None, None) => Ok(Mode::Driven),
@@ -78,6 +83,25 @@ pub trait Adapter: Send + Sync {
 
     /// The plan for [`Mode::Driven`]: `first` is the first turn (the task, or what woke the agent).
     fn plan(&self, m: &Manifest, run: &RunId, session: &AgentSession, first: &str) -> Result<LaunchPlan, String>;
+
+    /// [`Mode::DrivenRemote`]'s plan: as [`Adapter::plan`]'s, with the session also registered in the
+    /// vendor's apps. `login_meta` is what [`Adapter::remote_login_meta`] read.
+    fn driven_remote_plan(
+        &self,
+        _m: &Manifest,
+        _run: &RunId,
+        _session: &AgentSession,
+        _first: &str,
+        _login_meta: &Value,
+    ) -> Result<WrappedPlan, String> {
+        Err(format!("agent.remote.drive: the {} harness has no driven remote mode", self.harness()))
+    }
+
+    /// What a [`Mode::DrivenRemote`] session's output line says of its remote session: Ok(its
+    /// address), Err(why it didn't start). None for any other line.
+    fn driven_remote_status(&self, _line: &str) -> Option<Result<String, String>> {
+        None
+    }
 
     /// Whether a process in the box (its command line) is the harness's own runtime: the quiet-point
     /// check for hibernation counts nothing else (besides wicket's own and the agent's command).
@@ -215,9 +239,37 @@ impl Adapter for ClaudeCode {
     }
 
     fn remote_plan(&self, m: &Manifest, run: &RunId, login_meta: &Value) -> Result<WrappedPlan, String> {
-        let mode = m.agent.as_ref().and_then(|a| a.remote.as_ref()).map(|r| r.permission_mode).unwrap_or_default();
+        let mode = m.agent.as_ref().and_then(|a| a.remote.as_ref()).map(|r| r.permission_mode()).unwrap_or_default();
         let mode = self.remote_permission_mode(mode)?.unwrap_or(RemotePermissionMode::Default.as_str());
         crate::claude_code_remote_control_plan(m, run, login_meta, mode).map_err(|e| e.0)
+    }
+
+    fn driven_remote_plan(
+        &self,
+        m: &Manifest,
+        run: &RunId,
+        session: &AgentSession,
+        first: &str,
+        login_meta: &Value,
+    ) -> Result<WrappedPlan, String> {
+        let r = m.agent.as_ref().and_then(|a| a.remote.as_ref()).ok_or("agent.remote.drive needs agent.remote")?;
+        let mode = r.permission_mode();
+        if mode.is_default() {
+            // `claude -p` asks its stdin host, not the app, before an action that needs approval:
+            // wicket answers no such prompt, so the action would only be refused.
+            return Err(
+                "agent.remote.permission_mode \"default\" with drive: true: a driven Claude Code asks wicket, not the Claude app, \
+                        before acting, and wicket answers no such prompt; leave the mode out (bypassPermissions, as in any driven box, \
+                        with wicket's proxies deciding what the box can reach) or choose acceptEdits, auto, dontAsk or plan"
+                    .into(),
+            );
+        }
+        let mode = self.remote_permission_mode(mode)?.unwrap_or(RemotePermissionMode::BypassPermissions.as_str());
+        crate::claude_code_driven_remote_plan(m, run, session, first, login_meta, mode).map_err(|e| e.0)
+    }
+
+    fn driven_remote_status(&self, line: &str) -> Option<Result<String, String>> {
+        crate::driven_remote_status(line)
     }
 
     fn remote_permission_mode(&self, mode: RemotePermissionMode) -> Result<Option<&'static str>, String> {
@@ -357,6 +409,11 @@ mod tests {
         let r = rc.agent.as_ref().unwrap();
         assert!(matches!(Mode::of(r, None), Ok(Mode::Remote(s)) if s.name == "box"));
         assert!(Mode::of(r, Some(&argv)).is_err());
+        let d =
+            Manifest::from_yaml("task: hi\nagent: { name: a, remote: { name: box, drive: true } }\nzone: { name: z, llm: {} }\n").unwrap();
+        let d = d.agent.as_ref().unwrap();
+        assert!(matches!(Mode::of(d, None), Ok(Mode::DrivenRemote(s)) if s.name == "box" && s.drive));
+        assert!(Mode::of(d, Some(&argv)).is_err());
     }
 
     #[test]
@@ -384,6 +441,9 @@ mod tests {
         assert!(!a.is_runtime(&m, "claude -p"));
         let run = RunId("run_1".into());
         assert!(a.remote_plan(&m, &run, &Value::Null).err().unwrap().contains("no remote mode"));
+        let e = a.driven_remote_plan(&m, &run, &AgentSession::new(), "hi", &Value::Null).err().unwrap();
+        assert_eq!(e, "agent.remote.drive: the acp harness has no driven remote mode");
+        assert!(a.driven_remote_status(r#"{"type":"control_response"}"#).is_none());
         assert_eq!(a.remote_permission_mode(RemotePermissionMode::Default), Ok(None));
         let e = a.remote_permission_mode(RemotePermissionMode::BypassPermissions).unwrap_err();
         assert_eq!(e, "agent.remote.permission_mode \"bypassPermissions\": the acp harness has no permission modes");

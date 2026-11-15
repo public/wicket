@@ -1,10 +1,13 @@
 # Drive a box from the Claude apps
 
-Two ways to chat with an agent in a wicket box from the Claude apps (desktop, web, phone):
+Three ways to chat with an agent in a wicket box from the Claude apps (desktop, web, phone):
 
 - **A remote session** (`agent.remote`, #169): wicket starts the box, and the harness in it
-  registers its own session with the vendor. The task is optional: the first message comes from the
-  app.
+  registers its own session with the vendor. The task is optional, and wicket can't give it one: the
+  session starts working when its owner sends the first message from the app.
+- **A driven remote session** (`agent.remote.drive`, #285): wicket drives the agent as in any box
+  (the manifest's task is its first turn), and its session is also in the app, where you watch it
+  and can send it messages.
 - **A wrapped session** (`wicket wrap`): Claude Code's Remote Control on your host launches each
   session process, and wicket puts it in a box.
 
@@ -88,6 +91,48 @@ What it protects, and how:
 - **Not with hibernation.** The session lives in the vendor's apps, so the `hibernate` tool is refused;
   the box ends with its session. A supervisor that is handed over (`wicket self update`, #151) rebuilds
   the swap from the manifest.
+- **It waits for you.** `claude remote-control` takes its messages from the app only, so the
+  manifest's `task` isn't delivered (wicket has no channel into the session): the box idles until
+  its owner sends the first message. For a box that starts on its task by itself, use a driven
+  remote session.
+
+## A driven remote session
+
+`agent.remote` with `drive: true` is a driven box whose Claude Code session is also a Remote
+Control session. wicket gives it the manifest's task, `wicket say` follow-ups, peers' messages and
+wakes as turns, as in any driven box; in the app you see the same conversation as it happens, and a
+message you send there is the agent's next turn.
+
+1. Link the login as for a remote session (step 1 above).
+2. Start from `examples/remote-driven-box.yaml`: it has a `task`, `agent.remote: { name: ...,
+   drive: true }`, and a zone whose reach is what a driven session calls.
+3. `wicket run examples/remote-driven-box.yaml`. wicket prints `[wicket] remote session: <url>` and
+   records it as `run.remote_session` once Remote Control is on; if it can't start (no claude.ai
+   subscription, a zone that refuses its calls), wicket prints why, records
+   `run.remote_session_failed`, and the agent carries on, driven only.
+
+How it works, and what differs from a remote session:
+
+- **Claude Code** runs as in the driven mode (`claude -p --input-format stream-json`). `claude -p`
+  takes no Remote Control flag (`--remote-control` starts an interactive session only, and
+  `claude remote-control` takes its messages from the app only); instead its stdin host can turn
+  Remote Control on with a `remote_control` control request, which wicket writes before the task.
+  Its answer has the session's address.
+- **The login** is a placeholder, as for a remote session, and Remote Control runs only against
+  `api.anthropic.com` with a claude.ai login: so the model calls go there through the egress proxy
+  (with `zone.llm`'s budget and accounting), not to wicket's model proxy with an inference token.
+- **Permission mode.** `agent.remote.permission_mode` defaults to `bypassPermissions`, as in any
+  driven box. In `claude -p`, an action that needs approval is asked of its stdin host (wicket), not
+  the app, and wicket answers no such prompt, so `default` is refused; `acceptEdits`, `auto`,
+  `dontAsk` and `plan` are passed to `--permission-mode`. wicket's proxies decide what the box can
+  reach whatever the mode.
+- **Hibernation.** It hibernates and wakes as a driven agent: a wake resumes the same conversation
+  and turns Remote Control on again, which registers a new session in the app (with a new address,
+  printed and recorded as before).
+- **Reach.** A driven session creates its session with `POST /v1/code/sessions` and gets its worker
+  credentials from `/v1/code/sessions/<id>/bridge`, instead of registering an environment and polling
+  for work; the example's reach has those, and refuses the account's MCP servers and the settings a
+  box doesn't need.
 
 ## A wrapped session
 
