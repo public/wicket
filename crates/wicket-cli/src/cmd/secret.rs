@@ -74,18 +74,18 @@ pub enum SecretCmd {
     /// Store a secret. Prompts without echo, or reads stdin when it isn't a terminal.
     Set {
         name: String,
-        /// The only hosts it may be sent to (comma-separated; `*.example.com` for every host under
-        /// it). Without it, the secret keeps the hosts it had; a new one with none is sent nowhere,
-        /// unless it is a harness's default model secret: then it goes to that harness's model host.
+        /// The only host names it may be sent to (comma-separated; `*.example.com` for every name
+        /// under it). Without it, the secret keeps the host names it had; a new one with none is sent nowhere,
+        /// unless it is a harness's default model secret: then it goes to that harness's model host name.
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
     },
-    /// List secret names and the hosts each may be sent to (never values).
+    /// List secret names and the host names each may be sent to (never values).
     List,
-    /// Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their
-    /// run's lease next reaches them, within seconds while connected (#152).
+    /// Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it
+    /// when the control host next checks that run's secrets, within seconds while connected (#152).
     Rm { name: String },
-    /// Bind a secret to the only hosts it may be sent to, replacing its list.
+    /// Bind a secret to the only host names it may be sent to, replacing its list.
     Hosts {
         name: String,
         #[arg(long, value_delimiter = ',', required = true)]
@@ -94,7 +94,7 @@ pub enum SecretCmd {
     /// Make a secret a reference to a JSON field in another file, re-read on every use (never copied):
     /// e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's
     /// account fields (never its holder's name) are kept with the reference as they are now, for
-    /// remote-session boxes: re-link to refresh them.
+    /// Remote Control boxes: re-link to refresh them.
     Link {
         name: String,
         #[arg(long)]
@@ -105,7 +105,7 @@ pub enum SecretCmd {
         pointer: Option<String>,
         #[arg(long)]
         expires_pointer: Option<String>,
-        /// The only hosts it may be sent to (as for `secret set`).
+        /// The only host names it may be sent to (as for `secret set`).
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
     },

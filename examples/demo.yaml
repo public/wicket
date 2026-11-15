@@ -1,7 +1,7 @@
 # A guided tour of the PoC. Watch the console while it runs.
 #
 # - The lead agent reads a public GitHub repo: allowed by the zone's reach, so no prompt.
-# - It starts a child agent ("fetcher") in its own sandbox with its own identity. The child's read of
+# - It starts a child agent ("fetcher") in its own box with its own identity. The child's read of
 #   example.com is outside the reach, so it waits for you. The console card shows which agent it is,
 #   verified, and who it acts for.
 # - The lead then tries to push to the repo. Pushes are risk R4, so that waits for you too: deny it.

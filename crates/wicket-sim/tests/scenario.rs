@@ -7,6 +7,8 @@
 //!   failing seed's report says to run.
 //! - `deterministic`: one seed, run twice, gives the same trace.
 //! - `without_the_spend_journal_a_crashed_node_overspends`: the bug this found, still found.
+//! - `published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime`: #342's
+//!   expiry boundary, held by the strict oracle.
 
 use std::path::PathBuf;
 use wicket_sim::Options;
@@ -93,4 +95,16 @@ fn without_the_spend_journal_a_crashed_node_overspends() {
         "seed 8 without the journal no longer overspends: {r}"
     );
     assert!(r.violations.iter().all(|v| v.contains("billed, budget")), "and breaks nothing else: {r}");
+}
+
+/// #342: a node honoured a grant up to 999 ms past the ledger's `expires_at` (#333's observation,
+/// #337's F1): the token's check is `time <= not_after` in whole seconds, and the grant was
+/// published with `not_after = expires_at`. The oracle is strict (live while `now < expires_at`,
+/// in ms): published as before, seed 1 allows by a grant past its lifetime; published with
+/// `expires_at - 1` (the `seeds` test), no seed does.
+#[test]
+fn published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime() {
+    let r = wicket_sim::run_with(1, &dir().join("grant-end"), Options { grant_end_fix: false, ..Options::default() });
+    assert!(r.violations.iter().any(|v| v.contains("past its lifetime")), "seed 1 no longer allows past a grant's end: {r}");
+    assert!(r.violations.iter().all(|v| v.contains("past its lifetime")), "and breaks nothing else: {r}");
 }

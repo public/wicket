@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -38,19 +38,42 @@ const authority = { status: "running", node: "local", policy: { version: null },
   grants: [{ id: "g-1", method: "POST", host: "h", path: HOSTILE, uses: 2, expires_at: 1, approved_by: "passkey:laptop", approved_at: 1, revoked: false, reached_node: true }] } };
 const explained = { run: "run_a", policy: null, recorded: { method: "GET", host: "h", path: HOSTILE, outcome: "forbidden", decided_on: "the box's node", at: 1, detail: "d" },
   against_token_now: { available: true, decision: "forbidden", why: "block 0: check if " + HOSTILE, zone_says: "Forbidden" } };
-let nextAction = null;
+let nextAction = null, begun = null;
+// Web Push: a fake browser (permission, service worker, push manager) and server (devices).
+let permAsked = 0, permAskedAt = -1, swRegistered = null, swListener = null, subscribed = null, pushDevices = [];
+const fakeSub = { endpoint: "https://fcm.googleapis.com/fcm/send/dev1", options: { applicationServerKey: null },
+  toJSON() { return { endpoint: this.endpoint, keys: { p256dh: "BPK", auth: "AU" } }; }, unsubscribe: async () => { subscribed = null; return true; } };
+const swReg = { pushManager: { getSubscription: async () => subscribed,
+  subscribe: async o => { assert.strictEqual(o.userVisibleOnly, true); assert.deepStrictEqual(Array.from(o.applicationServerKey), [4, 1, 2]); fakeSub.options.applicationServerKey = o.applicationServerKey.buffer; subscribed = fakeSub; return fakeSub; } } };
+const devId = ep => require("crypto").createHash("sha256").update(ep).digest("hex").slice(0, 16);
 const reply = (body, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => body });
 const fetch = async (path, opts) => {
   calls.push({ path, body: opts && opts.body ? JSON.parse(opts.body) : null });
   if (path === "/api/me") return reply({ who: { state: "operator" } });
   if (path === "/api/state") return reply(state);
-  if (path === "/api/action/begin") return reply({ action: nextAction, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
-  if (path === "/api/action/finish") return reply({ ok: "done" });
+  if (path === "/api/action/begin") {
+    const b = JSON.parse(opts.body);
+    // Push actions: the server's signed JSON, as the fake server sees the device.
+    const a = b.action === "push_subscribe" ? { v: 1, action: b.action, device: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, replaces: false }
+      : b.action === "push_details" ? { v: 1, action: b.action, device: b.id, label: "laptop", service: "fcm.googleapis.com", details: true } : nextAction;
+    begun = { body: b, action: a };
+    return reply({ action: a, publicKey: { challenge: "Y2g", rpId: "localhost", allowCredentials: [] } });
+  }
+  if (path === "/api/action/finish") {
+    const b = begun && begun.body;
+    if (b && b.action === "push_subscribe") pushDevices = pushDevices.filter(d => d.id !== devId(b.endpoint)).concat([{ id: devId(b.endpoint), label: b.label, service: "fcm.googleapis.com", details: b.details, created: 1, last_success: null }]);
+    if (b && b.action === "push_details") for (const d of pushDevices) if (d.id === b.id) d.details = true;
+    return reply({ ok: "done" });
+  }
   if (path === "/api/manifests/check") return reply({ valid: true, sha256: "bb", saved_sha256: "aa", diff: { widens: true, widening: ["reach api.example.com"], changes: ["+ reach x"] } });
   if (path.startsWith("/api/manifests/")) return reply({ root: "manifests", name: "a.yaml", yaml: "task: <b>hi</b>\n", valid: true, writable: true, history: [{ version: "1-aa.yaml", saved_before: 1, sha256_prefix: "aa" }],
     fields: [{ path: "task", value: "<b>hi</b>", default: false }, { path: "zone.isolation", value: "gvisor", default: true }],
     grants: { task: "<b>hi</b>", image: { Ok: "img" }, isolation: "Gvisor", unlisted_hosts: "escalate", reach: [], hosts: [], forbid: [], inject: [{ secret: "gh", host: "h", header: "authorization", secret_set: false, bound_to_host: true }], volumes: [], limits: {}, org_policy: null } });
 
+  if (path === "/api/push") return reply({ public_key: "BAEC", devices: pushDevices, min_interval_secs: 30 });
+  if (path === "/api/push/subscribe") return reply({ error: "registering a device is a signed action" }, false);
+  if (path === "/api/push/remove") { const b = JSON.parse(opts.body); pushDevices = pushDevices.filter(d => d.id !== b.id); return reply({ ok: "device removed" }); }
+  if (path === "/api/push/details") { const b = JSON.parse(opts.body); for (const d of pushDevices) if (d.id === b.id) d.details = b.details; return reply({ ok: "ok" }); }
   if (path === "/api/policy") return reply({ installed: null, current: null, versions: [], runs: [] });
   if (path.endsWith("/authority")) return reply(authority);
   if (path.startsWith("/api/explain/")) return reply(explained);
@@ -60,7 +83,13 @@ let ceremonies = 0;
 const sandbox = {
   document: { createElement: t => new Node(t), createTextNode: t => new Text(t), getElementById: id => ids[id], addEventListener: (k, f) => { if (k === "DOMContentLoaded") sandbox.ready = f; } },
   fetch,
-  navigator: { credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
+  window: { PushManager: function () {}, Notification: {}, addEventListener() {} },
+  Notification: { requestPermission: async () => { permAsked++; permAskedAt = calls.length; return "granted"; } },
+  crypto: require("crypto").webcrypto, TextEncoder,
+  navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+    serviceWorker: { register: async (u, o) => { swRegistered = [u, o.scope]; return swReg; }, ready: Promise.resolve(swReg),
+      getRegistration: async () => (swRegistered ? swReg : undefined), addEventListener: (k, f) => { if (k === "message") swListener = f; } },
+    credentials: { get: async () => { ceremonies++; return { rawId: new ArrayBuffer(1), response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } }; } } },
   performance: { now: () => now },
   setTimeout: (f, ms) => { timers.push({ f, at: now + ms }); return timers.length; },
   clearTimeout: () => {},
@@ -176,4 +205,106 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.startsWith("Save manifests/a.yaml") && ids["confirm-what"].textContent.includes("WIDENS authority: reach api.example.com"), ids["confirm-what"].textContent);
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console manifest editor: ok");
+
+  // WebCrypto's digest resolves off the microtask queue: give it real time too.
+  const settle = async () => { for (let i = 0; i < 20; i++) await flush(); await new Promise(r => global.setTimeout(r, 5)); for (let i = 0; i < 20; i++) await flush(); };
+  // Notifications: permission is asked only from the button's click, and first (iOS); then the
+  // service worker is registered at the root, the browser subscribes with the server's key, and the
+  // subscription is posted. Devices are listed as text, and can be removed.
+  pushDevices = [];
+  await run("renderPush()"); await flush();
+  assert.strictEqual(permAsked, 0, "nothing asks for permission by itself");
+  const enable = ids.push.all(n => n.tagName === "button" && n.textContent === "Enable notifications")[0];
+  assert.ok(enable, ids.push.textContent);
+  const callsBefore = calls.length;
+  await enable.click(); await settle();
+  assert.strictEqual(permAsked, 1);
+  assert.strictEqual(permAskedAt, callsBefore, "permission is asked before anything else happens");
+  assert.deepStrictEqual(swRegistered, ["/sw.js", "/"]);
+  // Registering the device is a signed action: the confirmation says which device, and only its
+  // sign button posts it.
+  assert.ok(!calls.some(c => c.path === "/api/push/subscribe"), "no unsigned subscribe");
+  const sp = began().filter(c => c.body.action === "push_subscribe").pop();
+  assert.deepStrictEqual([sp.body.endpoint, sp.body.p256dh, sp.body.auth, sp.body.details, sp.body.label], [fakeSub.endpoint, "BPK", "AU", false, "iPhone · Safari"]);
+  assert.ok(ids["confirm-what"].textContent.startsWith("Send notifications to iPhone · Safari (fcm.googleapis.com"), ids["confirm-what"].textContent);
+  assert.strictEqual(pushDevices.length, 0, "nothing registered before it is signed");
+  const signNow = async () => { await advance(1000); const before = ceremonies; await ids["confirm-go"].click(); await settle(); assert.strictEqual(ceremonies, before + 1, "a passkey ceremony"); };
+  await signNow();
+  assert.ok(ids.push.textContent.includes("iPhone · Safari (this device)"), ids.push.textContent);
+  assert.strictEqual(ids.push.all(n => n.textContent === "Enable notifications").length, 0);
+  // Showing the request on a device is signed; hiding it again is not.
+  const box = () => ids.push.all(n => n.className === "row push-dev" && n.textContent.includes("(this device)"))[0];
+  const tick = box().all(n => n.tagName === "input")[0];
+  tick.checked = true; tick.onchange(); await settle();
+  assert.strictEqual(began().pop().body.action, "push_details");
+  assert.ok(ids["confirm-what"].textContent.startsWith("Show the agent and what it asks for"), ids["confirm-what"].textContent);
+  await signNow();
+  assert.strictEqual(pushDevices[0].details, true);
+  assert.ok(!calls.some(c => c.path === "/api/push/details"), "details on is never posted unsigned");
+  const untick = box().all(n => n.tagName === "input")[0];
+  assert.strictEqual(untick.checked, true);
+  untick.checked = false; untick.onchange(); await settle();
+  assert.deepStrictEqual(calls.filter(c => c.path === "/api/push/details").map(c => c.body), [{ id: devId(fakeSub.endpoint), details: false }]);
+  // The browser replaced the subscription (pushsubscriptionchange): the console doesn't know the new
+  // one, so the page offers a signed re-registration (and the worker's message brings it up).
+  const renewed = { ...fakeSub, endpoint: "https://fcm.googleapis.com/fcm/send/dev2", toJSON() { return { endpoint: this.endpoint, keys: { p256dh: "BPK2", auth: "AU2" } }; } };
+  subscribed = renewed;
+  swListener({ data: { resubscribe: true } }); await settle();
+  const again = ids.push.all(n => n.tagName === "button" && n.textContent === "Re-register this device")[0];
+  assert.ok(again, ids.push.textContent);
+  await again.click(); await settle();
+  const rs = began().pop().body;
+  assert.deepStrictEqual([rs.action, rs.endpoint, rs.p256dh, rs.auth], ["push_subscribe", renewed.endpoint, "BPK2", "AU2"]);
+  await signNow();
+  assert.ok(ids.push.textContent.includes("(this device)") && !ids.push.all(n => n.textContent === "Re-register this device").length, ids.push.textContent);
+  pushDevices = pushDevices.filter(d => d.id === devId(renewed.endpoint)); // the push service's 410 drops the old one
+  pushDevices.push({ id: "other", label: HOSTILE, service: "web.push.apple.com", details: false, created: 1, last_success: null });
+  await run("renderPush()"); await settle();
+  assert.ok(ids.push.textContent.includes(HOSTILE) && ids.push.all(n => n.tagName === "img").length === 0, "a label stays text");
+  const otherRow = ids.push.all(n => n.className === "row push-dev" && n.textContent.includes(HOSTILE))[0];
+  await otherRow.all(n => n.tagName === "button" && n.textContent === "Remove")[0].click(); await settle();
+  assert.deepStrictEqual(calls.filter(c => c.path === "/api/push/remove").map(c => c.body), [{ id: "other" }]);
+  assert.ok(subscribed, "removing another device leaves this one subscribed");
+  const mineRow = ids.push.all(n => n.className === "row push-dev" && n.textContent.includes("(this device)"))[0];
+  await mineRow.all(n => n.tagName === "button" && n.textContent === "Remove")[0].click(); await settle();
+  assert.strictEqual(subscribed, null, "removing this device unsubscribes the browser");
+  // A tap on a notification while the console is open marks that request's card.
+  state = { ...base, pending: [A, B] };
+  await run("refresh()"); await flush();
+  swListener({ data: { open: "q-b" } });
+  assert.deepStrictEqual(cardsIn().map(c => c.className), ["card req", "card req opened"]);
+  console.log("console notifications: ok");
+
+  // The service worker: a replaced subscription is subscribed again with the same key, any open
+  // console is told, and one notification says so; tapping it opens the console's notifications.
+  const sw = { listeners: {}, shown: [], posted: [], opened: [], subscribedWith: null, wins: [] };
+  const swSelf = {
+    location: { origin: "https://console.example" },
+    addEventListener: (k, f) => { sw.listeners[k] = f; },
+    skipWaiting() {},
+    clients: { claim: async () => {}, matchAll: async () => sw.wins, openWindow: async u => { sw.opened.push(u); } },
+    registration: { showNotification: async (t, o) => { sw.shown.push(o); }, pushManager: { subscribe: async o => { sw.subscribedWith = o; return {}; } } },
+  };
+  const swCtx = { self: swSelf, URL, JSON, Promise };
+  vm.createContext(swCtx);
+  vm.runInContext(fs.readFileSync(require("path").join(require("path").dirname(process.argv[2]), "sw.js"), "utf8"), swCtx);
+  const fire = async (k, e) => { let p; sw.listeners[k]({ ...e, waitUntil: x => { p = x; } }); await p; };
+  const key = new Uint8Array([4, 1, 2]).buffer;
+  sw.wins = [{ url: "https://console.example/", postMessage: m => sw.posted.push(m), focus: async () => {} }, { url: "https://evil.example/", postMessage: () => assert.fail("another origin is told nothing") }];
+  await fire("pushsubscriptionchange", { oldSubscription: { options: { applicationServerKey: key } }, newSubscription: null });
+  assert.deepStrictEqual([sw.subscribedWith.userVisibleOnly, sw.subscribedWith.applicationServerKey], [true, key]);
+  assert.strictEqual(JSON.stringify(sw.posted), JSON.stringify([{ resubscribe: true }]));
+  assert.strictEqual(sw.shown.length, 1);
+  assert.ok(sw.shown[0].body.includes("open the console") && sw.shown[0].data.resubscribe === true && sw.shown[0].tag !== "wicket-pending", JSON.stringify(sw.shown[0]));
+  // The browser already made the new one, or there was none: nothing is subscribed, it still says so.
+  sw.subscribedWith = null;
+  await fire("pushsubscriptionchange", { oldSubscription: null, newSubscription: {} });
+  assert.strictEqual(sw.subscribedWith, null);
+  assert.strictEqual(sw.shown.length, 2);
+  sw.wins = [];
+  await fire("notificationclick", { notification: { close() {}, data: { resubscribe: true } } });
+  assert.deepStrictEqual(sw.opened, ["https://console.example/#notifications"]);
+  await fire("notificationclick", { notification: { close() {}, data: { id: "q-b" } } });
+  assert.deepStrictEqual(sw.opened[1], "https://console.example/#pending/q-b");
+  console.log("console service worker: ok");
 })().catch(e => { console.error(e); process.exit(1); });

@@ -16,7 +16,7 @@ it, and bounds what a grant covers.
 
 - **Reach.** A request is allowed by a reach rule only if its class is R2 or lower, or the rule has
   `allow_dangerous: true`. An R3 or R4 request otherwise needs a grant, even inside reach.
-- **Grants.** A grant covers nothing riskier than the request the human approved. Approving an R2
+- **Grants.** A grant covers nothing riskier than the request the operator approved. Approving an R2
   prefix (`wicket approve --prefix`, or a `request_access` with `scope: prefix`) doesn't allow the R4
   operations under it.
 - **Splice-through.** A host the list can rate R3 or higher (GitHub, `*.amazonaws.com`, metadata

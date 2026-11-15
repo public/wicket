@@ -105,19 +105,19 @@ humantime strings (`90s`, `10m`, `1h`).
 ## `wicket`
 
 ```text
-Run agents in least-privilege sandboxes (proof of concept)
+Run agents in least-privilege boxes (proof of concept)
 
 Usage: wicket <COMMAND>
 
 Commands:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
-  say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+  say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; its harness session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
-  wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
+  wake       Wake a hibernated agent: rebuild its box, restore its state and resume its harness session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
   agents     Long-lived agents: state, generation, current run and bundle size
-  wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
-  pending    List pending escalation requests
+  wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+  pending    List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial
   approve    Approve a pending request. The grant is never wider than the request
   deny       Deny a pending request
   links      Links between boxes (expose/connect/link), newest first
@@ -134,13 +134,13 @@ Commands:
   state      Control-plane state off this host (#154): the state store, the ledger's stream, the recovery kit and a restore onto a standby
   keys       The installation's root keys (#154)
   reconcile  Make what exists agree with the ledger (#38): end runs whose process is gone, end leases past their end or whose run ended, destroy owned machines no lease needs (checking the owner tag again right before each destroy), adopt or create the ones leases need, and stop boxes whose run has ended, here and on enrolled nodes. Records every change in the audit log
-  lease      Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the ask with `wicket approve`/`deny` (see `wicket pending`)
+  lease      Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
   zone       The zone view of a manifest: for each host its reach names, whether the egress proxy inspects it (terminates TLS and decides every request) or splices it through (decides on the hostname, relays the encrypted bytes), and why (#62)
   doctor     Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes
-  node       Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
+  node       Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
   place      Nodes from a provider (#37): Vultr plans, owned nodes, create inside a money envelope with a terminal approval and enrol with the host key pinned at creation, release
   dev        Development helpers
-  self       Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 a human approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
+  self       Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
   daemon     wicketd (#12): run as the wicket system user and serve other users' commands over a unix socket, letting each caller do what the policy grants its uid (from SO_PEERCRED). Approving, denying and other privileged commands need root over the socket, or a passkey in the console. Installed and started by deploy/install.sh
   help       Print this message or the help of the given subcommand(s)
 
@@ -172,7 +172,7 @@ Options:
 ## `wicket say`
 
 ```text
-Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; its harness session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
 
 Usage: wicket say <RUN> [TEXT]...
 
@@ -202,7 +202,7 @@ Options:
 ## `wicket wake`
 
 ```text
-Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
+Wake a hibernated agent: rebuild its box, restore its state and resume its harness session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
 
 Usage: wicket wake <AGENT> [TEXT]...
 
@@ -241,7 +241,7 @@ Options:
 ## `wicket wrap`
 
 ```text
-Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
+Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
 
 Usage: wicket wrap [OPTIONS] --manifest <MANIFEST> <ARGV>...
 
@@ -257,7 +257,7 @@ Options:
 ## `wicket pending`
 
 ```text
-List pending escalation requests
+List pending requests: what boxes asked for that their zones don't allow, waiting for a grant or a denial
 
 Usage: wicket pending
 
@@ -426,10 +426,10 @@ Usage: wicket secret <COMMAND>
 
 Commands:
   set    Store a secret. Prompts without echo, or reads stdin when it isn't a terminal
-  list   List secret names and the hosts each may be sent to (never values)
-  rm     Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their run's lease next reaches them, within seconds while connected (#152)
-  hosts  Bind a secret to the only hosts it may be sent to, replacing its list
-  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for remote-session boxes: re-link to refresh them
+  list   List secret names and the host names each may be sent to (never values)
+  rm     Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
+  hosts  Bind a secret to the only host names it may be sent to, replacing its list
+  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -447,14 +447,14 @@ Arguments:
   <NAME>  
 
 Options:
-      --hosts <HOSTS>  The only hosts it may be sent to (comma-separated; `*.example.com` for every host under it). Without it, the secret keeps the hosts it had; a new one with none is sent nowhere, unless it is a harness's default model secret: then it goes to that harness's model host
+      --hosts <HOSTS>  The only host names it may be sent to (comma-separated; `*.example.com` for every name under it). Without it, the secret keeps the host names it had; a new one with none is sent nowhere, unless it is a harness's default model secret: then it goes to that harness's model host name
   -h, --help           Print help
 ```
 
 ### `wicket secret list`
 
 ```text
-List secret names and the hosts each may be sent to (never values)
+List secret names and the host names each may be sent to (never values)
 
 Usage: wicket secret list
 
@@ -465,7 +465,7 @@ Options:
 ### `wicket secret rm`
 
 ```text
-Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their run's lease next reaches them, within seconds while connected (#152)
+Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
 
 Usage: wicket secret rm <NAME>
 
@@ -479,7 +479,7 @@ Options:
 ### `wicket secret hosts`
 
 ```text
-Bind a secret to the only hosts it may be sent to, replacing its list
+Bind a secret to the only host names it may be sent to, replacing its list
 
 Usage: wicket secret hosts --hosts <HOSTS> <NAME>
 
@@ -494,7 +494,7 @@ Options:
 ### `wicket secret link`
 
 ```text
-Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for remote-session boxes: re-link to refresh them
+Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
 
 Usage: wicket secret link [OPTIONS] --file <FILE> <NAME>
 
@@ -509,7 +509,7 @@ Options:
       --expires-pointer <EXPIRES_POINTER>
           
       --hosts <HOSTS>
-          The only hosts it may be sent to (as for `secret set`)
+          The only host names it may be sent to (as for `secret set`)
   -h, --help
           Print help
 ```
@@ -1020,7 +1020,7 @@ Options:
 ## `wicket lease`
 
 ```text
-Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the ask with `wicket approve`/`deny` (see `wicket pending`)
+Capacity leases (#7): nodes agents asked for with request_capacity. Approve or deny the request with `wicket approve`/`deny` (see `wicket pending`)
 
 Usage: wicket lease <COMMAND>
 
@@ -1108,7 +1108,7 @@ Options:
 ## `wicket node`
 
 ```text
-Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
+Remote nodes (#16), machines that run boxes: one-time join tokens, enrolment with a pinned ssh host key, a node key and a name-constrained node CA; listing, revoking, renewing the CA
 
 Usage: wicket node <COMMAND>
 
@@ -1156,7 +1156,7 @@ Options:
       --ssh-key <SSH_KEY>    ssh identity to log in with (remembered for later runs)
       --host-key <HOST_KEY>  The node's ssh host key (`ssh-ed25519 AAAA…`) or its fingerprint (`SHA256:…`), from the provider's console, cloud-init output or the image: not from the network
       --trust-first-use      No --host-key: pin whatever key the node presents now, and print its fingerprint
-      --hosts <HOSTS>        Hosts the node's CA may mint certificates for: `api.example.com`, `*.example.org` (comma-separated)
+      --hosts <HOSTS>        Host names the node's CA may mint certificates for: `api.example.com`, `*.example.org` (comma-separated)
       --ca-ttl <CA_TTL>      Node CA lifetime [default: 24h]
       --cert-ttl <CERT_TTL>  Node identity certificate lifetime (renewed over the control channel at half-life) [default: 24h]
   -h, --help                 Print help
@@ -1240,7 +1240,7 @@ Arguments:
   <NAME>  
 
 Options:
-      --hosts <HOSTS>        Replace the hosts it is constrained to (default: keep them)
+      --hosts <HOSTS>        Replace the host names it is constrained to (default: keep them)
       --ca-ttl <CA_TTL>      [default: 24h]
       --cert-ttl <CERT_TTL>  Node identity certificate lifetime [default: 24h]
   -h, --help                 Print help
@@ -1315,7 +1315,7 @@ Options:
       --name <NAME>
           Node name (hostname, label and enrolled name)
       --hosts <HOSTS>
-          Hosts the node's CA may issue for, as for `wicket node enrol --hosts`
+          Host names the node's CA may issue for, as for `wicket node enrol --hosts`
       --region <REGION>
           [default: lhr]
       --plan <PLAN>
@@ -1413,7 +1413,7 @@ Options:
 ## `wicket self`
 
 ```text
-Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 a human approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
+Update this installation to another wicket build (#162): blue/green, with a health gate and automatic rollback, on the control host and then its nodes. Only artifacts signed by a release key this installation trusts, or whose sha256 an operator approved (an agent's `request_update`), are accepted. See docs/explanation/updates.md
 
 Usage: wicket self <COMMAND>
 

@@ -593,7 +593,7 @@ impl Gateway {
             return ("this run's lifetime is its process's: it ends when the process exits".into(), true);
         };
         if w == crate::Want::Hibernate && self.ctx.fence.is_none() {
-            return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped or a remote session); call finish when you are done".into(), true);
+            return ("this run can't hibernate: only a long-lived agent wicket started itself can (not a child, a wrapped session or a Remote Control session); call finish when you are done".into(), true);
         }
         if tx.send(w).is_err() {
             return ("this run's supervisor is gone".into(), true);
@@ -956,7 +956,7 @@ fn tools() -> Value {
         },
         {
             "name": "spawn_agent",
-            "description": "Start a child agent in its own sandbox with its own wicket identity, for work that should be separately identified and approved. It gets the task text and (optionally) a narrower reach. Returns its run id; use await_message for its messages and result.",
+            "description": "Start a child agent in its own box with its own wicket identity, for work that should be separately identified and approved. It gets the task text and (optionally) a narrower reach. Returns its run id; use await_message for its messages and result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

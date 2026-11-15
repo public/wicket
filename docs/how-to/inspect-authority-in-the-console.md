@@ -15,7 +15,7 @@ says what each view shows and never shows.
    - **authority until**: when its authority ends (its deadline), and whether its box has stopped.
    - **secrets on its node** and **budget slice**: what its node holds for it, secrets by name.
    - **token**: whether it loads, then each block. Block 0 is the zone's ceiling; spawn blocks narrow
-     it for a child run; grant blocks carry what a human approved. A block marked REVOKED takes the
+     it for a child run; grant blocks carry what an operator approved. A block marked REVOKED takes the
      whole token (and every run below it) with it.
    - **grants**: each with its uses, expiry, approver, and "not yet on its node" while the feed delta
      carrying it hasn't reached the node.

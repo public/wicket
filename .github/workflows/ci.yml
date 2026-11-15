@@ -81,6 +81,8 @@ jobs:
         run: ci/check-public.py
       - name: relative links in Markdown files
         run: ci/check-doc-links.sh
+      - name: one word per thing in the docs and the CLI's help (#332)
+        run: ci/check-terms.sh
       - name: gitleaks, every commit
         run: |
           f=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
@@ -143,6 +145,29 @@ jobs:
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
         run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
 
+  # #327: the console's session view (web/session): its bundle built from the committed lockfile,
+  # licence-checked and reproduced byte for byte (ci/session-view.sh), then embedded in the binary
+  # for the serve tests and the view's own client driven against the real endpoint under node.
+  session-view:
+    name: Session view bundle
+    needs: select
+    if: ${{ !cancelled() && needs.select.outputs.rust != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # A pinned Node, checksum-verified (ci/install-node.sh); the same in build.yml and release.yml.
+      NODE_VERSION: 22.23.5
+      NODE_SHA256: "cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8" # node-v22.23.5-linux-x64.tar.xz, from nodejs.org/dist/v22.23.5/SHASUMS256.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Node (pinned)
+        run: ci/install-node.sh
+      - name: Build, reproduce, embed and test
+        run: ci/session-view.sh --test
+
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
   # change touches: narrows or widens. A solver timeout or `unknown` fails.
   policy:
@@ -174,6 +199,20 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: ci/lean.sh
+
+  # #321: TLC on the TLA+ models under verification/tla/, at the bounds their .cfg files state
+  # (a few minutes), when they or the code they model change. A pinned, checksum-verified JRE.
+  tla:
+    name: TLA+ models (TLC)
+    needs: select
+    if: ${{ !cancelled() && (needs.select.outputs.suites == '' || contains(needs.select.outputs.suites, ' tla ')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/tla.sh
 
   # #324: the deterministic simulation (crates/wicket-sim). A pull request runs its fixed seeds with
   # the crate's tests, whenever ci/affected.py selects it. This runs a few hundred more, a different
