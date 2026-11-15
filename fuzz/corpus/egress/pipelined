@@ -1,0 +1,8 @@
+GET /a HTTP/1.1
+host: fuzz.example
+
+GET /b/../c HTTP/1.1
+host: fuzz.example
+
+HEAD /d HTTP/1.1
+

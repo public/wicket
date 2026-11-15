@@ -1,0 +1,14 @@
+POST /upload HTTP/1.1
+host: fuzz.example
+transfer-encoding: chunked
+
+5
+hello
+6;ext=1
+ world
+0
+x-trailer: t
+
+GET /after HTTP/1.1
+host: fuzz.example
+

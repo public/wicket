@@ -62,13 +62,24 @@ impl Egress {
     {
         let cfg = self.ca.server_config(&host)?;
         let tls = tokio_rustls::TlsAcceptor::from(cfg).accept(io).await?;
+        self.serve_decrypted(tls, host, hyper::server::conn::http1::Builder::new()).await
+    }
+
+    /// Serves the requests of a tunnel to `host` whose TLS is already terminated (`io` carries the
+    /// box's plaintext HTTP/1.1), with `http1`'s settings: what [`Self::tunnel_io`] does after the
+    /// handshake. Public for the fuzz targets (#323), which feed it raw bytes.
+    #[doc(hidden)]
+    pub async fn serve_decrypted<S>(self: Arc<Self>, io: S, host: String, http1: hyper::server::conn::http1::Builder) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let me = self.clone();
         let svc = service_fn(move |req: Request<Incoming>| {
             let me = me.clone();
             let host = host.clone();
             async move { Ok::<_, hyper::Error>(me.handle(req, host, "https", Via::Tcp).await) }
         });
-        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await?;
+        http1.serve_connection(TokioIo::new(io), svc).await?;
         Ok(())
     }
 
