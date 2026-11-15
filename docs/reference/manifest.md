@@ -29,7 +29,7 @@ zone:
 | field | type | default | meaning |
 |---|---|---|---|
 | `tenant` | string | `t0` | The tenant. 0.0.1 is single-tenant: leave it out. |
-| `task` | string | `""` | The trusted task text, given to the agent as its first turn (or to a program, which may ignore it). It is the only input policy derivation ever sees. Required for agents, except a remote session (`agent.remote`), whose messages come from the vendor's app. `wicket run --task` replaces it. |
+| `task` | string | `""` | The trusted task text, given to the agent as its first turn (or to a program, which may ignore it). It is the only input policy derivation ever sees. Required for agents, except a remote session (`agent.remote`) that wicket doesn't drive, whose messages come from the vendor's app. `wicket run --task` replaces it. |
 | `agent` | [agent](#agent) | none | A Claude Code agent. |
 | `program` | [program](#program) | none | A deterministic workload with no model. |
 | `zone` | [zone](#zone) | required | Where the workload runs, and what it may reach. |
@@ -53,17 +53,18 @@ run ends when the agent calls wicket's [`finish`](mcp-tools.md#finish) tool or e
 | `image` | string | the agent image | The image the agent's box starts from: the installation's agent image, or one `zone.images` allows. A tag of a repository `zone.images` pins starts as that pin. `wicket run --image` overrides it. See [pins](#image-pins). |
 | `env` | map of string to string | `{}` | Non-secret environment variables for the agent. Names are `[A-Z0-9_]+`. Refused: `HOME`, `PATH`, `USER`, and names starting `ANTHROPIC_`, `CLAUDE_`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_`, `CURL_`, `NODE_`, `MCP_`, `GIT_SSL` or `WICKET_`. |
 | `adapter_settings` | map | `{}` | Settings for the harness (for Claude Code, its `settings.json`). Only `includeCoAuthoredBy`, `attribution`, `outputStyle`, `alwaysThinkingEnabled` and `language` are allowed. `cleanupPeriodDays` is wicket's own and refused. |
-| `remote` | object | none | The harness's remote mode: a session the owner drives from the vendor's apps (for Claude Code, Remote Control). See [`agent.remote`](#agentremote). |
+| `remote` | object | none | The harness's remote modes: a session in the vendor's apps (for Claude Code, Remote Control), which the owner drives, or which wicket drives and the owner watches and steers (`drive`). See [`agent.remote`](#agentremote). |
 
 ### Harness modes
 
-An agent is one kind of workload; its harness runs in one of three modes, and the harness's adapter
+An agent is one kind of workload; its harness runs in one of four modes, and the harness's adapter
 says which it has (a mode it hasn't is refused, saying so):
 
 | mode | how | `claude-code` | `acp` |
 |---|---|---|---|
 | driven | the default: wicket starts the harness and gives it the task, follow-ups and messages as turns. The only mode that hibernates and wakes. | yes | yes |
-| remote | `agent.remote`: the harness registers its own session with its vendor's apps, and the owner drives it from there. | Remote Control | no |
+| remote | `agent.remote`: the harness registers its own session with its vendor's apps, and the owner drives it from there. It starts when the owner sends its first message. | Remote Control (`claude remote-control`) | no |
+| driven remote | `agent.remote` with `drive: true`: driven, as above (the task is its first turn; it hibernates and wakes), with its session also in the vendor's apps, where the owner watches it and can send it messages. | Remote Control turned on in `claude -p` | no |
 | wrapped | `wicket wrap`: a command line another program launched runs in a box, keeping its launcher's stdio. | Remote Control's session processes | no |
 
 (`spawn`'s `kind`, `agent` or `program`, is the workload type, not the harness.)
@@ -73,7 +74,8 @@ says which it has (a mode it hasn't is refused, saying so):
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
-| `permission_mode` | string | `default` | How far the harness acts without asking in the app: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. |
+| `permission_mode` | string | `default`; `bypassPermissions` with `drive` | How far the harness acts without asking: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks in the app before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. With `drive`, `default` is refused: a driven Claude Code asks wicket, not the app, and wicket answers no such prompt. |
+| `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, follow-ups and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
 
 Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
 whether the harness asks the owner in the app first, as `bypassPermissions` does for the driven mode.

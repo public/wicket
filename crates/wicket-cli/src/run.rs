@@ -414,7 +414,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         None => None,
     };
     let remote = matches!(mode, Some(wicket_agent::harness::Mode::Remote(_)));
-    if remote {
+    // Driven by wicket, with its session also in the vendor's apps (#285): the remote login, the
+    // driven mode's events.
+    let driven_remote = matches!(mode, Some(wicket_agent::harness::Mode::DrivenRemote(_)));
+    if remote || driven_remote {
         let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
         if vault.hosts(secret).is_empty() {
             bail!("agent.remote: the login secret {secret:?} is bound to no hosts, so it would be swapped in nowhere");
@@ -509,8 +512,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // rebuilt. Wrapped sessions belong to their launcher, and boxes on nodes keep their
     // state there: both stay one-shot.
     // A remote session (#169) lives in its vendor's apps, not as a long-lived wicket agent: only the
-    // driven mode is long-lived.
-    let long_lived = matches!(mode, Some(wicket_agent::harness::Mode::Driven));
+    // driven modes are long-lived (a driven remote one turns its remote session on at each wake).
+    let long_lived = matches!(mode, Some(wicket_agent::harness::Mode::Driven | wicket_agent::harness::Mode::DrivenRemote(_)));
     if wake.is_some() && !long_lived {
         bail!("only an agent wicket drives itself (not a remote or wrapped session) can be woken");
     }
@@ -888,12 +891,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let meta = h.remote_login_meta(vault.linked_object(secret).as_ref(), vault.link_meta(secret).as_ref());
             Some(h.remote_plan(&m, &run, &meta).map_err(anyhow::Error::msg)?)
         }
+        // Driven, so its first turn is the task or what woke it, as for any driven agent.
+        (Some(h), Some(wicket_agent::harness::Mode::DrivenRemote(_))) => {
+            let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
+            let meta = h.remote_login_meta(vault.linked_object(secret).as_ref(), vault.link_meta(secret).as_ref());
+            let first = wake.as_ref().map_or(m.task.as_str(), |w| w.first.as_str());
+            Some(h.driven_remote_plan(&m, &run, &session, first, &meta).map_err(anyhow::Error::msg)?)
+        }
         _ => None,
     };
     let swaps = match &wrapped {
         None => vec![],
         // A remote session's login: swapped wherever its secret is bound (the provider's hosts).
-        Some(w) if remote => {
+        Some(w) if remote || driven_remote => {
             let secret = m.zone.llm.as_ref().map(|l| l.secret.clone()).unwrap_or_default();
             vault
                 .hosts(&secret)
@@ -1637,6 +1647,27 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             let _ = write_json(&acp_state, &*c);
                         }
                     } else {
+                        // A driven remote session's answer to wicket's Remote Control request: its
+                        // address, recorded once as a remote session's is; or why there is none (the
+                        // session carries on, driven only).
+                        if driven_remote && remote_url.is_none() {
+                            match harness.and_then(|h| h.driven_remote_status(&l)) {
+                                Some(Ok(u)) => {
+                                    println!("[wicket] remote session: {u}");
+                                    if let Ok(lg) = ledger.lock() {
+                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                    }
+                                    remote_url = Some(u);
+                                }
+                                Some(Err(why)) => {
+                                    println!("[wicket] the remote session didn't start (the agent carries on, driven by wicket only): {why}");
+                                    if let Ok(lg) = ledger.lock() {
+                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                         // A top-level result ends the agent's turn (subagents' results carry a parent).
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
                             if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {

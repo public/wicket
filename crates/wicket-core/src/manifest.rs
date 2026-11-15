@@ -133,11 +133,24 @@ pub const ACP_PROFILES: [&str; 1] = ["claude-agent-acp"];
 pub struct RemoteSpec {
     /// The session's name in the vendor's apps.
     pub name: String,
-    /// How far the harness acts without asking in the app (#285). Whatever the mode, wicket's
-    /// proxies decide what the box can reach. Left out when `default`, so manifests that don't set it
-    /// serialize as before.
-    #[serde(default, skip_serializing_if = "RemotePermissionMode::is_default")]
-    pub permission_mode: RemotePermissionMode,
+    /// How far the harness acts without asking (#285). Whatever the mode, wicket's proxies decide
+    /// what the box can reach. Unset: `default` (ask in the app before acting) for a session the
+    /// owner drives, `bypassPermissions` for one wicket drives (`drive`), as in any driven box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<RemotePermissionMode>,
+    /// wicket drives the session too (#285 part 2): it starts the harness as in a driven box and
+    /// gives it the manifest's task, follow-ups and messages, and the session is also registered
+    /// with the vendor's apps, where the owner watches it and can send it messages. Needs a task.
+    /// Left out when false, so manifests that don't set it serialize as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drive: bool,
+}
+
+impl RemoteSpec {
+    /// The permission mode the session runs in: the manifest's, or its mode's default.
+    pub fn permission_mode(&self) -> RemotePermissionMode {
+        self.permission_mode.unwrap_or(if self.drive { RemotePermissionMode::BypassPermissions } else { RemotePermissionMode::Default })
+    }
 }
 
 /// `agent.remote.permission_mode`: the modes `claude remote-control --permission-mode` takes. A
@@ -763,6 +776,11 @@ impl Manifest {
                         if !ok {
                             return Err(ManifestError::Invalid("agent.remote.name: 1-64 letters, digits, spaces, '-', '_' or '.'".into()));
                         }
+                        if r.drive && self.task.trim().is_empty() {
+                            return Err(ManifestError::Invalid(
+                                "task is empty: agent.remote.drive gives the session the manifest's task, so it needs one".into(),
+                            ));
+                        }
                     }
                     None if self.task.trim().is_empty() => {
                         return Err(ManifestError::Invalid("task is empty (only an agent.remote session may leave it out)".into()))
@@ -1085,7 +1103,7 @@ zone:
     }
 
     fn m_mode(y: &dyn Fn(&str) -> Result<Manifest, ManifestError>, extra: &str) -> Result<RemotePermissionMode, ManifestError> {
-        Ok(y(&format!(", remote: {{ name: x{extra} }}"))?.agent.unwrap().remote.unwrap().permission_mode)
+        Ok(y(&format!(", remote: {{ name: x{extra} }}"))?.agent.unwrap().remote.unwrap().permission_mode())
     }
 
     #[test]
@@ -1105,13 +1123,33 @@ zone:
         let e = y(", remote: { name: x, permission_mode: yolo }").unwrap_err().to_string();
         assert!(e.contains("unknown variant `yolo`"), "{e}");
         assert!(y(", remote: { name: x, permission_mode: BypassPermissions }").is_err(), "spelled as the CLI takes it");
-        // A default mode isn't written out, so a remote manifest's digest is unchanged.
+        // An unset mode isn't written out, so a remote manifest's digest is unchanged; a set one is,
+        // `default` included (a driven session's default differs).
+        let rc = serde_yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
+        assert!(!rc.contains("permission_mode") && !rc.contains("drive"), "{rc}");
         let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
-        assert!(!rc.contains("permission_mode"), "{rc}");
+        assert!(rc.contains("permission_mode: default"), "{rc}");
         let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
         assert!(rc.contains("permission_mode: plan"), "{rc}");
         // Other manifests serialize as before (their identity digests don't change).
         let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
         assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));
+    }
+
+    #[test]
+    fn a_driven_remote_session_needs_a_task_and_bypasses_permissions_by_default() {
+        let y = |task: &str, remote: &str| {
+            Manifest::from_yaml(&format!("{task}agent: {{ name: a, remote: {{ name: x{remote} }} }}\nzone: {{ name: z, llm: {{}} }}\n"))
+        };
+        let e = y("", ", drive: true").unwrap_err().to_string();
+        assert!(e.contains("task is empty") && e.contains("agent.remote.drive"), "{e}");
+        let m = y("task: t\n", ", drive: true").unwrap();
+        let r = m.agent.as_ref().unwrap().remote.as_ref().unwrap();
+        assert!(r.drive);
+        assert_eq!(r.permission_mode(), RemotePermissionMode::BypassPermissions);
+        let r = y("task: t\n", ", drive: true, permission_mode: acceptEdits").unwrap().agent.unwrap().remote.unwrap();
+        assert_eq!(r.permission_mode(), RemotePermissionMode::AcceptEdits);
+        assert_eq!(y("", "").unwrap().agent.unwrap().remote.unwrap().permission_mode(), RemotePermissionMode::Default);
+        assert!(serde_yaml::to_string(&m).unwrap().contains("drive: true"));
     }
 }

@@ -127,10 +127,11 @@ that protocol can't survive.
 
 ## Remote sessions and wrapped agents
 
-Two [harness modes](manifest.md#harness-modes) let the owner drive an agent in a box from the
-vendor's apps: remote (`agent.remote`), which boots the harness's own remote-session feature in the
-box (#169), and wrapped (`wicket wrap`), which boxes an agent process another program launches. Each
-is its harness adapter's; one without the mode refuses it. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
+Three [harness modes](manifest.md#harness-modes) put an agent in a box in the vendor's apps:
+remote (`agent.remote`), which boots the harness's own remote-session feature in the box (#169) for
+the owner to drive; driven remote (`agent.remote.drive`), which wicket drives as any agent while the
+owner watches and steers it from the app (#285); and wrapped (`wicket wrap`), which boxes an agent
+process another program launches. Each is its harness adapter's; one without the mode refuses it. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
 has both, with what each protects.
 
 Zones can also `forbid` hosts or paths outright, and `unlisted_hosts: hide` makes anything the zone
