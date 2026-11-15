@@ -9,12 +9,12 @@
 #   - "mandate", "crew": deferred designs (#259), outside docs/explanation/research/ and
 #     design.md's "22. Deferred" section;
 #   - "sandbox" in the user docs (README.md, docs/README.md, docs/how-to/, docs/reference/,
-#     docs/tutorials/, docs/explanation/concepts.md) where "box" is meant: "sandbox" names only
+#     docs/tutorials/, docs/explanation/concepts.md) and the plugin's skills (plugins/) where "box" is meant: "sandbox" names only
 #     gVisor's layer, so "gVisor sandbox", "gVisor's sandbox" and the protocol's "Blocked by wicket
 #     sandbox" pass.
 #
-# Checked: README.md and every tracked *.md under docs/ except docs/explanation/research/, code
-# blocks included.
+# Checked: README.md and every tracked *.md under docs/ (except docs/explanation/research/) and
+# plugins/, code blocks included.
 # ci/check-terms.allow lists the lines that may use a word anyway: `<path> | <text>`, where the line
 # contains <text> (or `<path> | *` for the whole file). Keep it short, and say why above each entry.
 #
@@ -28,7 +28,7 @@ import sys
 
 ALLOW_FILE = "ci/check-terms.allow"
 
-USER_DOCS = ("README.md", "docs/README.md", "docs/how-to/", "docs/reference/", "docs/tutorials/", "docs/explanation/concepts.md")
+USER_DOCS = ("README.md", "docs/README.md", "docs/how-to/", "docs/reference/", "docs/tutorials/", "docs/explanation/concepts.md", "plugins/")
 SANDBOX_OK = re.compile(r"gvisor(?:'s)? sandbox|blocked by wicket sandbox", re.I)
 
 RULES = [
@@ -41,7 +41,7 @@ RULES = [
 
 
 def checked(path):
-    return path.endswith(".md") and (path == "README.md" or path.startswith("docs/")) and not path.startswith("docs/explanation/research/")
+    return path.endswith(".md") and (path == "README.md" or path.startswith(("docs/", "plugins/"))) and not path.startswith("docs/explanation/research/")
 
 
 def load_allow():
