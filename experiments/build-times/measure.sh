@@ -31,10 +31,10 @@ export CARGO_TARGET_DIR=$([ "${target#/}" != "$target" ] && echo "$target" || ec
 
 record() { # step seconds peak_kib [extra json]
   local load; load=$(cut -d' ' -f1 /proc/loadavg)
-  jq -nc --arg label "$label" --arg step "$1" --argjson secs "$2" --argjson peak "$3" --argjson extra "${4:-{\}}" \
+  jq -nc --arg lbl "$label" --arg step "$1" --argjson secs "$2" --argjson peak "$3" --argjson extra "${4:-"{}"}" \
     --arg jobs "${CARGO_BUILD_JOBS:-}" --arg wrapper "$(basename "${RUSTC_WRAPPER:-}")" --arg incr "${CARGO_INCREMENTAL:-}" \
     --arg rustflags "${RUSTFLAGS:-}" --arg load "$load" --arg commit "$(git rev-parse --short HEAD)" \
-    '{label: $label, step: $step, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit, jobs: $jobs,
+    '{label: $lbl, step: $step, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit, jobs: $jobs,
       rustc_wrapper: $wrapper, incremental: $incr, rustflags: $rustflags, load: $load} + $extra' >>"$out/results.jsonl"
   echo "$label $1: ${2}s, peak $(( $3 / 1024 )) MiB"
 }

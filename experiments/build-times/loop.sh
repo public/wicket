@@ -25,11 +25,11 @@ export CARGO_TARGET_DIR=$([ "${t#/}" != "$t" ] && echo "$t" || echo "$PWD/$t")
 read -r -a extra <<<"${LOOP_CARGO_ARGS:-}"
 
 record() { # case phase seconds peak_kib
-  jq -nc --arg label "$label" --arg case "$1" --arg phase "$2" --argjson secs "$3" --argjson peak "$4" \
+  jq -nc --arg lbl "$label" --arg case "$1" --arg phase "$2" --argjson secs "$3" --argjson peak "$4" \
     --arg jobs "${CARGO_BUILD_JOBS:-}" --arg wrapper "$(basename "${RUSTC_WRAPPER:-}")" --arg incr "${CARGO_INCREMENTAL:-}" \
     --arg rustflags "${RUSTFLAGS:-}" --arg cargo_args "${LOOP_CARGO_ARGS//$HOME/~}" --arg nextest "${LOOP_NEXTEST:-}" \
     --arg load "$(cut -d' ' -f1 /proc/loadavg)" --arg commit "$(git rev-parse --short HEAD)" \
-    '{label: $label, case: $case, phase: $phase, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit,
+    '{label: $lbl, case: $case, phase: $phase, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit,
       jobs: $jobs, rustc_wrapper: $wrapper, incremental: $incr, rustflags: $rustflags, cargo_args: $cargo_args,
       nextest: $nextest, load: $load}' >>"$out/loop.jsonl"
   printf '%-28s %-6s %-11s %7ss  peak %5s MiB\n' "$label" "$1" "$2" "$3" "$(($4 / 1024))"
