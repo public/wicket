@@ -1,0 +1,6 @@
+b../outside
+bpwned
+t
+l 0777 0 = 0 link;f 0644 0 = 1 link2
+t
+d 0755 0 0 2 sub;l 0777 0 = 0 sub2

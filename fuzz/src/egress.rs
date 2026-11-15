@@ -164,17 +164,36 @@ fn op_of(u: &Seen) -> Result<Seen, String> {
     Ok(Seen { method: op.method, host: op.host, path: op.path })
 }
 
+/// The proxy's HTTP/1.1 server, except that it answers what it has read after the client shuts
+/// down its side (as a box that keeps the connection open until it has its answers would see).
+pub(crate) fn half_closing() -> hyper::server::conn::http1::Builder {
+    let mut b = hyper::server::conn::http1::Builder::new();
+    b.half_close(true);
+    b
+}
+
 pub fn run(data: &[u8]) {
-    let Some((&mode, stream)) = data.split_first() else { return };
+    let (decided, upstream) = exchange(data);
+    check(&decided, &upstream);
+}
+
+/// Runs one connection; what was decided, and what the origins received.
+pub fn exchange(data: &[u8]) -> (Vec<Seen>, Vec<Seen>) {
+    let Some((&mode, stream)) = data.split_first() else { return (vec![], vec![]) };
     let w = world();
+    // One connection at a time: the logs are the world's (tests run on several threads).
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    w.decided.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    w.upstream.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let out = w.rt.block_on(async {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let egress = w.egress.clone();
         let served = if mode & 1 == 0 {
-            tokio::spawn(egress.serve_io(server))
+            tokio::spawn(egress.serve_io(server, half_closing()))
         } else {
             tokio::spawn(async move {
-                let _ = egress.serve_decrypted(server, TLS_HOST.to_string()).await;
+                let _ = egress.serve_decrypted(server, TLS_HOST.to_string(), half_closing()).await;
             })
         };
         let talk = async {
@@ -198,9 +217,9 @@ pub fn run(data: &[u8]) {
     // caused it by leaving a body unfinished; the proxy has no request timeout of its own, so
     // timeouts aren't findings.
     let _ = out;
-    let decided = std::mem::take(&mut *w.decided.lock().unwrap());
-    let upstream = std::mem::take(&mut *w.upstream.lock().unwrap());
-    check(&decided, &upstream);
+    let decided = std::mem::take(&mut *w.decided.lock().unwrap_or_else(|e| e.into_inner()));
+    let upstream = std::mem::take(&mut *w.upstream.lock().unwrap_or_else(|e| e.into_inner()));
+    (decided, upstream)
 }
 
 /// Every request the origins got must be one decided, in order, and the same request.

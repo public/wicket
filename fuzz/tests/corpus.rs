@@ -53,3 +53,18 @@ fn store() {
 fn git() {
     replay("git", wicket_fuzz::git::run);
 }
+
+/// The egress oracle is only as good as its view of the origins: allowed requests get there.
+#[test]
+fn egress_requests_reach_the_origins() {
+    let (d, u) = wicket_fuzz::egress::exchange(b"\x01GET /a HTTP/1.1\r\nhost: fuzz.example\r\n\r\nPOST /b HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi");
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert_eq!(u.len(), 2, "{u:?}");
+    assert_eq!((u[1].method.as_str(), u[1].host.as_str(), u[1].path.as_str()), ("POST", "fuzz.example", "/b"));
+    let (d, u) = wicket_fuzz::egress::exchange(b"\x00GET http://plain.example/x?y HTTP/1.1\r\n\r\n");
+    assert_eq!((d.len(), u.len()), (1, 1), "{d:?} {u:?}");
+    assert_eq!(u[0].path, "/x?y");
+    // A hidden request in a body is decided as nothing and reaches nobody.
+    let (_, u) = wicket_fuzz::egress::exchange(b"\x00CONNECT other.example:443 HTTP/1.1\r\n\r\n");
+    assert!(u.is_empty());
+}

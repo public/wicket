@@ -30,7 +30,7 @@ pub fn run(data: &[u8]) {
     let out = rt.block_on(async {
         let gw = wicket_proxy::gateway::Gateway::new(ctx);
         let (mut client, server) = tokio::io::duplex(64 * 1024);
-        let served = tokio::spawn(gw.serve_io(server));
+        let served = tokio::spawn(gw.serve_io(server, crate::egress::half_closing()));
         let talk = async {
             let (mut rd, mut wr) = tokio::io::split(&mut client);
             let write = async {
