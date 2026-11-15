@@ -1,0 +1,1 @@
+GET /acme/app.git/info/refs?service=git-receive-pack

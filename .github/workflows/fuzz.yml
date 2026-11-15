@@ -1,0 +1,106 @@
+name: Fuzz (nightly)
+
+# #323: every fuzz target, for longer than a PR's short run (ci.yml's fuzz job), one runner each.
+# A finding is minimized (ci/fuzz.sh), uploaded with the run's logs and corpus, and filed as an
+# issue (one open issue collects the nights until it is closed). To keep a finding: add its
+# minimized input to fuzz/regressions/<target>/, where the corpus replay runs it on every change.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: Seconds per target
+        default: "1200"
+      sanitizer:
+        description: none (coverage only) or address (ASan)
+        default: none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  replay:
+    name: Corpora and past findings (stable)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+          key: replay
+      - run: cd fuzz && cargo test --locked
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    # A standard runner (4 CPUs, 16 GB): the optimized build takes about ten minutes, then the run.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [egress, gateway, chan, feed, token, manifest, store, git]
+    env:
+      FUZZ_WORK: ${{ github.workspace }}/fuzz-work
+      SECS: ${{ inputs.secs || '1200' }}
+      SANITIZER: ${{ inputs.sanitizer || 'none' }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+          # One build serves every target (the harnesses are one library).
+          key: fuzz-${{ inputs.sanitizer || 'none' }}
+          save-if: ${{ matrix.target == 'egress' }}
+      - name: Fuzz
+        run: ci/fuzz.sh --no-replay --secs "$SECS" --sanitizer "$SANITIZER" "$TARGET"
+      - name: Findings (minimized), logs and the corpus grown
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz-work/artifacts
+            fuzz-work/corpus
+            fuzz-work/*.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  file:
+    name: File the findings
+    needs: [replay, fuzz]
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue, or comment on the open one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly fuzzing found something"
+          body="The nightly fuzz run failed: $RUN. Each failed target's artifact (fuzz-<target>) holds the minimized input (artifacts/<target>/*.min) and the log. Add the input to fuzz/regressions/<target>/ with the fix (#323)."
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

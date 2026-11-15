@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"request_access","arguments":{"url":"https://api.example.com/v1/x","scope":"prefix","reason":"needed"}}}

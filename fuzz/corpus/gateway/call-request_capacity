@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"request_capacity","arguments":{"vcpus":2,"memory_mib":1024,"reason":"build"}}}

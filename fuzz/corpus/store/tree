@@ -1,0 +1,7 @@
+bhello
+b#!/bin/sh
+b/etc/passwd
+t
+f 0644 1700000000 = 0 a.txt;f 0750 0 = 1 run.sh;l 0777 0 = 2 out
+t
+d 0755 1600000000 0 3 sub;f 0644 0 = 0 top

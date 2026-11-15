@@ -1,0 +1,3 @@
+Acheck if host("a") or host("b");
+%%
+Acheck if method("GET");
