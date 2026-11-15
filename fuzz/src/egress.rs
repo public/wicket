@@ -161,7 +161,7 @@ fn op_of(u: &Seen) -> Result<Seen, String> {
     let canon = wicket_core::canonical_path(path).map_err(|e| format!("the origin got a path that isn't canonical ({e}): {u:?}"))?;
     let host = u.host.split(':').next().unwrap_or("").to_string();
     let t = wicket_core::TenantId::single();
-    let op = wicket_core::git::op_for(&t, &wicket_core::RunId("r".into()), "z", &u.method, &host, &canon.to_string(), query);
+    let op = wicket_core::git::op_for(&t, &wicket_core::RunId("r".into()), "z", &u.method, &host, canon.as_ref(), query);
     Ok(Seen { method: op.method, host: op.host, path: op.path })
 }
 
