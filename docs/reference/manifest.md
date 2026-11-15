@@ -103,7 +103,7 @@ A manifest can't set `_meta`, MCP servers or a system prompt for an ACP agent: w
 | `name` | string | required | The program's name, the last part of its SPIFFE ID. |
 | `command` | list of strings | required, not empty | The command run in the box, in `/workspace`. |
 | `source` | string | none | A directory, relative to the manifest, copied into `/workspace`. |
-| `digest` | string | none | The approved source digest (`wicket program digest DIR`). When set, a run refuses any other source. Without it, the run prints the digest and is a development run. |
+| `digest` | string | none | The approved source digest (`wicket program digest DIR`: the source's plain tree, [store.md](../explanation/store.md)). When set, a run refuses any other source. Without it, the run prints the digest and is a development run. An earlier build's `wicket-program-v1` digest is accepted with a warning until `wicket zone pin` rewrites it. |
 | `on_pending` | `fail` or `wait` | `fail` | What happens to a request outside the zone's reach. `fail`: refused, nothing queued. `wait`: it becomes a pending request, as an agent's would, and the program may wait with `await_grant`. |
 | `image` | string | the agent image | The image the program runs in, by tag or [pinned](#image-pins). The agent image has bash, curl, jq, git and python3. |
 

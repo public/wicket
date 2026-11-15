@@ -442,12 +442,15 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 Some(s) => Some(crate::program::digest_dir(s)?),
                 None => None,
             };
-            match (&p.digest, &digest) {
-                (Some(want), Some(got)) if want != got => {
-                    bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name)
-                }
-                (Some(_), None) => bail!("program {} pins a digest but has no source", p.name),
-                (None, Some(got)) => println!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
+            match (&p.digest, &digest, &src) {
+                (Some(want), Some(got), Some(s)) if want != got => match crate::program::check_pin(s, got, want)? {
+                    crate::program::Pinned::Legacy => {
+                        println!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name)
+                    }
+                    _ => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
+                },
+                (Some(_), None, _) => bail!("program {} pins a digest but has no source", p.name),
+                (None, Some(got), _) => println!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
                 _ => {}
             }
             src.map(|s| (s, digest.unwrap_or_default()))

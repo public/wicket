@@ -1,6 +1,7 @@
 //! `wicket zone pin MANIFEST` (#192): rewrites a manifest's image tags (`zone.images`, `agent.image`,
 //! `program.image`) to the digests they point to now, in place, keeping the rest of the file as it
-//! is (comments, layout). The digests are what this installation's Docker reports (`wicket image
+//! is (comments, layout). A program pinned by its old `wicket-program-v1` digest is re-pinned to
+//! its tree digest (#258), when the source is still the one it pinned. The digests are what this installation's Docker reports (`wicket image
 //! digest`, through wicketd on an installed host). The rewrite is checked by reading the manifest
 //! back: it must be the same manifest with exactly those images pinned, or nothing is written.
 
@@ -74,26 +75,49 @@ fn digests(refs: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(m)
 }
 
+/// The program's old pin and the tree digest that replaces it, if `m`'s program is pinned by the
+/// `wicket-program-v1` digest of the source it has now. `base` is the manifest's directory.
+pub fn program_repin(m: &wicket_core::Manifest, base: &Path) -> Result<Option<(String, String)>> {
+    let Some(p) = &m.program else { return Ok(None) };
+    let (Some(pin), Some(src)) = (&p.digest, &p.source) else { return Ok(None) };
+    let src = base.join(src);
+    let digest = crate::program::digest_dir(&src)?;
+    Ok(match crate::program::check_pin(&src, &digest, pin)? {
+        crate::program::Pinned::Legacy => Some((pin.clone(), digest)),
+        // Not the source it pinned: left for a run to refuse, and for a human to re-approve.
+        crate::program::Pinned::Yes | crate::program::Pinned::No => None,
+    })
+}
+
 pub fn pin(manifest: &Path, dry_run: bool) -> Result<()> {
     let text = std::fs::read_to_string(manifest).with_context(|| manifest.display().to_string())?;
     let m = wicket_core::Manifest::from_yaml(&text)?;
     let tags = tags(&m);
-    if tags.is_empty() {
+    let repin = program_repin(&m, manifest.parent().unwrap_or(Path::new(".")))?;
+    if tags.is_empty() && repin.is_none() {
         println!("{}: every image is pinned already", manifest.display());
         return Ok(());
     }
-    let found = digests(&tags)?;
     let mut pins = BTreeMap::new();
-    for t in &tags {
-        let d = found.get(t).with_context(|| format!("no digest for {t}"))?;
-        pins.insert(t.clone(), wicket_core::image::pinned(t, d));
+    if !tags.is_empty() {
+        let found = digests(&tags)?;
+        for t in &tags {
+            let d = found.get(t).with_context(|| format!("no digest for {t}"))?;
+            pins.insert(t.clone(), wicket_core::image::pinned(t, d));
+        }
     }
-    let new = rewrite(&text, &pins);
+    let mut want = expected(&m, &pins);
+    let mut all = pins.clone();
+    if let Some((old, new)) = &repin {
+        all.insert(old.clone(), new.clone());
+        want.program.as_mut().expect("a program").digest = Some(new.clone());
+    }
+    let new = rewrite(&text, &all);
     let back = wicket_core::Manifest::from_yaml(&new).context("the rewritten manifest")?;
-    if serde_json::to_value(&back)? != serde_json::to_value(expected(&m, &pins))? {
+    if serde_json::to_value(&back)? != serde_json::to_value(want)? {
         bail!("{}: couldn't pin it safely (a tag appears elsewhere in the file as well); pin it by hand", manifest.display());
     }
-    for (t, p) in &pins {
+    for (t, p) in &all {
         println!("{t} -> {p}");
     }
     if dry_run {
@@ -102,7 +126,8 @@ pub fn pin(manifest: &Path, dry_run: bool) -> Result<()> {
     let tmp = manifest.with_extension("pinning");
     std::fs::write(&tmp, &new)?;
     std::fs::rename(&tmp, manifest)?;
-    println!("pinned {} image(s) in {}", pins.len(), manifest.display());
+    let what = if repin.is_some() { " and the program's source" } else { "" };
+    println!("pinned {} image(s){what} in {}", pins.len(), manifest.display());
     Ok(())
 }
 
@@ -138,5 +163,32 @@ mod tests {
         // A longer tag that starts with a shorter one isn't touched by it.
         let p: BTreeMap<String, String> = [("img:dev".to_string(), "X".to_string())].into();
         assert_eq!(rewrite("images: [img:dev2, img:dev]", &p), "images: [img:dev2, X]");
+    }
+
+    #[test]
+    fn a_program_pinned_by_its_old_digest_is_repinned_to_its_tree() {
+        let d = std::env::temp_dir().join(format!("wicket-pin-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/run.sh"), b"echo hi\n").unwrap();
+        let legacy = crate::program::legacy_digest_dir(&d.join("src")).unwrap();
+        let tree = crate::program::digest_dir(&d.join("src")).unwrap();
+        let yaml = |pin: &str| {
+            format!("# approved: see the review\ntask: t\nprogram:\n  name: p\n  source: src\n  command: [sh, /workspace/run.sh]\n  digest: {pin}   # pinned\nzone:\n  name: z\n")
+        };
+        let m = d.join("m.yaml");
+        std::fs::write(&m, yaml(&legacy)).unwrap();
+        pin(&m, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), yaml(&legacy), "a dry run writes nothing");
+        pin(&m, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), yaml(&tree), "only the pin changes");
+        pin(&m, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), yaml(&tree), "pinned already");
+        // A source that changed since its old pin isn't re-pinned: that is a new approval.
+        std::fs::write(&m, yaml(&legacy)).unwrap();
+        std::fs::write(d.join("src/run.sh"), b"echo changed\n").unwrap();
+        pin(&m, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), yaml(&legacy));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -16,7 +16,7 @@ It describes what we'd build, the order to build it in, and what is still open.
 | Volume snapshots (#251) | not built; "sha256 of its tree" | | |
 | Pre-update ledger snapshots (#167) | the SQLite file, sealed as a whole | `<data dir>/snapshots/` and `ledger-snapshots/<time>-<build>.db` in the state store | file name |
 | Installed versions (#162) | a directory per build id holding `wicket` and `manifest.json` | the versions root, and pushed to nodes over ssh | the first 12 hex digits of the binary's sha256 |
-| Program sources | a directory; its own digest `wicket-program-v1` over plain files (`program::digest_dir`) | the manifest's `program.source` | `sha256:` of that digest |
+| Program sources | a directory; its own digest `wicket-program-v1` over plain files (`program::digest_dir`); a tree digest since step 2 | the manifest's `program.source` | `sha256:` of that digest |
 | Images (#191) | OCI image layout | Docker, or an archive sent to a node | the OCI manifest's `sha256:` |
 
 That is three tree digests (the bundle's per-entry lines, the program digest and OCI's manifests),
@@ -170,7 +170,7 @@ snapshots, that means the blob of a snapshot no other ref points to.
 | **Volume snapshot** (#251) | A tree digest. Freezing a volume puts its tree, and the read-only grant is a grant on that digest (below). A reader's node fetches the tree (from the owner's node or the state store), restores it once into a read-only directory keyed by digest, and bind-mounts it into each box that holds a grant. |
 | **Ledger snapshot** (#167) | A blob, plus a ref `ledger-snapshots/<time>-<build id>.db` in the state store. The local copy in `<data dir>/snapshots/` stays a plain file, because the restore procedure opens it with SQLite. **The first PR.** |
 | **Installed version** | The artifact is a blob, and the version is a tree `{wicket, manifest.json}`. The versions root stays as it is (a checkout, named by build id, because the binaries are run from there). Nodes fetch the binary by digest through the store instead of having it pushed over ssh. Root's own copies (#261) stay root's: root reads the blob by digest and checks it. |
-| **Program source** | Its tree digest replaces `wicket-program-v1`. Symlinks and special files are still refused. Pins change once: `wicket zone pin` rewrites them. |
+| **Program source** | Its tree digest replaces `wicket-program-v1`: a plain tree, with modes normalised to the executable bit and times 0, so a pin doesn't depend on when the source was checked out. Symlinks and special files are still refused. Pins change once: `wicket zone pin` rewrites them. |
 | **Image** (#191) | Stays OCI: an OCI layout's `blobs/sha256/<hex>` are already blobs named by their sha256. So an image's blobs can be carried and cached by the store, and the pin is still the OCI manifest's digest. The verified import (`oci::unpack_verified`) is unchanged. |
 
 ## "May this digest run" is a grant on the digest
@@ -204,8 +204,11 @@ Done for #258, an update, a program and an image are all accepted through `may_u
    and `has` by digest; trees (the format, `put_tree`, `get_tree`); write-once refs; `has` on
    `ObjectStore` (a HEAD on S3); `SealedStore::sealed_only`. `snapstore` moves onto it. Snapshots
    that earlier builds pushed stay readable and are pruned the same way.
-2. **Trees from directories**: `put_dir` and `checkout`, with bundle restore's checks, and the program
-   digest as a tree digest.
+2. **Trees from directories** (done): `put_dir` and `checkout`, with bundle restore's checks, and the
+   program digest as a tree digest. A program's tree is a *plain* tree (`DirOpts::plain`): plain
+   files only, every file `0644` or `0755` by its executable bit, every directory `0755` and every
+   time 0, so the same source has one digest in every checkout. Old `wicket-program-v1` pins are
+   accepted with a warning while the source is unchanged, and `wicket zone pin` rewrites them.
 3. **Hibernation bundles as bundle trees**, through the local store; push to the state store by
    negotiation; manifest version 2 alongside a reader for version 1 until no agent's head is version 1.
 4. **Garbage collection** in the reconciler, and the local store's cache cap.
