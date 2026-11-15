@@ -1319,6 +1319,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         seed,
         plan: plan.to_string(),
         violations: w.trace.violations.clone(),
+        known: vec![],
         hash: w.trace.hash(),
         stats: format!("{:?}", w.stats),
         trace: w.trace.lines().to_vec(),

@@ -61,6 +61,8 @@ pub struct Report {
     /// The plan, as printed.
     pub plan: String,
     pub violations: Vec<String>,
+    /// What it found that is known and not yet fixed: reported, not counted as violations.
+    pub known: Vec<String>,
     /// A hash of the whole trace: equal for equal seeds.
     pub hash: u64,
     pub stats: String,
@@ -80,6 +82,9 @@ impl fmt::Display for Report {
         writeln!(f, "  trace hash: {:016x}", self.hash)?;
         for v in &self.violations {
             writeln!(f, "  VIOLATION {v}")?;
+        }
+        for k in &self.known {
+            writeln!(f, "  KNOWN {k}")?;
         }
         if !self.ok() {
             writeln!(f, "  replay: {}", replay_command(self.scenario, self.seed))?;

@@ -1,19 +1,23 @@
-//! The simulated scenario (#324): a control host, one node and two box stubs, with faults from a
-//! seed, checked against #321's invariants.
+//! The simulated scenarios (#324), each with faults from a seed, checked against #321's invariants:
+//! `feed` (the first slice: a control host, one node and two box stubs; grants and model budgets),
+//! `placement` (placed nodes' leases, the reconciler, the money envelope and release, several runs
+//! on one node) and `messages` (principals, held messages, wake and receipts).
 //!
-//! - `seeds`: a fixed set of seeds, or `WICKET_SIM_SEEDS=<n>` seeds from `WICKET_SIM_FROM`
-//!   (default 0): CI runs the fixed set on pull requests and more nightly (`ci/sim.sh`).
-//! - `replay`: one seed, `WICKET_SIM_SEED=<seed>`, with its plan and whole trace printed: what a
-//!   failing seed's report says to run.
-//! - `deterministic`: one seed, run twice, gives the same trace.
-//! - `without_the_spend_journal_a_crashed_node_overspends`: the bug this found, still found.
+//! - `seeds`: every scenario for a fixed set of seeds, or `WICKET_SIM_SEEDS=<n>` seeds from
+//!   `WICKET_SIM_FROM` (default 0): CI runs the fixed set on pull requests and more nightly
+//!   (`ci/sim.sh`). `WICKET_SIM_SCENARIO=<name>` runs one scenario only.
+//! - `replay`: one seed, `WICKET_SIM_SEED=<seed>` (and `WICKET_SIM_SCENARIO`), with its plan and
+//!   whole trace printed: what a failing seed's report says to run.
+//! - `deterministic`: seed 7 of each scenario, run twice, gives the same trace.
+//! - `without_…` and `a_relayed_message_…`: what the simulation found, still found with its fix
+//!   turned off (or, for the known relay loss, not yet fixed).
 
 use std::path::PathBuf;
 use wicket_sim::trace::{replay_command, SCENARIOS};
 use wicket_sim::Options;
 
 /// The seeds every pull request runs.
-const FIXED: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
+const FIXED: [u64; 11] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144];
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wicket-sim")
@@ -45,6 +49,9 @@ fn seeds() {
         for &seed in &seeds {
             let r = wicket_sim::run_scenario(scenario, seed, &dir(), false);
             println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
+            for k in &r.known {
+                println!("  KNOWN {k}");
+            }
             if !r.ok() {
                 eprintln!("{r}");
                 failed.push(replay_command(scenario, seed));
@@ -131,4 +138,16 @@ fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
 fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
     let o = wicket_sim::placement::Options { young_grace: false, ..Default::default() };
     placement_without(20, o, "before its lease ends");
+}
+
+/// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
+/// `await_message` answer lost with the node's channel after the control host recorded the message
+/// read. Seed 13 still loses one; when this fails, the loss is fixed: make `strict_relay` the
+/// default and drop this test.
+#[test]
+fn a_relayed_message_whose_answer_is_cut_off_is_still_lost() {
+    let o = wicket_sim::messages::Options { strict_relay: true, ..Default::default() };
+    let r = wicket_sim::messages::run(13, &dir().join("strict"), o);
+    assert!(r.violations.iter().any(|v| v.contains("its receipt says read")), "seed 13 no longer loses a relayed message: {r}");
+    assert!(r.violations.iter().all(|v| v.contains("its receipt says read")), "and breaks nothing else: {r}");
 }

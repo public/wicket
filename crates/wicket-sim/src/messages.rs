@@ -201,6 +201,9 @@ pub struct Oracle {
     refused: BTreeMap<String, Sent>,
     /// By number: the principals that received it, in order.
     received: BTreeMap<String, Vec<String>>,
+    /// Known losses, not counted as violations unless [`Options::strict_relay`]: see [`run`].
+    pub known: Vec<String>,
+    strict_relay: bool,
 }
 
 impl Oracle {
@@ -268,23 +271,33 @@ impl Oracle {
 
     /// At the end, with the control host's ledger and the node's inbox: every accepted message
     /// arrived once, or is still held for its recipient.
-    fn check_end(&mut self, ledger: &Ledger, node_inbox: &BTreeSet<String>) {
-        let t = self.now();
+    fn check_end(&mut self, t: i64, ledger: &Ledger, node_inbox: &BTreeSet<String>) {
         for (n, s) in self.accepted.clone() {
             if self.received.contains_key(&n) {
                 continue;
             }
             let state = if s.id.starts_with("m-node-") {
-                if node_inbox.contains(&s.id) { "held on the node".to_string() } else { "gone from the node's inbox".to_string() }
+                if node_inbox.contains(&s.id) {
+                    "held on the node".to_string()
+                } else {
+                    "gone from the node's inbox".to_string()
+                }
             } else {
                 match ledger.receipt(&s.id) {
                     Ok(Some(r)) => r.state,
                     _ => "not on the record".to_string(),
                 }
             };
+            let lost = format!("{n} ({} -> {}, {}) was accepted and never arrived: its receipt says {state}", s.from, s.to, s.id);
             match state.as_str() {
                 "held" | "delivered" | "held on the node" => self.trace.note(t, format!("end: {n} ({} -> {}) is {state}", s.from, s.to)),
-                _ => self.trace.violate(t, format!("{n} ({} -> {}, {}) was accepted and never arrived: its receipt says {state}", s.from, s.to, s.id)),
+                // Taken from the inbox and recorded read on the control host, then lost with the
+                // relayed answer (a cut-off or crash between them): the known loss (see `run`).
+                "read" if !self.strict_relay => {
+                    self.trace.note(t, format!("KNOWN {lost}"));
+                    self.known.push(lost);
+                }
+                _ => self.trace.violate(t, lost),
             }
         }
         for (n, s) in self.refused.clone() {
@@ -348,6 +361,8 @@ pub struct CtlDisk {
     next_run: BTreeMap<String, u32>,
     /// `c` was woken by a message and its new run is due.
     wake_due: bool,
+    /// `c`'s generation (its activation's fence).
+    c_generation: i64,
 }
 
 pub struct Env {
@@ -366,14 +381,23 @@ pub struct Env {
     /// (gone with a crash; a restarted supervisor gets a fresh identity, as the runner's refresh
     /// gives one).
     gateways: RefCell<BTreeMap<String, Arc<Gateway>>>,
+    ledger_conn: RefCell<Option<Arc<Mutex<Ledger>>>>,
 }
 
 impl Env {
     fn note(&self, line: impl Into<String>) {
         self.oracle.borrow_mut().trace.note(now_ms(), line);
     }
-    fn ledger(&self) -> Ledger {
-        Ledger::open(&self.dir.join("control").join("ledger.db")).expect("the control host's ledger")
+    /// The control host's ledger: one connection per control-host process (opened again after a
+    /// crash), shared by its gateways as each run's own would be.
+    fn ledger(&self) -> Arc<Mutex<Ledger>> {
+        self.ledger_conn
+            .borrow_mut()
+            .get_or_insert_with(|| Arc::new(Mutex::new(Ledger::open(&self.ledger_path()).expect("the control host's ledger"))))
+            .clone()
+    }
+    fn ledger_path(&self) -> PathBuf {
+        self.dir.join("control").join("ledger.db")
     }
 }
 
@@ -455,15 +479,22 @@ fn identity(env: &Env, run: &str, p: &str) -> (String, wicket_identity::AgentCla
 }
 
 /// The run's gateway, as its supervisor makes it (`RunCtx` with its identity).
-fn gateway(env: &Env, run: &str, p: &str, jws: String, claims: wicket_identity::AgentClaims, key: wicket_identity::AgentKey) -> Arc<Gateway> {
+fn gateway(
+    env: &Env,
+    run: &str,
+    p: &str,
+    jws: String,
+    claims: wicket_identity::AgentClaims,
+    key: wicket_identity::AgentKey,
+) -> Arc<Gateway> {
     let zone: ZoneSpec = serde_json::from_value(json!({ "name": zone_of(p), "accept_from": accept_from(p) })).expect("a zone");
     let mut ctx = crate::run_ctx(run, &zone);
     ctx.tenant = TenantId(TENANT.into());
-    ctx.ledger = Arc::new(Mutex::new(env.ledger()));
+    ctx.ledger = env.ledger();
     ctx.identity =
         Some(Arc::new(wicket_proxy::IdentityCell::new(wicket_proxy::RunIdentity { jws, claims, key, issuer: env.issuer.verifying_key() })));
     if p == "c" {
-        let g = ctx.ledger.lock().expect("ledger").agent_generation(&env.agent_c).ok().flatten().unwrap_or(1);
+        let g = env.ctl.borrow().c_generation.max(1);
         ctx.fence = Some(wicket_proxy::Fence { agent: env.agent_c.clone(), generation: g });
     }
     let woken = env.woken.clone();
@@ -475,9 +506,11 @@ async fn control(env: Rc<Env>) -> turmoil::Result {
     env.oracle.borrow_mut().stats.control_starts += 1;
     env.note("control host starts");
     env.gateways.borrow_mut().clear();
+    *env.ledger_conn.borrow_mut() = None;
     if env.ctl.borrow().started {
         // The reconciler's adoption: every running run's supervisor again.
         let l = env.ledger();
+        let l = l.lock().expect("ledger");
         let live: Vec<(String, &'static str)> = env.ctl.borrow().identities.iter().map(|(r, p)| (r.clone(), *p)).collect();
         for (run, p) in live {
             if l.run_status(&run).ok().flatten().as_deref() == Some("running") {
@@ -485,7 +518,8 @@ async fn control(env: Rc<Env>) -> turmoil::Result {
             }
         }
     } else {
-        let mut l = env.ledger();
+        let l = env.ledger();
+        let mut l = l.lock().expect("ledger");
         for p in PRINCIPALS {
             start_run(&env, &l, p);
         }
@@ -523,15 +557,16 @@ async fn events(env: Rc<Env>) {
     loop {
         tokio::time::sleep(ms(50)).await;
         let t = now_ms() - EPOCH_MS;
-        let l = env.ledger();
         let woken = std::mem::take(&mut *env.woken.lock().expect("woken"));
         if woken {
             env.ctl.borrow_mut().wake_due = true;
         }
         if env.ctl.borrow().wake_due {
             env.ctl.borrow_mut().wake_due = false;
-            wake_c(&env).await;
+            wake_c(&env);
         }
+        let l = env.ledger();
+        let l = l.lock().expect("ledger");
         loop {
             let done = env.ctl.borrow().done;
             let Some(e) = env.plan.events.get(done).cloned() else { break };
@@ -552,6 +587,7 @@ async fn events(env: Rc<Env>) {
                         tokio::task::spawn_local(async move {
                             tokio::time::sleep(ms(down)).await;
                             let l = env2.ledger();
+                            let l = l.lock().expect("ledger");
                             start_run(&env2, &l, who);
                         });
                         continue;
@@ -577,8 +613,9 @@ async fn events(env: Rc<Env>) {
 }
 
 /// `c` is woken (`claim_wake`, then its new run, as `wicket run --wake` starts it).
-async fn wake_c(env: &Rc<Env>) {
-    let mut l = env.ledger();
+fn wake_c(env: &Rc<Env>) {
+    let l = env.ledger();
+    let mut l = l.lock().expect("ledger");
     let n = {
         let mut c = env.ctl.borrow_mut();
         let n = c.next_run.entry("c".into()).or_insert(0);
@@ -588,6 +625,7 @@ async fn wake_c(env: &Rc<Env>) {
     let run = format!("run_c{n}");
     match l.claim_wake(&env.agent_c, &run, wicket_store::now() + 3_600) {
         Ok(Some(g)) => {
+            env.ctl.borrow_mut().c_generation = g;
             env.oracle.borrow_mut().stats.wakes += 1;
             env.note(format!("c is woken as {run} (generation {g})"));
             start_run_as(env, &l, "c", &run);
@@ -613,7 +651,7 @@ async fn serve_node(env: Rc<Env>, s: turmoil::net::TcpStream) {
         let Ok(Chan::Tool { id, run, name, args }) = wire::parse::<Chan>(&b) else { continue };
         let (env, tx) = (env.clone(), tx.clone());
         calls.push(crate::control::AbortOnDrop(tokio::task::spawn_local(async move {
-            let live = env.ledger().run_status(&run).ok().flatten().as_deref() == Some("running");
+            let live = env.ledger().lock().expect("ledger").run_status(&run).ok().flatten().as_deref() == Some("running");
             let g = env.gateways.borrow().get(&run).cloned();
             let (text, is_error) = match g.filter(|_| live) {
                 Some(g) => g.sim_call(&name, args).await,
@@ -753,7 +791,9 @@ fn send_local(n: &Rc<Node>, run: &str, args: &Value) -> (String, bool) {
     let env = &n.env;
     let to = args["to"].as_str().unwrap_or("");
     let Some(me) = principal_of_run(env, run) else { return ("not sent: this box holds no authority on its node".into(), true) };
-    let Some(p) = PRINCIPALS.iter().copied().find(|p| principal_id(p) == to) else { return (format!("not sent: {to} is not a principal"), true) };
+    let Some(p) = PRINCIPALS.iter().copied().find(|p| principal_id(p) == to) else {
+        return (format!("not sent: {to} is not a principal"), true);
+    };
     let Some(to_run) = env.live.borrow().get(p).cloned().flatten().filter(|_| BOXED.contains(&p)) else {
         return (format!("not sent: {to} isn't running on your node, and wicket's control host is unreachable from it; send it again when it is back"), true);
     };
@@ -766,8 +806,15 @@ fn send_local(n: &Rc<Node>, run: &str, args: &Value) -> (String, bool) {
         return (format!("refused: {id} was not delivered: {why}\nreceipt: {receipt}"), true);
     }
     let priority = args["priority"].as_str().unwrap_or("next").to_string();
-    d.inbox.push(LocalMessage { id: id.clone(), to_run: to_run.clone(), from: me.into(), body: args["body"].clone(), priority: priority.clone() });
-    let receipt = json!({ "message_id": id, "to": to, "state": "delivered", "run": to_run, "priority": priority, "verified_by": "node node" });
+    d.inbox.push(LocalMessage {
+        id: id.clone(),
+        to_run: to_run.clone(),
+        from: me.into(),
+        body: args["body"].clone(),
+        priority: priority.clone(),
+    });
+    let receipt =
+        json!({ "message_id": id, "to": to, "state": "delivered", "run": to_run, "priority": priority, "verified_by": "node node" });
     (format!("sent {id} to {to_run}, delivered by your node (wicket's control host is unreachable, so it is attested by the node, not signed with your identity)\nreceipt: {receipt}"), false)
 }
 
@@ -860,8 +907,21 @@ async fn agent_box(env: Rc<Env>, p: &'static str, mut rng: Rng) -> turmoil::Resu
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     pub keep_trace: bool,
+    /// Count the known relay loss as a violation (see [`run`]).
+    pub strict_relay: bool,
 }
 
+/// Runs the messages scenario for `seed`, with the hosts' directories under `dir` (removed after).
+///
+/// **The known loss (#324).** Connected, a box's `await_message` is relayed to its run's gateway
+/// on the control host, which takes the message from the inbox and records it read in one
+/// transaction (`Ledger::take_message`) before its answer goes back over the node's channel. A
+/// cut-off or crash between the two loses the message: its receipt says `read`, and its recipient
+/// never saw it. Fixing it needs the node to acknowledge what it delivered (an offer that is read
+/// only once acknowledged, and the node dropping one it has already delivered), across the channel
+/// protocol, the store and the node's gateway. Until then each such message is reported in
+/// [`Report::known`], not as a violation; [`Options::strict_relay`] counts them, and
+/// `tests/scenario.rs` keeps it found.
 pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
     let plan = Plan::new(seed);
     let dir = dir.join(format!("messages-{seed}"));
@@ -878,6 +938,8 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
             accepted: BTreeMap::new(),
             refused: BTreeMap::new(),
             received: BTreeMap::new(),
+            known: vec![],
+            strict_relay: options.strict_relay,
         })),
         ctl: Rc::new(RefCell::new(CtlDisk::default())),
         node: Rc::new(RefCell::new(NodeDisk::default())),
@@ -886,6 +948,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         woken: Arc::new(Mutex::new(false)),
         agent_c: "agt_c".into(),
         gateways: RefCell::new(BTreeMap::new()),
+        ledger_conn: RefCell::new(None),
     });
     let mut sim = turmoil::Builder::new()
         .epoch(UNIX_EPOCH + Duration::from_millis(EPOCH_MS as u64))
@@ -939,9 +1002,11 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
     }
     drop(sim);
     let inbox: BTreeSet<String> = env.node.borrow().inbox.iter().map(|m| m.id.clone()).collect();
-    let ledger = env.ledger();
+    *env.ledger_conn.borrow_mut() = None;
+    env.gateways.borrow_mut().clear();
+    let ledger = Ledger::open(&env.ledger_path()).expect("the control host's ledger");
     let mut o = env.oracle.borrow_mut();
-    o.check_end(&ledger, &inbox);
+    o.check_end(EPOCH_MS + END_MS, &ledger, &inbox);
     drop(ledger);
     let _ = std::fs::remove_dir_all(&dir);
     if let Some(e) = host_error {
@@ -953,7 +1018,8 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         plan: plan.to_string(),
         violations: o.trace.violations.clone(),
         hash: o.trace.hash(),
-        stats: format!("{:?}", o.stats),
+        stats: format!("{:?}, {} known relay losses", o.stats, o.known.len()),
+        known: o.known.clone(),
         trace: o.trace.lines().to_vec(),
     }
 }

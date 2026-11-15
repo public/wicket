@@ -476,13 +476,14 @@ pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> 
                 seed,
                 plan: r.plan.to_string(),
                 violations: r.violations,
+                known: vec![],
                 hash: r.hash,
                 stats: format!("{:?}, billed {:?}", r.stats, r.billed),
                 trace: r.trace,
             }
         }
         "placement" => placement::run(seed, dir, placement::Options { keep_trace, ..placement::Options::default() }),
-        "messages" => messages::run(seed, dir, messages::Options { keep_trace }),
+        "messages" => messages::run(seed, dir, messages::Options { keep_trace, ..messages::Options::default() }),
         other => panic!("no scenario {other:?}: one of {:?}", trace::SCENARIOS),
     }
 }
