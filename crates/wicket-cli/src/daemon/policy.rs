@@ -62,8 +62,9 @@ pub fn route(cmd: &Cmd) -> Route {
     use Class::*;
     use Route::*;
     match cmd {
-        // Hibernating and waking steer an agent the way `say` does; waking reruns its stored manifest.
-        Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Say { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
+        // Hibernating and waking steer an agent the way prompting its session does; waking reruns its
+        // stored manifest.
+        Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Session { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
         Cmd::Agents { .. } | Cmd::Top { .. } => Forward(Read),
         Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
@@ -314,7 +315,8 @@ mod tests {
         let cases: &[(&[&str], Route)] = &[
             (&["run", "m.yaml"], Route::Forward(Run)),
             (&["wrap", "--manifest", "m.yaml", "--", "claude"], Route::Forward(Run)),
-            (&["say", "r1", "hello"], Route::Forward(Run)),
+            (&["session", "r1", "hello"], Route::Forward(Run)),
+            (&["session", "r1"], Route::Forward(Run)),
             (&["hibernate", "r1"], Route::Forward(Run)),
             (&["wake", "a1", "hello"], Route::Forward(Run)),
             (&["agents"], Route::Forward(Read)),

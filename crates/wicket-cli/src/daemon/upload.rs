@@ -121,7 +121,7 @@ impl Stage {
     pub fn new(parent: &Path, roots: Vec<(String, PathBuf)>) -> Result<Stage> {
         std::fs::create_dir_all(parent)?;
         let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let dir = parent.join(hex::encode(nonce));
         std::fs::create_dir(&dir).with_context(|| dir.display().to_string())?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -272,7 +272,7 @@ mod tests {
     }
     fn tmp(tag: &str) -> Tmp {
         let mut n = [0u8; 6];
-        getrandom::getrandom(&mut n).unwrap();
+        getrandom::fill(&mut n).unwrap();
         let d = std::env::temp_dir().join(format!("wicket-upload-{tag}-{}", hex::encode(n)));
         std::fs::create_dir_all(&d).unwrap();
         Tmp(d)

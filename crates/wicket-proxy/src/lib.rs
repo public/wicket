@@ -630,6 +630,29 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
     resp
 }
 
+/// Seconds a box is told to wait (`Retry-After`) when its node can't decide right now (#352).
+pub(crate) const UNAVAILABLE_RETRY_AFTER: u64 = 5;
+
+/// The answer when this node can't decide a request right now: it is catching up with its policy
+/// feed, holds no valid policy, or can't reach the control host (#352). These conditions pass, so
+/// the answer is 503 with `Retry-After`, which HTTP clients and model SDKs retry (Claude Code
+/// retries every 5xx from the Messages API; a 429 it may read as a usage limit, a 403 as an
+/// authentication failure that ends its turn). 403 stays for refusals that retrying doesn't change.
+pub(crate) fn unavailable(detail: &str) -> http::Response<BoxBody> {
+    let mut body = serde_json::json!({
+        "type": "https://wicket.dev/e/unavailable",
+        "title": "Blocked by wicket sandbox: control plane unreachable",
+        "status": 503,
+        "detail": detail,
+        "retry_after": UNAVAILABLE_RETRY_AFTER,
+    });
+    body["hint"] = "This is temporary: retry this same request in a few seconds.".into();
+    let mut resp = problem(503, "unavailable", "Blocked by wicket sandbox: control plane unreachable", detail, None);
+    *resp.body_mut() = full(serde_json::to_vec_pretty(&body).unwrap_or_default());
+    resp.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from(UNAVAILABLE_RETRY_AFTER));
+    resp
+}
+
 /// What every refusal reminds the agent of: where it is, and that there is no other way out.
 /// What an agent whose zone may not ask (`escalation.request: false`, #50) is told when it asks.
 pub const NEVER_ASKS: &str = "this zone may not ask for anything outside its reach (escalation.request: false), so this will never be allowed from this sandbox; tell the user";

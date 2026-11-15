@@ -23,7 +23,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use p256::ecdsa::signature::Signer;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use ring::{aead, hkdf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -99,7 +99,7 @@ impl std::fmt::Debug for Vapid {
 fn random_secret() -> p256::SecretKey {
     loop {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).expect("OS randomness");
+        getrandom::fill(&mut b).expect("OS randomness");
         if let Ok(k) = p256::SecretKey::from_slice(&b) {
             return k;
         }
@@ -107,7 +107,7 @@ fn random_secret() -> p256::SecretKey {
 }
 
 fn public_bytes(k: &p256::SecretKey) -> Vec<u8> {
-    k.public_key().to_encoded_point(false).as_bytes().to_vec()
+    k.public_key().to_sec1_point(false).as_bytes().to_vec()
 }
 
 impl Vapid {
@@ -170,7 +170,7 @@ fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
 /// ECDH on P-256: the x coordinate of `secret · public`.
 fn ecdh(secret: &p256::SecretKey, public: &p256::PublicKey) -> Vec<u8> {
     let shared = (public.to_projective() * *secret.to_nonzero_scalar()).to_affine();
-    shared.to_encoded_point(false).x().expect("not the identity").to_vec()
+    shared.to_sec1_point(false).x().expect("not the identity").to_vec()
 }
 
 /// Encrypts a push message for a browser (RFC 8291, `aes128gcm` content coding of RFC 8188): one
@@ -457,7 +457,7 @@ pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], contac
     let ua = unb64u(&sub.p256dh).map_err(|_| anyhow!("bad p256dh"))?;
     let auth = unb64u(&sub.auth).map_err(|_| anyhow!("bad auth"))?;
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).expect("OS randomness");
+    getrandom::fill(&mut salt).expect("OS randomness");
     let body = encrypt(&ua, &auth, plaintext, &random_secret(), &salt)?;
     let headers = vec![
         ("authorization", vapid.authorization(&url, contact, now)),

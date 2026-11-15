@@ -111,19 +111,27 @@ pub const WARN_AT: f64 = 0.90;
 pub const WARN_RESET: f64 = 0.75;
 
 /// The warning for a box at `m`, if it is due (`warned`: whether it was already warned and hasn't
-/// dropped below the reset level since). Returns the new `warned`, and the text to send.
-pub fn pressure(m: &Mem, warned: bool) -> (bool, Option<String>) {
+/// dropped below the reset level since). Returns the new `warned`, and the text to send. The text
+/// says only what holds for any box; `advice`, the zone's `limits.memory_advice` (#348), is
+/// appended when set (clipped to its cap, in case a manifest skipped validation).
+pub fn pressure(m: &Mem, warned: bool, advice: Option<&str>) -> (bool, Option<String>) {
     let Some(max) = m.max.filter(|x| *x > 0) else { return (warned, None) };
     let share = m.current as f64 / max as f64;
     if share >= WARN_AT && !warned {
-        let text = format!(
+        let mut text = format!(
             "[wicket] This box is using {} of its {} memory limit ({:.0}%). If it goes over, the kernel kills the whole box and \
-             anything not saved is lost. Reduce parallelism now (for example CARGO_BUILD_JOBS=1, `make -j1`, one test run at a time), \
-             stop processes you don't need, and commit or save work in progress.",
+             anything not saved is lost. Use less memory now: do fewer things at once, stop processes you don't need, \
+             and save work in progress.",
             human(m.current),
             human(max),
             share * 100.0
         );
+        if let Some(a) = advice.map(str::trim).filter(|a| !a.is_empty()) {
+            let a: String =
+                a.chars().map(|c| if c.is_control() { ' ' } else { c }).take(wicket_core::manifest::MEMORY_ADVICE_MAX).collect();
+            text.push_str(" For this zone: ");
+            text.push_str(&a);
+        }
         return (true, Some(text));
     }
     (warned && share >= WARN_RESET, None)
@@ -166,14 +174,34 @@ mod tests {
     #[test]
     fn the_agent_is_warned_once_near_its_limit_and_again_after_dropping_back() {
         let at = |pct: u64| Mem { current: 10 * GIB * pct / 100, max: Some(10 * GIB), peak: 0, oom_kills: 0 };
-        assert_eq!(pressure(&at(80), false), (false, None));
-        let (w, t) = pressure(&at(92), false);
-        assert!(w && t.unwrap().contains("9.2 GiB of its 10 GiB memory limit (92%)"));
-        assert_eq!(pressure(&at(95), true), (true, None), "once");
-        assert_eq!(pressure(&at(80), true), (true, None), "not reset above 75%");
-        assert_eq!(pressure(&at(70), true), (false, None), "reset");
-        assert!(pressure(&at(91), false).1.is_some(), "and warned again");
-        assert_eq!(pressure(&Mem { current: 5, max: None, ..Mem::default() }, false), (false, None), "no limit, no warning");
+        assert_eq!(pressure(&at(80), false, None), (false, None));
+        let (w, t) = pressure(&at(92), false, None);
+        let t = t.unwrap();
+        assert!(w && t.contains("9.2 GiB of its 10 GiB memory limit (92%)"), "{t}");
+        // The core text is general: it names no tool (#348).
+        for tool in ["cargo", "CARGO", "make", "-j", "test run"] {
+            assert!(!t.contains(tool), "names {tool}: {t}");
+        }
+        assert_eq!(pressure(&at(95), true, None), (true, None), "once");
+        assert_eq!(pressure(&at(80), true, None), (true, None), "not reset above 75%");
+        assert_eq!(pressure(&at(70), true, None), (false, None), "reset");
+        assert!(pressure(&at(91), false, None).1.is_some(), "and warned again");
+        assert_eq!(pressure(&Mem { current: 5, max: None, ..Mem::default() }, false, None), (false, None), "no limit, no warning");
+    }
+
+    #[test]
+    fn a_zones_memory_advice_is_appended_and_capped() {
+        let m = Mem { current: 95, max: Some(100), peak: 0, oom_kills: 0 };
+        let plain = pressure(&m, false, None).1.unwrap();
+        assert_eq!(pressure(&m, false, Some("  ")).1.unwrap(), plain, "empty advice is none");
+        let t = pressure(&m, false, Some("CARGO_BUILD_JOBS=1, `make -j1`")).1.unwrap();
+        assert_eq!(t, format!("{plain} For this zone: CARGO_BUILD_JOBS=1, `make -j1`"));
+        let long = "x".repeat(wicket_core::manifest::MEMORY_ADVICE_MAX + 50);
+        let t = pressure(&m, false, Some(&format!("a\nb{long}"))).1.unwrap();
+        let added = t.strip_prefix(&plain).unwrap().strip_prefix(" For this zone: ").unwrap();
+        assert_eq!(added.chars().count(), wicket_core::manifest::MEMORY_ADVICE_MAX, "capped");
+        assert!(added.starts_with("a b"), "one line: {added}");
+        assert_eq!(pressure(&m, true, Some("x")), (true, None), "advice doesn't change when");
     }
 
     #[test]
