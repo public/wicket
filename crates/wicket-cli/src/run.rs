@@ -996,6 +996,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
     let proxies_lap = std::time::Instant::now();
     let egress = Egress::new(ctx.clone(), ca.clone())?;
+    // The run's model budget and spend: its node's model proxy is the box's only one and the counter
+    // of record (#152, #257), whose reports are merged in here and whose slices are leased from here.
+    // Nothing listens for model calls on this side.
     let llm = Llm::new(ctx.clone())?;
     let _ = llm_slot.set(llm.clone());
     // A wrapped session's model calls reach the model host through the egress proxy: they get the
@@ -1031,23 +1034,23 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // Taken over from its node (#164): its time counts from when it started there.
         (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
-    let (es, ls, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/llm.sock"), dir.join("ctl/gateway.sock"));
+    let (es, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/gateway.sock"));
     // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
-    for s in [&es, &ls, &gs] {
+    for s in [&es, &gs] {
         wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
     }
     let gateway = Gateway::new(ctx.clone());
     // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
-    // forwards, the model, the MCP gateway): `ctl/`, not the box's `sock/`, which is the node's.
+    // forwards, the MCP gateway's tools it doesn't decide yet): `ctl/`, not the box's `sock/`, which
+    // is the node's. The model proxy is the node's alone (#257).
     // Each is bound and listening before it is served, so it is ready here, with no wait for its
     // socket to appear (#287), and one that can't be bound fails the run, naming it.
     let waited = std::time::Instant::now();
     let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
-    let (gl, el, ll) = (listen(&gs)?, listen(&es)?, listen(&ls)?);
+    let (gl, el) = (listen(&gs)?, listen(&es)?);
     timings.since("proxies.sockets", waited);
     let g_task = tokio::spawn(gateway.serve_on(gl));
     let e_task = tokio::spawn(egress.serve_on(el));
-    let l_task = tokio::spawn(llm.clone().serve_on(ll));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 
@@ -2116,7 +2119,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
     e_task.abort();
-    l_task.abort();
     g_task.abort();
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its

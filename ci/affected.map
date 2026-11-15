@@ -49,6 +49,7 @@ ci/changelog_test.py               | -   | docs
 examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
+images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
 deploy/vultr/node-setup.sh         | wicket-placement | -

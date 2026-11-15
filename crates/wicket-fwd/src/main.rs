@@ -3,11 +3,13 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use wicket_fwd::entry::{self, Prepare};
 use wicket_fwd::{spec, Config, Forwarder, Kind};
 
 const USAGE: &str = "\
 usage: wicket-fwd --listen IP:PORT=/path/to/unix.sock [--listen ...] [--udp IP:PORT=/path/to/unix.sock ...]
                   [--max-conns N] [--copy rw|splice] [--buf BYTES] [--bind-timeout SECS] [--verbose]
+                  [--control [--mkdir DIR ...] [--try-mkdir DIR ...] [--bundle OUT=IN,IN... ...] [--times-to PATH]]
        wicket-fwd --dial IP:PORT [--copy rw|splice] [--buf BYTES]
        wicket-fwd --stdin-from /path/to/unix.sock -- CMD [ARGS...]
 
@@ -20,12 +22,20 @@ Relays each TCP connection accepted on IP:PORT to a new connection on the unix s
   --buf           buffer or pipe size per direction, in bytes (default 262144)
   --bind-timeout  how long to wait at start for a listen address to appear (default 5)
   --verbose       one log line per connection (peer, byte counts, duration; never contents)
+  --control       wicket-entry's start, over stdin and stdout (src/entry.rs): makes the directories and
+                  bundles below, says `prepared`, listens once stdin says `listen`, then says `ready`;
+                  the rest of stdin is the start's step times, for --times-to, then it says `done`
+  --mkdir         (--control) a directory made with its parents before listening; failing is fatal
+  --try-mkdir     (--control) the same, best effort
+  --bundle        (--control) OUT written as the concatenation of the INs (absolute paths); fatal
+  --times-to      (--control) where the step times are written (best effort)
   --dial          instead: one TCP connection to IP:PORT, relayed to stdin/stdout (links between boxes)
   --stdin-from    instead: runs CMD with its stdin fed from wicket's node over the unix socket,
                   reconnecting if the node restarts; exits with CMD's exit code";
 
-fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
+fn parse(args: impl IntoIterator<Item = String>) -> Result<(Config, Option<Prepare>), String> {
     let mut cfg = Config::default();
+    let (mut control, mut prep) = (false, Prepare::default());
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         let (flag, inline) = match a.split_once('=') {
@@ -41,6 +51,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
             "--buf" => cfg.buf_size = number(&flag, &value()?)?,
             "--bind-timeout" => cfg.bind_timeout = Duration::from_secs_f64(number::<f64>(&flag, &value()?)?.clamp(0.0, 3600.0)),
             "--verbose" => cfg.verbose = true,
+            "--control" => control = true,
+            "--mkdir" => prep.mkdirs.push(absolute(&flag, value()?)?),
+            "--try-mkdir" => prep.try_mkdirs.push(absolute(&flag, value()?)?),
+            "--bundle" => prep.bundles.push(entry::parse_bundle(&value()?)?),
+            "--times-to" => prep.times_to = Some(absolute(&flag, value()?)?),
             "--dial" => {
                 let v = value()?;
                 cfg.dial = Some(v.trim().parse().map_err(|_| format!("--dial {v:?}: not an IP:PORT (names aren't resolved)"))?);
@@ -56,7 +71,22 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
         return Err("--max-conns must be at least 1 and --buf between 4096 and 64 MiB".into());
     }
     spec::check_distinct(&cfg.listens)?;
-    Ok(cfg)
+    if control && cfg.dial.is_some() {
+        return Err("--control is for listeners, not --dial".into());
+    }
+    if !control && prep != Prepare::default() {
+        return Err("--mkdir, --try-mkdir, --bundle and --times-to need --control".into());
+    }
+    Ok((cfg, control.then_some(prep)))
+}
+
+fn absolute(flag: &str, v: String) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(&v);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Err(format!("{flag} {v:?}: not an absolute path"))
+    }
 }
 
 fn number<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -78,7 +108,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    let cfg = match parse(argv) {
+    let (cfg, control) = match parse(argv) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
             println!("{USAGE}");
@@ -98,7 +128,12 @@ fn main() -> ExitCode {
             }
         };
     }
-    match Forwarder::start(cfg) {
+    let started = match control {
+        // Unbuffered handles on fds 0 and 1: the exchange is a line at a time.
+        Some(prep) => stdio().and_then(|(i, o)| entry::control(cfg, &prep, i, o)),
+        None => Forwarder::start(cfg),
+    };
+    match started {
         Ok(f) => {
             f.wait();
             ExitCode::SUCCESS
@@ -108,6 +143,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn stdio() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::AsFd;
+    Ok((
+        std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned()?),
+        std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?),
+    ))
 }
 
 #[cfg(test)]
@@ -120,14 +163,23 @@ mod tests {
 
     #[test]
     fn parses_the_entry_command_line() {
-        let u = parse(args("--udp 0.0.0.0:443=/wicket/sock/udp.sock --udp 198.18.0.1:53=/wicket/sock/udp.sock")).unwrap();
+        let (u, _) = parse(args("--udp 0.0.0.0:443=/wicket/sock/udp.sock --udp 198.18.0.1:53=/wicket/sock/udp.sock")).unwrap();
         assert!(u.listens.iter().all(|l| l.kind == Kind::Udp));
-        let c = parse(args("--listen 198.18.0.1:3128=/wicket/sock/egress.sock --listen 198.18.0.1:8080=/wicket/sock/llm.sock --copy splice --max-conns=8 --verbose")).unwrap();
+        let (c, _) = parse(args("--listen 198.18.0.1:3128=/wicket/sock/egress.sock --listen 198.18.0.1:8080=/wicket/sock/llm.sock --copy splice --max-conns=8 --verbose")).unwrap();
         assert_eq!(c.listens.len(), 2);
         assert_eq!(c.copy, wicket_fwd::CopyMode::Splice);
         assert_eq!(c.max_conns, 8);
         assert!(c.verbose);
-        let d = parse(args("--dial 127.0.0.1:9222 --copy rw")).unwrap();
+        let (_, p) = parse(args(
+            "--control --listen 198.18.0.1:8080=/wicket/sock/llm.sock --mkdir /home/a --try-mkdir /workspace/out \
+             --bundle /tmp/ca-bundle.pem=/etc/ssl/certs/ca-certificates.crt,/wicket/ca/ca.pem --times-to /wicket/sock/entry.times",
+        ))
+        .unwrap();
+        let p = p.expect("--control");
+        assert_eq!(p.mkdirs, [std::path::PathBuf::from("/home/a")]);
+        assert_eq!(p.bundles[0].1.len(), 2);
+        assert!(parse(args("--listen 127.0.0.1:1=/s")).unwrap().1.is_none());
+        let (d, _) = parse(args("--dial 127.0.0.1:9222 --copy rw")).unwrap();
         assert_eq!(d.dial, Some("127.0.0.1:9222".parse().unwrap()));
     }
 
@@ -144,6 +196,10 @@ mod tests {
             "--listen 127.0.0.1:1=/s --buf 1",
             "--dial localhost:80",
             "--dial 127.0.0.1:80 --listen 127.0.0.1:1=/s",
+            "--dial 127.0.0.1:80 --control",
+            "--listen 127.0.0.1:1=/s --mkdir /a",
+            "--listen 127.0.0.1:1=/s --control --mkdir a",
+            "--listen 127.0.0.1:1=/s --control --bundle /o",
         ] {
             assert!(parse(args(bad)).is_err_and(|e| !e.is_empty()), "{bad:?} should be refused");
         }

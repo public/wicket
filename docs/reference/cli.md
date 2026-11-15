@@ -20,6 +20,7 @@ humantime strings (`90s`, `10m`, `1h`).
 - [`wicket links`](#wicket-links)
 - [`wicket unlink`](#wicket-unlink)
 - [`wicket grant`](#wicket-grant)
+  - [`wicket grant list`](#wicket-grant-list)
   - [`wicket grant revoke`](#wicket-grant-revoke)
   - [`wicket grant renew`](#wicket-grant-renew)
 - [`wicket audit`](#wicket-audit)
@@ -317,12 +318,26 @@ Grants made by approvals
 Usage: wicket grant <COMMAND>
 
 Commands:
+  list    List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
   revoke  Revoke a grant. A grant handed to a node is revoked there through its feed by the run that published it (at once if the node is reachable)
   renew   Renew a live grant, or a running box's authority, so it lasts --ttl from now (#56): a grant by its id (or the request it answers), a box's authority by its run id. Every grant keeps a lifetime: at most 24h, and a box's authority never past its run's timeout. Audited as a decision; the run publishes it to the box's node
   help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+```
+
+### `wicket grant list`
+
+```text
+List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
+
+Usage: wicket grant list [OPTIONS]
+
+Options:
+      --all          Also revoked and expired grants
+      --tail <TAIL>  [default: 40]
+  -h, --help         Print help
 ```
 
 ### `wicket grant revoke`

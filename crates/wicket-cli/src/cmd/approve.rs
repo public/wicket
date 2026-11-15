@@ -107,6 +107,18 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             println!("denied {id}");
             Ok(())
         }
+        Cmd::Grant { cmd: GrantCmd::List { all, tail } } => {
+            let l = Ledger::open(&ledger_path())?;
+            let rows = l.grants(&TenantId::single(), all, tail)?;
+            if rows.is_empty() {
+                println!("no {}grants", if all { "" } else { "live " });
+            }
+            let now = wicket_store::now();
+            for r in rows {
+                println!("{}", show_grant(&r, now));
+            }
+            Ok(())
+        }
         Cmd::Grant { cmd: GrantCmd::Revoke { id } } => {
             let l = Ledger::open(&ledger_path())?;
             let g = l.grant(&id)?.with_context(|| format!("no grant {id}"))?;
@@ -142,8 +154,50 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
     }
 }
 
+/// One line of `wicket grant list`: what it grants (a quota's resource and amount, or an approval's
+/// method, host and path), to whom, how much is left, when it ends, and who made it.
+fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
+    let g = &r.grant;
+    let what = match (g.quota(), g.amount) {
+        (Some(res), Some(n)) => format!("quota {res} = {n}"),
+        _ => format!(
+            "{} {}{}",
+            wicket_agent::clip(&g.method, 16),
+            wicket_agent::clip(&g.host, 255),
+            wicket_agent::clip(&if g.prefix { format!("{}* [prefix]", g.path) } else { g.path.clone() }, 400)
+        ),
+    };
+    let to = match &g.run {
+        Some(run) => format!("run {run}"),
+        None => format!("any run in zone {}", wicket_agent::clip(&g.zone, 64)),
+    };
+    let uses = match (g.amount, g.uses_left) {
+        (Some(_), _) => String::new(),
+        (None, Some(n)) => format!(", {n} use(s) left"),
+        (None, None) => ", unlimited uses".into(),
+    };
+    let state = if g.revoked {
+        "revoked".to_string()
+    } else if g.expires_at <= now {
+        "expired".to_string()
+    } else {
+        format!("ends in {}", humantime::format_duration(std::time::Duration::from_secs(u64::try_from(g.expires_at - now).unwrap_or(0))))
+    };
+    let node = g.node.as_deref().map(|n| format!(", on node {n}")).unwrap_or_default();
+    format!("{}  {what}  {to}{uses}, {state}{node}  by {}", g.id, wicket_agent::clip(&r.decided_by, 80))
+}
+
 #[derive(Subcommand)]
 pub enum GrantCmd {
+    /// List grants, newest first: approvals, and the quotas carved for runs (model budget,
+    /// children, bytes; #256). Every grant has a lifetime; only live ones unless --all.
+    List {
+        /// Also revoked and expired grants.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 40)]
+        tail: usize,
+    },
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
     Revoke { id: String },
