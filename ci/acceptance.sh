@@ -266,8 +266,8 @@ check "  and its retry got through" '[ -n "$(lf approve_retry)" ] && [ "$(lf app
 check "wicket deny: the agent's await_grant saw it denied" 'lf deny_wait | grep -q "^denied"'
 check "  and its retry is still refused" '[ "$(lf deny_retry)" = 403 ]'
 check "spawn of a narrower zone starts at once" 'lf narrow | grep -q "^started program narrow .*within your own"'
-check "spawn of a wider zone (ask_human) waits for a human" 'lf wide_first | grep -q "^needs human approval: request r-"'
-check "  and starts once approved" 'lf wide_wait | grep -q "^granted" && lf wide | grep -q "^started program wide .*approved by a human beyond your own zone"'
+check "spawn of a wider zone (ask_human) waits for an operator" 'lf wide_first | grep -q "^needs approval: request r-"'
+check "  and starts once approved" 'lf wide_wait | grep -q "^granted" && lf wide | grep -q "^started program wide .*approved beyond your own zone"'
 check "link wires the two children" 'lf link | grep -q "narrow.wicket.internal:8000"'
 # A child's output: its log (the supervisor's lines) and its transcript (a program's own output).
 child_log() {
@@ -375,7 +375,7 @@ ares=$(result_of "$work/acp1.log")
 af() { jq -r "$1" <<<"$ares" 2>/dev/null; }
 check "an ACP agent ran its turn (run ${our_runs[-1]:-?})" '[ "$(af .status)" = done ] && grep -q "ACP session mock-session-1 new" "$work/acp1.log"'
 check "  wicket offered it no file, terminal or auth capability" '[ "$(af ".seen.initialize.clientCapabilities | [.fs.readTextFile, .fs.writeTextFile, .terminal, has(\"auth\")] | map(tostring) | join(\",\")")" = false,false,false,false ]'
-check "  its only MCP server is wicket's gateway, which answers, and the notice is a system-prompt append" '[ "$(af ".seen.session.mcpServers | map(.name) | join(\",\")")" = wicket ] && af .seen.gateway | grep -q "with await_grant: True" && [ "$(af .seen.session.systemPrompt.mode)" = append ] && af .seen.session.systemPrompt.head | grep -q "wicket sandbox" && [ "$(af .seen.session.has_meta)" = false ]'
+check "  its only MCP server is wicket's gateway, which answers, and the notice is a system-prompt append" '[ "$(af ".seen.session.mcpServers | map(.name) | join(\",\")")" = wicket ] && af .seen.gateway | grep -q "with await_grant: True" && [ "$(af .seen.session.systemPrompt.mode)" = append ] && af .seen.session.systemPrompt.head | grep -q "wicket box" && [ "$(af .seen.session.has_meta)" = false ]'
 check "  its fs and terminal calls got -32601" '[ "$(af "[.seen.errors.fs_read, .seen.errors.fs_write, .seen.errors.terminal] | map(tostring) | join(\",\")")" = -32601,-32601,-32601 ] && grep -q "called terminal/create, which wicket doesn.t offer" "$work/acp1.log"'
 check "  permissions: allow_once for a command, reject_once for settings.local.json and a mode change, never an always" '[ "$(af .seen.answers.execute)" = opt-allow_once ] && [ "$(af .seen.answers.settings_local)" = opt-reject_once ] && [ "$(af .seen.answers.switch_mode)" = opt-reject_once ] && [ "$(af .seen.answers.only_always)" = cancelled ] && [ "$(af .always_state_written)" = false ]'
 check "  and each answer is audited" '[ "$(w audit --tail 400 | grep "${our_runs[-1]}" | grep -c run.agent_prompt)" -ge 4 ] && w audit --tail 400 | grep "${our_runs[-1]}" | grep run.agent_call_refused | grep -q fs/write_text_file'

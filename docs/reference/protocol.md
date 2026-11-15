@@ -4,17 +4,17 @@
 
 Every refusal is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`
 response with an `x-wicket: <kind>` header, and a status line that says what happened, since many
-tools show only that (`403 Blocked by wicket sandbox: needs human approval (r-1a2b3c4d)`). The body:
+tools show only that (`403 Blocked by wicket box: needs approval (r-1a2b3c4d)`). The body:
 
 ```json
 {
   "type": "https://wicket.dev/e/pending-approval",
-  "title": "Blocked by wicket sandbox: needs human approval",
+  "title": "Blocked by wicket box: needs approval",
   "status": 403,
   "detail": "…",
   "request_id": "r-1a2b3c4d",
   "retry_after": 30,
-  "hint": "Call the wicket MCP tool await_grant with request_id r-1a2b3c4d to wait for a human's decision, then retry this same request once. …"
+  "hint": "Call the wicket MCP tool await_grant with request_id r-1a2b3c4d to wait for the decision, then retry this same request once. …"
 }
 ```
 
@@ -23,11 +23,11 @@ adds the headers `x-wicket-request-id` and `retry-after: 30`.
 
 | kind | status | title (or meaning) |
 |---|---|---|
-| `pending-approval` | 403 | Blocked by wicket sandbox: needs human approval. A pending request exists; retries deduplicate onto it. |
-| `queued` | 403 | Needs human approval (queued offline): a node raised it while the control host was away; the id is node-local, `q-…`. |
-| `denied` | 403 | Denied by a human. |
+| `pending-approval` | 403 | Blocked by wicket box: needs approval. A pending request exists, for an operator (or an agent above the box) to decide; retries deduplicate onto it. |
+| `queued` | 403 | Needs approval (queued offline): a node raised it while the control host was away; the id is node-local, `q-…`. |
+| `denied` | 403 | Denied, by an operator or an agent above the box. |
 | `forbidden` | 403 | Never allowed (a `forbid` rule, a metadata endpoint, a non-public address), or a malformed request. |
-| `unavailable` | 403 | Control plane unreachable: a node can't decide this without the control host. |
+| `unavailable` | 403 | Control host unreachable: a node can't decide this without the control host. |
 | `misdirected` | 421 | Wrong host for this connection: an HTTP/3 connection serves one host only. |
 | `budget` | 429 | The model budget, or a node's slice of it, is spent. |
 | `stale-generation` | 409 | This activation of a long-lived agent was superseded. |

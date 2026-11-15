@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare a fresh Ubuntu 24.04 Vultr instance as a wicket sandbox node (proof of concept).
+# Prepare a fresh Ubuntu 24.04 Vultr instance as a wicket node (proof of concept).
 #
 # The node gets Docker + gVisor and an unprivileged `wicket` user that wicket's control host logs in as.
 # The model key, the installation CA key and the ledger stay on the control host. After enrolment,

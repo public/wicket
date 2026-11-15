@@ -1,7 +1,7 @@
 # Example: wicket working on wicket
 
 An example of a project describing its own workload to wicket: an agent that works on wicket's
-source, inside a wicket sandbox. Nothing here is part of wicket; any project would write its own
+source, inside a wicket box. Nothing here is part of wicket; any project would write its own
 image and manifest the same way.
 
 What the manifest gives the agent:

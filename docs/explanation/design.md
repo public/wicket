@@ -1316,7 +1316,7 @@ negotiated them. Connections are never held open while a human decides.
 **Agents must not spin at the edge** (owner, 2026-11-09: the goal is that agents don't spin endlessly
 when they hit isolation limits, and instead ask for more reach when they need it).
 - **Every refusal says which case it is in the status line**, because many tools show nothing else:
-  `Blocked by wicket sandbox: never allowed`, `… needs human approval (r-…)`, `… denied by a human`, or,
+  `Blocked by wicket box: never allowed`, `… needs approval (r-…)`, `… denied`, or,
   in hiding zones, `unknown host`. The body says the sandbox has no other route, and what to do.
 - **Repeats are counted.** From the third block of the same request, the refusal says to stop. After every
   ten blocks in a run, the operator sees "agent may be stuck".

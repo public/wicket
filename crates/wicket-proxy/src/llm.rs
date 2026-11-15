@@ -581,13 +581,7 @@ impl Llm {
     ) -> std::result::Result<Filtered, Box<Response<BoxBody>>> {
         let refuse = |status: u16, why: String| {
             self.event(None, status, Usage::default(), &format!("refused: {why}"));
-            Box::new(problem(
-                status,
-                "forbidden",
-                "Blocked by wicket: model request refused",
-                &format!("{why}. {}", crate::SANDBOX_FACT),
-                None,
-            ))
+            Box::new(problem(status, "forbidden", "Blocked by wicket: model request refused", &format!("{why}. {}", crate::BOX_FACT), None))
         };
         let path = parts.uri.path();
         if matches!(parts.method, http::Method::GET | http::Method::HEAD) {
@@ -692,7 +686,7 @@ impl Llm {
                                     "Model token budget too low for this request",
                                     &format!(
                                         "{why}. Send it without extended thinking or with a smaller max_tokens, or ask for more budget. {}",
-                                        crate::SANDBOX_FACT
+                                        crate::BOX_FACT
                                     ),
                                     None,
                                 )));

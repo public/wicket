@@ -576,7 +576,7 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
             (false, true) => Some(queue_call(node, run, tool, args)),
             (false, false) => Some((
                 format!(
-                    "not started: this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask a human to approve exactly this zone (queued while wicket's control host is unreachable).",
+                    "not started: this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask for exactly this zone to be approved (queued while wicket's control host is unreachable).",
                     plan.violations.join("\n- ")
                 ),
                 true,
@@ -813,9 +813,9 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     let verdict = node.replica.lock().expect("replica").host_verdict(run, &host);
     match verdict {
         wicket_core::HostVerdict::Forbidden(why) => {
-            return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false)
+            return (format!("not requested: {why}. This will never be allowed from this box; tell the user."), false)
         }
-        wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host this sandbox can see."), false),
+        wicket_core::HostVerdict::Hidden => return (format!("not requested: {host} is not a host name this box can see."), false),
         wicket_core::HostVerdict::Open => {}
     }
     // A push's discovery is asked for as the push it is part of (#26).
@@ -830,7 +830,7 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
             return (format!("{method} {host}{path} is already allowed: just make the request."), false)
         }
         wicket_feed::Decision::Forbidden(why) => {
-            return (format!("not requested: {why}. This will never be allowed from this sandbox; tell the user."), false)
+            return (format!("not requested: {why}. This will never be allowed from this box; tell the user."), false)
         }
         wicket_feed::Decision::Refused { mode, why } => return (wicket_proxy::decide::stale_text(mode, &why), true),
         _ => {}
@@ -853,7 +853,7 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
             }
             Ok(Asked::Denied { request }) => {
                 return (
-                    format!("not requested: a human denied {request} for this a few minutes ago. Don't ask again; continue without it."),
+                    format!("not requested: {request} for this was denied a few minutes ago. Don't ask again; continue without it."),
                     false,
                 )
             }
@@ -872,7 +872,7 @@ async fn request_access(node: &Arc<Node>, run: &str, args: &Value) -> (String, b
     }
     (
         format!(
-            "queued: {id} for {scope}. wicket's control host is unreachable from your node, so it is put to a human when it is back. Call await_grant with request_id {id} to follow it."
+            "queued: {id} for {scope}. wicket's control host is unreachable from your node, so it is put to an operator when it is back. Call await_grant with request_id {id} to follow it."
         ),
         false,
     )
@@ -904,7 +904,7 @@ async fn await_grant(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool
             if left().is_zero() {
                 return (
                     format!(
-                        "pending: {id} is queued on your node, and wicket's control host is still unreachable after {}s. It is put to a human when it is back; you may call await_grant again.",
+                        "pending: {id} is queued on your node, and wicket's control host is still unreachable after {}s. It is put to an operator when it is back; you may call await_grant again.",
                         timeout.as_secs()
                     ),
                     false,
@@ -941,9 +941,8 @@ async fn await_grant(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool
 async fn pending_requests(node: &Arc<Node>, run: &str) -> (String, bool) {
     let mut out = match connected(node, run) {
         true => relay_tool(node, run, "pending_requests", &json!({})).await.map(|(t, _)| t).unwrap_or_else(|e| format!("({e})")),
-        false => {
-            "wicket's control host is unreachable from your node: requests already put to a human aren't listed until it is back.".into()
-        }
+        false => "wicket's control host is unreachable from your node: requests already put to an operator aren't listed until it is back."
+            .into(),
     };
     let now = (node.clock)();
     let ago = |at: i64| (now - at).max(0) / 1000;
@@ -958,7 +957,7 @@ async fn pending_requests(node: &Arc<Node>, run: &str) -> (String, bool) {
     queued.extend(node.edge.unmade(run).into_iter().map(|c| format!("- {} {} (queued {}s ago)", c.id, c.name, ago(c.at))));
     if !queued.is_empty() {
         out.push_str(&format!(
-            "\n\nQueued on your node while the control host was unreachable (put to a human when it is back; await_grant follows each):\n{}",
+            "\n\nQueued on your node while the control host was unreachable (put to an operator when it is back; await_grant follows each):\n{}",
             queued.join("\n")
         ));
     }
@@ -972,7 +971,7 @@ fn queue_call(node: &Arc<Node>, run: &str, name: &str, args: &Value) -> (String,
     }
     (
         format!(
-            "queued: {name} needs a human, and wicket's control host is unreachable from your node. It is made as {id} when the control host is back; call await_grant with request_id {id} to follow it."
+            "queued: {name} needs approval, and wicket's control host is unreachable from your node. It is made as {id} when the control host is back; call await_grant with request_id {id} to follow it."
         ),
         false,
     )

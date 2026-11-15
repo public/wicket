@@ -10,8 +10,7 @@
 #     design.md's "22. Deferred" section;
 #   - "sandbox" in the user docs (README.md, docs/README.md, docs/how-to/, docs/reference/,
 #     docs/tutorials/, docs/explanation/concepts.md) where "box" is meant: "sandbox" names only
-#     gVisor's layer, so "gVisor sandbox", "gVisor's sandbox" and the protocol's "Blocked by wicket
-#     sandbox" pass.
+#     gVisor's layer, so "gVisor sandbox" and "gVisor's sandbox" pass.
 #
 # Checked: README.md and every tracked *.md under docs/ except docs/explanation/research/, code
 # blocks included.
@@ -29,7 +28,7 @@ import sys
 ALLOW_FILE = "ci/check-terms.allow"
 
 USER_DOCS = ("README.md", "docs/README.md", "docs/how-to/", "docs/reference/", "docs/tutorials/", "docs/explanation/concepts.md")
-SANDBOX_OK = re.compile(r"gvisor(?:'s)? sandbox|blocked by wicket sandbox", re.I)
+SANDBOX_OK = re.compile(r"gvisor(?:'s)? sandbox", re.I)
 
 RULES = [
     # (pattern, what to say instead, applies to path)
