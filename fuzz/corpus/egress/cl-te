@@ -1,0 +1,10 @@
+POST /a HTTP/1.1
+host: fuzz.example
+content-length: 44
+transfer-encoding: chunked
+
+0
+
+GET /smuggled HTTP/1.1
+host: fuzz.example
+

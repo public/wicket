@@ -11,9 +11,10 @@
 use super::{escape_fault, plain_fault};
 use crate::proofs::AnyStr;
 
-/// Segments: `/`, `.`, a letter, `;`, `\`, and the escape `%2E` (an encoded dot) and `%22` (a byte
-/// that may be escaped). Paths of up to [`N`] bytes: `/a/./`, `/../a`, `//`, `/%2E/a`, `/a;\`.
-const PATH: &[u8] = b"/.%2Ea;\\";
+/// Segments: `/`, `.`, a letter, `;`, `\`, `{` (which a URL parser would escape), and the escape
+/// `%2E` (an encoded dot) and `%22` (a byte that may be escaped). Paths of up to [`N`] bytes:
+/// `/a/./`, `/../a`, `//`, `/%2E/a`, `/a;\`, `/a{`.
+const PATH: &[u8] = b"/.%2Ea;\\{";
 
 /// Longest path checked.
 const N: usize = 6;
@@ -86,9 +87,18 @@ fn segs_ok(p: &[u8]) -> bool {
     true
 }
 
+/// `unescapedChar`: what a URL parser would percent-encode on the way upstream (a symbol is a UTF-8 byte).
+fn unescaped_char(c: u8) -> bool {
+    [b' ', b'"', b'#', b'<', b'>', b'?', b'`', b'{', b'}'].contains(&c) || 0x80 <= c
+}
+
 /// `plainOk`.
 fn plain_ok(p: &[u8]) -> bool {
-    !p.iter().any(|&c| c == b'\\' || c < 0x20 || c == 0x7f) && !p.contains(&b';') && escapes_ok(p) && segs_ok(p)
+    !p.iter().any(|&c| c == b'\\' || c < 0x20 || c == 0x7f)
+        && !p.iter().any(|&c| unescaped_char(c))
+        && !p.contains(&b';')
+        && escapes_ok(p)
+        && segs_ok(p)
 }
 
 /// `check_escapes` is exactly Lean's `escapesOk`, on the escapes' own alphabet (the segment
