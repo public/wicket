@@ -144,7 +144,7 @@ pub enum SecretCmd {
         helper_socket: Option<String>,
     },
     /// Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper,
-    /// #350): run it as that user, e.g. as a systemd user service (deploy/systemd/wicket-secret-helper.service).
+    /// #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service).
     /// It answers only wicketd's user, and only with each secret's current value and expiry; it
     /// reads the file at each request, so a refresh is picked up at once.
     Serve {
@@ -192,7 +192,12 @@ fn serve(secrets: Vec<wicket_proxy::secret_helper::Served>, for_user: &str, sock
     let socket = socket.unwrap_or_else(|| h::default_socket(me));
     for s in &secrets {
         match wicket_proxy::vault::read_linked(&s.name, &s.file, s.pointer.as_deref(), s.expires_pointer.as_deref()) {
-            Ok(_) => eprintln!("wicket secret serve: {} from {}{}", s.name, s.file, s.pointer.as_deref().unwrap_or("")),
+            Ok(_) => eprintln!(
+                "wicket secret serve: {} from {}{}",
+                s.name,
+                s.file,
+                s.pointer.as_deref().map(|p| format!("#{p}")).unwrap_or_default()
+            ),
             Err(e) => eprintln!("wicket secret serve: warning: {} can't be read now: {e:#}", s.name),
         }
     }

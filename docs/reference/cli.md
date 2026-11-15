@@ -431,7 +431,7 @@ Commands:
   rm     Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
   hosts  Bind a secret to the only host names it may be sent to, replacing its list
   link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
-  serve  Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
+  serve  Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -525,7 +525,7 @@ Options:
 ### `wicket secret serve`
 
 ```text
-Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
+Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
 
 Usage: wicket secret serve [OPTIONS] --secret <SECRETS>
 

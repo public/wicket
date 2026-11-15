@@ -67,7 +67,7 @@ impl HelperRef {
         let s = connect(&self.socket).with_context(|| {
             format!(
                 "the secret helper for secret {name} isn't reachable at {} (it runs as uid {}: `wicket secret serve`, e.g. \
-                 deploy/systemd/wicket-secret-helper.service)",
+                 deploy/systemd-user/wicket-secret-helper.service)",
                 self.socket, self.uid
             )
         })?;
@@ -199,6 +199,10 @@ pub fn serve_one(c: &UnixStream, allowed: &[u32], served: &[Served]) -> Result<(
     // A refused peer is answered without reading what it asks.
     if allowed.contains(&peer) {
         BufReader::new(c.take(MAX_REQUEST)).read_line(&mut line)?;
+        // Hung up without asking (e.g. `wicket doctor`, or a vault that refused this helper's uid).
+        if line.is_empty() {
+            return Ok(());
+        }
     }
     let a = answer(peer, allowed, served, line.trim());
     let what = serde_json::from_str::<serde_json::Value>(line.trim()).ok().and_then(|r| r.get("secret")?.as_str().map(String::from));
