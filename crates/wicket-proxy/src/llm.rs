@@ -556,17 +556,31 @@ impl Llm {
         let server_ok = spec.is_some_and(|s| s.allow_server_tools);
         let model = json.get("model").and_then(|m| m.as_str()).map(String::from);
         let mut notes = Vec::new();
-        let before = json.len();
-        json.retain(|k, _| REQUEST_FIELDS.contains(&k.as_str()) || (server_ok && SERVER_FIELDS.contains(&k.as_str())));
-        if json.len() != before {
-            notes.push(format!("stripped {} request field(s)", before - json.len()));
+        // Stripped fields and tools are named (#307), by their names and types only, never their values.
+        let mut stripped = Vec::new();
+        json.retain(|k, _| {
+            let keep = REQUEST_FIELDS.contains(&k.as_str()) || (server_ok && SERVER_FIELDS.contains(&k.as_str()));
+            if !keep {
+                stripped.push(k.clone());
+            }
+            keep
+        });
+        if !stripped.is_empty() {
+            notes.push(format!("stripped {} request field(s): {}", stripped.len(), named(stripped)));
         }
         if !server_ok {
             if let Some(tools) = json.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                let before = tools.len();
-                tools.retain(|t| client_tool(t.get("type").and_then(|v| v.as_str())));
-                if tools.len() != before {
-                    notes.push(format!("stripped {} server-side tool(s)", before - tools.len()));
+                let mut types = Vec::new();
+                tools.retain(|t| {
+                    let ty = t.get("type").and_then(|v| v.as_str());
+                    let keep = client_tool(ty);
+                    if !keep {
+                        types.push(ty.unwrap_or("?").to_string());
+                    }
+                    keep
+                });
+                if !types.is_empty() {
+                    notes.push(format!("stripped {} server-side tool(s): {}", types.len(), named(types)));
                 }
             }
         }
@@ -793,6 +807,32 @@ fn client_tool(ty: Option<&str>) -> bool {
         None | Some("custom") => true,
         Some(t) => ["bash_", "text_editor_", "memory_", "computer_2"].iter().any(|p| t.starts_with(p)),
     }
+}
+
+/// How many stripped names a note lists, and how much of each it keeps.
+const NAMED_MAX: usize = 4;
+const NAME_MAX_CHARS: usize = 32;
+
+/// The names of stripped fields or tool types for a note (#307): distinct, sorted, each clipped and
+/// kept printable (they come from the agent), at most [`NAMED_MAX`] of them, then "…".
+fn named(mut names: Vec<String>) -> String {
+    for n in names.iter_mut() {
+        let clean: String = n.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+        *n = if clean.chars().count() > NAME_MAX_CHARS {
+            format!("{}…", clean.chars().take(NAME_MAX_CHARS).collect::<String>())
+        } else {
+            clean
+        };
+    }
+    names.sort();
+    names.dedup();
+    let more = names.len() > NAMED_MAX;
+    names.truncate(NAMED_MAX);
+    let mut out = names.join(", ");
+    if more {
+        out.push_str(", …");
+    }
+    out
 }
 
 /// A vetted model request body, and what it reserves.
@@ -1442,7 +1482,18 @@ mod tests {
         assert_eq!(keys, ["max_tokens", "messages", "model", "tools"], "{out}");
         let names: Vec<&str> = out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["a", "b", "bash"]);
-        assert!(f.note.contains("stripped 3 request field(s)") && f.note.contains("stripped 7 server-side tool(s)"), "{}", f.note);
+        // The note names what was stripped (#307), sorted, at most a handful, never a value.
+        assert!(f.note.contains("stripped 3 request field(s): container, mcp_servers, some_future_field"), "{}", f.note);
+        assert!(
+            f.note.contains(
+                "stripped 7 server-side tool(s): advisor_20260301, code_execution_20260521, mcp_toolset, some_new_server_tool, …"
+            ),
+            "{}",
+            f.note
+        );
+        for value in ["evil.example", "https", "skills"] {
+            assert!(!f.note.contains(value), "{value} in {}", f.note);
+        }
         // With server tools allowed, they and their fields go through.
         let mut open = spec.clone();
         open.allow_server_tools = true;
@@ -1463,6 +1514,48 @@ mod tests {
             assert_eq!(r.err().map(|r| r.status().as_u16()), Some(status), "{m} {path}");
         }
         assert!(llm.filter(Some(&spec), &parts("GET", "/v1/models", None), bytes::Bytes::new()).is_ok());
+    }
+
+    /// #307: names are distinct, sorted, clipped and printable, and only a handful are listed.
+    #[test]
+    fn stripped_names_are_listed_briefly() {
+        let v = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::named(v(&["b", "a", "b"])), "a, b");
+        assert_eq!(super::named(v(&["e", "d", "c", "b", "a"])), "a, b, c, d, …");
+        assert_eq!(super::named(v(&[&"x".repeat(40), "a\nb"])), format!("a?b, {}…", "x".repeat(32)));
+    }
+
+    /// #307: a call that had fields stripped names them, not their values, in the `op` audit record.
+    #[tokio::test]
+    async fn the_audit_record_names_stripped_fields_without_values() {
+        let chunks = vec![[
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#),
+            sse("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":7}}"#),
+            sse("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat()];
+        let (port, _) = sse_upstream(chunks, std::time::Duration::ZERO).await;
+        let (llm, dir) = llm_to(port, 1000, "named");
+        let body = r#"{"model":"m","max_tokens":30,"stream":true,"messages":[{"role":"user","content":"hi"}],
+            "program_use_case_id":"secret-use-case","diagnostics":{"previous_message_id":"msg_secret"},
+            "tools":[{"name":"a","input_schema":{}},{"type":"web_search_20260209","name":"secret_search"}]}"#;
+        assert_eq!(call(llm.clone(), "named", body, true).await, 200);
+        let mut op = None;
+        for _ in 0..300 {
+            let recs = llm.ctx.ledger.lock().unwrap().audit_of_kind("op").unwrap();
+            op = recs.into_iter().map(|r| r.body).find(|b| b.contains("\"kind\":\"llm\""));
+            if op.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let op = op.expect("an llm op record");
+        assert!(op.contains("stripped 2 request field(s): diagnostics, program_use_case_id"), "{op}");
+        assert!(op.contains("stripped 1 server-side tool(s): web_search_20260209"), "{op}");
+        for value in ["secret-use-case", "msg_secret", "secret_search", "previous_message_id"] {
+            assert!(!op.contains(value), "{value} in {op}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

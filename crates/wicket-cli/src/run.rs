@@ -2310,7 +2310,7 @@ fn print_event(ev: &Event) {
             println!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
                 wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
-                wicket_agent::clip(outcome, 120)
+                wicket_agent::clip(outcome, 240)
             );
         }
     }
