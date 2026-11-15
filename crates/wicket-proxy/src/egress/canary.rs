@@ -276,3 +276,79 @@ pub(crate) fn guard_response(body: BoxBody, scan: Scanner, on_hit: impl FnOnce()
         });
     BodyExt::boxed(StreamBody::new(stream))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `chunks` through `s`; returns what came out and whether anything matched.
+    fn run(mut s: Scanner, chunks: &[&[u8]]) -> (String, bool) {
+        let (mut out, mut hit) = (Vec::new(), false);
+        for c in chunks {
+            let f = s.feed(c);
+            out.extend_from_slice(&f.out);
+            hit |= f.hit;
+        }
+        let f = s.finish();
+        out.extend_from_slice(&f.out);
+        (String::from_utf8(out).unwrap(), hit || f.hit)
+    }
+
+    #[test]
+    fn a_secret_split_across_chunks_is_masked_and_nothing_else_is() {
+        let s = || Scanner::secrets(&["s3cret-value-42".to_string()]);
+        let (out, hit) = run(s(), &[b"abc s3cr", b"et-val", b"ue-42 def"]);
+        assert_eq!(out, "abc *************** def");
+        assert!(hit);
+        // A prefix that never completes passes through whole, held only until it can't match.
+        let (out, hit) = run(s(), &[b"abc s3cr", b"et-nope"]);
+        assert_eq!((out.as_str(), hit), ("abc s3cret-nope", false));
+        // Byte by byte.
+        let text = b"x s3cret-value-42 y";
+        let chunks: Vec<&[u8]> = text.chunks(1).collect();
+        assert_eq!(run(s(), &chunks).0, "x *************** y");
+    }
+
+    #[test]
+    fn nothing_that_cant_start_a_match_is_held() {
+        let mut s = Scanner::secrets(&["s3cret-value-42".to_string()]);
+        assert_eq!(&s.feed(b"data: {\"delta\":\"hi\"}\n\n").out[..], b"data: {\"delta\":\"hi\"}\n\n");
+        assert_eq!(&s.feed(b"tail s3c").out[..], b"tail ");
+    }
+
+    #[test]
+    fn base64_and_hex_forms_are_found_at_any_alignment() {
+        let secret = "s3cret-value-42";
+        for prefix in ["", "u:", "user:", "git-user:"] {
+            for engine in [base64::engine::general_purpose::STANDARD, base64::engine::general_purpose::URL_SAFE] {
+                let enc = engine.encode(format!("{prefix}{secret}"));
+                assert!(Scanner::secrets(&[secret.into()]).first(enc.as_bytes()).is_some(), "{prefix:?} {enc}");
+            }
+        }
+        for h in [hex::encode(secret), hex::encode_upper(secret)] {
+            assert!(Scanner::secrets(&[secret.into()]).first(format!("id={h};").as_bytes()).is_some());
+        }
+        // Too short a secret isn't scanned for at all, rather than masking common bytes.
+        assert!(Scanner::secrets(&["abc".into()]).is_empty());
+    }
+
+    #[test]
+    fn another_runs_placeholder_needs_its_run_id() {
+        let s = || Scanner::placeholders(["ph-own-1234"].into_iter());
+        let other = "sk-ant-oat01-wicket-placeholder-run-01jabcdefghjkmnpqrstvwxyz0";
+        assert!(s().first(format!("x={other}").as_bytes()).is_some());
+        assert!(s().first(b"x=ph-own-1234").is_some());
+        // Source code naming the shape isn't a placeholder.
+        assert!(s().first(b"format!(\"sk-ant-oat01-wicket-placeholder-run-{tag}\")").is_none());
+        // Split across chunks, the run id arriving last: held until it can be told.
+        let (_, hit) = run(s(), &[&other.as_bytes()[..40], &other.as_bytes()[40..]]);
+        assert!(hit);
+        let (out, hit) = run(s(), &[b"sk-ant-oat01-wicket-placeholder-run-01j", b"}"]);
+        assert_eq!((out.as_str(), hit), ("sk-ant-oat01-wicket-placeholder-run-01j}", false));
+    }
+
+    #[test]
+    fn percent_escapes_decode() {
+        assert_eq!(percent_decode("/a%2Fb%zz%4"), b"/a/b%zz%4");
+    }
+}

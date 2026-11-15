@@ -494,9 +494,8 @@ impl Egress {
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
-            Err(e) if canary::tripped_response(&e).is_some() => canary::tripped_response(&e).expect("tripped"),
-            // The whole chain: a refused dial (#116) says why at its end.
-            Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
+            // The tripwire (#362) refuses; otherwise the whole chain: a refused dial (#116) says why at its end.
+            Err(e) => canary::tripped_response(&e).unwrap_or_else(|| problem(502, "upstream", "Upstream error", &format!("{e:#}"), None)),
         }
     }
 }
