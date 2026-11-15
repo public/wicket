@@ -1872,7 +1872,11 @@ mod tests {
     fn say_is_gone_and_says_where_prompts_go() {
         let mut t = setup("say");
         t.running("run_a", "lead");
-        assert_refused(&t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })), StatusCode::BAD_REQUEST, "open the run's session");
+        assert_refused(
+            &t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })),
+            StatusCode::BAD_REQUEST,
+            "open the run's session",
+        );
         assert!(t.ledger().take_operator_messages("run_a").unwrap().is_empty());
     }
 

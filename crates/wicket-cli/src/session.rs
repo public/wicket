@@ -240,8 +240,13 @@ impl Session {
     async fn acp(&self, text: Option<String>, wait: bool) -> Result<()> {
         let mut b = Bridge::new(crate::ledger_path(), self.dir.clone(), self.tenant.clone(), self.run.clone(), self.who());
         let mut scr = Screen::default();
-        let rpc = |id: &str, method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
-        b.on_client(&rpc("init", "initialize", json!({ "protocolVersion": wicket_agent::acp::PROTOCOL_VERSION, "clientCapabilities": {} })));
+        let rpc =
+            |id: &str, method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        b.on_client(&rpc(
+            "init",
+            "initialize",
+            json!({ "protocolVersion": wicket_agent::acp::PROTOCOL_VERSION, "clientCapabilities": {} }),
+        ));
         // The session so far: shown when opening it, not when sending one prompt.
         let history = b.on_client(&rpc("load", "session/load", json!({ "sessionId": self.run, "cwd": "/", "mcpServers": [] })));
         if let Some(t) = text {
@@ -310,7 +315,10 @@ impl Session {
             }
         };
         show(&scr.line(""));
-        b.audit("session.closed", json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "prompts": b.prompts, "why": why }));
+        b.audit(
+            "session.closed",
+            json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "prompts": b.prompts, "why": why }),
+        );
         Ok(())
     }
 
@@ -371,7 +379,10 @@ impl Session {
             }
         };
         show(&scr.line(""));
-        self.audit("session.closed", json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "prompts": prompts, "why": why }));
+        self.audit(
+            "session.closed",
+            json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "prompts": prompts, "why": why }),
+        );
         Ok(())
     }
 
@@ -495,11 +506,13 @@ impl Screen {
                 None => String::new(),
             },
             Some(_) => String::new(),
-            None => match (m.pointer("/result/stopReason").and_then(|s| s.as_str()), m.pointer("/error/message").and_then(|s| s.as_str())) {
-                (Some(stop), _) => self.line(&format!("[turn ended: {}]", clip(stop, 40))),
-                (_, Some(e)) => self.line(&format!("[wicket] {}", clip(e, 300))),
-                _ => String::new(),
-            },
+            None => {
+                match (m.pointer("/result/stopReason").and_then(|s| s.as_str()), m.pointer("/error/message").and_then(|s| s.as_str())) {
+                    (Some(stop), _) => self.line(&format!("[turn ended: {}]", clip(stop, 40))),
+                    (_, Some(e)) => self.line(&format!("[wicket] {}", clip(e, 300))),
+                    _ => String::new(),
+                }
+            }
         }
     }
 
@@ -521,7 +534,8 @@ impl Screen {
                 if self.titles.len() < 10_000 {
                     self.titles.insert(id, title.clone());
                 }
-                let input = u.get("rawInput").filter(|i| !i.is_null()).map(|i| format!("  {}", clip(&i.to_string(), 200))).unwrap_or_default();
+                let input =
+                    u.get("rawInput").filter(|i| !i.is_null()).map(|i| format!("  {}", clip(&i.to_string(), 200))).unwrap_or_default();
                 self.line(&format!("tool: {title} [{}]{input}", clip(s("status"), 20)))
             }
             "tool_call_update" => {
@@ -537,7 +551,9 @@ impl Screen {
                 let mut out = String::new();
                 for c in u.get("content").and_then(|c| c.as_array()).into_iter().flatten() {
                     match c.get("type").and_then(|t| t.as_str()) {
-                        Some("diff") => out += &self.line(&format!("  diff: {}", clip(c.get("path").and_then(|p| p.as_str()).unwrap_or("?"), 200))),
+                        Some("diff") => {
+                            out += &self.line(&format!("  diff: {}", clip(c.get("path").and_then(|p| p.as_str()).unwrap_or("?"), 200)))
+                        }
                         Some("content") => {
                             if let Some(t) = c.pointer("/content/text").and_then(|t| t.as_str()) {
                                 out += &self.line(&format!("  {}", clip(t, 300)));
@@ -575,7 +591,11 @@ impl Screen {
                         Some("text") => out += &self.line(&format!("agent: {}", lines(b["text"].as_str().unwrap_or("").trim_end()))),
                         Some("thinking") => out += &self.line(&format!("(thinking) {}", clip(b["thinking"].as_str().unwrap_or(""), 300))),
                         Some("tool_use") => {
-                            out += &self.line(&format!("tool: {}  {}", clip(b["name"].as_str().unwrap_or("?"), 80), clip(&b["input"].to_string(), 200)))
+                            out += &self.line(&format!(
+                                "tool: {}  {}",
+                                clip(b["name"].as_str().unwrap_or("?"), 80),
+                                clip(&b["input"].to_string(), 200)
+                            ))
                         }
                         _ => {}
                     }
@@ -618,12 +638,15 @@ mod tests {
         out += &s.acp(&upd(json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } })));
         out += &s.acp(&upd(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "On " } })));
         out += &s.acp(&upd(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "it." } })));
-        out += &s.acp(&upd(json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit a.rs", "kind": "edit", "status": "pending" })));
+        out += &s.acp(&upd(
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit a.rs", "kind": "edit", "status": "pending" }),
+        ));
         out += &s.acp(&upd(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1",
                                     "_meta": { "wicket": { "permission": { "outcome": "selected", "optionId": "allow" } } } })));
         out += &s.acp(&upd(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
                                     "content": [{ "type": "diff", "path": "/workspace/a.rs", "oldText": "a", "newText": "b" }] })));
-        out += &s.acp(&upd(json!({ "sessionUpdate": "plan", "entries": [{ "content": "test", "status": "pending", "priority": "high" }] })));
+        out +=
+            &s.acp(&upd(json!({ "sessionUpdate": "plan", "entries": [{ "content": "test", "status": "pending", "priority": "high" }] })));
         out += &s.acp(&json!({ "jsonrpc": "2.0", "id": "terminal-1", "result": { "stopReason": "end_turn" } }));
         assert_eq!(
             out,
@@ -640,7 +663,8 @@ mod tests {
                                  "params": { "sessionId": "run_a", "_meta": { "wicket": { "escalation": esc } } } }));
         assert!(out.contains("escalation R-1: POST api.github.com/repos, risk R2: open a PR [2J"), "{out}");
         assert!(out.contains("wicket approve R-1, or wicket deny R-1"), "{out}");
-        let out = s.acp(&upd(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "a\u{1b}]0;owned\u{7}\nb" } })));
+        let out = s
+            .acp(&upd(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "a\u{1b}]0;owned\u{7}\nb" } })));
         assert!(!out.contains('\u{1b}') && !out.contains('\u{7}') && out.contains("a ]0;owned \nb"), "{out:?}");
     }
 
