@@ -62,7 +62,7 @@ says which it has (a mode it hasn't is refused, saying so):
 
 | mode | how | `claude-code` | `acp` |
 |---|---|---|---|
-| driven | the default: wicket starts the harness and gives it the task, follow-ups and messages as turns. The only mode that hibernates and wakes. | yes | yes |
+| driven | the default: wicket starts the harness and gives it the task, prompts and messages as turns. The only mode that hibernates and wakes. | yes | yes |
 | remote | `agent.remote`: the harness registers its own session with its vendor's apps, and the owner drives it from there. It starts when the owner sends its first message. | Remote Control (`claude remote-control`) | no |
 | driven remote | `agent.remote` with `drive: true`: driven, as above (the task is its first turn; it hibernates and wakes), with its session also in the vendor's apps, where the owner watches it and can send it messages. | Remote Control turned on in `claude -p` | no |
 | wrapped | `wicket wrap`: a command line another program launched runs in a box, keeping its launcher's stdio. | Remote Control's session processes | no |
@@ -75,7 +75,7 @@ says which it has (a mode it hasn't is refused, saying so):
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
 | `permission_mode` | string | `default`; `bypassPermissions` with `drive` | How far the harness acts without asking: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks in the app before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. With `drive`, `default` is refused: a driven Claude Code asks wicket, not the app, and wicket answers no such prompt. |
-| `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, follow-ups and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
+| `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, prompts and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
 
 Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
 whether the harness asks the owner in the app first, as `bypassPermissions` does for the driven mode.
@@ -222,6 +222,7 @@ one reads.
 | `authority` | duration | the `timeout` | How long the box's authority lasts from the run's start: its token's block 0, and so how long its node keeps working for it without the control host. Never longer than `timeout`, never zero. The node stops the box when it ends, unless a principal who may grant it renews it first (`wicket grant renew <run> --ttl`, or a parent agent's `decide`; [#56](https://github.com/public/wicket/issues/56)), never past the `timeout`. |
 | `output` | size | `64m` | How much of the box's output (stdout and stderr) its node's host and the control host's transcript keep, each. At least `64k`. |
 | `on_output_full` | `keep_newest` or `stop` | `keep_newest` | When output passes `output`: keep the newest (the oldest goes, and the bytes dropped are recorded), or stop the box. |
+| `memory_advice` | string | none | Advice for this zone's work, appended to the warning its agent gets at 90% of `memory` ([the box](box.md#runtime)), for example ``CARGO_BUILD_JOBS=1, `make -j1`, one test run at a time``. One line of at most 300 characters. The warning itself says only what holds for any box: use less memory now and save work in progress. A spawned zone inherits it, and may replace it (an empty string: none). |
 | `exit_grace` | duration | `30s` | How long the harness has to exit by itself once its session is over: after the agent called [`finish`](mcp-tools.md#finish) and its session closed (then the box is stopped, the run recorded as succeeded with the processes left named), or when it asked to [`hibernate`](mcp-tools.md#hibernate) while other processes ran in the box (then they are stopped and it hibernates). |
 
 Docker reads a zero limit as "no limit", so every limit must be a positive bound.
@@ -229,7 +230,7 @@ Docker reads a zero limit as "no limit", so every limit must be a positive bound
 ## Spawned zones
 
 The `spawn` tool takes a `zone` object with these fields. What it leaves out: no reach and no
-credentials; the parent's limits, isolation, `unlisted_hosts` and `wildcards`; for an agent, half the parent's
+credentials; the parent's limits (and its `memory_advice` even when it gives its own limits), isolation, `unlisted_hosts` and `wildcards`; for an agent, half the parent's
 remaining model budget. The zone must be a subset of the parent's, as
 [concepts](../explanation/concepts.md#zones-and-the-subset-rule) explains, or it is refused with
 every violation listed.

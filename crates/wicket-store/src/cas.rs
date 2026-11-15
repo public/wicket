@@ -97,6 +97,20 @@ impl<R: Read> Read for HashRead<R> {
     }
 }
 
+/// A hasher as an [`io::Write`] sink, for `io::copy` (RustCrypto's hashers stopped implementing it
+/// in digest 0.11).
+pub(crate) struct HashWrite<'a>(pub(crate) &'a mut Sha256);
+
+impl io::Write for HashWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// An object as it is read: decompressed, hashed, and an error at the end unless it is `want`.
 struct Verified<R: Read> {
     inner: zstd::stream::read::Decoder<'static, io::BufReader<R>>,
@@ -175,7 +189,7 @@ impl Cas {
     /// [`Cas::put_file`], and the file's length as it was stored.
     pub(crate) fn put_file_len(&self, path: &Path) -> io::Result<(Digest, u64)> {
         let mut h = Sha256::new();
-        let n = io::copy(&mut std::fs::File::open(path)?, &mut h)?;
+        let n = io::copy(&mut std::fs::File::open(path)?, &mut HashWrite(&mut h))?;
         let d = Digest(h.finalize().into());
         if self.inner.has(&d.key())? {
             return Ok((d, n));

@@ -14,7 +14,7 @@
 //!   tree it rebuilds is the one asked for; each file's and link's size is checked against its
 //!   entry as well.
 
-use super::{invalid, Cas, Digest, Entry, Kind, Tree};
+use super::{invalid, Cas, Digest, Entry, HashWrite, Kind, Tree};
 use sha2::{Digest as _, Sha256};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -44,7 +44,7 @@ struct Named;
 impl Sink for Named {
     fn file(&self, path: &Path) -> io::Result<(Digest, u64)> {
         let mut h = Sha256::new();
-        let n = io::copy(&mut std::fs::File::open(path)?, &mut h)?;
+        let n = io::copy(&mut std::fs::File::open(path)?, &mut HashWrite(&mut h))?;
         Ok((Digest(h.finalize().into()), n))
     }
     fn bytes(&self, b: &[u8]) -> io::Result<Digest> {

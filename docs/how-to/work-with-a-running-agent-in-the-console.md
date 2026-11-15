@@ -75,6 +75,13 @@ Go **‹ Console**, or close the tab. The session also closes when you sign out,
 session expires (15 minutes idle, 8 hours in all), or when the run ends. The page then says why and
 offers **Reopen**, which asks for your passkey again.
 
+## At the host's shell instead
+
+`wicket session <run>` shows the same session in the terminal, and each line you type is a prompt
+(`/stop` stops the running turn, Ctrl-C leaves and the agent goes on). `wicket session <run> "…"`
+sends one prompt and returns when its turn ends; `--no-wait` returns at once. Decide escalations it
+shows with `wicket approve <id>` or `wicket deny <id>`.
+
 ## Check what happened
 
 ```sh

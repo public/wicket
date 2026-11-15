@@ -467,7 +467,7 @@ impl AgentSession {
     /// A new session with a fresh random (v4) UUID.
     pub fn new() -> AgentSession {
         let mut b = [0u8; 16];
-        getrandom::getrandom(&mut b).expect("random bytes");
+        getrandom::fill(&mut b).expect("random bytes");
         b[6] = (b[6] & 0x0f) | 0x40;
         b[8] = (b[8] & 0x3f) | 0x80;
         let h = hex::encode(b);

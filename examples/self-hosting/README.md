@@ -38,5 +38,5 @@ Each session:
 ```sh
 wicket run examples/self-hosting/manifest.yaml \
   --workspace-dir ../wicket-self --task "Fix …, run the tests, and commit on a new branch."
-wicket say <run> "Also …"          # follow-ups while it runs; it stays open until it finishes
+wicket session <run>               # its session, live; type prompts; it stays open until it finishes
 ```

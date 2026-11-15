@@ -88,7 +88,7 @@ impl<S: ObjectStore> SealedStore<S> {
     /// `data`, sealed for object `object`, as it is read.
     fn sealer<'a>(&self, object: &str, data: &'a mut dyn Read) -> io::Result<Sealer<'a>> {
         let mut prefix = [0u8; 8];
-        getrandom::getrandom(&mut prefix).map_err(|e| io::Error::other(format!("random: {e}")))?;
+        getrandom::fill(&mut prefix).map_err(|e| io::Error::other(format!("random: {e}")))?;
         let mut head = Vec::with_capacity(20);
         head.extend_from_slice(MAGIC);
         head.extend_from_slice(&self.kid);

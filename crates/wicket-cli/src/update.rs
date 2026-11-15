@@ -404,7 +404,7 @@ pub fn keygen(out: &Path) -> Result<()> {
         bail!("{} exists", out.display());
     }
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     let key = wicket_identity::SigningKey::from_bytes(&seed);
     let public = key.verifying_key().to_bytes();
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode_0600().open(out)?;

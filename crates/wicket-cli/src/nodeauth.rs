@@ -292,7 +292,7 @@ pub mod testkit {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let issuer = Issuer::generate("test.wicket.example");
-            let key = SigningKey::generate(&mut rand_core::OsRng);
+            let key = SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
             let mut l = Ledger::open_in_memory().unwrap();
             let t = l.create_node_token(&wicket_core::TenantId::single(), "n1", 600).unwrap();
             let row = wicket_store::NodeRow {
@@ -354,7 +354,7 @@ mod tests {
         let id = i.identity();
         id.install_cert(&i.dir, &jws, "n1", n.iat).unwrap();
         assert_eq!(std::fs::read_to_string(i.dir.join(CERT_FILE)).unwrap().trim(), jws);
-        let other = SigningKey::generate(&mut rand_core::OsRng);
+        let other = SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
         let (foreign_key, _) = i.issuer.issue_node_cert("n1", &other.verifying_key(), n.iat, 3600);
         assert!(id.install_cert(&i.dir, &foreign_key, "n1", n.iat).unwrap_err().to_string().contains("another key"));
         let (foreign_issuer, _) = Issuer::generate("test.wicket.example").issue_node_cert("n1", &i.key.verifying_key(), n.iat, 3600);

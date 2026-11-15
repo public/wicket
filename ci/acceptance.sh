@@ -554,7 +554,7 @@ restart_flow() {
     r=${runs[$i]} l=${labels[$i]}
     check "  reconcile adopted the run on $l" 'grep -q "^run_adopted .*$r" "$work/rec-restart.log"'
     wait_for 60 'grep -q "run.attach\|reconnected" "$WICKET_HOME/runs/'"$r"'/ctl/attach.log" 2>/dev/null' || true
-    w say "$r" "Again, after the restart." >/dev/null 2>&1 || true
+    w session --no-wait "$r" "Again, after the restart." >/dev/null 2>&1 || true
     wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 2 ]' || true
     local res; res=$(restart_result "$r")
     echo "   $l: $res"
@@ -563,7 +563,7 @@ restart_flow() {
   done
   # Then a node's `serve` alone dies (#151): this host's own is started again by its runs'
   # supervisors; acc-n1's by this script, as its service manager would. Its boxes are adopted, and
-  # one `wicket say` is one turn (stdin neither lost nor doubled).
+  # one session prompt is one turn (stdin neither lost nor doubled).
   log "a node's serve restarts alone: its boxes are adopted"
   for p in $(pgrep -f "$W" 2>/dev/null); do
     tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "WICKET_HOME=$WICKET_HOME" || continue
@@ -581,7 +581,7 @@ restart_flow() {
   sleep 3
   for i in "${!runs[@]}"; do
     r=${runs[$i]} l=${labels[$i]}
-    w say "$r" "Once more, after the node restarted." >/dev/null 2>&1 || true
+    w session --no-wait "$r" "Once more, after the node restarted." >/dev/null 2>&1 || true
     wait_for 180 '[ "$(restart_result '"$r"' | jq -r .turn 2>/dev/null)" = 3 ]' || true
     sleep 5
     res=$(restart_result "$r")
