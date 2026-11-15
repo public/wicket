@@ -29,8 +29,9 @@ pub const MAX_TTL: Duration = Duration::from_secs(24 * 3600);
 /// The principal deciding.
 #[derive(Clone, Debug)]
 pub enum Granter {
-    /// A human: `$USER`-style on the CLI, `passkey:<name>` on the console.
-    Human(String),
+    /// A human operator (#11): its identity and its authority (`operators.yaml`; anything by
+    /// default). It may decide only what its authority covers.
+    Human(crate::operators::Operator),
     /// An agent run (#50): it may decide only its descendants' requests, and approve only what its
     /// own authority covers ([`within_authority`]).
     Agent(AgentAuthority),
@@ -40,7 +41,7 @@ impl Granter {
     /// How the decision is recorded (`decided_by`, the audit record's `by`).
     pub fn label(&self) -> String {
         match self {
-            Granter::Human(by) => by.clone(),
+            Granter::Human(o) => o.label.clone(),
             Granter::Agent(a) => format!("agent:{}", a.run),
         }
     }
@@ -195,27 +196,79 @@ pub enum Decided {
 /// Decides pending request `id` as `by`. An approval is one grant, which exists only if its
 /// decision is on the audit record (otherwise it is revoked again: fail closed). `extra` is merged
 /// into the record (the console's signed decision).
+///
+/// A decision outside the decider's own authority (an operator's, #11, or an agent's, #50) is
+/// refused, and the refusal is on the audit record (`decision.refused`) with who tried and why.
 pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_json::Value) -> Result<Decided> {
+    let mut extra = extra;
+    if let Granter::Human(o) = by {
+        if let Err(why) = asked(l, id, v).and_then(|a| o.may_decide(&a).map_err(anyhow::Error::msg)) {
+            return Err(refused(l, by, id, v, why));
+        }
+        merge(&mut extra, serde_json::json!({ "granter": "human", "granter_identity": o.id }));
+    }
     if let Verdict::Renew(ttl) = v {
         return renew(l, by, id, *ttl, extra);
     }
-    let mut extra = extra;
     if let Granter::Agent(a) = by {
         let req = l.request(id)?;
         if req.status != "pending" {
             bail!("request {id} is no longer pending (it is {})", req.status);
         }
-        let chain = within_authority(l, a, &req)?;
-        if let Verdict::Approve(t) = v {
-            check_terms(&req, t)?;
-            agent_terms(a, &req, t)?;
-        }
+        let chain = match within_authority(l, a, &req).and_then(|chain| {
+            if let Verdict::Approve(t) = v {
+                check_terms(&req, t)?;
+                agent_terms(a, &req, t)?;
+            }
+            Ok(chain)
+        }) {
+            Ok(c) => c,
+            Err(why) => return Err(refused(l, by, id, v, why)),
+        };
         merge(&mut extra, serde_json::json!({ "granter": "agent", "chain": chain }));
     }
     match v {
         Verdict::Approve(t) => approve(l, by, id, t, extra),
         Verdict::Deny => deny(l, by, id, extra),
         Verdict::Renew(_) => unreachable!("renewed above"),
+    }
+}
+
+/// What a decision on `id` is on, as an operator's authority sees it: a request, the request a
+/// grant answers (or the grant itself), or a running box's authority.
+fn asked(l: &Ledger, id: &str, v: &Verdict) -> Result<crate::operators::Asked> {
+    use crate::operators::Asked;
+    if !matches!(v, Verdict::Renew(_)) {
+        return Ok(Asked::of_request(&l.request(id)?));
+    }
+    Ok(match target(l, id)? {
+        Target::Grant(g) => match g.request_id.as_deref().map(|r| l.request(r)).transpose()? {
+            Some(req) => Asked::of_request(&req),
+            None => Asked::of_op(&g.method, &g.host, g.max_risk),
+        },
+        Target::Authority { .. } => Asked::authority(),
+    })
+}
+
+/// Records that `by` was refused deciding `id`, and returns the refusal. If the record can't be
+/// written, the refusal stands and says so.
+fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) -> anyhow::Error {
+    let (granter, identity) = match by {
+        Granter::Human(o) => ("human", Some(o.id.clone())),
+        Granter::Agent(a) => ("agent", l.identity(&a.run.0).ok().flatten().map(|i| i.spiffe_id)),
+    };
+    let decision = match v {
+        Verdict::Approve(_) => "approve",
+        Verdict::Deny => "deny",
+        Verdict::Renew(_) => "renew",
+    };
+    let record = serde_json::json!({
+        "target": id, "decision": decision, "by": by.label(), "granter": granter, "granter_identity": identity,
+        "why": format!("{why:#}"),
+    });
+    match l.audit(&TenantId::single(), None, "decision.refused", &record) {
+        Ok(_) => why.context("refused (the refusal is on the audit record)"),
+        Err(e) => why.context(format!("refused (the refusal could not be recorded: {e})")),
     }
 }
 
@@ -530,6 +583,47 @@ fn merge(record: &mut serde_json::Value, extra: serde_json::Value) {
 mod tests {
     use super::*;
 
+    fn human(label: &str) -> Granter {
+        let a = crate::operators::Authority::Anything;
+        Granter::Human(crate::operators::Operator { id: format!("spiffe://wicket.test/t/default/op/unix/{label}"), label: label.into(), authority: a })
+    }
+
+    /// #11: an operator decides only within its authority, through the same function; a decision
+    /// outside it is refused, leaves the request pending, and is on the audit record.
+    #[test]
+    fn an_approval_outside_the_operators_authority_is_refused_and_audited() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let policy = crate::operators::Policy::parse("operators:\n  unix/bob: { kinds: [http], hosts: [docs.example.com] }\n").unwrap();
+        let bob = Granter::Human(crate::operators::Operator::new("default", "unix", "bob", "bob@cli".into(), &policy));
+        let id = asked(&l, "/v1/items");
+        for v in [Verdict::Approve(terms(60)), Verdict::Deny] {
+            let e = decide(&mut l, &bob, &id, &v, serde_json::json!({})).unwrap_err();
+            assert!(format!("{e:#}").contains("may not decide requests for api.example.com"), "{e:#}");
+        }
+        assert_eq!(l.request(&id).unwrap().status, "pending", "refused: still for someone who may decide it");
+        assert!(decisions(&l).is_empty(), "no decision was made");
+        let refusals: Vec<serde_json::Value> = l
+            .audit_tail(20)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.2 == "decision.refused")
+            .map(|r| serde_json::from_str(&r.4).unwrap())
+            .collect();
+        assert_eq!(refusals.len(), 2);
+        let r = &refusals[1];
+        assert_eq!((r["target"].as_str(), r["decision"].as_str(), r["by"].as_str()), (Some(id.as_str()), Some("approve"), Some("bob@cli")));
+        assert!(r["granter_identity"].as_str().unwrap().ends_with("/op/unix/bob"), "{r}");
+        assert!(r["why"].as_str().unwrap().contains("its hosts: docs.example.com"), "{r}");
+        // Unlisted, alice has the default (anything): her approval is recorded with her identity.
+        let alice = Granter::Human(crate::operators::Operator::new("default", "unix", "alice", "alice@cli".into(), &policy));
+        assert!(matches!(decide(&mut l, &alice, &id, &Verdict::Approve(terms(60)), serde_json::json!({})).unwrap(), Decided::Approved { .. }));
+        let d = decisions(&l);
+        assert!(d[0]["granter_identity"].as_str().unwrap().ends_with("/op/unix/alice") && d[0]["granter"] == "human", "{:?}", d[0]);
+        // A renewal is a decision too: bob may not renew alice's grant for that host.
+        let g = l.grant_for_request(&id).unwrap().unwrap().id;
+        assert!(format!("{:#}", decide(&mut l, &bob, &g, &Verdict::Renew(Duration::from_secs(600)), serde_json::json!({})).unwrap_err()).contains("api.example.com"));
+    }
+
     fn asked(l: &Ledger, path: &str) -> String {
         let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", path);
         l.pending_for(&op, "blocked", None).unwrap().0
@@ -547,7 +641,7 @@ mod tests {
     fn an_approval_is_one_grant_on_the_record() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let Decided::Approved { grant, lease, .. } =
             decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap()
         else {
@@ -569,7 +663,7 @@ mod tests {
     fn every_grant_has_a_bounded_lifetime_and_a_use() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         for (t, why) in [
             (terms(24 * 3600 + 1), "at most 1day"),
             (terms(0), "needs a lifetime"),
@@ -587,7 +681,7 @@ mod tests {
     fn a_prefix_must_cover_the_ask() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x/y");
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let wide = Terms { prefix: Some("/v2/".into()), ..terms(60) };
         let e = decide(&mut l, &by, &id, &Verdict::Approve(wide), serde_json::json!({})).unwrap_err();
         assert!(format!("{e:#}").contains("doesn't cover"), "{e:#}");
@@ -616,7 +710,7 @@ mod tests {
     fn a_denial_is_recorded_with_extra_fields() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
-        let by = Granter::Human("passkey:k".into());
+        let by = human("passkey:k");
         assert_eq!(
             decide(&mut l, &by, &id, &Verdict::Deny, serde_json::json!({ "signed": "s" })).unwrap(),
             Decided::Denied { lease: None }
@@ -776,7 +870,7 @@ mod tests {
             assert_eq!(t.status(id), "pending");
         }
         // A human still decides it, through the same function.
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let mut l = t.ledger.lock().unwrap();
         assert!(decide(&mut l, &by, &beyond, &Verdict::Approve(terms(60)), serde_json::json!({})).is_ok());
     }
@@ -849,7 +943,7 @@ mod tests {
     fn a_renewed_grant_lasts_its_new_ttl_and_is_audited() {
         let mut l = Ledger::open_in_memory().unwrap();
         let id = asked(&l, "/v1/x");
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let Decided::Approved { grant, .. } =
             decide(&mut l, &by, &id, &Verdict::Approve(Terms { uses: Some(3), ..terms(60) }), serde_json::json!({})).unwrap()
         else {
@@ -898,7 +992,7 @@ mod tests {
         assert!(r["signed"].as_str().is_some());
         // What it couldn't have granted, it can't renew: a stranger's grant, a zone-wide or an
         // unlimited one a human made, one beyond its reach.
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let approve = |id: &str, t2: Terms| {
             let mut l = t.ledger.lock().unwrap();
             match decide(&mut l, &by, id, &Verdict::Approve(t2), serde_json::json!({})).unwrap() {
@@ -947,7 +1041,7 @@ mod tests {
         let no_grant = t.hook(&format!("{PARENT_ZONE}escalation: {{ grant: false }}\n"));
         assert!(no_grant.decide(&t.signed_renew("run_c", 250)).unwrap_err().contains("escalation.grant: false"));
         // A human, up to the run's timeout and no further; not once it ended.
-        let by = Granter::Human("alice@cli".into());
+        let by = human("alice@cli");
         let mut l = t.ledger.lock().unwrap();
         let e = renewed(&mut l, &by, "run_c", 7200).unwrap_err();
         assert!(format!("{e:#}").contains("outlast its timeout"), "{e:#}");

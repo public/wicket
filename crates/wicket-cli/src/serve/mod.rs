@@ -1240,7 +1240,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             let t = grant::Terms { uses: *uses, ttl: Duration::from_secs(*ttl_secs), prefix: prefix.clone(), zone_wide: *zone_wide };
             let grant::Decided::Approved { grant, lease, .. } = grant::decide(
                 &mut l,
-                &grant::Granter::Human(by),
+                &grant::Granter::Human(crate::operators::Operator::console(&t.0, &oc.name)?),
                 request,
                 &grant::Verdict::Approve(t),
                 json!({ "action": "decide", "signed": signed }),
@@ -1257,7 +1257,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
         Action::Decide { request, approve: false, .. } => {
             let lease = match grant::decide(
                 &mut l,
-                &grant::Granter::Human(by),
+                &grant::Granter::Human(crate::operators::Operator::console(&t.0, &oc.name)?),
                 request,
                 &grant::Verdict::Deny,
                 json!({ "action": "decide", "signed": signed }),
@@ -1809,7 +1809,7 @@ mod tests {
             t.running("run_e", "lead");
             let (a, d) = (ask(&t, "/items/"), ask(&t, "/other/"));
             // As `wicket approve --uses 3 --ttl 1h --prefix /items/a/ --zone-wide` and `wicket deny`.
-            let by = grant::Granter::Human("passkey:laptop".into());
+            let by = grant::Granter::Human(crate::operators::Operator::console(&wicket_core::TenantId::single().0, "laptop").unwrap());
             let terms = grant::Terms { uses: Some(3), ttl: Duration::from_secs(3600), prefix: Some("/items/a/".into()), zone_wide: true };
             let mut l = t.ledger();
             let grant::Decided::Approved { grant: gid, .. } =

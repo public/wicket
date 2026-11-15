@@ -750,7 +750,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let env: Vec<(String, String)> = std::env::vars().collect();
                     (harness.expect("a wrapped agent").wrapped_principal(&env), None)
                 }
-                None => (crate::cli_principal(), None),
+                // An operator (#11): its principal id (`sub`) next to how wicket knew them.
+                None => (crate::operators::with_identity(crate::cli_principal(), &m.tenant.0), None),
             };
             let spec = wicket_identity::IdentitySpec {
                 tenant: m.tenant.0.clone(),

@@ -32,7 +32,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 bail!("not approved");
             }
             let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Approve(t), serde_json::json!({}))?
+                grant::decide(&mut l, &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?), &id, &grant::Verdict::Approve(t), serde_json::json!({}))?
             else {
                 unreachable!("an approval approves")
             };
@@ -100,7 +100,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Deny { id } => {
             let mut l = Ledger::open(&ledger_path())?;
             if let grant::Decided::Denied { lease: Some(lease) } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Deny, serde_json::json!({}))?
+                grant::decide(&mut l, &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?), &id, &grant::Verdict::Deny, serde_json::json!({}))?
             {
                 println!("lease {lease} denied: its reservation is released");
             }
@@ -122,7 +122,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
             let mut l = Ledger::open(&ledger_path())?;
             let grant::Decided::Renewed { what, until } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Renew(ttl), serde_json::json!({}))?
+                grant::decide(&mut l, &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?), &id, &grant::Verdict::Renew(ttl), serde_json::json!({}))?
             else {
                 unreachable!("a renewal renews")
             };
