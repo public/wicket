@@ -20,7 +20,8 @@ shift
 cases=("$@")
 [ ${#cases[@]} -gt 0 ] || cases=(proxy core)
 out=experiments/build-times
-export CARGO_TARGET_DIR=$PWD/${LOOP_TARGET:-target-loop}
+t=${LOOP_TARGET:-target-loop}
+export CARGO_TARGET_DIR=$([ "${t#/}" != "$t" ] && echo "$t" || echo "$PWD/$t")
 read -r -a extra <<<"${LOOP_CARGO_ARGS:-}"
 
 record() { # case phase seconds peak_kib
@@ -39,7 +40,7 @@ timed() { # case phase command...: a failed build stops the run; failed tests ar
   local tf; tf=$(mktemp)
   local log=$out/.loop-$label-$c-$p.log
   local st=0
-  /usr/bin/time -f '%e %M' -o "$tf" "$@" >"$log" 2>&1 || st=$?
+  "${TIME:-/usr/bin/time}" -f '%e %M' -o "$tf" "$@" >"$log" 2>&1 || st=$?
   if [ "$st" != 0 ] && [ "$p" != test-run ]; then
     tail -30 "$log"
     rm -f "$tf"

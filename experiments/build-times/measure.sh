@@ -27,7 +27,7 @@ steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=(clean touch-core touch-cli test-build test-run sizes)
 out=experiments/build-times
 target=${MEASURE_TARGET:-target-measure}
-export CARGO_TARGET_DIR=$PWD/$target
+export CARGO_TARGET_DIR=$([ "${target#/}" != "$target" ] && echo "$target" || echo "$PWD/$target")
 
 record() { # step seconds peak_kib [extra json]
   local load; load=$(cut -d' ' -f1 /proc/loadavg)
@@ -42,7 +42,7 @@ record() { # step seconds peak_kib [extra json]
 timed() { # step command...: runs it, records wall time and peak memory
   local step=$1; shift
   local tf; tf=$(mktemp)
-  /usr/bin/time -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || { tail -20 "$out/.last.log"; rm -f "$tf"; return 1; }
+  "${TIME:-/usr/bin/time}" -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || { tail -20 "$out/.last.log"; rm -f "$tf"; return 1; }
   read -r secs peak <"$tf"
   rm -f "$tf"
   record "$step" "$secs" "$peak"
