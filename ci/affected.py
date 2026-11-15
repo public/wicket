@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
 SUITES = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
-          "node-e2e", "acceptance-nodes", "update"]
+          "node-e2e", "acceptance-nodes", "update", "tla"]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().
 LIBS = set()
@@ -275,6 +275,10 @@ def self_test():
          lambda c: c != ALL and {"wicket-cli", "wicket-fwd"} <= c, lambda s: s != ALL and "smoke" in s)
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
          set())
+    case("the TLA+ models", ["verification/tla/GrantsOnNodes.tla", "verification/tla/fail_today.cfg"], set(), {"tla"})
+    case("the TLA+ models' README", ["verification/tla/README.md"], set(), {"docs", "tla"})
+    case("code the grants model maps", ["crates/wicket-cli/src/noderun.rs"], {"wicket-cli"},
+         {"node-e2e", "acceptance-nodes", "tla"})
     case("an acceptance scenario", ["ci/acceptance/acp.yaml"], set(), {"acceptance", "acceptance-nodes"})
     # A rule naming one path (no wildcard) names one that exists: a rename mustn't leave it behind.
     for pat, _, _ in rules:
