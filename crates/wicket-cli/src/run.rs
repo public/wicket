@@ -2327,29 +2327,28 @@ fn check_fetched(tree: &str, here: &Path, got: &Path, skip: &[&str]) -> Result<(
     Ok(())
 }
 
+/// An egress decision's line, as the run log prints it (and `wicket node top` shows it). A node sends
+/// these events, and an agent chose the method, host and path: printed only stripped (#128).
+pub fn egress_line(ev: &Event) -> Option<String> {
+    let Event::Egress { method, host, path, risk, outcome, detail } = ev else { return None };
+    let tag = match outcome.as_str() {
+        "allow" => "ALLOW  ",
+        "pending" => "PENDING",
+        "denied" => "DENIED ",
+        "forwarded" => "FORWARD",
+        "spliced" => "SPLICE ",
+        "unavailable" => "STALE  ",
+        _ => "BLOCKED",
+    };
+    let clip = wicket_agent::clip;
+    Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
+}
+
 fn print_event(ev: &Event) {
     match ev {
-        Event::Egress { method, host, path, risk, outcome, detail } => {
-            let tag = match outcome.as_str() {
-                "allow" => "ALLOW  ",
-                "pending" => "PENDING",
-                "denied" => "DENIED ",
-                "forwarded" => "FORWARD",
-                "spliced" => "SPLICE ",
-                "unavailable" => "STALE  ",
-                _ => "BLOCKED",
-            };
-            // A node sends these events, and an agent chose the method, host and path: printed only
-            // stripped (#128), and the hint only for what is shaped like a request id (#121).
-            let clip = wicket_agent::clip;
-            println!(
-                "[egress] {tag} {} {}{}  ({}; {})",
-                clip(method, 16),
-                clip(host, 120),
-                clip(path, 120),
-                clip(risk, 24),
-                clip(detail, 240)
-            );
+        Event::Egress { outcome, detail, .. } => {
+            println!("{}", egress_line(ev).unwrap_or_default());
+            // The hint only for what is shaped like a request id (#121).
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");

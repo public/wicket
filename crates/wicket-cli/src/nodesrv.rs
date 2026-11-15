@@ -251,9 +251,93 @@ struct Node {
     llms: Mutex<HashMap<String, Arc<wicket_proxy::llm::Llm>>>,
     /// Images being received (#191), by stream.
     images: images::Incoming,
+    /// What `wicket node top` shows beyond the rest: boxes starting, egress decisions, connections.
+    seen: crate::top::NodeSeen,
 }
 
 impl Node {
+    /// What `wicket node top` shows of this node (its status socket's answer): names, deadlines,
+    /// states and counts only; no secret, body or credential.
+    fn status(&self) -> crate::top::NodeStatus {
+        use crate::top::{BoxStatus, FeedStatus, NodeStatus};
+        let now = (self.clock)();
+        let mut st = NodeStatus { node: self.name.clone(), build: self.build.clone(), now_ms: now, ..Default::default() };
+        match std::fs::read_to_string(self.paths.root.join(crate::nodeauth::CERT_FILE)) {
+            Ok(c) => match wicket_identity::node::verify_node_cert(c.trim(), &self.ident.issuer, &self.name, 0) {
+                Ok(c) => {
+                    st.identity = Some(c.sub);
+                    st.identity_until = Some(c.exp);
+                }
+                Err(e) => st.identity_error = Some(e.to_string()),
+            },
+            Err(_) => st.identity_error = Some("no identity certificate".into()),
+        }
+        st.ca_until = std::fs::read(self.paths.root.join("ca.pem")).ok().and_then(|pem| ca_not_after(&pem));
+        {
+            let r = self.replica.lock().expect("replica");
+            st.feed = FeedStatus {
+                mode: serde_json::to_value(r.mode(now)).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+                epoch: r.state().map(|s| s.epoch),
+                fresh_until_ms: r.fresh_until(),
+            };
+        }
+        st.control = self.seen.control();
+        let links: std::collections::HashSet<u64> = self.links.lock().expect("links").keys().copied().collect();
+        let stopped: std::collections::HashSet<String> = self.stopped.lock().expect("stopped").keys().cloned().collect();
+        let boxes: Vec<(String, BoxStatus)> = self
+            .boxes
+            .lock()
+            .expect("boxes")
+            .iter()
+            .map(|(run, b)| {
+                let rec = &b.record;
+                let state = match (&b.exited, stopped.contains(run)) {
+                    (Some(_), _) => "exited",
+                    // A long-lived agent's box on its way down is hibernating (or being stopped for
+                    // good: its run says which).
+                    (None, true) if rec.start.long_lived => "hibernating",
+                    (None, true) => "stopping",
+                    (None, false) if self.seen.is_paused(run) => "paused",
+                    (None, false) => "running",
+                };
+                let agent = rec.start.edge.as_ref().and_then(|e| e.who.get("agent").and_then(|a| a.as_str()).map(String::from));
+                (
+                    run.clone(),
+                    BoxStatus {
+                        run: run.clone(),
+                        name: b.name.clone(),
+                        agent,
+                        zone: rec.start.zone.clone(),
+                        state: state.into(),
+                        started_ms: rec.started_ms,
+                        cpus: b.cpus,
+                        memory_mib: b.memory_mib,
+                        connected: b.owner.is_some_and(|g| links.contains(&g)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let llms = self.llms.lock().expect("llms").clone();
+        for (run, mut b) in boxes {
+            if let Some(l) = llms.get(&run) {
+                b.spent = l.spent();
+                b.slice = l.slice();
+            }
+            (b.egress_allowed, b.egress_refused) = self.seen.counts(&run);
+            b.asks = self.queue.of(&run).len();
+            st.boxes.push(b);
+        }
+        for (run, zone, since) in self.seen.being_started() {
+            if !st.boxes.iter().any(|b| b.run == run) {
+                st.boxes.push(BoxStatus { run, zone, state: "starting".into(), started_ms: since, ..Default::default() });
+            }
+        }
+        st.boxes.sort_by(|a, b| a.started_ms.cmp(&b.started_ms).then_with(|| a.run.cmp(&b.run)));
+        st.egress = self.seen.recent();
+        st
+    }
+
     /// Sends on connection `gen`.
     fn send_to(&self, gen: u64, f: Frame) -> bool {
         self.links.lock().expect("links").get(&gen).is_some_and(|l| l.out.send(f).is_ok())
@@ -589,6 +673,11 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
     std::fs::set_permissions(ctl_dir, std::fs::Permissions::from_mode(0o700))?;
     let _ = std::fs::remove_file(&ctl);
     let listener = wicket_proxy::sockpath::bind(&ctl).with_context(|| format!("listening on {}", ctl.display()))?;
+    // `wicket node top`'s status socket (read-only: one JSON document per connection), beside the
+    // control socket in the same 0700 directory.
+    let status_sock = crate::top::status_socket(&ctl);
+    let _ = std::fs::remove_file(&status_sock);
+    let status_listener = wicket_proxy::sockpath::bind(&status_sock).with_context(|| format!("listening on {}", status_sock.display()))?;
     let clock = node_clock();
     let node_root = paths.root.clone();
     // Secrets live in this process's memory only (#152): keep it out of core dumps and others' ptrace,
@@ -630,6 +719,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         mem: Mutex::new(HashMap::new()),
         llms: Mutex::new(HashMap::new()),
         images: Default::default(),
+        seen: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -720,6 +810,17 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                     let _ = n.docker.unpause(&name).await;
                     let _ = n.docker.kill(&name).await;
                 }
+            }
+        });
+    }
+    {
+        let n = node.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = status_listener.accept().await {
+                let body = serde_json::to_vec(&n.status()).unwrap_or_default();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c.write_all(&body)).await;
+                });
             }
         });
     }
@@ -854,8 +955,14 @@ async fn box_ctl(node: &Node, run: &str, what: &str, user: &str, arg: &str) -> R
             let d = tree_dir(&node.paths, run, arg)?;
             Ok(Some(tokio::task::spawn_blocking(move || crate::hibernate::used_bytes(&d)).await?.to_string()))
         }
-        "pause" => node.docker.pause(&name).await.map(|()| None),
-        "unpause" => node.docker.unpause(&name).await.map(|()| None),
+        "pause" => node.docker.pause(&name).await.map(|()| {
+            node.seen.paused(run, true);
+            None
+        }),
+        "unpause" => node.docker.unpause(&name).await.map(|()| {
+            node.seen.paused(run, false);
+            None
+        }),
         "processes" => Ok(Some(serde_json::to_string(&node.docker.processes(&name, user).await?)?)),
         // Leftover processes the control host stops (#293): pids, space-separated.
         "kill" => {
@@ -912,6 +1019,16 @@ fn start_box_boxed(
 /// steps, and each Docker call (`docker.<call>`); with [`BoxStart::timings`], also the runtime's
 /// part of `docker run` as Docker's own timestamps show it ([`runtime_spans`]).
 async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Timings>) -> Result<String> {
+    let run = bs.run.clone();
+    if crate::run::check_run_id(&run).is_ok() && !node.boxes.lock().expect("boxes").contains_key(&run) {
+        node.seen.starting(&run, &bs.zone, wicket_feed::now_ms());
+    }
+    let r = start_box_steps(node, owner, bs, t).await;
+    node.seen.started(&run);
+    r
+}
+
+async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Timings>) -> Result<String> {
     let total = t.span("total");
     let docker = node.docker.timed(t.clone());
     let checks = t.span("checks");
@@ -1978,6 +2095,9 @@ async fn serve_box(
         let (n, run) = (node.clone(), bs.run.clone());
         tasks.push(tokio::spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
+                if let (wicket_proxy::Event::Egress { outcome, .. }, Some(line)) = (&ev, crate::run::egress_line(&ev)) {
+                    n.seen.egress(&run, outcome, line, (n.clock)());
+                }
                 if let Ok(event) = serde_json::to_value(&ev) {
                     n.send_run(&run, Frame::Msg(Msg::Event { run: run.clone(), event }));
                 }
@@ -2028,6 +2148,13 @@ async fn sample_memory(n: &Arc<Node>) {
 
 /// A box's model spend as its node counted it (#152), beside its record.
 const SPEND_FILE: &str = "node-spend.json";
+
+/// When a CA certificate (PEM) expires (Unix s).
+fn ca_not_after(pem: &[u8]) -> Option<i64> {
+    let (_, p) = x509_parser::pem::parse_x509_pem(pem).ok()?;
+    let (_, c) = x509_parser::parse_x509_certificate(&p.contents).ok()?;
+    Some(c.validity().not_after.timestamp())
+}
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
 fn box_name_ok(name: &str, run: &str) -> bool {
@@ -2217,6 +2344,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             mem: Mutex::new(HashMap::new()),
             llms: Mutex::new(HashMap::new()),
             images: Default::default(),
+            seen: Default::default(),
         })
     }
 
