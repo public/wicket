@@ -1567,21 +1567,7 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
-    let spent = l.spent();
-    let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
-    let slice = match p.slice {
-        Some(cur)
-            if !low(cur.requests, next.requests, spent.requests)
-                && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
-                && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, l.input_total()))
-                && cur.requests <= next.requests
-                && cur.output_tokens <= next.output_tokens
-                && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
-        {
-            cur
-        }
-        _ => next,
-    };
+    let slice = wicket_proxy::llm::Slice::renewed(p.slice, next, l.spent(), l.input_total());
     if p.slice_sent && p.slice == Some(slice) {
         return None;
     }

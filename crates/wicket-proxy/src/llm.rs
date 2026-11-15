@@ -54,7 +54,12 @@ pub struct Llm {
     last_activity: std::sync::Mutex<Instant>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
+    /// Told [`Llm::spent_charged`] as each call is sent upstream ([`Llm::set_journal`]).
+    journal: std::sync::Mutex<Option<Journal>>,
 }
+
+/// Where a node writes its count before a call goes upstream ([`Llm::set_journal`]).
+type Journal = Box<dyn Fn(Spent) + Send + Sync>;
 
 /// A run's model budget, as its model proxy enforces it (#256): the limits every check here reads,
 /// and the only ones. On the control host they are the amounts of the run's live quota grants
@@ -83,6 +88,30 @@ pub struct Slice {
     pub output_tokens: u64,
     #[serde(default)]
     pub input_tokens: Option<u64>,
+}
+
+impl Slice {
+    /// The slice to lease a node next (#152), given the one it holds (`cur`, None before the first),
+    /// the control host's [`Llm::next_slice`], what it has counted (`spent`, and `input_total` with
+    /// cached tokens): `cur` until less than half a slice of it is left, else `next`; and `next` at
+    /// once if it is lower than `cur` (what is left of the budget shrank, a spawn's carve-out). The
+    /// control host's rule (`noderun::slice_due`), here so the simulation (#324) runs the same one.
+    pub fn renewed(cur: Option<Slice>, next: Slice, spent: Spent, input_total: u64) -> Slice {
+        let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
+        match cur {
+            Some(cur)
+                if !low(cur.requests, next.requests, spent.requests)
+                    && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
+                    && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, input_total))
+                    && cur.requests <= next.requests
+                    && cur.output_tokens <= next.output_tokens
+                    && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
+            {
+                cur
+            }
+            _ => next,
+        }
+    }
 }
 
 /// What a run's model proxy has counted, as a node reports it to its control host (#152).
@@ -207,6 +236,7 @@ impl Llm {
             quota,
             last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
+            journal: std::sync::Mutex::new(None),
         }))
     }
 
@@ -218,6 +248,30 @@ impl Llm {
             cache_read_tokens: self.cache_read_tokens.load(Ordering::SeqCst),
             cache_creation_tokens: self.cache_creation_tokens.load(Ordering::SeqCst),
             output_tokens: self.output_tokens.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What this activation has counted, with the output tokens reserved by calls in flight charged
+    /// in full: what a node persists (#324). A call in flight when the node's `serve` crashes was
+    /// billed upstream and is never settled here, so a restarted node counts it as a call whose
+    /// final usage wasn't seen is counted: its whole reservation.
+    pub fn spent_charged(&self) -> Spent {
+        let mut s = self.spent();
+        s.output_tokens += self.inflight_output_tokens.load(Ordering::SeqCst);
+        s
+    }
+
+    /// Has `f` told [`Llm::spent_charged`] as each model call is sent, before it goes upstream:
+    /// a node persists it there, so a crash can't lose a call the provider bills (#324).
+    pub fn set_journal(&self, f: impl Fn(Spent) + Send + Sync + 'static) {
+        *self.journal.lock().expect("journal") = Some(Box::new(f));
+    }
+
+    /// Tells the journal [`Llm::spent_charged`] now. The count is read under the journal's lock,
+    /// so of two calls the later write is never the older count.
+    pub fn journal(&self) {
+        if let Some(f) = &*self.journal.lock().expect("journal") {
+            f(self.spent_charged());
         }
     }
 
@@ -449,6 +503,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
+        self.journal();
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
         // the credential (first use while the control host is unreachable), the call fails clearly.
@@ -693,6 +748,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return *r,
         };
+        self.journal();
         let reserved = f.reserved;
         let mut parts = parts;
         // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
@@ -980,6 +1036,38 @@ fn max_after(s: &str, key: &str) -> u64 {
         }
     }
     best
+}
+
+/// The deterministic simulation's seam (#324, `wicket-sim`): one model call through this proxy's
+/// own checks and accounting, without HTTP or an upstream. [`Llm::sim_begin`] is what
+/// [`Llm::handle`] does before it sends a call (the slice and budget checks of `admit`, then
+/// `filter`'s reservation of `max_tokens`); [`Llm::sim_settle`] is what the call's end does
+/// (`settle`). Built only with the `sim` feature.
+#[cfg(feature = "sim")]
+impl Llm {
+    /// Admits a `POST /v1/messages` asking for `max_tokens`: the output tokens reserved for it
+    /// (possibly lowered to what is left), or the status it is refused with (429 for a budget).
+    pub fn sim_begin(&self, max_tokens: u64) -> std::result::Result<u64, u16> {
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return Err(r.status().as_u16());
+        }
+        let (parts, ()) = Request::post("/v1/messages").body(()).expect("a static request").into_parts();
+        let body = serde_json::json!({"model": "sim", "max_tokens": max_tokens, "messages": []});
+        match self.filter(spec, &parts, Bytes::from(body.to_string())) {
+            Ok(f) => {
+                self.journal();
+                Ok(f.reserved)
+            }
+            Err(r) => Err(r.status().as_u16()),
+        }
+    }
+
+    /// Settles a call [`Llm::sim_begin`] admitted with `reserved`: charged `output` and `input`
+    /// tokens if its final usage was seen (`settled`), else its whole reservation.
+    pub fn sim_settle(&self, reserved: u64, input: u64, output: u64, settled: bool) {
+        self.settle(reserved, Usage { input, output, ..Default::default() }, settled);
+    }
 }
 
 #[cfg(test)]
@@ -1544,6 +1632,28 @@ mod tests {
         assert_eq!(llm.spent().requests, 7, "a node's count only raises this one");
         llm.merge_spent(super::Spent { requests: 1, ..Default::default() });
         assert_eq!(llm.spent().requests, 7);
+    }
+
+    /// #324: what a node persists counts the calls in flight at their whole reservation, so a node
+    /// restarted mid-call never counts less than its upstream billed. The journal reads the count
+    /// when it is told, not when its caller looked.
+    #[test]
+    fn the_journal_charges_calls_in_flight_in_full() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 1000}")).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let s = seen.clone();
+        llm.set_journal(move |sp| s.lock().unwrap().push(sp.output_tokens));
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        assert!(llm.admit(Some(&spec)).is_none());
+        let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let f =
+            llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":300,"messages":[]}"#)).ok().unwrap();
+        assert_eq!((llm.spent().output_tokens, llm.spent_charged().output_tokens), (0, 300));
+        llm.journal();
+        llm.settle(f.reserved, Usage { output: 40, ..Usage::default() }, true);
+        llm.journal();
+        assert_eq!(*seen.lock().unwrap(), vec![300, 40], "in flight: its reservation; settled: what it used");
+        assert_eq!(llm.spent_charged(), llm.spent());
     }
 
     #[test]
