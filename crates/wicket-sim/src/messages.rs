@@ -34,7 +34,7 @@ use crate::wire;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -288,7 +288,9 @@ impl Oracle {
                     _ => "not on the record".to_string(),
                 }
             };
-            let lost = format!("{n} ({} -> {}, {}) was accepted and never arrived: its receipt says {state}", s.from, s.to, s.id);
+            // (Without its id: `ulid` makes ids from the OS's clock and randomness, which the
+            // trace must not depend on.)
+            let lost = format!("{n} ({} -> {}) was accepted and never arrived: its receipt says {state}", s.from, s.to);
             match state.as_str() {
                 "held" | "delivered" | "held on the node" => self.trace.note(t, format!("end: {n} ({} -> {}) is {state}", s.from, s.to)),
                 // Taken from the inbox and recorded read on the control host, then lost with the
@@ -668,13 +670,16 @@ struct Node {
     env: Rc<Env>,
     /// The channel to the control host, while it is up: calls out, and their answers by id.
     link: RefCell<Option<mpsc::UnboundedSender<Chan>>>,
-    pending: RefCell<HashMap<u64, oneshot::Sender<(String, bool)>>>,
+    /// A `BTreeMap`: calls in flight fail in one order when the channel drops (a `HashMap`'s
+    /// order is random, and so would be the order their boxes are answered in).
+    pending: RefCell<BTreeMap<u64, oneshot::Sender<(String, bool)>>>,
     next_call: RefCell<u64>,
 }
 
 async fn node(env: Rc<Env>) -> turmoil::Result {
     env.oracle.borrow_mut().stats.node_starts += 1;
-    let n = Rc::new(Node { env: env.clone(), link: RefCell::new(None), pending: RefCell::new(HashMap::new()), next_call: RefCell::new(0) });
+    let n =
+        Rc::new(Node { env: env.clone(), link: RefCell::new(None), pending: RefCell::new(BTreeMap::new()), next_call: RefCell::new(0) });
     tokio::task::spawn_local(control_link(n.clone()));
     let listener = turmoil::net::TcpListener::bind(("0.0.0.0", PORT_NODE)).await?;
     loop {
