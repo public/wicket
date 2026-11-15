@@ -69,7 +69,8 @@ process, and anything not saved. When you get one:
 
 ## Results
 
-- `/workspace` is your workspace. It is copied back to the host when the run ends.
+- `/workspace` is your workspace, and what the operator gets back: it is kept on the host when the
+  run ends (copied back, or mounted there in place).
 - `/workspace/out/result.json` is the outbox: write what you did there (status, a summary,
   commit ids, test results, what a reviewer should check) before you `finish`. wicket prints it
   when the run ends.
