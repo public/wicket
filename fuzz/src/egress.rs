@@ -230,36 +230,32 @@ pub fn exchange(data: &[u8]) -> (Vec<Seen>, Vec<Seen>) {
     (decided, upstream)
 }
 
-/// Every request the origins got must be one decided, in order, and the same request.
+/// Every request the origins got must be a request decided, the same request (each decision used
+/// once). Not in order: a request decided twice in a run (a git push's `info/refs` is decided as
+/// the push) may arrive late from the run before, so which decision it answers is ambiguous.
 pub fn check(decided: &[Seen], upstream: &[Seen]) {
     check_with(vec![], decided, upstream);
 }
 
-/// [`check`], where a request may also be one of `late` (decided by an earlier run, in any order).
-/// Returns the decisions no request matched (the last [`LATE`] of them, oldest first).
-pub fn check_with(mut late: Vec<Seen>, decided: &[Seen], upstream: &[Seen]) -> Vec<Seen> {
-    let mut next = 0;
-    let mut unmatched = Vec::new();
+/// [`check`], where a request may also answer one of `late` (decided by an earlier run). Returns
+/// the decisions no request matched (the last [`LATE`] of them, oldest first).
+pub fn check_with(late: Vec<Seen>, decided: &[Seen], upstream: &[Seen]) -> Vec<Seen> {
+    let mut open: Vec<Seen> = late.into_iter().chain(decided.iter().cloned()).collect();
     for u in upstream {
         let want = op_of(u).unwrap_or_else(|e| panic!("{e}"));
         // A decided request may not reach the origin (refused when readied, an upstream error).
-        if let Some(k) = decided[next..].iter().position(|x| *x == want) {
-            unmatched.extend_from_slice(&decided[next..next + k]);
-            next += k + 1;
-        } else if let Some(k) = late.iter().position(|x| *x == want) {
-            late.remove(k);
-        } else {
-            panic!(
+        match open.iter().position(|x| *x == want) {
+            Some(k) => {
+                open.remove(k);
+            }
+            None => panic!(
                 "smuggled: the origin received {u:?} (decided as {want:?}), which was never decided; decided: {decided:?}, upstream: {upstream:?}"
-            );
+            ),
         }
     }
-    unmatched.extend_from_slice(&decided[next..]);
-    // A late decision a request of this run's own matched instead is still on its way.
-    late.extend(unmatched);
-    let drop = late.len().saturating_sub(LATE);
-    late.drain(..drop);
-    late
+    let drop = open.len().saturating_sub(LATE);
+    open.drain(..drop);
+    open
 }
 
 /// How many decisions not (yet) seen upstream are kept for later runs.

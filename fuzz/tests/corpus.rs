@@ -88,6 +88,13 @@ fn egress_late_requests_match_earlier_decisions() {
     let late = check_with(vec![post.clone()], std::slice::from_ref(&post), std::slice::from_ref(&post));
     assert_eq!(late, vec![post.clone()]);
     assert!(check_with(late, &[], std::slice::from_ref(&post)).is_empty());
+    // A git push's info/refs is decided as the push: with a late push from run 2 arriving first,
+    // run 3's own two decisions still answer its own two requests (`regressions/egress/late-git-push-twice`).
+    let push = Seen { method: "POST".into(), host: "fuzz.example".into(), path: "/acme/app.git/git-receive-pack".into() };
+    let other = Seen { method: "POST".into(), host: "fuzz.example".into(), path: "/acme/app.git/x".into() };
+    let refs = Seen { method: "GET".into(), host: "fuzz.example".into(), path: "/acme/app.git/info/refs?service=git-receive-pack".into() };
+    let left = check_with(vec![push.clone()], &[push.clone(), other.clone(), push.clone()], &[push.clone(), refs, other.clone()]);
+    assert_eq!(left, vec![push.clone()]);
     // Without the earlier decision, the same POST /a is smuggled.
     let smuggled = std::panic::catch_unwind(|| check_with(vec![], std::slice::from_ref(&get), &[get.clone(), post.clone()]));
     assert!(smuggled.is_err());
