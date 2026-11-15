@@ -579,7 +579,8 @@ pub enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_request_ms: Option<i64>,
     },
-    /// Open a tunnel to the run's `target` socket on the control host: `egress`, `llm` or `gateway`.
+    /// Open a tunnel to the run's `target` socket on the control host: `egress` or `gateway`. (`llm`
+    /// is refused: a node's model proxy calls the model itself, since protocol 3, #152, #257.)
     TunnelOpen {
         stream: u64,
         run: String,

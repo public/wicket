@@ -17,8 +17,9 @@
 //!   each reconnect the node is caught up (deltas or a snapshot, and a statement signed for the
 //!   occasion), stdout and stderr resume where they left off, unsent stdin is resent, and the node
 //!   ships the audit records it made meanwhile.
-//! - **Tunnels.** The node opens tunnels to this run's LLM and MCP gateway sockets, and to its egress
-//!   proxy for hosts the node must not terminate; they are connected here.
+//! - **Tunnels.** The node opens tunnels to this run's MCP gateway socket, and to its egress proxy
+//!   for hosts the node must not terminate; they are connected here. The model proxy runs only on
+//!   the node (#257).
 //! - **Asks.** A request the node can't allow is raised here as an ordinary pending request.
 //! - **Identity.** Every connection starts with the mutual authentication in `nodeauth.rs`; at half
 //!   its life the node's certificate is renewed over the channel, and a node revoked meanwhile (from
@@ -1237,7 +1238,8 @@ async fn on_frame(
                 }
             }
             Msg::TunnelOpen { stream, run, target } => {
-                let ok_target = ["egress", "llm", "gateway"].contains(&target.as_str());
+                // The model proxy is the node's alone (#257): only forwarded hosts and the gateway.
+                let ok_target = ["egress", "gateway"].contains(&target.as_str());
                 let conn = match (run == sh.run.0, ok_target) {
                     (true, true) => {
                         tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
