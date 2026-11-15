@@ -298,7 +298,7 @@ where
                     if !self.dry_run {
                         self.ledger.lease_transition(&lease.id, &["pending"], "approved", &format!("request {rid} granted"))?;
                     }
-                    self.did("lease_approved", &lease.id, &format!("request {rid} granted by a human"), Some(&lease.run));
+                    self.did("lease_approved", &lease.id, &format!("request {rid} granted by an operator"), Some(&lease.run));
                 }
                 s => {
                     let status = if s == "denied" { "denied" } else { "withdrawn" };

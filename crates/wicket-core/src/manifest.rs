@@ -104,7 +104,7 @@ pub struct AgentSpec {
     /// other image must be listed in `zone.images`, as for `spawn`. `wicket run --image` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// How many child agents this agent may start with `spawn_agent`, each in its own sandbox with
+    /// How many child agents this agent may start with `spawn_agent`, each in its own box with
     /// its own identity (design §3.2, §5.1). 0 = none.
     #[serde(default)]
     pub max_children: u32,
@@ -787,7 +787,9 @@ impl Manifest {
                             return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
                         }
                         if a.remote.is_some() {
-                            return Err(ManifestError::Invalid("agent.remote: an ACP agent has no remote session of its own".into()));
+                            return Err(ManifestError::Invalid(
+                                "agent.remote: an ACP agent has no Remote Control session of its own".into(),
+                            ));
                         }
                         if a.max_turns.is_some() {
                             return Err(ManifestError::Invalid(

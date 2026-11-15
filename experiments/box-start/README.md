@@ -45,7 +45,7 @@ On the control host (the supervisor, `wicket run`):
 | `node.local` | making sure this host's own `wicket node serve` runs |
 | `token.keys`, `token.policy`, `token.mint` | the minting keys and the node's feed, opened (its delta log replayed: only the entries still held are compiled, #287); block 0 compiled from Cedar; the box's token minted and published |
 | `feed.publish` | the token committed to the node's feed |
-| `node.ready` | from starting the node connection until the node is fresh on the feed at the box's epoch, made of `node.dial` (ssh, or the local unix socket), `node.handshake` (hello, authentication, welcome), `feed.catch_up`, `budget.lease` (the budget slice sealed and sent, #152) and `feed.fresh` (a moment) |
+| `node.ready` | from starting the node connection until the node is fresh on the feed at the box's epoch, made of `node.dial` (ssh, or the local unix socket), `node.handshake` (hello, authentication, welcome), `feed.catch_up`, `budget.slice` (the budget slice sealed and sent, #152) and `feed.fresh` (a moment) |
 | `trees`, `image.deliver` | the box's trees sent to a remote node; a pinned image sent or pulled there |
 | `node.start` | the node round trip: `BoxStart` sent until `Started` received |
 | `box_start` | all of the node part (`node.ready` to `node.start`) |

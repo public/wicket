@@ -392,7 +392,7 @@ pub struct Start {
     /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
     /// fetched first).
     pub keep: bool,
-    /// The run's own model proxy: it leases the node budget slices and takes the node's spend
+    /// The run's own model proxy: it sends the node budget slices and takes the node's spend
     /// (#152). None: no model route.
     pub llm: Option<Arc<wicket_proxy::llm::Llm>>,
     /// Where the secrets the node fetches come from (#152).
@@ -788,7 +788,7 @@ struct Progress {
     renew_after: i64,
     /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
     proto: u32,
-    /// Whether a lease went on this connection, and the slice in the last one (#152).
+    /// Whether a budget slice went on this connection, and the last one sent (#152).
     slice_sent: bool,
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
@@ -968,9 +968,9 @@ async fn session(
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
     }
-    let leasing = std::time::Instant::now();
+    let slicing = std::time::Instant::now();
     if first {
-        sh.timings.record("feed.catch_up", catching, leasing);
+        sh.timings.record("feed.catch_up", catching, slicing);
     }
     // The run's secrets and budget slice, sealed to the node (#152), before anything the box does.
     p.slice_sent = false;
@@ -978,7 +978,7 @@ async fn session(
         send(f);
     }
     if first {
-        sh.timings.since("budget.lease", leasing);
+        sh.timings.since("budget.slice", slicing);
     }
     if sh.attach && !p.ever_resumed && !runs.iter().any(|r| r.run == sh.run.0) {
         p.ever = false;
@@ -1475,7 +1475,7 @@ fn timeout_end(run_dir: &Path) -> Option<i64> {
     Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
 }
 
-/// What this host has released and leased to a run's node (#152), kept beside the run
+/// What this host has released to a run's node, secrets and budget slices (#152), kept beside the run
 /// (`ctl/holdings.json`) for `wicket node list`: the secrets the node fetched for the run (by name,
 /// never values) and its budget slice. An upper bound: the node may have dropped some already, never
 /// holds more.
@@ -1549,7 +1549,7 @@ pub fn fmt_ms(ms: i64) -> String {
         .unwrap_or_else(|| format!("{ms} ms"))
 }
 
-/// The fraction of a run's model budget leased to its node at a time (#152):
+/// The fraction of a run's model budget sent to its node as a slice at a time (#152):
 /// `WICKET_NODE_BUDGET_SLICE` on the control host, default 0.25. Offline, the node can spend what is
 /// left of its slice and nothing more; connected, it is renewed before half of it is gone.
 fn slice_fraction() -> f64 {
@@ -1799,7 +1799,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
-        // As the node routes it: a host injected with a secret leased to the node is decided there,
+        // As the node routes it: a host injected with a secret released to the node is decided there,
         // and so is a swapped one (#257), unless a control host before protocol 10 started the box
         // and swaps it here.
         if sh.swap_hosts.iter().any(|h| wicket_core::manifest::host_matches(h, &g.host)) {

@@ -29,7 +29,7 @@ zone:
 | field | type | default | meaning |
 |---|---|---|---|
 | `tenant` | string | `t0` | The tenant. 0.0.1 is single-tenant: leave it out. |
-| `task` | string | `""` | The trusted task text, given to the agent as its first turn (or to a program, which may ignore it). It is the only input policy derivation ever sees. Required for agents, except a remote session (`agent.remote`) that wicket doesn't drive, whose messages come from the vendor's app. `wicket run --task` replaces it. |
+| `task` | string | `""` | The trusted task text, given to the agent as its first turn (or to a program, which may ignore it). It is the only input policy derivation ever sees. Required for agents, except a Remote Control session (`agent.remote`) that wicket doesn't drive, whose messages come from the vendor's app. `wicket run --task` replaces it. |
 | `agent` | [agent](#agent) | none | An agent, run by its [harness](#harness-modes). |
 | `program` | [program](#program) | none | A deterministic workload with no model. |
 | `zone` | [zone](#zone) | required | Where the workload runs, and what it may reach. |
@@ -119,7 +119,7 @@ request: true }` it becomes a pending request, as an agent's would, and the prog
 | `name` | string | required | The zone's name, part of every SPIFFE ID in it (`…/z/<name>/…`). A spawned zone is named `<parent zone>.<name>.<parent run>`. |
 | `isolation` | `gvisor` or `runc` | `gvisor` | The runtime. `runc` is plain containers, for development only. |
 | `reach` | list of [reach rules](#reach) | `[]` | What the box may reach without asking. |
-| `unlisted_hosts` | `escalate` or `hide` | `escalate` | What a host no reach rule names is. `escalate`: a request to it becomes a pending request, unless its registered domain doesn't exist (only that is looked up, never the full name), when it is an unknown host. `hide`: it doesn't exist for the box (NXDOMAIN, and the proxy refuses the connection before TLS with a not-found status). |
+| `unlisted_hosts` | `escalate` or `hide` | `escalate` | What a host name no reach rule names is. `escalate`: a request to it becomes a pending request, unless its registered domain doesn't exist (only that is looked up, never the full name), when it is an unknown host. `hide`: it doesn't exist for the box (NXDOMAIN, and the proxy refuses the connection before TLS with a not-found status). |
 | `wildcards` | `{ forbid, max_names }` | `{ forbid: false, max_names: 32 }` | Wildcard reach rules (`*.cdn.example`). wicket resolves every name under one on the host, so the names are a narrow channel out of the box. It resolves a name only after a request to it is allowed, and reaches at most `max_names` (at least 1) distinct names under each rule per run. With `forbid: true`, no reach rule may be a wildcard. `wicket zone` warns about each one. |
 | `forbid` | list of [forbid rules](#forbid) | `[]` | Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked before `reach`. |
 | `inject` | list of [inject rules](#inject) | `[]` | Credentials the egress proxy adds to requests. |
@@ -132,13 +132,13 @@ request: true }` it becomes a pending request, as an agent's would, and the prog
 
 ### `reach`
 
-A request is allowed by reach if some rule matches its host, method and path, and its
+A request is allowed by reach if some rule matches its host name, method and path, and its
 [risk](risk-classes.md) is R2 or lower or the rule has `allow_dangerous`. Rules are a set, not an
 ordered list.
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `host` | string | required | An exact host (`api.github.com`), or `*.example.com` for one or more labels under `example.com` (not `example.com` itself). Matched ignoring case and a trailing dot. No `/`. |
+| `host` | string | required | A host name, exact (`api.github.com`) or `*.example.com` for one or more labels under `example.com` (not `example.com` itself). Matched ignoring case and a trailing dot. No `/`. |
 | `methods` | list of strings | `[GET, HEAD]` | The methods allowed. The proxy forwards only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. |
 | `paths` | list of globs | `["/**"]` | Path globs: `*` matches within one segment, `**` across segments. Case-sensitive. The query string isn't matched. |
 | `allow_dangerous` | boolean | `false` | Allow requests the dangerous-pattern list rates R3 or R4 without a grant. |
@@ -172,7 +172,7 @@ rulesets or branch protection).
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `host` | string | required | The host the credential goes to. |
+| `host` | string | required | The host name the credential goes to. |
 | `header` | string | required | The one header it goes in (`Authorization`). |
 | `format` | string | `{secret}` | The header's value. `{secret}` is the secret; `{basic:USER}` is `base64(USER:secret)`, so `Basic {basic:x-access-token}` is HTTP Basic with a token as password. Must contain one of the two. |
 | `secret` | string | required | The vault secret's name. Its host binding must cover `host`, or the run is refused. |

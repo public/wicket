@@ -1009,7 +1009,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let proxies_lap = std::time::Instant::now();
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
-    // of record (#152, #257), whose reports are merged in here and whose slices are leased from here.
+    // of record (#152, #257), whose reports are merged in here and whose budget slices are sent from here.
     // Nothing listens for model calls on this side.
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
     let llm = Llm::with_quota(ctx.clone(), limits.model)?;
@@ -1147,7 +1147,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if node.is_some() {
         println!("  node {node_name} via wicket node serve (egress decided there from the signed feed; secrets stay here)");
     }
-    println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
+    println!("  decide requests from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
     let lap = std::time::Instant::now();
@@ -1642,7 +1642,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         println!("[remote] {}", wicket_agent::clip(&l, 300));
                         if remote_url.is_none() {
                             if let Some(u) = harness.and_then(|h| h.remote_session_url(&l)) {
-                                println!("[wicket] remote session: {u}");
+                                println!("[wicket] Remote Control session: {u}");
                                 if let Ok(lg) = ledger.lock() {
                                     let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
                                 }
@@ -1729,18 +1729,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     let mut body = serde_json::json!({ "url": u });
                                     match prior_remote_url.as_deref() {
                                         Some(old) if same_remote_session(old, &u) => {
-                                            println!("[wicket] remote session resumed: {u}");
+                                            println!("[wicket] Remote Control session resumed: {u}");
                                             body["resumed"] = true.into();
                                         }
                                         // A new session, as at the start, and the old one is no longer
                                         // this box's: said as loudly as the start's address.
                                         Some(old) => {
-                                            println!("[wicket] the woken box couldn't reattach to its remote session {old}; it started a new one");
-                                            println!("[wicket] remote session (NEW): {u}");
+                                            println!("[wicket] the woken box couldn't reattach to its Remote Control session {old}; it started a new one");
+                                            println!("[wicket] Remote Control session (NEW): {u}");
                                             body["resumed"] = false.into();
                                             body["previous"] = old.into();
                                         }
-                                        None => println!("[wicket] remote session: {u}"),
+                                        None => println!("[wicket] Remote Control session: {u}"),
                                     }
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &body);
@@ -1749,9 +1749,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 }
                                 Some(Err(why)) => {
                                     if let Some(old) = &prior_remote_url {
-                                        println!("[wicket] the woken box's remote session {old} wasn't resumed");
+                                        println!("[wicket] the woken box's Remote Control session {old} wasn't resumed");
                                     }
-                                    println!("[wicket] the remote session didn't start (the agent carries on, driven by wicket only): {why}");
+                                    println!("[wicket] the Remote Control session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
                                     }
@@ -2462,7 +2462,7 @@ fn print_event(ev: &Event) {
             // The hint only for what is shaped like a request id (#121).
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
-                    println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
+                    println!("         → an operator decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
         }

@@ -79,4 +79,5 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
   [security review before 0.0.1](explanation/security-review-0.0.1.md)
 
 Changes are in [CHANGELOG.md](../CHANGELOG.md), assembled at release time from the fragments pull requests add under [changes/](../changes/README.md). `ci/check-doc-links.sh` checks every relative link
-in these pages; `ci/gen-cli-reference.sh` writes the command-line reference.
+in these pages, `ci/check-terms.sh` that they use the [glossary's words](explanation/concepts.md#the-nouns), and
+`ci/gen-cli-reference.sh` writes the command-line reference.

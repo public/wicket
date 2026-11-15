@@ -47,7 +47,7 @@ pub struct RunCtx {
     /// This agent instance's wicket-issued identity (design §3.2), rotated while it runs. None for
     /// programs.
     pub identity: Option<Arc<IdentityCell>>,
-    /// Starts a child agent in its own sandbox; None when the agent may not spawn.
+    /// Starts a child agent in its own box; None when the agent may not spawn.
     pub spawner: Option<Spawner>,
     /// Placeholders the box holds in place of real credentials, swapped at the egress proxy.
     pub swaps: Vec<CredentialSwap>,

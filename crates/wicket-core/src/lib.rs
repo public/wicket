@@ -72,7 +72,7 @@ impl fmt::Display for RunId {
     }
 }
 
-/// Short, human-typable id for escalation requests, e.g. `r-01jc4x2k`.
+/// Short, human-typable id for requests, e.g. `r-01jc4x2k`.
 pub fn new_request_id() -> String {
     let u = ulid::Ulid::new().to_string().to_lowercase();
     format!("r-{}", &u[u.len() - 8..])

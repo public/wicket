@@ -161,7 +161,7 @@ pub trait ControlLink: Send + Sync {
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// What the agent is told when the node can't reach the control host to escalate.
-pub const UNREACHABLE: &str = "wicket's control plane is unreachable from this node, so nothing new can be approved right now; retry later";
+pub const UNREACHABLE: &str = "wicket's control host is unreachable from this node, so nothing new can be approved right now; retry later";
 
 /// Decisions from a node's verified feed replica.
 pub struct NodeDecider {
