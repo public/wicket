@@ -56,15 +56,23 @@ impl Gateway {
     pub async fn serve_on(self: Arc<Self>, listener: tokio::net::UnixListener) -> Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
-            let me = self.clone();
-            tokio::spawn(async move {
-                let svc = service_fn(move |req| {
-                    let me = me.clone();
-                    async move { Ok::<_, hyper::Error>(me.handle(req).await) }
-                });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
-            });
+            tokio::spawn(self.clone().serve_io(stream));
         }
+    }
+
+    /// Serves one connection from the box on any byte stream, until it ends: what
+    /// [`Self::serve_on`] does with each connection it accepts. Public for the fuzz targets (#323),
+    /// which feed it raw bytes.
+    #[doc(hidden)]
+    pub async fn serve_io<S>(self: Arc<Self>, io: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let svc = service_fn(move |req| {
+            let me = self.clone();
+            async move { Ok::<_, hyper::Error>(me.handle(req).await) }
+        });
+        let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(io), svc).await;
     }
 
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
