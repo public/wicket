@@ -1,6 +1,11 @@
-# wicket — design v0.2
+# wicket — design
 
-*v0.2, 2026-11-08. Draft for discussion: research 01–17 folded in. Nothing is built yet.*
+*v0.3, 2026-11-15. wicket 0.0.1 is built and 0.0.2 is in progress. This document gives the design and the
+reasons for it. The [reference](../README.md#reference) and [concepts](concepts.md) describe what is built.
+Where this document describes something not built, it says so. Subsystems that are designed but not
+planned are cut to one line each under [Deferred](#22-deferred). The #253 simplification takes
+precedence over any older text here: only the node decides; there is one grant, one principal and one
+workload; the harness decides its lifetime; and there is one content-addressed store.*
 
 A **meta-harness**: it does not run an agent loop. It builds the environment that other agent processes
 run in, gives each the least access its task needs, brokers every crossing of a boundary, and shows humans
@@ -70,7 +75,7 @@ Things the brief assumed or left open, and what we now know (2026-11-08):
 | Two enforcement surfaces (MCP gateway, egress proxy) | **Three.** The model API is its own surface: an **LLM proxy** (via `ANTHROPIC_BASE_URL`) holds the model key, is the best liveness sensor, and is a taint ingress (Claude's WebSearch runs server-side and is invisible to the egress proxy). [01 §4.5–4.6] |
 | microVMs for speed and lightness | This box (Vultr VC2) has **no KVM**. v1 Linux tiers are a native process jail and gVisor (which also gives checkpoint/restore for parking). Firecracker comes later on bare metal. [02 §1, §10] |
 | Typed escalation à la RFC 9396 | Kept. MCP's own spec now says single-use must be enforced server-side, so use counts and approvals live in a **ledger**, not in tokens. [03 §2.6] |
-| Macaroon/Biscuit attenuation | Adopted: zone ceilings, grants and leases are Biscuit tokens, checked on the node by a vendored, patched `biscuit-auth` (§2.1). The PoC still uses a capability algebra with a syntactic subset check, stored in the ledger. [03 §7.2] |
+| Macaroon/Biscuit attenuation | Adopted: zone ceilings, grants and leases are Biscuit tokens, checked on the node by a vendored, patched `biscuit-auth` (§2.1). The syntactic subset check (`wicket_core::subset`) is kept only to refuse over-wide asks and explain them; it decides nothing (§4.1). [03 §7.2] |
 | Claude-style Remote Control and wicket's own UI side by side (owner, 2026-11-08) | Remote Control needs a claude.ai subscription login and Anthropic's own base URL, and its control protocol runs through Anthropic's session service (`--sdk-url`, Anthropic hosts only). So it can't share wicket's default launch. It becomes an opt-in `vendor_rc` zone mode: the RC bridge stays on the host, and its sessions are jailed via `CLAUDE_CODE_PROCESS_WRAPPER`. An observe-only tap at the egress proxy feeds wicket's console, and RC answers are never wicket grants. [09] |
 | Claude Code is the only inner agent that matters | **Codex app-server and pi are T1 too**: native control protocols with host-answered approvals, steering and typed output. pi has no permission layer by design ("the sandbox is your job"). Codex has its own Remote Control. [11] |
 | Hash-pin tool descriptions; label per agent | Tool descriptions poisoned from the start defeat pinning, and the highest-success real attacks tamper with *values inside* allowed calls (MCPTox, MSB). So descriptions are taint, sink arguments need provenance on every R2+ `Op`, and handles can be passed as arguments. [05, 06] |
@@ -104,8 +109,8 @@ enters the context window, so compaction can't erode it.
 4. **Judge the request, not the reasoning.** Escalation deciders see a typed request and the trusted task
    text, never the agent's justification or context.
 5. **Authority only narrows downward.** A child's ceiling is a subset of its parent's, checked mechanically.
-6. **Data carries labels; free text does not cross gates into wider authority.** Parents get typed
-   low-capacity fields and opaque handles.
+6. **Free text does not carry authority.** What an agent read never widens what it may do. Data labels,
+   typed gates and handles are deferred (§22); taint tracking starts as a one-bit flag (#27).
 7. **The picture is generated from the enforcement config.** The zone view and the blast-radius answer are
    computed from the same objects the proxies enforce. No hand-drawn diagrams.
 8. **Small trusted core.** The decision engine, proxies, jail helper and adapter interpreter are the TCB.
@@ -120,15 +125,14 @@ enters the context window, so compaction can't erode it.
     thousands of tenants (owner, 2026-11-08). Tenants are the outermost isolation boundary. By default
     nothing that can carry data or authority is shared between them; sharing happens only through
     policy-controlled cross-tenant gates (§15).
-11. **Agents are long-lived by default** (owner, 2026-11-08). An agent is a durable identity that wakes,
-    works, sleeps, hibernates, and is eventually garbage-collected by policy. Processes are disposable;
-    authority is per work item; what persists across sleep passes a promotion gate (§13).
-12. **Users can delegate, narrowly** (owner, 2026-11-08). An agent can act on a user's behalf, shopping
-    online for example, only under a mandate: purpose-, time- and money-bound, revocable, with
-    checkout-style approval points the user signs. The user's credentials never reach the agent (§16).
-13. **Reusable programs run without an agent, never without a boundary** (owner, 2026-11-08). Code an
-    agent writes becomes a program only through a reviewed, signed promotion, and every run gets the same
-    sandbox, egress control and audit as an agent (§17).
+11. **The harness decides its lifetime** (#249). An agent is a durable identity. Its run ends when its
+    process exits, at its timeout, or when its authority ends. It hibernates when it or an operator asks,
+    and a message wakes it. wicket keeps no timers that end, pause or hibernate it (§13).
+12. **Users can delegate, narrowly** (owner, 2026-11-08). A user is a principal like any other (#11), so
+    acting for a user is a grant from that user: bound to a purpose, a time and an amount, and revocable.
+    The user's credentials never reach the agent. A separate mandate subsystem is deferred (§16, §22).
+13. **A program is an agent without a model** (#255). It gets the same sandbox, egress control and audit,
+    and by default it may not ask for more. Approving one is a grant on its digest (§17).
 
 ### 2.1 Build versus reuse (owner, 2026-11-10)
 
@@ -150,14 +154,14 @@ Everything around that uses standard components:
 | Need | Reuse | Status |
 |---|---|---|
 | Workload identity, rotation, attestation | **SPIFFE** IDs and SVID formats; a real **SPIRE** deployment can be the issuer | the PoC has its own small issuer with SPIFFE-shaped IDs (#52) |
-| Org rules: images, hosts, escalation and inspection rights, operator roles | **Cedar** (the `cedar-policy` crate, embedded), static and reviewed; **SymCC** in CI to diff policy changes (#50, #34, #11) | the PoC's checks are hand-written (#51) |
-| Delegated authority: zone ceilings, grants and leases | **capability chains in the Biscuit format**, checked by a vendored, patched `biscuit-auth`: narrowing by construction, signed, checked offline, revocable by subtree; intersected with the org rules at decision time | the PoC's `subset.rs` is hand-written and conservative (#57) |
-| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed** (TUF-style), with freshness statements so a node knows when it's cut off; it then works on the lifetimes of the tokens, grants and cached secrets it holds, and stops a box when its authority expires (#152, #153); no product signs increments | central checks on the control host (#57) |
+| Org rules: images, hosts, escalation and inspection rights, operator roles | **Cedar** (the `cedar-policy` crate, embedded), static and reviewed; **SymCC** in CI to diff policy changes (#50, #34, #11) | built: compiled into each box's Biscuit token at issuance (#51; [policy](../reference/policy.md)) |
+| Delegated authority: zone ceilings, grants and leases | **capability chains in the Biscuit format**, checked by a vendored, patched `biscuit-auth`: narrowing by construction, signed, checked offline, revocable by subtree; intersected with the org rules at decision time | built (#57); `subset.rs` remains only for admission |
+| Distributing policy and grants to nodes | wicket's own **signed snapshot-and-delta feed** (TUF-style), with freshness statements so a node knows when it's cut off; it then works on the lifetimes of the tokens, grants and cached secrets it holds, and stops a box when its authority expires (#152, #153); no product signs increments | built (#152, #153, #164) |
 | Relationship data: spawn trees, tenants, roles | Cedar entities materialised from wicket's ledger; **OpenFGA** as an optional source in platform mode | the ledger (#11) |
 | Human identity and groups | the organisation's **identity provider** (OIDC), passkeys at the IdP | passkeys enrolled in wicket's console (#53) |
 | Downstream credentials | providers' **scoped native credentials** (AWS STS session policies, GCP downscoped tokens, GitHub App installation tokens; §9.4) | whole tokens injected from the vault (#54) |
 | Human just-in-time access workflows | Teleport access requests, AWS Identity Center, Entra PIM, as optional **approval channels** | wicket's own ledger and console |
-| Clusters and scheduling | Kubernetes behind the placement interface (#45) | Vultr + SSH first (#37) |
+| Clusters and scheduling | Kubernetes behind the placement interface (#45, deferred) | static hosts and Vultr, over SSH (#37) |
 
 The rule: if a mature, standard component does it, wicket integrates with it, and keeps its own code for
 what only an in-path broker can do. Where the best fit is weakly maintained, wicket may fork or vendor it.
@@ -239,11 +243,11 @@ The survey behind these choices, with the options ruled out and why, is research
 
 ```
                          ┌──────────────────────────── wicketd (control plane) ───────────────────────────┐
-  human ── CLI / TUI ──► │ task runner · zone compiler · escalation broker · ledger · handle & label store │
+  human ── CLI / TUI ──► │ task runner · zone compiler · escalation broker · ledger · content store        │
   (approvals, views)     │ audit log · credential vault · view/blast-radius · adapter registry             │
                          └───────┬────────────────────────────┬───────────────────────────┬───────────────┘
-                                 │ Decision engine (library, in-process in every enforcement point)
-                                 │ Op → Cedar(org ∧ zone ∧ forbids) ∧ ∃grant ⊇ op ∧ label rules ∧ ledger
+                                 │ Decision engine: on the node that runs the box (§9.2.1)
+                                 │ Op → token(Cedar org ∧ zone ∧ forbids, compiled) ∧ ∃grant ⊇ op ∧ ledger
               ┌──────────────────┼────────────────────┬───────────────────────┐
               ▼                  ▼                    ▼                       ▼
      ┌────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌───────────────────────┐
@@ -376,7 +380,7 @@ the human user if there is one).
   parent agent said. Neither the principal nor the chain can be widened along the way.
 - **It's shown wherever a human decides,** e.g. "Acting for: alice (cli, unix-user) → lead → fetcher".
   The passkey signs it with the decision, and recipients of messages see it too.
-- Mandates (§16) will hang off the same principal.
+- Acting for a user is a grant from the same principal (§16).
 
 **Agent-to-agent messages** go only through wicket (boxes have no network to reach each other). A
 sender calls `send_message(to, body)` on its gateway. wicket sets the sender from the socket (an agent
@@ -391,7 +395,8 @@ A message is therefore delivered only if:
 2. its zone is the zone wicket put it in;
 3. it was addressed to this recipient.
 
-Bodies are the sender's data, shown to the recipient as such. Typed gates (§4.3) narrow them further.
+Bodies are the sender's data, shown to the recipient as such. (Typed gates that would narrow them
+further are deferred, §22.)
 
 **PoC status (2026-11-08).** Built: the issuer (`wicket identity issuer`), per-run identity documents
 (EdDSA JWS) with keys held by `wicket run`, `whoami`, `send_message`, `await_message`, `spawn_agent`
@@ -488,206 +493,63 @@ member, and gets its own record, sockets and signatures.
 These types live in `wicket-core`. It has no I/O and is the most heavily property-tested crate. Detail and
 rationale: [03 §7.5].
 
-### 4.1 Resources and capabilities
+### 4.1 Resources, ceilings and grants
 
-```rust
-pub struct ResourcePath(Vec<SmolStr>);       // ["repo","acme/api","ref","main","path","infra","ci.yml"]
-pub enum ResourcePattern { Exact(ResourcePath), Prefix(ResourcePath), OneLevel(ResourcePath) }
-#[derive(PartialOrd, Ord)]
-pub enum RiskClass { R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege }
+What a box may do is a **Biscuit token** held by its node (§2.1). Block 0 is the box's ceiling. It is
+compiled when the token is minted, from the org policy, the zone's policy and their forbids, which are
+written in Cedar ([policy](../reference/policy.md)). Each grant adds a block. Every request is checked
+against every block, and the ledger's use counts and revocations must agree too:
 
-pub struct Capability {
-    pub provider: ProviderId,
-    pub resources: ResourcePattern,
-    pub verbs: BTreeSet<Verb>,
-    pub max_risk: RiskClass,
-    pub args: BTreeMap<SmolStr, Constraint>,  // closed world: unlisted args are denied
-}
-pub struct Budget { pub expires_at: Timestamp, pub max_uses: Option<u32>, pub egress_bytes: Option<u64> }
-```
+  `decide(op) = org ∧ every ancestor zone's reach ∧ live grant (where one is needed) ∧ ledger(uses, epoch, revocation)`
 
-`Constraint` is a closed vocabulary:
-- `Exact`, `OneOf`, `NotOneOf`, `Range`, `Prefix`, `Any`;
-- `IfPresent { then, otherwise }`, for optional arguments and resources (Fly's `resset.IfPresent`).
+wicket has no capability algebra of its own beside that. `wicket_core::subset` is a conservative,
+syntactic check of one zone against another. It is used only for **admission and explanation**: it
+refuses over-wide spawns and links and lists what an ask exceeds. A bug in it costs usability, never
+authority, because the token still narrows by construction.
 
-Numbers are strict: NaN, ±∞, and booleans passed as numbers are rejected [05 §10.2-12].
+Requests carry a risk class, R0 (read) to R4 (exec or privilege); unknown means R4
+([risk classes](../reference/risk-classes.md)).
 
-**Enforcement evaluates the whole chain on every `Op`** (Fly macaroon style) [08 §6 a2-2]:
-
-  `decide(op) = org ∧ every ancestor zone's reach ∧ live grant ∧ label rules ∧ ledger(uses, epoch, revocation)`
-
-`is_subset_of` (a syntactic, per-field check) is used only for **admission and explanation**: refusing
-over-wide spawns and asks, and rendering diffs. A bug in it then costs usability, never authority.
-
-**Cedar** expresses the human-authored layers (org ceiling, zone policy, dangerous-pattern `forbid`s). The
-algebra→Cedar compiler is in the TCB. It is differentially tested: Cedar `is_authorized` against
-`wicket-core`'s `decide`. Templates are linked before analysis (SymCC rejects templates, open attributes and
-`AnyEntity`), and `OneLevel(p)` compiles to `like "p/*" && !like "p/*/*"`, because `*` crosses `/`.
-
-**`cedar-policy-symcc`** (pinned together with `cedar-policy`, with a cvc5 sidecar; a timeout means fail)
-proves the slow properties off the hot path:
-- child ⊆ parent at zone creation;
-- whether a policy change narrows (automatic) or widens (needs a decision);
-- whether a generated adapter is narrower than the conservative default and disjoint from the dangerous
-  list.
+**`cedar-policy-symcc`** (pinned together with `cedar-policy`; a timeout means fail) proves properties
+off the hot path, in CI: whether a policy change narrows (automatic) or widens (needs a decision), and
+whether a generated adapter is narrower than the conservative default.
 
 ### 4.2 Labels
 
-```rust
-pub struct Label { pub conf: BTreeSet<DataClass>, pub taint: BTreeSet<SourceTag> }  // join = (∪, ∪); ∅ taint = trusted
-pub enum Capacity { Bool, Enum(u16), Int { min: i64, max: i64 }, BoundedStr(u32), Handle }
-```
+Deferred (§22): information-flow labels on data and agents. Taint tracking starts as a one-bit,
+opt-in zone flag (#27).
 
-- **Unknown is not trusted.** Ingress that no adapter labels gets the explicit taint `unknown`, never ∅.
-  Assigning provenance is itself part of the TCB. [05 §10.2-9]
-- **Third-party tool descriptions are taint** for the zone that sees them, as are agent context files
-  (`CLAUDE.md`, `AGENTS.md`, `AGENTS.override.md`, `.agents/skills`, per adapter). [05 §10.2-10, 11 §3.7]
-- **Server-asserted metadata is never a policy input.** MCP annotations, an upstream's `_meta.ifc`, and
-  classification fields the caller supplies may only *raise* labels, never lower them or grant anything
-  [08 §6 a2-8]. GitHub's MCP server `pkg/ifc` label table seeds the GitHub adapter's default labels.
+### 4.3 Zones
 
-- An agent's label **floats up** as it reads (the gateway and proxies join each response's label into the
-  agent), capped by its zone's `clearance` and `taint_admit`.
-- **No writing down:** an `Op` to a destination is denied unless the destination's clearance covers the
-  agent's `conf`.
-- **Integrity per risk:** a zone says which taint may be present when it performs an action of a given
-  risk (`action_taint_allow`). For example, a zone tainted with `web` may comment (R3) but not push (R2 with
-  `exec.ci`, which is R4).
-- **Per-argument stance, not only per-agent** [05 §10.2-1, 10.2-2]. Adapters mark each parameter as
-  *content* (a body, a message, file contents) or *sink* (recipient, target repo or ref, URL host,
-  @mention, amount).
-  - A content argument may carry untrusted data. Better still, it can be a **handle** the gateway
-    substitutes at dispatch, after checking the handle's label against the destination's clearance.
-  - A sink argument on any R2+ `Op` must trace to the trusted task text, the manifest, a typed gate field
-    or a live grant, *and* the agent's taint must be inside `action_taint_allow`. Otherwise the `Op`
-    becomes pending.
+A **zone** is the boundary a box runs in: its reach, forbids, injected credentials, model budget,
+limits and isolation, declared in the manifest ([manifest](../reference/manifest.md#zone)). A child's
+zone is within its parent's (§5.1). A zone can hold many agents, each in its own box.
 
-  This makes "the PR body may be untrusted, the target repo must be trusted" expressible, and it is the
-  main lever against label creep. Strict per-agent IFC alone cost SPA about half its utility.
-- **Provider-side state is memory.** The gateway records a label for every resource it allowed a write to,
-  and applies it to later reads. Adapters give pessimistic default labels for resources wicket has never
-  seen written. [03 §5.3]
+Boxes share nothing directly. They talk through messages, which the receiver's `accept_from` admits
+(§3.2), and through links (§8.2). A link lends the connector the target's authority, so the target's
+reach must be within the connector's, or a human approves it.
 
-### 4.3 Zones, gates, handles
-
-```rust
-pub struct Zone {
-    pub id: ZoneId, pub name: String, pub parent: Option<ZoneId>,
-    pub reach: CapabilitySet,                 // ⊆ parent.reach
-    pub clearance: BTreeSet<DataClass>,       // what it may see
-    pub taint_admit: BTreeSet<SourceTag>,     // what untrusted input it may ingest at all
-    pub action_taint_allow: BTreeMap<RiskClass, BTreeSet<SourceTag>>,
-    pub send: Vec<Destination>,               // where it may send
-    pub stores: Vec<StoreId>,                 // task-scoped memory, deleted at task end
-    pub auto_max_risk: RiskClass,             // ceiling of the auto tier
-    pub ratchet_budget: u32,                  // cumulative-grant budget before forced human review
-    pub sandbox: SandboxRequirement,          // isolation floor, snapshot need
-}
-pub enum GateRule {
-    TypedFields { schema: Vec<(SmolStr, Capacity)>, endorse: BTreeMap<SmolStr, Endorsement> },
-    HandlesOnly,
-    QuarantinedReader { output: Vec<(SmolStr, Capacity)> },   // capability-less LLM extracts typed fields
-    Declassify { by: Decider, to: Label },
-    HumanApproval,
-}
-pub struct Gate { pub from: ZoneId, pub to: ZoneId, pub rules: Vec<GateRule> }
-pub enum Endorsement {
-    Validator(ValidatorRef),   // trusted check against trusted state, e.g. "names a file in the repo tree"
-    CleanRerun,                // a fresh child admitting only trusted inputs must produce the same value
-}
-pub struct Handle { pub id: HandleId, pub origin: AgentId, pub label: Label, pub schema: Option<SchemaRef>,
-                    pub expires_at: Timestamp, pub entry: Option<(SessionRef, EntryId)> }  // transcript-entry handles
-```
-
-**Gates carry typed fields and handles only, on every edge**, including `wicket.spawn` inputs, child status
-and **errors** (enums plus labelled handles). The reason: a forged "error" relayed by a child got
-arbitrary code run 58–90% of the time [05, MAS hijacking].
-- Any free text an adapter forwards joins the child's taint into the parent.
-- A `BoundedStr` from a tainted zone longer than a small N must pass a trusted validator; otherwise it
-  becomes a handle.
-- Endorsement always needs a validator or a clean re-run, never just a low-capacity type. That is stricter
-  than FIDES, which described endorsement but didn't evaluate it; SPA forbids it outright.
-- The quarantined reader returns typed fields plus `enough_information: Bool`, with no free-text error
-  channel.
-
-A **handle** is an opaque reference to content in the store (transcript, diff, report). A parent can pass
-it to another child or to the final output without reading it. Dereferencing a handle joins its label into
-the reader: that is how creep is made explicit rather than avoided.
-
-**Agents live in zones.** An agent is a durable identity (§13) with a *home zone*: its standing ceiling.
-A zone can hold many agents, which can collaborate on one work item, in separate sandboxes or as a crew
-in one sandbox (§13.7). Uniform swarms are one zone; non-uniform swarms are several zones joined by
-gates.
+Typed gates between zones and opaque handles are deferred (§22).
 
 ---
 
 ## 5. Tasks and the manifest
 
-A task is a **manifest**: trusted task text plus a zone/gate graph. It is the human-facing artifact and
-what humans approve. Example, the split from the brief:
+A task is a **manifest**: the workload (an agent, with its harness and task text, or a program) and the
+zone it runs in. It is the human-facing artifact and what humans approve. Every field is in the
+[manifest reference](../reference/manifest.md), and `examples/` has working ones. The task text is
+trusted. Nothing the agent fetches is.
 
-```yaml
-# tasks/fix-flaky-sync.yaml
-task: fix-flaky-sync
-text: |                                   # TRUSTED. The only input to policy derivation.
-  tests/test_sync.py::test_reconnect in acme/api is flaky. Find the cause, fix it,
-  and open a PR against main. Upstream docs for the websocket library may help.
-org: acme                                 # org ceiling + data classes + who may approve what
-data_classes: [acme.source]
+### 5.1 Spawning: agents construct zones
 
-zones:
-  research:
-    agent: claude-code
-    sandbox: { isolation: process }
-    reach:
-      - { provider: github, resources: "repo/acme/api/**", verbs: [read] }
-      - { provider: net, resources: "host/websockets.readthedocs.io/**", verbs: [read] }
-    clearance: [acme.source]
-    taint_admit: [web, repo-content]
-    send: []                              # can't write anywhere external
-  fix:
-    agent: claude-code
-    sandbox: { isolation: process }
-    reach:
-      - { provider: github, resources: "repo/acme/api/**", verbs: [read] }
-      - { provider: github, resources: "repo/acme/api/ref/wicket/fix-*/**", verbs: [contents.write] }
-      - { provider: github, resources: "repo/acme/api/pulls", verbs: [create] }
-    clearance: [acme.source]
-    taint_admit: [repo-content]           # no web: a poisoned docs page can't reach a push
-    action_taint_allow: { R2: [repo-content] }
-    send: [{ id: github-acme-api, clearance: [acme.source] }]
-
-gates:
-  - from: research
-    to: fix
-    rules:
-      - typed:
-          cause: { enum: [race, timeout, ordering, env, unknown] }
-          file:  { bounded_str: 200 }      # endorsed only if it names a file in the repo
-          line:  { int: [1, 100000] }
-          notes: handle                    # free text stays behind a handle
-```
-
-`wicket explain tasks/fix-flaky-sync.yaml` answers the human question mechanically: *"If `research` is
-compromised: it can read acme/api and the docs host and send nowhere. It can influence `fix` only via
-{cause: 5 values, file: ≤200 chars endorsed against the repo tree, line}. `notes` is unread unless `fix`
-dereferences it, which taints `fix` with `web` and blocks its pushes."*
-
-### 5.1 Static and dynamic topology
-
-- **Static:** wicketd runs the manifest's graph directly. Zones run in dependency order, and outputs flow
-  through gates.
-- **Dynamic** (PoC: `spawn`, with `max_children` in the agent spec): a zone may be granted the
-  `wicket.spawn` tool in its MCP gateway. A parent calls
-  `spawn(zone_template, task_text, inputs: [handle…])`. wicketd checks child ⊆ parent and admits only
-  handles and typed values as inputs. **The child's task text inherits the parent's label.** It is only as
-  trusted as the parent, and re-derivation for the child's escalations runs against the chain of task texts
-  back to the root, each with its label.
+An agent with `max_children` gets the `spawn` tool in its MCP gateway. It starts a child, an agent or a
+program, in a zone the parent writes. The child's task text comes from the parent, so it is only as
+trusted as the parent.
 
 **Agents construct zones** (owner, 2026-11-09: as long as the new zone's permissions are a subset of the
 agent's own; a human with that much access can approve an extension). Built:
 - **`spawn` starts an agent (task) or a program (command, possibly a long-running service)** in a zone the
-  caller writes.
+  caller writes. `spawn_agent` is a narrowing of `spawn` (#255).
 - **`wicket_core::subset` proves the zone is within the caller's,** conservatively; anything it can't prove
   is a violation, and every violation is listed. It checks:
   - reach: host, method and path, each covered by a parent rule;
@@ -707,7 +569,7 @@ agent's own; a human with that much access can approve an extension). Built:
 
 **Humans are principals under the same rules** (owner, 2026-11-09): an identity, an authority (by default
 everything) and audited, signed actions. An approval is a principal delegating part of its own authority,
-accepted only within it (#11).
+accepted only within it (#11). Agents decide their descendants' requests the same way (§11).
 
 Also recorded as issues:
 - MCP servers per zone, granted by the creator within its own access (#9);
@@ -718,27 +580,8 @@ Also recorded as issues:
 
 ### 5.2 Policy derivation
 
-The proposer is an LLM, so it **chooses among vetted templates; it never writes policy** [05 §10.2-6:
-MiniScope, AutoCedar, ceLLMate, Conseca]:
-1. **The proposer instantiates adapter-defined capability templates**, one rationale per line. It never
-   writes raw capabilities or Cedar.
-2. **A deterministic solver** computes the minimal capability set covering those templates, and the
-   minimal *native* scopes (GitHub App permissions from endpoint coverage, never from scope names or an
-   LLM). Generation runs in two phases: sufficiency first, then a tightness audit.
-3. **Humans approve floors and ceilings per task class × agent kind**, and symcc certifies
-   *floor ⊆ manifest ⊆ ceiling*. Inside that band the manifest needs no fresh human review.
-4. **The proposer's view is an explicit, labelled manifest field.** By default it holds the task text, the
-   org's data classes and the adapter catalog, and **nothing fetched** (CaMeL's rule). It may opt in to
-   repo file names and similar context, labelled as attacker-influenced. ActPlane found 74% of policies
-   needed some repo context to be concrete, so the utility cost of the strict default is measured, not
-   assumed. The proposer never sees third-party tool descriptions.
-5. **Hand-off detection.** Tasks that delegate control to data ("do what issue #12 says") are flagged.
-   They get an R1-capped tainted zone or human review. The proposer also emits a **data-minimisation set**:
-   what gets mounted or exposed at all.
-6. **Learning.** Each manifest a human approves (and each approved escalation) feeds that task class's
-   defaults. Approved deviations never write themselves back into standing policy (DRIFT does that).
-   The diff between proposed and approved manifests is logged, which is the brief's 20-task
-   over/under-grant experiment run continuously.
+Deferred (§22): an LLM manifest proposer choosing among vetted templates, with ratchets on cumulative
+grants. Manifests are written by people, or by agents within their own authority (§5.1).
 
 ---
 
@@ -765,7 +608,7 @@ loopback forwarders like Claude Code.
 
 **Claude Code adapter details from the Agent SDK hosting guide** [17 §3]: auto-memory loads regardless of
 `settingSources`, so the LaunchPlan sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`; each zone gets its own
-`CLAUDE_CONFIG_DIR`; there is no session timeout, so §13.8 budgets must cover it; and
+`CLAUDE_CONFIG_DIR`; there is no session timeout, so the zone's `limits.timeout` must cover it; and
 `CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` is a usable stall signal.
 
 ```rust
@@ -781,11 +624,11 @@ pub trait InnerAgent: Send + Sync {
 #[async_trait]
 pub trait AgentSession: Send {
     async fn start(&mut self, prompt: TaskPrompt) -> Result<()>;
-    fn events(&mut self) -> BoxStream<'_, AgentEvent>;        // normalised, size-bounded, free text as handles; AgentState::Settled
+    fn events(&mut self) -> BoxStream<'_, AgentEvent>;        // normalised, size-bounded; AgentState::Settled
     async fn answer(&mut self, req: PermissionReqId, d: AgentDecision) -> Result<()>;
     async fn send(&mut self, msg: HostMessage) -> Result<()>; // steer / follow-up, e.g. "R-123 granted; retry"
     async fn checkpoint(&mut self) -> Result<ResumeToken>;
-    async fn finish(self: Box<Self>) -> Result<AgentOutcome>; // typed fields (schema-validated) + labelled handles
+    async fn finish(self: Box<Self>) -> Result<AgentOutcome>; // typed fields (schema-validated) + outputs
 }
 ```
 
@@ -819,8 +662,8 @@ pub trait AgentSession: Send {
 
 **Launches.** Common to all three: no model credential in the box, only a zone- and session-bound
 placeholder. The model base URL points at the LLM proxy, and `HTTPS_PROXY` plus the CA env vars point at
-the egress proxy. The only MCP server is the wicket gateway. Repo context files are labelled as taint. The
-agent's state dir sits inside the zone's labelled state.
+the egress proxy. The only MCP server is the wicket gateway. Repo context files are untrusted. The
+agent's state dir sits in the box's own state (`/wicket/state`).
 - **Claude Code** ([01 §4.4]):
   - `ANTHROPIC_BASE_URL` plus a placeholder `ANTHROPIC_AUTH_TOKEN`;
   - nonessential traffic, auto-update, telemetry and claude.ai connectors off, so it needs **no internet
@@ -828,7 +671,7 @@ agent's state dir sits inside the zone's labelled state.
   - `--strict-mcp-config`;
   - root-owned managed settings (`allowManagedHooksOnly`, `allowManagedMcpServersOnly`, deny rules
     mirroring the ceiling);
-  - `CLAUDE_CONFIG_DIR` in labelled state, auto-memory off.
+  - `CLAUDE_CONFIG_DIR` in the box's state, auto-memory off.
 - **Codex** ([11 §5.1]):
   - root-owned `/etc/codex/requirements.toml` pins `model_provider = "wicket"` (Responses wire, base URL =
     LLM proxy, websockets off), allows only the gateway MCP server, disables remote control, web search,
@@ -894,8 +737,8 @@ It:
   hosted `web_search_call`);
 - classifies cache-warm and model-refresh requests as not proving liveness.
 
-**wicket's own LLM calls are different.** These are the manifest proposer, the parent-tier re-derivation,
-quarantined readers and the adapter generator. They go through a small Rust `Model` trait implemented over
+**wicket's own LLM calls are different.** The only one designed is the adapter generator (§10); an LLM
+manifest proposer and quarantined readers are deferred (§22). They go through a small Rust `Model` trait implemented over
 the LLM proxy's upstream module, Claude by default, and each gets a fresh context containing only the
 trusted inputs its role allows. No third-party LLM library sits in the TCB; pi-ai's context and compat
 design is borrowed, not its Node code [11 §3.5].
@@ -967,7 +810,7 @@ backend whose capabilities satisfy both (§7.1). `EgressMode` deliberately has n
 
 **Isolation floor.** The `process` tier shares the host kernel the way containers do, and frontier models
 escape misconfigured containers (SandboxEscapeBench [05]). So:
-- **gVisor (or a microVM) is the default floor** for any zone with valuable reach, clearance or labels,
+- **gVisor (or a microVM) is the default floor** for any zone with valuable reach or data,
   and for every third-party MCP server.
 - `process` is for development, M1, and low-value zones.
 - On production hosts the vault and `wicketd` never share a kernel with process-tier boxes.
@@ -1016,8 +859,8 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
 **Workdir and output:** the base repo is a read-only lower layer, and the agent writes to an upper layer.
 `extract(Patch)` computes the diff host-side, in user space; we never mount a guest-written image with the
 host kernel. Host-side git runs with `core.hooksPath=/dev/null`, so the workdir's `.git` is never
-executed on the host. Launch-time path scans are not protection. The diff becomes a labelled handle, and
-its taint survives `extract` up to any push or merge, because code is delayed execution. Its *summary*
+executed on the host. Launch-time path scans are not protection. The diff is untrusted, and
+stays so up to any push or merge, because code is delayed execution. Its *summary*
 (files touched, test result) crosses gates as typed fields. After an approved file escalation, a later
 `Instance::grant_fd` can inject the opened file via `SECCOMP_IOCTL_NOTIF_ADDFD` without a restart (nono).
 
@@ -1030,8 +873,8 @@ its taint survives `extract` up to any push or merge, because code is delayed ex
 4. For long waits, detach the upper layer.
 
 Each snapshot is **restored at most once**, and the source is never resumed. Lower layers are pinned by
-digest, and restore is refused on mismatch. RNGs are reseeded after any restore. Snapshot images carry the
-zone's `conf` label and count against a disk budget. Resume uses the agent's own resume path.
+digest, and restore is refused on mismatch. RNGs are reseeded after any restore. Snapshot images count against a
+disk budget. Resume uses the agent's own resume path.
 
 ### 7.1 Startup and efficiency
 
@@ -1046,8 +889,8 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
    on the node and mounted read-only. Per-sandbox state is a thin overlay or copy-on-write upper layer.
    Lazy image pulling (stargz, SOCI or nydus) for big images on cluster nodes.
 2. **Warm pools, claim-then-bind.** Pristine sandboxes are pre-created with nothing identifying in them.
-   On claim, wicket binds the identity: listener fd / socket, per-zone CA, placeholders, mounts and
-   labels. So a pooled sandbox can't carry one task's identity or state into another. [07]
+   On claim, wicket binds the identity: listener fd / socket, per-zone CA, placeholders and
+   mounts. So a pooled sandbox can't carry one task's identity or state into another. [07]
 3. **Snapshot clones.** Boot an MCP server, or an agent up to "ready", once; snapshot it; restore clones
    from that snapshot. Firecracker restores in milliseconds with copy-on-write memory shared across clones,
    and gVisor checkpoint/restore plays the same role without KVM. After restore, reseed RNGs and rotate
@@ -1056,10 +899,10 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
 4. **Right-sized enforcement.** The proxies and gateway are per node, not per sandbox, so a sandbox adds a
    listener and some ledger rows, not a process. Codemode (Wasm or V8 isolates) serves tool-only zones in
    microseconds to milliseconds.
-5. **Direct launch on the hot path** (§8.3). The Kubernetes pod path promises only a 5 s p99 *before*
-   image pull, and CNI setup alone can double that under concurrency. A bare namespace jail took about 3 ms
-   on this box. So agent sandboxes and per-task MCP instances are launched directly by `wicket-node`.
-6. **No cross-tenant memory dedup.** KSM across zones with different labels is a timing side channel, so
+5. **Direct launch on the hot path.** A node starts boxes itself, through Docker's Engine API with
+   `runsc` (#312), not through a scheduler. The Kubernetes pod path promises only a 5 s p99 *before* image
+   pull, and CNI setup alone can double that under concurrency [10 §4].
+6. **No cross-tenant memory dedup.** KSM across zones is a timing side channel, so
    it is allowed only within a trust class. Explicit snapshot copy-on-write sharing is preferred.
 
 **Reference numbers** [10 §4.1]:
@@ -1155,7 +998,8 @@ Full mediation is the default, but some zones need raw speed. `zone.network` tak
 **Policy:**
 - `filtered` and `direct` give up per-request control and audit for unsteered traffic, and `direct` makes DNS an
   exfiltration route again. They're only for zones with nothing confidential to leak (no private
-  repositories, confidential volumes or tenant data), and only a human grants them.
+  repositories, confidential volumes or tenant data), and only by a grant (#63) from a principal whose
+  policy lets it grant one (#50).
 - By the subset rule a zone can't give a child a more open mode than its own.
 - The zone view and approval cards say "open internet".
 - With taint tracking (#27), a `direct` zone counts as an untrusted source.
@@ -1168,74 +1012,29 @@ Full mediation is the default, but some zones need raw speed. `zone.network` tak
 
 Measure before reaching for `direct`.
 
-## 8. Infrastructure: hosts, placement and isolated services
+## 8. Infrastructure: nodes, placement and money
 
-*Draft. Owner requirement 2026-11-08. Kubernetes, provider and billing research is in
-[`research/10-infrastructure.md`](research/10-infrastructure.md); the details here firm up once it lands.*
+*Owner requirement 2026-11-08. Provider and billing research is in
+[`research/10-infrastructure.md`](research/10-infrastructure.md). What is built is in
+[nodes](../reference/nodes.md) and `crates/wicket-placement`.*
 
-**Requirement.** wicket provisions and manages what code runs on:
-- hosts: this machine, cloud VMs, bare metal, hosted sandbox services;
-- the sandboxes on those hosts;
-- long-running **isolated services**, for example third-party MCP servers, each in its own container or
-  VM, isolated from each other.
+**Requirement.** wicket provisions and manages what code runs on: **nodes** (the control host, the
+operator's own machines, cloud VMs) and the boxes on them. The control host is a node like any other.
 
 Provisioning costs money and adds attack surface, so it is an authority domain like any other: it goes
 through `Op`s, policy, budgets and escalation.
 
 ### 8.1 Everything that runs is a workload
 
-```rust
-pub enum WorkloadKind {
-    AgentSandbox { zone: ZoneId },
-    McpServer   { server: McpServerRef, scope: InstanceScope },   // third-party server, pinned image + tool hashes
-    Codemode    { zone: ZoneId },
-    NodeService (NodeService),                                     // per-host egress/LLM proxy, gateway shard
-    Fixture     { purpose: SmolStr },                              // e.g. adapter test org runners
-}
-pub enum InstanceScope { PerTask, PerZone, Shared }
-pub struct Workload {
-    pub id: WorkloadId, pub kind: WorkloadKind,
-    pub sandbox: SandboxRequirement,           // isolation floor, snapshot need (§7)
-    pub reach: CapabilitySet,                  // its OWN egress, via the proxy and adapters
-    pub placement: Vec<PlacementConstraint>,   // §8.3
-    pub lease: Lease,                          // TTL; nothing runs without one
-    pub label: Label,                          // join of everything it has served
-}
-```
+A **workload** is what runs in a box: an agent, or a program, which is an agent with no model that may
+not ask (#255). Every workload gets the same box, proxies, identity and audit. It runs on a node chosen
+by placement (§8.3), under a lease or the control host's own capacity, and never without a lifetime.
+Third-party MCP servers as their own workloads (service zones) are deferred (§8.2, §22).
 
-Agent sandboxes from §7 are one kind of workload. Every kind is placed the same way, through Kubernetes (§8.3).
+### 8.2 Links between boxes
 
-### 8.2 Isolated MCP servers (service zones)
-
-No surveyed project combines all four of: a server with no network route of its own, egress only through
-an inspecting proxy, credentials injected only at that proxy, and a gateway-owned non-TCP transport.
-ToolHive comes closest, and secrets go in environment variables everywhere [07 a.4, 08 §6 a3]. wicket's
-contract for a third-party MCP server:
-1. **One sandbox per (server, task, zone)**, under the same `Sandbox` trait as agents, with gVisor as the
-   floor. Its own UID, netns, mount view and cgroup; default limits 1 CPU and 512 MiB. Its own *server
-   zone*, whose reach is the server's manifest ∩ the calling zone's reach. It is pinned by image digest
-   next to its tool-description hashes. It is never shared across tasks or zones.
-2. **An empty netns.** The only route out is the egress proxy, with the sandbox's own CA. There is no
-   path to other servers, the agent, the host, the API server, metadata services or DNS.
-3. **Placeholders only.** The server is launched with an explicit minimal env; nothing is inherited.
-   Credential→host bindings come only from the vault and adapter, never from a caller (microsandbox-mcp
-   lets the calling agent choose which secret goes to which host: a confused deputy). A non-HTTP server
-   that must hold a secret gets a short-lived, narrowest-scope one, and the zone view marks it.
-4. **A gateway-owned transport, never TCP.**
-   - For stdio servers, `wicket-jail` hands the server's stdin/stdout fds to the gateway.
-   - For HTTP-only servers, streamable HTTP runs over a UDS bind-mounted out of the sandbox, or vsock on
-     Firecracker.
-
-   The gateway terminates MCP on both sides and forwards re-encoded messages.
-5. **The server's own egress is an `Op` of its server zone, carrying the invoking agent's label.**
-   Otherwise the server becomes a label-laundering deputy. With concurrent calls, the labels of all
-   in-flight callers are joined, which is another reason for per-task instances.
-6. **No runtime additions.** The server set is part of the approved manifest. Adding a server is an
-   escalation.
-
-Instance state is memory (§12). `PerTask` is the default. `PerZone` is for servers with expensive
-startup. `Shared` is only for servers declared stateless *and* restored from a clean template per task.
-Warm pools and snapshot clones (§7.1) make per-task instances cheap.
+Service zones, which run each third-party MCP server in its own sandbox with no route of its own, are
+deferred (§22). This section covers links.
 
 **Links between boxes (PoC, #6).** Boxes reach each other's ports only through links wicket relays:
 `expose(port)`, `connect(box, port)` (which returns `<name>.wicket.internal:<port>`), and `link(from, to,
@@ -1245,112 +1044,41 @@ lends the connector the target's authority, so the target's reach must be within
 (`subset::reach_within`), or a human approves. Each linked name gets an address from 198.18.1.1–32, added
 at box start, and a line in a hosts file wicket owns. Under gVisor the box can't offer a socket to the host,
 so wicket reaches into the target with `docker exec` per connection. Every link is audited and closes when
-cut, revoked at either end, or when either run ends. Labels don't cross links yet (no label mechanism).
+cut, revoked at either end, or when either run ends. Labels don't cross links (labels are deferred, §22).
 See `examples/links/`.
 
-### 8.3 Substrate: Kubernetes for capacity, direct launch for the hot path
+### 8.3 Placement
 
-*Owner direction (2026-11-08): use Kubernetes rather than build our own scheduler. Research 10 refines this
-into a hybrid, because the pod path is too slow and too limited for per-zone and per-task churn (§7.1).*
+Placement (`wicket-placement`) chooses the node a box runs on. Its backends are `Provider`s: the
+operator's own static hosts, reached over SSH, and Vultr. `Placer` enforces the same rules over any of
+them: owner tags (nothing untagged, or tagged `wicket-protected`, is ever listed or destroyed),
+idempotent creates, the money envelope and worst-case reservation (§8.5). A node runs boxes itself, by
+direct launch (§7.1), and decides their requests at the edge (§9.2.1).
 
-| Kubernetes does | `wicket-node` does (direct launch, inside reserved capacity) | wicket keeps |
-|---|---|---|
-| Nodes, node pools, autoscaling (cluster-autoscaler or Karpenter), node lifecycle and upgrades | Agent sandboxes and per-task MCP instances on the hot path: process jail, `runsc` or Firecracker launched directly, in under 300 ms | `Op`s, policy, ledger, escalation, labels, handles |
-| wicket's own services, and long-lived shared MCP services as gVisor pods | gVisor checkpoint/restore and Firecracker snapshots for parking, which the pod API can't do | Placement *compilation and verification*: which isolation, separation and region each workload requires |
-| L3/L4 policy for pods (Cilium default-deny) | Interface-less netns for direct-launched boxes, so there is no CNI to bypass | The money envelope, leases and billing-aligned release |
+Kubernetes placement, a `kube-rs` operator and reservation pods are deferred (#45, §22). Kubernetes would
+be one more `Provider`, and the ledger would stay the authority.
 
-- **How capacity is held.** `wicket-node` asks Kubernetes for capacity as **reservation pods**: pause pods
-  requesting the CPU and memory of N sandbox slots, including each tier's fixed overhead. The scheduler
-  and autoscaler then see the real load and add nodes. Inside a reservation, `wicket-node` launches and
-  recycles sandboxes freely.
-- **wicket is a `kube-rs` operator** for its CRDs (`NodePool`, `Workload`, `WarmPool`). The CRDs are desired
-  state, **never authority**: admission accepts only specs whose digest the ledger has approved, so editing
-  a CR can't skip human approval. The operator can't read Secrets cluster-wide.
-- **Untrusted pods**, where the pod path is used at all, run under a sandboxed `RuntimeClass` (gVisor, or
-  Kata on KVM pools), enforced by a `ValidatingAdmissionPolicy`. They get no service-account token, no
-  Kubernetes Secrets and no host mounts. Their only egress is the node-local proxy under Cilium
-  default-deny (`policyEnforcementMode=always`); `toFQDNs` rules would bypass TLS inspection. Payloads start
-  only after the endpoint's policy is realised. MCP pods get per-namespace deny-all, with ingress only from
-  the gateway.
-- **`kubernetes-sigs/agent-sandbox`** is an optional `Sandbox` backend: v1.0.10 but a `v1beta1` API with
-  near-weekly breaking changes, and default egress to the whole public internet. It runs with its network
-  policy unmanaged and Cilium in charge, for clusters where pod-path latency is acceptable (GKE warm pools
-  claim in about 200 ms).
-- Kubernetes adds a large TCB (API server, kubelet, CNI, runc; there were runc escape CVEs in November
-  2025). The privileged `wicket-node` DaemonSet is TCB too, as `wicket-jail` already is.
+### 8.4 Providers and billing
 
-### 8.4 Many clouds
+wicket must be able to run on anything from Vultr or Hetzner to GCP or AWS (owner, 2026-11-08), and
+clouds differ in the ways that matter to it: billing granule, idempotent create, signed node identity
+[10 §3]. So a provider's differences are **data** (`BillingModel`, in `wicket-placement::billing`) and the
+rest of wicket reasons about them:
+- **Idempotency** uses the provider's token where one exists. Otherwise it is tag-then-list-before-create
+  (Vultr).
+- **Billing** is modelled per provider, so leases end before the next paid unit (§8.5).
+- **Node trust** comes from enrolment: a one-time join token, a pinned host key, a node key and a
+  short-lived node certificate (§3.2 "Node identity"). The handshake is the same on every provider.
+- **Nodes hold no cloud credentials** and no long-lived upstream credentials. They keep in memory only
+  the secrets their runs fetched (#152).
 
-wicket must run on **anything from Vultr or Hetzner to GCP or AWS** (owner, 2026-11-08). Clouds differ in
-exactly the ways that matter to wicket [10 §3]:
-
-| | Vultr | Hetzner | AWS | GCP | Azure | Fly | E2B |
-|---|---|---|---|---|---|---|---|
-| Billing granule | per started hour | hourly | per second (60 s min) | per second (1 min min) | per second | per second | per second |
-| KVM | no | dedicated only | nested (Intel C7i/M7i/…) | nested (N4D and others) | nested (Dsv5/6, …) | no | — |
-| Idempotent create | no (tag + list) | no | `ClientToken` | `requestId` | named PUT | — | — |
-| Signed node identity | no | no | IID document, NitroTPM | identity JWT | attested data | no | — |
-| Confidential VMs | no | no | SEV-SNP (limited regions) | SEV-SNP/TDX (not London) | SEV-SNP, TDX | no | — |
-| Managed Kubernetes | VKE (no scale to zero) | — | EKS | GKE | AKS | — | — |
-
-So providers are **plugins behind one trait**, and their differences are **data** the rest of wicket
-reasons about:
-
-```rust
-#[async_trait]
-pub trait HostProvider: Send + Sync {             // wicket-provisioner: the ONLY holder of cloud credentials
-    fn id(&self) -> ProviderId;
-    fn catalog(&self) -> &[HostClass];           // plan, region, $/h, features {kvm, arch, gpu}, attestation level
-    fn billing(&self, class: &HostClass) -> BillingModel;   // granule, rounding, monthly cap, stopped-bills, min lease
-    async fn create(&self, intent: &Intent, class: &HostClass, boot: &BootConfig) -> Result<HostRef>; // idempotent by intent
-    async fn get(&self, h: &HostRef) -> Result<Option<ObservedHost>>;
-    async fn list_owned(&self) -> Result<Vec<ObservedHost>>;   // by owner tag only
-    async fn destroy(&self, h: &HostRef) -> Result<()>;        // refuses unowned or protected resources
-    async fn attest(&self, h: &HostRef, ev: &NodeEvidence) -> Result<AttestationLevel>;
-    async fn charges_since(&self, t: Timestamp) -> Result<Vec<ChargeLine>>;   // daily money reconcile
-}
-// impls, in order: Local (this host / a Mac), Vultr (via the provisioning broker on the control host), AWS, GCP, Hetzner,
-// then Azure, OVH, Scaleway, Latitude; Fly and E2B as "hosts of one" / hosted Sandbox backends
-```
-
-- **Idempotency** uses the provider's token where one exists (`ClientToken`, `requestId`). Otherwise it is
-  tag-then-list-before-create.
-- **Cluster modes are per pool**, not per installation:
-  - *managed* Kubernetes (GKE, EKS, AKS, VKE) where its pools fit;
-  - *k3s self-managed* on VMs from any provider. That is the default on Vultr and Hetzner, and wherever
-    pools must scale to zero.
-  - One wicket installation can span several clouds. Nodes join over **WireGuard + mTLS**, so wicket
-    doesn't depend on any provider's VPC.
-- **Node trust is graded.** Bootstrap uses cloud-init with a single-use, CA-pinned join token. The node
-  dials out (no inbound port) and refuses to register if any preflight probe fails (Landlock ABI,
-  seccomp, KVM, runsc). Trust is then graded by `AttestationLevel`:
-  - `ProviderApi`: Vultr and Hetzner, trust on first use, checked against the provider API;
-  - `InstanceIdentity`: signed documents on AWS, GCP and Azure;
-  - `Tpm`, `SevSnp`, `Tdx`: hardware attestation, later.
-
-  Whatever the level, a node then proves itself on every control connection with its node key and a
-  short-lived identity certificate from the issuer, and the control host proves the issuer key back
-  (§3.2 "Node identity"). That handshake is the same on every cloud and transport, so a stronger level
-  changes how the first certificate is earned, not how it is used.
-
-  Measured boot of `wicket-node`'s own image is the first hardware attestation worth building, because
-  it is what lets the vault release credentials to a node. High-sensitivity zones can demand
-  `AttestationAtLeast(SevSnp)`, which today means Azure, or AWS outside London.
-- **Credentials to nodes.** Nodes hold no cloud credentials and no long-lived upstream credentials.
-  Per-task native credentials are delivered only to that task's node, audience-bound to the node's
-  identity and held in memory. In v1 multi-host, the **LLM proxy is central**, so the model key isn't on
-  every node.
-- **Placement vocabulary** gains `Provider{allow, deny}`, `Region`, `Residency(jurisdiction)`,
-  `AttestationAtLeast`, `MaxCostPerHour` and `MaxLifetime`. Each constraint carries its provenance (org
-  policy, manifest, derived from labels, grant), so `explain` can say *why* a workload landed where it did.
-  Labels derive constraints automatically: for example, `customer.pii` ⇒ `Residency(UK)`.
-- **Upstream native credentials** use each cloud's narrowing mechanism: AWS STS session policies, GCP
-  credential access boundaries, Azure scoped role assignments (§9.4).
+Only Vultr and static hosts are built. A `HostProvider` across six clouds, graded attestation levels
+(instance identity documents, TPM, SEV-SNP, TDX) and placement by residency are deferred (§22).
 
 ### 8.5 Capacity, leases and money
 
-- **The provisioner is the only holder of cloud credentials.** It is a reconciler over desired state
-  (`NodePool` CRDs, or SQLite in local mode) with idempotent creates and owner-tagged resources.
+- **Placement is the only holder of cloud credentials.** The reconciler (`wicket reconcile`) makes the
+  provider match the ledger, the desired state, with idempotent creates and owner-tagged resources.
   Garbage collection only ever touches resources that carry wicket's owner tag.
 - **Leases snap to the billing granule.** Under per-started-hour billing (Vultr), a host's
   `granted_until` stops at the paid-hour boundary ("minute 50" rule). Hosts are pooled within the paid
@@ -1359,38 +1087,24 @@ pub trait HostProvider: Send + Sync {             // wicket-provisioner: the ONL
 - **Money is reserved at the worst case.** A provisioning `Op` reserves `BillingModel::worst_case(rate,
   lifetime)` in the ledger before creating anything. A pool's `max × rate × 672 h` must fit the budget.
   A daily reconcile matches the ledger against `charges_since` from every provider, to the cent.
-- **The money envelope:**
-  - the auto tier applies only inside the pre-approved envelope (plans, providers, max $/h, max lifetime,
-    monthly cap);
-  - anything beyond it goes to a human, with the cost on the approval card;
-  - the monthly cap is a hard stop in the ledger.
+- **The money envelope** (`placement.yaml`: a maximum hourly rate over every owned node, and a maximum
+  total) is a hard limit. A request beyond it is refused, and no approval widens it. Inside it, every
+  paid node needs a human's approval, with the plan, rate and worst case shown.
 - **Agents can ask for capacity, never for credentials.** A cloud key would be an egress bypass,
-  persistence and money all at once. `wicket.request_capacity{isolation, kvm, gpu, duration}` is a typed
-  escalation; a grant is a *lease on capacity* inside the requesting zone.
+  persistence and money all at once. `request_capacity` is a typed request. A **lease** is a grant of
+  capacity (#253): a node for a time, its worst case reserved, held by the requesting run.
 - **On the control host during development**, the Vultr provider goes through provisioning-broker grants. wicket
   automates what the broker script does by hand, inside the existing $20/month cap.
 
-### 8.6 Modes and v1 scope
+### 8.6 Modes and scope
 
-| Mode | Where | Backends |
+| Mode | Where | State |
 |---|---|---|
-| **Single host, no Kubernetes** | laptops, this box, M1 | `process`, `gvisor` (Linux), `seatbelt` (macOS); same reconcilers on SQLite |
-| **Single-node k3s** | this box on demand (about 1.6 GB with gVisor and Cilium; agree with the host's operator, stop when idle) | direct launch + gVisor pods |
-| **Multi-cloud clusters** | production | per-pool managed or k3s; gVisor everywhere, Kata/Firecracker on KVM pools |
+| **Single host** | a laptop or one server; the control host is the only node | built (gVisor) |
+| **Control host and nodes** | static hosts and Vultr nodes, enrolled, over SSH | built |
+| **Kubernetes pools, many clouds** | production clusters | deferred (#45, §22) |
 
-v1 steps [10 §13]:
-
-| Step | Build | Where | Spend |
-|---|---|---|---|
-| I0 | placement vocabulary, compiler and verifier for local mode; `BillingModel` data for Vultr, AWS, GCP, Hetzner and Fly; leases; ledger `money` effect | this box | $0 |
-| I1 | `wicket-node` local: direct launch, unbound warm pools with claim-then-bind, per-task MCP instances; **measure every tier** | this box via the host's job-slot limits | $0 |
-| I2 | Vultr provider through the provisioning broker, host reconciler (adopt-or-destroy after a crash), WireGuard + mTLS join of a second node | Vultr London | ~$1–3/month |
-| I3 | operator, reservation pods, Cilium default-deny, gVisor RuntimeClass, optional agent-sandbox backend | k3s on this box, on demand | $0 |
-| I4 | Firecracker tier, snapshot clones with RNG reseeding | a Mac (M3 or later, macOS 15+) or an AWS `c7i-flex.large` with nested virtualization in London (~$0.10/h) | $0–1 |
-
-Later: GCP and Hetzner providers, managed Kubernetes pools, hosted Fly and E2B capacity, hardware
-attestation. Vultr bare metal waits until its billing is confirmed: the API says monthly ($185), the docs
-say hourly ($0.25).
+Later isolation tiers (Firecracker #64, macOS #47–#49) are per node and change nothing above it.
 
 ---
 
@@ -1420,7 +1134,7 @@ Detail: [04 §7].
 - **Acquired authority is quarantined** [05 §10.2-5]. Adapters declare the effects `mint.credential` and
   `create.principal`, with the response-field paths that carry authority: deploy keys, PATs, GitHub App
   creation, Actions secrets, IAM keys. The proxy or gateway moves those fields into the vault and returns a
-  placeholder or handle. Activating one is a separate ledger grant.
+  placeholder. Activating one is a separate ledger grant.
 - **Denials carry no tainted content** and list remedies (§9.5).
 
 ### 9.1 Egress proxy (`wicket-egress`)
@@ -1488,7 +1202,7 @@ Detail: [04 §7].
   `wicket.*` tool, codemode, any `call_tool`). Codemode gets step and call budgets.
 - **Four kinds of tools:**
   1. **Gateway-native tools generated from adapters** (preferred; wicket writes the descriptions).
-  2. **Third-party MCP servers as isolated service workloads (§8.2).** Their descriptions are pinned by
+  2. **Third-party MCP servers as isolated service workloads** (service zones, deferred: §22). Their descriptions are pinned by
      hash *and* treated as taint: hash pinning doesn't catch descriptions that were poisoned from the start
      (MCPTox). A changed definition is a policy change — automatic if it narrows, a decision if it widens.
      Admission is by mechanism (sandbox, egress, no secrets), not by scanner verdict.
@@ -1501,12 +1215,11 @@ Detail: [04 §7].
   agent's own control pipe where supported (Codex `dynamicTools`, ACP MCP-over-ACP, pi extension tools).
   The box then needs no network path to the gateway.
 - **`wicket.*` tools:**
-  - `spawn`, `await_grant(request_id)`, `read_handle`, `request_access(typed)`, `request_capacity(typed)`
-    (§8.5);
+  - `spawn`, `await_grant(request_id)`, `request_access(typed)`, `request_capacity(typed)` (§8.5),
+    `decide` (§11), `finish` and `hibernate` (§13.2); the full list is in
+    [MCP tools](../reference/mcp-tools.md);
   - `check_send(dest)` (a dry run);
   - `restrict(...)`, a zero-risk tool that lets the agent narrow its own policy, applied automatically.
-
-  Sink tools accept **handles as arguments**, and the gateway substitutes the content at dispatch (§4.2).
 
 ### 9.2.1 Decided at the edge: what a node still asks the control host (owner, 2026-11-12, #164)
 
@@ -1579,7 +1292,7 @@ What a node still sends the control host, and why:
   - AWS STS session policies;
   - Stripe restricted keys;
   - Cloudflare scoped tokens.
-- Native scopes are computed by the solver from endpoint coverage (§5.2).
+- Native scopes are computed from endpoint coverage (§10), never from scope names or an LLM.
 - Vault-to-provider auth uses workload identity federation where the provider offers it.
 - No token passthrough (MCP spec).
 
@@ -1665,8 +1378,8 @@ Detail, schema and six worked GitHub endpoints: [04 §4].
   never lower it. Generated rules start at `unknown` (R4).
 - **Resolvers** handle opaque IDs (declared lookups with a TTL, re-verified against the response).
   **Query rewrite** narrows over-broad reads; post-filtering is a marked fallback.
-- **Sink parameters are marked** (recipient, repo/ref, URL host, @mention, amount) for the per-argument
-  provenance check (§4.2). A `triggers` effect declares provider-side reactions (CI runs, notifications,
+- **Sink parameters are marked** (recipient, repo/ref, URL host, @mention, amount), for a per-argument
+  provenance check once labels exist (deferred, §22). A `triggers` effect declares provider-side reactions (CI runs, notifications,
   ChatOps), so `explain` can compute *authority*, not just permission.
 - **Examples are tests.** Every endpoint rule and dangerous pattern ships `examples.allow` and
   `examples.deny` requests, checked at load time and in CI (from Codex execpolicy).
@@ -1701,64 +1414,52 @@ Detail, schema and six worked GitHub endpoints: [04 §4].
 
 ## 11. Escalation
 
-Detail and state machine: [03 §7.4].
+Detail and state machine: [03 §7.4]. Every answer to a request is a **grant**: one record, made by one
+decide function (`grant::decide`), whoever decides and whatever the kind (#256).
 
 ```
-Received → Validated (typed, canonical, bound to Op digest) → Narrowed (narrowest grant covering the call) → Classify
-  ├ forbidden by org/dangerous list ─────────────────────────────────► Denied{reason, narrower_alt?}
-  ├ ⊆ zone ceiling ∧ risk ≤ auto_max ∧ provenance OK ∧ ratchet OK ───► Granted(Auto)
-  ├ ⊆ parent authority ∧ re-derivation(trusted task text) says yes ──► Granted(Parent)      [off in v1]
-  ├ outside parent authority ────────────────────────────────────────► PendingUp(grandparent … Human)
-  └ else ────────────────────────────────────────────────────────────► PendingHuman{binding_code, expires_at}
-PendingHuman → Granted | Denied | Expired          Granted → Active → Closed (uses | expiry | task end | revoke subtree)
+Received → Validated (typed, canonical, bound to the request) → Classify
+  ├ forbidden by org or zone ─────────────────────────────────────────► Denied (never allowed)
+  ├ within the zone's reach ──────────────────────────────────────────► Allowed, no grant needed
+  ├ escalation.request off in the asker's zone ───────────────────────► Denied (never allowed)
+  └ else ─────────────────────────────────────────────────────────────► Pending
+Pending → Granted | Denied | Expired, decided by the first principal whose authority covers it:
+  an ancestor agent with escalation.grant, within its own authority, or a human
+Granted → Active → Closed (uses | expiry | the run ends | revoke) ; renewable before expiry
 ```
 
-- **Field provenance:** each field of the request must trace to the task text, the manifest, a typed gate
-  field or an existing grant. A field that only the agent supplied (say, a repo name that appears nowhere
-  upstream) cannot be auto- or parent-granted. The same check applies to sink arguments on *every* R2+
-  `Op`, not just escalations (§4.2). The highest-success real attacks tamper with a value inside an allowed
-  capability: MCPTox parameter tampering at 72.8%, an out-of-scope parameter in MSB at 76.5% [05, 06].
+- **Who may ask and who may grant is policy** (#50): the zone's `escalation: { request, grant }`, both
+  on by default. A child never gets a right its parent lacks.
+- **Agents grant within their own authority** (#291). An ancestor agent may decide a descendant's
+  request (the `decide` tool) only if its own zone allows the request by reach at the request's risk,
+  and its org layer doesn't refuse it. Its grant is run-scoped, exact-path and bounded in uses, and it
+  ends no later than the granter's own authority. The check is deterministic; no LLM decides. SPAWN,
+  LINK, CAPACITY and UPDATE requests, prefix asks and git pushes stay with humans for now.
+- **Every grant has a lifetime** and may be renewed, never made unlimited (#56). A box's own authority
+  is a grant like the others, renewed the same way.
 - **The justification is `Untrusted<String>`.** It is stored and shown to humans, clearly marked, and never
-  given to an LLM decider.
-- **Grants are narrower than or equal to the ask** (RAR semantics): one file, not the repo; one use, not
-  standing access. Everything expires at task end at the latest.
+  given to an LLM.
+- **Grants are narrower than or equal to the ask** (RAR semantics): one path, not the host; one use, not
+  standing access.
 - **Ledger semantics** [05 §10.2-8, 06]:
-  - The ratchet and use counts are keyed by (task root, policy epoch), not grant id. Past
-    `ratchet_budget`, everything goes to a human with the full diff.
   - A single-use grant is consumed in the same transaction that forwards the request, after re-checking
-    revocation and the epoch. Every policy change bumps the epoch, and decisions carry a Zanzibar-style
-    consistency token against revoke and relabel races.
-  - Relational limits the per-capability check can't express live here: co-possession ("read secret XOR
-    publish") and cardinality.
-  - No standing grants for R3+. Children never inherit live grants or pending requests.
-  - A pre-approved request type is auto-granted only while the agent's taint is ∅.
-  - **Fresh per use** is a grant property (from Codex's `prompt-user` rules), default for R4 and `money`.
-    Such request types never count towards ratchet credit or fatigue promotion.
-- **Fatigue, carefully.** High approval rates measure habituation, not safety. Chrome's SSL warnings were
-  clicked through 70% of the time, and users attended to permission prompts 17% of the time and
-  understood 3% [06]. So a request type humans approve more than 95% of the time becomes a *candidate*
-  auto rule only if all of these hold:
-  - a second reviewer approves the promotion;
-  - it is not R3+ and matches no dangerous pattern;
-  - a shadow metric of seeded bad requests shows humans still catch them.
+    revocation.
+  - Children never inherit live grants or pending requests.
+- **Human channel:** asynchronous, so approval can happen on another device. Decisions come only from
+  wicket's own channels (CLI, console, the gateway's `decide` for agents), each signed: a passkey
+  assertion over the request digest in the console (§14.1). Vendor UIs such as Remote Control can
+  announce a request but never decide it.
 
-  A type humans mostly deny becomes an auto-deny.
-- **Human channel:** CIBA-shaped, so approval is asynchronous and can happen on another device. Decisions
-  come only from wicket-native operator channels (CLI, API, console) with a passkey assertion over the
-  request digest (§14.1). Vendor UIs such as Remote Control can announce a request but never decide it.
-- **v1 starts with the parent tier off** (auto or human only), and measures in shadow mode what it would
-  have decided. The evidence is DRIFT's ablation: letting an LLM validator widen policy raised attack
-  success from 2.14% to 5.41%, for about 15 points of utility [05]. Adaptive attacks break LLM-based
-  defences generally (*The Attacker Moves Second*). (Progent's 3.9% ASB figure, cited in v0.1, measures
-  something else and is inflated by ASB's forced attack-tool injection [06].) If the parent tier is ever
-  turned on, it gets a mechanically checked limit on what it may approve (no endorsement, at most R2),
-  with each ruling bound single-use to the exact call.
+Deferred (§22): an LLM parent tier that re-derives a request from the trusted task text, field
+provenance on sink arguments, ratchets on cumulative grants, and auto rules promoted from approval
+history. DRIFT's ablation is why the LLM tier stays out: letting an LLM validator widen policy raised
+attack success from 2.14% to 5.41% [05].
 
 ### 11.1 Who a request is for (owner, 2026-11-08: "a user can't approve a grant if it doesn't know who it's for")
 
 Every pending request names who asked, and the human sees it before deciding.
 - **Across sandboxes** this is exact: the identity is the socket (§3.2).
-- **Inside one sandbox** (Claude Code's subagents and agent teams, Codex threads, a crew) it is reported,
+- **Inside one sandbox** (Claude Code's subagents and agent teams, Codex threads) it is reported,
   not proven. wicket reads the agent's own event stream outside the box. For Claude Code, every subagent
   tool call carries `parent_tool_use_id`, which points at the `Agent` call that started the subagent, with
   its type and description. wicket matches a blocked request to the calls in flight: exactly one call
@@ -1786,11 +1487,10 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   - the agent's own config directory (`CLAUDE_CONFIG_DIR`, transcripts);
   - the workdir;
   - caches and logs;
-  - provider-side state (the gateway's label store);
+  - provider-side state;
   - wicket's own learned artifacts.
-- Default: everything an activation writes is **staged**. What persists across sleep is decided by the
-  agent's promotion gate (§13.4), and the label stays attached. One-shot agents (`delete_when_done`) keep
-  nothing.
+- What persists is what the box wrote to its workspace, state and durable volumes (§13.5). A promotion
+  gate for memory (§13.4) is designed, not built.
 - **wicket's learned artifacts** (adapters, default manifests, approval history) are produced only from
   trusted inputs or human decisions. The adapter generator never sees agent context; a manifest default
   only changes from a human-approved manifest or grant.
@@ -1798,109 +1498,88 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   agent, which is why those paths are dangerous patterns. Labelling them as taint is necessary but not
   sufficient, because the agent still obeys them: config-file injection worked against every provider
   tested [06]. So for refs that aren't trusted, preflight **removes** agent context files from the agent's
-  view (or exposes them only as handles), per each adapter's `context_files` list.
+  view, per each adapter's `context_files` list.
 - **The agent's own policy stores are memory:** Codex `$CODEX_HOME/rules/*.rules` and config writes, pi
   `trust.json`. They are read-only or discarded, and never fed from approvals.
-- **Taint recovery by forking.** Transcript entries carry labels (`(session, entry)` handles). When an
-  agent gets tainted, wicket can fork its session at the last clean entry (pi, Codex fork/rollback) instead
-  of discarding the run.
+- **Recovery by forking.** A tainted agent's session can be forked at a clean point instead of being
+  discarded (#177).
 - **Covert channels** (timing, sizes, file names, escalation request contents) are not closed. Escalation
   requests are rate- and size-limited, and anomalies are logged.
 
 ---
 
-## 13. Agent lifecycle: long-lived by default
+## 13. Agent lifecycle: long-lived, and the harness decides
 
-*Owner direction (2026-11-08): long-lived agents are the default. Agents are active for a while, go to
-sleep, hibernate, and are woken later. Agent garbage collection permanently removes agents and state no
-longer deemed useful. Refined by research 12 (OpenClaw) and 13 (Hermes), the two long-lived assistants
-studied.*
+*Owner direction (2026-11-08): long-lived agents are the default. Refined by research 12 (OpenClaw) and
+13 (Hermes), and by #249: the harness, not a wicket timer, decides when a run is done.*
 
 ### 13.1 Agent ≠ process ≠ task
 
 ```rust
 pub struct Agent {                       // the durable identity: outlives every process
     pub id: AgentId, pub tenant: TenantId, pub owner: PrincipalId,
-    pub home_zone: ZoneId,               // standing ceiling: reach, clearance, send
+    pub home_zone: ZoneId,               // standing ceiling: reach, limits
     pub charter: Versioned<TrustedText>, // standing instructions, operator-signed
-    pub kind: AgentKind, pub adapter_pin: semver::Version,
-    pub memory: Vec<MemoryStoreId>,      // versioned, labelled (§13.4)
-    pub subscriptions: Vec<Subscription>,// what may wake it (§13.2)
-    pub retention: RetentionPolicy,      // §13.6
+    pub harness: Harness, pub adapter_pin: semver::Version,   // the manifest's agent.harness (#255)
+    pub memory: Vec<MemoryStoreId>,      // versioned (§13.4)
     pub key: AgentKeyRef,                // per-agent data key, wrapped by the tenant key
     pub state: LifecycleState,
 }
 pub struct Activation {                  // one period of activity in one sandbox
-    pub id: ActivationId, pub agents: Vec<AgentId> /* one, or a crew (§13.7) */, pub woke_by: Wake,
-    pub work: Vec<WorkItemId>, pub sandbox: InstanceRef, pub lease: Lease,
+    pub id: ActivationId, pub agent: AgentId, pub woke_by: Wake,
+    pub work: Vec<WorkItemId>, pub sandbox: InstanceRef, pub authority: GrantId,  // renewable (#56)
 }
 pub struct WorkItem {                    // what used to be a "task": a unit of work delivered to an agent
     pub id: WorkItemId, pub assignees: Vec<AgentId>,   // collaboration on one work item is first-class
     pub text: TrustedText,               // from an authenticated operator or an operator-created subscription
-    pub payload: Vec<Handle>,            // event data: untrusted, labelled
+    pub payload: Vec<Digest>,            // event data: untrusted, in the store
     pub deadline: Option<Timestamp>,
 }
-pub enum Wake { OperatorMessage, Schedule(CronSpec), Event(SubscriptionId), AgentMessage(GateId), GrantDecided(RequestId) }
-pub enum LifecycleState { Active, Idle, Sleeping, Hibernated, Archived, Deleted(Tombstone) }
+pub enum Wake { OperatorMessage, AgentMessage(PrincipalId), GrantDecided(RequestId) }  // schedules and events are messages
+pub enum LifecycleState { Active, Hibernated, Archived, Deleted(Tombstone) }
 ```
 
-The old one-shot task is the special case: an agent whose retention is `delete_when_done`, with one work
-item. Manifests (§5) now describe an agent's home zone and its gates, or a team of long-lived agents; a
-work item runs inside that standing structure.
+The one-shot task is the special case: an agent that finishes after one work item. The sketch above is
+the design; what is built is the agent row described in §13.5.
 
 ### 13.2 Lifecycle
 
 ```
-            message / schedule / event / grant decided
-   ┌────────────────────────────────────────────────────────────────┐
-   ▼                                                                │
- Active ──no activity N s──► Idle ──M min──► Sleeping ──H h──► Hibernated ──D days──► Archived ──policy──► Deleted
- sandbox running             freeze; RAM      checkpoint or      snapshot, workdir,      snapshot dropped;   crypto-shred;
- model calls flowing         held; ~ms wake   snapshot on node   session, staged memory  charter, memory and  tombstone in
-                                              disk; ~s wake      pushed to object store; transcript handles  ledger + audit
-                                                                 node released           kept; cold rebuild
+            message (from an operator, another agent, or a decided request)
+   ┌──────────────────────────────────────────────┐
+   ▼                                              │
+ Active ──agent calls hibernate, or `wicket hibernate`──► Hibernated ──retention──► Archived ──► Deleted
+ box running, between turns too                         bundle in the store,       (designed, not built:
+                                                        node released              §13.6)
+ Active ──process exits (agent calls finish) | timeout | authority ends──► Ended
 ```
 
-- **Each step down frees resources and costs more to wake.** The thresholds are per plan and per agent,
-  and billing-aware (§8.5): a sleeping agent pins its node, a hibernated one pins only storage.
-- **Wake = restore or rebuild.** A snapshot is restored when it is compatible (same runtime version, CPU
-  features and lower-layer digests, §7). Otherwise the agent is **rebuilt**: a fresh sandbox from the base
-  image, plus the durable workdir, the approved memory version, and the agent's own session resume (Claude
-  `--resume`, Codex `thread/resume`, pi `--session-id`). Rebuild must always work; snapshots are an
-  optimisation. Every wake re-binds identity (claim-then-bind, §7.1). A **rebuild** gets new placeholders,
-  a new listener and a CA from the ceiling. A **memory restore** re-binds the old placeholders, and the
-  run's CA must outlive the snapshot, because the restored process already trusts it (research 22).
-- **Wake sources are explicit and authenticated:**
-  - an operator message (any operator channel, origin-labelled, §14.1.2);
-  - a schedule;
-  - an event subscription (a GitHub webhook received through the gateway, a queue);
-  - a message from another agent through a gate;
-  - a pending grant being decided.
-
-  Subscriptions are created by operators or granted like any capability. An agent can't subscribe itself
-  to arbitrary inputs.
-- **Vendor remote UIs:** an RC session past its resumability window is re-served on wake (§14.1.4).
+- **The harness decides when it is done** (#249). A run ends when its process exits, at its zone's
+  `limits.timeout`, or when its authority ends. wicket never ends, pauses or hibernates a run on a turn
+  boundary or an idle timer. The agent ends its session with the gateway's `finish` tool, which takes
+  effect at the end of its turn.
+- **Hibernation is asked for**, by the agent (`hibernate`) or an operator (`wicket hibernate`). It
+  happens at a quiet point. If something else still runs in the box, the agent goes on running, with
+  the reason recorded.
+- **A message wakes a hibernated agent**, so there is no separate wake source to configure. A schedule
+  or an event is a message from the principal that set it up (#250).
+- **Lifetimes are one renewable authority grant plus a hard timeout** (#56). A box nobody renews stops
+  when its authority ends.
+- **Wake = rebuild**: a fresh box from the base image, the bundle restored, and the agent's own session
+  resume (Claude `--resume`). Every wake re-binds identity and bumps the generation (§13.5). Restoring a
+  memory snapshot instead (gVisor checkpoint, #71) is an optimisation.
 
 ### 13.3 Authority across a long life
 
 - **Living long doesn't widen reach.** The home zone is a standing *ceiling*. What an agent can actually
   do is still decided per `Op`.
-- **Grants are scoped to a work item, not to the agent's lifetime.**
-  - Standing grants exist only up to the auto tier, within the ceiling, and are listed in the manifest.
-  - R3+ is always fresh per use (§11).
-  - There are two ratchets: one per work item, and a lifetime ratchet per agent. The lifetime ratchet
-    counts cumulative escalations since a human last reviewed the charter, and forces that review when
-    exceeded.
+- **Grants belong to the run that asked**, not to the agent's lifetime. Every grant has a lifetime, and
+  the agent's own authority does too (§11).
 - **Trusted text** is the charter (operator-signed, versioned) plus the current work item's text. For
   event-triggered work only the *subscription* is trusted, never the event. "Wake on a new issue and triage
-  it" is trusted; the issue's content is a labelled handle.
-- **Sleep is a declassification checkpoint, on rebuild only.** A memory restore keeps the agent's full label;
-  a rebuild or a forked session declassifies (research 22). Across a rebuilding sleep, the agent's floating
-  label resets to the join
-  of what it *keeps*: approved memory versions, the workdir and its session handles. Ephemeral context is
-  discarded at sleep unless it is promoted (§13.4). So a long life doesn't mean unbounded taint creep, and
-  a run tainted by one bad page can be ended by sleeping past it, or by forking the session at the last
-  clean entry.
+  it" is trusted; the issue's content is untrusted data.
+- **A rebuild starts from what the agent keeps** (§13.4), not from its whole past context. With labels
+  deferred (§22), that is a recovery point, not a declassification.
 
 ### 13.4 What an agent keeps
 
@@ -1908,16 +1587,15 @@ work item runs inside that standing structure.
 |---|---|---|
 | Charter | yes | Operator-signed versions; changing it is a policy change (narrowing is automatic, widening needs a decision) |
 | Memory stores: facts, notes, preferences, **skills** | yes, versioned | Writes during an activation land in a **staging layer**. A **promotion gate** decides what joins the next version: automatic for typed, low-risk facts within the label ceiling; quarantined-reader or human review for anything instruction-like (skills, procedures, "remember to…"). Every version is labelled, can be forked and rolled back, and each activation starts from a fork, so poison is undoable. |
-| Session and transcript | yes, as labelled handles; resumed on wake | Compaction is allowed; entries keep their labels |
+| Session and transcript | yes; resumed on wake | Compaction is allowed |
 | Workdir | yes | Copy-on-write upper layer made durable; git-backed where it's a repo |
-| Process and RAM state | only in the Idle and Sleeping tiers, and in hibernated snapshots | Dropped at archive |
+| Process and RAM state | only while Active (a memory snapshot, #71, would keep it) | Dropped at hibernation |
 | Caches | no | Rebuilt |
 | The agent's own config and policy files | no | Regenerated from the LaunchPlan on every wake |
 | Live grants, pending requests | no | Work-item-scoped; a pending request survives sleep only as a ledger entry that can wake the agent when decided |
 
 Self-improving agents that write their own skills (Hermes, OpenClaw) are exactly the case the promotion
-gate exists for. A skill is an instruction to every future activation, so it is never auto-promoted, and
-its label is the join of everything that shaped it.
+gate exists for. A skill is an instruction to every future activation, so it is never auto-promoted.
 
 ### 13.5 Durability
 
@@ -1943,7 +1621,7 @@ its label is the join of everything that shaped it.
   input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
-**Hibernate and wake (#70, 2026-11-12).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0), with `docker pause` for Idle.
+**Hibernate and wake (#70, 2026-11-12; #249).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0). The Idle tier and its `docker pause` were removed by #249.
 - The ledger has an agent row for each long-lived agent: its state, generation, session, manifest and head
   bundle.
   - A wake is a compare-and-set claim that bumps the generation.
@@ -1962,15 +1640,15 @@ its label is the join of everything that shaped it.
   (`experiments/bundle-formats/RESULTS.md`) measured the restic format storing 5–18× less after many
   sessions and saving incrementals 2–6× faster for Rust and Node trees, at the cost of a 0.x dependency,
   more memory, and restore safety wicket would have to add itself. Revisit if bundle size or save time
-  becomes the bottleneck.
+  becomes the bottleneck. Bundles, snapshots and versions are moving onto one content-addressed store
+  (#258, [store](store.md)).
 - The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
   recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
   messages can't buy it a fresh budget.
 - Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
-  box stays Idle.
+  agent goes on running, with the reason recorded.
 - Not built:
   - per-agent data keys and a signed `StateManifest` (sealing today uses the installation's one state key);
-  - the Sleeping tier (a stopped box with its state cached on the node);
   - the gVisor checkpoint (H2);
   - garbage collection;
   - hibernation for node and wrapped boxes.
@@ -1979,63 +1657,30 @@ Volumes inherit the zone's taint like any store (§12): whatever one run leaves 
 
 ### 13.6 Garbage collection
 
-- **Policy decides; the agent never does.** `RetentionPolicy` sets each tier's threshold (`idle_to_sleep` …
-  `archive_to_delete`), a storage cap, and whether the agent is `delete_when_done`. It comes from the plan,
-  the tenant and the agent, narrowest wins. Quota pressure can push agents down the ladder early.
-- **"No longer useful"** is computed from signals:
-  - no wake in N days;
-  - no inbound references: subscriptions, schedules, other agents' gates, handles shared with others;
-  - the owner is gone;
-  - the charter has expired;
-  - an explicit delete.
-- **Reversible until the last step.** Hibernate → archive (drops the snapshot) → delete. Before delete,
-  the owner is notified with a grace period, and inbound references are listed. A legal hold, or a live
-  cross-tenant gate that promised retention (§15), blocks deletion.
-- **Delete is crypto-shredding:**
-  - destroy the agent's data key, so every durable blob becomes unreadable, then delete the blobs;
-  - revoke grants, cancel schedules and subscriptions;
-  - write a tombstone into the ledger and audit log, keeping the hash chain intact without the content.
+Not built. **Ending, hibernating and waking are the harness's or an operator's decision** (#249), never
+a retention timer's. Garbage collection only reclaims what nothing needs any more:
+- **Bundles and blobs** go by mark and sweep from the digests the ledger and the store's refs name
+  ([store](store.md)).
+- **An agent** is archived (its bundle dropped) and then deleted when its owner or policy says so. That
+  is an explicit request, or a retention grant expiring, with a grace period and a notice to the owner
+  first.
+- **Delete is crypto-shredding** once per-agent data keys exist: destroy the key, then the blobs, revoke
+  grants, and write a tombstone into the ledger and audit log, keeping the hash chain intact.
 
-  GDPR erasure uses the same path. Shared derived copies follow their gate's terms.
+### 13.7 Several agents in one zone
 
-### 13.7 Several agents in one zone: teams and crews
+A zone can hold any number of agents, and several collaborating on one piece of work is a normal case
+(owner, 2026-11-08). Each runs in its own box, with its own identity, and they talk through messages
+and links (§4.3). They share the zone's ceiling, not their grants. An agent's own sub-agents (Claude
+Code's subagents and agent teams) are processes inside its box; to wicket they are part of that agent.
 
-A zone can hold any number of agents, and **several agents collaborating on one work item is a normal
-case** (owner, 2026-11-08), including several Claudes on one machine. Two layouts, chosen per zone:
-
-| Layout | What's shared | When |
-|---|---|---|
-| **Team:** one sandbox per agent | A zone-scoped shared workdir (copy-on-write branches merged by wicket, or a shared volume), a zone message channel through wicket, the work item's grants | Default where members need separate attribution, different agent kinds, or independent sleep and wake |
-| **Crew:** several agents in **one sandbox** | Filesystem, processes and the network listener; each agent keeps its own adapter session | Cheapest and closest collaboration: pair programming, an agent and its reviewer, Claude Code agent teams |
-
-Rules for both:
-- **One ceiling.** Members share the zone's reach and the work item's grants. Members who need different
-  ceilings belong in different zones joined by gates, as before.
-- **Free flow inside the zone** means plain messages between members are fine. That is the definition of a
-  zone. It also means **taint is shared**: one member reading a poisoned page taints whatever state the
-  others read. In a crew that's the whole sandbox; in a team, the shared workdir and channel. Containing
-  taint is done by splitting the agents into separate zones, not by trusting them to keep it to themselves.
-- **Attribution.** In a team, each agent has its own transport identity. In a crew, members can impersonate
-  each other inside the box, so authority and labels are per crew (the join of its members). Per-agent
-  attribution is best effort: per-agent placeholders and listener fds, tagged in the audit log.
-- **Escalations** are judged per zone and work item. A grant made for the work item serves every assignee.
-- **Lifecycle.** A crew is one activation: it sleeps and wakes as one. Team members sleep and wake
-  independently.
-- **An agent's own sub-agents** (Claude Code's subagents and agent teams, Codex threads) are processes
-  inside its sandbox. To wicket they are part of that agent; it doesn't need to know about them.
-- **Budgets:** §7.1's per-instance overhead is per sandbox, so a crew of N agents costs one sandbox plus N
-  agent processes.
+Crews, several agents sharing one box, are deferred (§22).
 
 ### 13.8 Lifecycle budgets
 
-These extend §7.1:
-
 | Transition | Budget (p95) |
 |---|---|
-| Wake from Idle | ≤ 50 ms |
-| Wake from Sleeping | ≤ 2 s |
-| Wake from Hibernated | ≤ 10 s by restore, or a rebuild |
-| Active checkpoint RPO | 60 s by default |
+| Wake from Hibernated | ≤ 10 s by rebuild |
 
 ---
 
@@ -2119,13 +1764,13 @@ own channels.
    | wicket operator, typed `AmendTask` ("also update `docs/ci.md`") | **Yes.** Signed into the trusted text chain (§5.1), so a later request for that path passes the provenance check. It still needs a decision. |
    | wicket operator, free-text steer | No. Steers within the existing ceiling only. |
    | RC message (vendor-attested author, not wicket-verified) | No. Same as a steer, shown with an RC badge. |
-   | Pasted or attached content, from any channel | No. **Untrusted data** with its own labels and taint: a human forwarding a poisoned page is the classic injection path. The UI offers *Instruct* vs *Attach as data*. |
+   | Pasted or attached content, from any channel | No. **Untrusted data**: a human forwarding a poisoned page is the classic injection path. The UI offers *Instruct* vs *Attach as data*. |
    | wicket system ("R-123 granted, retry") | n/a (trusted notice) |
 3. **A native remote UI is a destination and an ingress, so it is mediated.** Remote Control sends the
    transcript, which includes tool outputs, to Anthropic's session service, and brings instructions back.
    So it:
    - is declared in the zone (`operator_mode: vendor_rc`), and the destination
-     `anthropic.session_store{retention, training, devices}` must be cleared for the zone's labels;
+     `anthropic.session_store{retention, training, devices}` must be acceptable for the zone's data;
    - is allowed **only** through the egress proxy, path-allowlisted to this session's endpoints;
    - is refused for zones holding data classes the destination isn't cleared for (wicket's own channels
      still work there).
@@ -2147,7 +1792,7 @@ own channels.
   of it; nothing is UI-only.
 - **Web UI (mobile-first)** has these views:
   - tasks and zones (§14.2 view, blast radius);
-  - per-agent live transcript, with handles dereferenced for cleared humans and each view logged;
+  - per-agent live transcript, each view logged;
   - steer box;
   - pause, interrupt, kill, snapshot;
   - diff review for extracted patches;
@@ -2270,19 +1915,18 @@ would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gai
 
 ### 14.2 Showing humans the boundaries
 
-- **The zone view** is generated from compiled zones, gates, live grants and the gateway's provider-side
-  label store. Two zones that write to the same GitHub issue get an edge. Nested zones collapse by default
+- **The zone view** is generated from compiled zones, links and live grants. Two zones that write to the
+  same GitHub issue get an edge. Nested zones collapse by default
   to about 7 or fewer at the top.
 - **The blast-radius query:** `wicket explain --compromised <zone>` returns
   - reach and send;
-  - what can cross each outgoing gate on its behalf (capacity in bits for typed fields);
+  - what can reach other zones on its behalf: messages and links;
   - unmediated channels (SNI-only hosts, DNS on hosted backends, vendor remote UIs);
   - **authority, not just permission**: what provider-side `triggers` (CI on push, ChatOps, notifications)
     turn its allowed actions into (Miller's distinction) [06];
   - Cedar witness requests from symcc for "can X cause Y" questions.
 
-  The zone compiler also refuses any zone with an uncontrolled channel to a destination not cleared for
-  its `conf`, and every label raise is explicit and logged.
+  The zone view marks every uncontrolled channel.
 - **The timeline** of grant diffs, for example "fix gained `contents.write` on `ci.yml` at 14:02, granted
   by human, expires 14:12".
 - **Everything untrusted shown to humans is sanitised:** ANSI and control characters stripped, bidi and
@@ -2304,7 +1948,8 @@ would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gai
 
 *Owner requirement (2026-11-08): wicket is not only a developer tool. An agentic SaaS product must be able
 to run on it as a platform, with strong multi-tenant support and isolation. Owner direction for now: build
-single-tenant first, but leave room for multi-tenancy. Detail and prior art are in
+single-tenant first, but leave room for multi-tenancy. Designed, not built; the label and handle rules
+below wait on §22. Detail and prior art are in
 [`research/14-multi-tenancy.md`](research/14-multi-tenancy.md).*
 
 **The hierarchy gains two levels:** platform → tenant → org/workspace → task → zone.
@@ -2418,260 +2063,88 @@ the tenants scheduled on it, and only their short-lived credentials).
 
 ## 16. Mandates: acting on a user's behalf
 
-*Owner requirement (2026-11-08): "user authed creds", where an agent gets time- and purpose-limited
-access to resources so it can act on the user's behalf, such as shopping online. Protocols, prior art,
-Rust types, 31 red-team cases and milestones MD0–MD9 are in
-[`research/15-mandates-user-delegation.md`](research/15-mandates-user-delegation.md).*
+*Owner requirement (2026-11-08): an agent gets time- and purpose-limited access to act as a user, for
+example shopping online. Research: [`research/15-mandates-user-delegation.md`](research/15-mandates-user-delegation.md).*
 
-A **mandate** is authority a *user* delegates to an agent: to act *as them* at a provider, for a stated
-purpose, within limits, until a deadline. It is the same machinery as a grant (§4, §11) with one
-difference: the principal is the user, not the operator, and the user's own account is used.
-
-### 16.1 Model
-
-```rust
-pub struct Mandate {
-    pub id: MandateId, pub tenant: TenantId,
-    pub principal: UserId,                  // whose account and money
-    pub grantee: AgentOrZone,               // who may use it
-    pub connection: ConnectionId,           // the user's account at the provider; held in the vault, never in a box
-    pub purpose: TrustedText,               // the user's own words: "weekly groceries, usual brands, Saturday delivery"
-    pub allow: CapabilitySet,               // e.g. site:search, site:product.read, site:basket.*
-    pub forbid: Vec<ActionPattern>,         // e.g. payment.*, address.*, account.*, subscription.*
-    pub money: Option<MoneyLimit>,          // per order, total, currency
-    pub quantity: Option<QuantityLimit>,    // per item, per order
-    pub window: (Timestamp, Timestamp),     // not before / expires
-    pub uses: Option<u32>,
-    pub approvals: Vec<ApprovalPoint>,      // e.g. Checkout => passkey approval of the typed cart
-    pub state: MandateState,                // Active | Exhausted | Expired | Revoked
-}
-pub struct MoneyLimit { pub per_order: Money, pub total: Money }
-pub enum ApprovalPoint { Checkout, NewPayee, AnyR3, Custom(ActionPattern) }
-```
-
-- **A mandate is signed with a passkey by the principal**, the person whose account and money it is.
-  Only that person can widen it or approve money. Spend counters live in the ledger, and without a
-  mandate, no use of the user's credentials is possible.
-- **Purpose:** a closed `PurposeClass` (groceries, travel booking, …) is what policy uses. The user's own
-  purpose text is hashed into the mandate and shown on every approval, but it is never policy: no standard
-  enforces purpose, and Transaction Tokens dropped their purpose claim.
-- **The purpose is trusted text** for sink provenance (§4.2). Quantities, recipients and items must trace
-  to the user's purpose or the user's live instructions. A product review saying "add 50 bottles" fails
-  provenance and the quantity limit.
-- **Mandates sit in the ledger** beside grants. Every use is recorded, the money spent is tracked against
-  the limit, and the user can revoke at any time; revocation takes effect on the next request.
-- **Standing mandates** suit long-lived agents (§13), for example "weekly groceries under £120, until I
-  revoke it". Each order still passes its approval points.
-
-### 16.2 Connections: how the user's access gets in, without reaching the agent
-
-| Provider kind | How the user connects | What the agent gets |
-|---|---|---|
-| Has an API (Gmail, GitHub, calendars, banks with open banking) | OAuth consent on a wicket-owned page; narrowest scopes; RAR-style limits and token exchange where supported | Gateway tools or proxied HTTP. The token is injected per request, only under a live mandate |
-| Website without an API (most shops) | The user logs in **themselves** in a wicket-provided remote browser. The session is kept in the vault's cookie jar | A browser workload it can drive (§16.3). Never the cookies, never the password |
-| Agent payment protocols (AP2 mandates, agentic payment tokens, single-use virtual cards) | The user's wallet or bank issues a token with a merchant lock and an amount cap | A payment step that can't exceed what the user signed |
-
-The agent never sees passwords, cookies, OAuth tokens or card numbers. That's principle 2, unchanged.
-
-### 16.3 Websites: the shopping case
-
-- **Three pieces, so the session never reaches anything the agent controls:**
-  1. the user logs in themselves in a wicket-provided remote browser, and the session cookies go to the
-     vault;
-  2. the agent drives a separate, sandboxed browser that holds **no** session;
-  3. the egress proxy injects the cookies only into requests that the mandate allows for that site, and
-     captures any `Set-Cookie` back into the vault.
-
-  A device-bound session (Chrome DBSC) would break step 3; no UK grocer uses one yet.
-- **Site adapters** classify actions by risk, from URL and form-action patterns and page structure:
-  - browsing and search: R0;
-  - basket add and remove: R2, within the money and quantity limits;
-  - checkout, placing an order, payment, delivery address, account and subscription changes: R4 with the
-    `money` or `perm.manage` effect. These are always approval points, and are forbidden outright unless
-    the mandate allows them.
-- **"Never pay without the human" is seven layers, not one check:**
-  1. Payment, wallet and 3-D Secure hosts are denied at egress.
-  2. The site adapter makes checkout endpoints approval points, and unknown POSTs wait for review.
-  3. A checkout-page detector freezes the session.
-  4. The cart is locked. The user's passkey signs a **typed cart that wicket read itself** (items,
-     quantities, unit prices, total, delivery slot, address, card last four). It is re-read just before the
-     one allowed submit; any change voids the approval.
-  5. The final charge is reconciled after delivery. At UK grocers checkout commits the order but the charge
-     comes later, and substitutions and weighed items change it.
-  6. The user can take over and press Pay themselves.
-  7. Optionally, a capped virtual card or a bank-side limit.
-
-  This is the rule this box already follows by hand: build the basket, notify the owner, wait.
-- **Payment protocols** are used where available, but none of the live rails checks *what* is bought, so
-  layers 1–6 stay:
-  - AP2 v0.2 and Mastercard Verifiable Intent have user-signed, line-item constraints but few live
-    merchants;
-  - Visa Intelligent Commerce has been live with UK issuers since July 2026, using passkeys;
-  - ACP and Stripe Shared Payment Tokens cap amount, merchant and expiry, but the user signs nothing.
-- **Wire shapes:** RFC 9396 authorization details plus the `insufficient_authorization` remediation draft;
-  Open Banking VRP control parameters for money limits; CIBA for approval delivery; ISO 27560 consent
-  receipts.
-- **Known risks:**
-  - injected or manipulated items that stay within limits (dark patterns steer agents in over 70% of tasks);
-  - address or card swaps, vouchers and loyalty points;
-  - leaks of order history and other personal data;
-  - sites that block agents (Tesco and Asda blocked ChatGPT agent);
-  - terms that make the user liable for every order on their account (Ocado);
-  - approval fatigue on weekly shops.
-
-### 16.4 Lifecycle and UX
-
-- **Grant:** a consent screen shows the purpose in the user's own words, the scope, the limits, the expiry
-  and the approval points.
-- **While it runs:** live view and receipts. After each action that matters (basket changed, order placed)
-  the user gets a short receipt.
-- **Revoke** at any time, from the console or a push notification. **Expiry** is automatic.
-- **In platform mode,** a SaaS product's end users grant mandates inside the product through an embeddable
-  consent and approval flow (§15). Tenant policy caps what mandates may allow at all.
+A separate mandate subsystem is deferred (§22). With one principal (#11) and one grant (#256), a mandate
+is a grant from a user principal to an agent: bound to a resource, a purpose, a lifetime and an amount,
+and revocable. The user's credentials stay in the vault, injected at egress, never in the box.
 
 ---
 
 ## 17. Programs: deterministic workloads without an agent
 
-*Owner requirement (2026-11-08): wicket also runs ordinary, deterministic workloads. An agent might write
-a reusable program; running it again shouldn't need an agent each time, but it must get the same isolation.*
+*Owner requirement (2026-11-08): wicket also runs ordinary, deterministic workloads, with the same
+isolation as an agent.*
 
-A **program** is code plus a run contract:
-- **Code:** a source tree, content-addressed by digest; the digest is the program's identity.
-- **Runtime:** a pinned image, plus a lockfile where relevant.
-- **Entrypoint and typed I/O:** inputs as handles or typed fields; outputs in the outbox, as typed fields plus
-  labelled handles.
-- **Declared reach:** the hosts and adapter endpoints it needs, closed-world.
-- **Labels:** inherited from how it was made (below).
+A **program is an agent without a model** (#255): the manifest's `program` (a command, or a source tree
+named by its digest) instead of an `agent`, in the same box, zone, proxies, identity and audit. There's
+no model route. It can't reason about a pending request, so by default it may not ask
+(`program.on_pending: fail`; `escalation.request: false` once #256 lands). `spawn` starts one like an
+agent.
 
-```rust
-pub struct Program {
-    pub id: ProgramId, pub tenant: TenantId,
-    pub digest: Digest,                     // of the source tree: the identity a run pins
-    pub runtime: ImageRef,                  // pinned by digest
-    pub entrypoint: Vec<String>,
-    pub inputs: Schema, pub outputs: Schema,
-    pub reach: CapabilitySet,               // closed-world; effective reach = this ∩ the zone's ceiling
-    pub label: Label,                       // join of its author's label at the time it was written
-    pub provenance: Provenance,             // written by (agent, run) or a human; reviewed by whom
-    pub state: ProgramState,                // Draft | Approved{by, signature} | Retired
-}
-```
+**Approving a program is a grant on its digest** (#258): a source tree in the content-addressed store
+is named by its sha256, and "may this digest run" is one check over grants, as for any other artifact.
+Any change is a new digest. A separate program registry and promotion flow are not needed, and are
+deferred with it (§22).
 
-**From agent output to approved program.** Code an agent writes is untrusted code, carrying the agent's
-taint, so it goes through a **promotion gate**, the same idea as memory promotion (§13.4):
-1. The agent emits a program as a handle: source, entrypoint and the reach it claims to need.
-2. A human (or, for low-risk programs, an automated check) reviews the diff and the claimed reach, and
-   approves it with a passkey signature over the program's digest (§14.1).
-3. Only an approved digest can run without an agent. Any change, even one line, is a new digest and needs
-   a new approval. A new version that asks for *more* reach is a policy change and needs a decision.
-
-**Running a program** is a workload like any other (§8.1, kind `Program`):
-- **Same sandbox, isolation floor, placement and budgets as an agent zone.** There's no LLM proxy socket,
-  because there's no model. The egress proxy, credential injection, reach rules, dangerous patterns and
-  ledger are unchanged.
-- **Escalation without an agent:** a program can't reason about a pending request. Each run says what
-  happens: `on_pending: fail` (the default for scheduled runs), `park` until a human decides (the run is
-  frozen or checkpointed, §7), or `fail_and_notify`.
-- **Triggers:** on demand (a human, the CLI or API), a schedule, an event subscription, or **an agent calling
-  it as a tool** through the gateway (`wicket.run_program(name, inputs)`). In that last case the agent gets
-  typed outputs and handles back, and never the program's credentials.
-- **Determinism and provenance:** pinned image, pinned dependencies, declared network only, inputs passed as
-  handles. Every run records (program digest, image digest, input digests, output digests, every egress
-  decision), so a result can be traced and re-run.
-- **Labels:** outputs carry the join of the program's label, its inputs' labels and whatever it fetched. A
-  program an agent wrote while tainted by the web stays tainted until a human's review endorses it.
-- **Cheaper than an agent:** no model, no agent start-up. Pure functions can run in the Wasm codemode tier
-  in milliseconds (§7.1).
-
-**Verifier zones** [17 §4-5]. Harness search (ADAS, Darwin Gödel Machine, Meta-Harness) and agent-written
-programs are natural wicket workloads, and every one of those systems assumes an honest scorer. The evidence
-says otherwise: agents game checkers they can see. So the proposer zone emits a candidate as a handle; a
-runner zone executes it with only the LLM proxy; a verifier zone that the proposer cannot read scores it and
-returns a typed, low-capacity score across the gate. A winning candidate is promoted through the signed
-program promotion above.
+**Verifier zones** [17 §4-5]. Agents game checkers they can see, so a scorer belongs in a zone the
+proposer can't read, returning only a score.
 
 ---
 
 ## 18. Crate layout
 
 ```
-wicket/
-  crates/
-    wicket-core        types: ids, Resource/Capability algebra, Label, Zone, Gate, Handle, Op, Decision. No I/O.
-    wicket-policy      Cedar compilation of org/zone/forbids; decide(Op) -> Decision; ledger trait
-    wicket-verify      cedar-policy-symcc + cvc5 sidecar: subset/narrowing/disjointness proofs (feature-gated)
-    wicket-adapter     DSL schema, parser, interpreter, canonicalizer, dangerous patterns, resolvers
-    wicket-store       ledger, grants, handles, labels, provider label store, audit log (SQLite + replication; Postgres in cluster mode); agent registry, memory versions, object-storage blobs with per-agent keys
-    wicket-escalation  request validation/narrowing/classification, deciders, human channel
-    wicket-egress      rama MITM proxy, per-box CA, credential injection, decider protocol
-    wicket-git         smart-HTTP receive-pack store-and-forward
-    wicket-llm         LLM proxy: Anthropic first, OpenAI later; budgets, liveness, taint
-    wicket-gateway     rmcp MCP gateway: adapter-generated tools, wicket.* tools, third-party pinning
-    wicket-sandbox     Sandbox/Instance traits + backends behind features (docker (dev), process, gvisor, firecracker, seatbelt, e2b, wasm, k8s-agent-sandbox)
-    wicket-jail        privileged helper binary for the process backend
-    wicket-agent       InnerAgent/AgentSession traits; T1: claude-code, codex (app-server; types generated from its pinned JSON schema), pi (RPC); T2: acp; T3: process
-    wicket-view        zone graph, blast-radius, timeline
-    wicket-infra       placement vocabulary, compiler + verifier, BillingModel, leases, Reconciler/Store traits
-    wicket-operator    kube-rs operator: NodePool/Workload/WarmPool CRDs, admission, reservation pods, Cilium policy
-    wicket-node        per-node agent: direct launch, warm pools, parking, local enforcement, per-workload credentials
-    wicket-provisioner HostProvider impls (local, vultr/broker, aws, gcp, hetzner, …); the only holder of cloud credentials
-    wicket-channels    event log projections, OperatorChannel trait, WebAuthn decision verification, push, RC bridge supervision + tap
-    wicket-lifecycle   agent registry state machine, wake sources, hibernation, promotion gate, retention and GC
-    wicket-guest       static PID 1 shim inside microVMs (exec, IO, diff, vsock proxy shim)
-    wicket-bench       startup, memory and density measurements per backend
-    wicket-mandate     mandates: model, consent, connections (OAuth, browser sessions), money/quantity limits, approval points
-    wicket-program     program registry: digests, promotion and approval, run contracts, on_pending policy
-    wicket-browser     browser workload: a sandboxed headless browser holding a user's session, driven via gateway tools; site adapters
-    wicket-console     untrusted web front end (mobile-first PWA) over wicketd's API; no ledger write access, no creds
-    wicketd            daemon wiring it together
-    wicket-cli         `wicket run | explain | approve | ls | logs`
-  adapters/            github-rest.yaml, github-git.yaml, anthropic.yaml, dangerous/github.yaml
-  agents/pi/wicket-ext/  tiny in-box pi extension (TypeScript; advisory; hash-pinned in the image)
-  third_party/         vendored files with NOTICE (Codex proxy_routing/seccomp/authorization_path/process-hardening, sandstorm runsc parking, smokescreen classifier port)
-  tasks/               example manifests
-  docs/
+crates/
+  wicket-core        types: manifest and zones, Op, the subset check, links, canonical forms. No I/O.
+  wicket-policy      Cedar org and zone policy, compiled for tokens
+  wicket-policy-diff SymCC policy diffs for CI
+  wicket-authz       vendored, patched biscuit-auth and wicket's token vocabulary (§2.1)
+  wicket-feed        the signed snapshot-and-delta feed and its replica on a node
+  wicket-identity    issuer, agent and node identities, one compact-JWS module
+  wicket-auth        passkeys (WebAuthn)
+  wicket-store       ledger, audit chain, leases, links, bundles, object and content-addressed store
+  wicket-proxy       egress proxy, model proxy and MCP gateway
+  wicket-sandbox     box backends (Docker with runsc)
+  wicket-agent       harness adapters (Claude Code, ACP) and their modes
+  wicket-placement   providers (static hosts, Vultr), billing, the money envelope
+  wicket-fwd         in-box forwarders to wicket.internal
+  wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
 ```
 
-Dependency rule: `wicket-core` depends on nothing internal. Enforcement crates depend on `core`, `policy`,
-`adapter` and `store` only. Nothing in the TCB depends on `wicket-agent`.
+Dependency rule: `wicket-core` depends on nothing internal. Nothing that decides depends on
+`wicket-agent`.
 
 ---
 
 ## 19. Milestones
 
-Each milestone ends with the smallest test that could prove it wrong. From M1 on, every milestone also has to stay within the §7.1 budgets for what it adds.
+v0.2 planned milestones M0–M12. Releases now follow the GitHub milestones: 0.0.1 is built, and 0.0.2
+is the #253 simplification with the features that stand on it. Where the v0.2 milestones stand:
 
-| # | Milestone | Done when |
+| # | Milestone | State |
 |---|---|---|
-| **M0** | Workspace, `wicket-core` with the capability algebra and labels | Property tests: `is_subset_of` is a partial order; grant ⊆ ask; label join is monotone. Cedar compile round-trips. |
-| **M1** | `process` backend + `wicket-jail`; egress proxy with an allowlist; LLM proxy for Anthropic; `wicket-bench` skeleton | **Claude Code runs a real task in the box holding only a placeholder.** Conformance checks 1–2 pass. All attempted connections over a 30-minute session are logged ([01 E3]). Test whether Claude Code survives a connection reset. Box setup overhead stays under 100 ms and 20 MB beyond Claude Code itself. Every hardening layer is confirmed or the jail refuses to start; the DNS-canary and placeholder-reflection checks pass (release gates from here on). |
-| **M2** | Adapter interpreter + ~15 GitHub REST endpoints + git push S&F; per-task GitHub App tokens | The [04 §4.7] matrix runs green in a test org. The red-team agent, scoped to one repo and one directory, finds ≤3 escapes, and each escape becomes a rule. |
-| **M3** | Escalation broker (auto + human tiers), ledger (epochs, atomic single-use, fresh-per-use), `wicket approve`, recoverable problem+json / MCP pending | **E1:** 20 tasks × {bare 403, structured pending with remedies, `await_grant` tool} × {Claude Code, Codex app-server, pi × {Claude, GPT, an open-weights model}, Gemini CLI}. Measure wait/retry vs route-around vs give-up, and retry loops. Running pi with several models separates model behaviour from harness behaviour. This decides how much the escalation UX can rely on HTTP, versus T1/T2 permission channels. |
-| **M3b** | Operator channels: wicketd event log + API, `wicket` CLI, `wicket-console` PWA (transcript, steer, typed `AmendTask`, pause/kill, escalation queue with passkey approvals verified in wicketd), push; then `vendor_rc` bridge flavour (E-RC1–5) | From a phone, an operator can run a task end to end in wicket's console: watch, steer, amend, approve, kill. In a `vendor_rc` zone the same task is also watchable and steerable in the Claude app, its messages appear in wicket's console with an RC badge, and an RC 'allow' creates no grant. The RC kill switch disconnects RC while the agent keeps running. The E-OP1 phishing red-team yields no wrong approvals. |
-| **M3c** | Codex (app-server) and pi (RPC) T1 adapters | Both pass conformance checks 1–13 and experiments E-CX1–3, E-PI1–2. |
-| **M4** | MCP gateway with adapter-generated tools | An MCP call and a `gh api` call to each endpoint get identical decisions (differential test). |
-| **M4b** | Isolated MCP servers as per-task workloads (§8.2): `wicket-node` direct launch with unbound warm pools (I1); then `wicket-operator` on single-node k3s with reservation pods, Cilium default-deny and gVisor RuntimeClass (I3) | Two third-party MCP servers and the agent each run in their own sandbox. Probing from inside each shows neither server can reach the other, the agent, the API server, the metadata service or DNS, except through the gateway. A pod without a sandboxed RuntimeClass, or a hand-edited CR, is rejected. A changed tool description is refused. State is gone at task end. The same probes pass in single-host mode. A per-task MCP server from the warm pool is `tools/list`-ready within 250 ms, and twenty concurrent instances fit the density budget on one node. |
-| **M5** | Handles (including handles as tool arguments), per-argument sink provenance, labels, typed-only gates, two-zone static topology | **The brief's smuggling test**, built as a GitHub-coding suite in AgentDojo's format: a test-org repo, injection slots in issue comments, docs pages and `CLAUDE.md`, deterministic checks on provider state, and an **adaptive attacker** that sees the policy and denial bodies. Free text vs typed vs handles. Report attack success *and* utility over 3 runs, and require a non-zero baseline attack rate before crediting a defence. If typed already gives zero, handles are optional in v1. |
-| **M6** | `wicket explain` + zone view + timeline | The three-engineer test. |
-| **M7** | Agent lifecycle (§13): agent registry, Active → Idle → Sleeping → Hibernated → Archived → Deleted, gVisor checkpoint, push to object storage (a local directory or Garage/SeaweedFS locally), rebuild path, wake sources (message, schedule, event), memory staging and promotion gate, retention and GC with crypto-shredding | An agent works, sleeps, hibernates to MinIO, and is woken a day later by a schedule. Its node is killed while it's active, and it rebuilds elsewhere from the last checkpoint within the RPO. A skill it wrote is staged, reviewed and only then visible to its next activation; rolling back the memory version removes it. GC deletes an agent after its grace period, and its blobs are unreadable while the audit chain still verifies. Every transition stays within the §13.8 budgets. |
-| **M8** | Adapter generator loop | Generated vs hand-written GitHub adapters diffed. Zero too-permissive rules, or find which check missed it. |
-| **M9** | ACP (T2) adapter; `wicket.spawn` dynamic topology | Conformance suite passes for one ACP agent. Child ⊆ parent is enforced by the capability algebra, which is tested against SymCC's segment model in CI. |
-| **M10** | Many clouds: provisioner with the Vultr (via broker) and AWS or GCP providers, WireGuard + mTLS node join, a KVM pool with Kata/Firecracker, money envelope + human approval for spend, `request_capacity` | One installation spans two providers. An agent's `request_capacity{kvm}` gets a Firecracker sandbox on a newly created per-second-billed host inside the envelope. A Vultr host is released before its next paid hour. Killing the provisioner mid-create leaks nothing, and the daily reconcile matches every provider's charges to the cent. |
-| **M11** | Mandates (research 15, MD0–MD9): passkey-signed mandates in the ledger, consent screen, connections (OAuth via a wicket page; websites via a remote browser the user logs into), a session-less agent browser with cookies injected at egress, a site adapter, the seven-layer checkout guard | **Demo:** Claude Code builds an Ocado basket under a 48-hour, £120 mandate. Every step past the basket stays pending, no Ocado cookie reaches the box, and no order is placed. The approve-and-submit path is proven on a local fake shop (`wicket-mart`): a price change after approval voids it, and an injected \"add 50\" is refused. |
-| **M12** | Programs: program manifests, source digests, pinned runs without an agent, `on_pending` policy; then promotion from an agent's output with a passkey-signed approval, and `wicket.run_program` as a gateway tool | A program an agent wrote is approved by digest, then runs on a schedule with no model in the loop. A one-line change is refused until re-approved. A request outside its reach fails the run (or parks it), and outputs carry the author's taint. |
-| later | Firecracker (on bare metal via the broker), seatbelt, e2b, wasm codemode; parent tier on, once its shadow decisions are measured | |
-
-M1 is deliberately first: until Claude Code runs usefully with no credentials and no direct network, none
-of the rest matters.
+| M0, M1 | core types; a box holding only a placeholder; egress and model proxies | built, with Biscuit authority (§4.1) and gVisor as the only tier |
+| M2, M4, M8 | provider adapters, adapter-generated MCP tools, the adapter generator | not built |
+| M3, M3b | escalation, ledger, `wicket approve`, the console with passkeys, Remote Control (`wicket wrap`) | built; one grant and one decide function (#256) |
+| M3c | Codex and pi adapters | not built |
+| M4b | service zones, Kubernetes | deferred (§22) |
+| M5 | labels, handles, typed gates | deferred (§22); #27 keeps a one-bit flag |
+| M6 | `wicket explain`, the zone view, the timeline | not built |
+| M7 | lifecycle | hibernate and wake by rebuild built; the timer ladder replaced by #249 |
+| M9 | ACP adapter, `spawn` | built |
+| M10 | Vultr placement, `request_capacity`, the money envelope | built; other clouds deferred (§22) |
+| M11 | mandates | deferred (§22) |
+| M12 | programs | built as agents without a model (§17); registry and promotion deferred |
 
 ---
 
-## 20. Decisions taken in this draft
+## 20. Decisions
 
 | Decision | Why | Revisit if |
 |---|---|---|
-| Cedar for authored policy + an own capability algebra for grants | Analysable (SymCC in CI), explains decisions, fast; grants need a cheap syntactic subset check. Experiment #58: SymCC handles realistic org policy diffs in 0–9 ms, but gives `unknown` on some zone globs, so it stays out of the spawn path | Cedar's analysis can decide segment-wise globs quickly and completely |
+| Cedar for authored policy, compiled into each box's Biscuit token at issuance; no capability algebra of wicket's own | Analysable (SymCC in CI) and explains decisions; nodes evaluate only the token, so decisions happen at the edge (#51, #253). Experiment #58: SymCC diffs org policy in 0–9 ms but gives `unknown` on some zone globs, so the conservative subset check, not SymCC, admits spawns | Cedar's analysis can decide segment-wise globs quickly and completely |
 | Authority in the Biscuit format, checked by a vendored `biscuit-auth` (upstream main plus three patches), with a structural check before loading and a differential test against the stock engine in CI; use counts stay in the ledger | Narrowing, offline attenuation, third-party approvals and subtree revocation come with the format, which outside parties can verify. The patches take a depth-5 request from about 1 ms to 7–11 µs, deterministically (#59, biscuit-fast) | Upstream takes patches 1 and 2 (then only patch 3 is ours), or the fork's upkeep outweighs it (fall back to plain signed records with the same semantics, measured at under 1 µs) |
 | `rama` 0.4 parts (rustls termination assembled ourselves) behind the `srt` decider seam | Rust, composable, swappable; no ready rustls MITM relay exists anywhere | rama churn hurts → hyper + tokio-rustls |
 | `rmcp` gateway, not agentgateway | agentgateway isn't embeddable (`publish=false`). Its argument rules (CEL guardrails), like ToolHive's and ContextForge's, see raw arguments rather than adapter-bound typed resources. It also passes client headers through by default and runs stdio servers unsandboxed | — |
@@ -2680,39 +2153,35 @@ of the rest matters.
 | Claude subscription token (`claude setup-token`) injected by the LLM proxy; never an Anthropic API key | Owner's rule; the credential still never enters the box | — |
 | Subscription tokens only for the unmodified Claude Code binary, in single-owner mode; never for other inner agents, never brokered in platform mode | Anthropic's legal and compliance page; owner: "whatever Anthropic say is ok" | §6 |
 | YAML-subset adapter DSL | Diffable by humans and LLMs; JSON canonical form for signing | — |
-| Hybrid substrate: Kubernetes for capacity, pools and services; `wicket-node` direct launch for sandboxes and per-task MCP instances; CRDs are desired state, the ledger is authority | Don't rebuild scheduling, autoscaling and GC. But the pod path is 1–2 orders of magnitude too slow for the hot path and can't park |  Kubernetes' TCB or footprint proves unacceptable for hostile workloads → own small reconciler behind the same `Sandbox` trait |
+| Placement behind a `Provider` interface (static hosts, Vultr); nodes launch boxes directly; the ledger is the authority | Don't build a scheduler; the pod path is too slow for per-box churn [10 §4]. Kubernetes would be one more `Provider` (#45, deferred) | Clusters are needed |
 | Enforcement evaluates the whole chain; subset checks only for admission and explanation | A subset-check bug then costs usability, never authority (Fly macaroons) | — |
 | Never forward client headers; rebuild upstream requests from the `Op`; swap placeholders only in their declared slot | Every surveyed gateway that forwarded headers or substituted in bodies leaked or reflected credentials | — |
 | Codex via app-server (T1), pi via RPC (T1); ACP is the fallback | Native protocols carry host approvals, steering, typed output and resume that ACP drops | — |
 | No third-party LLM library in the TCB; a Rust `Model` trait over wicket-llm | pi-ai etc. are Node plus vendor SDKs; borrow the design, not the code | — |
 | Agent config locked down by managed files where they exist (Claude managed settings, Codex `requirements.toml`), by ownership plus flags where they don't (pi) | Repo-supplied config is the cheapest injection path | — |
-| Long-lived agents by default: durable identity, activations, work items, lifecycle tiers, policy GC | The owner's model; rebuild-from-durable-state always works, so snapshots are only an optimisation; sleep doubles as a declassification checkpoint | — |
-| Parent (LLM) decider tier off at first | It's an LLM in the TCB; DRIFT's ablation shows LLM-widened policy roughly doubles attack success; measure it in shadow mode first | Shadow decisions agree with humans ≥ an agreed rate |
+| Long-lived agents, and the harness decides its lifetime: a run ends when its process exits, at its timeout or when its authority ends; hibernation is asked for (#249) | The harness knows when its work is done, and wicket's clock doesn't; one renewable authority grant plus a hard timeout bounds every run | — |
+| Escalation rights are policy (`escalation: { request, grant }`, on by default); an ancestor agent grants within its own authority, checked deterministically (#50, #291). No LLM decider | Approval is a principal delegating part of its own authority; DRIFT's ablation shows LLM-widened policy roughly doubles attack success [05] | — |
 
 ## 21. Open questions
 
 1. **Agent behaviour under denial** (E1), the biggest unknown. If agents route around HTTP denials, the
    escalation UX has to live in the T1/T2 permission channels, and T3 agents get a degraded experience.
-2. **Utility cost of taint.** Does a coding agent that reads one issue comment become useless for
-   pushing? The per-argument stance, handles as arguments, forking at the last clean entry and disposable
-   tainted children are the planned answers. M5 measures them.
+2. **Utility cost of taint**, once #27's one-bit flag exists: does a coding agent that reads one issue
+   comment become useless for pushing?
 3. **Claude Code specifics to test:**
    - Does a placeholder key plus proxy injection work end to end?
    - Does it survive connection resets after a snapshot?
    - Does `--bare` suppress managed-settings hooks?
    - Does `--setting-sources ""` behave as expected?
    - Which `api.anthropic.com` calls bypass `ANTHROPIC_BASE_URL` (fast-mode check, feature flags)?
-4. **Where the parent-tier "re-derivation" gets its trusted text for dynamic spawns:** the chain of
-   labelled task texts (§5.1) is proposed but not validated.
+4. *(Withdrawn: the LLM parent tier is deferred, §22. Agents grant within their own authority, §11.)*
 5. **Vultr bare-metal billing:** the API says monthly ($185) and the docs say hourly ($0.25). Settle it
    before buying.
 6. **GraphQL:** deny entirely in v1, or allow a persisted-query allowlist? (Proposed: deny.)
 7. **Owner decisions for infrastructure** [10 §13]:
    - An AWS or GCP account for minute-billed KVM, or the Mac (is it an M3 or later)?
-   - May k3s run on the control host on demand? The host's operator has to agree.
    - Should wicket's Vultr usage share the provisioning broker's $20 cap, or get its own line?
-8. **The proposer's view:** what does the strict "nothing fetched" default cost in utility, and which
-   labelled context (repo file names, the tree) buys most of it back safely?
+8. *(Withdrawn: the manifest proposer is deferred, §22.)*
 9. **`vendor_rc` credentials:** can the proxy swap a placeholder for the vendor session credential
    (E-RC2), or does `vendor_rc` always mean "vendor credential in the box"?
 10. **`Placement::Split` before v1?** Codex `exec-server` is experimental; pi's remote tool operations and
@@ -2720,10 +2189,10 @@ of the rest matters.
     loop reads every tool result, so it is as tainted as the box, and moving it out helps only if its host
     also holds no credentials and its egress also goes through the proxies [17 §4-9].
 11. **Agent context files in untrusted refs:** removing them is safe but may break legitimate project
-    conventions. Should they be exposed as handles, summarised by a quarantined reader, or simply dropped?
+    conventions. Should they be summarised, or simply dropped?
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
-    own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
+    own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they are removed.
 12. **Node transport: SSH for now, explore others** (owner, 2026-11-08: "ssh is fine for now but keep a
     note about exploring other protocols"). SSH (`ssh -R` per run) is not resumable:
     - one TCP connection carries the forwarded sockets and the event stream, and a drop kills the run's
@@ -2745,3 +2214,26 @@ of the rest matters.
       or tool (§17).
     - Steering from a phone needs the console reachable (§14.1).
 14. **Name.** "wicket" is a working name (the small door set into a larger gate).
+
+---
+
+## 22. Deferred
+
+Designed, but not planned. Each is one line, with its issue where there is one. Older detail is in
+this file's git history and in the research notes.
+
+- **LLM manifest proposer and ratchets**: an LLM that instantiates vetted templates into a manifest
+  (§5.2), an LLM parent tier that re-derives requests, quarantined readers, and ratchets on cumulative
+  grants (§11).
+- **IFC labels and handles**: confidentiality and taint labels, no-write-down, per-argument sink
+  provenance, typed gates and opaque handles (§4.2, §4.3). #27 keeps a one-bit, opt-in taint flag.
+- **Separate mandate and program subsystems**: mandates are grants from a user principal (§16, #11,
+  #256); programs are agents without a model, approved as a grant on their digest (§17, #255, #258).
+- **Six-cloud `HostProvider` and attestation levels**: AWS, GCP, Hetzner, Azure and others; instance
+  identity, TPM, SEV-SNP and TDX attestation; residency placement (§8.4). Vultr and static hosts are
+  built.
+- **Service zones**: each third-party MCP server in its own sandbox and zone (§8.2). Related: MCP servers
+  per zone (#9), agent-built MCP servers (#10).
+- **Crews**: several agents in one box (§13.7).
+- **Kubernetes placement**: a Kubernetes `Provider`, an operator, reservation pods, k3s (§8.3, #45).
+
