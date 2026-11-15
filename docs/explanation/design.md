@@ -624,11 +624,11 @@ pub trait InnerAgent: Send + Sync {
 #[async_trait]
 pub trait AgentSession: Send {
     async fn start(&mut self, prompt: TaskPrompt) -> Result<()>;
-    fn events(&mut self) -> BoxStream<'_, AgentEvent>;        // normalised, size-bounded, free text as handles; AgentState::Settled
+    fn events(&mut self) -> BoxStream<'_, AgentEvent>;        // normalised, size-bounded; AgentState::Settled
     async fn answer(&mut self, req: PermissionReqId, d: AgentDecision) -> Result<()>;
     async fn send(&mut self, msg: HostMessage) -> Result<()>; // steer / follow-up, e.g. "R-123 granted; retry"
     async fn checkpoint(&mut self) -> Result<ResumeToken>;
-    async fn finish(self: Box<Self>) -> Result<AgentOutcome>; // typed fields (schema-validated) + labelled handles
+    async fn finish(self: Box<Self>) -> Result<AgentOutcome>; // typed fields (schema-validated) + outputs
 }
 ```
 
@@ -662,8 +662,8 @@ pub trait AgentSession: Send {
 
 **Launches.** Common to all three: no model credential in the box, only a zone- and session-bound
 placeholder. The model base URL points at the LLM proxy, and `HTTPS_PROXY` plus the CA env vars point at
-the egress proxy. The only MCP server is the wicket gateway. Repo context files are labelled as taint. The
-agent's state dir sits inside the zone's labelled state.
+the egress proxy. The only MCP server is the wicket gateway. Repo context files are untrusted. The
+agent's state dir sits in the box's own state (`/wicket/state`).
 - **Claude Code** ([01 §4.4]):
   - `ANTHROPIC_BASE_URL` plus a placeholder `ANTHROPIC_AUTH_TOKEN`;
   - nonessential traffic, auto-update, telemetry and claude.ai connectors off, so it needs **no internet
@@ -671,7 +671,7 @@ agent's state dir sits inside the zone's labelled state.
   - `--strict-mcp-config`;
   - root-owned managed settings (`allowManagedHooksOnly`, `allowManagedMcpServersOnly`, deny rules
     mirroring the ceiling);
-  - `CLAUDE_CONFIG_DIR` in labelled state, auto-memory off.
+  - `CLAUDE_CONFIG_DIR` in the box's state, auto-memory off.
 - **Codex** ([11 §5.1]):
   - root-owned `/etc/codex/requirements.toml` pins `model_provider = "wicket"` (Responses wire, base URL =
     LLM proxy, websockets off), allows only the gateway MCP server, disables remote control, web search,
@@ -810,7 +810,7 @@ backend whose capabilities satisfy both (§7.1). `EgressMode` deliberately has n
 
 **Isolation floor.** The `process` tier shares the host kernel the way containers do, and frontier models
 escape misconfigured containers (SandboxEscapeBench [05]). So:
-- **gVisor (or a microVM) is the default floor** for any zone with valuable reach, clearance or labels,
+- **gVisor (or a microVM) is the default floor** for any zone with valuable reach or data,
   and for every third-party MCP server.
 - `process` is for development, M1, and low-value zones.
 - On production hosts the vault and `wicketd` never share a kernel with process-tier boxes.
@@ -859,8 +859,8 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
 **Workdir and output:** the base repo is a read-only lower layer, and the agent writes to an upper layer.
 `extract(Patch)` computes the diff host-side, in user space; we never mount a guest-written image with the
 host kernel. Host-side git runs with `core.hooksPath=/dev/null`, so the workdir's `.git` is never
-executed on the host. Launch-time path scans are not protection. The diff becomes a labelled handle, and
-its taint survives `extract` up to any push or merge, because code is delayed execution. Its *summary*
+executed on the host. Launch-time path scans are not protection. The diff is untrusted, and
+stays so up to any push or merge, because code is delayed execution. Its *summary*
 (files touched, test result) crosses gates as typed fields. After an approved file escalation, a later
 `Instance::grant_fd` can inject the opened file via `SECCOMP_IOCTL_NOTIF_ADDFD` without a restart (nono).
 
@@ -873,8 +873,8 @@ its taint survives `extract` up to any push or merge, because code is delayed ex
 4. For long waits, detach the upper layer.
 
 Each snapshot is **restored at most once**, and the source is never resumed. Lower layers are pinned by
-digest, and restore is refused on mismatch. RNGs are reseeded after any restore. Snapshot images carry the
-zone's `conf` label and count against a disk budget. Resume uses the agent's own resume path.
+digest, and restore is refused on mismatch. RNGs are reseeded after any restore. Snapshot images count against a
+disk budget. Resume uses the agent's own resume path.
 
 ### 7.1 Startup and efficiency
 
@@ -889,8 +889,8 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
    on the node and mounted read-only. Per-sandbox state is a thin overlay or copy-on-write upper layer.
    Lazy image pulling (stargz, SOCI or nydus) for big images on cluster nodes.
 2. **Warm pools, claim-then-bind.** Pristine sandboxes are pre-created with nothing identifying in them.
-   On claim, wicket binds the identity: listener fd / socket, per-zone CA, placeholders, mounts and
-   labels. So a pooled sandbox can't carry one task's identity or state into another. [07]
+   On claim, wicket binds the identity: listener fd / socket, per-zone CA, placeholders and
+   mounts. So a pooled sandbox can't carry one task's identity or state into another. [07]
 3. **Snapshot clones.** Boot an MCP server, or an agent up to "ready", once; snapshot it; restore clones
    from that snapshot. Firecracker restores in milliseconds with copy-on-write memory shared across clones,
    and gVisor checkpoint/restore plays the same role without KVM. After restore, reseed RNGs and rotate
@@ -902,7 +902,7 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
 5. **Direct launch on the hot path.** A node starts boxes itself, through Docker's Engine API with
    `runsc` (#312), not through a scheduler. The Kubernetes pod path promises only a 5 s p99 *before* image
    pull, and CNI setup alone can double that under concurrency [10 §4].
-6. **No cross-tenant memory dedup.** KSM across zones with different labels is a timing side channel, so
+6. **No cross-tenant memory dedup.** KSM across zones is a timing side channel, so
    it is allowed only within a trust class. Explicit snapshot copy-on-write sharing is preferred.
 
 **Reference numbers** [10 §4.1]:
@@ -1134,7 +1134,7 @@ Detail: [04 §7].
 - **Acquired authority is quarantined** [05 §10.2-5]. Adapters declare the effects `mint.credential` and
   `create.principal`, with the response-field paths that carry authority: deploy keys, PATs, GitHub App
   creation, Actions secrets, IAM keys. The proxy or gateway moves those fields into the vault and returns a
-  placeholder or handle. Activating one is a separate ledger grant.
+  placeholder. Activating one is a separate ledger grant.
 - **Denials carry no tainted content** and list remedies (§9.5).
 
 ### 9.1 Egress proxy (`wicket-egress`)
@@ -1498,7 +1498,7 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   agent, which is why those paths are dangerous patterns. Labelling them as taint is necessary but not
   sufficient, because the agent still obeys them: config-file injection worked against every provider
   tested [06]. So for refs that aren't trusted, preflight **removes** agent context files from the agent's
-  view (or exposes them only as handles), per each adapter's `context_files` list.
+  view, per each adapter's `context_files` list.
 - **The agent's own policy stores are memory:** Codex `$CODEX_HOME/rules/*.rules` and config writes, pi
   `trust.json`. They are read-only or discarded, and never fed from approvals.
 - **Recovery by forking.** A tainted agent's session can be forked at a clean point instead of being
@@ -1587,7 +1587,7 @@ the design; what is built is the agent row described in §13.5.
 |---|---|---|
 | Charter | yes | Operator-signed versions; changing it is a policy change (narrowing is automatic, widening needs a decision) |
 | Memory stores: facts, notes, preferences, **skills** | yes, versioned | Writes during an activation land in a **staging layer**. A **promotion gate** decides what joins the next version: automatic for typed, low-risk facts within the label ceiling; quarantined-reader or human review for anything instruction-like (skills, procedures, "remember to…"). Every version is labelled, can be forked and rolled back, and each activation starts from a fork, so poison is undoable. |
-| Session and transcript | yes, as labelled handles; resumed on wake | Compaction is allowed; entries keep their labels |
+| Session and transcript | yes; resumed on wake | Compaction is allowed |
 | Workdir | yes | Copy-on-write upper layer made durable; git-backed where it's a repo |
 | Process and RAM state | only while Active (a memory snapshot, #71, would keep it) | Dropped at hibernation |
 | Caches | no | Rebuilt |
@@ -1595,8 +1595,7 @@ the design; what is built is the agent row described in §13.5.
 | Live grants, pending requests | no | Work-item-scoped; a pending request survives sleep only as a ledger entry that can wake the agent when decided |
 
 Self-improving agents that write their own skills (Hermes, OpenClaw) are exactly the case the promotion
-gate exists for. A skill is an instruction to every future activation, so it is never auto-promoted, and
-its label is the join of everything that shaped it.
+gate exists for. A skill is an instruction to every future activation, so it is never auto-promoted.
 
 ### 13.5 Durability
 
@@ -1765,13 +1764,13 @@ own channels.
    | wicket operator, typed `AmendTask` ("also update `docs/ci.md`") | **Yes.** Signed into the trusted text chain (§5.1), so a later request for that path passes the provenance check. It still needs a decision. |
    | wicket operator, free-text steer | No. Steers within the existing ceiling only. |
    | RC message (vendor-attested author, not wicket-verified) | No. Same as a steer, shown with an RC badge. |
-   | Pasted or attached content, from any channel | No. **Untrusted data** with its own labels and taint: a human forwarding a poisoned page is the classic injection path. The UI offers *Instruct* vs *Attach as data*. |
+   | Pasted or attached content, from any channel | No. **Untrusted data**: a human forwarding a poisoned page is the classic injection path. The UI offers *Instruct* vs *Attach as data*. |
    | wicket system ("R-123 granted, retry") | n/a (trusted notice) |
 3. **A native remote UI is a destination and an ingress, so it is mediated.** Remote Control sends the
    transcript, which includes tool outputs, to Anthropic's session service, and brings instructions back.
    So it:
    - is declared in the zone (`operator_mode: vendor_rc`), and the destination
-     `anthropic.session_store{retention, training, devices}` must be cleared for the zone's labels;
+     `anthropic.session_store{retention, training, devices}` must be acceptable for the zone's data;
    - is allowed **only** through the egress proxy, path-allowlisted to this session's endpoints;
    - is refused for zones holding data classes the destination isn't cleared for (wicket's own channels
      still work there).
@@ -1793,7 +1792,7 @@ own channels.
   of it; nothing is UI-only.
 - **Web UI (mobile-first)** has these views:
   - tasks and zones (§14.2 view, blast radius);
-  - per-agent live transcript, with handles dereferenced for cleared humans and each view logged;
+  - per-agent live transcript, each view logged;
   - steer box;
   - pause, interrupt, kill, snapshot;
   - diff review for extracted patches;
@@ -1949,7 +1948,8 @@ would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gai
 
 *Owner requirement (2026-11-08): wicket is not only a developer tool. An agentic SaaS product must be able
 to run on it as a platform, with strong multi-tenant support and isolation. Owner direction for now: build
-single-tenant first, but leave room for multi-tenancy. Detail and prior art are in
+single-tenant first, but leave room for multi-tenancy. Designed, not built; the label and handle rules
+below wait on §22. Detail and prior art are in
 [`research/14-multi-tenancy.md`](research/14-multi-tenancy.md).*
 
 **The hierarchy gains two levels:** platform → tenant → org/workspace → task → zone.
@@ -2189,7 +2189,7 @@ is the #253 simplification with the features that stand on it. Where the v0.2 mi
     loop reads every tool result, so it is as tainted as the box, and moving it out helps only if its host
     also holds no credentials and its egress also goes through the proxies [17 §4-9].
 11. **Agent context files in untrusted refs:** removing them is safe but may break legitimate project
-    conventions. Should they be exposed as handles, summarised by a quarantined reader, or simply dropped?
+    conventions. Should they be summarised, or simply dropped?
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
     own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they are removed.
