@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn say_is_gone_and_says_where_prompts_go() {
-        let mut t = setup("say");
+        let t = setup("say");
         t.running("run_a", "lead");
         assert_refused(
             &t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })),
