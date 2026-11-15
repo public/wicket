@@ -3307,6 +3307,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // Decided here: both swapped hosts are terminated by the node's own egress proxy, which
         // decides them from the box's token in the feed; a host outside the CA is uncovered (spliced
         // or refused, never forwarded, slice 3).
+        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
         let router = NodeRouter { ca: node.ca(), clock: node.clock.clone() };
         assert_eq!(router.route("rc.api.test"), Route::Terminate);
         assert_eq!(router.route("wrap.api.test"), Route::Terminate);

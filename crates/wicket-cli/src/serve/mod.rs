@@ -2018,7 +2018,7 @@ mod tests {
         let r = t.post("/api/action/finish", a);
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert!(r.body["ok"].as_str().unwrap().contains("every path under"));
-        let mut l = t.ledger();
+        let l = t.ledger();
         assert_eq!(l.request(&rid).unwrap().status, "granted");
         let deeper = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "GET", "news.example", "/items/42");
         assert!(l.grant_covering(&deeper).unwrap().is_some(), "the grant covers paths under the prefix");
@@ -2056,7 +2056,7 @@ mod tests {
         let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
         let r = t.post("/api/action/finish", a);
         assert!(r.body["ok"].as_str().unwrap().contains("every path under news.example/items/a/"), "{:?}", r.body);
-        let mut l = t.ledger();
+        let l = t.ledger();
         assert!(l.grant_covering(&op("run_e", "/items/a/1")).unwrap().is_some());
         assert!(l.grant_covering(&op("run_e", "/items/b/1")).unwrap().is_none(), "narrowed to what the human named");
         // Zone-wide: another run in the zone may use it too.

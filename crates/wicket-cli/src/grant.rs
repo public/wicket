@@ -875,7 +875,7 @@ mod tests {
         assert!(text.starts_with("approved:"), "{text}");
         assert_eq!(t.status(&child), "granted");
         // The grant is the child's own, for the exact path, with the uses given.
-        let mut l = t.ledger.lock().unwrap();
+        let l = t.ledger.lock().unwrap();
         let op = |run: &str, path: &str| Op::egress(&TenantId::single(), &RunId(run.into()), "z.c", "GET", "api.example.com", path);
         assert!(l.grant_covering(&op("run_x", "/v1/items")).unwrap().is_none(), "another run can't use it");
         assert!(l.grant_covering(&op("run_c", "/v1/items/more")).unwrap().is_none(), "exact path only");
