@@ -2164,6 +2164,36 @@ mod tests {
         assert_eq!(crate::principal_from_env(None), None);
     }
 
+    /// #369: the passkey signs the request's effect descriptor, and the blast radius of an approval
+    /// that widens is shown first; a request that changed between begin and finish isn't approved.
+    #[test]
+    fn the_passkey_signs_the_effect_and_a_changed_request_is_refused() {
+        let mut t = setup("effect");
+        t.running("run_g", "lead");
+        let op = wicket_core::Op::egress(&TenantId::single(), &RunId("run_g".into()), "z", "GET", "a.example", "/x");
+        let (rid, _) = t.ledger().pending_for(&op, "x", None).unwrap();
+        let ask = json!({ "action": "decide", "id": rid, "decision": "approve", "uses": 5 });
+        let b = t.begin(ask.clone());
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let a = &b.body["action"];
+        let sha = a["effect_sha256"].as_str().unwrap().to_string();
+        assert_eq!((a["effect"]["path"].as_str(), a["effect"]["terms"]["uses"].as_u64(), sha.len()), (Some("/x"), Some(5), 64));
+        assert_eq!(a["blast"]["widens"], json!(["5 uses, not one"]), "{a}");
+        // Another asker joins the request before the passkey answers: it isn't what was signed.
+        t.ledger().pending_for(&op, "x", Some(&json!({ "requesters": [{ "agent": "other" }] }))).unwrap();
+        let signed = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        assert_refused(&t.post("/api/action/finish", signed), StatusCode::CONFLICT, "not the effect that was shown");
+        assert_eq!(t.ledger().request(&rid).unwrap().status, "pending");
+        // Shown again, as it is now: approved, and the record carries what was signed.
+        let r = t.act(ask);
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        let d = t.audit_kinds().into_iter().rev().find(|(k, _)| k == "decision").unwrap().1;
+        let now = d["effect_sha256"].as_str().unwrap();
+        assert_ne!(now, sha);
+        assert!(d["signed"]["decision_json"].as_str().unwrap().contains(now), "{d}");
+        assert_eq!(d["effect"]["requested_by"], json!(["other"]));
+    }
+
     #[test]
     fn approval_is_refused_if_the_agent_is_revoked_between_begin_and_finish() {
         let mut t = setup("revoked-mid");
