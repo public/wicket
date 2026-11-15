@@ -276,7 +276,7 @@ harness session, and a **generation** number. Each run is one activation of it.
   of its turn, if the box is at a quiet point (nothing else running). The box stops, and its whole writable state is bundled into
   wicket's object store: the workspace, `$HOME` and the agent's config, `/tmp`, and `persist: durable`
   volumes.
-- **Wake:** `wicket wake`, `wicket say`, or a message from another agent rebuilds the box with a new
+- **Wake:** `wicket wake`, opening its session (`wicket session`, or a prompt in the console), or a message from another agent rebuilds the box with a new
   identity, restores the state, and resumes the harness session at the same path.
 
 A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly one wins.

@@ -62,7 +62,7 @@ says which it has (a mode it hasn't is refused, saying so):
 
 | mode | how | `claude-code` | `acp` |
 |---|---|---|---|
-| driven | the default: wicket starts the harness and gives it the task, follow-ups and messages as turns. The only mode that hibernates and wakes. | yes | yes |
+| driven | the default: wicket starts the harness and gives it the task, prompts and messages as turns. The only mode that hibernates and wakes. | yes | yes |
 | remote | `agent.remote`: the harness registers its own session with its vendor's apps, and the owner drives it from there. It starts when the owner sends its first message. | Remote Control (`claude remote-control`) | no |
 | driven remote | `agent.remote` with `drive: true`: driven, as above (the task is its first turn; it hibernates and wakes), with its session also in the vendor's apps, where the owner watches it and can send it messages. | Remote Control turned on in `claude -p` | no |
 | wrapped | `wicket wrap`: a command line another program launched runs in a box, keeping its launcher's stdio. | Remote Control's session processes | no |
@@ -75,7 +75,7 @@ says which it has (a mode it hasn't is refused, saying so):
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
 | `permission_mode` | string | `default`; `bypassPermissions` with `drive` | How far the harness acts without asking: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks in the app before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. With `drive`, `default` is refused: a driven Claude Code asks wicket, not the app, and wicket answers no such prompt. |
-| `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, follow-ups and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
+| `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, prompts and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
 
 Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
 whether the harness asks the owner in the app first, as `bypassPermissions` does for the driven mode.
