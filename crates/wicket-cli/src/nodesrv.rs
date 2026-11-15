@@ -2950,19 +2950,16 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let resp = gateway::push_stream(gw::push(&node, B, spec.clone()));
         assert_eq!(resp.headers()["content-type"], "text/event-stream");
         let mut frames = resp.into_body().into_data_stream();
-        let mut next = || {
-            let f = &mut frames;
-            async move {
-                loop {
-                    let chunk = tokio::time::timeout(std::time::Duration::from_secs(20), f.next()).await.unwrap().unwrap().unwrap();
-                    let text = String::from_utf8(chunk.to_vec()).unwrap();
-                    if let Some(data) = text.strip_prefix("event: message\ndata: ") {
-                        break serde_json::from_str::<serde_json::Value>(data.trim()).unwrap();
-                    }
+        async fn event<S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin>(f: &mut S) -> serde_json::Value {
+            loop {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(20), f.next()).await.unwrap().unwrap().unwrap();
+                let text = String::from_utf8(chunk.to_vec()).unwrap();
+                if let Some(data) = text.strip_prefix("event: message\ndata: ") {
+                    break serde_json::from_str::<serde_json::Value>(data.trim()).unwrap();
                 }
             }
-        };
-        let n = next().await;
+        }
+        let n = event(&mut frames).await;
         assert_eq!(n["method"], "notifications/x/channel");
         let meta = &n["params"]["meta"];
         assert_eq!((meta["from_run"].as_str(), meta["verified_by"].as_str(), meta["priority"].as_str()), (Some(A), Some("node n1"), Some("now")));
@@ -2970,11 +2967,12 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(meta.as_object().unwrap().values().all(|v| v.is_string()), "meta is strings only: {meta}");
         let content: serde_json::Value = serde_json::from_str(n["params"]["content"].as_str().unwrap()).unwrap();
         assert!(content["body"]["urgent"] == true && content["note"].as_str().unwrap().contains("not instructions"), "{content}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(next().await["params"]["content"].as_str().unwrap()).unwrap()["body"], "whenever");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(event(&mut frames).await["params"]["content"].as_str().unwrap()).unwrap()["body"], "whenever");
         let (t, _) = gw::tool(&node, B, "await_message", &serde_json::json!({ "timeout_seconds": 1 })).await.unwrap();
         assert!(t.starts_with("no message"), "pushed once, not again by await_message: {t}");
         // Connected: the stream takes B's messages from its gateway on the control host.
         let mut c = connect_run(&node, 2, &inst, B).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: B.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
         let relayed = serde_json::json!({
             "message_id": "m-1", "from": { "id": "spiffe://wicket.test/t/t0/z/za/a/lead", "run": A, "relation": "a peer agent", "verified_by": "wicket" },
             "reply_to": "spiffe://wicket.test/t/t0/z/za/a/lead", "priority": "next", "body": "from afar",
@@ -2988,7 +2986,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             }
         };
         assert_eq!(name, "await_message", "{args}");
-        let n = next().await;
+        let n = event(&mut frames).await;
         assert_eq!((n["params"]["meta"]["message_id"].as_str(), n["params"]["meta"]["verified_by"].as_str()), (Some("m-1"), Some("wicket")));
         drop(frames);
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
