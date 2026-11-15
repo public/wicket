@@ -72,6 +72,7 @@ struct World {
 fn world() -> &'static World {
     static W: OnceLock<World> = OnceLock::new();
     W.get_or_init(|| {
+        crate::util::ignore_sigpipe();
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
         let upstream: Arc<Mutex<Vec<Seen>>> = Default::default();
         let decided: Arc<Mutex<Vec<Seen>>> = Default::default();

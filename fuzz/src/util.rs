@@ -16,7 +16,19 @@ pub fn scratch(tag: &str) -> PathBuf {
 /// A run context for a zone (YAML flow mapping body, e.g. `reach: [...]`), with an in-memory
 /// ledger and an empty vault, and the receiving end of its events: the caller holds it for as long
 /// as the context lives (forgetting it leaked the channel on every run, which LeakSanitizer reports).
+/// Ignores SIGPIPE, once, as a Rust `main` would: libFuzzer's entry point doesn't, so a write to a
+/// socket the other end closed killed the whole target (CI's egress run) instead of failing that write.
+pub fn ignore_sigpipe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: setting SIGPIPE's disposition to SIG_IGN before any thread writes to a socket; the
+    // handler is the libc constant, not code of ours.
+    ONCE.call_once(|| unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    });
+}
+
 pub fn ctx(zone: &str, vault: PathBuf) -> (wicket_proxy::RunCtx, tokio::sync::mpsc::UnboundedReceiver<wicket_proxy::Event>) {
+    ignore_sigpipe();
     let m =
         wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, {zone}}}")).expect("the harness's zone");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
