@@ -85,6 +85,30 @@ pub struct Slice {
     pub input_tokens: Option<u64>,
 }
 
+impl Slice {
+    /// The slice to lease a node next (#152), given the one it holds (`cur`, None before the first),
+    /// the control host's [`Llm::next_slice`], what it has counted (`spent`, and `input_total` with
+    /// cached tokens): `cur` until less than half a slice of it is left, else `next`; and `next` at
+    /// once if it is lower than `cur` (what is left of the budget shrank, a spawn's carve-out). The
+    /// control host's rule (`noderun::slice_due`), here so the simulation (#324) runs the same one.
+    pub fn renewed(cur: Option<Slice>, next: Slice, spent: Spent, input_total: u64) -> Slice {
+        let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
+        match cur {
+            Some(cur)
+                if !low(cur.requests, next.requests, spent.requests)
+                    && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
+                    && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, input_total))
+                    && cur.requests <= next.requests
+                    && cur.output_tokens <= next.output_tokens
+                    && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
+            {
+                cur
+            }
+            _ => next,
+        }
+    }
+}
+
 /// What a run's model proxy has counted, as a node reports it to its control host (#152).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Spent {
@@ -980,6 +1004,35 @@ fn max_after(s: &str, key: &str) -> u64 {
         }
     }
     best
+}
+
+/// The deterministic simulation's seam (#324, `wicket-sim`): one model call through this proxy's
+/// own checks and accounting, without HTTP or an upstream. [`Llm::sim_begin`] is what
+/// [`Llm::handle`] does before it sends a call (the slice and budget checks of `admit`, then
+/// `filter`'s reservation of `max_tokens`); [`Llm::sim_settle`] is what the call's end does
+/// (`settle`). Built only with the `sim` feature.
+#[cfg(feature = "sim")]
+impl Llm {
+    /// Admits a `POST /v1/messages` asking for `max_tokens`: the output tokens reserved for it
+    /// (possibly lowered to what is left), or the status it is refused with (429 for a budget).
+    pub fn sim_begin(&self, max_tokens: u64) -> std::result::Result<u64, u16> {
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return Err(r.status().as_u16());
+        }
+        let (parts, ()) = Request::post("/v1/messages").body(()).expect("a static request").into_parts();
+        let body = serde_json::json!({"model": "sim", "max_tokens": max_tokens, "messages": []});
+        match self.filter(spec, &parts, Bytes::from(body.to_string())) {
+            Ok(f) => Ok(f.reserved),
+            Err(r) => Err(r.status().as_u16()),
+        }
+    }
+
+    /// Settles a call [`Llm::sim_begin`] admitted with `reserved`: charged `output` and `input`
+    /// tokens if its final usage was seen (`settled`), else its whole reservation.
+    pub fn sim_settle(&self, reserved: u64, input: u64, output: u64, settled: bool) {
+        self.settle(reserved, Usage { input, output, ..Default::default() }, settled);
+    }
 }
 
 #[cfg(test)]
