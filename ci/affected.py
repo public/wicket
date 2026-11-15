@@ -7,7 +7,7 @@ dependencies, and changed files -> end-to-end suites, from the table in ci/affec
   --base REF       compare with the merge base of REF and HEAD (default origin/main)
   --worktree       also uncommitted and untracked files (local gates, before a commit)
   --files FILE|-   the changed paths, one per line, instead of asking git
-  --github-output  append crates=, all_crates=, suites= and rust= to this file (GitHub Actions)
+  --github-output  append crates=, all_crates=, suites=, fuzz= and rust= to this file (GitHub Actions)
   --self-test      check the mapping on synthetic changes, and that the table covers every file a
                    crate reads from outside its own directory
 
@@ -26,8 +26,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-SUITES = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
-          "node-e2e", "acceptance-nodes", "update"]
+E2E = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+       "node-e2e", "acceptance-nodes", "update"]
+# The fuzz targets (#323, fuzz/), each a suite `fuzz-<target>` that ci/fuzz.sh runs for a short while.
+FUZZ = ["egress", "gateway", "chan", "feed", "token", "manifest", "store", "git"]
+SUITES = E2E + [f"fuzz-{t}" for t in FUZZ]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().
 LIBS = set()
@@ -65,6 +68,16 @@ def load_table(path=TABLE):
             raise ValueError(f"{path.name}:{n}: unknown suite(s) {sorted(ss - set(SUITES))}")
         rules.append((pat, cs, ss))
     return rules
+
+
+def is_fuzz_only(crates, suites):
+    """Whether a rule names fuzz targets and nothing else (see select)."""
+    return crates != ALL and not crates and suites != ALL and bool(suites) and all(x.startswith("fuzz-") for x in suites)
+
+
+def fuzz_targets(suites):
+    """The fuzz targets a selection runs, in FUZZ's order."""
+    return list(FUZZ) if suites == ALL else [t for t in FUZZ if f"fuzz-{t}" in suites]
 
 
 def matches(pat, path):
@@ -117,15 +130,24 @@ def select(files, dirs, deps, rules):
     for f in files:
         owner = next((c for c, d in dirs.items() if f.startswith(d + "/")), None)
         hit = [(p, cs, ss) for p, cs, ss in rules if matches(p, f)]
+        # In a crate, a rule naming only fuzz targets adds them, without narrowing the rest: the file
+        # is still unmapped (or mapped) by the other rules.
+        tags = set()
+        if owner is not None:
+            tags = set().union(*(ss for _, cs, ss in hit if is_fuzz_only(cs, ss)))
+            hit = [r for r in hit if not is_fuzz_only(r[1], r[2])]
         fc = set() if owner is None else {owner}
         fs = set()
         for _, cs, ss in hit:
             fc = ALL if cs == ALL or fc == ALL else fc | cs
             fs = ALL if ss == ALL or fs == ALL else fs | ss
         if not hit:
-            # Unmapped: in a crate, its crates' tests and every suite; elsewhere, everything.
+            # Unmapped: in a crate, its crates' tests, every end-to-end suite and the fuzz targets
+            # tagged on it; elsewhere, everything.
             fc = fc if owner else ALL
-            fs = ALL
+            fs = set(E2E) if owner else ALL
+        if fs != ALL:
+            fs |= tags
         why.append(f"{f}: crates {'all' if fc == ALL else ' '.join(sorted(fc)) or '-'}; "
                    f"suites {'all' if fs == ALL else ' '.join(s for s in SUITES if s in fs) or '-'}"
                    + ("" if hit else " (no rule)"))
@@ -258,9 +280,11 @@ def self_test():
     case("policy code", ["crates/wicket-policy/tests/cedar.rs"], {"wicket-policy", "wicket-policy-diff", "wicket-cli"}, {"policy"})
     case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
-    case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, ALL)
+    # Every end-to-end suite, and the fuzz target that reads its frames (#323).
+    case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, set(E2E) | {"fuzz-chan"})
     case("a CLI command group", ["crates/wicket-cli/src/cmd/itself.rs"], {"wicket-cli"}, {"update"})
-    case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, ALL)
+    # An unmapped crate file: every end-to-end suite, no fuzz target.
+    case("the run commands (nearly every suite calls them)", ["crates/wicket-cli/src/cmd/run.rs"], {"wicket-cli"}, set(E2E))
     case("the lockfile", ["Cargo.lock"], ALL, ALL)
     case("the toolchain", ["rust-toolchain.toml"], ALL, ALL)
     case("a crate manifest", ["crates/wicket-fwd/Cargo.toml"], ALL, ALL)
@@ -268,7 +292,18 @@ def self_test():
     case("a workflow", [".github/workflows/ci.yml"], ALL, ALL)
     case("an unmapped file", ["somewhere/new.txt"], ALL, ALL)
     case("nothing changed", [], ALL, ALL)
-    case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-cli"}, ALL)
+    case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-cli"}, set(E2E))
+    # Fuzz targets (#323): the code a target fuzzes adds it without narrowing anything; a harness, its
+    # corpus or a past finding selects that target alone; the shared harness code, every target.
+    case("egress code", ["crates/wicket-proxy/src/egress/mod.rs"], lambda c: c != ALL and "wicket-proxy" in c,
+         set(E2E) | {"fuzz-egress", "fuzz-gateway", "fuzz-chan"})
+    case("policy code, fuzzed", ["crates/wicket-policy/src/lib.rs"], lambda c: c != ALL and "wicket-policy" in c,
+         {"policy", "fuzz-manifest"})
+    case("a fuzz harness", ["fuzz/src/store.rs"], set(), {"fuzz-store"})
+    case("a fuzz finding", ["fuzz/regressions/egress/x", "fuzz/corpus/git/y"], set(), {"fuzz-egress", "fuzz-git"})
+    case("the fuzz crate", ["fuzz/src/lib.rs"], set(), {f"fuzz-{t}" for t in FUZZ})
+    case("the fuzz crate's manifest", ["fuzz/Cargo.toml"], ALL, ALL)
+    case("the fuzz notes", ["fuzz/README.md"], set(), {"docs"})
     case("an example zone", ["examples/demo.yaml"], lambda c: c != ALL and {"wicket-core", "wicket-authz", "wicket-feed"} <= c,
          set())
     case("the agent image", ["images/claude-code/wicket-entry"],
@@ -356,6 +391,7 @@ def main(argv):
     print(f"crates: {c}")
     print(f"suites: {s}")
     print(f"doc crates: {docs}")
+    print(f"fuzz: {' '.join(fuzz_targets(suites)) or '-'}")
     if gh_out:
         with open(gh_out, "a") as f:
             f.write(f"crates={'' if crates == ALL else c}\n")
@@ -371,6 +407,8 @@ def main(argv):
             # Space-padded, so a workflow can test ` smoke ` with contains().
             # An empty value means "run everything" to the workflow, so no suite is ` none `.
             f.write(f"suites= {' '.join(SUITES) if suites == ALL else (s or 'none')} \n")
+            # The fuzz targets to run (ci/fuzz.sh's arguments); `none` when none.
+            f.write(f"fuzz={' '.join(fuzz_targets(suites)) or 'none'}\n")
     return 0
 
 

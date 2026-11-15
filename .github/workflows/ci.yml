@@ -42,6 +42,7 @@ jobs:
       doc_args: ${{ steps.select.outputs.doc_args }}
       rust: ${{ steps.select.outputs.rust }}
       suites: ${{ steps.select.outputs.suites }}
+      fuzz: ${{ steps.select.outputs.fuzz }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -142,6 +143,39 @@ jobs:
       - name: Doctests (nextest doesn't run them)
         if: ${{ steps.pkgs.outputs.doc_args != '' }}
         run: cargo test ${{ steps.pkgs.outputs.doc_args }} --locked --doc
+
+  # #323: the fuzz targets a change selects (ci/affected.map's fuzz-<target> suites; none selected
+  # says `none`, no selection says nothing: every target), 60 s each after the corpora are replayed.
+  # Coverage only (no ASan): the optimized build that also fits a 4 GiB box. Findings are minimized
+  # and uploaded; the nightly run (fuzz.yml) runs every target for longer.
+  fuzz:
+    name: Fuzz (short)
+    needs: select
+    if: ${{ !cancelled() && needs.select.outputs.fuzz != 'none' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FUZZ_WORK: ${{ github.workspace }}/fuzz-work
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+      - name: Fuzz the selected targets
+        env:
+          TARGETS: ${{ needs.select.outputs.fuzz }}
+        run: ci/fuzz.sh --secs 60 $TARGETS
+      - name: Findings (minimized) and logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-findings
+          path: |
+            fuzz-work/artifacts
+            fuzz-work/*.log
+          if-no-files-found: ignore
 
   # #51: SymCC (with cvc5, checksum-verified) on its fixtures, and on the example org policies a
   # change touches: narrows or widens. A solver timeout or `unknown` fails.

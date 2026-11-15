@@ -16,6 +16,8 @@
 # selected crates, with cargo-nextest when it is installed (a retried test that then passed is
 # reported as flaky, never hidden), else cargo test. End-to-end suites run against
 # target/debug/wicket; they need what each script says (Docker with runsc, the agent image, sudo).
+# Selected fuzz targets run for $GATES_FUZZ_SECS (default 30) each, after the suites (ci/fuzz.sh;
+# in a 4 GiB box, set CARGO_BUILD_JOBS=1).
 # Pass WICKET_DOCKER, IMAGE and the like through the environment as for the scripts themselves.
 #
 # Sessions on the shared build host give it their slot command, so only the heavy steps take a slot
@@ -64,6 +66,8 @@ else
 fi
 [ -n "$only_suites" ] && suites=$only_suites
 all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
+fuzz_targets="egress gateway chan feed token manifest store git"
+for t in $fuzz_targets; do all_suites+=" fuzz-$t"; done
 [ "$suites" = all ] && suites=$all_suites
 has() { [[ " $suites " == *" $1 "* ]]; }
 
@@ -121,6 +125,15 @@ if [ "$e2e" = 1 ]; then
         update) hstep "self update" ci/update.sh ;;
       esac
     done
+  fi
+fi
+
+# ---- fuzz targets (#323): a short run of each one selected (ci/fuzz.sh) ----
+if [ "$e2e" = 1 ]; then
+  fuzz=()
+  for t in $fuzz_targets; do has "fuzz-$t" && fuzz+=("$t"); done
+  if [ ${#fuzz[@]} -gt 0 ]; then
+    hstep "fuzz (${fuzz[*]}, ${GATES_FUZZ_SECS:-30} s each)" ci/fuzz.sh --secs "${GATES_FUZZ_SECS:-30}" "${fuzz[@]}"
   fi
 fi
 
