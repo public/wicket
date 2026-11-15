@@ -481,11 +481,10 @@ pub struct LeaseLine {
     pub reserved_micro_usd: i64,
 }
 
-/// Reads the control host's frame from its ledger and the runs' link records.
-pub fn control_frame(l: &wicket_store::Ledger, now_ms: i64) -> Result<ControlFrame> {
+/// Reads the control host's frame from its ledger and the runs' link records (under `runs_dir`).
+pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> Result<ControlFrame> {
     let tenant = wicket_core::TenantId::single();
     let mut f = ControlFrame { now_ms, ..Default::default() };
-    let runs_dir = crate::data_dir().join("runs");
     let mut by_node: HashMap<String, (Vec<LinkRecord>, usize)> = HashMap::new();
     let agents = l.agents(&tenant.0)?;
     // A long-lived agent's run on its way to hibernating (or waking) says so.
@@ -888,7 +887,7 @@ pub async fn node_top(dir: Option<std::path::PathBuf>, once: bool, json: bool) -
 pub async fn control_top(once: bool) -> Result<()> {
     show(once, |w| async move {
         let now = wicket_feed::now_ms();
-        let f = wicket_store::Ledger::open(&crate::ledger_path()).map_err(anyhow::Error::from).and_then(|l| control_frame(&l, now));
+        let f = wicket_store::Ledger::open(&crate::ledger_path()).map_err(anyhow::Error::from).and_then(|l| control_frame(&l, &crate::data_dir().join("runs"), now));
         match f {
             Ok(mut f) => {
                 // This host's own node answers its status socket here.
@@ -1105,6 +1104,40 @@ mod tests {
         let want = include_str!("top/testdata/control-80.txt");
         assert_eq!(got, want.trim_end_matches('\n'), "got:\n{got}");
         assert!(got.lines().all(|l| l.chars().count() <= 80));
+    }
+
+    #[test]
+    fn the_control_frame_is_read_from_the_ledger_and_the_runs_link_records() {
+        let dir = std::env::temp_dir().join(format!("wicket-top-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let l = wicket_store::Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId::single();
+        for (run, node) in [("run_01jcaaaaaaaaaaaaaaaaaaaaaa", "local"), ("run_01jcbbbbbbbbbbbbbbbbbbbbbb", "hyperv1")] {
+            l.run_started(&t, &wicket_core::RunId(run.into()), "dev", "coder").unwrap();
+            l.set_run_node(run, node).unwrap();
+        }
+        l.run_started(&t, &wicket_core::RunId("run_01jccccccccccccccccccccccc".into()), "dev", "gone").unwrap();
+        l.run_ended(&wicket_core::RunId("run_01jccccccccccccccccccccccc".into()), "done", "").unwrap();
+        let a = dir.join("run_01jcaaaaaaaaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(a.join("ctl")).unwrap();
+        let cap = crate::chan::NodeCapacity { vcpus: 2.0, memory_mib: 4096, used_vcpus: 1.0, used_memory_mib: 1024, boxes: 1 };
+        let spent = Spent { requests: 5, input_tokens: 100, output_tokens: 20, ..Default::default() };
+        LinkRecord { node: "local".into(), connected: true, since_ms: NOW - 5000, spent, capacity: Some(cap), updated_ms: NOW }.save(&a);
+        let b = dir.join("run_01jcbbbbbbbbbbbbbbbbbbbbbb");
+        std::fs::create_dir_all(b.join("ctl")).unwrap();
+        LinkRecord { node: "hyperv1".into(), connected: false, since_ms: NOW - 7000, updated_ms: NOW, ..Default::default() }.save(&b);
+        let f = control_frame(&l, &dir, NOW).unwrap();
+        let runs: Vec<(&str, Option<&str>, &str, Option<bool>)> =
+            f.runs.iter().map(|r| (r.run.as_str(), r.node.as_deref(), r.status.as_str(), r.connected)).collect();
+        assert_eq!(runs.len(), 2, "ended runs are left out: {runs:?}");
+        assert!(runs.contains(&("run_01jcaaaaaaaaaaaaaaaaaaaaaa", Some("local"), "running", Some(true))));
+        assert!(runs.contains(&("run_01jcbbbbbbbbbbbbbbbbbbbbbb", Some("hyperv1"), "running", Some(false))));
+        assert_eq!(f.runs.iter().find(|r| r.node.as_deref() == Some("local")).unwrap().spent, Some(spent));
+        // The local node is always listed; the other has no enrolment row here, so isn't.
+        let local = &f.nodes[0];
+        assert_eq!((local.name.as_str(), local.link, local.boxes, local.capacity), ("local", Some((true, NOW - 5000)), 1, Some(cap)));
+        assert_eq!((f.pending, f.leases.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
