@@ -155,7 +155,7 @@ jobs:
     env:
       # A pinned Node, checksum-verified (ci/install-node.sh); the same in build.yml and release.yml.
       NODE_VERSION: 22.23.5
-      NODE_SHA256: ""
+      NODE_SHA256: "cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8" # node-v22.23.5-linux-x64.tar.xz, from nodejs.org/dist/v22.23.5/SHASUMS256.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
