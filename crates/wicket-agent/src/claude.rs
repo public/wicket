@@ -27,6 +27,22 @@ pub fn model_route() -> wicket_core::ModelRoute {
     wicket_core::ModelRoute { provider: MODEL_PROVIDER.into(), secret: LOGIN_SECRET.into(), upstream: MODEL_UPSTREAM.into() }
 }
 
+/// Claude Code's channels (#252): an MCP server that declares [`CHANNEL_CAPABILITY`] can push
+/// [`CHANNEL_NOTIFICATION`]s (`{ content, meta }`) that the session takes as new turns.
+pub const CHANNEL_CAPABILITY: &str = "claude/channel";
+pub const CHANNEL_NOTIFICATION: &str = "notifications/claude/channel";
+
+/// Whether the gateway pushes messages to Claude Code in a box as channel notifications. Off: in
+/// the image's Claude Code (2.1.319) a box's session can't take them. wicket drives it with `-p`
+/// and stream-json, where no channel handler is registered (checked: a pushed notification never
+/// became a turn). Interactively, a server outside the approved plugin allowlist needs
+/// `--dangerously-load-development-channels`, which asks for confirmation at startup. And channels
+/// need a feature flag that is fetched from Anthropic, which a box doesn't reach
+/// (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`). The gateway also has to negotiate MCP before
+/// 2026-07-28 (it does, with push on). Until then a Claude Code agent reads messages with
+/// `await_message`, nudged between turns by its supervisor.
+pub const CHANNELS_IN_BOX: bool = false;
+
 /// Claude Code's config directory, under the box's state dir (`CLAUDE_CONFIG_DIR`).
 pub const STATE_SUBDIR: &str = "claude";
 
