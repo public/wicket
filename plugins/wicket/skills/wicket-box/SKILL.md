@@ -100,7 +100,8 @@ With `max_children` in your agent spec you may start other boxes
 - When a child's run ends you get `run_finished`, with its `status`, a `cause` if it ended abnormally
   (out of memory, say), and its `result`.
 
-To coordinate several boxes, see the `wicket-coordinator` skill.
+To coordinate several boxes, see the `wicket-coordinator` skill of
+[wicket's plugin](https://github.com/public/wicket/blob/main/docs/how-to/use-wickets-skills.md).
 
 ## Habits that keep work
 
