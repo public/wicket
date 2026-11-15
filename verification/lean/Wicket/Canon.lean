@@ -4,7 +4,9 @@ import Wicket.Subset
 # Canonical paths: a normalized path can't escape a rule (#322, item 2)
 
 `wicket_core::canon::canonical_path` decides a request on its path only if that path has one
-spelling: no dot or empty segments, no `;`, no backslash or control character, and every `%` an
+spelling: no dot or empty segments, no `;`, no backslash or control character, nothing a URL parser
+would percent-encode on the way upstream (space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{`, `}` or a
+non-ASCII byte: those go percent-encoded), and every `%` an
 upper-case escape of a byte that has to be escaped (never `/`, `\`, `.`, NUL, `%` or an unreserved
 character). npm's scoped-package form (`/@scope%2fname`, #143) is decided as `/@scope/name`.
 
@@ -43,6 +45,12 @@ def escapesOk : Str → Bool
 
 def badChar (c : Char) : Bool := c == '\\' || c.toNat < 0x20 || c.toNat == 0x7f
 
+/-- What a URL parser would percent-encode on the way upstream (WHATWG's path percent-encode set,
+and every non-ASCII character: a byte of 0x80 or more, as the symbols are UTF-8 bytes), so
+`check_plain` refuses it unescaped: the decided path is then the one sent. -/
+def unescapedChar (c : Char) : Bool :=
+  c ∈ [' ', '"', '#', '<', '>', '?', '`', '{', '}'] || 0x80 ≤ c.toNat
+
 def stripSlash (b : Str) : Str := if b.getLast? = some '/' then b.dropLast else b
 
 /-- The segment checks of `check_plain`. -/
@@ -54,7 +62,8 @@ def segsOk : Str → Bool
   | _ => false
 
 /-- `check_plain`. -/
-def plainOk (p : Str) : Bool := !p.any badChar && !p.contains ';' && escapesOk p && segsOk p
+def plainOk (p : Str) : Bool :=
+  !p.any badChar && !p.any unescapedChar && !p.contains ';' && escapesOk p && segsOk p
 
 def npmPart (s : Str) : Bool :=
   !s.isEmpty && decide (s.length ≤ 214) && s.head? != some '.' &&

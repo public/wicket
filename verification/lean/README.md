@@ -27,7 +27,11 @@ definitions as an oracle that wicket-core's decisions are checked against.
   of the spec: it matches bytes (`?` is one byte of UTF-8), and a glob made only of `**` segments
   (`**/`, `**/**/`) matches everything.
 - **Canonical paths.** The theorems that need them take an absolute path (`AbsPath`), as
-  `canonical_path` guarantees.
+  `canonical_path` guarantees. `canonicalPath` refuses what `check_plain` refuses, over UTF-8 bytes:
+  besides backslashes, control characters, `;`, bad escapes and dot or empty segments, anything a
+  URL parser would percent-encode on the way upstream (space, `"`, `#`, `<`, `>`, `?`, `` ` ``,
+  `{`, `}`, and every byte of a non-ASCII character), which must come percent-encoded (#323).
+  Refusing more keeps every theorem about canonical paths true: they assume `plainOk`.
 - **The org layer** is a predicate. `within_authority` asks it at the request's risk;
   `agent_grant_org` extends that to every use only for an org layer that allows at a lower risk
   what it allows at a higher one. The token's org checks still apply at every use.
