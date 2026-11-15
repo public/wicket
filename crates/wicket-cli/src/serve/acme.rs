@@ -85,7 +85,7 @@ impl AcmeConfig {
 }
 
 /// Writes a secret file atomically: 0600, in a 0700 directory.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = path.parent().ok_or_else(|| anyhow!("{} has no directory", path.display()))?;

@@ -10,9 +10,9 @@
 # when a path is safe to narrow, never a catch-all. `*` stays within a directory, `**` crosses
 # them, and a pattern without a slash matches the file name anywhere.
 #
-# Suites: docs (check-public, Markdown links),
+# Suites: docs (check-public, Markdown links, terms),
 # policy (SymCC policy diffs), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
-# install-test, and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
+# install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update. And one per fuzz target (#323, ci/fuzz.sh): fuzz-egress,
 # fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git.
 #
@@ -46,6 +46,8 @@ LICENSE                            | -   | docs
 .gitignore                         | -   | docs
 ci/check-public.py                 | -   | docs
 ci/check-doc-links.sh              | -   | docs
+ci/check-terms.sh                  | -   | docs
+ci/check-terms.allow               | -   | docs
 ci/gen-cli-reference.sh            | wicket-cli | docs
 changes/**                         | -   | docs
 ci/changelog.py                    | -   | docs
@@ -55,6 +57,10 @@ ci/changelog_test.py               | -   | docs
 examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
+# The console's session view (#327): embedded by crates/wicket-cli/build.rs, checked by its job.
+web/**                             | wicket-cli | -
+ci/session-view.sh                 | wicket-cli | -
+ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
@@ -82,12 +88,12 @@ crates/wicket-cli/src/rootcopy.rs  | -   | update install-test
 crates/wicket-cli/src/daemon/**    | -   | daemon-uids acceptance
 crates/wicket-cli/src/serve/static/** | - | acceptance
 crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes tla
+crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes tla
+crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
@@ -178,3 +184,9 @@ crates/wicket-agent/src/**         | -   | fuzz-manifest
 crates/wicket-policy/src/**        | -   | fuzz-manifest
 crates/wicket-store/src/**         | -   | fuzz-store fuzz-egress fuzz-gateway fuzz-chan
 crates/wicket-identity/src/**      | -   | fuzz-chan
+ci/tla.sh                          | -   | tla
+
+# ---- the TLA+ models (#321) ----
+# Each README maps its actions to the code. That code selects tla too: noderun, nodesrv, nodegw and
+# nodesecrets above; the rest (llm.rs, spawn.rs, the feed, the ledger) isn't listed, so every suite.
+verification/**                    | -   | tla

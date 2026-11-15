@@ -95,7 +95,7 @@ which `sudo wicket` runs, isn't made: see [following](#follow-main-on-its-own) b
 
 The audit records the commit, the run, the environment and the signing key (`self.staged`'s
 `source.ci`). A signature without the claims (from `wicket self sign`) doesn't do for `--from-ci`, and
-no human approval of a sha256 stands in for one.
+no operator's approval of a sha256 stands in for one.
 
 ## Follow main on its own
 

@@ -31,8 +31,18 @@ pub struct Asset {
 
 pub struct Assets {
     pub page: Bytes,
+    /// A run's session page (#327), `/session?run=<id>`: the same for every run (the page reads the
+    /// run from its URL), and like the console's page, no data in it.
+    pub session_page: Bytes,
     pub files: HashMap<String, Asset>,
 }
+
+/// The session view's bundle (web/session, #327), as `build.rs` embedded it: built in CI, or a
+/// placeholder page when the build had no bundle.
+pub const SESSION_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/session.js"));
+pub const SESSION_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/session.css"));
+/// Whether [`SESSION_JS`] is the real view (false: the placeholder).
+pub const SESSION_VIEW_BUILT: bool = matches!(env!("WICKET_SESSION_VIEW_BUILT").as_bytes(), b"1");
 
 fn hashed(name: &str, ext: &str, body: &[u8]) -> (String, String) {
     let digest = sha2::Sha256::digest(body);
@@ -51,18 +61,31 @@ pub static ASSETS: LazyLock<Assets> = LazyLock::new(|| {
         .replace("{{css_sri}}", &css_sri)
         .replace("{{js}}", &js)
         .replace("{{js_sri}}", &js_sri);
+    let (sjs, sjs_sri) = hashed("session", "js", SESSION_JS);
+    let (scss, scss_sri) = hashed("session", "css", SESSION_CSS);
+    let session_page = include_str!("static/session.html")
+        .replace("{{css}}", &scss)
+        .replace("{{css_sri}}", &scss_sri)
+        .replace("{{js}}", &sjs)
+        .replace("{{js_sri}}", &sjs_sri);
     let mut files = HashMap::new();
     let mut add = |path: &str, ctype: &'static str, body: &'static [u8], immutable: bool| {
         files.insert(path.to_string(), Asset { ctype, body: Bytes::from_static(body), immutable });
     };
     add(&js, "text/javascript; charset=utf-8", JS.as_bytes(), true);
     add(&css, "text/css; charset=utf-8", CSS.as_bytes(), true);
+    add(&sjs, "text/javascript; charset=utf-8", SESSION_JS, true);
+    add(&scss, "text/css; charset=utf-8", SESSION_CSS, true);
+    // The service worker (Web Push): at the root so its scope is the whole console, and not cached
+    // for long so a new build's reaches devices. The CSP's `script-src 'self'` allows it (with no
+    // `worker-src`, workers fall back to `script-src`).
+    add("/sw.js", "text/javascript; charset=utf-8", include_bytes!("static/sw.js"), false);
     add("/manifest.webmanifest", "application/manifest+json", include_bytes!("static/manifest.webmanifest"), false);
     add("/static/icon.svg", "image/svg+xml", include_bytes!("static/icon.svg"), false);
     add("/static/icon-192.png", "image/png", include_bytes!("static/icon-192.png"), false);
     add("/static/icon-512.png", "image/png", include_bytes!("static/icon-512.png"), false);
     add("/static/apple-touch-icon.png", "image/png", include_bytes!("static/apple-touch-icon.png"), false);
-    Assets { page: Bytes::from(page), files }
+    Assets { page: Bytes::from(page), session_page: Bytes::from(session_page), files }
 });
 
 /// Sets the security headers every response carries (replacing any a handler set), and HSTS when

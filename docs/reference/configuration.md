@@ -66,7 +66,7 @@ operators:
 ```
 
 An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
-human decision until it is fixed: an authority is never guessed. Roles, several operators with their
+operator's decision until it is fixed: an authority is never guessed. Roles, several operators with their
 own enrolment, and two-person approval are later steps of #11.
 
 ## Environment variables
@@ -85,7 +85,7 @@ own enrolment, and two-person approval are later steps of #11.
 | `WICKET_VERSIONS` | see [files](files.md#versions) | The versions root in development mode. |
 | `WICKET_TRUST_DOMAIN` | | The trust domain, used only if no issuer key exists yet; must match it after. `wicket identity init` is the usual way. |
 | `WICKET_IDENTITY_TTL` | `600` | Seconds an agent identity is valid (at least 20); it is re-issued at half that. |
-| `WICKET_NODE_BUDGET_SLICE` | `0.25` | On the control host: the fraction of a run's model budget leased to its node at a time (0 < f ≤ 1). |
+| `WICKET_NODE_BUDGET_SLICE` | `0.25` | On the control host: the fraction of a run's model budget sent to its node as one slice at a time (0 < f ≤ 1). |
 | `WICKET_LOCAL_NODE_IDLE_SECS` | `600` | Seconds this host's own node's `serve` waits with no boxes and no connections before it exits. |
 | `WICKET_NODE_HOME` | `~/.local/share/wicket-node` | On a node: its directory. |
 | `WICKET_H3_BOX_MTU` | `1452` | The packet size on the box's leg of HTTP/3 (at least 1200). `16000` is much faster under gVisor, for clients that accept large packets. |

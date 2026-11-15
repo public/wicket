@@ -53,5 +53,5 @@ wicket run examples/mock-github.yaml
 | `ci/update.sh` | `wicket self update`, its health gate and automatic rollback |
 | `ci/restore.sh` | the state store and a restore, against a local S3 gateway |
 | `examples/links/demo.sh` | links between boxes |
-| `ci/check-public.py`, `ci/check-doc-links.sh` | no secrets or machine details; no broken relative links in Markdown |
+| `ci/check-public.py`, `ci/check-doc-links.sh`, `ci/check-terms.sh` | no secrets or machine details; no broken relative links in Markdown; no word the [glossary](../explanation/concepts.md#the-nouns) replaced |
 | `ci/gen-cli-reference.sh --check` | `docs/reference/cli.md` matches the commands' `--help` |

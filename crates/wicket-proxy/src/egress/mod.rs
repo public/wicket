@@ -460,7 +460,7 @@ impl Egress {
                 emit("queued", format!("{id}: {why}{for_line}"));
                 let note = self.strike(&op.digest());
                 return problem(403, "queued", "Blocked by wicket sandbox: needs human approval (queued offline)", &format!(
-                    "{why}. wicket's control plane is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
+                    "{why}. wicket's control host is unreachable from this node, so this ask is queued here as {id} and will be put to a human when it is back; nothing new can be approved until then. {} Continue without it for now, or retry later.{note}",
                     crate::SANDBOX_FACT
                 ), None);
             }
