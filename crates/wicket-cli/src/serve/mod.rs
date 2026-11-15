@@ -19,8 +19,8 @@
 //!    `sha256(nonce || canonical action JSON)`. The actions: approve or deny a request (its id,
 //!    method, host, path, whether it is a prefix ask, decision, uses, lifetime and the agent's
 //!    verified identity), start a run (the allowlisted manifest, its content digest, the task
-//!    override, the run id and the principal it will carry), send a follow-up (run and text),
-//!    revoke an identity (run and reason), and the two that widen what a device receives from Web
+//!    override, the run id and the principal it will carry), open a run's session (#327; prompts
+//!    are sent in the session, #198), revoke an identity (run and reason), and the two that widen what a device receives from Web
 //!    Push ([`push`]): register a device (its id, label, push service and digests of its endpoint and
 //!    keys) and turn its details on (removing a device or turning details off only narrow, and need
 //!    only the session). The server builds the JSON from its own reading of the
@@ -59,7 +59,7 @@ mod limits;
 mod manifests;
 mod net;
 mod push;
-mod session;
+pub mod session;
 mod tls;
 mod web;
 
@@ -105,8 +105,8 @@ const MAX_CHALLENGES_PER_OWNER: usize = 8;
 /// Sign-in challenges per address block (an IPv4 /24, an IPv6 /48): one host with a routed block
 /// doesn't get a pool's worth of addresses.
 const MAX_LOGIN_CHALLENGES_PER_BLOCK: usize = 32;
-/// Longest follow-up or task override the console accepts (characters).
-const MAX_TEXT: usize = 16 * 1024;
+/// Longest task override or session prompt the console accepts (characters).
+pub(crate) const MAX_TEXT: usize = 16 * 1024;
 const MAX_REASON: usize = 500;
 /// The one answer to an unauthenticated request for anything but the sign-in surface.
 const DENIED: &str = r#"{"error":"sign in with your passkey"}"#;
@@ -139,10 +139,6 @@ enum Action {
         prefix: Option<String>,
         /// Usable by any run in the request's zone (as `wicket approve --zone-wide`).
         zone_wide: bool,
-    },
-    Say {
-        run: String,
-        text: String,
     },
     Revoke {
         run: String,
@@ -424,7 +420,7 @@ fn launch_detached(exe: &std::path::Path, l: &Launch) -> Result<()> {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut b = vec![0u8; n];
-    getrandom::getrandom(&mut b).expect("the OS random source");
+    getrandom::fill(&mut b).expect("the OS random source");
     b
 }
 
@@ -802,7 +798,7 @@ fn ws_upgrade<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer:
         Err((status, msg)) => return to_response(err(status, msg)),
     };
     let who = match crate::operators::Operator::console(&state.tenant.0, &ticket.name) {
-        Ok(op) => session::Who { principal: op.id, label: op.label, token: ctx.sid.clone() },
+        Ok(op) => session::Who { principal: op.id, label: op.label, token: ctx.sid.clone(), via: "acp" },
         Err(e) => return to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
     };
     let on = hyper::upgrade::on(req);
@@ -1206,24 +1202,8 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             });
             Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide }, v))
         }
-        Some("say") => {
-            let (Some(run), Some(text)) = (str_field(body, "run"), str_field(body, "text")) else {
-                return Err(bad("run and text required"));
-            };
-            if text.trim().is_empty() {
-                return Err(bad("nothing to say"));
-            }
-            if text.chars().count() > MAX_TEXT {
-                return Err(bad("the message is too long"));
-            }
-            check_running(&l, run)?;
-            let identity = (state.identity)(&l, run);
-            let v = json!({
-                "v": 1, "action": "say", "tenant": state.tenant.0, "run": run, "text": text,
-                "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
-            });
-            Ok((Action::Say { run: run.into(), text: text.into() }, v))
-        }
+        // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
+        Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
         Some("open_session") => {
             let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
             check_running(&l, run)?;
@@ -1330,7 +1310,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
         Some("capacity_grant") => capacity::build_grant(state, body),
         Some("capacity_renew") => capacity::build_renew(state, &l, body),
         _ => Err(bad(
-            "action must be decide, say, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, capacity_grant or capacity_renew",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, capacity_grant or capacity_renew",
         )),
     }
 }
@@ -1459,17 +1439,6 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             };
             let lease = lease.map(|x| format!("; lease {x}'s reservation is released")).unwrap_or_default();
             Ok(format!("denied {request}{lease} (signed with {})", oc.name))
-        }
-        Action::Say { run, text } => {
-            check_running(&l, run).map_err(|r| anyhow::anyhow!("{}", r.body["error"].as_str().unwrap_or("not running")))?;
-            l.add_operator_message(run, text, &by)?;
-            l.audit(
-                t,
-                Some(&rid(run)),
-                "operator.message",
-                &json!({ "action": "say", "run": run, "by": by, "via": "console", "chars": text.len(), "signed": signed }),
-            )?;
-            Ok(format!("queued for {run}: the agent gets it as its next turn (signed with {})", oc.name))
         }
         Action::Revoke { run, reason } => {
             let fresh = l.revoke(run, &by, reason)?;
@@ -1755,6 +1724,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::Generate;
 
     const ORIGIN: &str = "http://localhost:8787";
     const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -1811,8 +1781,8 @@ mod tests {
         let dir = tmp.0.clone();
         std::fs::create_dir_all(dir.join("manifests")).unwrap();
         std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
-        let key = SigningKey::random(&mut rand_core::OsRng);
-        let p = key.verifying_key().to_encoded_point(false);
+        let key = SigningKey::generate();
+        let p = key.verifying_key().to_sec1_point(false);
         let cred = b64u(b"cred-1");
         let ledger = dir.join("ledger.db");
         let l = Ledger::open(&ledger).unwrap();
@@ -1926,26 +1896,15 @@ mod tests {
     }
 
     #[test]
-    fn say_queues_a_signed_operator_message() {
-        let mut t = setup("say");
+    fn say_is_gone_and_says_where_prompts_go() {
+        let t = setup("say");
         t.running("run_a", "lead");
-        let r = t.act(json!({ "action": "say", "run": "run_a", "text": "also check the tests" }));
-        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-        let msgs = t.ledger().take_operator_messages("run_a").unwrap();
-        assert_eq!(msgs, vec![("also check the tests".to_string(), "passkey:laptop".to_string())]);
-        let (kind, body) = t.audit_kinds().pop().unwrap();
-        assert_eq!(kind, "operator.message");
-        assert_eq!(body["by"], "passkey:laptop");
-        let signed: Value = serde_json::from_str(body["signed"]["action_json"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            (signed["action"].as_str(), signed["run"].as_str(), signed["text"].as_str()),
-            (Some("say"), Some("run_a"), Some("also check the tests"))
+        assert_refused(
+            &t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })),
+            StatusCode::BAD_REQUEST,
+            "open the run's session",
         );
-        assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (1, 0), "re-verifies offline");
-        // Not to a run that isn't running.
-        assert_refused(&t.begin(json!({ "action": "say", "run": "run_nope", "text": "hi" })), StatusCode::NOT_FOUND, "no run");
-        t.ledger().run_ended(&RunId("run_a".into()), "done", "").unwrap();
-        assert_refused(&t.begin(json!({ "action": "say", "run": "run_a", "text": "hi" })), StatusCode::CONFLICT, "not running");
+        assert!(t.ledger().take_operator_messages("run_a").unwrap().is_empty());
     }
 
     #[test]
@@ -1960,15 +1919,15 @@ mod tests {
         assert_eq!(kind, "identity.revoked");
         assert!(body["signed"]["signature"].is_string());
         assert_refused(&t.begin(json!({ "action": "revoke", "run": "run_none" })), StatusCode::NOT_FOUND, "no identity");
-        // A revoked agent gets no follow-ups.
-        assert_refused(&t.begin(json!({ "action": "say", "run": "run_b", "text": "hi" })), StatusCode::CONFLICT, "revoked");
+        // A revoked agent's session can't be opened.
+        assert_refused(&t.begin(json!({ "action": "open_session", "run": "run_b" })), StatusCode::CONFLICT, "revoked");
     }
 
     #[test]
     fn every_action_needs_a_signed_in_operator_and_a_valid_signature() {
         let mut t = setup("unsigned");
         t.running("run_c", "lead");
-        let say = json!({ "action": "say", "run": "run_c", "text": "hi" });
+        let say = json!({ "action": "revoke", "run": "run_c", "reason": "hi" });
         // No session (or a bootstrap one): no challenge.
         assert_refused(&post(&t.state, "/api/action/begin", &anon(), &say).unwrap(), StatusCode::UNAUTHORIZED, "sign in");
         // No assertion at all.
@@ -1982,13 +1941,13 @@ mod tests {
         let b = t.begin(say.clone());
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let mut a = t.sign(&ch);
-        t.key = SigningKey::random(&mut rand_core::OsRng);
+        t.key = SigningKey::generate();
         let forged = t.sign(&ch);
         a["signature"] = forged["signature"].clone();
         a["authenticatorData"] = forged["authenticatorData"].clone();
         a["clientDataJSON"] = forged["clientDataJSON"].clone();
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "signature");
-        assert!(t.ledger().take_operator_messages("run_c").unwrap().is_empty());
+        assert!(t.ledger().revoked("run_c").unwrap().is_none());
         // An unknown action.
         assert_refused(&t.begin(json!({ "action": "reboot" })), StatusCode::BAD_REQUEST, "action must be");
     }
@@ -1997,15 +1956,16 @@ mod tests {
     fn replayed_stale_mismatched_or_other_session_assertions_are_refused() {
         let mut t = setup("replay");
         t.running("run_d", "lead");
+        t.running("run_d1", "lead");
         // Replay: a finished action's assertion can't be used again.
-        let b = t.begin(json!({ "action": "say", "run": "run_d", "text": "one" }));
+        let b = t.begin(json!({ "action": "revoke", "run": "run_d1", "reason": "one" }));
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let a = t.sign(&ch);
         assert_eq!(t.post("/api/action/finish", a.clone()).status, StatusCode::OK);
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "unknown, used or expired");
         // Mismatched parameters: an assertion over one action's challenge, presented for another's.
-        let small = t.begin(json!({ "action": "say", "run": "run_d", "text": "harmless" }));
-        let big = t.begin(json!({ "action": "revoke", "run": "run_d" }));
+        let small = t.begin(json!({ "action": "revoke", "run": "run_d", "reason": "harmless" }));
+        let big = t.begin(json!({ "action": "revoke", "run": "run_d", "reason": "big" }));
         let small_ch = small.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let big_ch = big.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let mut a = t.sign(&small_ch);
@@ -2013,21 +1973,22 @@ mod tests {
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "challenge");
         assert!(t.ledger().revoked("run_d").unwrap().is_none());
         // Stale: past its two minutes.
-        let b = t.begin(json!({ "action": "say", "run": "run_d", "text": "late" }));
+        let b = t.begin(json!({ "action": "revoke", "run": "run_d", "reason": "late" }));
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         t.state.challenges.lock().unwrap().get_mut(&ch).unwrap().expires = Instant::now() - Duration::from_secs(1);
         let a = t.sign(&ch);
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "unknown, used or expired");
         // Another session can't finish this session's action, and a login challenge isn't an action.
-        let b = t.begin(json!({ "action": "say", "run": "run_d", "text": "mine" }));
+        let b = t.begin(json!({ "action": "revoke", "run": "run_d", "reason": "mine" }));
         let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
         let a = t.sign(&ch);
         assert_refused(&post(&t.state, "/api/action/finish", &anon(), &a).unwrap(), StatusCode::FORBIDDEN, "something else");
         let login = t.post("/api/login/begin", json!({}));
         let a = t.sign(login.body["publicKey"]["challenge"].as_str().unwrap());
         assert_refused(&t.post("/api/action/finish", a), StatusCode::FORBIDDEN, "something else");
-        let msgs: Vec<String> = t.ledger().take_operator_messages("run_d").unwrap().into_iter().map(|m| m.0).collect();
-        assert_eq!(msgs, vec!["one"]);
+        let (_, _, reason) = t.ledger().revoked("run_d1").unwrap().unwrap();
+        assert_eq!(reason, "one");
+        assert!(t.ledger().revoked("run_d").unwrap().is_none());
     }
 
     #[test]
@@ -2381,7 +2342,7 @@ mod tests {
             let sid = sid.clone();
             async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let body = r#"{"action":"say","run":"run_x","text":"hi"}"#;
+                let body = r#"{"action":"revoke","run":"run_x","reason":"hi"}"#;
                 let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let h = if csrf { "x-wicket-csrf: 1\r\n" } else { "" };
                 let req = format!("POST /api/action/begin HTTP/1.1\r\nhost: localhost:8787\r\norigin: http://localhost:8787\r\ncookie: __Host-wicket_sid={sid}\r\ncontent-type: application/json\r\n{h}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
@@ -2395,7 +2356,7 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 403") && out.contains("x-wicket-csrf"), "{out}");
         // With the header, the same request reaches the action (and fails on its merits: no such run).
         let out = send(true).await;
-        assert!(out.starts_with("HTTP/1.1 404") && out.contains("no run run_x"), "{out}");
+        assert!(out.starts_with("HTTP/1.1 404") && out.contains("no identity was issued for run_x"), "{out}");
     }
 
     /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,

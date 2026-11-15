@@ -40,8 +40,81 @@ wicket secret link claude-oauth --file ~/.claude/.credentials.json \
 API key file, say). `--expires-pointer` names the field that says when the value expires (Unix ms),
 so a node holding a copy drops it then. `--hosts` works as for `secret set`. On an installed host
 the file is read as the `wicket` user, so it must be readable by it, and by no one else but its
-owner: to share an owner-only file with it, grant it read with an ACL
+owner. For another user's file, such as an operator's Claude login, use the
+[secret helper](#link-a-login-without-an-acl-the-secret-helper); granting the `wicket` user read with
+an ACL also works, until a program rewriting the file drops it
 ([secrets reference](../reference/secrets.md#let-the-wicket-user-read-a-linked-file)).
+
+## Link a login without an ACL: the secret helper
+
+An ACL on another user's login file doesn't last: Claude Code refreshes its login by rewriting
+`~/.claude/.credentials.json` at mode 0600, which drops the ACL, and from then on every model call
+fails until it is granted again. It is also wider than needed: it lets the `wicket` user read the
+whole file, refresh token included. Instead, run the **secret helper** as the file's owner, and link
+the secret through it:
+
+1. As the file's owner, install and start the helper as a systemd user service (edit `--secret` in
+   the unit if your login is elsewhere, or to serve more than one secret):
+
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   cp deploy/systemd-user/wicket-secret-helper.service ~/.config/systemd/user/
+   systemctl --user daemon-reload && systemctl --user enable --now wicket-secret-helper
+   loginctl enable-linger "$USER"    # keep it running while you are logged out
+   ```
+
+   It runs `wicket secret serve --for wicket --secret
+   claude-oauth=%h/.claude/.credentials.json#/claudeAiOauth/accessToken#/claudeAiOauth/expiresAt`:
+   each `--secret` is `NAME=FILE[#POINTER[#EXPIRES_POINTER]]`.
+
+2. Link the secret through it (`--file` and `--pointer` are only noted, and say whose login it is):
+
+   ```sh
+   sudo wicket secret link claude-oauth --via-helper --helper-user "$USER" \
+       --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken
+   ```
+
+   ```text
+   secret claude-oauth is now read through the secret helper of uid 1000 at @wicket-secret.1000 (at each use; never copied; wicket reads no file); sent only to api.anthropic.com
+   ```
+
+3. Remove the ACLs you had granted (`setfacl -x u:wicket ~/.claude/.credentials.json`), and check:
+   `wicket doctor` says `claude-oauth: read through the secret helper of uid 1000 at
+   @wicket-secret.1000: reachable, valid for N more minutes`.
+
+What it does:
+
+- At every use, wicketd asks the helper for the secret by name. The helper reads the file itself, as
+  its owner, and answers with the pointed-to value and its expiry, nothing else from the file: the
+  refresh token never leaves its owner. A refresh is picked up at the next request.
+- Each end checks the other by the kernel's word (`SO_PEERCRED`): the helper answers only the
+  `wicket` user (`--for`), and wicketd takes an answer only from the uid the link names
+  (`--helper-user`, by default you, the caller), so another process that took the socket's name
+  can't hand it a token of its own.
+- The socket is in the abstract namespace, `@wicket-secret.<uid>`, so there is no directory both
+  users need to reach. Boxes have their own network namespace and can't reach it. `--socket` (on
+  `serve`) and `--helper-socket` (on `link`) take another name, or a path.
+
+Why a flag, and not a fallback when the file can't be read: a link says where its value comes from,
+and that doesn't change behind the operator's back when an ACL comes or goes. A plain link to a file
+wicket can't read fails, and the error says to use the helper.
+
+A Remote Control box (`agent.remote`) also uses non-secret fields of the login object (scopes,
+plan) that wicket reads from the file when the box starts. Through the helper it can't, so those
+boxes start without them; the account fields kept at link time still need `~/.claude.json` readable
+for the link ([secrets reference](../reference/secrets.md#what-a-link-keeps-besides-the-reference)).
+
+## When a model call can't read its secret
+
+The model proxy reads its secret again for up to 3 seconds when it can't (the file is being
+rewritten, or the helper is restarting). If it still can't, the call gets a `503` naming the secret
+and the cause, for example:
+
+```text
+secret "claude-oauth" could not be read (16 tries): the secret helper for secret claude-oauth isn't reachable at @wicket-secret.1000 (...)
+```
+
+`wicket doctor` checks every linked secret the same way.
 
 ## Use it in a zone
 

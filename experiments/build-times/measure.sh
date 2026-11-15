@@ -27,14 +27,14 @@ steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=(clean touch-core touch-cli test-build test-run sizes)
 out=experiments/build-times
 target=${MEASURE_TARGET:-target-measure}
-export CARGO_TARGET_DIR=$PWD/$target
+export CARGO_TARGET_DIR=$([ "${target#/}" != "$target" ] && echo "$target" || echo "$PWD/$target")
 
 record() { # step seconds peak_kib [extra json]
   local load; load=$(cut -d' ' -f1 /proc/loadavg)
-  jq -nc --arg label "$label" --arg step "$1" --argjson secs "$2" --argjson peak "$3" --argjson extra "${4:-{\}}" \
+  jq -nc --arg lbl "$label" --arg step "$1" --argjson secs "$2" --argjson peak "$3" --argjson extra "${4:-"{}"}" \
     --arg jobs "${CARGO_BUILD_JOBS:-}" --arg wrapper "$(basename "${RUSTC_WRAPPER:-}")" --arg incr "${CARGO_INCREMENTAL:-}" \
     --arg rustflags "${RUSTFLAGS:-}" --arg load "$load" --arg commit "$(git rev-parse --short HEAD)" \
-    '{label: $label, step: $step, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit, jobs: $jobs,
+    '{label: $lbl, step: $step, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit, jobs: $jobs,
       rustc_wrapper: $wrapper, incremental: $incr, rustflags: $rustflags, load: $load} + $extra' >>"$out/results.jsonl"
   echo "$label $1: ${2}s, peak $(( $3 / 1024 )) MiB"
 }
@@ -42,10 +42,17 @@ record() { # step seconds peak_kib [extra json]
 timed() { # step command...: runs it, records wall time and peak memory
   local step=$1; shift
   local tf; tf=$(mktemp)
-  /usr/bin/time -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || { tail -20 "$out/.last.log"; rm -f "$tf"; return 1; }
-  read -r secs peak <"$tf"
+  local st=0
+  "${TIME:-/usr/bin/time}" -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || st=$?
+  # A failed build stops the run; failed tests are recorded as such (test-run-failed).
+  if [ "$st" != 0 ] && [ "$step" != test-run ]; then
+    tail -20 "$out/.last.log"
+    rm -f "$tf"
+    return 1
+  fi
+  read -r secs peak < <(tail -1 "$tf")
   rm -f "$tf"
-  record "$step" "$secs" "$peak"
+  record "$step$([ "$st" = 0 ] || echo "-failed")" "$secs" "$peak"
 }
 
 touch_and_build() { # step file
@@ -67,7 +74,7 @@ for s in "${steps[@]}"; do
     touch-cli) touch_and_build touch-cli crates/wicket-cli/src/main.rs ;;
     test-build) timed test-build cargo test --workspace --locked --no-run ;;
     test-run)
-      timed test-run cargo test --workspace --locked
+      timed test-run cargo test --workspace --locked --no-fail-fast
       ;;
     sizes)
       bins=$(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f -executable -name '*-*' ! -name '*.so' ! -name '*.d' | wc -l)

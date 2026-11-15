@@ -215,8 +215,8 @@ wicket node revoke n1
   |---|---|---|
   | fresh (a statement within the TTL, 30 s) | the box's token and its live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
   | offline (no live statement) | the same, each until its own expiry | queued on the node (`asks.json`; a node-local id `q-…` in the 403) and raised when the control host is back, saying how old it is; no approvals on the node alone |
-  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 403, retry |
-  | closed (no verified state, or the feed key's certificate expired) | nothing | 403 |
+  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 503 with `Retry-After` (a model call is held up to 3 s first) |
+  | closed (no verified state, or the feed key's certificate expired) | nothing | 503 with `Retry-After` |
 
   Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
   counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
@@ -234,7 +234,7 @@ wicket node revoke n1
   and a credential swap's host are terminated on the node, which injects or swaps the credential itself, its
   secret fetched on first use (#152, #257). The node forwards a swapped host only for a box that a control host
   at protocol 9 started. While disconnected, they
-  fail with a clear 403. The LLM proxy and the MCP gateway are reached the same way, through tunnels.
+  fail with a 503 and `Retry-After` (temporary; clients retry). The LLM proxy and the MCP gateway are reached the same way, through tunnels.
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
   recomputes each node's chain. The control host, not the node, decides where a shipped record is filed. It

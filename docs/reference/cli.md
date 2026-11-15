@@ -9,7 +9,7 @@ only: [the daemon](daemon.md#who-may-run-what) lists which commands need `sudo`.
 humantime strings (`90s`, `10m`, `1h`).
 
 - [`wicket run`](#wicket-run)
-- [`wicket say`](#wicket-say)
+- [`wicket session`](#wicket-session)
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket wake`](#wicket-wake)
 - [`wicket top`](#wicket-top)
@@ -32,6 +32,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket secret rm`](#wicket-secret-rm)
   - [`wicket secret hosts`](#wicket-secret-hosts)
   - [`wicket secret link`](#wicket-secret-link)
+  - [`wicket secret serve`](#wicket-secret-serve)
 - [`wicket image`](#wicket-image)
   - [`wicket image digest`](#wicket-image-digest)
 - [`wicket serve`](#wicket-serve)
@@ -109,7 +110,7 @@ Usage: wicket <COMMAND>
 
 Commands:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
-  say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; its harness session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+  session    Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its harness session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
@@ -166,19 +167,21 @@ Options:
   -h, --help                           Print help
 ```
 
-## `wicket say`
+## `wicket session`
 
 ```text
-Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; its harness session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
+Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
 
-Usage: wicket say <RUN> [TEXT]...
+Usage: wicket session [OPTIONS] <RUN> [TEXT]...
 
 Arguments:
   <RUN>      
-  [TEXT]...  
+  [TEXT]...  A prompt to send; then only its turn shows
 
 Options:
-  -h, --help  Print help
+      --no-wait            With TEXT: queue it and exit at once
+      --timeout <TIMEOUT>  With TEXT: stop following its turn after this many seconds (it stays queued)
+  -h, --help               Print help
 ```
 
 ## `wicket hibernate`
@@ -427,6 +430,7 @@ Commands:
   rm     Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
   hosts  Bind a secret to the only host names it may be sent to, replacing its list
   link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
+  serve  Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -493,22 +497,42 @@ Options:
 ```text
 Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
 
-Usage: wicket secret link [OPTIONS] --file <FILE> <NAME>
+Usage: wicket secret link [OPTIONS] <NAME>
 
 Arguments:
   <NAME>  
 
 Options:
       --file <FILE>
-          
+          The file. With --via-helper, only noted (the helper is told its file)
       --pointer <POINTER>
-          A JSON pointer into the file (e.g. /login/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file)
+          A JSON pointer into the file (e.g. /login/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file). With --via-helper, only noted (it says whose login it is)
       --expires-pointer <EXPIRES_POINTER>
           
       --hosts <HOSTS>
           The only host names it may be sent to (as for `secret set`)
+      --via-helper
+          Read the secret through `wicket secret serve`, run as the file's owner, instead of reading the file: no ACL on it, and wicket gets only the value the helper serves under this name and its expiry
+      --helper-user <HELPER_USER>
+          The user the helper runs as (a name or uid); an answer from any other is refused. Default: you (the caller wicketd names)
+      --helper-socket <HELPER_SOCKET>
+          The helper's socket: `@NAME` (abstract) or a path. Default: @wicket-secret.<uid>
   -h, --help
           Print help
+```
+
+### `wicket secret serve`
+
+```text
+Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
+
+Usage: wicket secret serve [OPTIONS] --secret <SECRETS>
+
+Options:
+      --secret <SECRETS>  A secret to serve: NAME=FILE[#POINTER[#EXPIRES_POINTER]], e.g. claude-login=/home/me/.claude/.credentials.json#/claudeAiOauth/accessToken#/claudeAiOauth/expiresAt
+      --for <FOR_USER>    The user it answers (wicketd's; a name or uid) [default: wicket]
+      --socket <SOCKET>   Where to listen: `@NAME` (abstract) or a path. Default: @wicket-secret.<your uid>
+  -h, --help              Print help
 ```
 
 ## `wicket image`

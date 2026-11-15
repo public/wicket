@@ -19,7 +19,7 @@
 //! policy. This endpoint doesn't talk to the box itself; it reads both sides of that conversation:
 //! the agent's from the run's transcript, wicket's from [`crate::transcript::ACP_LOG`], put back in
 //! order by transcript offset. A prompt from the browser becomes an operator message, which the
-//! supervisor hands to its ACP client as the next turn (as `wicket say` does; v1 has no steering),
+//! supervisor hands to its ACP client as the next turn (v1 has no steering),
 //! and its `session/prompt` is answered with the agent's stop reason when that turn ends.
 //!
 //! What the browser gets:
@@ -284,7 +284,7 @@ pub(super) fn check_upgrade(
     Ok((t, accept, slot))
 }
 
-/// What the socket runs as.
+/// What the socket (or `wicket session` in a terminal, #198) runs as.
 #[derive(Clone, Debug)]
 pub struct Who {
     /// The operator's principal id (`spiffe://…/op/passkey/<name>`).
@@ -293,6 +293,9 @@ pub struct Who {
     pub label: String,
     /// The console session's cookie token (to re-check the session).
     pub token: Option<String>,
+    /// Where the session is open, for the audit log: `acp` (the console's socket) or `terminal`
+    /// (`wicket session`).
+    pub via: &'static str,
 }
 
 /// Serves an upgraded connection until the client, the console session or the run ends it.
@@ -453,13 +456,13 @@ impl Bridge {
         Ledger::open(&self.ledger).ok()
     }
 
-    fn audit(&self, kind: &str, body: Value) {
+    pub fn audit(&self, kind: &str, body: Value) {
         if let Some(l) = self.ledger() {
             let _ = l.audit(&self.tenant, Some(&RunId(self.run.clone())), kind, &body);
         }
     }
 
-    fn running(&self) -> bool {
+    pub fn running(&self) -> bool {
         self.ledger().is_some_and(|l| check_running(&l, &self.run).is_ok())
     }
 
@@ -566,7 +569,7 @@ impl Bridge {
             &self.tenant,
             Some(&RunId(self.run.clone())),
             "session.prompt",
-            &json!({ "run": self.run, "by": self.who.label, "principal": self.who.principal, "via": "acp", "operator_message": op,
+            &json!({ "run": self.run, "by": self.who.label, "principal": self.who.principal, "via": self.who.via, "operator_message": op,
                      "chars": text.chars().count(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())) }),
         );
         self.waiting.insert(op, Waiting { rpc: id });
@@ -597,7 +600,7 @@ impl Bridge {
             &self.tenant,
             Some(&RunId(self.run.clone())),
             "session.cancel",
-            &json!({ "run": self.run, "by": self.who.label, "principal": self.who.principal, "via": "acp", "cancel": id }),
+            &json!({ "run": self.run, "by": self.who.label, "principal": self.who.principal, "via": self.who.via, "cancel": id }),
         );
         vec![self.notice("asked the agent to stop its running turn")]
     }

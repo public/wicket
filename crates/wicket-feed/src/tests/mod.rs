@@ -19,7 +19,7 @@ pub(crate) const NODE: &str = "n1";
 pub(crate) const TTL: i64 = 3_000;
 
 pub(crate) fn key() -> SigningKey {
-    SigningKey::generate(&mut rand_core::OsRng)
+    SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng))
 }
 
 /// A directory removed when dropped.

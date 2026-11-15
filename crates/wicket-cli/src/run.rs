@@ -1298,6 +1298,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
+            memory_advice: m.zone.limits.memory_advice().map(str::to_string),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -1486,7 +1487,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
         _ => None,
     };
-    // The task is the first user turn on stdin; follow-ups from the operator (`wicket say`) are
+    // The task is the first user turn on stdin; prompts from the operator's session (#198) are
     // written the same way while the session is open. wicket closes stdin only when the agent asked
     // to finish or hibernate (#249): the harness decides when it is done.
     let mut stdin = stdin;

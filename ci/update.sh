@@ -198,7 +198,7 @@ another_turn() {   # $1: what happened
   local i r res
   for i in "${!runs[@]}"; do
     r=${runs[$i]}
-    w say "$r" "Again, $1." >/dev/null 2>&1 || true
+    w session --no-wait "$r" "Again, $1." >/dev/null 2>&1 || true
     wait_for 180 '[ "$(result '"$r"' | jq -r .turn 2>/dev/null)" = '"$turns"' ]' || true
     res=$(result "$r")
     echo "   ${labels[$i]}: $res"

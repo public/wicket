@@ -6,8 +6,8 @@ use super::*;
 
 fn keys() -> (String, String) {
     let k = p256::SecretKey::from_slice(&[0x11; 32]).unwrap();
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    (b64u(k.public_key().to_encoded_point(false).as_bytes()), b64u(&[5u8; 16]))
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    (b64u(k.public_key().to_sec1_point(false).as_bytes()), b64u(&[5u8; 16]))
 }
 
 fn cookie(t: &T) -> String {
