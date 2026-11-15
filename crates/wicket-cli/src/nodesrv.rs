@@ -2996,6 +2996,12 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // connection, the control host answering as `noderun::fetch_secret` does.
         let mut c = connect_run(&node, 2, &inst, RUN).await;
         c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..500 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let theirs = wicket_proxy::vault::Vault::from_source(node.secrets.source(RUN, node.fetcher()));
         let made = node_swaps(&start);
         assert_eq!(made.iter().map(|s| s.placeholder.as_str()).collect::<Vec<_>>(), ["ph-login", "ph-session"]);
