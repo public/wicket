@@ -1573,12 +1573,11 @@ the design; what is built is the agent row described in §13.5.
 
 - **Living long doesn't widen reach.** The home zone is a standing *ceiling*. What an agent can actually
   do is still decided per `Op`.
-- **Grants are scoped to a work item, not to the agent's lifetime.**
-  - Standing grants exist only up to the auto tier, within the ceiling, and are listed in the manifest.
-  - Every grant has a lifetime, and the agent's own authority does too (§11).
+- **Grants belong to the run that asked**, not to the agent's lifetime. Every grant has a lifetime, and
+  the agent's own authority does too (§11).
 - **Trusted text** is the charter (operator-signed, versioned) plus the current work item's text. For
   event-triggered work only the *subscription* is trusted, never the event. "Wake on a new issue and triage
-  it" is trusted; the issue's content is a labelled handle.
+  it" is trusted; the issue's content is untrusted data.
 - **A rebuild starts from what the agent keeps** (§13.4), not from its whole past context. With labels
   deferred (§22), that is a recovery point, not a declassification.
 
@@ -1917,19 +1916,18 @@ would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gai
 
 ### 14.2 Showing humans the boundaries
 
-- **The zone view** is generated from compiled zones, gates, live grants and the gateway's provider-side
-  label store. Two zones that write to the same GitHub issue get an edge. Nested zones collapse by default
+- **The zone view** is generated from compiled zones, links and live grants. Two zones that write to the
+  same GitHub issue get an edge. Nested zones collapse by default
   to about 7 or fewer at the top.
 - **The blast-radius query:** `wicket explain --compromised <zone>` returns
   - reach and send;
-  - what can cross each outgoing gate on its behalf (capacity in bits for typed fields);
+  - what can reach other zones on its behalf: messages and links;
   - unmediated channels (SNI-only hosts, DNS on hosted backends, vendor remote UIs);
   - **authority, not just permission**: what provider-side `triggers` (CI on push, ChatOps, notifications)
     turn its allowed actions into (Miller's distinction) [06];
   - Cedar witness requests from symcc for "can X cause Y" questions.
 
-  The zone compiler also refuses any zone with an uncontrolled channel to a destination not cleared for
-  its `conf`, and every label raise is explicit and logged.
+  The zone view marks every uncontrolled channel.
 - **The timeline** of grant diffs, for example "fix gained `contents.write` on `ci.yml` at 14:02, granted
   by human, expires 14:12".
 - **Everything untrusted shown to humans is sanitised:** ANSI and control characters stripped, bidi and
@@ -2065,260 +2063,88 @@ the tenants scheduled on it, and only their short-lived credentials).
 
 ## 16. Mandates: acting on a user's behalf
 
-*Owner requirement (2026-11-08): "user authed creds", where an agent gets time- and purpose-limited
-access to resources so it can act on the user's behalf, such as shopping online. Protocols, prior art,
-Rust types, 31 red-team cases and milestones MD0–MD9 are in
-[`research/15-mandates-user-delegation.md`](research/15-mandates-user-delegation.md).*
+*Owner requirement (2026-11-08): an agent gets time- and purpose-limited access to act as a user, for
+example shopping online. Research: [`research/15-mandates-user-delegation.md`](research/15-mandates-user-delegation.md).*
 
-A **mandate** is authority a *user* delegates to an agent: to act *as them* at a provider, for a stated
-purpose, within limits, until a deadline. It is the same machinery as a grant (§4, §11) with one
-difference: the principal is the user, not the operator, and the user's own account is used.
-
-### 16.1 Model
-
-```rust
-pub struct Mandate {
-    pub id: MandateId, pub tenant: TenantId,
-    pub principal: UserId,                  // whose account and money
-    pub grantee: AgentOrZone,               // who may use it
-    pub connection: ConnectionId,           // the user's account at the provider; held in the vault, never in a box
-    pub purpose: TrustedText,               // the user's own words: "weekly groceries, usual brands, Saturday delivery"
-    pub allow: CapabilitySet,               // e.g. site:search, site:product.read, site:basket.*
-    pub forbid: Vec<ActionPattern>,         // e.g. payment.*, address.*, account.*, subscription.*
-    pub money: Option<MoneyLimit>,          // per order, total, currency
-    pub quantity: Option<QuantityLimit>,    // per item, per order
-    pub window: (Timestamp, Timestamp),     // not before / expires
-    pub uses: Option<u32>,
-    pub approvals: Vec<ApprovalPoint>,      // e.g. Checkout => passkey approval of the typed cart
-    pub state: MandateState,                // Active | Exhausted | Expired | Revoked
-}
-pub struct MoneyLimit { pub per_order: Money, pub total: Money }
-pub enum ApprovalPoint { Checkout, NewPayee, AnyR3, Custom(ActionPattern) }
-```
-
-- **A mandate is signed with a passkey by the principal**, the person whose account and money it is.
-  Only that person can widen it or approve money. Spend counters live in the ledger, and without a
-  mandate, no use of the user's credentials is possible.
-- **Purpose:** a closed `PurposeClass` (groceries, travel booking, …) is what policy uses. The user's own
-  purpose text is hashed into the mandate and shown on every approval, but it is never policy: no standard
-  enforces purpose, and Transaction Tokens dropped their purpose claim.
-- **The purpose is trusted text** for sink provenance (§4.2). Quantities, recipients and items must trace
-  to the user's purpose or the user's live instructions. A product review saying "add 50 bottles" fails
-  provenance and the quantity limit.
-- **Mandates sit in the ledger** beside grants. Every use is recorded, the money spent is tracked against
-  the limit, and the user can revoke at any time; revocation takes effect on the next request.
-- **Standing mandates** suit long-lived agents (§13), for example "weekly groceries under £120, until I
-  revoke it". Each order still passes its approval points.
-
-### 16.2 Connections: how the user's access gets in, without reaching the agent
-
-| Provider kind | How the user connects | What the agent gets |
-|---|---|---|
-| Has an API (Gmail, GitHub, calendars, banks with open banking) | OAuth consent on a wicket-owned page; narrowest scopes; RAR-style limits and token exchange where supported | Gateway tools or proxied HTTP. The token is injected per request, only under a live mandate |
-| Website without an API (most shops) | The user logs in **themselves** in a wicket-provided remote browser. The session is kept in the vault's cookie jar | A browser workload it can drive (§16.3). Never the cookies, never the password |
-| Agent payment protocols (AP2 mandates, agentic payment tokens, single-use virtual cards) | The user's wallet or bank issues a token with a merchant lock and an amount cap | A payment step that can't exceed what the user signed |
-
-The agent never sees passwords, cookies, OAuth tokens or card numbers. That's principle 2, unchanged.
-
-### 16.3 Websites: the shopping case
-
-- **Three pieces, so the session never reaches anything the agent controls:**
-  1. the user logs in themselves in a wicket-provided remote browser, and the session cookies go to the
-     vault;
-  2. the agent drives a separate, sandboxed browser that holds **no** session;
-  3. the egress proxy injects the cookies only into requests that the mandate allows for that site, and
-     captures any `Set-Cookie` back into the vault.
-
-  A device-bound session (Chrome DBSC) would break step 3; no UK grocer uses one yet.
-- **Site adapters** classify actions by risk, from URL and form-action patterns and page structure:
-  - browsing and search: R0;
-  - basket add and remove: R2, within the money and quantity limits;
-  - checkout, placing an order, payment, delivery address, account and subscription changes: R4 with the
-    `money` or `perm.manage` effect. These are always approval points, and are forbidden outright unless
-    the mandate allows them.
-- **"Never pay without the human" is seven layers, not one check:**
-  1. Payment, wallet and 3-D Secure hosts are denied at egress.
-  2. The site adapter makes checkout endpoints approval points, and unknown POSTs wait for review.
-  3. A checkout-page detector freezes the session.
-  4. The cart is locked. The user's passkey signs a **typed cart that wicket read itself** (items,
-     quantities, unit prices, total, delivery slot, address, card last four). It is re-read just before the
-     one allowed submit; any change voids the approval.
-  5. The final charge is reconciled after delivery. At UK grocers checkout commits the order but the charge
-     comes later, and substitutions and weighed items change it.
-  6. The user can take over and press Pay themselves.
-  7. Optionally, a capped virtual card or a bank-side limit.
-
-  This is the rule this box already follows by hand: build the basket, notify the owner, wait.
-- **Payment protocols** are used where available, but none of the live rails checks *what* is bought, so
-  layers 1–6 stay:
-  - AP2 v0.2 and Mastercard Verifiable Intent have user-signed, line-item constraints but few live
-    merchants;
-  - Visa Intelligent Commerce has been live with UK issuers since July 2026, using passkeys;
-  - ACP and Stripe Shared Payment Tokens cap amount, merchant and expiry, but the user signs nothing.
-- **Wire shapes:** RFC 9396 authorization details plus the `insufficient_authorization` remediation draft;
-  Open Banking VRP control parameters for money limits; CIBA for approval delivery; ISO 27560 consent
-  receipts.
-- **Known risks:**
-  - injected or manipulated items that stay within limits (dark patterns steer agents in over 70% of tasks);
-  - address or card swaps, vouchers and loyalty points;
-  - leaks of order history and other personal data;
-  - sites that block agents (Tesco and Asda blocked ChatGPT agent);
-  - terms that make the user liable for every order on their account (Ocado);
-  - approval fatigue on weekly shops.
-
-### 16.4 Lifecycle and UX
-
-- **Grant:** a consent screen shows the purpose in the user's own words, the scope, the limits, the expiry
-  and the approval points.
-- **While it runs:** live view and receipts. After each action that matters (basket changed, order placed)
-  the user gets a short receipt.
-- **Revoke** at any time, from the console or a push notification. **Expiry** is automatic.
-- **In platform mode,** a SaaS product's end users grant mandates inside the product through an embeddable
-  consent and approval flow (§15). Tenant policy caps what mandates may allow at all.
+A separate mandate subsystem is deferred (§22). With one principal (#11) and one grant (#256), a mandate
+is a grant from a user principal to an agent: bound to a resource, a purpose, a lifetime and an amount,
+and revocable. The user's credentials stay in the vault, injected at egress, never in the box.
 
 ---
 
 ## 17. Programs: deterministic workloads without an agent
 
-*Owner requirement (2026-11-08): wicket also runs ordinary, deterministic workloads. An agent might write
-a reusable program; running it again shouldn't need an agent each time, but it must get the same isolation.*
+*Owner requirement (2026-11-08): wicket also runs ordinary, deterministic workloads, with the same
+isolation as an agent.*
 
-A **program** is code plus a run contract:
-- **Code:** a source tree, content-addressed by digest; the digest is the program's identity.
-- **Runtime:** a pinned image, plus a lockfile where relevant.
-- **Entrypoint and typed I/O:** inputs as handles or typed fields; outputs in the outbox, as typed fields plus
-  labelled handles.
-- **Declared reach:** the hosts and adapter endpoints it needs, closed-world.
-- **Labels:** inherited from how it was made (below).
+A **program is an agent without a model** (#255): the manifest's `program` (a command, or a source tree
+named by its digest) instead of an `agent`, in the same box, zone, proxies, identity and audit. There's
+no model route. It can't reason about a pending request, so by default it may not ask
+(`program.on_pending: fail`; `escalation.request: false` once #256 lands). `spawn` starts one like an
+agent.
 
-```rust
-pub struct Program {
-    pub id: ProgramId, pub tenant: TenantId,
-    pub digest: Digest,                     // of the source tree: the identity a run pins
-    pub runtime: ImageRef,                  // pinned by digest
-    pub entrypoint: Vec<String>,
-    pub inputs: Schema, pub outputs: Schema,
-    pub reach: CapabilitySet,               // closed-world; effective reach = this ∩ the zone's ceiling
-    pub label: Label,                       // join of its author's label at the time it was written
-    pub provenance: Provenance,             // written by (agent, run) or a human; reviewed by whom
-    pub state: ProgramState,                // Draft | Approved{by, signature} | Retired
-}
-```
+**Approving a program is a grant on its digest** (#258): a source tree in the content-addressed store
+is named by its sha256, and "may this digest run" is one check over grants, as for any other artifact.
+Any change is a new digest. A separate program registry and promotion flow are not needed, and are
+deferred with it (§22).
 
-**From agent output to approved program.** Code an agent writes is untrusted code, carrying the agent's
-taint, so it goes through a **promotion gate**, the same idea as memory promotion (§13.4):
-1. The agent emits a program as a handle: source, entrypoint and the reach it claims to need.
-2. A human (or, for low-risk programs, an automated check) reviews the diff and the claimed reach, and
-   approves it with a passkey signature over the program's digest (§14.1).
-3. Only an approved digest can run without an agent. Any change, even one line, is a new digest and needs
-   a new approval. A new version that asks for *more* reach is a policy change and needs a decision.
-
-**Running a program** is a workload like any other (§8.1, kind `Program`):
-- **Same sandbox, isolation floor, placement and budgets as an agent zone.** There's no LLM proxy socket,
-  because there's no model. The egress proxy, credential injection, reach rules, dangerous patterns and
-  ledger are unchanged.
-- **Escalation without an agent:** a program can't reason about a pending request. Each run says what
-  happens: `on_pending: fail` (the default for scheduled runs), `park` until a human decides (the run is
-  frozen or checkpointed, §7), or `fail_and_notify`.
-- **Triggers:** on demand (a human, the CLI or API), a schedule, an event subscription, or **an agent calling
-  it as a tool** through the gateway (`wicket.run_program(name, inputs)`). In that last case the agent gets
-  typed outputs and handles back, and never the program's credentials.
-- **Determinism and provenance:** pinned image, pinned dependencies, declared network only, inputs passed as
-  handles. Every run records (program digest, image digest, input digests, output digests, every egress
-  decision), so a result can be traced and re-run.
-- **Labels:** outputs carry the join of the program's label, its inputs' labels and whatever it fetched. A
-  program an agent wrote while tainted by the web stays tainted until a human's review endorses it.
-- **Cheaper than an agent:** no model, no agent start-up. Pure functions can run in the Wasm codemode tier
-  in milliseconds (§7.1).
-
-**Verifier zones** [17 §4-5]. Harness search (ADAS, Darwin Gödel Machine, Meta-Harness) and agent-written
-programs are natural wicket workloads, and every one of those systems assumes an honest scorer. The evidence
-says otherwise: agents game checkers they can see. So the proposer zone emits a candidate as a handle; a
-runner zone executes it with only the LLM proxy; a verifier zone that the proposer cannot read scores it and
-returns a typed, low-capacity score across the gate. A winning candidate is promoted through the signed
-program promotion above.
+**Verifier zones** [17 §4-5]. Agents game checkers they can see, so a scorer belongs in a zone the
+proposer can't read, returning only a score.
 
 ---
 
 ## 18. Crate layout
 
 ```
-wicket/
-  crates/
-    wicket-core        types: ids, Resource/Capability algebra, Label, Zone, Gate, Handle, Op, Decision. No I/O.
-    wicket-policy      Cedar compilation of org/zone/forbids; decide(Op) -> Decision; ledger trait
-    wicket-verify      cedar-policy-symcc + cvc5 sidecar: subset/narrowing/disjointness proofs (feature-gated)
-    wicket-adapter     DSL schema, parser, interpreter, canonicalizer, dangerous patterns, resolvers
-    wicket-store       ledger, grants, handles, labels, provider label store, audit log (SQLite + replication; Postgres in cluster mode); agent registry, memory versions, object-storage blobs with per-agent keys
-    wicket-escalation  request validation/narrowing/classification, deciders, human channel
-    wicket-egress      rama MITM proxy, per-box CA, credential injection, decider protocol
-    wicket-git         smart-HTTP receive-pack store-and-forward
-    wicket-llm         LLM proxy: Anthropic first, OpenAI later; budgets, liveness, taint
-    wicket-gateway     rmcp MCP gateway: adapter-generated tools, wicket.* tools, third-party pinning
-    wicket-sandbox     Sandbox/Instance traits + backends behind features (docker (dev), process, gvisor, firecracker, seatbelt, e2b, wasm, k8s-agent-sandbox)
-    wicket-jail        privileged helper binary for the process backend
-    wicket-agent       InnerAgent/AgentSession traits; T1: claude-code, codex (app-server; types generated from its pinned JSON schema), pi (RPC); T2: acp; T3: process
-    wicket-view        zone graph, blast-radius, timeline
-    wicket-infra       placement vocabulary, compiler + verifier, BillingModel, leases, Reconciler/Store traits
-    wicket-operator    kube-rs operator: NodePool/Workload/WarmPool CRDs, admission, reservation pods, Cilium policy
-    wicket-node        per-node agent: direct launch, warm pools, parking, local enforcement, per-workload credentials
-    wicket-provisioner HostProvider impls (local, vultr/broker, aws, gcp, hetzner, …); the only holder of cloud credentials
-    wicket-channels    event log projections, OperatorChannel trait, WebAuthn decision verification, push, RC bridge supervision + tap
-    wicket-lifecycle   agent registry state machine, wake sources, hibernation, promotion gate, retention and GC
-    wicket-guest       static PID 1 shim inside microVMs (exec, IO, diff, vsock proxy shim)
-    wicket-bench       startup, memory and density measurements per backend
-    wicket-mandate     mandates: model, consent, connections (OAuth, browser sessions), money/quantity limits, approval points
-    wicket-program     program registry: digests, promotion and approval, run contracts, on_pending policy
-    wicket-browser     browser workload: a sandboxed headless browser holding a user's session, driven via gateway tools; site adapters
-    wicket-console     untrusted web front end (mobile-first PWA) over wicketd's API; no ledger write access, no creds
-    wicketd            daemon wiring it together
-    wicket-cli         `wicket run | explain | approve | ls | logs`
-  adapters/            github-rest.yaml, github-git.yaml, anthropic.yaml, dangerous/github.yaml
-  agents/pi/wicket-ext/  tiny in-box pi extension (TypeScript; advisory; hash-pinned in the image)
-  third_party/         vendored files with NOTICE (Codex proxy_routing/seccomp/authorization_path/process-hardening, sandstorm runsc parking, smokescreen classifier port)
-  tasks/               example manifests
-  docs/
+crates/
+  wicket-core        types: manifest and zones, Op, the subset check, links, canonical forms. No I/O.
+  wicket-policy      Cedar org and zone policy, compiled for tokens
+  wicket-policy-diff SymCC policy diffs for CI
+  wicket-authz       vendored, patched biscuit-auth and wicket's token vocabulary (§2.1)
+  wicket-feed        the signed snapshot-and-delta feed and its replica on a node
+  wicket-identity    issuer, agent and node identities, one compact-JWS module
+  wicket-auth        passkeys (WebAuthn)
+  wicket-store       ledger, audit chain, leases, links, bundles, object and content-addressed store
+  wicket-proxy       egress proxy, model proxy and MCP gateway
+  wicket-sandbox     box backends (Docker with runsc)
+  wicket-agent       harness adapters (Claude Code, ACP) and their modes
+  wicket-placement   providers (static hosts, Vultr), billing, the money envelope
+  wicket-fwd         in-box forwarders to wicket.internal
+  wicket-cli         the `wicket` binary: CLI, daemon, console, node, reconciler
 ```
 
-Dependency rule: `wicket-core` depends on nothing internal. Enforcement crates depend on `core`, `policy`,
-`adapter` and `store` only. Nothing in the TCB depends on `wicket-agent`.
+Dependency rule: `wicket-core` depends on nothing internal. Nothing that decides depends on
+`wicket-agent`.
 
 ---
 
 ## 19. Milestones
 
-Each milestone ends with the smallest test that could prove it wrong. From M1 on, every milestone also has to stay within the §7.1 budgets for what it adds.
+v0.2 planned milestones M0–M12. Releases now follow the GitHub milestones: 0.0.1 is built, and 0.0.2
+is the #253 simplification with the features that stand on it. Where the v0.2 milestones stand:
 
-| # | Milestone | Done when |
+| # | Milestone | State |
 |---|---|---|
-| **M0** | Workspace, `wicket-core` with the capability algebra and labels | Property tests: `is_subset_of` is a partial order; grant ⊆ ask; label join is monotone. Cedar compile round-trips. |
-| **M1** | `process` backend + `wicket-jail`; egress proxy with an allowlist; LLM proxy for Anthropic; `wicket-bench` skeleton | **Claude Code runs a real task in the box holding only a placeholder.** Conformance checks 1–2 pass. All attempted connections over a 30-minute session are logged ([01 E3]). Test whether Claude Code survives a connection reset. Box setup overhead stays under 100 ms and 20 MB beyond Claude Code itself. Every hardening layer is confirmed or the jail refuses to start; the DNS-canary and placeholder-reflection checks pass (release gates from here on). |
-| **M2** | Adapter interpreter + ~15 GitHub REST endpoints + git push S&F; per-task GitHub App tokens | The [04 §4.7] matrix runs green in a test org. The red-team agent, scoped to one repo and one directory, finds ≤3 escapes, and each escape becomes a rule. |
-| **M3** | Escalation broker (auto + human tiers), ledger (epochs, atomic single-use, fresh-per-use), `wicket approve`, recoverable problem+json / MCP pending | **E1:** 20 tasks × {bare 403, structured pending with remedies, `await_grant` tool} × {Claude Code, Codex app-server, pi × {Claude, GPT, an open-weights model}, Gemini CLI}. Measure wait/retry vs route-around vs give-up, and retry loops. Running pi with several models separates model behaviour from harness behaviour. This decides how much the escalation UX can rely on HTTP, versus T1/T2 permission channels. |
-| **M3b** | Operator channels: wicketd event log + API, `wicket` CLI, `wicket-console` PWA (transcript, steer, typed `AmendTask`, pause/kill, escalation queue with passkey approvals verified in wicketd), push; then `vendor_rc` bridge flavour (E-RC1–5) | From a phone, an operator can run a task end to end in wicket's console: watch, steer, amend, approve, kill. In a `vendor_rc` zone the same task is also watchable and steerable in the Claude app, its messages appear in wicket's console with an RC badge, and an RC 'allow' creates no grant. The RC kill switch disconnects RC while the agent keeps running. The E-OP1 phishing red-team yields no wrong approvals. |
-| **M3c** | Codex (app-server) and pi (RPC) T1 adapters | Both pass conformance checks 1–13 and experiments E-CX1–3, E-PI1–2. |
-| **M4** | MCP gateway with adapter-generated tools | An MCP call and a `gh api` call to each endpoint get identical decisions (differential test). |
-| **M4b** | Isolated MCP servers as per-task workloads (§8.2): `wicket-node` direct launch with unbound warm pools (I1); then `wicket-operator` on single-node k3s with reservation pods, Cilium default-deny and gVisor RuntimeClass (I3) | Two third-party MCP servers and the agent each run in their own sandbox. Probing from inside each shows neither server can reach the other, the agent, the API server, the metadata service or DNS, except through the gateway. A pod without a sandboxed RuntimeClass, or a hand-edited CR, is rejected. A changed tool description is refused. State is gone at task end. The same probes pass in single-host mode. A per-task MCP server from the warm pool is `tools/list`-ready within 250 ms, and twenty concurrent instances fit the density budget on one node. |
-| **M5** | Handles (including handles as tool arguments), per-argument sink provenance, labels, typed-only gates, two-zone static topology | **The brief's smuggling test**, built as a GitHub-coding suite in AgentDojo's format: a test-org repo, injection slots in issue comments, docs pages and `CLAUDE.md`, deterministic checks on provider state, and an **adaptive attacker** that sees the policy and denial bodies. Free text vs typed vs handles. Report attack success *and* utility over 3 runs, and require a non-zero baseline attack rate before crediting a defence. If typed already gives zero, handles are optional in v1. |
-| **M6** | `wicket explain` + zone view + timeline | The three-engineer test. |
-| **M7** | Agent lifecycle (§13): agent registry, Active → Idle → Sleeping → Hibernated → Archived → Deleted, gVisor checkpoint, push to object storage (a local directory or Garage/SeaweedFS locally), rebuild path, wake sources (message, schedule, event), memory staging and promotion gate, retention and GC with crypto-shredding | An agent works, sleeps, hibernates to MinIO, and is woken a day later by a schedule. Its node is killed while it's active, and it rebuilds elsewhere from the last checkpoint within the RPO. A skill it wrote is staged, reviewed and only then visible to its next activation; rolling back the memory version removes it. GC deletes an agent after its grace period, and its blobs are unreadable while the audit chain still verifies. Every transition stays within the §13.8 budgets. |
-| **M8** | Adapter generator loop | Generated vs hand-written GitHub adapters diffed. Zero too-permissive rules, or find which check missed it. |
-| **M9** | ACP (T2) adapter; `wicket.spawn` dynamic topology | Conformance suite passes for one ACP agent. Child ⊆ parent is enforced by the capability algebra, which is tested against SymCC's segment model in CI. |
-| **M10** | Many clouds: provisioner with the Vultr (via broker) and AWS or GCP providers, WireGuard + mTLS node join, a KVM pool with Kata/Firecracker, money envelope + human approval for spend, `request_capacity` | One installation spans two providers. An agent's `request_capacity{kvm}` gets a Firecracker sandbox on a newly created per-second-billed host inside the envelope. A Vultr host is released before its next paid hour. Killing the provisioner mid-create leaks nothing, and the daily reconcile matches every provider's charges to the cent. |
-| **M11** | Mandates (research 15, MD0–MD9): passkey-signed mandates in the ledger, consent screen, connections (OAuth via a wicket page; websites via a remote browser the user logs into), a session-less agent browser with cookies injected at egress, a site adapter, the seven-layer checkout guard | **Demo:** Claude Code builds an Ocado basket under a 48-hour, £120 mandate. Every step past the basket stays pending, no Ocado cookie reaches the box, and no order is placed. The approve-and-submit path is proven on a local fake shop (`wicket-mart`): a price change after approval voids it, and an injected \"add 50\" is refused. |
-| **M12** | Programs: program manifests, source digests, pinned runs without an agent, `on_pending` policy; then promotion from an agent's output with a passkey-signed approval, and `wicket.run_program` as a gateway tool | A program an agent wrote is approved by digest, then runs on a schedule with no model in the loop. A one-line change is refused until re-approved. A request outside its reach fails the run (or parks it), and outputs carry the author's taint. |
-| later | Firecracker (on bare metal via the broker), seatbelt, e2b, wasm codemode; parent tier on, once its shadow decisions are measured | |
-
-M1 is deliberately first: until Claude Code runs usefully with no credentials and no direct network, none
-of the rest matters.
+| M0, M1 | core types; a box holding only a placeholder; egress and model proxies | built, with Biscuit authority (§4.1) and gVisor as the only tier |
+| M2, M4, M8 | provider adapters, adapter-generated MCP tools, the adapter generator | not built |
+| M3, M3b | escalation, ledger, `wicket approve`, the console with passkeys, Remote Control (`wicket wrap`) | built; one grant and one decide function (#256) |
+| M3c | Codex and pi adapters | not built |
+| M4b | service zones, Kubernetes | deferred (§22) |
+| M5 | labels, handles, typed gates | deferred (§22); #27 keeps a one-bit flag |
+| M6 | `wicket explain`, the zone view, the timeline | not built |
+| M7 | lifecycle | hibernate and wake by rebuild built; the timer ladder replaced by #249 |
+| M9 | ACP adapter, `spawn` | built |
+| M10 | Vultr placement, `request_capacity`, the money envelope | built; other clouds deferred (§22) |
+| M11 | mandates | deferred (§22) |
+| M12 | programs | built as agents without a model (§17); registry and promotion deferred |
 
 ---
 
-## 20. Decisions taken in this draft
+## 20. Decisions
 
 | Decision | Why | Revisit if |
 |---|---|---|
-| Cedar for authored policy + an own capability algebra for grants | Analysable (SymCC in CI), explains decisions, fast; grants need a cheap syntactic subset check. Experiment #58: SymCC handles realistic org policy diffs in 0–9 ms, but gives `unknown` on some zone globs, so it stays out of the spawn path | Cedar's analysis can decide segment-wise globs quickly and completely |
+| Cedar for authored policy, compiled into each box's Biscuit token at issuance; no capability algebra of wicket's own | Analysable (SymCC in CI) and explains decisions; nodes evaluate only the token, so decisions happen at the edge (#51, #253). Experiment #58: SymCC diffs org policy in 0–9 ms but gives `unknown` on some zone globs, so the conservative subset check, not SymCC, admits spawns | Cedar's analysis can decide segment-wise globs quickly and completely |
 | Authority in the Biscuit format, checked by a vendored `biscuit-auth` (upstream main plus three patches), with a structural check before loading and a differential test against the stock engine in CI; use counts stay in the ledger | Narrowing, offline attenuation, third-party approvals and subtree revocation come with the format, which outside parties can verify. The patches take a depth-5 request from about 1 ms to 7–11 µs, deterministically (#59, biscuit-fast) | Upstream takes patches 1 and 2 (then only patch 3 is ours), or the fork's upkeep outweighs it (fall back to plain signed records with the same semantics, measured at under 1 µs) |
 | `rama` 0.4 parts (rustls termination assembled ourselves) behind the `srt` decider seam | Rust, composable, swappable; no ready rustls MITM relay exists anywhere | rama churn hurts → hyper + tokio-rustls |
 | `rmcp` gateway, not agentgateway | agentgateway isn't embeddable (`publish=false`). Its argument rules (CEL guardrails), like ToolHive's and ContextForge's, see raw arguments rather than adapter-bound typed resources. It also passes client headers through by default and runs stdio servers unsandboxed | — |
@@ -2327,39 +2153,35 @@ of the rest matters.
 | Claude subscription token (`claude setup-token`) injected by the LLM proxy; never an Anthropic API key | Owner's rule; the credential still never enters the box | — |
 | Subscription tokens only for the unmodified Claude Code binary, in single-owner mode; never for other inner agents, never brokered in platform mode | Anthropic's legal and compliance page; owner: "whatever Anthropic say is ok" | §6 |
 | YAML-subset adapter DSL | Diffable by humans and LLMs; JSON canonical form for signing | — |
-| Hybrid substrate: Kubernetes for capacity, pools and services; `wicket-node` direct launch for sandboxes and per-task MCP instances; CRDs are desired state, the ledger is authority | Don't rebuild scheduling, autoscaling and GC. But the pod path is 1–2 orders of magnitude too slow for the hot path and can't park |  Kubernetes' TCB or footprint proves unacceptable for hostile workloads → own small reconciler behind the same `Sandbox` trait |
+| Placement behind a `Provider` interface (static hosts, Vultr); nodes launch boxes directly; the ledger is the authority | Don't build a scheduler; the pod path is too slow for per-box churn [10 §4]. Kubernetes would be one more `Provider` (#45, deferred) | Clusters are needed |
 | Enforcement evaluates the whole chain; subset checks only for admission and explanation | A subset-check bug then costs usability, never authority (Fly macaroons) | — |
 | Never forward client headers; rebuild upstream requests from the `Op`; swap placeholders only in their declared slot | Every surveyed gateway that forwarded headers or substituted in bodies leaked or reflected credentials | — |
 | Codex via app-server (T1), pi via RPC (T1); ACP is the fallback | Native protocols carry host approvals, steering, typed output and resume that ACP drops | — |
 | No third-party LLM library in the TCB; a Rust `Model` trait over wicket-llm | pi-ai etc. are Node plus vendor SDKs; borrow the design, not the code | — |
 | Agent config locked down by managed files where they exist (Claude managed settings, Codex `requirements.toml`), by ownership plus flags where they don't (pi) | Repo-supplied config is the cheapest injection path | — |
-| Long-lived agents by default: durable identity, activations, work items, lifecycle tiers, policy GC | The owner's model; rebuild-from-durable-state always works, so snapshots are only an optimisation; sleep doubles as a declassification checkpoint | — |
-| Parent (LLM) decider tier off at first | It's an LLM in the TCB; DRIFT's ablation shows LLM-widened policy roughly doubles attack success; measure it in shadow mode first | Shadow decisions agree with humans ≥ an agreed rate |
+| Long-lived agents, and the harness decides its lifetime: a run ends when its process exits, at its timeout or when its authority ends; hibernation is asked for (#249) | The harness knows when its work is done, and wicket's clock doesn't; one renewable authority grant plus a hard timeout bounds every run | — |
+| Escalation rights are policy (`escalation: { request, grant }`, on by default); an ancestor agent grants within its own authority, checked deterministically (#50, #291). No LLM decider | Approval is a principal delegating part of its own authority; DRIFT's ablation shows LLM-widened policy roughly doubles attack success [05] | — |
 
 ## 21. Open questions
 
 1. **Agent behaviour under denial** (E1), the biggest unknown. If agents route around HTTP denials, the
    escalation UX has to live in the T1/T2 permission channels, and T3 agents get a degraded experience.
-2. **Utility cost of taint.** Does a coding agent that reads one issue comment become useless for
-   pushing? The per-argument stance, handles as arguments, forking at the last clean entry and disposable
-   tainted children are the planned answers. M5 measures them.
+2. **Utility cost of taint**, once #27's one-bit flag exists: does a coding agent that reads one issue
+   comment become useless for pushing?
 3. **Claude Code specifics to test:**
    - Does a placeholder key plus proxy injection work end to end?
    - Does it survive connection resets after a snapshot?
    - Does `--bare` suppress managed-settings hooks?
    - Does `--setting-sources ""` behave as expected?
    - Which `api.anthropic.com` calls bypass `ANTHROPIC_BASE_URL` (fast-mode check, feature flags)?
-4. **Where the parent-tier "re-derivation" gets its trusted text for dynamic spawns:** the chain of
-   labelled task texts (§5.1) is proposed but not validated.
+4. *(Withdrawn: the LLM parent tier is deferred, §22. Agents grant within their own authority, §11.)*
 5. **Vultr bare-metal billing:** the API says monthly ($185) and the docs say hourly ($0.25). Settle it
    before buying.
 6. **GraphQL:** deny entirely in v1, or allow a persisted-query allowlist? (Proposed: deny.)
 7. **Owner decisions for infrastructure** [10 §13]:
    - An AWS or GCP account for minute-billed KVM, or the Mac (is it an M3 or later)?
-   - May k3s run on the control host on demand? The host's operator has to agree.
    - Should wicket's Vultr usage share the provisioning broker's $20 cap, or get its own line?
-8. **The proposer's view:** what does the strict "nothing fetched" default cost in utility, and which
-   labelled context (repo file names, the tree) buys most of it back safely?
+8. *(Withdrawn: the manifest proposer is deferred, §22.)*
 9. **`vendor_rc` credentials:** can the proxy swap a placeholder for the vendor session credential
    (E-RC2), or does `vendor_rc` always mean "vendor credential in the box"?
 10. **`Placement::Split` before v1?** Codex `exec-server` is experimental; pi's remote tool operations and
@@ -2370,7 +2192,7 @@ of the rest matters.
     conventions. Should they be exposed as handles, summarised by a quarantined reader, or simply dropped?
     Proposal [17 §4-6]: the dominant 2026 practice keeps the harness in the repo (AGENTS.md, progress files),
     so for trusted refs a task's context files are part of its declared harness and pass through; an agent's
-    own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they become handles.
+    own progress files pass the §13.4 promotion gate as its memory; for untrusted refs they are removed.
 12. **Node transport: SSH for now, explore others** (owner, 2026-11-08: "ssh is fine for now but keep a
     note about exploring other protocols"). SSH (`ssh -R` per run) is not resumable:
     - one TCP connection carries the forwarded sockets and the event stream, and a drop kills the run's
@@ -2392,3 +2214,26 @@ of the rest matters.
       or tool (§17).
     - Steering from a phone needs the console reachable (§14.1).
 14. **Name.** "wicket" is a working name (the small door set into a larger gate).
+
+---
+
+## 22. Deferred
+
+Designed, but not planned. Each is one line, with its issue where there is one. Older detail is in
+this file's git history and in the research notes.
+
+- **LLM manifest proposer and ratchets**: an LLM that instantiates vetted templates into a manifest
+  (§5.2), an LLM parent tier that re-derives requests, quarantined readers, and ratchets on cumulative
+  grants (§11).
+- **IFC labels and handles**: confidentiality and taint labels, no-write-down, per-argument sink
+  provenance, typed gates and opaque handles (§4.2, §4.3). #27 keeps a one-bit, opt-in taint flag.
+- **Separate mandate and program subsystems**: mandates are grants from a user principal (§16, #11,
+  #256); programs are agents without a model, approved as a grant on their digest (§17, #255, #258).
+- **Six-cloud `HostProvider` and attestation levels**: AWS, GCP, Hetzner, Azure and others; instance
+  identity, TPM, SEV-SNP and TDX attestation; residency placement (§8.4). Vultr and static hosts are
+  built.
+- **Service zones**: each third-party MCP server in its own sandbox and zone (§8.2). Related: MCP servers
+  per zone (#9), agent-built MCP servers (#10).
+- **Crews**: several agents in one box (§13.7).
+- **Kubernetes placement**: a Kubernetes `Provider`, an operator, reservation pods, k3s (§8.3, #45).
+
