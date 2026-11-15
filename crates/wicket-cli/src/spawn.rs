@@ -969,6 +969,27 @@ mod tests {
         assert!(p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty(), "nobody asked");
     }
 
+    /// #255: a program is an agent that may not ask: its zone's `escalation.request` is false unless
+    /// the spawn says true (and the parent may ask), and that survives into its manifest.
+    #[test]
+    fn a_spawned_program_may_not_ask_unless_its_zone_says_so() {
+        let p = parent(2, ZONE);
+        let child = |p: &Parent| {
+            let e =
+                std::fs::read_dir(p.dir.join("children")).unwrap().flatten().find(|e| e.path().extension().is_some_and(|x| x == "yaml"));
+            let y = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            wicket_agent::load(&y).unwrap()
+        };
+        spawn(&p.ctx, program("quiet")).unwrap();
+        let m = child(&p);
+        assert!(m.program.is_some() && !m.zone.escalation.request && m.zone.escalation.grant, "{:?}", m.zone.escalation);
+        let q = parent(2, ZONE);
+        let mut req = program("asks");
+        req.zone.as_mut().unwrap()["escalation"] = json!({ "request": true });
+        spawn(&q.ctx, req).unwrap();
+        assert!(child(&q).zone.escalation.request);
+    }
+
     /// #118: a different model route or credential is refused outright; a card for anything else
     /// beyond the parent is R4 and says, from wicket's record, what the child gets.
     #[test]
