@@ -74,6 +74,8 @@ pub fn route(cmd: &Cmd) -> Route {
         Cmd::Unlink { .. } | Cmd::Grant { cmd: GrantCmd::Revoke { .. } } => Forward(Revoke),
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::List => Forward(Read),
+            // The helper runs as the caller, the owner of the files it serves (#350): never as wicket.
+            SecretCmd::Serve { .. } => Local,
             // Setting a secret changes what the proxies present upstream; linking one makes the
             // wicket user read a file the caller names.
             // and binding one to hosts decides where it may go.

@@ -32,6 +32,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket secret rm`](#wicket-secret-rm)
   - [`wicket secret hosts`](#wicket-secret-hosts)
   - [`wicket secret link`](#wicket-secret-link)
+  - [`wicket secret serve`](#wicket-secret-serve)
 - [`wicket image`](#wicket-image)
   - [`wicket image digest`](#wicket-image-digest)
 - [`wicket serve`](#wicket-serve)
@@ -432,6 +433,7 @@ Commands:
   rm     Remove a secret (a reference: only the reference). Nodes holding a copy for a run delete it when the control host next checks that run's secrets, within seconds while connected (#152)
   hosts  Bind a secret to the only host names it may be sent to, replacing its list
   link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
+  serve  Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -498,22 +500,42 @@ Options:
 ```text
 Make a secret a reference to a JSON field in another file, re-read on every use (never copied): e.g. a harness's login on this host (docs/how-to/store-and-link-secrets.md). A harness login's account fields (never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
 
-Usage: wicket secret link [OPTIONS] --file <FILE> <NAME>
+Usage: wicket secret link [OPTIONS] <NAME>
 
 Arguments:
   <NAME>  
 
 Options:
       --file <FILE>
-          
+          The file. With --via-helper, only noted (the helper is told its file)
       --pointer <POINTER>
-          A JSON pointer into the file (e.g. /login/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file)
+          A JSON pointer into the file (e.g. /login/accessToken). Without one, the whole file is the secret, trimmed (e.g. an API key file). With --via-helper, only noted (it says whose login it is)
       --expires-pointer <EXPIRES_POINTER>
           
       --hosts <HOSTS>
           The only host names it may be sent to (as for `secret set`)
+      --via-helper
+          Read the secret through `wicket secret serve`, run as the file's owner, instead of reading the file: no ACL on it, and wicket gets only the value the helper serves under this name and its expiry
+      --helper-user <HELPER_USER>
+          The user the helper runs as (a name or uid); an answer from any other is refused. Default: you (the caller wicketd names)
+      --helper-socket <HELPER_SOCKET>
+          The helper's socket: `@NAME` (abstract) or a path. Default: @wicket-secret.<uid>
   -h, --help
           Print help
+```
+
+### `wicket secret serve`
+
+```text
+Serve linked secrets to wicketd, as the owner of the files they are in (a secret helper, #350): run it as that user, e.g. as a systemd user service (deploy/systemd-user/wicket-secret-helper.service). It answers only wicketd's user, and only with each secret's current value and expiry; it reads the file at each request, so a refresh is picked up at once
+
+Usage: wicket secret serve [OPTIONS] --secret <SECRETS>
+
+Options:
+      --secret <SECRETS>  A secret to serve: NAME=FILE[#POINTER[#EXPIRES_POINTER]], e.g. claude-login=/home/me/.claude/.credentials.json#/claudeAiOauth/accessToken#/claudeAiOauth/expiresAt
+      --for <FOR_USER>    The user it answers (wicketd's; a name or uid) [default: wicket]
+      --socket <SOCKET>   Where to listen: `@NAME` (abstract) or a path. Default: @wicket-secret.<your uid>
+  -h, --help              Print help
 ```
 
 ## `wicket image`
