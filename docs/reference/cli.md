@@ -382,7 +382,7 @@ Commands:
   list   List secret names and the hosts each may be sent to (never values)
   rm     Remove a secret (a reference: only the reference). Nodes holding a copy delete it when their run's lease next reaches them, within seconds while connected (#152)
   hosts  Bind a secret to the only hosts it may be sent to, replacing its list
-  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt
+  link   Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt A Claude login's account fields (from ~/.claude.json, never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -447,7 +447,7 @@ Options:
 ### `wicket secret link`
 
 ```text
-Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt
+Make a secret a reference to a JSON field in another file, re-read on every use (never copied). E.g. the Claude login on this host: wicket secret link claude-oauth --file ~/.claude/.credentials.json --pointer /claudeAiOauth/accessToken --expires-pointer /claudeAiOauth/expiresAt A Claude login's account fields (from ~/.claude.json, never its holder's name) are kept with the reference as they are now, for Remote Control boxes: re-link to refresh them
 
 Usage: wicket secret link [OPTIONS] --file <FILE> <NAME>
 

@@ -142,13 +142,6 @@ impl Vault {
         Ok(v.trim().to_string())
     }
 
-    /// The file a linked secret refers to (None for a stored secret).
-    pub fn linked_file(&self, name: &str) -> Option<PathBuf> {
-        let r = self.path(name).ok()?.with_extension("ref");
-        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
-        spec.get("file")?.as_str().map(PathBuf::from)
-    }
-
     /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
     /// the Claude login's `claudeAiOauth`, for its non-secret fields: scopes, subscription type).
     /// None for a stored secret or a whole-file link.
@@ -162,16 +155,36 @@ impl Vault {
         doc.pointer(parent).filter(|v| v.is_object()).cloned()
     }
 
+    /// What the linker stored with a linked secret (see [`Vault::link`]); None for a stored secret,
+    /// or a link made without any.
+    pub fn link_meta(&self, name: &str) -> Option<serde_json::Value> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        spec.get("meta").filter(|m| !m.is_null()).cloned()
+    }
+
     /// Makes `name` a reference to another file (never copied into the vault): a JSON field in it,
-    /// or with no `pointer`, the whole file, trimmed.
-    pub fn link(&self, name: &str, file: &str, pointer: Option<&str>, expires_pointer: Option<&str>) -> Result<()> {
+    /// or with no `pointer`, the whole file, trimmed. `meta` is kept with the reference as it is,
+    /// replacing what an earlier link kept: opaque to the vault, never a credential (e.g. the
+    /// account fields a harness reads from the login's config once, at link time, #298).
+    pub fn link(
+        &self,
+        name: &str,
+        file: &str,
+        pointer: Option<&str>,
+        expires_pointer: Option<&str>,
+        meta: Option<&serde_json::Value>,
+    ) -> Result<()> {
         if pointer.is_none() && expires_pointer.is_some() {
             bail!("an expiry pointer needs a JSON pointer: a whole-file reference has no fields");
         }
         let p = self.path(name)?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        let spec = serde_json::json!({ "file": file, "pointer": pointer, "expires_pointer": expires_pointer });
+        let mut spec = serde_json::json!({ "file": file, "pointer": pointer, "expires_pointer": expires_pointer });
+        if let Some(m) = meta {
+            spec["meta"] = m.clone();
+        }
         let r = p.with_extension("ref");
         std::fs::write(&r, serde_json::to_vec_pretty(&spec)?)?;
         std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
@@ -484,7 +497,7 @@ mod tests {
         let far = 32503680000000i64; // year 3000, in ms
         write("tok-1", far);
         let v = Vault::new(dir.join("vault"));
-        v.link("claude-oauth", creds.to_str().unwrap(), Some("/o/accessToken"), Some("/o/expiresAt")).unwrap();
+        v.link("claude-oauth", creds.to_str().unwrap(), Some("/o/accessToken"), Some("/o/expiresAt"), None).unwrap();
         assert_eq!(v.get("claude-oauth").unwrap(), "tok-1");
         write("tok-2", far); // the owner refreshed it: we see the new value
         assert_eq!(v.get("claude-oauth").unwrap(), "tok-2");
@@ -492,6 +505,24 @@ mod tests {
         assert!(v.get("claude-oauth").unwrap_err().to_string().contains("expired"));
         std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(v.get("claude-oauth").is_err(), "world-readable source refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_keeps_its_metadata_until_relinked() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-meta-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("api-key");
+        std::fs::write(&key, "key-1\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = Vault::new(dir.join("vault"));
+        v.link("api", key.to_str().unwrap(), None, None, Some(&serde_json::json!({ "a": 1 }))).unwrap();
+        assert_eq!(v.link_meta("api").unwrap()["a"], 1);
+        v.link("api", key.to_str().unwrap(), None, None, None).unwrap();
+        assert_eq!(v.link_meta("api"), None, "a re-link replaces what the last one kept");
+        v.set("stored", "x").unwrap();
+        assert_eq!(v.link_meta("stored"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -504,8 +535,8 @@ mod tests {
         std::fs::write(&key, "key-1\n").unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         let v = Vault::new(dir.join("vault"));
-        assert!(v.link("api", key.to_str().unwrap(), None, Some("/exp")).is_err(), "no expiry without a JSON pointer");
-        v.link("api", key.to_str().unwrap(), None, None).unwrap();
+        assert!(v.link("api", key.to_str().unwrap(), None, Some("/exp"), None).is_err(), "no expiry without a JSON pointer");
+        v.link("api", key.to_str().unwrap(), None, None, None).unwrap();
         assert_eq!(v.get("api").unwrap(), "key-1", "trimmed");
         std::fs::write(&key, "key-2").unwrap();
         assert_eq!(v.get("api").unwrap(), "key-2", "re-read, never copied");
@@ -601,7 +632,7 @@ mod tests {
             return;
         }
         let v = Vault::new(dir.join("vault"));
-        v.link("api", key.to_str().unwrap(), None, None).unwrap();
+        v.link("api", key.to_str().unwrap(), None, None, None).unwrap();
         assert_ne!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o070, 0, "the mask shows in the group bits");
         assert_eq!(v.get("api").unwrap(), "key-1", "readable by the reader alone");
         assert!(setfacl(&format!("u:{}:r", me.wrapping_add(1))));

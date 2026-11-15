@@ -881,10 +881,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let env: Vec<(String, String)> = std::env::vars().collect();
             Some(h.wrapped_plan(&m, &run, argv, &env, &home).map_err(anyhow::Error::msg)?)
         }
-        // Only the login's non-secret fields go in, from the file the zone's secret links to.
+        // Only the login's non-secret fields go in: from the file the zone's secret links to, and
+        // what was kept with the secret when it was linked (#298).
         (Some(h), Some(wicket_agent::harness::Mode::Remote(_))) => {
             let secret = m.zone.llm.as_ref().map(|l| l.secret.as_str()).unwrap_or_default();
-            let meta = h.remote_login_meta(vault.linked_object(secret).as_ref(), vault.linked_file(secret).as_deref());
+            let meta = h.remote_login_meta(vault.linked_object(secret).as_ref(), vault.link_meta(secret).as_ref());
             Some(h.remote_plan(&m, &run, &meta).map_err(anyhow::Error::msg)?)
         }
         _ => None,
