@@ -1579,7 +1579,7 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
 
 /// Why a box can't start on node `name` talking `proto`: it needs something an older node wouldn't
 /// do, and so would run unbounded or unchecked there (or fail closed, as a swap would).
-fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool) -> Result<()> {
+pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool) -> Result<()> {
     // A node before #256 would take no budget slice: a box with a model budget goes only where its
     // node is bounded by one.
     if budget && proto < crate::chan::BUDGET_SLICE {

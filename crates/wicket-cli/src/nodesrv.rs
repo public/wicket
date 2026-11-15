@@ -3039,4 +3039,29 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(audit.iter().filter(|r| r.2 == "node.secret_fetched").count(), 2, "{audit:?}");
         assert!(!format!("{audit:?}").contains(LOGIN) && !format!("{audit:?}").contains(VALUE));
     }
+
+    /// #257: a box with credential swaps starts only on a node talking protocol 10 or later; an
+    /// older one is refused, saying why and what to do, as for a pin or a model budget.
+    #[test]
+    fn a_box_with_swaps_is_refused_by_a_node_before_protocol_10() {
+        let mut start = fake_record("run_a").start;
+        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true).is_ok(), "no swaps: protocol 9 will do");
+        start.swaps = chan::swap_starts(&[wicket_proxy::CredentialSwap {
+            name: "account login".into(),
+            host: "rc.api.test".into(),
+            placeholder: "ph".into(),
+            real: wicket_proxy::SwapSource::Vault("login".into()),
+            box_bearers: true,
+        }]);
+        let why = crate::noderun::refuse_older_node("n1", 9, &start, true).unwrap_err().to_string();
+        assert!(why.contains("node n1 talks protocol 9") && why.contains("credential swaps") && why.contains("from protocol 10"), "{why}");
+        assert!(why.contains("wicket node install n1"), "{why}");
+        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true).is_ok());
+        // The others still hold: a pin below 6, a budget below 9.
+        start.swaps.clear();
+        start.image_pin = Some("sha256:00".into());
+        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false).unwrap_err().to_string().contains("pinned"));
+        start.image_pin = None;
+        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true).unwrap_err().to_string().contains("model budget"));
+    }
 }
