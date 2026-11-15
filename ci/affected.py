@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-SUITES = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+SUITES = ["docs", "policy", "lean", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
           "node-e2e", "acceptance-nodes", "update", "tla"]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().
@@ -270,11 +270,15 @@ def self_test():
     case("nothing changed", [], ALL, ALL)
     case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-cli"}, ALL)
     case("an example zone", ["examples/demo.yaml"], lambda c: c != ALL and {"wicket-core", "wicket-authz", "wicket-feed"} <= c,
-         set())
+         {"lean"})
     case("the agent image", ["images/claude-code/wicket-entry"],
          lambda c: c != ALL and {"wicket-cli", "wicket-fwd"} <= c, lambda s: s != ALL and "smoke" in s)
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
-         set())
+         {"lean"})
+    # #322: the Lean spec and its oracle test.
+    case("the Lean spec", ["verification/lean/Wicket/Glob.lean"], lambda c: c != ALL and "wicket-authz" in c, {"lean"})
+    case("the oracle's fixtures", ["crates/wicket-core/tests/subset_cases.rs"], lambda c: c != ALL and "wicket-authz" in c,
+         {"lean"})
     case("the TLA+ models", ["verification/tla/GrantsOnNodes.tla", "verification/tla/fail_today.cfg"], set(), {"tla"})
     case("the TLA+ models' README", ["verification/tla/README.md"], set(), {"docs", "tla"})
     case("code the grants model maps", ["crates/wicket-cli/src/noderun.rs"], {"wicket-cli", "wicket-sim"},

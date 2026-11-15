@@ -1,0 +1,395 @@
+//! The Lean spec as an oracle (#322): wicket-core's decisions, on this crate's fixtures (the example
+//! manifests' zones and the subset tests' parents and children, with `oracles.rs`'s probes) and on
+//! generated cases, must be the spec's (verification/lean, `Oracle.lean`). Any divergence fails,
+//! with the case.
+//!
+//! Ignored by default: it needs the pinned Lean toolchain (`ci/lean.sh` installs it and runs this).
+//! `LAKE` names the `lake` binary (default: `lake` on `PATH`).
+
+mod common;
+use common::*;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use wicket_core::manifest::{ForbidRule, Isolation, OnOutputFull, ReachRule, UnlistedHosts};
+use wicket_core::{subset, CompiledZone, ZoneSpec};
+
+/// A finite `f32` as `m × 2^e`, exactly; `null` if not finite.
+fn f32_json(x: f32) -> Value {
+    if !x.is_finite() {
+        return Value::Null;
+    }
+    let bits = x.to_bits();
+    let (sign, exp, mant) = (bits >> 31, (bits >> 23) & 0xff, i64::from(bits & 0x7f_ffff));
+    let (m, e) = if exp == 0 { (mant, -149) } else { (mant | 0x80_0000, i64::from(exp) - 150) };
+    json!({ "m": if sign == 1 { -m } else { m }, "e": e })
+}
+
+fn zone_json(z: &ZoneSpec) -> Value {
+    let ms = |d: Result<Duration, _>| d.ok().map(|d: Duration| d.as_millis() as u64);
+    json!({
+        "name": z.name,
+        "isolation": match z.isolation { Isolation::Runc => 1, Isolation::Gvisor => 2 },
+        "reach": z.reach.iter().map(|r| json!({
+            "host": r.host, "methods": r.methods, "paths": r.paths, "dangerous": r.allow_dangerous,
+        })).collect::<Vec<_>>(),
+        "forbid": z.forbid.iter().map(|f| json!({ "host": f.host, "paths": f.paths })).collect::<Vec<_>>(),
+        "hide": z.unlisted_hosts == UnlistedHosts::Hide,
+        "wildcards_forbid": z.wildcards.forbid,
+        "max_names": z.wildcards.max_names,
+        "inject": z.inject.iter().map(|i| json!([i.host, i.header, i.format, i.secret])).collect::<Vec<_>>(),
+        "llm": z.llm.as_ref().map(|l| json!({
+            "provider": l.provider, "secret": l.secret, "upstream": l.upstream, "server_tools": l.allow_server_tools,
+            "max_requests": l.max_requests, "max_output": l.max_output_tokens, "max_input": l.max_input_tokens,
+        })),
+        "escalation": { "request": z.escalation.request, "grant": z.escalation.grant },
+        "limits": {
+            "memory": subset::parse_bytes(&z.limits.memory),
+            "cpus": f32_json(z.limits.cpus),
+            "pids": z.limits.pids,
+            "output": subset::parse_bytes(&z.limits.output),
+            "stop_on_full": z.limits.on_output_full == OnOutputFull::Stop,
+            "timeout_ms": ms(z.limits.timeout()),
+            "authority_ms": ms(z.limits.authority()),
+        },
+        "accept_from": z.accept_from,
+    })
+}
+
+/// The cases, and what wicket-core decided for each (as the oracle prints it).
+#[derive(Default)]
+struct Cases {
+    zones: Vec<Value>,
+    cases: Vec<Value>,
+    rust: Vec<String>,
+    /// What each case is, for a failure message.
+    what: Vec<String>,
+}
+
+impl Cases {
+    fn zone(&mut self, z: &ZoneSpec) -> usize {
+        self.zones.push(zone_json(z));
+        self.zones.len() - 1
+    }
+
+    fn push(&mut self, case: Value, rust: String, what: String) {
+        self.cases.push(case);
+        self.rust.push(rust);
+        self.what.push(what);
+    }
+
+    /// One request against a compiled zone (zone index `zi`).
+    fn eval(&mut self, zi: usize, cz: &CompiledZone, m: &str, h: &str, p: &str) {
+        let o = op(&cz.name, m, h, p);
+        let rust = ["allow", "forbidden", "needs_grant"][kind_of_verdict(&cz.evaluate(&o)) as usize].to_string();
+        let case = json!({ "kind": "eval", "zone": zi, "op": {
+            "method": o.method, "host": o.host, "path": o.path, "risk": o.risk.rank(),
+            "unreachable": wicket_core::never_reachable(&o.host).is_some(),
+        }});
+        self.push(case, rust, format!("zone {}: {m} {h}{p} (risk {:?})", cz.name, o.risk));
+    }
+
+    fn check(&mut self, parent: &ZoneSpec, child: &ZoneSpec, b: &subset::Bounds<'_>, ask: &subset::Ask<'_>, what: &str) {
+        let images_ok = wicket_core::image::matching(ask.image, &b.images).is_some()
+            && child.images.iter().all(|i| wicket_core::image::matching(i, &b.images).is_some());
+        let (pi, ci) = (self.zone(parent), self.zone(child));
+        let rust = subset::check(ask, b).is_ok().to_string();
+        let case = json!({ "kind": "check", "parent": pi, "child": ci, "max_children": ask.max_children, "bounds": {
+            "images_ok": images_ok, "llm_remaining": b.llm_remaining.map(|(r, t)| json!([r, t])),
+            "llm_input_remaining": b.llm_input_remaining, "time_remaining_ms": b.time_remaining.as_millis() as u64,
+            "child_slots": b.child_slots,
+        }});
+        self.push(case, rust, format!("check {what}"));
+        let rust = subset::reach_within(parent, child).is_ok().to_string();
+        self.push(json!({ "kind": "reach_within", "outer": pi, "inner": ci }), rust, format!("reach_within {what}"));
+    }
+}
+
+// --- generators ------------------------------------------------------------------------------
+
+/// A glob in the spec's language: segments of literals, `*` and `?`, or `**`.
+fn gen_glob(rng: &mut Rng) -> String {
+    let n = 1 + rng.below(4);
+    let mut segs: Vec<String> = Vec::new();
+    for _ in 0..n {
+        if rng.chance(20) {
+            segs.push("**".into());
+        } else {
+            let len = rng.below(4);
+            segs.push((0..len).map(|_| *rng.pick(&["a", "b", "A", "*", "?", ".", "-", "ab", "**"])).collect());
+        }
+    }
+    let lead = if rng.chance(92) { "/" } else { "" };
+    let tail = if rng.chance(10) { "/" } else { "" };
+    format!("{lead}{}{tail}", segs.join("/"))
+}
+
+fn gen_path(rng: &mut Rng) -> String {
+    let n = rng.below(5);
+    let segs: Vec<String> =
+        (0..n).map(|_| (0..rng.below(4)).map(|_| *rng.pick(&["a", "b", "A", "B", ".", "-", "\u{e9}"])).collect()).collect();
+    let tail = if rng.chance(15) { "/" } else { "" };
+    format!("/{}{tail}", segs.join("/"))
+}
+
+const HOSTS: [&str; 9] = ["a.test", "b.a.test", "c.b.a.test", "A.test", "b.test", "x.a.test", "a.test.", "test", "B.A.TEST"];
+const HOST_PATTERNS: [&str; 9] = ["a.test", "*.a.test", "*.test", "*.b.a.test", "A.TEST", "*.A.test", "b.a.test", "*.", "*.c.b.a.test"];
+
+fn gen_rule(rng: &mut Rng) -> ReachRule {
+    let ms = ["GET", "HEAD", "POST", "put", "DELETE"];
+    let mut methods: Vec<String> = (0..1 + rng.below(3)).map(|_| rng.pick(&ms).to_string()).collect();
+    methods.dedup();
+    ReachRule {
+        host: rng.pick(&HOST_PATTERNS).to_string(),
+        methods,
+        paths: (0..1 + rng.below(2)).map(|_| gen_glob(rng)).collect(),
+        allow_dangerous: rng.chance(30),
+    }
+}
+
+fn gen_forbid(rng: &mut Rng) -> ForbidRule {
+    ForbidRule { host: rng.pick(&HOST_PATTERNS).to_string(), paths: (0..1 + rng.below(2)).map(|_| gen_glob(rng)).collect() }
+}
+
+fn base_zone() -> ZoneSpec {
+    wicket_core::Manifest::from_yaml("task: t\nagent: { name: a }\nzone:\n  name: g\n  limits: { memory: 1g, cpus: 1, timeout: 30m }\n")
+        .unwrap()
+        .zone
+}
+
+fn gen_zone(rng: &mut Rng, base: &ZoneSpec) -> ZoneSpec {
+    let mut z = base.clone();
+    z.reach = (0..1 + rng.below(3)).map(|_| gen_rule(rng)).collect();
+    z.forbid = (0..rng.below(3)).map(|_| gen_forbid(rng)).collect();
+    z
+}
+
+/// A child of `p`: mostly narrowings of its rules (so some are admitted), sometimes fresh ones.
+fn gen_child(rng: &mut Rng, p: &ZoneSpec) -> ZoneSpec {
+    let mut c = p.clone();
+    c.name = "c".into();
+    c.reach = Vec::new();
+    for r in &p.reach {
+        if !rng.chance(80) {
+            continue;
+        }
+        c.reach.push({
+            let mut r = r.clone();
+            if rng.chance(50) {
+                let mut paths = Vec::new();
+                for g in &r.paths {
+                    // Under the rule, beside it (a string prefix, not a segment prefix), or anything.
+                    let stem = g.trim_end_matches("/**");
+                    paths.push(match rng.below(4) {
+                        0 => format!("{stem}/x"),
+                        1 => format!("{stem}x*"),
+                        2 => format!("{stem}/*/x"),
+                        _ => gen_glob(rng),
+                    });
+                }
+                r.paths = paths;
+            }
+            if rng.chance(20) {
+                r.host = rng.pick(&HOST_PATTERNS).to_string();
+            }
+            if rng.chance(20) {
+                r.allow_dangerous = !r.allow_dangerous;
+            }
+            r
+        });
+    }
+    if rng.chance(30) {
+        c.reach.push(gen_rule(rng));
+    }
+    if rng.chance(70) {
+        c.forbid.clone_from(&p.forbid);
+    }
+    if rng.chance(40) {
+        c.forbid.push(gen_forbid(rng));
+    }
+    c
+}
+
+fn gen_canon(rng: &mut Rng) -> String {
+    let alphabet = [
+        "/", "/", "a", "b", ".", "..", "%", "%2F", "%2f", "%2E", "%41", "%7E", "%20", "%C3%A9", "%e9", ";", "\\", "?", "?x=1", "@",
+        "@s%2fn", "-", "\u{e9}", "%2",
+    ];
+    let n = rng.below(7);
+    let body: String = (0..n).map(|_| *rng.pick(&alphabet)).collect();
+    if rng.chance(90) {
+        format!("/{body}")
+    } else {
+        body
+    }
+}
+
+// --- running the spec ------------------------------------------------------------------------
+
+fn lean_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../verification/lean")
+}
+
+fn run_lean(file: &Path) -> Vec<String> {
+    let lake = std::env::var("LAKE").unwrap_or_else(|_| "lake".into());
+    let built = Command::new(&lake).arg("build").current_dir(lean_dir()).status().unwrap_or_else(|e| panic!("{lake}: {e}"));
+    assert!(built.success(), "lake build failed");
+    let out = Command::new(&lake)
+        .args(["env", "lean", "--run", "Oracle.lean"])
+        .arg(file)
+        .current_dir(lean_dir())
+        .output()
+        .unwrap_or_else(|e| panic!("{lake}: {e}"));
+    assert!(out.status.success(), "the oracle failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().lines().map(String::from).collect()
+}
+
+#[test]
+#[ignore = "needs the pinned Lean toolchain: ci/lean.sh"]
+fn rust_decides_as_the_lean_spec() {
+    let mut c = Cases::default();
+
+    // 1. The fixtures: every zone oracle 1 uses, on its probes (a deterministic sample of them).
+    let zones = all_zones();
+    let mut rng = Rng(322);
+    for z in &zones {
+        let Ok(cz) = CompiledZone::new(z.clone()) else { continue };
+        let zi = c.zone(z);
+        let (hosts, paths) = probes(&[z]);
+        for h in &hosts {
+            for p in &paths {
+                for m in ["GET", "POST", "DELETE"] {
+                    if rng.chance(25) {
+                        c.eval(zi, &cz, m, h, p);
+                    }
+                }
+            }
+        }
+    }
+    let fixture_evals = c.cases.len();
+
+    // 2. The subset tests' parents and children: `check` and `reach_within`.
+    let parents = subset_cases::parents();
+    for ch in subset_cases::children() {
+        let p = parents.iter().find(|p| p.key == ch.parent).unwrap();
+        let b = subset::Bounds {
+            zone: &p.zone,
+            images: p.images.clone(),
+            llm_remaining: p.llm_remaining,
+            llm_input_remaining: None,
+            time_remaining: p.time_remaining,
+            child_slots: p.child_slots,
+        };
+        let ask = subset::Ask { zone: &ch.zone, image: &ch.image, max_children: ch.max_children };
+        c.check(&p.zone, &ch.zone, &b, &ask, &format!("{} in {}", ch.name, ch.parent));
+    }
+    // Every zone pair among the fixtures, for reach_within.
+    for (i, outer) in zones.iter().enumerate().step_by(3) {
+        for inner in zones.iter().skip(i % 5).step_by(7) {
+            let (oi, ii) = (c.zone(outer), c.zone(inner));
+            let rust = subset::reach_within(outer, inner).is_ok().to_string();
+            c.push(
+                json!({ "kind": "reach_within", "outer": oi, "inner": ii }),
+                rust,
+                format!("reach_within {} ⊇ {}", outer.name, inner.name),
+            );
+        }
+    }
+    let fixtures = c.cases.len();
+
+    // 3. Generated: globs against paths (one rule, both as reach and as forbid), hosts, canonical
+    // paths, and parent/child zones.
+    let base = base_zone();
+    let mut rng = Rng(0x322);
+    let mut skipped = 0;
+    for _ in 0..1500 {
+        let mut z = base.clone();
+        z.reach =
+            vec![ReachRule { host: "a.test".into(), methods: vec!["GET".into()], paths: vec![gen_glob(&mut rng)], allow_dangerous: false }];
+        if rng.chance(40) {
+            z.forbid = vec![ForbidRule { host: "a.test".into(), paths: vec![gen_glob(&mut rng)] }];
+        }
+        let Ok(cz) = CompiledZone::new(z.clone()) else {
+            skipped += 1;
+            continue;
+        };
+        let zi = c.zone(&z);
+        for _ in 0..8 {
+            let p = gen_path(&mut rng);
+            c.eval(zi, &cz, "GET", "a.test", &p);
+        }
+    }
+    for pat in HOST_PATTERNS {
+        for h in HOSTS.iter().chain(&["xa.test", "a.test..", ".a.test", "b.a.test.", "c.b.a.test."]) {
+            let rust = wicket_core::manifest::host_matches(pat, h).to_string();
+            c.push(json!({ "kind": "host", "pattern": pat, "host": h }), rust, format!("host_matches({pat:?}, {h:?})"));
+        }
+    }
+    for _ in 0..3000 {
+        let pq = gen_canon(&mut rng);
+        let rust = match wicket_core::canonical_path(&pq) {
+            Ok(p) => serde_json::to_string(&p.to_string()).unwrap(),
+            Err(_) => "null".into(),
+        };
+        c.push(json!({ "kind": "canon", "path": pq }), rust, format!("canonical_path({pq:?})"));
+    }
+    let mut admitted = 0;
+    for i in 0..3000 {
+        let p = gen_zone(&mut rng, &base);
+        let ch = gen_child(&mut rng, &p);
+        if CompiledZone::new(p.clone()).is_err() || CompiledZone::new(ch.clone()).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let b = subset::Bounds {
+            zone: &p,
+            images: vec!["img".into()],
+            llm_remaining: None,
+            llm_input_remaining: None,
+            time_remaining: Duration::from_secs(3600),
+            child_slots: 2,
+        };
+        let ask = subset::Ask { zone: &ch, image: "img", max_children: 0 };
+        admitted += usize::from(subset::check(&ask, &b).is_ok());
+        c.check(&p, &ch, &b, &ask, &format!("generated pair {i}: parent {:?}, child {:?}", p.reach, ch.reach));
+        // And the child's decisions on a few requests (with its forbids).
+        if let Ok(cz) = CompiledZone::new(ch.clone()) {
+            let zi = c.zone(&ch);
+            for _ in 0..4 {
+                let (h, p) = (rng.pick(&HOSTS).to_string(), gen_path(&mut rng));
+                c.eval(zi, &cz, rng.pick(&["GET", "POST", "PUT"]), &h, &p);
+            }
+        }
+    }
+
+    let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lean-oracle-cases.json");
+    std::fs::write(&file, serde_json::to_vec(&json!({ "zones": c.zones, "cases": c.cases })).unwrap()).unwrap();
+    let lean = run_lean(&file);
+    assert_eq!(lean.len(), c.cases.len(), "the oracle printed {} decisions for {} cases", lean.len(), c.cases.len());
+
+    let mut divergent = Vec::new();
+    let mut unsupported = 0;
+    for (i, l) in lean.iter().enumerate() {
+        if l == "unsupported" {
+            unsupported += 1;
+            continue;
+        }
+        if *l != c.rust[i] {
+            divergent.push(format!("{}: wicket-core {}, the spec {l}\n    case {}", c.what[i], c.rust[i], c.cases[i]));
+        }
+    }
+    println!(
+        "lean oracle: {} cases ({fixture_evals} fixture decisions, {} more fixture cases, {} generated); {unsupported} outside the spec's language; {skipped} generated zones that don't compile; {admitted} generated children admitted",
+        c.cases.len(),
+        fixtures - fixture_evals,
+        c.cases.len() - fixtures
+    );
+    assert!(admitted > 50, "too few generated children admitted ({admitted}) to test the check");
+    assert!(
+        divergent.is_empty(),
+        "{} divergences from the Lean spec:\n{}",
+        divergent.len(),
+        divergent.iter().take(30).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
