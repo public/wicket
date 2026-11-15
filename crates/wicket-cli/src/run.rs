@@ -1946,6 +1946,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Some(e) => e,
         None => child.wait().await?,
     };
+    // The run's end here, from the box's exit (#287): its last output, its files, the records.
+    let teardown = std::time::Instant::now();
     if let Some(t) = wrapped_out.take() {
         // Everything the box wrote reaches the launcher before the run ends.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
@@ -1959,6 +1961,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         Err(_) => Default::default(),
     };
     let stderr_text = stderr_kept.text.clone();
+    timings.since("teardown.output", teardown);
     if let Some(t) = &rotate_task {
         t.abort();
     }
@@ -1981,6 +1984,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // bundled), and an in-place workspace goes back into the operator's directory.
     let mut fetched = !keep_on_node;
     if keep_on_node && !superseded {
+        let _fetching = timings.span("teardown.fetch");
         match fetch_trees(
             &stopper,
             Fetch {
@@ -2186,7 +2190,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         println!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
     }
     println!("[wicket] transcript {}", transcript.display());
-    // The box's first output and first model request, if they came, join its start's timings.
+    // The box's first output and first model request, if they came, join its start's timings, with
+    // its own start and its end (#287).
+    timings.since("teardown", teardown);
     if record.is_none() {
         let _ = save_timings(&dir, &timings);
     }

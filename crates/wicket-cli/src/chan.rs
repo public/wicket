@@ -514,6 +514,10 @@ pub enum Msg {
         /// Why the node stopped it, if it did (#153: its authority expired).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Where the box's own start and its end went (#287), as its node saw them: placed by the
+        /// node's wall clock (`at_ms` in Unix milliseconds, `wicket_core::timing::wall_span`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        timings: Vec<wicket_core::timing::Span>,
     },
     /// An enforcement event (`wicket_proxy::Event`), for the operator's console.
     Event {
@@ -1036,5 +1040,10 @@ mod tests {
         let said = Msg::Started { run: "r".into(), error: None, digest: None, timings: vec![span.clone()] };
         let back: Msg = serde_json::from_value(serde_json::to_value(&said).unwrap()).unwrap();
         assert!(matches!(back, Msg::Started { timings, .. } if timings == vec![span]));
+        // The exit's timings, likewise.
+        let old: Msg = serde_json::from_str(r#"{"m":"exited","run":"r","code":0,"result":null}"#).unwrap();
+        assert!(matches!(old, Msg::Exited { ref timings, .. } if timings.is_empty()));
+        let quiet = serde_json::to_value(Msg::Exited { run: "r".into(), code: 0, result: None, reason: None, timings: vec![] }).unwrap();
+        assert!(quiet.get("timings").is_none());
     }
 }

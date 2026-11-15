@@ -62,7 +62,7 @@ Unknown keys are errors, so a misspelt setting can't silently stay at its defaul
 | `WICKET_NODE_HOME` | `~/.local/share/wicket-node` | On a node: its directory. |
 | `WICKET_H3_BOX_MTU` | `1452` | The packet size on the box's leg of HTTP/3 (at least 1200). `16000` is much faster under gVisor, for clients that accept large packets. |
 | `WICKET_H3_HTTPS_RECORDS` | | `0` stops wicket's DNS answering HTTPS (`alpn=h3`) records. |
-| `WICKET_DOCKER` | `docker` | The Docker command, split on spaces. |
+| `WICKET_DOCKER` | `docker` | The Docker command, split on spaces. A box start's calls go to Docker's Engine API instead when it is plain `docker` (or `docker -H unix:///path`) and the socket can be connected to: its `-H`, else `DOCKER_HOST` (`unix://` only), else `/var/run/docker.sock` (unless a Docker context other than `default` is current). Otherwise (`sudo -n docker`, a TCP host, a context, a socket this user can't open) the command is run for every call. |
 | `WICKET_NODE_SSH` | | An ssh command to use instead of wicket's own for nodes, split on spaces, `%t` replaced by the target (tests use it to stand in for several nodes). |
 | `WICKET_BOX_PREFIX` | | A prefix for box (container) names, `[A-Za-z0-9-]+` (`ci/acceptance.sh` uses `acc-`). |
 
