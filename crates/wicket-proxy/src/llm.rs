@@ -21,6 +21,14 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// How long a response is still read to its end after the agent stopped reading it, so its final
 /// usage is seen (#113). Past this, the call is charged its whole reservation.
 const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a model call waits for its secret to become readable again (#350): one refresh's worth
+/// (a harness rewriting its login file, or its secret helper restarting), then it fails, naming the
+/// secret and the cause.
+pub const SECRET_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
+/// What a refusal for an unreadable model secret suggests.
+const SECRET_UNAVAILABLE_FIX: &str =
+    "On the host, `wicket doctor` checks every secret; a login linked from a file wicket can't read can be served by `wicket secret serve` \
+     (docs/how-to/store-and-link-secrets.md)";
 
 pub struct Llm {
     ctx: RunCtx,
@@ -413,6 +421,11 @@ impl Llm {
         }
         match self.forward(req).await {
             Ok(r) => r,
+            // The model secret couldn't be read (#350): say which and why, not a bare upstream error.
+            Err(e) if e.downcast_ref::<crate::vault::SecretUnavailable>().is_some() => {
+                self.event(None, 503, Usage::default(), &format!("model secret unavailable: {e}"));
+                problem(503, "secret-unavailable", "Model secret unavailable", &format!("{e}. {SECRET_UNAVAILABLE_FIX}"), None)
+            }
             Err(e) => {
                 self.event(None, 502, Usage::default(), &format!("upstream error: {e}"));
                 problem(502, "upstream", "Model upstream error", &e.to_string(), None)
@@ -558,7 +571,7 @@ impl Llm {
         // The real credential, attached as the provider's profile says (the one slot it uses).
         // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
         let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
-        let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
+        let token = self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await?;
         let profile =
             crate::provider::profile(&spec.provider).ok_or_else(|| anyhow::anyhow!("no provider profile for {:?}", spec.provider))?;
         rb = (profile.attach)(rb, &token).header("accept-encoding", "identity");
@@ -1212,6 +1225,68 @@ mod tests {
         let (status, _) = post(super::Llm::new(c).unwrap(), "bound").await;
         assert_eq!(status, 200);
         assert!(seen.lock().await.iter().any(|r| r.to_ascii_lowercase().contains("authorization: bearer the-model-token")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model secret that can't be read (#350): the call waits a refresh's worth for it, then fails
+    /// with a 503 naming the secret and the cause, and the upstream sees nothing. Readable again in
+    /// time, the call goes through.
+    #[tokio::test]
+    async fn an_unreadable_model_secret_is_retried_then_named() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = c.read(&mut buf).await;
+                seen2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = c
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wicket-llm-secret-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("creds.json");
+        let write = |p: &std::path::Path, t: &str| {
+            std::fs::write(p, format!(r#"{{"o":{{"accessToken":"{t}"}}}}"#)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(&creds, "tok-1");
+        let vault = crate::vault::Vault::new(dir.join("vault"));
+        vault.link("model", creds.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let llm = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}");
+        let with_vault = || {
+            let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
+            c.vault = vault.clone();
+            super::Llm::new(c).unwrap()
+        };
+
+        std::fs::remove_file(&creds).unwrap();
+        let t = std::time::Instant::now();
+        let (status, body) = post(with_vault(), "unreadable").await;
+        assert!(t.elapsed() >= super::SECRET_PATIENCE, "retried for its patience");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("secret \\\"model\\\" could not be read") && body.contains("missing"), "{body}");
+        assert!(body.contains("wicket doctor"), "{body}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0, "the upstream saw nothing");
+
+        // Rewritten while the call waits: it goes through with the new token.
+        let c2 = creds.clone();
+        let back = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            write(&c2, "tok-2");
+        });
+        let (status, body) = post(with_vault(), "rewritten").await;
+        back.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

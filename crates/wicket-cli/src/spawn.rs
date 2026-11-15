@@ -333,6 +333,11 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
         }
     };
     z.forbid = p.zone.forbid.iter().cloned().chain(z.forbid).collect();
+    // The parent's memory advice (#348), unless the caller's limits give their own (empty: none).
+    let said_advice = req.zone.as_ref().and_then(|v| v.get("limits")).is_some_and(|l| l.get("memory_advice").is_some());
+    if !said_advice {
+        z.limits.memory_advice = p.zone.limits.memory_advice.clone();
+    }
     if is_agent {
         let derived_from_parent = req.zone.as_ref().is_none_or(|v| v.get("llm").is_none());
         if derived_from_parent {
@@ -873,6 +878,47 @@ mod tests {
         };
         assert!(plan(Some("tool:latest"), Some(&org)).is_ok());
         assert!(plan(Some("other:1"), Some(&org)).err().unwrap_or_default().contains("org policy"));
+    }
+
+    /// #348: a spawned zone inherits its parent's `limits.memory_advice` whether it states limits
+    /// or not, may replace it (or clear it, empty), and a replacement past the cap is refused.
+    #[test]
+    fn a_spawned_zone_inherits_its_parents_memory_advice_and_may_replace_it() {
+        let p = wicket_agent::load(
+            "task: t\nagent: { name: lead, max_children: 4 }\nzone:\n  name: z\n  llm: { secret: m }\n  limits: { memory: 1g, cpus: 1, timeout: 1h, memory_advice: 'CARGO_BUILD_JOBS=1' }\n",
+        )
+        .unwrap();
+        let plan = |zone: Option<serde_json::Value>| {
+            let req = SpawnRequest { name: "kid".into(), kind: "agent".into(), task: Some("t".into()), zone, ..Default::default() };
+            plan_child(
+                &PlanIn {
+                    parent: &p,
+                    run: &RunId("run_x".into()),
+                    image: "wicket/claude-code:dev",
+                    time_left: std::time::Duration::from_secs(3600),
+                    llm_left: None,
+                    llm_input_left: None,
+                    slots: 4,
+                    org: None,
+                },
+                &req,
+            )
+        };
+        let advice = |zone| plan(zone).map(|c| c.cm.zone.limits.memory_advice().map(String::from));
+        let lim = |extra: serde_json::Value| {
+            let mut l = json!({ "memory": "128m", "cpus": 1, "timeout": "5m" });
+            l.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            Some(json!({ "limits": l }))
+        };
+        let inherited = Ok(Some("CARGO_BUILD_JOBS=1".to_string()));
+        assert_eq!(advice(None), inherited, "no zone: the parent's");
+        assert_eq!(advice(Some(json!({}))), inherited, "no limits: the parent's");
+        assert_eq!(advice(lim(json!({}))), inherited, "limits without advice: the parent's");
+        assert_eq!(advice(lim(json!({ "memory_advice": "one query at a time" }))), Ok(Some("one query at a time".into())), "replaced");
+        assert_eq!(advice(lim(json!({ "memory_advice": "" }))), Ok(None), "cleared");
+        let long = "x".repeat(wicket_core::manifest::MEMORY_ADVICE_MAX + 1);
+        assert!(advice(lim(json!({ "memory_advice": long }))).unwrap_err().contains("memory_advice"), "capped");
+        assert!(advice(lim(json!({ "memory_advice": "a\nb" }))).unwrap_err().contains("memory_advice"), "one line");
     }
 
     const NOW: i64 = 1_000_000;

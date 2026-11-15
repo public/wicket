@@ -40,7 +40,6 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   `spiffe://<domain>/t/<tenant>/op/passkey/<name>` as its `sub`), not the host's unix user. What you may
   approve is your authority in [`operators.yaml`](configuration.md#operatorsyaml) (anything by default);
 - **open a run's session** (an ACP agent's: the row's *session* link), below;
-- **send a follow-up** to a running agent (`wicket say`; for an ACP agent, the session's prompts replace it);
 - **revoke an identity** with a reason (`wicket identity revoke`);
 - **answer `request_access` asks**, including prefix asks: the passkey signs that the grant covers every path
   under the prefix, and, as for every approval, the agent's verified identity. A prefix covers whole path
@@ -103,6 +102,14 @@ messages from the browser up to 256 KiB, one cancel a second per socket. Session
 at **4 per console session** and **32 in all** (upgraded sockets leave `--max-connections`): over a
 cap the open is refused before a ticket is issued, and an upgrade gets 429 without spending its
 ticket, which still works within its 60 s once a socket closes.
+
+**In a terminal,** `wicket session <run>` opens the same session at the host's shell, through the same
+bridge (`crates/wicket-cli/src/session.rs`): it runs as the operator wicketd names, with no passkey
+(as `wicket approve` does), shows what the page shows as text, and sends each line typed as a prompt;
+`/stop` is Stop. Escalations are decided with `wicket approve` or `wicket deny`, or here. It also
+opens a Claude Code agent's session (stream-json, which has no ACP stream): its messages, tool calls
+and turn ends from the transcript. Its records carry `via: terminal`. `wicket say` and the console's
+**Follow-up** box are gone (#198): prompts are sent in a session.
 
 **Audit:** `session.opened` (with the signed assertion), `session.attached`, `session.prompt` (by
 principal, with the operator message it queued and the text's length and sha256), `session.cancel`

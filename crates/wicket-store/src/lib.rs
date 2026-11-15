@@ -542,9 +542,9 @@ impl Ledger {
         Ok((id, true))
     }
 
-    // ---- operator follow-ups to a running agent ----
+    // ---- operator messages to a running agent: session prompts and wicket's own notices ----
 
-    /// Queues a follow-up from the operator for a running agent. Operator text is trusted task text
+    /// Queues a message from the operator (a session prompt, #198) or wicket for a running agent. Operator text is trusted task text
     /// (it comes from the principal), unlike anything an agent or a web page says.
     pub fn add_operator_message(&self, run: &str, text: &str, by: &str) -> Result<i64> {
         self.conn
@@ -552,7 +552,7 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Takes every queued follow-up for `run`, oldest first: (text, by). Each is handed out once.
+    /// Takes every queued message for `run`, oldest first: (text, by). Each is handed out once.
     pub fn take_operator_messages(&mut self, run: &str) -> Result<Vec<(String, String)>> {
         Ok(self.take_operator_messages_with_ids(run)?.into_iter().map(|(_, t, b)| (t, b)).collect())
     }
@@ -571,6 +571,14 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(rows)
+    }
+
+    /// Whether operator message `id` was handed to its run yet (None: there is no such message).
+    pub fn operator_message_taken(&self, id: i64) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row("SELECT consumed_at IS NOT NULL FROM operator_messages WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?)
     }
 
     /// Asks `run`'s supervisor to cancel the agent's running turn (#327: `session/cancel` from the
@@ -1581,7 +1589,7 @@ impl Ledger {
     /// Makes a join token for node `name`, valid for `ttl_secs`. Returns the token, shown once.
     pub fn create_node_token(&self, tenant: &TenantId, name: &str, ttl_secs: i64) -> Result<String> {
         let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
+        getrandom::fill(&mut b).map_err(|e| StoreError::Random(e.to_string()))?;
         let token = format!("wkt_{}", hex::encode(b));
         let t = now();
         self.conn.execute(
@@ -2095,6 +2103,11 @@ mod tests {
         let got = l.take_operator_messages("run_a").unwrap();
         assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
         assert!(l.take_operator_messages("run_a").unwrap().is_empty());
+        let id = l.add_operator_message("run_a", "third", "owner").unwrap();
+        assert_eq!(l.operator_message_taken(id).unwrap(), Some(false));
+        l.take_operator_messages("run_a").unwrap();
+        assert_eq!(l.operator_message_taken(id).unwrap(), Some(true));
+        assert_eq!(l.operator_message_taken(id + 100).unwrap(), None);
         // Turn cancels (#327): taken once, for their run only, stale ones dropped.
         l.request_turn_cancel("run_a", "passkey:phone").unwrap();
         l.request_turn_cancel("run_b", "passkey:laptop").unwrap();

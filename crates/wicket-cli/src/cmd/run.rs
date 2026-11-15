@@ -1,4 +1,4 @@
-//! `wicket run`, `wrap`, `attach`, `say`, `hibernate`, `wake` and `agents`: starting and steering runs.
+//! `wicket run`, `wrap`, `attach`, `session`, `hibernate`, `wake` and `agents`: starting and steering runs.
 //!
 //! One module per command group, out of `main.rs` (#220): a PR that changes one group's flags or
 //! handling touches only its own file.
@@ -71,56 +71,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         })
         .await
         .inspect_err(|e| run::attach_failed(&run, e)),
-        Cmd::Say { run, text } => {
+        Cmd::Session { run, text, no_wait, timeout } => {
             let text = text.join(" ");
-            if text.trim().is_empty() {
-                bail!("nothing to say");
+            let text = (!text.trim().is_empty()).then_some(text);
+            if no_wait && text.is_none() {
+                bail!("--no-wait needs a prompt to send");
             }
-            let l = Ledger::open(&ledger_path())?;
-            // A long-lived agent is reached through its current run; a hibernated one is woken, and
-            // the message is its first turn.
-            let mut run = run;
-            if l.run_status(&run)?.as_deref() != Some("running") {
-                if let Ok(a) = hibernate::resolve(&l, &run) {
-                    match a.state.as_str() {
-                        "hibernated" if a.restorable => {
-                            if let Some(why) = hibernate::exhausted(&a) {
-                                bail!("agent {} is hibernated and can't be woken: {why}", a.id);
-                            }
-                            l.add_operator_message(&a.id, &text, &operator())?;
-                            l.audit(
-                                &TenantId::single(),
-                                None,
-                                "operator.message",
-                                &serde_json::json!({ "by": operator(), "chars": text.len(), "agent": a.id, "wakes": true }),
-                            )?;
-                            hibernate::trigger_wake(&a.id, &format!("wicket say by {}", operator()));
-                            println!(
-                                "agent {} is hibernated: waking it; the message is its first turn (log: {})",
-                                a.id,
-                                hibernate::agent_dir(&a.id).join("wake.log").display()
-                            );
-                            return Ok(());
-                        }
-                        "active" | "waking" | "hibernating" => run = a.run,
-                        s => bail!("agent {} is {s}", a.id),
-                    }
-                }
-            }
-            match l.run_status(&run)?.as_deref() {
-                Some("running") => {}
-                Some(s) => bail!("{run} is {s}, not running"),
-                None => bail!("no run {run}"),
-            }
-            l.add_operator_message(&run, &text, &operator())?;
-            l.audit(
-                &TenantId::single(),
-                Some(&wicket_core::RunId(run.clone())),
-                "operator.message",
-                &serde_json::json!({ "by": operator(), "chars": text.len() }),
-            )?;
-            println!("queued for {run}: the agent gets it within a second (as its next turn, or queued behind the current one)");
-            Ok(())
+            session::open(session::Opts { run, text, wait: !no_wait, timeout: timeout.map(std::time::Duration::from_secs) }).await
         }
         Cmd::Hibernate { run, wait } => hibernate::hibernate(&run, wait).await,
         Cmd::Wake { agent, text, by } => {
