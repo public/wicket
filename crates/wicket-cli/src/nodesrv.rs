@@ -15,10 +15,11 @@
 //!   node's name-constrained CA. Hosts the node must not terminate (an `inject` rule, a credential
 //!   swap, outside the CA's constraints, or an expired CA) are tunnelled to the control host's egress
 //!   proxy for the run.
-//! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy checks each call and
-//!   relays it to the run's own on the control host, which holds the credential and checks it again;
-//!   the gateway relays each call to the run's, which decides every tool, and answers MCP's own
-//!   handshake itself while the control host can't be reached.
+//! - **It runs the box's model proxy and MCP gateway** (#151). The model proxy is the box's only
+//!   one (#257): it checks each call and makes it itself, with the credential fetched from the
+//!   control host on first use (#152). The gateway decides the tools it can from the box's token
+//!   (#164), relays the rest to the run's own on the control host, and answers MCP's own handshake
+//!   itself while the control host can't be reached.
 //! - **It keeps an audit log.** A ledger of its own (`audit.db`), hash-chained like the control host's,
 //!   records its decisions; it ships records past the control host's watermark on every connect.
 //! - **One control connection per run** (its scope; #146), on a unix socket in a 0700 directory,
@@ -363,7 +364,7 @@ impl Node {
     /// Opens a tunnel to the run's `target` socket on the control host: over the control channel, or
     /// for the control host's own node, the socket itself (the run's `ctl/` directory, on this host).
     async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<Box<dyn RelayStream>> {
-        if self.paths.shares_host() && ["egress", "llm", "gateway"].contains(&target) {
+        if self.paths.shares_host() && chan::TUNNEL_TARGETS.contains(&target) {
             crate::run::check_run_id(run).map_err(std::io::Error::other)?;
             let s = UnixStream::connect(self.paths.runs().join(run).join("ctl").join(format!("{target}.sock"))).await?;
             return Ok(Box::new(s));
@@ -1788,8 +1789,9 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause, timings: t.done() }));
 }
 
-/// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
-/// on the control host. Started for a new box, and again for one a restarted `serve` adopts.
+/// The box's enforcement points: egress and the model proxy decided here; the MCP gateway's tools
+/// this node doesn't decide yet, and hosts it forwards, reached on the control host (#257). Started
+/// for a new box, and again for one a restarted `serve` adopts.
 async fn serve_box(
     node: &Arc<Node>,
     bs: &BoxStart,
@@ -1845,21 +1847,16 @@ async fn serve_box(
     });
     let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, swaps: ctx.swaps.clone() });
     let mut tasks = vec![];
-    // The model proxy (#151, #152): the run's checks here (allowed routes and models, server tools,
-    // the budget and this node's slice of it). With the model credential in this node's cache, it
-    // calls the model itself, the control host isn't asked, and this node is the counter of record
-    // (its spend persisted beside the box, and reported). Otherwise the call is relayed to the
-    // run's own proxy on the control host, which adds the credential and counts it there too.
+    // The model proxy (#151, #152), the box's only one (#257): the run's checks here (allowed routes
+    // and models, server tools, the budget and this node's slice of it). It calls the model itself
+    // with the credential from this node's cache (fetched on first use; without it, the call fails
+    // clearly), the control host isn't asked, and this node is the counter of record (its spend
+    // persisted beside the box, and reported).
     let llm = {
         let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel::<wicket_proxy::Event>();
         let mut c = ctx.clone();
         c.events = quiet_tx;
-        let (n, run) = (node.clone(), bs.run.clone());
-        let relay: wicket_proxy::llm::LlmRelay = Arc::new(move || {
-            let (n, run) = (n.clone(), run.clone());
-            Box::pin(async move { n.open_tunnel(&run, "llm").await })
-        });
-        let l = wicket_proxy::llm::Llm::relayed(c, relay)?;
+        let l = wicket_proxy::llm::Llm::new(c)?;
         l.spent_before(bs.llm_prior.0, bs.llm_prior.1, bs.llm_prior.2);
         // What this node already counted for the box, before a restart of `serve`.
         if let Some(sp) = std::fs::read(dir.join(SPEND_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
@@ -1867,8 +1864,9 @@ async fn serve_box(
         }
         l.set_slice(node.slices.get(&bs.run));
         node.llms.lock().expect("llms").insert(bs.run.clone(), l.clone());
-        // Its events are the console's only when the call went from here (else the control host's
-        // proxy shows the same call).
+        // Its events are the console's once this node holds the credential: a call refused for want
+        // of it is answered with its problem only, as when such calls were relayed (#257 keeps the
+        // events as they were).
         let (vault, secret, fwd) = (ctx.vault.clone(), ctx.zone.llm.as_ref().map(|x| x.secret.clone()), ctx.events.clone());
         tasks.push(tokio::spawn(async move {
             while let Some(ev) = quiet_rx.recv().await {
@@ -2492,11 +2490,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             .unwrap();
         // A lease's slice: kept on disk for a restarted `serve`.
         let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
-        c.write_all(
-            &Frame::Msg(Msg::Lease { run: RUN.into(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }).encode(),
-        )
-        .await
-        .unwrap();
+        c.write_all(&Frame::Msg(Msg::BudgetSlice { run: RUN.into(), slice }).encode()).await.unwrap();
         for _ in 0..200 {
             if node.queue.of(RUN).is_empty() && node.slices.get(RUN).is_some() {
                 break;
