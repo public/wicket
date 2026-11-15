@@ -20,8 +20,12 @@ if [ ! -x "$lean_home/bin/lake" ]; then
   echo "$LEAN_SHA256  $work/lean.zip" | sha256sum -c -
   unzip -q "$work/lean.zip" -d "$work"
   mkdir -p "$(dirname "$lean_home")"
+  # A cache can restore part of an earlier install (no bin/lake): mv would then nest the new
+  # toolchain inside it, off PATH. Replace it whole.
+  rm -rf "$lean_home"
   mv "$work/lean-$LEAN_VERSION-linux" "$lean_home"
 fi
+[ -x "$lean_home/bin/lean" ] || { echo "no lean in $lean_home/bin" >&2; exit 1; }
 export PATH="$lean_home/bin:$PATH" LAKE="$lean_home/bin/lake"
 lean --version
 

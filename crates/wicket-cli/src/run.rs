@@ -1701,7 +1701,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     audit("run.agent_prompt", serde_json::json!({ "tool": tool, "kind": kind, "answer": answer, "why": why }))
                                 }
                                 E::Refused { method } => audit("run.agent_call_refused", serde_json::json!({ "method": method })),
-                                E::TurnDone { .. } if !c.busy() => turn_running = false,
+                                E::TurnDone { stop } if !c.busy() => {
+                                    turn_running = false;
+                                    // A delegated child's turn ended (#252): its report (ACP gives no result text).
+                                    report_turn(&ctx, None, stop != "end_turn");
+                                }
                                 E::Failed { error } => {
                                     // Nothing more can be said to it: end the session.
                                     if status == "unknown" {
@@ -1765,6 +1769,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             }
                             if v.get("type").and_then(|t| t.as_str()) == Some("result") && v.get("parent_tool_use_id").is_none_or(|p| p.is_null()) {
                                 turn_running = false;
+                                // A delegated child's turn ended (#252): its result is its report.
+                                let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+                                report_turn(&ctx, v.get("result").and_then(|r| r.as_str()), is_error);
                             }
                         }
                         let sub = tracker.lock().ok().and_then(|mut t| t.observe(&l));
@@ -1923,7 +1930,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 if !turn_running && !finish_asked && waiting > notified_msgs {
                     use tokio::io::AsyncWriteExt;
-                    let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
+                    let t = format!("[wicket] {waiting} message(s) from other agents (or your parent's next brief) are waiting: read them with wicket's await_message tool.");
                     println!("{t}");
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {
@@ -2255,9 +2262,23 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         } else {
             serde_json::json!({ "status": status, "cause": cause, "note": end_note, "result": result })
         };
+        let body = match ctx.ledger.lock().ok().and_then(|l| l.delegation_of_child(&run.0).ok().flatten()) {
+            Some(d) => {
+                let mut b = body;
+                b["delegation"] = serde_json::json!(d.id);
+                b
+            }
+            None => body,
+        };
         match ctx.send_message(&wicket_proxy::Recipient::Parent, "run_finished", body) {
-            Ok(s) => println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to),
-            Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),
+            Ok(s) => {
+                println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to);
+                ctx.end_delegation(Some(&s.id));
+            }
+            Err(e) => {
+                println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub);
+                ctx.end_delegation(None);
+            }
         }
     }
     // A parent's children end with it: interrupt them (each stops its own box), then wait briefly.
@@ -2523,6 +2544,15 @@ const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;
+
+/// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
+fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
+    match ctx.report_turn(result, is_error) {
+        Some(Ok(s)) => println!("[wicket] sent {} (report) to its parent {}", s.id, s.to),
+        Some(Err(e)) => println!("[wicket] could not send its report to its parent: {e}"),
+        None => {}
+    }
+}
 
 /// What to write to an agent's stdin for a new user turn: a stream-json user message, or for an ACP
 /// agent the `session/prompt` (nothing yet if a turn is running: it is queued until that ends).
