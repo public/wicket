@@ -12,4 +12,4 @@ type: Added
   dot segment. The spec also runs as an oracle: `ci/lean.sh` (the `lean` CI suite) installs the
   pinned toolchain by checksum and checks wicket-core's decisions, `subset::check`,
   `reach_within`, `host_matches` and `canonical_path` against it on the authz fixtures and about
-  50,000 generated cases ([#322](https://github.com/public/wicket/issues/322)).
+  33,000 generated cases ([#322](https://github.com/public/wicket/issues/322)).

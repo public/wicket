@@ -13,9 +13,9 @@ if ! grep -qx "leanprover/lean4:v$LEAN_VERSION" verification/lean/lean-toolchain
   exit 1
 fi
 lean_home=${LEAN_HOME:-${TOOLS_DIR:-$PWD/target/tools}/lean-$LEAN_VERSION}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 if [ ! -x "$lean_home/bin/lake" ]; then
-  work=$(mktemp -d)
-  trap 'rm -rf "$work"' EXIT
   curl -fsSL -o "$work/lean.zip" "https://github.com/leanprover/lean4/releases/download/v$LEAN_VERSION/lean-$LEAN_VERSION-linux.zip"
   echo "$LEAN_SHA256  $work/lean.zip" | sha256sum -c -
   unzip -q "$work/lean.zip" -d "$work"
@@ -30,9 +30,8 @@ if grep -rnwE 'sorry|admit|axiom|native_decide' verification/lean/Wicket verific
   echo "the spec has an unproved step" >&2
   exit 1
 fi
-log=$(mktemp)
-(cd verification/lean && lake build 2>&1) | tee "$log"
-if grep -q "declaration uses 'sorry'" "$log"; then
+(cd verification/lean && lake build 2>&1) | tee "$work/build.log"
+if grep -q "declaration uses 'sorry'" "$work/build.log"; then
   echo "the spec has an unproved step" >&2
   exit 1
 fi
