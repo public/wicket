@@ -9,6 +9,8 @@
 //! - `without_the_spend_journal_a_crashed_node_overspends`: the bug this found, still found.
 //! - `published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime`: #342's
 //!   expiry boundary, held by the strict oracle.
+//! - `a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants`: #257's slice 3,
+//!   no forwarded egress: such a host is spliced or refused, never decided.
 
 use std::path::PathBuf;
 use wicket_sim::Options;
@@ -107,4 +109,18 @@ fn published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime
     let r = wicket_sim::run_with(1, &dir().join("grant-end"), Options { grant_end_fix: false, ..Options::default() });
     assert!(r.violations.iter().any(|v| v.contains("past its lifetime")), "seed 1 no longer allows past a grant's end: {r}");
     assert!(r.violations.iter().all(|v| v.contains("past its lifetime")), "and breaks nothing else: {r}");
+}
+
+/// #257, slice 3: the control host publishes every grant, one on a host the node's CA can't cover
+/// included, and decides nothing; the node splices such a host if the box's token allows it
+/// wholesale and refuses it otherwise. The `seeds` test checks that no such host is allowed but
+/// spliced. A node that decided those hosts from the feed instead (as if it could terminate them)
+/// would honour the published grant: the oracle finds it.
+#[test]
+fn a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants() {
+    let r = wicket_sim::run_with(1, &dir().join("uncovered"), Options { refuse_uncovered: false, ..Options::default() });
+    assert!(r.violations.iter().any(|v| v.contains("outside the node's CA, and was decided")), "seed 1 no longer shows it: {r}");
+    assert!(r.violations.iter().all(|v| v.contains("outside the node's CA")), "and breaks nothing else: {r}");
+    let ok = wicket_sim::run(1, &dir().join("uncovered-ok"));
+    assert!(ok.ok() && ok.stats.spliced > 0 && ok.stats.uncovered_refused > 0, "both ways exercised: {:?}", ok.stats);
 }

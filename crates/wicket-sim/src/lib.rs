@@ -11,7 +11,11 @@
 //!   own and reopened after a crash;
 //! - the box's authority: Biscuit tokens minted by [`wicket_feed::Issuer`], and grants as their
 //!   third-party blocks, published and revoked as `noderun.rs` does;
-//! - the decide path: `Replica::<BoxAuthority>::decide`, the node's only decision path (#257);
+//! - the decide path: `Replica::<BoxAuthority>::decide`, the node's only decision path (#257),
+//!   behind `wicket_proxy::decide::route`, the node's check of what its CA covers: since #257's
+//!   slice 3 a host it can't cover is spliced when the box's token allows it wholesale
+//!   (`Replica::splice`) and refused otherwise, never forwarded to the control host, which
+//!   decides no request;
 //! - the model budget: [`wicket_proxy::llm::Llm`] on both sides. On the node it is the box's model
 //!   proxy, with its slice; on the control host it is the run's counter, which leases the slices
 //!   ([`wicket_proxy::llm::Llm::next_slice`] and [`wicket_proxy::llm::Slice::renewed`], the rule
@@ -71,12 +75,37 @@ pub const CONTROL_PORT: u16 = 7000;
 pub const NODE_PORT: u16 = 8000;
 
 /// The ops a box makes, by path: reads its zone reaches, three comments that need a grant, a
-/// webhook no grant ever covers, and a forbidden host.
+/// webhook no grant ever covers, and a forbidden host. Since #257's slice 3, also an upload to a
+/// host the node's CA can't cover (which a grant is issued for, and which is never allowed), and
+/// a host outside the CA that the zone allows wholesale (spliced).
 pub const READ_PATH: &str = "/repos/acme/app/issues";
-pub const GRANT_PATHS: [&str; 3] =
-    ["/repos/acme/app/issues/1/comments", "/repos/acme/app/issues/2/comments", "/repos/acme/app/issues/3/comments"];
+pub const GRANT_PATHS: [&str; 4] = [
+    "/repos/acme/app/issues/1/comments",
+    "/repos/acme/app/issues/2/comments",
+    "/repos/acme/app/issues/3/comments",
+    UNCOVERED_PATH,
+];
+/// Of [`GRANT_PATHS`], those on [`HOST`]; the last is on [`UNCOVERED_HOST`].
+pub const COVERED_GRANTS: usize = 3;
+/// A host outside the node CA's name constraints ([`NODE_CA`]), out of the zone's reach: asked for,
+/// granted, published, and still never allowed.
+pub const UNCOVERED_HOST: &str = "uploads.github.com";
+pub const UNCOVERED_PATH: &str = "/repos/acme/app/releases/1/assets";
+/// A host outside the node CA too, which the zone allows wholesale: spliced through.
+pub const SPLICED_HOST: &str = "objects.githubusercontent.com";
+/// What the node's CA is name-constrained to (`wicket node enrol --hosts`).
+pub const NODE_CA: [&str; 1] = [HOST];
 pub const NEVER_PATH: &str = "/repos/acme/app/hooks";
 pub const HOST: &str = "api.github.com";
+
+/// The host a grant path is on.
+pub fn grant_host(path: usize) -> &'static str {
+    if path < COVERED_GRANTS {
+        HOST
+    } else {
+        UNCOVERED_HOST
+    }
+}
 pub const FORBIDDEN_HOST: &str = "evil.example.com";
 
 /// The command that replays `seed`, printed with every failure.
@@ -186,6 +215,16 @@ impl Plan {
                 }
             }
         }
+        // #257's slice 3: grants on the host the node's CA can't cover, drawn from a generator of
+        // their own so the rest of the plan is the same as before it.
+        let mut u = Rng::new(seed.rotate_left(29));
+        for (run, name) in RUNS.iter().enumerate() {
+            if u.chance(0.7) {
+                let at = u.range_i(0, DURATION_MS - 15_000);
+                let gid = format!("g_{name}_{COVERED_GRANTS}");
+                grants.push(GrantAction { at_ms: at, run, path: COVERED_GRANTS, gid, kind: GrantKind::Issue { lifetime_s: u.range(5, 30) } });
+            }
+        }
         grants.sort_by_key(|g| g.at_ms);
         Plan { seed, node_skew_ms, max_latency_ms, faults, grants }
     }
@@ -198,7 +237,7 @@ impl fmt::Display for Plan {
             writeln!(f, "  fault at {} ms for {} ms: {:?}", x.at_ms, x.dur_ms, x.kind)?;
         }
         for g in &self.grants {
-            writeln!(f, "  grant at {} ms: {} ({} {}) {:?}", g.at_ms, g.gid, RUNS[g.run], GRANT_PATHS[g.path], g.kind)?;
+            writeln!(f, "  grant at {} ms: {} ({} {}{}) {:?}", g.at_ms, g.gid, RUNS[g.run], grant_host(g.path), GRANT_PATHS[g.path], g.kind)?;
         }
         Ok(())
     }
@@ -268,11 +307,14 @@ pub struct Env {
 }
 
 /// The run's zone: reads on acme's repos by reach, the comment paths by grant, a forbidden host,
-/// and a model route with [`QUOTA`].
+/// a host allowed wholesale, and a model route with [`QUOTA`].
 pub fn zone() -> ZoneSpec {
     serde_json::from_value(serde_json::json!({
         "name": "z",
-        "reach": [{"host": HOST, "methods": ["GET"], "paths": ["/repos/acme/**"]}],
+        "reach": [
+            {"host": HOST, "methods": ["GET"], "paths": ["/repos/acme/**"]},
+            {"host": SPLICED_HOST, "methods": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]},
+        ],
         "forbid": [{"host": FORBIDDEN_HOST}],
         "llm": {
             "provider": "anthropic",
@@ -330,11 +372,15 @@ pub struct Options {
     /// ledger's `expires_at`. Off: `not_after = expires_at`, as before, and the strict oracle finds
     /// allows up to 999 ms past it (`tests/scenario.rs`).
     pub grant_end_fix: bool,
+    /// The node refuses a host its CA can't cover unless it splices it (#257's slice 3). Off: it
+    /// decides such a host from the feed as if it could terminate it, and the oracle finds the
+    /// published grant on [`UNCOVERED_HOST`] allowing (`tests/scenario.rs`).
+    pub refuse_uncovered: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { keep_trace: false, spend_journal: true, grant_end_fix: true }
+        Options { keep_trace: false, spend_journal: true, grant_end_fix: true, refuse_uncovered: true }
     }
 }
 
