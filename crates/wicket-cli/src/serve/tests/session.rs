@@ -489,6 +489,12 @@ async fn over_the_socket_cap_the_upgrade_is_refused_without_spending_its_ticket(
     assert_eq!(acp(&t), false);
     std::fs::write(t.dir.join("runs").join(RUN).join(crate::transcript::ACP_LOG), "").unwrap();
     assert_eq!(acp(&t), true);
+    // With this sign-in's places taken, the open is refused before the passkey is asked for.
+    let sid = session_id(&cookie);
+    let held: Vec<Slot> = (0..MAX_SOCKETS_PER_SESSION).map(|_| Slot::take(&t.state.sockets, &sid).unwrap()).collect();
+    let r = t.begin(json!({ "action": "open_session", "run": RUN }));
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{:?}", r.body);
+    drop(held);
     let tickets: Vec<String> = (0..=MAX_SOCKETS_PER_SESSION).map(|_| ticket(&mut t, RUN)).collect();
     let socks = t.state.sockets.clone();
     let addr = serve(t.state).await;

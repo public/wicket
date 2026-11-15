@@ -181,12 +181,18 @@ pub struct Ticket {
     pub expires: Instant,
 }
 
+/// Why another session socket for `console_session` would be refused now, if it would.
+pub(super) fn over_cap(state: &State, console_session: &str) -> Option<&'static str> {
+    state.sockets.lock().expect("lock").full(console_session)
+}
+
 /// Issues a ticket after the `open_session` action verified, and audits the signed open.
 pub(super) fn open(state: &State, run: &str, oc: &OperatorCredential, console_session: &str, signed: Value) -> Result<Value> {
     let l = state.ledger()?;
     check_running(&l, run).map_err(|r| anyhow::anyhow!("{}", r.body["error"].as_str().unwrap_or("not running")))?;
-    // Refused before a ticket is spent, if its socket would be.
-    if let Some(why) = state.sockets.lock().expect("lock").full(console_session) {
+    // Checked again here (sockets may have opened since the action began): no ticket for a socket
+    // that would be refused.
+    if let Some(why) = over_cap(state, console_session) {
         anyhow::bail!("{why}");
     }
     let op = crate::operators::Operator::console(&state.tenant.0, &oc.name)?;

@@ -1264,6 +1264,12 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
         Ok(x) => x,
         Err(r) => return r,
     };
+    // A session socket over its caps is refused before the passkey is asked for (#327).
+    if matches!(action, Action::OpenSession { .. }) {
+        if let Some(why) = session::over_cap(state, &sid) {
+            return err(StatusCode::TOO_MANY_REQUESTS, why);
+        }
+    }
     let action_json = v.to_string();
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();

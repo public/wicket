@@ -29,6 +29,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
 - [Run an ACP agent](how-to/run-an-acp-agent.md)
+- [Work with a running agent in the console](how-to/work-with-a-running-agent-in-the-console.md): its live session, prompts, escalations
 - [Use HTTP/3](how-to/use-http3.md)
 - [Export audit](how-to/export-audit.md)
 - [Inspect a run's authority in the console](how-to/inspect-authority-in-the-console.md), and explain a decision
@@ -56,7 +57,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [The box](reference/box.md): what a workload sees from inside
 - [Agents](reference/agents.md): identity, children, messages, sessions, hibernation
 - [Nodes](reference/nodes.md): enrolment, `node serve`, placement, leases, the reconciler
-- [Console](reference/console.md): passkeys, signed actions, authority views, manifests, what it enforces on the internet
+- [Console](reference/console.md): passkeys, signed actions, sessions, authority views, manifests, what it enforces on the internet
 - [Audit](reference/audit.md): the writer, export, checkpoints, record kinds
 
 ## Explanation
