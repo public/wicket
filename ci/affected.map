@@ -12,8 +12,8 @@
 #
 # Suites: docs (check-public, Markdown links, terms),
 # policy (SymCC policy diffs), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
-# install-test, and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
-# (acceptance --nodes local), update.
+# install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on
+# PRs: node-e2e, acceptance-nodes (acceptance --nodes local), update.
 
 # ---- the selection itself, the build and the toolchain: everything ----
 ci/affected.py                     | all | all
@@ -51,6 +51,10 @@ ci/changelog_test.py               | -   | docs
 examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
+# The console's session view (#327): embedded by crates/wicket-cli/build.rs, checked by its job.
+web/**                             | wicket-cli | -
+ci/session-view.sh                 | wicket-cli | -
+ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
@@ -78,12 +82,12 @@ crates/wicket-cli/src/rootcopy.rs  | -   | update install-test
 crates/wicket-cli/src/daemon/**    | -   | daemon-uids acceptance
 crates/wicket-cli/src/serve/static/** | - | acceptance
 crates/wicket-cli/src/node.rs      | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesrv.rs   | -   | node-e2e acceptance-nodes tla
+crates/wicket-cli/src/noderun.rs   | -   | node-e2e acceptance-nodes tla
+crates/wicket-cli/src/nodegw.rs    | -   | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
@@ -122,3 +126,9 @@ ci/node-e2e/**                     | -   | node-e2e
 ci/update.sh                       | -   | update
 ci/update/**                       | -   | update
 ci/policy-diff.sh                  | -   | policy
+ci/tla.sh                          | -   | tla
+
+# ---- the TLA+ models (#321) ----
+# Each README maps its actions to the code. That code selects tla too: noderun, nodesrv, nodegw and
+# nodesecrets above; the rest (llm.rs, spawn.rs, the feed, the ledger) isn't listed, so every suite.
+verification/**                    | -   | tla

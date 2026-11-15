@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# TLC on the TLA+ models under verification/tla/ (#321), at the small bounds their .cfg files state.
+# A Temurin 21 JRE and tla2tools.jar, both pinned by URL and sha256 and checked. Every `pass_*.cfg`
+# (and each model's own .cfg) must pass; every `fail_*.cfg` must be refused with the invariant this
+# script names for it, so a variant that stops failing (the model stopped seeing the bug) fails too.
+#
+#   ci/tla.sh [CFG...]     (default: every .cfg under verification/tla/)
+#
+# TOOLS_DIR (default target/tools) keeps the downloads; TLA_HEAP (default 1g) is TLC's heap.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+JRE_URL=https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_x64_linux_hotspot_21.0.13_9.tar.gz
+JRE_SHA256=a535a1df9c6284d9618872984e026ae0352d1f7e9e0605425c0e6114f47351dd
+TLA_URL=https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+# The release publishes sha1 bee4a54f3ee3d4afc347c3240ec2d9e93b075104; this is the same file's sha256.
+TLA_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+
+tools=${TOOLS_DIR:-$PWD/target/tools}
+mkdir -p "$tools"
+if [ ! -x "$tools/jre21/bin/java" ]; then
+  curl -sSfL -o "$tools/jre21.tar.gz" "$JRE_URL"
+  echo "$JRE_SHA256  $tools/jre21.tar.gz" | sha256sum -c -
+  rm -rf "$tools/jre21" && mkdir -p "$tools/jre21"
+  tar -xzf "$tools/jre21.tar.gz" -C "$tools/jre21" --strip-components=1
+  rm "$tools/jre21.tar.gz"
+fi
+if ! echo "$TLA_SHA256  $tools/tla2tools.jar" | sha256sum -c - >/dev/null 2>&1; then
+  curl -sSfL -o "$tools/tla2tools.jar" "$TLA_URL"
+  echo "$TLA_SHA256  $tools/tla2tools.jar" | sha256sum -c -
+fi
+java=$tools/jre21/bin/java
+
+# What each failing variant must be refused with (an extended regex of TLC's invariant names).
+expect_fail() {
+  case "$1" in
+    fail_token_boundary | fail_node_skew) echo 'NoAllowPastLifetime' ;;
+    fail_no_journal | fail_merged_counters | fail_slice_unreserved | fail_edge_carve | fail_no_first_slice) echo 'SpendWithinBudget' ;;
+    fail_today) echo 'NoAllowPastLifetime|SpendWithinBudget' ;;
+    *) echo "" ;;
+  esac
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+if [ $# -gt 0 ]; then cfgs=("$@"); else mapfile -t cfgs < <(ls verification/tla/*.cfg); fi
+status=0
+for cfg in "${cfgs[@]}"; do
+  dir=$(dirname "$cfg") name=$(basename "$cfg" .cfg)
+  # A model's own .cfg is named after it; the variants check the one model in their directory.
+  spec=$(ls "$dir"/*.tla | head -n 1)
+  [ -f "$dir/$name.tla" ] && spec=$dir/$name.tla
+  log=$work/$name.log
+  start=$(date +%s)
+  set +e
+  (cd "$dir" && "$java" -Xmx"${TLA_HEAP:-1g}" -XX:+UseParallelGC -Djava.io.tmpdir="$work" -cp "$tools/tla2tools.jar" \
+    tlc2.TLC -workers auto -deadlock -cleanup -metadir "$work/states-$name" -config "$name.cfg" "$(basename "$spec")") >"$log" 2>&1
+  rc=$?
+  set -e
+  took=$(( $(date +%s) - start ))
+  states=$(grep -Eo '^[0-9]+ states generated, [0-9]+ distinct states found' "$log" | tail -n 1 || true)
+  want=$(expect_fail "$name")
+  if [ -z "$want" ]; then
+    if [ $rc -eq 0 ] && grep -q 'Model checking completed. No error has been found.' "$log"; then
+      echo "ok    $name ($states; ${took}s)"
+    else
+      echo "FAIL  $name: TLC found an error (exit $rc):"
+      sed 's/^/    /' "$log" | tail -n 120
+      status=1
+    fi
+  elif grep -Eq "Invariant ($want) is violated" "$log"; then
+    echo "ok    $name refused: $(grep -Eo "Invariant ($want) is violated" "$log" | head -n 1) (${took}s)"
+  else
+    echo "FAIL  $name: expected TLC to refuse it with $want (exit $rc):"
+    sed 's/^/    /' "$log" | tail -n 60
+    status=1
+  fi
+done
+exit $status

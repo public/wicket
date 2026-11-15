@@ -1,0 +1,27 @@
+{
+  "name": "wicket-session-view",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "vue-tsc --noEmit && vite build",
+    "check": "vue-tsc --noEmit",
+    "check:build": "vite build --ssr check/check.ts --outDir check-dist",
+    "check:ui": "vite build --config vite.ui.config.ts && node check/ui-run.mjs"
+  },
+  "dependencies": {
+    "vue": "3.5.45"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.11",
+    "jsdom": "27.4.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "vue-tsc": "3.3.14"
+  },
+  "description": "wicket console's session view (#327): a fork of acp-ui",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}

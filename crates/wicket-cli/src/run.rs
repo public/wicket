@@ -1501,6 +1501,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let acp_state = dir.join("ctl/acp.json");
     let mut acp_audits: u32 = 0;
     let mut acp: Option<wicket_agent::acp::AcpClient> = None;
+    // What wicket says to the agent, for the console's session view (#327): only ACP runs keep it.
+    let mut acp_log = acp_cfg
+        .is_some()
+        .then(|| crate::transcript::AcpLog::open(&dir, m.zone.limits.output_bytes().unwrap_or(64 << 20), record.is_some()));
     if let Some(cfg) = acp_cfg {
         if record.is_some() {
             let c =
@@ -1508,7 +1512,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             acp = Some(c);
         } else {
             let (mut c, mut out) = wicket_agent::acp::AcpClient::start(cfg);
+            if let Some(log) = acp_log.as_mut() {
+                log.queued(0, if wake.is_some() { "wake" } else { "task" }, None);
+            }
             out.extend(c.prompt(wake.as_ref().map(|w| w.first.as_str()).unwrap_or(&m.task)));
+            if let Some(log) = acp_log.as_mut() {
+                log.wrote(0, &out.join("\n"));
+            }
             if let Some(si) = stdin.as_mut() {
                 use tokio::io::AsyncWriteExt;
                 for l in out {
@@ -1664,6 +1674,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
                             }
                         };
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &st.write.join("\n"));
+                        }
                         if let Some(si) = stdin.as_mut() {
                             use tokio::io::AsyncWriteExt;
                             for w in &st.write {
@@ -1847,17 +1860,51 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     reported_turn = Some(turn_running);
                 }
-                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
-                for (text, by) in msgs {
+                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default();
+                for (op, text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
                     println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
-                        if si.write_all(turn_input(&mut acp, &acp_state, &text).as_bytes()).await.is_err() {
+                        if let Some(log) = acp_log.as_mut() {
+                            log.queued(transcript_f.offset(), &by, Some(op));
+                        }
+                        let input = turn_input(&mut acp, &acp_state, &text);
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        if si.write_all(input.as_bytes()).await.is_err() {
                             stdin = None;
                             break;
                         }
                     }
                     turn_running = true;
+                }
+                // A `session/cancel` from the console's session view (#327): the running turn, if any.
+                // Prompts still queued behind it stay queued.
+                let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                if let Some(by) = cancels.last() {
+                    use tokio::io::AsyncWriteExt;
+                    let out = acp.as_mut().map(|c| c.cancel()).unwrap_or_default();
+                    let sent = !out.is_empty();
+                    if sent {
+                        println!("[operator] {by}: cancel the running turn");
+                        if let Some(c) = &acp {
+                            let _ = write_json(&acp_state, c);
+                        }
+                        let input: String = out.iter().map(|l| format!("{l}\n")).collect();
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        if let Some(si) = stdin.as_mut() {
+                            if si.write_all(input.as_bytes()).await.is_err() {
+                                stdin = None;
+                            }
+                        }
+                    }
+                    if let Ok(l) = ledger.lock() {
+                        let why = if sent { "cancelled" } else if acp.is_some() { "no turn was running" } else { "not an ACP run: nothing to cancel" };
+                        let _ = l.audit(&m.tenant, Some(&run), "run.turn_cancel", &serde_json::json!({ "by": by, "asked": cancels.len(), "outcome": why }));
+                    }
                 }
                 if let Some(f) = &fence {
                     // An operator's `wicket hibernate`.
@@ -1879,7 +1926,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
                     println!("{t}");
                     if let Some(si) = stdin.as_mut() {
-                        let _ = si.write_all(turn_input(&mut acp, &acp_state, &t).as_bytes()).await;
+                        if let Some(log) = acp_log.as_mut() {
+                            log.queued(transcript_f.offset(), "wicket", None);
+                        }
+                        let input = turn_input(&mut acp, &acp_state, &t);
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        let _ = si.write_all(input.as_bytes()).await;
                     }
                     notified_msgs = waiting;
                     turn_running = true;
@@ -2462,6 +2516,10 @@ fn write_secret(p: &Path, body: &str) -> Result<()> {
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
 }
+
+/// How old a `session/cancel` may be when the supervisor takes it (#327): older ones were meant for
+/// a turn that has likely ended.
+const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;

@@ -67,6 +67,9 @@ function describe(a) {
     return verb + " (sha256 " + s(a.sha256).slice(0, 12) + "\u2026" + (a.previous_sha256 ? ", replacing " + s(a.previous_sha256).slice(0, 12) + "\u2026" : ", new") + ")" + w +
       " \u00b7 " + (a.changes || []).length + " change(s)";
   }
+  if (a.action === "push_subscribe") return (a.replaces ? "Re-register " : "Send notifications to ") + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")" +
+    (a.details ? " \u00b7 showing the agent and what it asks for" : " \u00b7 showing only how many requests wait");
+  if (a.action === "push_details") return "Show the agent and what it asks for in notifications on " + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")";
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -80,9 +83,12 @@ let layoutAt = 0;
 const SETTLE_MS = 800;
 const settled = () => performance.now() - layoutAt >= SETTLE_MS;
 
-async function signed(body) {
+// `after`, if given, runs once the confirmation closes (signed, refused or cancelled).
+let afterConfirm = null;
+async function signed(body, after) {
   if (ceremony) return;
   ceremony = true;
+  afterConfirm = after || null;
   let begin;
   try { begin = await post("/api/action/begin", body); }
   catch (e) { toast(e.message); closeConfirm(); return; }
@@ -108,6 +114,8 @@ function closeConfirm() {
   document.getElementById("confirm").hidden = true;
   document.getElementById("confirm-go").onclick = null;
   ceremony = false;
+  const after = afterConfirm; afterConfirm = null;
+  if (after) after();
   refresh();
 }
 const act = (kind, body) => {
@@ -187,6 +195,7 @@ function renderPending(s) {
   if (empty) return;
   box.replaceChildren(...nodes);
   layoutAt = performance.now();
+  if (openId) for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
 }
 
 function renderRows(id, rows, f, emptyText) {
@@ -241,7 +250,8 @@ function placedRow(p) {
   return d;
 }
 
-// A running agent can be sent a follow-up or have its identity revoked; both are signed.
+// A running agent can be sent a follow-up or have its identity revoked; both are signed. An ACP
+// agent's session opens on its own page.
 function renderRun(s, x) {
   const d = el("div", "row");
   const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
@@ -250,6 +260,12 @@ function renderRun(s, x) {
   if (x.remote_url && x.remote_url.startsWith("https://")) {
     const a = el("a", "mono", "open session");
     a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    left.append(document.createTextNode(" · "), a);
+  }
+  // An ACP run's live session (#327): its own page, opened with a passkey there.
+  if (x.acp && x.status === "running" && !x.revoked) {
+    const a = el("a", "mono session", "session");
+    a.href = "/session?run=" + encodeURIComponent(x.id);
     left.append(document.createTextNode(" · "), a);
   }
   const auth = el("button", "link", "authority");
@@ -339,6 +355,132 @@ function renderOperator(s) {
   box.append(el("div", "note", "To add a passkey, run `wicket operator enrol-link` on the host and open the link on the new device."));
 }
 
+// ---- notifications (Web Push) ----
+// The service worker (/sw.js) shows what the server pushes; a tap on a notification opens the console
+// at "#pending/<id>" or, if it is open, tells it which request to show. Permission is asked only from
+// the button's click (iOS home-screen apps allow nothing else). Registering a device and showing the
+// request on it widen what it receives, so each is signed with the passkey (a stolen session cookie
+// can't add a receiver); removing a device or hiding the request need only the session. Each
+// device's notifications show only how many requests are waiting unless it opts in to the request
+// itself (lock screens show them). If the browser replaces this device's subscription (the service
+// worker's pushsubscriptionchange), the page offers a signed re-registration the next time it is open.
+const pushSupported = () => typeof navigator !== "undefined" && "serviceWorker" in navigator &&
+  typeof window !== "undefined" && "PushManager" in window && "Notification" in window;
+function deviceLabel() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  const os = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Mac OS X/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "device";
+  const br = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "";
+  return br ? os + " · " + br : os;
+}
+async function pushInfo() {
+  const r = await fetch("/api/push");
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+// This browser's current subscription, if it has one.
+async function currentSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration("/");
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+async function subId(sub) {
+  if (!sub || !crypto.subtle) return "";
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sub.endpoint)));
+  return Array.from(h.slice(0, 8), b => b.toString(16).padStart(2, "0")).join("");
+}
+async function enablePush() {
+  // First, while the click still counts as the user's gesture.
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast(perm === "denied" ? "Notifications are blocked for this site in the browser's settings." : "Notifications not allowed."); return; }
+  try {
+    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    await navigator.serviceWorker.ready;
+    const info = await pushInfo();
+    let sub = await reg.pushManager.getSubscription();
+    const key = sub && sub.options && sub.options.applicationServerKey ? b2a(sub.options.applicationServerKey) : null;
+    if (sub && key && key !== info.public_key) { await sub.unsubscribe(); sub = null; }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: a2b(info.public_key) });
+    registerSub(sub);
+  } catch (e) { toast("notifications: " + e.message); renderPush(); }
+}
+// Registers this browser's subscription with the server: a signed action.
+function registerSub(sub) {
+  const j = sub.toJSON();
+  signed({ action: "push_subscribe", endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, label: deviceLabel(), details: false }, renderPush);
+}
+async function removeDevice(id, mine) {
+  try {
+    await post("/api/push/remove", { id });
+    if (mine) { const sub = await currentSub(); if (sub) await sub.unsubscribe(); }
+    toast("Device removed");
+  } catch (e) { toast("notifications: " + e.message); }
+  renderPush();
+}
+async function setDetails(id, details) {
+  // Showing more is signed; showing less needs only the session.
+  if (details) { signed({ action: "push_details", id, details: true }, renderPush); return; }
+  try { toast((await post("/api/push/details", { id, details: false })).ok); } catch (e) { toast("notifications: " + e.message); }
+  renderPush();
+}
+// Renders can overlap (a toggle, a worker's message): only the latest one writes the box.
+let pushGen = 0;
+async function renderPush() {
+  const box = document.getElementById("push");
+  if (!box) return;
+  const gen = ++pushGen;
+  let info;
+  try { info = await pushInfo(); } catch (e) { if (gen === pushGen) box.replaceChildren(el("div", "note", "Notifications: " + e.message)); return; }
+  const sub = await currentSub().catch(() => null);
+  const mine = await subId(sub);
+  if (gen !== pushGen) return;
+  box.replaceChildren();
+  const b = el("div", "buttons");
+  if (!pushSupported()) {
+    box.append(el("div", "note", "This browser can't receive notifications here. On an iPhone or iPad, add the console to the home screen (Share → Add to Home Screen) and open it from there."));
+  } else if (sub && mine && !info.devices.some(d => d.id === mine)) {
+    // The browser holds a subscription the console doesn't know: it replaced the old one
+    // (pushsubscriptionchange), or this device was removed elsewhere. Registering it is signed.
+    box.append(el("div", "note", "This device's notification subscription changed, so the console can't reach it. Sign to register it again."));
+    const go = el("button", "approve", "Re-register this device"); go.onclick = () => registerSub(sub); b.append(go); box.append(b);
+  } else if (!info.devices.some(d => d.id === mine)) {
+    const go = el("button", "approve", "Enable notifications"); go.onclick = enablePush; b.append(go); box.append(b);
+  }
+  for (const d of info.devices) {
+    const row = el("div", "row push-dev");
+    row.append(el("span", "", strip(d.label) + (d.id === mine ? " (this device)" : "")),
+      el("span", "meta", strip(d.service) + " · " + (d.last_success ? "last delivered " + ago(Math.floor(Date.now() / 1000), d.last_success) : "nothing delivered yet")));
+    const lab = el("label", "details"); const cb = el("input"); cb.type = "checkbox"; cb.checked = !!d.details;
+    cb.onchange = () => setDetails(d.id, cb.checked);
+    lab.append(cb, document.createTextNode("Show the agent and what it asks for"));
+    const rm = el("button", "deny", "Remove"); rm.onclick = () => removeDevice(d.id, d.id === mine);
+    row.append(lab, rm);
+    box.append(row);
+  }
+  if (!info.devices.length) box.append(el("div", "empty", "No device gets notifications yet."));
+  box.append(el("div", "note", "A notification says how many requests are waiting (lock screens show it); tick a device to also show the agent and what it asks for. At most one per device every " + (info.min_interval_secs || 30) + " s."));
+}
+// The service worker saw the subscription change: show the notifications box (and its re-register button).
+function openNotifications() {
+  const box = document.getElementById("push");
+  if (box && box.scrollIntoView) box.scrollIntoView();
+  renderPush();
+}
+// Opened from a notification: scroll to the pending list and mark the request (if still waiting).
+let openId = "";
+function openPending(id) {
+  openId = id || "";
+  const box = document.getElementById("pending");
+  if (box && box.scrollIntoView) box.scrollIntoView();
+  for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
+}
+function fromHash() {
+  const h = (typeof location !== "undefined" && location.hash) || "";
+  const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
+  if (m) openPending(m[1]);
+  if (h === "#notifications") openNotifications();
+}
+
 // Signed out, the server answers /api/me with 401 and tells the page nothing else: the page offers
 // passkey sign-in (and says where enrolment links come from) whatever the server's state.
 async function boot() {
@@ -346,7 +488,7 @@ async function boot() {
   const me = r.ok ? await r.json() : { who: { state: "none" } };
   const auth = document.getElementById("auth"), con = document.getElementById("console");
   auth.replaceChildren();
-  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; refresh(); return; }
+  if (me.who.state === "operator") { auth.hidden = true; con.hidden = false; await refresh(); fromHash(); renderPush(); return; }
   con.hidden = true; auth.hidden = false;
   document.getElementById("tenant").textContent = "";
   if (me.who.state === "bootstrap") {
@@ -595,6 +737,11 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
   document.getElementById("mfedit-close").addEventListener("click", () => { document.getElementById("mfedit").hidden = true; });
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
+  if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => {
+    if (e.data && typeof e.data.open === "string") openPending(e.data.open);
+    if (e.data && e.data.resubscribe === true) openNotifications();
+  });
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("hashchange", fromHash);
   boot();
   setInterval(() => { if (!document.getElementById("console").hidden) refresh(); }, 2000);
 });
