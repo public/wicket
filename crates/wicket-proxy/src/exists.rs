@@ -73,7 +73,7 @@ pub async fn check(domain: &str) -> Exists {
 /// One SOA query for `domain` to `server`; the response code is the answer.
 async fn ask(server: SocketAddr, domain: &str) -> Exists {
     let mut id = [0u8; 2];
-    if getrandom::getrandom(&mut id).is_err() {
+    if getrandom::fill(&mut id).is_err() {
         return Exists::Unknown;
     }
     let Some(q) = query(u16::from_be_bytes(id), domain) else { return Exists::Unknown };

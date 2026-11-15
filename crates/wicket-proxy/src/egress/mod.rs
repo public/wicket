@@ -73,6 +73,11 @@ pub struct Egress {
 /// of its own.
 pub(crate) const MAX_DOMAIN_CHECKS: usize = 256;
 
+/// How long a model call the node can't decide yet is held before it is answered (#352), and how
+/// often it is decided again meanwhile.
+pub(crate) const MODEL_CALL_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+const MODEL_CALL_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// How upstream connections are made. The default (public DNS and the public roots) is what runs
 /// use; tests point hosts at local origins with their own CA.
 #[derive(Clone, Default)]
@@ -383,7 +388,17 @@ impl Egress {
         }
         // Who in the box is asking (reported by the agent's own event stream, not proven).
         let who = ctx.attribute.as_ref().and_then(|f| f(&host, &path));
-        match self.decider.decide(ctx, &op, who.as_ref()).await {
+        let mut outcome = self.decider.decide(ctx, &op, who.as_ref()).await;
+        // A model call the node can't decide yet (catching up with its feed, which takes
+        // milliseconds, or a brief cut) is held a short, bounded while before it is answered (#352).
+        if matches!(outcome, Outcome::Unavailable(_)) && self.model_gate.get().is_some_and(|l| l.is_model_call(&host, &path)) {
+            let until = tokio::time::Instant::now() + MODEL_CALL_HOLD;
+            while matches!(outcome, Outcome::Unavailable(_)) && tokio::time::Instant::now() < until {
+                tokio::time::sleep(MODEL_CALL_HOLD_POLL).await;
+                outcome = self.decider.decide(ctx, &op, who.as_ref()).await;
+            }
+        }
+        match outcome {
             Outcome::Allow(detail) => {
                 // A name under a wildcard counts against the rule's limit before it is resolved (#20).
                 if let Some((w, why)) = self.admit_wildcard(&host) {
@@ -466,13 +481,7 @@ impl Egress {
             }
             Outcome::Unavailable(why) => {
                 emit("unavailable", why.clone());
-                return problem(
-                    403,
-                    "unavailable",
-                    "Blocked by wicket sandbox: control plane unreachable",
-                    &format!("{why}. {}", crate::SANDBOX_FACT),
-                    None,
-                );
+                return crate::unavailable(&format!("{why}. {}", crate::SANDBOX_FACT));
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
@@ -994,5 +1003,147 @@ mod tests {
         assert_eq!(super::render_credential("Bearer {secret}", "tok"), "Bearer tok");
         // base64("x-access-token:tok")
         assert_eq!(super::render_credential("Basic {basic:x-access-token}", "tok"), "Basic eC1hY2Nlc3MtdG9rZW46dG9r");
+    }
+
+    /// A decider that answers from a script, then its last line for ever, counting the calls.
+    struct Scripted {
+        script: std::sync::Mutex<std::collections::VecDeque<crate::decide::Outcome>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<crate::decide::Outcome>) -> std::sync::Arc<Scripted> {
+            std::sync::Arc::new(Scripted { script: std::sync::Mutex::new(script.into()), calls: Default::default() })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::decide::Decider for Scripted {
+        fn host_verdict(&self, _: &crate::RunCtx, _: &str) -> wicket_core::HostVerdict {
+            wicket_core::HostVerdict::Open
+        }
+        fn decide<'a>(
+            &'a self,
+            _: &'a crate::RunCtx,
+            _: &'a wicket_core::Op,
+            _: Option<&'a (serde_json::Value, String)>,
+        ) -> futures_util::future::BoxFuture<'a, crate::decide::Outcome> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut s = self.script.lock().unwrap();
+            let o = if s.len() > 1 { s.pop_front().unwrap() } else { s.front().cloned().unwrap() };
+            Box::pin(async move { o })
+        }
+    }
+
+    fn catching_up() -> crate::decide::Outcome {
+        crate::decide::Outcome::Unavailable(crate::decide::stale_text(wicket_feed::Mode::Lagging, "catching up with the feed"))
+    }
+
+    /// #352: a node catching up with its feed answers egress and model calls with 503 and
+    /// Retry-After, which clients retry (a 403 ends a harness's turn); a model call is held a short
+    /// while first, and answered as soon as the node can decide. A real refusal is still a 403, and
+    /// the egress log says what it said before.
+    #[tokio::test]
+    async fn a_node_catching_up_answers_retryably_and_a_refusal_is_still_403() {
+        use http_body_util::BodyExt;
+        let reach = "reach: [{host: api.anthropic.com, methods: [GET, POST]}, {host: files.example, methods: [GET]}]";
+        let (mut c, dir) = ctx(reach, vec![], "catch-up");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        c.events = tx;
+        let send = |d: std::sync::Arc<Scripted>, model: bool| {
+            let c = c.clone();
+            async move {
+                let ca = std::sync::Arc::new(crate::ca::RunCa::generate("node").unwrap());
+                let e = super::Egress::with(c.clone(), ca, d, None).unwrap();
+                e.set_model_gate(crate::llm::Llm::new(c).unwrap());
+                let (req, host) = if model {
+                    let body = bytes::Bytes::from_static(br#"{"model":"m","max_tokens":5,"messages":[]}"#);
+                    let req = http::Request::post("/v1/messages").header("content-type", "application/json");
+                    (req.body(http_body_util::Full::new(body)).unwrap(), "api.anthropic.com")
+                } else {
+                    (http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), "files.example")
+                };
+                let started = std::time::Instant::now();
+                let r = e.handle(req, host.into(), "https", super::Via::Tcp).await;
+                let took = started.elapsed();
+                let st = r.status().as_u16();
+                let retry = r.headers().get("retry-after").map(|v| v.to_str().unwrap().to_string());
+                (st, retry, String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned(), took)
+            }
+        };
+        // Egress: answered at once, retryably.
+        let d = Scripted::new(vec![catching_up()]);
+        let (st, retry, body, _) = send(d.clone(), false).await;
+        assert_eq!((st, retry.as_deref()), (503, Some("5")), "{body}");
+        assert!(body.contains("catching up") && body.contains("\"retry_after\": 5"), "{body}");
+        assert_eq!(d.calls(), 1, "egress isn't held");
+        match rx.try_recv() {
+            Ok(crate::Event::Egress { outcome, detail, .. }) => {
+                assert_eq!(outcome, "unavailable");
+                assert!(detail.contains("catching up with wicket's policy feed"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A model call: held, decided again, then answered retryably.
+        let d = Scripted::new(vec![catching_up()]);
+        let (st, retry, body, took) = send(d.clone(), true).await;
+        assert_eq!((st, retry.as_deref()), (503, Some("5")), "{body}");
+        assert!(took >= super::MODEL_CALL_HOLD && took < super::MODEL_CALL_HOLD * 3, "{took:?}");
+        assert!(d.calls() > 2, "decided again while held: {}", d.calls());
+        // A model call the node can decide while it is held is answered by that decision (here a
+        // refusal, so nothing goes upstream), well before the hold ends.
+        let d = Scripted::new(vec![catching_up(), catching_up(), crate::decide::Outcome::Forbidden("org policy".into())]);
+        let (st, retry, body, took) = send(d.clone(), true).await;
+        assert_eq!((st, retry), (403, None), "{body}");
+        assert!(took < super::MODEL_CALL_HOLD, "{took:?}");
+        assert_eq!(d.calls(), 3);
+        // Real refusals stay 403.
+        let (st, _, body, _) = send(Scripted::new(vec![crate::decide::Outcome::Forbidden("org policy".into())]), false).await;
+        assert!(st == 403 && body.contains("never allowed"), "{body}");
+        let denied = crate::decide::Outcome::Denied { request: "r-1".into() };
+        assert_eq!(send(Scripted::new(vec![denied.clone()]), false).await.0, 403);
+        assert_eq!(send(Scripted::new(vec![denied]), true).await.0, 403, "a model call isn't held for a refusal");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A node's relay to a control host it can't reach.
+    struct Cut;
+
+    impl super::Relay for Cut {
+        fn route(&self, _: &str) -> crate::decide::Route {
+            crate::decide::Route::Forward("the zone injects a credential for this host".into())
+        }
+        fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn super::RelayStream>>> {
+            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "cut off")) })
+        }
+    }
+
+    /// #352: a CONNECT a node forwards to a control host it can't reach right now is answered 503
+    /// with Retry-After, not 403.
+    #[tokio::test]
+    async fn a_forwarded_connect_while_cut_off_is_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (c, dir) = ctx("reach: [{host: files.example, methods: [GET]}]", vec![], "cut-off");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("node").unwrap());
+        let e = super::Egress::with(c, ca, Scripted::new(vec![catching_up()]), Some(std::sync::Arc::new(Cut))).unwrap();
+        let sock = dir.join("egress.sock");
+        let s2 = sock.clone();
+        let task = tokio::spawn(async move { e.serve(&s2).await });
+        for _ in 0..3000 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        s.write_all(b"CONNECT files.example:443 HTTP/1.1\r\nHost: files.example:443\r\n\r\n").await.unwrap();
+        let mut got = vec![0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut got)).await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&got[..n]).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 503") && text.contains("retry-after: 5"), "{text}");
+        task.abort();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

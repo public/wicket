@@ -106,7 +106,7 @@ What it protects, and how:
 ## A driven Remote Control session
 
 `agent.remote` with `drive: true` is a driven box whose Claude Code session is also a Remote
-Control session. wicket gives it the manifest's task, `wicket say` follow-ups, peers' messages and
+Control session. wicket gives it the manifest's task, session prompts (`wicket session`), peers' messages and
 wakes as turns, as in any driven box; in the app you see the same conversation as it happens, and a
 message you send there is the agent's next turn.
 

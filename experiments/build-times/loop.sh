@@ -13,6 +13,7 @@
 # CARGO_PROFILE_*), plus LOOP_CARGO_ARGS for `--config` overrides, all recorded with each line. The
 # target dir (LOOP_TARGET, default target-loop) is primed first (`prime`, timed too) and kept, so
 # a variant measured twice is warm the second time; delete it between variants that change flags.
+# LOOP_RUN=0 skips the test-run phase (for core it is measure.sh's test-run step).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 label=${1:?label}
@@ -20,15 +21,16 @@ shift
 cases=("$@")
 [ ${#cases[@]} -gt 0 ] || cases=(proxy core)
 out=experiments/build-times
-export CARGO_TARGET_DIR=$PWD/${LOOP_TARGET:-target-loop}
+t=${LOOP_TARGET:-target-loop}
+export CARGO_TARGET_DIR=$([ "${t#/}" != "$t" ] && echo "$t" || echo "$PWD/$t")
 read -r -a extra <<<"${LOOP_CARGO_ARGS:-}"
 
 record() { # case phase seconds peak_kib
-  jq -nc --arg label "$label" --arg case "$1" --arg phase "$2" --argjson secs "$3" --argjson peak "$4" \
+  jq -nc --arg lbl "$label" --arg case "$1" --arg phase "$2" --argjson secs "$3" --argjson peak "$4" \
     --arg jobs "${CARGO_BUILD_JOBS:-}" --arg wrapper "$(basename "${RUSTC_WRAPPER:-}")" --arg incr "${CARGO_INCREMENTAL:-}" \
-    --arg rustflags "${RUSTFLAGS:-}" --arg cargo_args "${LOOP_CARGO_ARGS//$HOME/~}" --arg nextest "${LOOP_NEXTEST:-}" \
+    --arg rustflags "${RUSTFLAGS:-}" --arg cargo_args "$(c=${LOOP_CARGO_ARGS:-}; echo "${c//$HOME/~}")" --arg nextest "${LOOP_NEXTEST:-}" \
     --arg load "$(cut -d' ' -f1 /proc/loadavg)" --arg commit "$(git rev-parse --short HEAD)" \
-    '{label: $label, case: $case, phase: $phase, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit,
+    '{label: $lbl, case: $case, phase: $phase, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit,
       jobs: $jobs, rustc_wrapper: $wrapper, incremental: $incr, rustflags: $rustflags, cargo_args: $cargo_args,
       nextest: $nextest, load: $load}' >>"$out/loop.jsonl"
   printf '%-28s %-6s %-11s %7ss  peak %5s MiB\n' "$label" "$1" "$2" "$3" "$(($4 / 1024))"
@@ -39,7 +41,7 @@ timed() { # case phase command...: a failed build stops the run; failed tests ar
   local tf; tf=$(mktemp)
   local log=$out/.loop-$label-$c-$p.log
   local st=0
-  /usr/bin/time -f '%e %M' -o "$tf" "$@" >"$log" 2>&1 || st=$?
+  "${TIME:-/usr/bin/time}" -f '%e %M' -o "$tf" "$@" >"$log" 2>&1 || st=$?
   if [ "$st" != 0 ] && [ "$p" != test-run ]; then
     tail -30 "$log"
     rm -f "$tf"
@@ -84,7 +86,7 @@ for c in "${cases[@]}"; do
   trap 'git checkout -- "$f"' EXIT
   timed "$c" build cargo "${extra[@]}" build --locked -p wicket-cli
   timed "$c" test-build cargo "${extra[@]}" test --locked --no-run "${crates[@]}"
-  timed "$c" test-run bash -c "$(test_cmd "${crates[@]}")"
+  [ "${LOOP_RUN:-1}" = 0 ] || timed "$c" test-run bash -c "$(test_cmd "${crates[@]}")"
   git checkout -- "$f"
   trap - EXIT
   cargo "${extra[@]}" build --locked -p wicket-cli >/dev/null 2>&1

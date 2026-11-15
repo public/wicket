@@ -85,7 +85,7 @@ impl Egress {
 
     /// Tunnels a CONNECT, raw, to the control host's egress proxy for this run (a node's forwarded
     /// host): the control host decides and terminates TLS there. Its answer to the CONNECT is the
-    /// box's answer; after a 200 the bytes are piped both ways. Unreachable: a 403 that says so.
+    /// box's answer; after a 200 the bytes are piped both ways. Unreachable: a 503 with Retry-After that says so (#352).
     pub(super) async fn forward_connect(self: Arc<Self>, req: Request<Incoming>, host: String, why: String) -> Response<BoxBody> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let unreachable = |me: &Egress| {
@@ -97,16 +97,10 @@ impl Egress {
                 outcome: "unavailable".into(),
                 detail: format!("served by the control host ({why}), which is unreachable"),
             });
-            problem(
-                403,
-                "unavailable",
-                "Blocked by wicket sandbox: control plane unreachable",
-                &format!(
-                    "{host} is served by wicket's control host ({why}), which this node can't reach right now; retry later. {}",
-                    crate::SANDBOX_FACT
-                ),
-                None,
-            )
+            crate::unavailable(&format!(
+                "{host} is served by wicket's control host ({why}), which this node can't reach right now; retry later. {}",
+                crate::SANDBOX_FACT
+            ))
         };
         let Some(relay) = self.relay.clone() else { return unreachable(&self) };
         let mut s = match relay.open().await {

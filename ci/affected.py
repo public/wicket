@@ -312,7 +312,7 @@ def self_test():
          {"lean"})
     # #322: the Lean spec and its oracle test.
     case("the Lean spec", ["verification/lean/Wicket/Glob.lean"], lambda c: c != ALL and "wicket-authz" in c, {"lean"})
-    case("the oracle's fixtures", ["crates/wicket-core/tests/subset_cases.rs"], lambda c: c != ALL and "wicket-authz" in c,
+    case("the oracle's fixtures", ["crates/wicket-core/tests/integration/subset_cases.rs"], lambda c: c != ALL and "wicket-authz" in c,
          {"lean"})
     case("the TLA+ models", ["verification/tla/GrantsOnNodes.tla", "verification/tla/fail_today.cfg"], set(), {"tla"})
     case("the TLA+ models' README", ["verification/tla/README.md"], set(), {"docs", "tla"})

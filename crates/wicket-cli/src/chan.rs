@@ -218,6 +218,10 @@ pub struct BoxStart {
     /// doesn't know this field sends what it always measures (or nothing).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timings: bool,
+    /// The zone's `limits.memory_advice` (#348), appended to the warning the node gives the agent
+    /// near its memory limit. A node that doesn't know this field warns without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_advice: Option<String>,
 }
 
 /// One credential the node swaps in for a box (#257): toward `host`, a request carrying exactly

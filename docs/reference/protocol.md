@@ -27,7 +27,7 @@ adds the headers `x-wicket-request-id` and `retry-after: 30`.
 | `queued` | 403 | Needs human approval (queued offline): a node raised it while the control host was away; the id is node-local, `q-…`. |
 | `denied` | 403 | Denied by a human. |
 | `forbidden` | 403 | Never allowed (a `forbid` rule, a metadata endpoint, a non-public address), or a malformed request. |
-| `unavailable` | 403 | Control plane unreachable: a node can't decide this without the control host. |
+| `unavailable` | 503 | Control plane unreachable: a node can't decide this right now (catching up with its feed, no valid policy, or the control host is unreachable). Temporary, so it carries `retry-after: 5` and `retry_after`, and clients retry it; a model call is held up to 3 s first, in case the node catches up. |
 | `misdirected` | 421 | Wrong host for this connection: an HTTP/3 connection serves one host only. |
 | `budget` | 429 | The model budget, or a node's slice of it, is spent. |
 | `stale-generation` | 409 | This activation of a long-lived agent was superseded. |
