@@ -5,7 +5,7 @@ program:
   source: ../programs/repo-stats
   command: [bash, /workspace/stats.sh]
   on_pending: fail          # out-of-reach requests fail; nothing is queued for a human
-  digest: sha256:5323d8327784ed2da0351f0a2dd715550695c285691c67aa6d8a7f2208c2aaae
+  digest: sha256:610beeca625a7241e4365649edaeaf2c55ad40fc96efc61f2e741adc9633503c
 zone:
   name: stats
   isolation: gvisor

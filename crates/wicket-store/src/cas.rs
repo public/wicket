@@ -12,11 +12,15 @@
 //!   everything else is named by a digest the ledger holds.
 //! - **Sealing.** Open the store over [`crate::sealed::SealedStore::sealed_only`]: each object is
 //!   sealed under its own key (`o/<hex>`, `r/<name>`), and nothing plain is read.
+//! - **Directories** become trees with [`Cas::put_dir`] and come back with [`Cas::checkout`].
 
 use crate::objects::{valid_key, ObjectStore};
 use sha2::{Digest as _, Sha256};
 use std::io::{self, Read};
 use std::path::Path;
+
+mod dir;
+pub use dir::{dir_digest, DirOpts};
 
 const OBJECTS: &str = "o/";
 const REFS: &str = "r/";
@@ -165,11 +169,16 @@ impl Cas {
     /// Stores the file at `path`; returns its digest. The file is read twice (to name it, then to
     /// store it), and refused if it changed in between.
     pub fn put_file(&self, path: &Path) -> io::Result<Digest> {
+        self.put_file_len(path).map(|(d, _)| d)
+    }
+
+    /// [`Cas::put_file`], and the file's length as it was stored.
+    pub(crate) fn put_file_len(&self, path: &Path) -> io::Result<(Digest, u64)> {
         let mut h = Sha256::new();
-        io::copy(&mut std::fs::File::open(path)?, &mut h)?;
+        let n = io::copy(&mut std::fs::File::open(path)?, &mut h)?;
         let d = Digest(h.finalize().into());
         if self.inner.has(&d.key())? {
-            return Ok(d);
+            return Ok((d, n));
         }
         let mut hr = HashRead { inner: io::BufReader::new(std::fs::File::open(path)?), h: Sha256::new() };
         let wrote = {
@@ -182,7 +191,7 @@ impl Cas {
             }
             return Err(invalid(format!("{} changed while it was stored", path.display())));
         }
-        Ok(d)
+        Ok((d, n))
     }
 
     pub fn has(&self, d: &Digest) -> io::Result<bool> {

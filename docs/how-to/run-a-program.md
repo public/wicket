@@ -44,5 +44,12 @@ Put it in the manifest as `program.digest: sha256:…` (as in
 `examples/program-repo-stats.pinned.yaml`). From then on a run refuses any other source, and the
 digest is recorded in the run's `run.start` audit record.
 
+The digest is the source's tree in wicket's content-addressed store
+([store.md](../explanation/store.md)): every file's content, name and executable bit, and nothing
+else (not times, owners or other permission bits), so every checkout of the same source has the
+same digest. Symlinks and special files are refused. A pin made by an earlier build (the
+`wicket-program-v1` digest) is still accepted, with a warning, while the source is unchanged;
+`wicket zone pin MANIFEST` rewrites it to the tree digest.
+
 Programs get identities too, and agents can `spawn` them (a long-running service, say) and reach
 their ports through links.
