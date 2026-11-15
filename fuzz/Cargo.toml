@@ -1,0 +1,122 @@
+# The fuzz targets (#323). Not a workspace member, so `cargo build`/`cargo test` at the root don't
+# build them: see README.md. The harnesses live in the library (src/), so the regression tests
+# (tests/corpus.rs) replay every seed and every past crash on the stable toolchain.
+[package]
+name = "wicket-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: not part of the root one.
+[workspace]
+
+# The harnesses' own unit tests would compile the CLI modules' test code (see src/lib.rs); the corpus
+# replays are integration tests (tests/corpus.rs).
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wicket-core = { path = "../crates/wicket-core" }
+wicket-store = { path = "../crates/wicket-store" }
+wicket-proxy = { path = "../crates/wicket-proxy" }
+wicket-agent = { path = "../crates/wicket-agent" }
+wicket-feed = { path = "../crates/wicket-feed" }
+wicket-authz = { path = "../crates/wicket-authz" }
+wicket-policy = { path = "../crates/wicket-policy" }
+wicket-identity = { path = "../crates/wicket-identity" }
+biscuit-auth = { path = "../third_party/biscuit-auth" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full", "test-util"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", features = ["x509-parser"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+ed25519-dalek = "3"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+zeroize = "1"
+tar = "0.4"
+libc = "0.2"
+base64 = "0.22"
+ulid = "1"
+
+# Line tables are enough for symbolized stack traces; full debuginfo made each target's link take
+# up to 3.7 GiB (a 460 MB binary), too close to a 4 GiB box or a CI runner.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"
+
+[[bin]]
+name = "egress"
+path = "fuzz_targets/egress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway"
+path = "fuzz_targets/gateway.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chan"
+path = "fuzz_targets/chan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feed"
+path = "fuzz_targets/feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token"
+path = "fuzz_targets/token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store"
+path = "fuzz_targets/store.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git"
+path = "fuzz_targets/git.rs"
+test = false
+doc = false
+bench = false
