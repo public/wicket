@@ -324,8 +324,10 @@ wicket node release n2                             # destroy now (by name or ins
 ```
 
 - **Money.** `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
-  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused, and
-  everything inside it still waits for `yes` on the terminal, with the plan, rate and worst case shown. Vultr
+  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused.
+  Inside it, the node is a `CAPACITY wicket.internal /capacity/node/<name>` request from the operator who runs
+  `create`: approved at once by a live [capacity grant](console.md#capacity-grants) of theirs that covers it
+  (plans, regions, hourly and daily money, nodes at once), otherwise pending for an operator for up to `--wait`. Vultr
   bills per started hour, each line rounded up to the cent, with a 672 h monthly cap, so a node's lease ends at
   minute 50 of its last hour and `list --provider` shows when the next paid hour starts.
 - **Ownership.** Instances are tagged `wicket-owner-<installation>` (`--owner`, default the trust domain).

@@ -107,7 +107,7 @@ pub fn route(cmd: &Cmd) -> Route {
             NodeCmd::List { provider: false, .. } => Forward(Read),
             // Uses the provider's API key from the vault.
             NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
-            // Spends money after a terminal prompt, or destroys a machine.
+            // Spends money (a CAPACITY request decided by a grant or an operator), or destroys a machine.
             NodeCmd::Create(_) | NodeCmd::Release { .. } => Forward(Privileged),
             NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
                 Forward(Privileged)

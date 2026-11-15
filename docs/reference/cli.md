@@ -1113,7 +1113,7 @@ Commands:
   token     Print a one-time join token for a node (stored hashed; single use)
   enrol     Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a short-lived identity certificate for its node key, a short-lived CA certificate constrained to --hosts, the feed root key and the issuer key
   list      List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a node from `wicket node create` or a capacity lease), with any leased node not enrolled
-  create    Lease a machine from a provider (Vultr) and enrol it: inside a money envelope, after approval on this terminal, with its ssh host key generated here and pinned at creation
+  create    Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Inside a money envelope, its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
   release   Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and revoke its enrolment
   plans     List a provider's (Vultr's) plans in a region, with their hourly price
   revoke    Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
@@ -1183,7 +1183,7 @@ Options:
 ### `wicket node create`
 
 ```text
-Lease a machine from a provider (Vultr) and enrol it: inside a money envelope, after approval on this terminal, with its ssh host key generated here and pinned at creation
+Lease a machine from a provider (Vultr) and enrol it, with its ssh host key generated here and pinned at creation. Inside a money envelope, its spend is a CAPACITY request from you: approved at once by a capacity grant of yours that covers it, otherwise waiting for an operator
 
 Usage: wicket node create [OPTIONS] --name <NAME> --max-hourly <MAX_HOURLY> --max-total <MAX_TOTAL> --ssh-key-id <SSH_KEY_IDS>
 
@@ -1226,6 +1226,8 @@ Options:
           [default: 24h]
       --give-up-silent <GIVE_UP_SILENT>
           Give up on the node, and release it, if nothing answers on its ssh port for this long (every connect times out or is unreachable). Once the port answers (accepted or refused), wait up to 15 minutes for setup [default: 4m]
+      --wait <WAIT>
+          How long to wait for an operator when none of your capacity grants covers the node (the request is pending meanwhile, on the console and in `wicket pending`); 0: don't wait [default: 15m]
   -h, --help
           Print help
 ```

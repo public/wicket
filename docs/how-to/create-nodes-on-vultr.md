@@ -24,8 +24,9 @@ sudo -u wicket ssh-keygen -q -t ed25519 -N '' -C wicket-placement -f /var/lib/wi
 sudo cat /var/lib/wicket/ssh/placement.pub   # add this public half to the Vultr account, note its id
 ```
 
-`wicket node create` refuses a key it can't read before it creates anything, and asks for the spend
-on the terminal you run it from (`sudo` passes it through wicketd).
+`wicket node create` refuses a key it can't read before it creates anything. Its spend is a request
+from you: a capacity grant of yours approves it at once, and otherwise an operator decides it (see
+below).
 
 ## 2. Create a node by hand
 
@@ -38,8 +39,15 @@ wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime
 
 - `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
   every owned node's cost through its lease plus the new node's worst case. Anything beyond it is
-  refused; anything inside it still waits for `yes` on the terminal, with the plan, rate and worst
-  case shown.
+  refused before anything is asked.
+- Inside the envelope, the node is a request, `CAPACITY wicket.internal /capacity/node/n2`, with the
+  plan, region, rate and worst case. If one of your live capacity grants covers it, it is approved
+  at once and audited against that grant. Otherwise it waits for an operator: on the console, which
+  sends a notification, or `wicket approve <id>`. That wait lasts up to `--wait` (default `15m`);
+  if nobody decides by then, the request is denied and nothing is created.
+- To skip the wait, have an operator give you a capacity grant on the console's Capacity card: the
+  plans, regions, hourly and daily money, how many nodes at once, and for how long (at most 24h,
+  renewable). See [capacity grants](../reference/console.md#capacity-grants).
 - Vultr bills per started hour, so a node's lease ends at minute 50 of its last hour.
 - wicket generates the node's ssh host key, installs it through cloud-init as its only host key,
   pins it before the node boots, waits for `node-setup.sh` to finish, enrols the node and removes the
