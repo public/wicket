@@ -57,7 +57,8 @@ fn git() {
 /// The egress oracle is only as good as its view of the origins: allowed requests get there.
 #[test]
 fn egress_requests_reach_the_origins() {
-    let (d, u) = wicket_fuzz::egress::exchange(b"\x01GET /a HTTP/1.1\r\nhost: fuzz.example\r\n\r\nPOST /b HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi");
+    let (d, u) =
+        wicket_fuzz::egress::exchange(b"\x01GET /a HTTP/1.1\r\nhost: fuzz.example\r\n\r\nPOST /b HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi");
     assert_eq!(d.len(), 2, "{d:?}");
     assert_eq!(u.len(), 2, "{u:?}");
     assert_eq!((u[1].method.as_str(), u[1].host.as_str(), u[1].path.as_str()), ("POST", "fuzz.example", "/b"));

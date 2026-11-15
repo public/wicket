@@ -87,7 +87,9 @@ fn world() -> &'static World {
             http1_only: true,
             ..Default::default()
         };
-        let egress = rt.block_on(async { Egress::with_upstream(ctx, ca, Arc::new(Recorder { decided: decided.clone() }), None, up) }).expect("egress");
+        let egress = rt
+            .block_on(async { Egress::with_upstream(ctx, ca, Arc::new(Recorder { decided: decided.clone() }), None, up) })
+            .expect("egress");
         World { rt, egress, decided, upstream }
     })
 }
@@ -105,10 +107,7 @@ async fn origins(log: Arc<Mutex<Vec<Seen>>>) -> (SocketAddr, SocketAddr, String)
         .with_safe_default_protocol_versions()
         .expect("versions")
         .with_no_client_auth()
-        .with_single_cert(
-            vec![leaf.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
-        )
+        .with_single_cert(vec![leaf.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into())
         .expect("server config");
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));

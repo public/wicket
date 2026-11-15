@@ -48,10 +48,13 @@ pub fn publisher(dir: &std::path::Path) -> (Publisher<BoxAuthority>, Vec<Frame>)
     let cert = wicket_feed::KeyCert::new(&feed_key().verifying_key(), 1, T0 + 86_400_000, 30_000);
     let cert_jws = wicket_feed::sign(&root(), wicket_feed::TYP_KEY, &cert);
     let cfg = PublisherConfig { ttl_ms: 3_000, refresh_ms: 500, retain: 100 };
-    let mut p = Publisher::open_with(dir, NODE, &root().verifying_key(), feed_key(), &cert_jws, cfg, authz_root().public()).expect("publisher");
+    let mut p =
+        Publisher::open_with(dir, NODE, &root().verifying_key(), feed_key(), &cert_jws, cfg, authz_root().public()).expect("publisher");
     let not_after = ((T0 + 3_600_000) / 1000) as u64;
-    let issuer = Issuer::root(&authz_root(), &TenantId::single().0, RUN, RUN, 0, &zone(), &[], not_after, vec![approver().public()]).expect("issuer");
-    p.commit(vec![wicket_feed::format::Change::PutZone { zone: issuer.publish(&approver(), &[]).expect("publish") }], T0 - 10).expect("commit");
+    let issuer = Issuer::root(&authz_root(), &TenantId::single().0, RUN, RUN, 0, &zone(), &[], not_after, vec![approver().public()])
+        .expect("issuer");
+    p.commit(vec![wicket_feed::format::Change::PutZone { zone: issuer.publish(&approver(), &[]).expect("publish") }], T0 - 10)
+        .expect("commit");
     let r = Replica::<BoxAuthority>::new_with(NODE, root().verifying_key(), ReplicaConfig::default(), authz_root().public());
     let frames = p.catch_up(&r.hello(), T0).expect("catch up");
     (p, frames)

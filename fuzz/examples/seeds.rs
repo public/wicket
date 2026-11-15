@@ -43,12 +43,21 @@ fn egress() {
         write("egress", name, &v);
     };
     t("get", "GET /repos/acme/app/issues?state=open HTTP/1.1\r\nhost: fuzz.example\r\naccept: */*\r\n\r\n");
-    t("pipelined", "GET /a HTTP/1.1\r\nhost: fuzz.example\r\n\r\nGET /b/../c HTTP/1.1\r\nhost: fuzz.example\r\n\r\nHEAD /d HTTP/1.1\r\n\r\n");
-    t("post-length", "POST /v1/messages HTTP/1.1\r\nhost: fuzz.example\r\ncontent-type: application/json\r\ncontent-length: 13\r\n\r\n{\"a\":[1,2,3]}");
+    t(
+        "pipelined",
+        "GET /a HTTP/1.1\r\nhost: fuzz.example\r\n\r\nGET /b/../c HTTP/1.1\r\nhost: fuzz.example\r\n\r\nHEAD /d HTTP/1.1\r\n\r\n",
+    );
+    t(
+        "post-length",
+        "POST /v1/messages HTTP/1.1\r\nhost: fuzz.example\r\ncontent-type: application/json\r\ncontent-length: 13\r\n\r\n{\"a\":[1,2,3]}",
+    );
     t("post-chunked", "POST /upload HTTP/1.1\r\nhost: fuzz.example\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nx-trailer: t\r\n\r\nGET /after HTTP/1.1\r\nhost: fuzz.example\r\n\r\n");
     t("cl-te", "POST /a HTTP/1.1\r\nhost: fuzz.example\r\ncontent-length: 44\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nhost: fuzz.example\r\n\r\n");
     t("te-cl", "POST /a HTTP/1.1\r\nhost: fuzz.example\r\ntransfer-encoding: chunked\r\ncontent-length: 4\r\n\r\n2c\r\nGET /smuggled HTTP/1.1\r\nhost: fuzz.example\r\n\r\n\r\n0\r\n\r\n");
-    t("te-obfuscated", "POST /a HTTP/1.1\r\nhost: fuzz.example\r\ntransfer-encoding: xchunked\r\ntransfer-encoding : chunked\r\n\r\n0\r\n\r\n");
+    t(
+        "te-obfuscated",
+        "POST /a HTTP/1.1\r\nhost: fuzz.example\r\ntransfer-encoding: xchunked\r\ntransfer-encoding : chunked\r\n\r\n0\r\n\r\n",
+    );
     t("two-lengths", "POST /a HTTP/1.1\r\nhost: fuzz.example\r\ncontent-length: 3\r\ncontent-length: 30\r\n\r\nabcGET /x HTTP/1.1\r\n\r\n");
     t("get-with-body", "GET /a HTTP/1.1\r\nhost: fuzz.example\r\ncontent-length: 5\r\n\r\nhello");
     t("host-mismatch", "GET /a HTTP/1.1\r\nhost: other.example\r\n\r\n");
@@ -114,15 +123,21 @@ fn gateway() {
         ("nope", "[]"),
     ];
     for (name, args) in calls {
-        w(&format!("call-{name}"), &format!(r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#));
+        w(
+            &format!("call-{name}"),
+            &format!(r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#),
+        );
     }
     let mut raw = vec![0u8];
-    raw.extend_from_slice(b"POST /mcp HTTP/1.1\r\ncontent-length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}GET / HTTP/1.1\r\n\r\n");
+    raw.extend_from_slice(
+        b"POST /mcp HTTP/1.1\r\ncontent-length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}GET / HTTP/1.1\r\n\r\n",
+    );
     write("gateway", "raw-pipelined", &raw);
 }
 
 fn chan() {
-    let op = wicket_core::Op::egress(&wicket_core::TenantId::single(), &wicket_core::RunId("run_a".into()), "z", "GET", "api.example.com", "/x");
+    let op =
+        wicket_core::Op::egress(&wicket_core::TenantId::single(), &wicket_core::RunId("run_a".into()), "z", "GET", "api.example.com", "/x");
     let a64 = "a".repeat(64);
     let mut frames = vec![
         Frame::Msg(Msg::Hello {
@@ -134,9 +149,21 @@ fn chan() {
             nonce: "A".repeat(43),
             scope: "run_a".into(),
         }),
-        Frame::Msg(Msg::Ask { id: 7, run: "run_a".into(), op: Box::new(op), why: "out of reach".into(), who: None, queued: Some(("q-1".into(), 5)), prefix: true }),
+        Frame::Msg(Msg::Ask {
+            id: 7,
+            run: "run_a".into(),
+            op: Box::new(op),
+            why: "out of reach".into(),
+            who: None,
+            queued: Some(("q-1".into(), 5)),
+            prefix: true,
+        }),
         Frame::Msg(Msg::ImageHave { id: 3, digest: format!("sha256:{a64}") }),
-        Frame::Msg(Msg::PutImage { stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5, digest: format!("sha256:{a64}"), name: Some(format!("docker.io/library/x@sha256:{a64}")) }),
+        Frame::Msg(Msg::PutImage {
+            stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5,
+            digest: format!("sha256:{a64}"),
+            name: Some(format!("docker.io/library/x@sha256:{a64}")),
+        }),
         Frame::Msg(Msg::ImagePut { stream: TUNNEL_BIT | CONTROL_TUNNEL_BIT | 5, error: Some("tampered".into()) }),
         Frame::Msg(Msg::ImagePulled { id: 9, error: None }),
         Frame::Data { stream: TUNNEL_BIT | 4, offset: 1 << 40, bytes: b"hello\0world".to_vec() },
@@ -191,7 +218,10 @@ fn feed() {
 fn token() {
     let w = |name: &str, s: &str| write("token", name, s.as_bytes());
     // From crates/wicket-authz/tests/hostile.rs.
-    w("tp-ok", r#"Tapproved("g", "h", "GET", "/") <- time($t), $t <= 2030-01-01T00:00:00Z, box("b0/b1/b2"), epoch(3), uses_left("g", $n), $n > 0;"#);
+    w(
+        "tp-ok",
+        r#"Tapproved("g", "h", "GET", "/") <- time($t), $t <= 2030-01-01T00:00:00Z, box("b0/b1/b2"), epoch(3), uses_left("g", $n), $n > 0;"#,
+    );
     w("check-host", "Acheck if host(\"api.github.com\");");
     w("check-path", "Acheck if path($p), $p.matches(\"^/repos/acme/.*$\");");
     w("rule", "Aok($x) <- host($x);");
@@ -204,7 +234,16 @@ fn token() {
 
 fn manifest() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for f in ["demo.yaml", "hello-github.yaml", "mock-github.yaml", "program-repo-stats.yaml", "remote-control-box.yaml", "remote-driven-box.yaml", "links/demo.yaml", "acp-claude/manifest.yaml"] {
+    for f in [
+        "demo.yaml",
+        "hello-github.yaml",
+        "mock-github.yaml",
+        "program-repo-stats.yaml",
+        "remote-control-box.yaml",
+        "remote-driven-box.yaml",
+        "links/demo.yaml",
+        "acp-claude/manifest.yaml",
+    ] {
         if let Ok(s) = std::fs::read_to_string(root.join("examples").join(f)) {
             write("manifest", &f.replace('/', "-"), s.as_bytes());
         }

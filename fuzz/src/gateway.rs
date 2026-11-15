@@ -21,8 +21,9 @@ pub fn run(data: &[u8]) {
     let wire = if raw {
         data[1..].to_vec()
     } else {
-        let mut w = format!("POST /mcp HTTP/1.1\r\nhost: gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", data.len())
-            .into_bytes();
+        let mut w =
+            format!("POST /mcp HTTP/1.1\r\nhost: gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", data.len())
+                .into_bytes();
         w.extend_from_slice(data);
         w
     };

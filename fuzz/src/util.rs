@@ -17,7 +17,8 @@ pub fn scratch(tag: &str) -> PathBuf {
 /// ledger and an empty vault, and the receiving end of its events: the caller holds it for as long
 /// as the context lives (forgetting it leaked the channel on every run, which LeakSanitizer reports).
 pub fn ctx(zone: &str, vault: PathBuf) -> (wicket_proxy::RunCtx, tokio::sync::mpsc::UnboundedReceiver<wicket_proxy::Event>) {
-    let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, {zone}}}")).expect("the harness's zone");
+    let m =
+        wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, {zone}}}")).expect("the harness's zone");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ctx = wicket_proxy::RunCtx {
         tenant: wicket_core::TenantId::single(),
