@@ -1,0 +1,5 @@
+name = "wicket-spec"
+defaultTargets = ["Wicket"]
+
+[[lean_lib]]
+name = "Wicket"

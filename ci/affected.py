@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "ci" / "affected.map"
 # Every end-to-end suite the table can name, in the order they run.
-E2E = ["docs", "policy", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
+E2E = ["docs", "policy", "lean", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
        "node-e2e", "acceptance-nodes", "update", "tla"]
 # The fuzz targets (#323, fuzz/), each a suite `fuzz-<target>` that ci/fuzz.sh runs for a short while.
 FUZZ = ["egress", "gateway", "chan", "feed", "token", "manifest", "store", "git"]
@@ -305,11 +305,15 @@ def self_test():
     case("the fuzz crate's manifest", ["fuzz/Cargo.toml"], ALL, ALL)
     case("the fuzz notes", ["fuzz/README.md"], set(), {"docs"})
     case("an example zone", ["examples/demo.yaml"], lambda c: c != ALL and {"wicket-core", "wicket-authz", "wicket-feed"} <= c,
-         set())
+         {"lean"})
     case("the agent image", ["images/claude-code/wicket-entry"],
          lambda c: c != ALL and {"wicket-cli", "wicket-fwd"} <= c, lambda s: s != ALL and "smoke" in s)
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
-         set())
+         {"lean"})
+    # #322: the Lean spec and its oracle test.
+    case("the Lean spec", ["verification/lean/Wicket/Glob.lean"], lambda c: c != ALL and "wicket-authz" in c, {"lean"})
+    case("the oracle's fixtures", ["crates/wicket-core/tests/subset_cases.rs"], lambda c: c != ALL and "wicket-authz" in c,
+         {"lean"})
     case("the TLA+ models", ["verification/tla/GrantsOnNodes.tla", "verification/tla/fail_today.cfg"], set(), {"tla"})
     case("the TLA+ models' README", ["verification/tla/README.md"], set(), {"docs", "tla"})
     case("code the grants model maps", ["crates/wicket-cli/src/noderun.rs"], {"wicket-cli", "wicket-sim"},
