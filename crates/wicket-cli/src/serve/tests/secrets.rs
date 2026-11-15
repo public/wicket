@@ -9,7 +9,7 @@ const VALUE: &str = "ghp_the-very-secret-value-0123456789";
 const OLD: &str = "ghp_the-old-value-9876543210";
 const SALT: &str = "00112233445566778899aabbccddeeff";
 
-const DOCS: &str = "agent: { name: reader }\nzone:\n  name: docs\n  inject:\n    - { host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }\n    - { host: api.example.com, header: x-key, secret: unset-key, optional: true }\n";
+const DOCS: &str = "task: read the docs\nagent: { name: reader }\nzone:\n  name: docs\n  inject:\n    - { host: api.github.com, header: authorization, format: 'Bearer {secret}', secret: gh }\n    - { host: api.example.com, header: x-key, secret: unset-key, optional: true }\n  llm: { secret: model-tok }\n";
 
 fn with_vault(tag: &str) -> T {
     let mut t = setup(&format!("secrets-{tag}"));
@@ -81,7 +81,8 @@ async fn the_card_lists_secrets_by_name_kind_hosts_and_users_never_a_value() {
     let l = list.iter().find(|x| x["name"] == "linked").unwrap();
     assert_eq!(l["kind"], "reference");
     assert!(l["hosts"].as_array().unwrap().is_empty());
-    assert_eq!(s["secrets"]["missing"][0]["name"], "unset-key", "a name a manifest uses that the vault lacks");
+    let missing: Vec<&str> = s["secrets"]["missing"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(missing, ["model-tok", "unset-key"], "names the manifests use that the vault lacks (an injection's, the model proxy's)");
     assert!(s["secrets"]["link_cli_only"].as_str().unwrap().contains("wicket secret link"));
     // Only fields the card names: nothing else of a secret's record reaches the page.
     let keys: Vec<&String> = gh.as_object().unwrap().keys().collect();
