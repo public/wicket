@@ -700,6 +700,41 @@ mod tests {
         l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "decision").map(|r| serde_json::from_str(&r.4).unwrap()).collect()
     }
 
+    /// #369: a decision is made on the effect the decider was shown: its descriptor is on the grant
+    /// and the record, other terms than the ones shown are refused, and so is a request that
+    /// changed after it was shown.
+    #[test]
+    fn an_approval_is_made_only_on_the_effect_shown() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let by = human("alice@cli");
+        let id = asked(&l, "/v1/x");
+        let shown = crate::effect::descriptor(&l.request(&id).unwrap(), Some(&terms(600))).sha256();
+        let other = Terms { uses: Some(5), ..terms(600) };
+        let e = decide(&mut l, &by, &id, &Verdict::Approve(other), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
+        assert!(format!("{e:#}").contains("not the effect that was shown"), "{e:#}");
+        assert_eq!(l.request(&id).unwrap().status, "pending");
+        assert!(refusals(&l).iter().any(|r| r["why"].as_str().unwrap_or("").contains("not the effect that was shown")));
+        // As shown: granted, with the descriptor bound to the grant and on the record.
+        let Decided::Approved { grant, .. } =
+            decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap()
+        else {
+            panic!("not approved")
+        };
+        assert_eq!(l.grant_effect(&grant).unwrap(), Some((Some(shown.clone()), None)));
+        let d = decisions(&l);
+        assert_eq!(d[0]["effect_sha256"].as_str(), Some(shown.as_str()));
+        assert_eq!((d[0]["effect"]["path"].as_str(), d[0]["effect"]["terms"]["uses"].as_u64()), (Some("/v1/x"), Some(1)));
+        assert!(d[0].get(crate::effect::SHOWN_EFFECT).is_none(), "the check's input isn't recorded as a field");
+
+        // Changed after it was shown: another asker joined it.
+        let id = asked(&l, "/v1/y");
+        let shown = crate::effect::descriptor(&l.request(&id).unwrap(), Some(&terms(600))).sha256();
+        let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", "/v1/y");
+        l.pending_for(&op, "blocked", Some(&serde_json::json!({ "requesters": [{ "agent": "planted" }] }))).unwrap();
+        let e = decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
+        assert!(format!("{e:#}").contains("it changed since"), "{e:#}");
+    }
+
     #[test]
     fn an_approval_is_one_grant_on_the_record() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -862,10 +897,17 @@ mod tests {
 
         /// What the gateway signs for `decide`.
         fn signed(&self, id: &str, decision: &str, uses: u64, ttl: u64) -> String {
-            let p = serde_json::json!({
+            let mut p = serde_json::json!({
                 "jti": "d-1", "iat": wicket_store::now(), "kind": wicket_proxy::DECISION_KIND, "run": "run_p",
                 "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
             });
+            // As the gateway signs an approval: with the effect it grants (#369).
+            if decision == "approve" {
+                if let Ok(req) = self.ledger.lock().unwrap().request(id) {
+                    let t = wicket_store::DecisionTerms { uses: u32::try_from(uses).ok(), ttl_secs: ttl, prefix: None, zone_wide: false };
+                    p["effect_sha256"] = wicket_store::descriptor(&req, Some(&t)).sha256().into();
+                }
+            }
             wicket_identity::sign_envelope(&self.key, &self.jws, &p)
         }
 
@@ -884,6 +926,27 @@ mod tests {
     }
 
     use wicket_proxy::Decisions as _;
+
+    /// #369: an agent's approval names the effect it was made on; one that names none, or another,
+    /// is not made.
+    #[test]
+    fn an_agents_approval_must_name_the_effect_it_grants() {
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        let child = t.ask("run_c", "GET", "/v1/items");
+        let bare = serde_json::json!({
+            "jti": "d-9", "iat": wicket_store::now(), "kind": wicket_proxy::DECISION_KIND, "run": "run_p",
+            "request": child, "decision": "approve", "uses": 1, "ttl_secs": 60,
+        });
+        let e = hook.decide(&wicket_identity::sign_envelope(&t.key, &t.jws, &bare)).unwrap_err();
+        assert!(e.contains("names no effect"), "{e}");
+        let mut wrong = bare.clone();
+        wrong["effect_sha256"] = "00".repeat(32).into();
+        let e = hook.decide(&wicket_identity::sign_envelope(&t.key, &t.jws, &wrong)).unwrap_err();
+        assert!(e.contains("not the effect that was shown"), "{e}");
+        assert_eq!(t.status(&child), "pending");
+        assert!(hook.decide(&t.signed(&child, "approve", 1, 60)).unwrap().starts_with("approved:"));
+    }
 
     #[test]
     fn a_parent_approves_a_descendants_request_within_its_reach() {

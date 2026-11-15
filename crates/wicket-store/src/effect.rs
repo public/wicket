@@ -97,6 +97,7 @@ pub fn descriptor(req: &crate::Request, t: Option<&DecisionTerms>) -> wicket_cor
         host: req.host.clone(),
         path,
         prefix,
+        risk: req.risk.clone(),
         args_sha256: req.args_sha256.clone(),
         terms,
     }

@@ -3,7 +3,7 @@
 //! that the grant is then usable for only.
 //!
 //! A descriptor names who asks (tenant, zone, run and the agent's reported identity), the effect
-//! (its kind, method, canonical host, and path or prefix), the grant's terms (uses, lifetime, run
+//! (its kind, method, canonical host, path or prefix, and risk class), the grant's terms (uses, lifetime, run
 //! or zone-wide) and, for the request kinds whose outcome depends on more than the target, the
 //! sha256 of the arguments the decision was made on ([`args_sha256`]): a spawn's zone, task and
 //! image, a link's names, a capacity lease's spec, an update's artifact. Its canonical JSON
@@ -34,6 +34,8 @@ pub struct Effect {
     /// The canonical path, or with `prefix` the segment prefix it covers.
     pub path: String,
     pub prefix: bool,
+    /// The risk class it was asked at: the riskiest the grant covers (#119).
+    pub risk: String,
     /// The sha256 of the decided-on arguments ([`args_sha256`]), for the kinds that have them.
     pub args_sha256: Option<String>,
     /// The grant's terms; `None` while the request is only asked for.
@@ -140,6 +142,7 @@ mod tests {
             host: "wicket.internal".into(),
             path: "/zones/child/worker".into(),
             prefix: false,
+            risk: "R4ExecOrPrivilege".into(),
             args_sha256: Some(args_sha256(&json!({ "task": "build", "image": "x" }))),
             terms: Some(Terms { uses: Some(1), ttl_secs: 600, scope: "run".into() }),
         }
@@ -164,6 +167,7 @@ mod tests {
             Box::new(|e| e.zone = "other".into()),
             Box::new(|e| e.path = "/zones/child/other".into()),
             Box::new(|e| e.prefix = true),
+            Box::new(|e| e.risk = "R1ReadScoped".into()),
             Box::new(|e| e.method = "LINK".into()),
             Box::new(|e| e.requested_by = vec!["sub".into()]),
             Box::new(|e| e.args_sha256 = None),
