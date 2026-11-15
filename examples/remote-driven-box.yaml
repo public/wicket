@@ -30,6 +30,11 @@ zone:
     # arrive on), the session's own metadata, and archiving it at the end. Listing the account's
     # sessions stays outside reach.
     - { host: api.anthropic.com, methods: [POST], paths: ["/v1/code/sessions", "/v1/code/sessions/*/bridge", "/v1/sessions/*/archive"] }
+    # A woken box resumes its session (#330): Claude Code unarchives it (the session's id, in either
+    # of its forms), then fetches its bridge credentials again (above), so the app keeps the same
+    # conversation. Like archiving, the glob can't tell the box's session from the account's others
+    # (the zone is fixed before the box learns its session's id), so it takes knowing the id.
+    - { host: api.anthropic.com, methods: [POST], paths: ["/v1/sessions/*/unarchive", "/v1/code/sessions/*/unarchive"] }
     - { host: api.anthropic.com, methods: [GET, POST, PUT], paths: ["/v1/code/sessions/*/worker", "/v1/code/sessions/*/worker/**"] }
     - { host: api.anthropic.com, methods: [GET], paths: ["/v1/code/sessions/*"] }
     # The account's profile and Claude Code's start-up settings.

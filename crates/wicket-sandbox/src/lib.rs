@@ -58,6 +58,68 @@ pub struct BoxInfo {
     pub owner: Option<String>,
 }
 
+/// A running box's CPU and memory, as Docker's stats report them (`wicket node top`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BoxStats {
+    /// Percent of one CPU (200 is two CPUs' worth), if Docker had two samples to tell it from.
+    pub cpu_pct: Option<f64>,
+    /// Memory in use, page cache left out, as `docker stats` counts it.
+    pub memory: u64,
+    /// Its limit (0: none reported).
+    pub limit: u64,
+}
+
+/// [`BoxStats`] from the Engine API's `/containers/{id}/stats` answer.
+pub fn stats_of(v: &serde_json::Value) -> Option<BoxStats> {
+    let m = &v["memory_stats"];
+    let usage = m["usage"].as_u64()?;
+    // cgroup v2 reports `inactive_file`, v1 `total_inactive_file` (or `cache`): what `docker stats`
+    // takes off.
+    let st = &m["stats"];
+    let cache = st["inactive_file"].as_u64().or_else(|| st["total_inactive_file"].as_u64()).or_else(|| st["cache"].as_u64()).unwrap_or(0);
+    let (cpu, pre) = (&v["cpu_stats"], &v["precpu_stats"]);
+    let total = |c: &serde_json::Value| c["cpu_usage"]["total_usage"].as_u64();
+    let system = |c: &serde_json::Value| c["system_cpu_usage"].as_u64();
+    let online = cpu["online_cpus"]
+        .as_u64()
+        .or_else(|| cpu["cpu_usage"]["percpu_usage"].as_array().map(|a| a.len() as u64))
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let cpu_pct = match (total(cpu), total(pre), system(cpu), system(pre)) {
+        (Some(t), Some(t0), Some(s), Some(s0)) if s > s0 && t >= t0 => Some((t - t0) as f64 / (s - s0) as f64 * online as f64 * 100.0),
+        _ => None,
+    };
+    Some(BoxStats { cpu_pct, memory: usage.saturating_sub(cache), limit: m["limit"].as_u64().unwrap_or(0) })
+}
+
+/// [`BoxStats`] from a line of `docker stats --no-stream --format '{{json .}}'`.
+pub fn stats_of_cli(line: &str) -> Option<BoxStats> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let cpu_pct = v["CPUPerc"].as_str().and_then(|c| c.trim().trim_end_matches('%').parse::<f64>().ok());
+    let (used, limit) = v["MemUsage"].as_str()?.split_once('/')?;
+    Some(BoxStats { cpu_pct, memory: size_of_cli(used)?, limit: size_of_cli(limit).unwrap_or(0) })
+}
+
+/// `412.3MiB`, `2GiB`, `512kB`, `0B`: as `docker stats` prints sizes.
+fn size_of_cli(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let at = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let n: f64 = s[..at].parse().ok()?;
+    let unit: u64 = match s[at..].trim() {
+        "B" | "" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        "TiB" => 1 << 40,
+        "kB" | "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        _ => return None,
+    };
+    Some((n * unit as f64) as u64)
+}
+
 /// An image as a Docker has it (#192).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageIdentity {
@@ -838,6 +900,23 @@ impl Docker {
         Ok(parse_boxes(&String::from_utf8_lossy(&out.stdout)))
     }
 
+    /// A running box's CPU and memory (`wicket node top`): from the Engine API's stats (Docker
+    /// samples twice, about a second apart, for the CPU), else `docker stats`. None if it isn't
+    /// running.
+    pub async fn stats(&self, name: &str) -> Result<Option<BoxStats>> {
+        if let Some(e) = self.engine().await {
+            let v = e.get_json(&format!("/containers/{}/stats?stream=false", engine::enc(name, false))).await?;
+            return Ok(v.as_ref().and_then(stats_of));
+        }
+        let out = self
+            .command_with(["stats".to_string(), "--no-stream".into(), "--format".into(), "{{json .}}".into(), name.into()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await?;
+        Ok(out.status.success().then(|| stats_of_cli(&String::from_utf8_lossy(&out.stdout))).flatten())
+    }
+
     /// Freezes every process in the box (Idle, #70). Memory stays held; sockets and stdin stay open.
     pub async fn pause(&self, name: &str) -> Result<()> {
         self.simple(&["pause", name]).await
@@ -1178,6 +1257,30 @@ fn parse_boxes(out: &str) -> Vec<BoxInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_read_as_docker_stats_shows_them() {
+        // cgroup v2, as dockerd answers `stats?stream=false`: two samples.
+        let v = serde_json::json!({
+            "cpu_stats": { "cpu_usage": { "total_usage": 2_400_000_000u64 }, "system_cpu_usage": 120_000_000_000u64, "online_cpus": 2 },
+            "precpu_stats": { "cpu_usage": { "total_usage": 2_200_000_000u64 }, "system_cpu_usage": 118_000_000_000u64 },
+            "memory_stats": { "usage": 500u64 << 20, "limit": 2u64 << 30, "stats": { "inactive_file": 88u64 << 20 } }
+        });
+        let s = stats_of(&v).unwrap();
+        assert!((s.cpu_pct.unwrap() - 20.0).abs() < 1e-9, "{s:?}");
+        assert_eq!((s.memory, s.limit), (412 << 20, 2 << 30));
+        // One sample only (`one-shot`, or the box just started): no CPU figure, rather than a wrong one.
+        let mut one = v.clone();
+        one["precpu_stats"] = serde_json::json!({ "cpu_usage": { "total_usage": 0 } });
+        assert_eq!(stats_of(&one).unwrap().cpu_pct, None);
+        // A box that isn't running has no memory stats.
+        assert_eq!(stats_of(&serde_json::json!({ "memory_stats": {} })), None);
+        // The CLI's.
+        let s = stats_of_cli(r#"{"CPUPerc":"12.34%","MemUsage":"412MiB / 2GiB","Name":"x"}"#).unwrap();
+        assert_eq!((s.cpu_pct, s.memory, s.limit), (Some(12.34), 412 << 20, 2 << 30));
+        assert_eq!(stats_of_cli(r#"{"CPUPerc":"--","MemUsage":"0B / 0B"}"#).unwrap(), BoxStats { cpu_pct: None, memory: 0, limit: 0 });
+        assert_eq!(stats_of_cli("garbage"), None);
+    }
 
     #[test]
     fn args_never_include_a_network() {

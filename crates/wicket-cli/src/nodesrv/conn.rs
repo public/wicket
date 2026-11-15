@@ -80,6 +80,7 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
             }
         }
         links.insert(gen, Link { out: tx.clone(), scope: scope.clone(), kill: Some(kill_tx), tunnels: tunnels.clone(), proto: negotiated });
+        node.seen.connections(links.len(), (node.clock)());
     }
     let writer = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
@@ -127,7 +128,12 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
             }
         }
     };
-    let gone = node.links.lock().expect("links").remove(&gen);
+    let gone = {
+        let mut links = node.links.lock().expect("links");
+        let gone = links.remove(&gen);
+        node.seen.connections(links.len(), (node.clock)());
+        gone
+    };
     images::gone(&node, gen);
     if let Some(l) = gone {
         l.tunnels.clear();
@@ -324,6 +330,7 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             }
             Msg::Forget { run } => {
                 let b = node.boxes.lock().expect("boxes").remove(&run);
+                node.seen.forget(&run);
                 if let Some(b) = b {
                     b.tasks.iter().for_each(|t| t.abort());
                     // The control host's own node shares the run's directory with the run: that stays.

@@ -72,6 +72,7 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `ctl/progress.json` | Model spend and output offsets, saved as the run goes (every 3 s). |
 | `ctl/authority.json` | When the box's authority ends, and whether its node confirmed the box stopped. |
 | `ctl/holdings.json` | The secrets released to the run's node and its budget slice. |
+| `ctl/link.json` | Whether the run's supervisor is connected to its node (and since when), the node's size at the last connect, and the model spend the node last reported: what `wicket top` shows. |
 | `ctl/attach.log` | The log of a supervisor that adopted the run (`wicket attach`). |
 | `ctl/egress.sock`, `ctl/gateway.sock` | The run's own egress proxy and gateway, which its node reaches for what it doesn't decide itself (forwarded hosts, the gateway tools it relays). The model proxy runs only on the node. |
 | `sock/` | The box's sockets: egress, model, gateway, QUIC, links, `stdin.sock`. |
@@ -97,6 +98,7 @@ the user `serve` runs as:
 | `runs/<run>/` | Each box's directory: `node-box.json` (its record, for adoption), `node-spend.json` (its model spend), its sockets and workspace. |
 | `volumes/` | Zone volumes of the `node` class. |
 | `ctl/ctl.sock` | `serve`'s control socket (directory 0700), which `wicket node attach` joins an ssh session to. |
+| `ctl/status.sock` | `serve`'s status, read-only: one JSON document per connection, what `wicket node top` shows (names, deadlines, states and counts; no secrets). |
 | `serve.pid`, `serve.lock` | The running `serve`. This host's own node also keeps `serve.log`. |
 | `versions/` | Its versions root; `~/.local/bin/wicket` links to its `current`. |
 
