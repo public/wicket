@@ -795,6 +795,8 @@ struct Progress {
     fetched: std::collections::HashMap<String, String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
+    /// What `wicket top` reads of this run's node (`ctl/link.json`).
+    link: crate::top::LinkRecord,
 }
 
 async fn manage(
@@ -822,11 +824,18 @@ async fn manage(
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
+        link: crate::top::LinkRecord { node: sh.node.clone(), ..Default::default() },
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
+        // Cut off: since now, or since it was (a retry that fails again keeps the time).
+        if p.link.connected || p.link.since_ms == 0 {
+            let now = wicket_feed::now_ms();
+            p.link = crate::top::LinkRecord { connected: false, since_ms: now, updated_ms: now, ..p.link.clone() };
+            p.link.save(&sh.dir);
+        }
         sh.ctl.calls.set_out(None);
         if p.exited && !sh.ctl.kept() {
             return;
@@ -917,7 +926,10 @@ async fn session(
         }
     };
     let (feed, runs) = match authed.welcome {
-        Msg::Welcome { feed, runs, proto, .. } => {
+        Msg::Welcome { feed, runs, proto, capacity, .. } => {
+            let now = wicket_feed::now_ms();
+            p.link = crate::top::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
+            p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
             sh.ctl.calls.set_proto(proto);
@@ -1216,6 +1228,11 @@ async fn on_frame(
                 });
             }
             Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {
+                if p.link.spent != spent {
+                    p.link.spent = spent;
+                    p.link.updated_ms = wicket_feed::now_ms();
+                    p.link.save(&sh.dir);
+                }
                 // The box's first model request (#287), on the node's clock: only as good as the
                 // two hosts' clocks agree.
                 if let Some(ms) = first_request_ms.filter(|_| !sh.timings.has("agent.first_model_request")) {
