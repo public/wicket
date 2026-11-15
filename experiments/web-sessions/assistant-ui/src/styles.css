@@ -1,0 +1,31 @@
+/* Plain CSS, served as a file: the console's CSP allows style-src 'self' only. */
+:root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; }
+body { margin: 0; }
+.app { max-width: 920px; margin: 0 auto; padding: 12px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+header { padding: 6px 0; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+header .state { opacity: .6; }
+.err { color: #c33; }
+.thread { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.viewport { flex: 1; overflow-y: auto; }
+.msg { margin: 8px 0; padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; }
+.msg.user { background: #8882; margin-left: 15%; }
+.msg.assistant { background: transparent; }
+pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0; font-size: 13px; }
+.tool, .thought { border: 1px solid #8884; border-radius: 6px; padding: 4px 8px; margin: 6px 0; }
+.tool.error { border-color: #c336; }
+.tool .kind { font-family: monospace; opacity: .7; }
+.tool .status, .plan .status { font-size: 12px; opacity: .7; }
+.perm { font-size: 12px; margin-left: 8px; padding: 1px 6px; border-radius: 4px; background: #2a62; }
+.perm.no { background: #c332; }
+.args { opacity: .85; }
+.diff .old { background: #c331; } .diff .new { background: #2a61; } .diff .path { font-family: monospace; }
+.plan { margin: 6px 0; padding-left: 22px; } .plan .completed { text-decoration: line-through; opacity: .7; } .plan .in_progress { font-weight: 600; }
+.escalation { border: 2px solid #d90; border-radius: 8px; padding: 8px; margin: 8px 0; }
+.escalation.approved { border-color: #2a6; } .escalation.denied { border-color: #c33; }
+.escalation .op { font-family: monospace; margin: 4px 0; } .escalation .reason { opacity: .8; }
+.buttons, .confirm { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.confirm .what { flex-basis: 100%; font-weight: 600; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #8886; cursor: pointer; }
+button.approve { background: #2a6; color: white; } button.deny { background: #c33; color: white; }
+.composer { display: flex; gap: 8px; padding: 8px 0; }
+.composer textarea { flex: 1; font: inherit; padding: 8px; border-radius: 6px; resize: none; }
