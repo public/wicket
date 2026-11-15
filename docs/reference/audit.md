@@ -18,7 +18,7 @@ transaction and one fsync per batch, with the ledger in WAL mode and `synchronou
   cost 0.65–0.71 ms, under the ledger lock.
 - **Records that must be on disk before they take effect** wait for their batch's commit. This
   covers every `Ledger::audit` call (decisions, approvals, revocations, leases, links, messages) and
-  egress requests allowed by a human's grant. Waiting is a shared flush: when 16 threads append
+  egress requests allowed by an operator's grant. Waiting is a shared flush: when 16 threads append
   durably at once, each record costs about 80 µs instead of an fsync each.
 - **Order and the chain.** Each batch reads the chain head and appends its records under one
   `BEGIN IMMEDIATE` write lock. Processes that share the ledger interleave whole batches, so the

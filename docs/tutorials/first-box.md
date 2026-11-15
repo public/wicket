@@ -139,7 +139,7 @@ Then every model call and every request the box makes, as wicket decides them:
          → an operator decides: wicket approve r-…   or   wicket deny r-…
 ```
 
-The agent's request for example.com got a 403 that says a human must decide, and a request id. The
+The agent's request for example.com got a 403 that says an operator must decide, and a request id. The
 agent calls wicket's `await_grant` tool with it and waits.
 
 ## 7. Approve it in the console
