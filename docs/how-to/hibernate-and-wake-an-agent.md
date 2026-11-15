@@ -1,7 +1,7 @@
 # Hibernate and wake an agent
 
-A long-lived agent keeps its session between turns, sleeps when it (or you) asks, and is woken by a
-follow-up or a message. This page shows how; [agents](../reference/agents.md#hibernate-and-wake) has the rules
+A long-lived agent keeps its session between turns, sleeps when it (or you) asks, and is woken by
+opening its session or a message. This page shows how; [agents](../reference/agents.md#hibernate-and-wake) has the rules
 (what is bundled, generations, budgets, nodes).
 
 ## Make an agent long-lived
@@ -54,8 +54,9 @@ what it stopped in `wicket agents`, since a rebuild restores files, not processe
 Any of these rebuilds its box, restores its state and resumes its session:
 
 ```sh
-wicket say agt_… "and now the tests"     # a follow-up; wakes it if it is hibernated
-wicket wake agt_… ["text"]               # in the foreground, like wicket run
+wicket session agt_… "and now the tests"   # a prompt: its first turn once woken
+wicket session agt_…                       # wakes it, then shows its session live
+wicket wake agt_… ["text"]                 # in the foreground, like wicket run
 ```
 
 A message from another agent (`send_message`) wakes it too. The agent's first turn says it was woken,

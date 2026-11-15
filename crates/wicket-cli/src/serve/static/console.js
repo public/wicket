@@ -59,7 +59,6 @@ function describe(a) {
       " \u00b7 " + riskLabel(a.risk) + " \u00b7 request " + s(a.request) + " \u00b7 run " + s(a.run) +
       (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
   }
-  if (a.action === "say") return "Send to " + s(a.run) + ": \u201c" + s(a.text).slice(0, 80) + "\u201d";
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
   if (a.action === "save_manifest" || a.action === "restore_manifest") {
     const verb = a.action === "restore_manifest" ? "Restore " + s(a.name) + " to " + s(a.restored_from) : "Save " + s(a.root + "/" + a.name);
@@ -239,7 +238,8 @@ function line(op) {
   if (op.kind === "decision") return el("div", b.decision === "approve" ? "ok" : "blocked", b.decision + " " + b.request + " by " + strip(b.by) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "operator.passkey_added") return el("div", "", "passkey added: " + strip(b.name) + " via " + strip(b.via));
   if (op.kind === "run.start") return el("div", "", "start  " + op.run + " zone " + strip(b.zone) + " agent " + strip(b.agent));
-  if (op.kind === "operator.message") return el("div", "", "say    " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.signed ? " (passkey-signed)" : ""));
+  // operator.message is from before `wicket say` was removed (#198); prompts are session.prompt.
+  if (op.kind === "operator.message" || op.kind === "session.prompt") return el("div", "", "prompt " + op.run + " by " + strip(b.by) + " · " + b.chars + " chars" + (b.via ? " via " + strip(b.via) : "") + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "identity.revoked") return el("div", "blocked", "revoke " + op.run + " by " + strip(b.by) + ": " + strip(b.reason) + (b.signed ? " (passkey-signed)" : ""));
   if (op.kind === "run.console_start") return el("div", "", "launch " + op.run + " " + strip(b.root + "/" + b.manifest) + " by " + strip(b.by) + " (passkey-signed)");
   if (op.kind === "op" && b.kind === "box") return el("div", "pend", "box    " + strip(b.what) + ": " + strip(b.detail));
@@ -259,8 +259,8 @@ function placedRow(p) {
   return d;
 }
 
-// A running agent can be sent a follow-up or have its identity revoked; both are signed. An ACP
-// agent's session opens on its own page.
+// A running agent can have its identity revoked, signed. An ACP agent's session opens on its own
+// page, where prompts are sent (#198).
 function renderRun(s, x) {
   const d = el("div", "row");
   const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
@@ -282,37 +282,32 @@ function renderRun(s, x) {
   left.append(document.createTextNode(" · "), auth);
   if (x.status === "running" && x.has_identity && !x.revoked) {
     const acts = el("span", "acts");
-    const say = el("button", "", "Follow-up…");
-    say.onclick = () => openRunForm("say", x.id);
     const rev = el("button", "deny", "Revoke…");
     rev.onclick = () => openRunForm("revoke", x.id);
-    acts.append(say, rev); d.append(acts);
+    acts.append(rev); d.append(acts);
   }
   return d;
 }
 
-// The follow-up and revoke forms: one in-page form (no browser dialogs), kept outside the runs list
+// The revoke form: an in-page form (no browser dialogs), kept outside the runs list
 // so the 2-second refresh doesn't wipe what the operator is typing.
 function openRunForm(kind, run) {
   const f = document.getElementById("runform"), text = document.getElementById("runform-text");
   f.dataset.kind = kind; f.dataset.run = run;
   f.className = "card " + kind;
-  document.getElementById("runform-title").textContent = kind === "say"
-    ? "Follow-up for " + run + " (it arrives as the agent's next turn):"
-    : "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
+  document.getElementById("runform-title").textContent =
+    "Revoke " + run + "'s identity: its box is stopped and its requests can't be approved. Reason:";
   const go = document.getElementById("runform-go");
-  go.textContent = kind === "say" ? "Send" : "Revoke";
-  go.className = kind === "say" ? "approve" : "deny";
-  text.value = kind === "say" ? "" : "revoked by the operator";
+  go.textContent = "Revoke";
+  go.className = "deny";
+  text.value = "revoked by the operator";
   f.hidden = false; text.focus();
 }
 function closeRunForm() { const f = document.getElementById("runform"); f.hidden = true; document.getElementById("runform-text").value = ""; }
 function submitRunForm(ev) {
   ev.preventDefault();
   const f = document.getElementById("runform"), text = document.getElementById("runform-text").value;
-  const run = f.dataset.run, kind = f.dataset.kind;
-  if (kind === "say") { if (!text.trim()) return; signed({ action: "say", run, text }); }
-  else signed({ action: "revoke", run, reason: text });
+  signed({ action: "revoke", run: f.dataset.run, reason: text });
   closeRunForm();
 }
 

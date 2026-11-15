@@ -73,6 +73,10 @@ impl Vault {
     pub fn expires_at(&self, name: &str) -> Option<i64> {
         let r = self.path(name).ok()?.with_extension("ref");
         let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        if let Some(h) = spec.get("helper").filter(|h| !h.is_null()) {
+            let h: crate::secret_helper::HelperRef = serde_json::from_value(h.clone()).ok()?;
+            return h.fetch(name).ok()?.expires_at;
+        }
         let (file, ep) = (spec.get("file")?.as_str()?, spec.get("expires_pointer")?.as_str()?);
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
         doc.pointer(ep)?.as_i64()
@@ -113,34 +117,16 @@ impl Vault {
 
     fn get_ref(&self, name: &str, r: &std::path::Path) -> Result<String> {
         let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r)?)?;
+        if let Some(h) = spec.get("helper").filter(|h| !h.is_null()) {
+            let h: crate::secret_helper::HelperRef =
+                serde_json::from_value(h.clone()).with_context(|| format!("{name}.ref has a malformed \"helper\""))?;
+            return Ok(h.fetch(name)?.value);
+        }
         let file = spec.get("file").and_then(|v| v.as_str()).with_context(|| format!("{name}.ref needs \"file\""))?;
         // No pointer: the whole file is the secret (e.g. an API key file).
         let pointer = spec.get("pointer").and_then(|v| v.as_str());
-        let meta = std::fs::metadata(file).with_context(|| format!("secret {name} refers to {file}, which is missing"))?;
-        if let Err(why) = check_private(std::path::Path::new(file), &meta) {
-            bail!("{file} (referenced by secret {name}) must not be readable by group or others: {why}");
-        }
-        let Some(pointer) = pointer else {
-            let v = std::fs::read_to_string(file)?;
-            if v.trim().is_empty() {
-                bail!("secret {name} is empty");
-            }
-            return Ok(v.trim().to_string());
-        };
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file)?)?;
-        if let Some(ep) = spec.get("expires_pointer").and_then(|v| v.as_str()) {
-            if let Some(ms) = doc.pointer(ep).and_then(|v| v.as_i64()) {
-                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-                if ms <= now_ms {
-                    bail!("secret {name}: the referenced token has expired; its owner (the program on the host whose login it is) must refresh it");
-                }
-            }
-        }
-        let v = doc.pointer(pointer).and_then(|v| v.as_str()).with_context(|| format!("secret {name}: nothing at {pointer} in {file}"))?;
-        if v.trim().is_empty() {
-            bail!("secret {name} is empty");
-        }
-        Ok(v.trim().to_string())
+        let expires_pointer = spec.get("expires_pointer").and_then(|v| v.as_str());
+        read_linked(name, file, pointer, expires_pointer).map(|(v, _)| v).map_err(|e| unreadable_hint(name, file, e))
     }
 
     /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
@@ -191,6 +177,58 @@ impl Vault {
         std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
         let _ = std::fs::remove_file(&p);
         self.get(name).map(|_| ())
+    }
+
+    /// Makes `name` a reference to a value `wicket secret serve` holds, running as the linked file's
+    /// owner (#350): wicket never reads the file, and the helper answers only with the value it was
+    /// told to serve under this name and its expiry. `file` is only noted, for people reading the
+    /// link. Checked by fetching the value once, as for [`Vault::link`].
+    pub fn link_via_helper(
+        &self,
+        name: &str,
+        helper: &crate::secret_helper::HelperRef,
+        file: Option<&str>,
+        meta: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let p = self.path(name)?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut spec = serde_json::json!({ "file": file, "helper": helper });
+        if let Some(m) = meta {
+            spec["meta"] = m.clone();
+        }
+        let r = p.with_extension("ref");
+        std::fs::write(&r, serde_json::to_vec_pretty(&spec)?)?;
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o600))?;
+        let _ = std::fs::remove_file(&p);
+        self.get(name).map(|_| ())
+    }
+
+    /// The helper a linked secret is read through (#350), if it is linked that way.
+    pub fn helper_of(&self, name: &str) -> Option<crate::secret_helper::HelperRef> {
+        let r = self.path(name).ok()?.with_extension("ref");
+        let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
+        serde_json::from_value(spec.get("helper")?.clone()).ok()
+    }
+
+    /// [`Vault::get_for`], for a request about to go upstream (#350): a value that can't be read is
+    /// read again for up to `patience` (a linked login's owner may be rewriting its file, or its
+    /// helper restarting), and an error then names the secret and the cause. A host the secret
+    /// isn't bound to is refused at once.
+    pub async fn get_for_patiently(&self, name: &str, host: &str, patience: std::time::Duration) -> Result<String> {
+        self.check(name, host)?;
+        let until = tokio::time::Instant::now() + patience;
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            match self.get(name) {
+                Ok(v) => return Ok(v),
+                Err(e) if tokio::time::Instant::now() >= until => {
+                    return Err(SecretUnavailable { name: name.to_string(), tries, cause: format!("{e:#}") }.into());
+                }
+                Err(_) => tokio::time::sleep(RETRY_STEP.min(patience)).await,
+            }
+        }
     }
 
     /// The hosts `name` may be sent to: its `.hosts` list, else none.
@@ -349,6 +387,27 @@ pub fn normalize_hosts(hosts: &[String]) -> Result<Vec<String>> {
     Ok(v)
 }
 
+/// How often [`Vault::get_for_patiently`] tries again.
+const RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A secret that still couldn't be read after [`Vault::get_for_patiently`]'s retries: which one,
+/// and why (never its value).
+#[derive(Debug)]
+pub struct SecretUnavailable {
+    pub name: String,
+    pub tries: u32,
+    pub cause: String,
+}
+
+impl std::fmt::Display for SecretUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.tries;
+        write!(f, "secret {:?} could not be read ({n} tr{}): {}", self.name, if n == 1 { "y" } else { "ies" }, self.cause)
+    }
+}
+
+impl std::error::Error for SecretUnavailable {}
+
 /// A host name or IP address, or `*.` and a name with at least two labels.
 fn check_host_pattern(h: &str) -> Result<()> {
     let name = h.strip_prefix("*.").unwrap_or(h);
@@ -368,6 +427,55 @@ pub fn covers(allowed: &str, wanted: &str) -> bool {
         (None, Some(_)) => false,
         _ => wicket_core::manifest::host_matches(allowed, &wanted),
     }
+}
+
+/// The current value of a secret linked to `file` (a JSON field in it, or with no `pointer`, the whole
+/// file, trimmed), and when it expires (Unix ms) if `expires_pointer` says. Refused if anyone but its
+/// owner and this process's user can read the file, or the value has expired. What the vault reads for
+/// a link, and what `wicket secret serve` reads, as the file's owner, for a link via the helper (#350).
+pub fn read_linked(name: &str, file: &str, pointer: Option<&str>, expires_pointer: Option<&str>) -> Result<(String, Option<i64>)> {
+    if pointer.is_none() && expires_pointer.is_some() {
+        bail!("an expiry pointer needs a JSON pointer: a whole-file reference has no fields");
+    }
+    let meta = std::fs::metadata(file).with_context(|| format!("secret {name} refers to {file}, which is missing or can't be reached"))?;
+    if let Err(why) = check_private(std::path::Path::new(file), &meta) {
+        bail!("{file} (referenced by secret {name}) must not be readable by group or others: {why}");
+    }
+    let text = std::fs::read_to_string(file).with_context(|| format!("secret {name}: reading {file}"))?;
+    let Some(pointer) = pointer else {
+        if text.trim().is_empty() {
+            bail!("secret {name} is empty");
+        }
+        return Ok((text.trim().to_string(), None));
+    };
+    let doc: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("secret {name}: {file} is not JSON"))?;
+    let expires = expires_pointer.and_then(|ep| doc.pointer(ep)).and_then(|v| v.as_i64());
+    if let Some(ms) = expires {
+        if ms <= now_ms() {
+            bail!("secret {name}: the referenced token has expired; its owner (the program on the host whose login it is) must refresh it");
+        }
+    }
+    let v = doc.pointer(pointer).and_then(|v| v.as_str()).with_context(|| format!("secret {name}: nothing at {pointer} in {file}"))?;
+    if v.trim().is_empty() {
+        bail!("secret {name} is empty");
+    }
+    Ok((v.trim().to_string(), expires))
+}
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// A linked file wicket may not read: says how to link it without an ACL (#350).
+fn unreadable_hint(name: &str, file: &str, e: anyhow::Error) -> anyhow::Error {
+    let denied = e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied));
+    if !denied {
+        return e;
+    }
+    e.context(format!(
+        "wicket can't read {file}, which secret {name} is linked to: run `wicket secret serve` as the file's owner and link it with \
+         --via-helper (docs/how-to/store-and-link-secrets.md), rather than sharing the file by an ACL"
+    ))
 }
 
 /// Refuses a secret file that anyone but its owner (and the user wicket runs as) can read. A mode
@@ -707,5 +815,102 @@ mod tests {
         let e = v.get("api").unwrap_err().to_string();
         assert!(e.contains(&format!("user {}", me.wrapping_add(1))), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn private(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A file wicket can't read (here: mode 000, as a login whose ACL a refresh dropped): the error
+    /// says how to link it through the helper instead (#350).
+    #[test]
+    fn an_unreadable_link_says_how_to_use_the_helper() {
+        let d = std::env::temp_dir().join(format!("wicket-vault-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("creds.json");
+        private(&f, r#"{"o":{"accessToken":"sk"}}"#);
+        let v = Vault::new(d.join("vault"));
+        v.link("login", f.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&f).is_ok() {
+            eprintln!("skipped: this process reads mode-000 files (root)");
+            return;
+        }
+        let e = format!("{:#}", v.get("login").unwrap_err());
+        assert!(e.contains("--via-helper") && e.contains("wicket secret serve") && e.contains("ermission denied"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The model proxy's read (#350): a value that can't be read now is tried again for a while (a
+    /// refresh rewriting the file), and then the error names the secret and the cause.
+    #[tokio::test]
+    async fn a_failed_read_is_retried_then_named() {
+        let d = std::env::temp_dir().join(format!("wicket-vault-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("creds.json");
+        private(&f, r#"{"o":{"accessToken":"sk-1"}}"#);
+        let v = Vault::new(d.join("vault"));
+        v.link("login", f.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
+        v.set_hosts("login", &["api.example.com".into()]).unwrap();
+        let patience = std::time::Duration::from_secs(3);
+
+        // The owner is mid-rewrite: the file is gone, then back with a new token.
+        std::fs::remove_file(&f).unwrap();
+        let f2 = f.clone();
+        let back = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            private(&f2, r#"{"o":{"accessToken":"sk-2"}}"#);
+        });
+        assert_eq!(v.get_for_patiently("login", "api.example.com", patience).await.unwrap(), "sk-2");
+        back.join().unwrap();
+
+        // Still unreadable when patience runs out: one error, naming the secret and the cause.
+        std::fs::remove_file(&f).unwrap();
+        let t = std::time::Instant::now();
+        let e = v.get_for_patiently("login", "api.example.com", std::time::Duration::from_millis(600)).await.unwrap_err();
+        assert!(t.elapsed() >= std::time::Duration::from_millis(600));
+        let u = e.downcast_ref::<SecretUnavailable>().expect("typed");
+        assert_eq!(u.name, "login");
+        assert!(u.tries > 1, "retried: {u}");
+        let msg = e.to_string();
+        assert!(msg.starts_with("secret \"login\" could not be read") && msg.contains("missing"), "{msg}");
+
+        // A host it isn't bound to is refused at once, not retried.
+        let t = std::time::Instant::now();
+        let e = v.get_for_patiently("login", "evil.example", patience).await.unwrap_err();
+        assert!(t.elapsed() < std::time::Duration::from_secs(1) && e.downcast_ref::<SecretUnavailable>().is_none(), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A link via the helper: wicket never reads the file; the helper answers with the value and
+    /// its expiry, picked up at every use (#350).
+    #[test]
+    fn a_link_via_the_helper_reads_through_it() {
+        let d = std::env::temp_dir().join(format!("wicket-vault-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("creds.json");
+        private(&f, r#"{"o":{"accessToken":"sk-h","refreshToken":"rt","expiresAt":32503680000000}}"#);
+        // SAFETY: a plain getter.
+        let me = unsafe { libc::geteuid() };
+        let sock = format!("@wicket-vault-test.{}", std::process::id());
+        let served = vec![format!("login={}#/o/accessToken#/o/expiresAt", f.display()).parse().unwrap()];
+        let l = crate::secret_helper::bind(&sock).unwrap();
+        std::thread::spawn(move || crate::secret_helper::serve(l, vec![me], served));
+        let v = Vault::new(d.join("vault"));
+        let h = crate::secret_helper::HelperRef { uid: me, socket: sock };
+        v.link_via_helper("login", &h, Some(f.to_str().unwrap()), None).unwrap();
+        assert_eq!(v.helper_of("login"), Some(h.clone()));
+        assert_eq!(v.get("login").unwrap(), "sk-h");
+        assert_eq!(v.expires_at("login"), Some(32503680000000));
+        let kept = std::fs::read_to_string(d.join("vault/login.ref")).unwrap();
+        assert!(!kept.contains("sk-h") && !kept.contains("rt\""), "{kept}");
+        // A helper that isn't there: the link is refused.
+        let gone = crate::secret_helper::HelperRef { uid: me, socket: format!("@wicket-vault-test.{}.gone", std::process::id()) };
+        assert!(v.link_via_helper("other", &gone, None, None).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

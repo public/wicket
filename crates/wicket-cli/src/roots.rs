@@ -204,7 +204,7 @@ fn certify_issuing(root_seed: &[u8; 32], ms: i64) -> Result<i64> {
         Some(s) => s,
         None => {
             let mut s = [0u8; 32];
-            getrandom::getrandom(&mut s).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+            getrandom::fill(&mut s).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             write_new(&kp, hex::encode(s).as_bytes())?;
             s
         }

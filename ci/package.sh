@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The release archive (.github/workflows/release.yml, build.yml): the binary, deploy/install.sh and
-# deploy/systemd/, images/, examples/, README.md and LICENSE, so that `sudo <archive>/deploy/install.sh`
+# deploy/systemd/ and deploy/systemd-user/, images/, examples/, README.md and LICENSE, so that `sudo <archive>/deploy/install.sh`
 # needs nothing else. docs/ is not in it. Prints the archive's path.
 #   ci/package.sh BINARY OUTDIR [SUFFIX]
 # SUFFIX (e.g. a commit's first 12 hex digits, build.yml) goes in the archive's name after the
@@ -21,7 +21,7 @@ name=wicket-$v${suffix:+-$suffix}-x86_64-linux
 rm -rf "${out:?}/$d"
 mkdir -p "$out/$d/deploy"
 cp "$bin" "$out/$d/wicket"
-cp -r "$repo/deploy/install.sh" "$repo/deploy/systemd" "$out/$d/deploy/"
+cp -r "$repo/deploy/install.sh" "$repo/deploy/systemd" "$repo/deploy/systemd-user" "$out/$d/deploy/"
 cp -r "$repo/images" "$repo/examples" "$repo/README.md" "$repo/LICENSE" "$out/$d/"
 # Modes as git has them (not this checkout's umask): directories and executables 755, the rest 644.
 find "$out/$d" -type d -exec chmod 755 {} +

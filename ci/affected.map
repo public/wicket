@@ -58,8 +58,9 @@ ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
+deploy/systemd-user/**             | wicket-cli | -
 deploy/vultr/node-setup.sh         | wicket-placement | -
-crates/wicket-core/tests/subset_cases.rs | wicket-authz wicket-feed | lean
+crates/wicket-core/tests/integration/subset_cases.rs | wicket-authz wicket-feed | lean
 crates/wicket-authz/tests/common/** | wicket-feed | lean
 
 # ---- crate code with known end-to-end coverage ----

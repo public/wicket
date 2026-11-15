@@ -21,8 +21,9 @@ user wicket runs as can read. The error says who else can read it.
 ## Let the wicket user read a linked file
 
 On an installed host, wicket reads linked files as the `wicket` user. To link a file another user
-owns, such as an operator's Claude login, keep it owner-only and grant the `wicket` user read with
-an ACL, and let it reach the file through its directories:
+owns, such as an operator's Claude login, prefer [the secret helper](#a-link-through-the-secret-helper):
+nothing to grant, and a refresh doesn't break it. Otherwise keep it owner-only and grant the `wicket`
+user read with an ACL, and let it reach the file through its directories:
 
 ```sh
 chmod 600 ~/.claude/.credentials.json
@@ -37,6 +38,17 @@ sudo wicket secret link claude-oauth --file ~/.claude/.credentials.json \
 that rewrites the file may replace it with one without the ACL (Claude Code refreshing its login, for
 one): if wicket then can't read it, grant the ACL again, or set a default ACL on the directory
 (`setfacl -d -m u:wicket:r ~/.claude`) so new files there get it.
+
+## A link through the secret helper
+
+A `.ref` made by `wicket secret link --via-helper` names a helper instead of a file wicket reads:
+`{"file": …, "helper": {"uid": 1000, "socket": "@wicket-secret.1000"}}` (`file` is only noted). At
+every use the vault connects to the socket (`@` is the abstract namespace; otherwise a path), refuses
+it unless `SO_PEERCRED` says it is held by `uid`, sends `{"secret": NAME}` and reads one line back:
+`{"value": …, "expires_at": MS}` or `{"error": …}`. An expired value is refused. The helper is
+`wicket secret serve`, run as the file's owner: it serves only the secrets named on its command
+line, only to the uid `--for` names, and only their values and expiries. See
+[store and link secrets](../how-to/store-and-link-secrets.md#link-a-login-without-an-acl-the-secret-helper).
 
 ## What a link keeps besides the reference
 

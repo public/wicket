@@ -15,7 +15,7 @@ impl Drop for Tmp {
 
 fn tmp() -> Tmp {
     let mut n = [0u8; 6];
-    getrandom::getrandom(&mut n).unwrap();
+    getrandom::fill(&mut n).unwrap();
     let d = std::env::temp_dir().join(format!("wicketd-test-{}", hex::encode(n)));
     std::fs::create_dir_all(&d).unwrap();
     Tmp(d)
@@ -30,7 +30,7 @@ echo "principal: $WICKET_PRINCIPAL"
 case "$1" in
   run) echo "manifest: $(head -c 200 "$2" | tr '\n' ' ')"; [ "$3" = --workdir ] && echo "workdir: $(ls -A "$4" | tr '\n' ' ')";
        src=$(dirname "$2")/../programs/repo-stats; [ -d "$src" ] && echo "program: $(ls "$src" | tr '\n' ' ')";;
-  say) echo "stdin: $(cat)";;
+  session) echo "stdin: $(cat)";;
   links) exit "$3";;
 esac
 exit 0
@@ -115,7 +115,7 @@ async fn an_operator_reads_state_as_itself_through_the_daemon() {
     let (code, ..) = call(&f, &["links", "--tail", "5"], None).await.unwrap();
     assert_eq!(code, 5);
     // stdin is the caller's.
-    let (_, out, _) = call(&f, &["say", "r1", "hi"], Some("from the caller")).await.unwrap();
+    let (_, out, _) = call(&f, &["session", "r1"], Some("from the caller")).await.unwrap();
     assert!(out.contains("stdin: from the caller"), "{out}");
 }
 
