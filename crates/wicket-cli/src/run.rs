@@ -1600,6 +1600,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
     let mut remote_url: Option<String> = None;
+    // A woken driven remote box's session before it hibernated (#330): Claude Code reattaches to it
+    // if it can, and otherwise starts a new one, which the owner has to be told of.
+    let prior_remote_url = match &wake {
+        Some(w) if driven_remote => ledger.lock().ok().and_then(|l| prior_remote_session(&l, &w.agent.id, &run.0)),
+        _ => None,
+    };
     loop {
         tokio::select! {
             ex = child.exited(), if lines.is_none() => {
@@ -1703,13 +1709,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if driven_remote && remote_url.is_none() {
                             match harness.and_then(|h| h.driven_remote_status(&l)) {
                                 Some(Ok(u)) => {
-                                    println!("[wicket] remote session: {u}");
+                                    let mut body = serde_json::json!({ "url": u });
+                                    match prior_remote_url.as_deref() {
+                                        Some(old) if same_remote_session(old, &u) => {
+                                            println!("[wicket] remote session resumed: {u}");
+                                            body["resumed"] = true.into();
+                                        }
+                                        // A new session, as at the start, and the old one is no longer
+                                        // this box's: said as loudly as the start's address.
+                                        Some(old) => {
+                                            println!("[wicket] the woken box couldn't reattach to its remote session {old}; it started a new one");
+                                            println!("[wicket] remote session (NEW): {u}");
+                                            body["resumed"] = false.into();
+                                            body["previous"] = old.into();
+                                        }
+                                        None => println!("[wicket] remote session: {u}"),
+                                    }
                                     if let Ok(lg) = ledger.lock() {
-                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &body);
                                     }
                                     remote_url = Some(u);
                                 }
                                 Some(Err(why)) => {
+                                    if let Some(old) = &prior_remote_url {
+                                        println!("[wicket] the woken box's remote session {old} wasn't resumed");
+                                    }
                                     println!("[wicket] the remote session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
@@ -2455,9 +2479,41 @@ fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text
     }
 }
 
+/// The remote session an agent's earlier activations last recorded (`run.remote_session`), newest
+/// first, not counting the run `now`.
+fn prior_remote_session(l: &Ledger, agent: &str, now: &str) -> Option<String> {
+    let runs = l.agent_runs(agent).ok()?;
+    runs.iter().rev().filter(|(r, _)| r != now).find_map(|(r, _)| {
+        let body = l.audit_latest(r, "run.remote_session").ok()??;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        v["url"].as_str().filter(|u| u.starts_with("https://")).map(String::from)
+    })
+}
+
+/// Whether two remote session addresses are the same session: the last path segment, without a
+/// query, and with Claude's two forms of a session id (`session_…`, `cse_…`) taken as one.
+fn same_remote_session(a: &str, b: &str) -> bool {
+    fn id(u: &str) -> &str {
+        let path = u.split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+        let last = path.rsplit('/').next().unwrap_or("");
+        last.strip_prefix("session_").or_else(|| last.strip_prefix("cse_")).unwrap_or(last)
+    }
+    let (a, b) = (id(a), id(b));
+    !a.is_empty() && a == b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_woken_remote_session_is_the_same_one_whichever_form_its_id_takes() {
+        let old = "https://claude.ai/code/session_01abc";
+        assert!(same_remote_session(old, "https://claude.ai/code/session_01abc?from=cli"));
+        assert!(same_remote_session(old, "https://claude.ai/code/cse_01abc/"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/session_01def"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/"));
+    }
 
     #[test]
     fn a_fetch_that_brings_back_less_than_the_box_started_with_fails() {
