@@ -64,7 +64,7 @@ pub fn route(cmd: &Cmd) -> Route {
     match cmd {
         // Hibernating and waking steer an agent the way `say` does; waking reruns its stored manifest.
         Cmd::Run { .. } | Cmd::Wrap { .. } | Cmd::Say { .. } | Cmd::Hibernate { .. } | Cmd::Wake { .. } => Forward(Run),
-        Cmd::Agents { .. } => Forward(Read),
+        Cmd::Agents { .. } | Cmd::Top { .. } => Forward(Read),
         Cmd::Pending | Cmd::Links { .. } | Cmd::Audit { .. } | Cmd::Doctor { .. } | Cmd::Grant { cmd: GrantCmd::List { .. } } => {
             Forward(Read)
         }
@@ -108,7 +108,7 @@ pub fn route(cmd: &Cmd) -> Route {
             NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
                 Forward(Privileged)
             }
-            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } => Local,
+            NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
         },
         // Spends money after a terminal prompt.
         Cmd::Place { .. } => Forward(Privileged),

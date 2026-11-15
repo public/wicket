@@ -795,6 +795,8 @@ struct Progress {
     fetched: std::collections::HashMap<String, String>,
     /// A renewed authority end (Unix seconds) whose re-mint failed: not tried again (#56).
     remint_failed: i64,
+    /// What `wicket top` reads of this run's node (`ctl/link.json`).
+    link: crate::top::LinkRecord,
 }
 
 async fn manage(
@@ -822,11 +824,18 @@ async fn manage(
         slice: None,
         fetched: std::collections::HashMap::new(),
         remint_failed: 0,
+        link: crate::top::LinkRecord { node: sh.node.clone(), ..Default::default() },
     };
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
         let r = session(&sh, &mut io, &mut p, &mut ready, &mut started, target_epoch).await;
         *sh.ctl.link.lock().expect("link") = None;
+        // Cut off: since now, or since it was (a retry that fails again keeps the time).
+        if p.link.connected || p.link.since_ms == 0 {
+            let now = wicket_feed::now_ms();
+            p.link = crate::top::LinkRecord { connected: false, since_ms: now, updated_ms: now, ..p.link.clone() };
+            p.link.save(&sh.dir);
+        }
         sh.ctl.calls.set_out(None);
         if p.exited && !sh.ctl.kept() {
             return;
@@ -917,7 +926,10 @@ async fn session(
         }
     };
     let (feed, runs) = match authed.welcome {
-        Msg::Welcome { feed, runs, proto, .. } => {
+        Msg::Welcome { feed, runs, proto, capacity, .. } => {
+            let now = wicket_feed::now_ms();
+            p.link = crate::top::LinkRecord { connected: true, since_ms: now, updated_ms: now, capacity, ..p.link.clone() };
+            p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
             sh.ctl.calls.set_proto(proto);
@@ -1216,6 +1228,11 @@ async fn on_frame(
                 });
             }
             Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {
+                if p.link.spent != spent {
+                    p.link.spent = spent;
+                    p.link.updated_ms = wicket_feed::now_ms();
+                    p.link.save(&sh.dir);
+                }
                 // The box's first model request (#287), on the node's clock: only as good as the
                 // two hosts' clocks agree.
                 if let Some(ms) = first_request_ms.filter(|_| !sh.timings.has("agent.first_model_request")) {
@@ -1761,7 +1778,8 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         wicket_feed::Policy::compile(&a, &ctx, &|_, _| false).map(|_| ())
     };
     let before = p.live.len();
-    p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
+    // Live while `now < expires_at`, published as `not_after = expires_at - 1` (#342).
+    p.live.retain(|g| g.grant.not_after >= u64::try_from(now_s).unwrap_or(0));
     let mut rebuild = p.live.len() != before || reminted.is_some();
     rebuild |= renew_live(&mut p.live, &grants, &sh.node, now_s);
     let mut handed: Vec<String> = vec![];
@@ -1906,7 +1924,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
 fn renew_live(live: &mut [LiveGrant], grants: &[wicket_store::GrantRow], node: &str, now_s: i64) -> bool {
     let mut changed = false;
     for g in grants.iter().filter(|g| g.node.as_deref() == Some(node) && !g.revoked && g.expires_at > now_s) {
-        let end = u64::try_from(g.expires_at).unwrap_or(0);
+        let end = wicket_authz::Grant::not_after_for(g.expires_at);
         if let Some(l) = live.iter_mut().find(|l| l.grant.gid == g.id && l.grant.not_after != end) {
             l.grant.not_after = end;
             changed = true;
@@ -1949,7 +1967,8 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
             host: op.host.clone(),
             method: op.method.clone(),
             path: op.path.clone(),
-            not_after: u64::try_from(g.expires_at).unwrap_or(0),
+            // The ledger's end, as the token's inclusive whole-second check reads it (#342).
+            not_after: wicket_authz::Grant::not_after_for(g.expires_at),
             approver: g.request_id.as_deref().map_or_else(|| "operator".to_string(), |r| format!("request:{r}")),
             digest: hex::decode(op.digest()).unwrap_or_default(),
         },
@@ -1992,10 +2011,14 @@ mod tests {
         assert!(!renew_live(&mut live, &[row("g-1", Some("n1"), now + 60)], "n1", now), "unchanged");
         let renewed = [row("g-1", Some("n1"), now + 3600), row("g-2", None, now + 3600)];
         assert!(renew_live(&mut live, &renewed, "n1", now));
-        assert_eq!((live.len(), live[0].grant.not_after, live[0].uses), (1, (now + 3600) as u64, Some(2)));
+        assert_eq!(
+            (live.len(), live[0].grant.not_after, live[0].uses),
+            (1, (now + 3600 - 1) as u64, Some(2)),
+            "published as expires_at - 1 (#342)"
+        );
         let revoked = wicket_store::GrantRow { revoked: true, ..row("g-1", Some("n1"), now + 7200) };
         assert!(!renew_live(&mut live, &[revoked, row("g-1", Some("n2"), now + 7200)], "n1", now));
-        assert_eq!(live[0].grant.not_after, (now + 3600) as u64);
+        assert_eq!(live[0].grant.not_after, (now + 3600 - 1) as u64);
     }
 
     /// #152: `wicket node list` shows, per run on a node, its authority, the secrets released to it
