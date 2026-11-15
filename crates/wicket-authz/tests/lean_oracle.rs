@@ -179,7 +179,14 @@ fn gen_child(rng: &mut Rng, p: &ZoneSpec) -> ZoneSpec {
             if rng.chance(50) {
                 let mut paths = Vec::new();
                 for g in &r.paths {
-                    paths.push(if rng.chance(50) { format!("{}/x", g.trim_end_matches("/**")) } else { gen_glob(rng) });
+                    // Under the rule, beside it (a string prefix, not a segment prefix), or anything.
+                    let stem = g.trim_end_matches("/**");
+                    paths.push(match rng.below(4) {
+                        0 => format!("{stem}/x"),
+                        1 => format!("{stem}x*"),
+                        2 => format!("{stem}/*/x"),
+                        _ => gen_glob(rng),
+                    });
                 }
                 r.paths = paths;
             }
@@ -328,7 +335,7 @@ fn rust_decides_as_the_lean_spec() {
         c.push(json!({ "kind": "canon", "path": pq }), rust, format!("canonical_path({pq:?})"));
     }
     let mut admitted = 0;
-    for i in 0..1500 {
+    for i in 0..3000 {
         let p = gen_zone(&mut rng, &base);
         let ch = gen_child(&mut rng, &p);
         if CompiledZone::new(p.clone()).is_err() || CompiledZone::new(ch.clone()).is_err() {

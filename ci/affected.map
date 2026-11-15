@@ -11,7 +11,8 @@
 # them, and a pattern without a slash matches the file name anywhere.
 #
 # Suites: docs (check-public, Markdown links),
-# policy (SymCC policy diffs), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
+# policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322),
+# smoke, hibernate, restore, acceptance (local flows), daemon-uids,
 # install-test, and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update.
 
@@ -46,15 +47,15 @@ ci/changelog.py                    | -   | docs
 ci/changelog_test.py               | -   | docs
 
 # ---- inputs the crates read from outside their directories (the self-test checks this list) ----
-examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | -
+examples/**                        | wicket-core wicket-authz wicket-feed wicket-policy wicket-cli | lean
 examples/policy/**                 | wicket-policy | policy
 images/**                          | wicket-cli | smoke acceptance
 images/claude-code/wicket-entry    | wicket-fwd | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
 deploy/vultr/node-setup.sh         | wicket-placement | -
-crates/wicket-core/tests/subset_cases.rs | wicket-authz wicket-feed | -
-crates/wicket-authz/tests/common/** | wicket-feed | -
+crates/wicket-core/tests/subset_cases.rs | wicket-authz wicket-feed | lean
+crates/wicket-authz/tests/common/** | wicket-feed | lean
 
 # ---- crate code with known end-to-end coverage ----
 crates/*/tests/**                  | -   | -
@@ -120,3 +121,8 @@ ci/node-e2e/**                     | -   | node-e2e
 ci/update.sh                       | -   | update
 ci/update/**                       | -   | update
 ci/policy-diff.sh                  | -   | policy
+# #322: the Lean spec (its oracle test in wicket-authz reads it) and the test itself. wicket-core,
+# grant.rs and the toolchain files aren't listed, so they select every suite, this one included.
+verification/lean/**               | wicket-authz | lean
+ci/lean.sh                         | -   | lean
+crates/wicket-authz/tests/lean_oracle.rs | - | lean
