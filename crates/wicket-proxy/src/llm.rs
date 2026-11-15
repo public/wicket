@@ -22,21 +22,9 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// usage is seen (#113). Past this, the call is charged its whole reservation.
 const DRAIN_AFTER_DISCONNECT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// An upstream's answer: status, headers and body.
-type Upstream =
-    (u16, http::HeaderMap, futures_util::stream::BoxStream<'static, std::result::Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>);
-
-/// Opens a byte stream to the run's own model proxy on the control host (#151).
-pub type LlmRelay =
-    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, std::io::Result<Box<dyn crate::egress::RelayStream>>> + Send + Sync>;
-
 pub struct Llm {
     ctx: RunCtx,
     client: reqwest::Client,
-    /// On a node without a secret source (#151): the vetted request goes to the run's model proxy on
-    /// the control host, which adds the credential. Otherwise (a node's cache, #152, or None) the call
-    /// goes straight to the upstream from here, with the secret.
-    relay: Option<LlmRelay>,
     pub requests: AtomicU64,
     /// Uncached input tokens.
     pub input_tokens: AtomicU64,
@@ -64,9 +52,9 @@ pub struct Llm {
     first_request_ms: std::sync::OnceLock<i64>,
 }
 
-/// A budget slice leased to a node (#152): this activation may count up to these totals of its own
+/// A budget slice sent to a node (#152): this activation may count up to these totals of its own
 /// (requests; output tokens, in flight included; input tokens, cached ones included) before the
-/// control host leases it more. Offline, the node spends its current slice and nothing more.
+/// control host sends it more. Offline, the node spends its current slice and nothing more.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Slice {
     pub requests: u64,
@@ -167,7 +155,6 @@ impl Llm {
         Ok(Arc::new(Llm {
             ctx,
             client,
-            relay: None,
             requests: AtomicU64::new(0),
             input_tokens: AtomicU64::new(0),
             cache_read_tokens: AtomicU64::new(0),
@@ -184,14 +171,6 @@ impl Llm {
             last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
         }))
-    }
-
-    /// A model proxy on a node (#151): requests it lets through go on to the run's own proxy on the
-    /// control host over `relay`, without a credential.
-    pub fn relayed(ctx: RunCtx, relay: LlmRelay) -> Result<Arc<Llm>> {
-        let mut l = Arc::into_inner(Llm::new(ctx)?).expect("fresh");
-        l.relay = Some(relay);
-        Ok(Arc::new(l))
     }
 
     /// What this activation has counted itself.
@@ -416,7 +395,7 @@ impl Llm {
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
         // the credential (first use while the control host is unreachable), the call fails clearly.
-        let relay = !self.ctx.vault.is_sourced();
+        // Only the node runs a model proxy for a box (#257): nothing relays a call to another one.
         if self.ctx.vault.is_sourced() {
             if let Err(e) = self.ctx.vault.ensure(&spec.secret).await {
                 self.settle(reserved, Usage::default(), true);
@@ -424,14 +403,11 @@ impl Llm {
                 return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
             }
         }
-        let up = match &self.relay {
-            Some(r) if relay => self.send_relayed(r, &parts, body).await,
-            _ => self.send_upstream(spec, &parts, body).await.map(|r| {
-                let (status, headers) = (r.status().as_u16(), r.headers().clone());
-                let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
-                (status, headers, stream)
-            }),
-        };
+        let up = self.send_upstream(spec, &parts, body).await.map(|r| {
+            let (status, headers) = (r.status().as_u16(), r.headers().clone());
+            let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
+            (status, headers, stream)
+        });
         let (status, headers, stream) = match up {
             Ok(r) => r,
             Err(e) => {
@@ -448,37 +424,6 @@ impl Llm {
         let sse = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
         let body = self.account(model, status, sse, stream, reserved, note);
         Ok(out.body(body)?)
-    }
-
-    /// Sends a vetted request to the run's own model proxy on the control host (#151).
-    async fn send_relayed(&self, relay: &LlmRelay, parts: &http::request::Parts, body: Bytes) -> Result<Upstream> {
-        let io = relay().await.map_err(|e| anyhow::anyhow!("the control host's model proxy is unreachable: {e}"))?;
-        let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        let mut rb = Request::builder().method(parts.method.clone()).uri(parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
-        for (name, value) in parts.headers.iter() {
-            let n = name.as_str();
-            if n != "accept-encoding"
-                && n != "content-length"
-                && (FORWARD_REQUEST.contains(&n) || crate::provider_request_header(MODEL_HOST, n))
-            {
-                rb = rb.header(n, value);
-            }
-        }
-        let req = rb.header("host", "wicket.internal").header("accept-encoding", "identity").body(http_body_util::Full::new(body))?;
-        let resp = send.send_request(req).await?;
-        let (status, headers) = (resp.status().as_u16(), resp.headers().clone());
-        let stream = http_body_util::BodyStream::new(resp.into_body())
-            .filter_map(|f| async move {
-                match f {
-                    Ok(f) => f.into_data().ok().map(Ok),
-                    Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)),
-                }
-            })
-            .boxed();
-        Ok((status, headers, stream))
     }
 
     async fn send_upstream(

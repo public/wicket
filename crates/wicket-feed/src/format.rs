@@ -66,7 +66,7 @@ impl KeyCert {
     }
 }
 
-/// A grant or lease: lets one op, by wicket-core's [`wicket_core::Op::digest`] (tenant, zone, method,
+/// A grant: lets one op, by wicket-core's [`wicket_core::Op::digest`] (tenant, zone, method,
 /// host, path), until `not_after` on the node's clock, at most `uses` times, optionally only for one box.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,7 +92,7 @@ pub struct Grant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevokeKind {
-    /// A grant or lease id.
+    /// A grant id.
     Grant,
     /// A run (box) id: every op of that run is refused.
     Run,

@@ -22,7 +22,7 @@
 <text x="60" y="302" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Run supervisors: one per run</text>
 <text x="60" y="322" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Start the run&#x27;s box on a node, stream its events, enforce its budget and timeout.</text>
 <text x="60" y="339" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Hold what must stay central: credential injection and swaps for forwarded hosts,</text>
-<text x="60" y="356" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">the model credential and budget (the node&#x27;s model proxy relays here), the MCP</text>
+<text x="60" y="356" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">the model budget (the node&#x27;s model proxy calls the model and reports spend), the MCP</text>
 <text x="60" y="373" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">gateway&#x27;s ledger-backed tools, and the relay for links between boxes on any nodes.</text>
 <text x="60" y="390" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Survive a restart: a new build re-attaches to running runs (#151).</text>
 <rect x="48" y="433" width="300" height="150" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1"/>
@@ -73,7 +73,7 @@
 <text x="760" y="236" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  verified replica of the signed feed. No call to the control host per request.</text>
 <text x="760" y="253" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  Inspected hosts: TLS terminated with the node&#x27;s name-constrained CA, every request decided and audited.</text>
 <text x="760" y="270" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  Spliced hosts (allowed wholesale, no credential): decided on the hostname, encrypted bytes relayed.</text>
-<text x="760" y="287" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Wicket DNS and the HTTP/3 (QUIC) relay. Model proxy and MCP gateway for each box (relaying to the run).</text>
+<text x="760" y="287" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Wicket DNS and the HTTP/3 (QUIC) relay. Model proxy and MCP gateway for each box (some tools relayed to the run).</text>
 <text x="760" y="304" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">Keeps its own hash-chained audit log and ships it. If the control host is unreachable, keeps deciding</text>
 <text x="760" y="321" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">  from its feed while it is fresh, then reads only, then refuses (#152/#153: until grants expire).</text>
 <rect x="748" y="357" width="704" height="415" rx="10" fill="#fff5f5" stroke="#b3261e" stroke-width="2" stroke-dasharray="7 5"/>

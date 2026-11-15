@@ -18,8 +18,8 @@
 //!   loses the cache: credentialed hosts and model calls stop until the control host is back, while
 //!   plain egress the token allows goes on until its grants expire. A self-update's re-exec hands
 //!   the cache to the new process through a sealed memfd, never a file ([`Cache::export`]).
-//! - **Budget slices** are leased per run ([`Lease`]) and kept on the node's disk (they aren't
-//!   secret), so a restart doesn't hand an offline node a fresh one.
+//! - **Budget slices** are sent per run ([`crate::chan::Msg::BudgetSlice`]) and kept on the node's
+//!   disk (they aren't secret), so a restart doesn't hand an offline node a fresh one.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,14 +30,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use wicket_proxy::llm::Slice;
 use zeroize::Zeroize;
-
-/// A run's lease, as the control host sends it: its model budget slice.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Lease {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slice: Option<Slice>,
-}
 
 /// A secret released to a node for one run (over the run's authenticated channel).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

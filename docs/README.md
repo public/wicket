@@ -69,6 +69,8 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [How updates work](explanation/updates.md)
 - The design and the research behind it:
   - [Design](explanation/design.md) (v0.2; much of it not built yet)
+  - [One decision path](explanation/one-decision-path.md): where the control host still decides per
+    request, and the plan that moves it to the node (#257)
   - [Research notes](explanation/research/) and the [prior art catalogue](explanation/prior-art.md)
   - [The origin conversation](explanation/00-origin-conversation.md)
 - Records: the [proof-of-concept test record](explanation/poc-results.md) and the

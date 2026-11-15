@@ -12,6 +12,10 @@
 //!            --udp 0.0.0.0:443=/wicket/sock/udp.sock --udp 198.18.0.1:53=/wicket/sock/udp.sock
 //! ```
 //!
+//! With `--control` ([`entry`]), it also does the agent user's part of the box's start (its
+//! directories, the CA bundle) and tells `wicket-entry` over a pipe when every listener is bound,
+//! so the box's start neither polls for it nor spawns a process per step (#287).
+//!
 //! Each accepted TCP connection gets a new connection to its unix socket, and bytes are relayed both
 //! ways. The forwarder enforces nothing: every decision is made by the proxies outside the box. It
 //! replaces socat, which experiment #62 measured costing ~40 ms on most new connections (no
@@ -85,6 +89,7 @@
 //! `wicket_proxy::h3`.
 
 pub mod copy;
+pub mod entry;
 pub mod frame;
 pub mod spec;
 pub mod stdin;

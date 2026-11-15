@@ -271,7 +271,8 @@ def self_test():
     case("a deleted crate file", ["crates/wicket-sandbox/src/gone.rs"], {"wicket-sandbox", "wicket-cli"}, ALL)
     case("an example zone", ["examples/demo.yaml"], lambda c: c != ALL and {"wicket-core", "wicket-authz", "wicket-feed"} <= c,
          set())
-    case("the agent image", ["images/claude-code/wicket-entry"], {"wicket-cli"}, lambda s: s != ALL and "smoke" in s)
+    case("the agent image", ["images/claude-code/wicket-entry"],
+         lambda c: c != ALL and {"wicket-cli", "wicket-fwd"} <= c, lambda s: s != ALL and "smoke" in s)
     case("a test the feed includes", ["crates/wicket-authz/tests/common/mod.rs"], lambda c: c != ALL and "wicket-feed" in c,
          set())
     case("an acceptance scenario", ["ci/acceptance/acp.yaml"], set(), {"acceptance", "acceptance-nodes"})

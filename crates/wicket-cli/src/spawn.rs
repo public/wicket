@@ -149,7 +149,51 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
         }
         _ => s.image.clone(),
     };
-    launch_as(c, &s.manifest, &image, None, Some(&adopt)).map(|_| ())
+    let child = launch_as(c, &s.manifest, &image, None, Some(&adopt))?;
+    record_quotas(c, &cm, &child, weight);
+    Ok(())
+}
+
+/// What was carved for child `child` (#256): its model budget, its box slots (`weight`: its own and
+/// the boxes it may start) and its memory, as quota grants made by this run, lasting the child's
+/// timeout (at most 24h, renewable). The record only: enforcement stays with the model proxy's
+/// reservation, the slot counter and the box's limits. A failure to record is audited, not fatal:
+/// the carve-out it describes has already been made.
+fn quotas(cm: &Manifest, weight: u32) -> Vec<wicket_store::Quota> {
+    use wicket_store::Quota;
+    let mut q = vec![];
+    if let Some(l) = &cm.zone.llm {
+        q.push(Quota { resource: "model.requests", amount: l.max_requests });
+        q.push(Quota { resource: "model.output_tokens", amount: l.max_output_tokens });
+        if let Some(i) = l.max_input_tokens {
+            q.push(Quota { resource: "model.input_tokens", amount: i });
+        }
+    }
+    q.push(Quota { resource: "children", amount: u64::from(weight) });
+    if let Some(b) = cm.zone.limits.memory_bytes() {
+        q.push(Quota { resource: "bytes", amount: b });
+    }
+    q
+}
+
+fn record_quotas(c: &SpawnCtx, cm: &Manifest, child: &str, weight: u32) {
+    let ttl = cm.zone.limits.timeout().map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).unwrap_or(0);
+    let by = format!("agent:{}", c.run);
+    let Ok(l) = c.ledger.lock() else { return };
+    let child = RunId(child.to_string());
+    match l.record_quota_grants(&c.parent.tenant, &cm.zone.name, &child, &by, &quotas(cm, weight), ttl) {
+        Ok(ids) => {
+            let _ = l.audit(&c.parent.tenant, Some(&c.run), "spawn.quotas", &serde_json::json!({ "child": child.0, "grants": ids }));
+        }
+        Err(e) => {
+            let _ = l.audit(
+                &c.parent.tenant,
+                Some(&c.run),
+                "spawn.quotas_unrecorded",
+                &serde_json::json!({ "child": child.0, "error": e.to_string() }),
+            );
+        }
+    }
 }
 
 /// A child its node started (#164), to take over: `wicket run --adopt`.
@@ -472,6 +516,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
             return Err(e);
         }
     };
+    record_quotas(c, &cm, &child, weight);
     let budget =
         cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
     let at = placed.as_ref().map(|p| format!(" on node {}", p.node)).unwrap_or_default();
@@ -900,6 +945,47 @@ mod tests {
         assert!(e.contains("max_children 1: this zone has 1 box(es) left"), "{e}");
         assert!(spawn(&p.ctx, program("c")).unwrap().starts_with("started"));
         assert!(spawn(&p.ctx, program("d")).unwrap_err().contains("at most 3"));
+    }
+
+    /// #256: what a spawn carves for a child (its model budget, its slots, its memory) is recorded
+    /// as quota grants made by the parent, each with a lifetime of at most 24h, bound to the child;
+    /// a launch that fails records none.
+    #[test]
+    fn a_spawn_records_its_carve_out_as_quota_grants() {
+        let mut p = parent(4, ZONE);
+        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/nonexistent/wicket".into());
+        assert!(spawn(&p.ctx, program("a")).is_err());
+        assert!(p.ctx.ledger.lock().unwrap().grants(&wicket_core::TenantId::single(), true, 100).unwrap().is_empty());
+        Arc::get_mut(&mut p.ctx).unwrap().exe = Some("/bin/true".into());
+        let agent =
+            SpawnRequest { kind: "agent".into(), task: Some("work".into()), command: vec![], zone: None, max_children: 1, ..program("a") };
+        let out = spawn(&p.ctx, agent).unwrap();
+        let child = out.split(" as run ").nth(1).and_then(|r| r.split(':').next()).unwrap().to_string();
+        let l = p.ctx.ledger.lock().unwrap();
+        let gs = l.quota_grants(&child).unwrap();
+        let mut got: Vec<(String, i64)> = gs.iter().map(|g| (g.quota().unwrap().to_string(), g.amount.unwrap())).collect();
+        got.sort();
+        let cm = Manifest::from_yaml(&std::fs::read_to_string(p.dir.join("children").join(format!("{child}.yaml"))).unwrap()).unwrap();
+        let llm = cm.zone.llm.clone().expect("a model budget");
+        let mut want = vec![
+            ("bytes".to_string(), 1 << 30),
+            ("children".to_string(), 2),
+            ("model.output_tokens".to_string(), llm.max_output_tokens as i64),
+            ("model.requests".to_string(), llm.max_requests as i64),
+        ];
+        if let Some(i) = llm.max_input_tokens {
+            want.push(("model.input_tokens".into(), i as i64));
+        }
+        want.sort();
+        assert_eq!(got, want);
+        let now = wicket_store::now();
+        for g in &gs {
+            assert_eq!(g.run.as_deref(), Some(child.as_str()));
+            assert!(g.expires_at > now && g.expires_at <= now + 3600, "the child's timeout, never more than 24h");
+            assert!(g.request_id.is_none() && !g.revoked);
+        }
+        let listed = l.grants(&wicket_core::TenantId::single(), false, 100).unwrap();
+        assert!(listed.iter().all(|g| g.decided_by == "agent:run_01parent"), "made by the parent");
     }
 
     /// #125: a launch that fails gives its slots back.
