@@ -18,6 +18,10 @@ ulid.workspace = true
 humantime.workspace = true
 url.workspace = true
 
+# The budget counter's atomics under loom (#325, tests/loom_budget.rs): RUSTFLAGS="--cfg loom".
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false }
 
@@ -26,5 +30,6 @@ name = "evaluate"
 harness = false
 
 [lints.rust]
-# `cargo kani` sets `cfg(kani)` for the proof harnesses (#325).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+# `cargo kani` sets `cfg(kani)` for the proof harnesses, and ci/kani.sh `cfg(loom)` for the loom
+# test (#325).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(loom)"] }

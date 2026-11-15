@@ -63,8 +63,12 @@ fn allow_iff() {
             // Named: the first rule that matched, which doesn't allow this risk.
             assert!(rules[i].0 && !allows(rules[i], risk) && !rules[..i].iter().any(|r| r.0));
         }
-        Decision::NeedsGrant(None) => assert!(!rules.iter().any(|r| r.0)),
-        Decision::Forbidden => assert!(forbidden),
+        Decision::NeedsGrant(None) => {
+            assert!(!rules.iter().any(|r| r.0));
+        }
+        Decision::Forbidden => {
+            assert!(forbidden);
+        }
     }
 }
 

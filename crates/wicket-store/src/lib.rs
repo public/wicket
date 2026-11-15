@@ -74,6 +74,8 @@ pub enum StoreError {
 pub const SCHEMA_VERSION: u32 = 5;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
+// A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
+const _: () = assert!(SCHEMA_FLOOR <= SCHEMA_VERSION);
 
 /// How long a message waits for its principal to have a live run (#250): a principal that starts
 /// within it gets the message; after it, it stays undelivered on the record.
@@ -101,7 +103,7 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
 fn check_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_META)?;
     let s = read_schema(conn)?;
-    if SCHEMA_VERSION < s.floor {
+    if !wicket_core::version::schema_opens(SCHEMA_VERSION, s.floor) {
         return Err(StoreError::TooNew { version: s.version, floor: s.floor });
     }
     if s.version < SCHEMA_VERSION || s.floor < SCHEMA_FLOOR {

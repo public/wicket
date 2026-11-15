@@ -352,7 +352,7 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Manifest;
 

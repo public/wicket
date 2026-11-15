@@ -82,29 +82,32 @@ pub fn canonical_path(path_and_query: &str) -> Result<Cow<'_, str>, CanonError> 
     Ok(path)
 }
 
-/// The checks every decided path passes: no odd characters, parameters, escapes or segments.
+/// The checks every decided path passes: no odd characters, parameters, escapes or segments. On
+/// bytes, and allocating only for an error's text: the Kani harnesses (#325, proofs/canon.rs) check
+/// this function itself.
 fn check_plain(path: &str) -> Result<(), CanonError> {
-    if path.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f) {
+    let b = path.as_bytes();
+    if b.iter().any(|&c| c == b'\\' || c < 0x20 || c == 0x7f) {
         return Err(CanonError::BadCharacter);
     }
     // `;` starts a path parameter for some servers (`/a;x/b`, `/..;/`): not one spelling per resource.
-    if path.contains(';') {
+    if b.contains(&b';') {
         return Err(CanonError::Parameter);
     }
     check_escapes(path)?;
     // Skip the leading empty segment; a single trailing slash is allowed.
-    let body = &path[1..];
-    if body.starts_with('/') {
+    let body = &b[1..];
+    if body.first() == Some(&b'/') {
         return Err(CanonError::EmptySegment); // "//", which the trailing-slash rule below would accept
     }
-    let body = body.strip_suffix('/').unwrap_or(body);
+    let body = body.strip_suffix(b"/").unwrap_or(body);
     if body.is_empty() {
         return Ok(());
     }
-    for seg in body.split('/') {
+    for seg in body.split(|&c| c == b'/') {
         match seg {
-            "" => return Err(CanonError::EmptySegment),
-            "." | ".." => return Err(CanonError::DotSegment),
+            b"" => return Err(CanonError::EmptySegment),
+            b"." | b".." => return Err(CanonError::DotSegment),
             _ => {}
         }
     }
@@ -131,7 +134,14 @@ fn npm_scoped(path: &str) -> Option<String> {
             && b[0] != b'.'
             && b.iter().all(|&c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'))
     };
-    (part(scope) && part(name)).then(|| format!("/@{scope}/{name}{rest}"))
+    (part(scope) && part(name)).then(|| {
+        // Pushed, not `format!`ted: the Kani harnesses (#325, proofs/canon.rs) take this path.
+        let mut decoded = String::with_capacity(path.len());
+        for s in ["/@", scope, "/", name, rest] {
+            decoded.push_str(s);
+        }
+        decoded
+    })
 }
 
 /// Every `%` must start an escape of two upper-case hex digits, for a byte that has to be escaped:
@@ -139,26 +149,41 @@ fn npm_scoped(path: &str) -> Option<String> {
 /// would miss it), and not a separator, dot, NUL or `%` itself.
 fn check_escapes(path: &str) -> Result<(), CanonError> {
     let b = path.as_bytes();
+    let hex = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    // The escape as written, for an error (all of the rest if it isn't three characters).
+    let esc = |at: usize| path.get(at..at + 3).unwrap_or(&path[at..]);
     let mut i = 0;
-    while let Some(off) = b[i..].iter().position(|&c| c == b'%') {
-        let at = i + off;
-        let esc = path.get(at..at + 3).unwrap_or(&path[at..]);
-        let hex = |c: u8| matches!(c, b'0'..=b'9' | b'A'..=b'F');
-        if esc.len() < 3 || !hex(esc.as_bytes()[1]) || !hex(esc.as_bytes()[2]) {
-            let lower = esc.to_ascii_lowercase();
-            if ["%2f", "%5c", "%2e", "%00", "%25"].contains(&lower.as_str()) {
-                return Err(CanonError::EncodedSeparator(lower));
-            }
-            return Err(CanonError::NonCanonicalEscape(esc.to_string()));
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
         }
-        let byte = u8::from_str_radix(&esc[1..], 16).expect("two hex digits");
+        let byte = match (b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (Some(h), Some(l)) => 16 * h + l,
+            _ => {
+                // Not canonical; a lower-case spelling of an encoded separator or dot says so.
+                let lower = |j: usize| b.get(i + j).map(u8::to_ascii_lowercase);
+                let sep = matches!(
+                    (lower(1), lower(2)),
+                    (Some(b'2'), Some(b'f' | b'e' | b'5')) | (Some(b'5'), Some(b'c')) | (Some(b'0'), Some(b'0'))
+                );
+                if sep && esc(i).len() == 3 {
+                    return Err(CanonError::EncodedSeparator(esc(i).to_ascii_lowercase()));
+                }
+                return Err(CanonError::NonCanonicalEscape(esc(i).to_string()));
+            }
+        };
         if matches!(byte, b'/' | b'\\' | b'.' | 0 | b'%') {
-            return Err(CanonError::EncodedSeparator(esc.to_ascii_lowercase()));
+            return Err(CanonError::EncodedSeparator(esc(i).to_ascii_lowercase()));
         }
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
-            return Err(CanonError::NonCanonicalEscape(esc.to_string()));
+            return Err(CanonError::NonCanonicalEscape(esc(i).to_string()));
         }
-        i = at + 3;
+        i += 3;
     }
     Ok(())
 }
@@ -166,6 +191,70 @@ fn check_escapes(path: &str) -> Result<(), CanonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #325 rewrote `check_plain` and `check_escapes` on bytes for Kani: they decide, and report,
+    /// exactly as the previous spellings did, on every path of up to 6 bytes over two alphabets that
+    /// spell every escape case.
+    #[test]
+    fn byte_wise_checks_agree_with_the_old_spelling() {
+        fn plain_was(path: &str) -> Result<(), CanonError> {
+            if path.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f) {
+                return Err(CanonError::BadCharacter);
+            }
+            if path.contains(';') {
+                return Err(CanonError::Parameter);
+            }
+            escapes_was(path)?;
+            let body = &path[1..];
+            if body.starts_with('/') {
+                return Err(CanonError::EmptySegment);
+            }
+            let body = body.strip_suffix('/').unwrap_or(body);
+            if body.is_empty() {
+                return Ok(());
+            }
+            for seg in body.split('/') {
+                match seg {
+                    "" => return Err(CanonError::EmptySegment),
+                    "." | ".." => return Err(CanonError::DotSegment),
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        fn escapes_was(path: &str) -> Result<(), CanonError> {
+            let b = path.as_bytes();
+            let mut i = 0;
+            while let Some(off) = b[i..].iter().position(|&c| c == b'%') {
+                let at = i + off;
+                let esc = path.get(at..at + 3).unwrap_or(&path[at..]);
+                let hex = |c: u8| matches!(c, b'0'..=b'9' | b'A'..=b'F');
+                if esc.len() < 3 || !hex(esc.as_bytes()[1]) || !hex(esc.as_bytes()[2]) {
+                    let lower = esc.to_ascii_lowercase();
+                    if ["%2f", "%5c", "%2e", "%00", "%25"].contains(&lower.as_str()) {
+                        return Err(CanonError::EncodedSeparator(lower));
+                    }
+                    return Err(CanonError::NonCanonicalEscape(esc.to_string()));
+                }
+                let byte = u8::from_str_radix(&esc[1..], 16).expect("two hex digits");
+                if matches!(byte, b'/' | b'\\' | b'.' | 0 | b'%') {
+                    return Err(CanonError::EncodedSeparator(esc.to_ascii_lowercase()));
+                }
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
+                    return Err(CanonError::NonCanonicalEscape(esc.to_string()));
+                }
+                i = at + 3;
+            }
+            Ok(())
+        }
+        for alphabet in [&b"/.%2EFf;"[..], b"%05cC4a/", b"%2eAD\\/"] {
+            for tail in crate::subset::tests::strings(alphabet, 5) {
+                for p in [format!("/{tail}"), format!("/{tail}\u{e9}"), format!("/%{tail}\u{e9}")] {
+                    assert_eq!(check_plain(&p), plain_was(&p), "{p:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn accepts_plain_paths() {
@@ -282,3 +371,7 @@ mod tests {
         assert_eq!(canonical_path("/@scope%2fname/a\\b"), Err(CanonError::BadCharacter));
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/canon.rs"]
+mod proofs;
