@@ -277,11 +277,12 @@ def self_test():
          set())
     case("the TLA+ models", ["verification/tla/GrantsOnNodes.tla", "verification/tla/fail_today.cfg"], set(), {"tla"})
     case("the TLA+ models' README", ["verification/tla/README.md"], set(), {"docs", "tla"})
-    case("code the grants model maps", ["crates/wicket-cli/src/noderun.rs"], {"wicket-cli"},
+    case("code the grants model maps", ["crates/wicket-cli/src/noderun.rs"], {"wicket-cli", "wicket-sim"},
          {"node-e2e", "acceptance-nodes", "tla"})
     case("an acceptance scenario", ["ci/acceptance/acp.yaml"], set(), {"acceptance", "acceptance-nodes"})
     # #324: the simulation's stand-ins follow the node's run loop, so its seeds run on a change to it.
-    case("the node's run loop", ["crates/wicket-cli/src/nodesrv.rs"], {"wicket-cli", "wicket-sim"}, {"node-e2e", "acceptance-nodes"})
+    case("the node's run loop", ["crates/wicket-cli/src/nodesrv.rs"], {"wicket-cli", "wicket-sim"},
+         {"node-e2e", "acceptance-nodes", "tla"})
     # A rule naming one path (no wildcard) names one that exists: a rename mustn't leave it behind.
     for pat, _, _ in rules:
         if "/" in pat and not any(ch in pat for ch in "*?[") and not (ROOT / pat).exists():
