@@ -13,6 +13,7 @@
 # CARGO_PROFILE_*), plus LOOP_CARGO_ARGS for `--config` overrides, all recorded with each line. The
 # target dir (LOOP_TARGET, default target-loop) is primed first (`prime`, timed too) and kept, so
 # a variant measured twice is warm the second time; delete it between variants that change flags.
+# LOOP_RUN=0 skips the test-run phase (for core it is measure.sh's test-run step).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 label=${1:?label}
@@ -27,7 +28,7 @@ read -r -a extra <<<"${LOOP_CARGO_ARGS:-}"
 record() { # case phase seconds peak_kib
   jq -nc --arg lbl "$label" --arg case "$1" --arg phase "$2" --argjson secs "$3" --argjson peak "$4" \
     --arg jobs "${CARGO_BUILD_JOBS:-}" --arg wrapper "$(basename "${RUSTC_WRAPPER:-}")" --arg incr "${CARGO_INCREMENTAL:-}" \
-    --arg rustflags "${RUSTFLAGS:-}" --arg cargo_args "${LOOP_CARGO_ARGS//$HOME/~}" --arg nextest "${LOOP_NEXTEST:-}" \
+    --arg rustflags "${RUSTFLAGS:-}" --arg cargo_args "$(c=${LOOP_CARGO_ARGS:-}; echo "${c//$HOME/~}")" --arg nextest "${LOOP_NEXTEST:-}" \
     --arg load "$(cut -d' ' -f1 /proc/loadavg)" --arg commit "$(git rev-parse --short HEAD)" \
     '{label: $lbl, case: $case, phase: $phase, secs: $secs, peak_mib: (($peak / 1024) | floor), commit: $commit,
       jobs: $jobs, rustc_wrapper: $wrapper, incremental: $incr, rustflags: $rustflags, cargo_args: $cargo_args,
@@ -85,7 +86,7 @@ for c in "${cases[@]}"; do
   trap 'git checkout -- "$f"' EXIT
   timed "$c" build cargo "${extra[@]}" build --locked -p wicket-cli
   timed "$c" test-build cargo "${extra[@]}" test --locked --no-run "${crates[@]}"
-  timed "$c" test-run bash -c "$(test_cmd "${crates[@]}")"
+  [ "${LOOP_RUN:-1}" = 0 ] || timed "$c" test-run bash -c "$(test_cmd "${crates[@]}")"
   git checkout -- "$f"
   trap - EXIT
   cargo "${extra[@]}" build --locked -p wicket-cli >/dev/null 2>&1
