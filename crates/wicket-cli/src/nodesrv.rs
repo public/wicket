@@ -1119,16 +1119,14 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
             bail!("unpacking the workspace failed");
         }
     }
+    // The state tree may be the agent's own (restored from its bundle), so a name in it may be a
+    // symlink it planted: every directory on the way is made a real one and each file is created
+    // new, never followed.
     for (rel, body) in &bs.state_files {
         if rel.split('/').any(|p| p.is_empty() || p == "..") {
             bail!("bad state file name {rel:?}");
         }
-        let p = dir.join("state").join(rel);
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&p, b64.decode(body)?)?;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+        crate::hibernate::write_owned(&dir.join("state"), rel, &b64.decode(body)?).with_context(|| format!("writing state file {rel}"))?;
     }
     let mut volume_mounts = vec![];
     for (name, target) in &bs.volumes {
