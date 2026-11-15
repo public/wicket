@@ -297,7 +297,7 @@ impl Exporter {
     /// `issuer`: the key checkpoints are signed with (none: records only, and a warning).
     pub fn new(ledger_path: &Path, cfg: SinksConfig, issuer: Option<wicket_identity::Issuer>) -> Result<Exporter> {
         let mut nonce = [0u8; 6];
-        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let sinks = cfg
             .sinks
             .iter()
@@ -683,7 +683,7 @@ mod tests {
     impl TmpDir {
         fn new(name: &str) -> TmpDir {
             let mut n = [0u8; 4];
-            getrandom::getrandom(&mut n).unwrap();
+            getrandom::fill(&mut n).unwrap();
             let d = std::env::temp_dir().join(format!("wicket-export-{name}-{}-{}", std::process::id(), hex::encode(n)));
             std::fs::create_dir_all(&d).unwrap();
             TmpDir(d)

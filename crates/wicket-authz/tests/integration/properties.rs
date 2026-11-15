@@ -6,9 +6,8 @@
 //! own semantics (the stock `AuthorizerBuilder` path, with no structural check) would not have let it
 //! widen either: the structural check bounds cost, narrowing comes from Biscuit.
 
-mod common;
+use crate::common::{self, *};
 use biscuit_auth::{AuthorizerBuilder, BlockBuilder};
-use common::*;
 use std::collections::HashSet;
 use wicket_authz::*;
 use wicket_core::RiskClass;

@@ -12,7 +12,7 @@ zone:
     secret: mock
     upstream: http://127.0.0.1:9998
     # The agent's budget over its whole life: 3 requests a turn (the step, the hibernate call, the
-    # end of the turn), 4 activations (first run, wake, the winning double wake, say). A fifth wake
+    # end of the turn), 4 activations (first run, wake, the winning double wake, a session prompt). A fifth wake
     # is refused.
     max_requests: 12
   volumes:

@@ -334,7 +334,7 @@ fn spki_of(pem: &str) -> Result<Vec<u8>> {
 /// A random positive 16-byte serial. (rcgen's default is a hash of the public key, which would repeat.)
 fn random_serial() -> Result<Vec<u8>> {
     let mut s = vec![0u8; 16];
-    getrandom::getrandom(&mut s).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    getrandom::fill(&mut s).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     s[0] &= 0x7f;
     s[0] |= 0x01;
     Ok(s)
