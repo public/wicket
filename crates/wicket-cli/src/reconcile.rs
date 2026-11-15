@@ -1482,6 +1482,30 @@ mod tests {
         assert!(matches!(a.approve(&ask("cap-y", 1)).await, Approval::Denied(_)));
     }
 
+    /// #300, #324: a capacity lease whose run ended with files its node kept (a fetch that failed)
+    /// isn't ended, so its node isn't destroyed with them; once they are collected it ends.
+    #[tokio::test]
+    async fn a_lease_whose_run_left_uncollected_files_is_kept() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_files", "alive:1");
+        let lease = approved_lease(&mut l, &c, "run_files");
+        w.pass(&mut l, NOW, false).await;
+        let node = l.lease(&lease).unwrap().unwrap().node_name.expect("its node");
+        l.run_ended(&RunId("run_files".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_files", Some(&node)).unwrap();
+        let d = w.pass(&mut l, NOW + 60, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active", "{d:?}");
+        assert!(d.iter().any(|x| x.kind == "lease_held"), "{d:?}");
+        l.set_run_uncollected("run_files", None).unwrap();
+        w.pass(&mut l, NOW + 120, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "ended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn killing_the_control_plane_mid_run_leaves_nothing_after_one_pass_static() {
         let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));

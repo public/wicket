@@ -88,9 +88,15 @@ crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
 crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
 crates/wicket-placement/**         | -   | acceptance-nodes
 # The simulation's stand-ins follow the node's and the control host's run loops (#324): a change to
-# them runs its seeds (crates/wicket-sim, its tests), as do changes to the crates it links.
+# them runs its seeds (crates/wicket-sim, its tests), as do changes to the crates it links. Its
+# second slice's follow the node's gateway (messages), and `place create`, the reconciler and a
+# run's supervisor (placement).
 crates/wicket-cli/src/nodesrv.rs   | wicket-sim | -
 crates/wicket-cli/src/noderun.rs   | wicket-sim | -
+crates/wicket-cli/src/nodegw.rs    | wicket-sim | -
+crates/wicket-cli/src/place.rs     | wicket-sim | -
+crates/wicket-cli/src/reconcile.rs | wicket-sim | -
+crates/wicket-cli/src/hibernate.rs | wicket-sim | -
 # The CLI's command groups (#223 split them out of main.rs): each changes its commands' --help (the
 # CLI reference) and is called by the suites listed. Not listed, so every suite: cmd/mod.rs, and the
 # groups nearly every suite calls (run, dev mock-llm, secret, identity, audit, image).
