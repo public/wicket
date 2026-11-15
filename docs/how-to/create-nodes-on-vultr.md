@@ -1,7 +1,7 @@
-# Place nodes on Vultr
+# Create nodes on Vultr
 
-Have wicket create nodes on Vultr inside a money envelope, by hand (`wicket place`) or for agents
-that ask (`request_capacity` and leases). [Nodes](../reference/nodes.md#provisioning-nodes-wicket-place)
+Have wicket create nodes on Vultr inside a money envelope, by hand (`wicket node create`) or for agents
+that ask (`request_capacity` and leases). [Nodes](../reference/nodes.md#creating-nodes-wicket-node-create)
 has the rules; this page is the recipe. On an installed control host, run these commands with
 `sudo`.
 
@@ -24,14 +24,14 @@ sudo -u wicket ssh-keygen -q -t ed25519 -N '' -C wicket-placement -f /var/lib/wi
 sudo cat /var/lib/wicket/ssh/placement.pub   # add this public half to the Vultr account, note its id
 ```
 
-`wicket place create` refuses a key it can't read before it creates anything, and asks for the spend
+`wicket node create` refuses a key it can't read before it creates anything, and asks for the spend
 on the terminal you run it from (`sudo` passes it through wicketd).
 
 ## 2. Create a node by hand
 
 ```sh
-wicket place plans --region lhr                     # plans and their hourly price
-wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
+wicket node plans --region lhr                     # plans and their hourly price
+wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
     --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id> --ssh-key /var/lib/wicket/ssh/placement \
     --hosts 'api.example.com'
 ```
@@ -51,7 +51,7 @@ wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetim
   checks the owner tag first), records a `placement.node_unreachable` audit record with the reason,
   and says so. Its cost leaves the envelope with it, so you can run `create` again, perhaps in
   another `--region`. A node that answers but doesn't finish setup within 15 minutes is still left
-  running, with the `wicket place release` command to run.
+  running, with the `wicket node release` command to run.
 - A retried `create` with the same `--idempotency-key` (default: derived from `--name`) finds the
   first instance instead of making a second.
 
@@ -65,12 +65,13 @@ wicket run task.yaml --node n2
 ```
 
 ```sh
-wicket place list                  # owned nodes, lease end and next paid hour
-wicket place release <instance-id> # destroy now and revoke the enrolment
+wicket node list                   # every node; a leased one with its lease end, provider and cost
+wicket node list --provider        # and what Vultr says: state, next paid hour, untracked instances
+wicket node release n2             # destroy now (by name or instance id) and revoke the enrolment
 ```
 
 Only instances tagged `wicket-owner-<installation>` (`--owner`, default the trust domain) are listed
-or destroyed; tag an instance `wicket-protected` to keep wicket's hands off it.
+by the provider or destroyed; tag an instance `wicket-protected` to keep wicket's hands off it.
 
 ## 3. Leases for agents
 

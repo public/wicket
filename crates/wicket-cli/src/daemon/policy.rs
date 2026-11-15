@@ -107,14 +107,16 @@ pub fn route(cmd: &Cmd) -> Route {
             LeaseCmd::Release { .. } => Forward(Revoke),
         },
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List => Forward(Read),
+            NodeCmd::List { provider: false, .. } => Forward(Read),
+            // Uses the provider's API key from the vault.
+            NodeCmd::List { provider: true, .. } | NodeCmd::Plans { .. } => Forward(Privileged),
+            // Spends money after a terminal prompt, or destroys a machine.
+            NodeCmd::Create(_) | NodeCmd::Release { .. } => Forward(Privileged),
             NodeCmd::Token { .. } | NodeCmd::Enrol { .. } | NodeCmd::Revoke { .. } | NodeCmd::RenewCa { .. } | NodeCmd::Install { .. } => {
                 Forward(Privileged)
             }
             NodeCmd::Serve { .. } | NodeCmd::Attach { .. } | NodeCmd::Top { .. } => Local,
         },
-        // Spends money after a terminal prompt.
-        Cmd::Place { .. } => Forward(Privileged),
         // Applying an org policy changes what every box may do, and revokes runs.
         Cmd::Policy { cmd } => match cmd {
             PolicyCmd::Show => Forward(Read),
@@ -354,7 +356,13 @@ mod tests {
             (&["node", "revoke", "n1"], Route::Forward(Privileged)),
             (&["node", "serve"], Route::Local),
             (&["node", "attach"], Route::Local),
-            (&["place", "plans"], Route::Forward(Privileged)),
+            (&["node", "list", "--provider"], Route::Forward(Privileged)),
+            (&["node", "plans"], Route::Forward(Privileged)),
+            (&["node", "release", "i-1"], Route::Forward(Privileged)),
+            (
+                &["node", "create", "--name", "n1", "--hosts", "example.com", "--max-hourly", "1", "--max-total", "1", "--ssh-key-id", "k"],
+                Route::Forward(Privileged),
+            ),
             (&["self", "status"], Route::Forward(Read)),
             (&["self", "update", "/tmp/w.tar.gz"], Route::Forward(Privileged)),
             (&["self", "update", "/tmp/w", "--nodes", "all"], Route::Forward(Privileged)),

@@ -77,7 +77,9 @@ pub enum StoreError {
 /// Version 7 (expand) adds `agents.claim_until`, the wake claim's end, which `agents.lease_until`
 /// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
-pub const SCHEMA_VERSION: u32 = 7;
+/// Version 8 (expand) adds `placed_nodes.hourly`: what a node from `wicket node create` costs per
+/// hour, for `wicket node list` (#358).
+pub const SCHEMA_VERSION: u32 = 8;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -329,7 +331,8 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE INDEX IF NOT EXISTS leases_status ON leases (tenant, status);
 CREATE TABLE IF NOT EXISTS placed_nodes (
   id TEXT PRIMARY KEY, backend TEXT NOT NULL, name TEXT NOT NULL, owner TEXT NOT NULL, api_key_secret TEXT NOT NULL,
-  created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT
+  created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT,
+  hourly INTEGER
 );
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
@@ -433,6 +436,8 @@ impl Ledger {
         if conn.execute("ALTER TABLE agents ADD COLUMN claim_until INTEGER", []).is_ok() {
             conn.execute("UPDATE agents SET claim_until = lease_until", [])?;
         }
+        // Ledgers created before placed nodes recorded their hourly price (#358).
+        let _ = conn.execute("ALTER TABLE placed_nodes ADD COLUMN hourly INTEGER", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 

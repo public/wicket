@@ -96,7 +96,7 @@ crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodecreate.rs| -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
 crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
 crates/wicket-placement/**         | -   | acceptance-nodes

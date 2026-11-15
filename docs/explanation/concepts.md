@@ -25,6 +25,9 @@ One word for each thing, used the same way in the CLI's help, the docs and wicke
 - A **harness** is the agent program a box runs and how wicket talks to it: Claude Code or an ACP
   agent (`agent.harness`). The harness decides when its run is done.
 - A **node** is a machine that runs boxes and decides their requests ([nodes](../reference/nodes.md)).
+  A machine leased from a provider (`wicket node create`) and one you already had (`wicket node
+  enrol`) are both nodes, and `wicket node list` lists both. Don't say "placement" for a node:
+  placement is the interface that gets one.
 - The **control host** is the machine wicket's state lives on: the node that also runs the control
   plane. The **control plane** is the role, not the machine: the ledger, the vault, the keys,
   approvals and the feed ([#197](https://github.com/public/wicket/issues/197) would let it run
@@ -39,7 +42,7 @@ One word for each thing, used the same way in the CLI's help, the docs and wicke
   lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
   authority.
 - A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved
-  ([placement and leases](#placement-and-leases)). Nothing else is a lease: a long-lived agent's
+  ([placement and leases](#placement-and-leases)). Nothing else is a lease, and "lease" is the only word for a node's rented time: a long-lived agent's
   holder has a **claim** on it, and a node has a budget slice.
 - A **quota grant** is a grant of an amount, not of reach: a run's model budget and box slots, or a
   lease's money (`QUOTA wicket.internal/quota/…`, `wicket grant list`). A child's are carved from its
@@ -274,7 +277,8 @@ the connector's, or an operator approves. Every link is recorded and audited. It
 - **Placement** (`wicket-placement`) gets nodes from a backend: the operator's own static hosts, or
   Vultr. Every node carries the installation's owner tag; nothing without it, or tagged
   `wicket-protected`, is ever listed or destroyed. Spending stays inside an hourly and a total envelope,
-  and each paid create is confirmed.
+  and each paid create is confirmed. An operator leases a node by hand with `wicket node create` and
+  ends it with `wicket node release`.
 - **A lease**, a grant of capacity, is how an agent gets a machine without holding a cloud credential. The agent asks with
   `request_capacity`. The ask becomes a pending lease with its worst-case cost reserved against
   `placement.yaml`'s budget, and only an operator approves it. The approval is bound to that lease. The

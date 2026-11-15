@@ -1,4 +1,4 @@
-//! `wicket node`, `place`, `lease` and `reconcile`: nodes, capacity and cleanup.
+//! `wicket node`, `lease` and `reconcile`: nodes, capacity and cleanup.
 //!
 //! One module per command group, out of `main.rs` (#220): a PR that changes one group's flags or
 //! handling touches only its own file.
@@ -47,7 +47,17 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 })
                 .await
             }
-            NodeCmd::List => enrol::list(),
+            NodeCmd::List { provider, common } => {
+                enrol::list()?;
+                if provider {
+                    println!();
+                    nodecreate::list_provider(&common).await?;
+                }
+                Ok(())
+            }
+            NodeCmd::Create(args) => nodecreate::create(*args).await,
+            NodeCmd::Release { common, id } => nodecreate::release(common, id).await,
+            NodeCmd::Plans { common, region, plan_type } => nodecreate::plans(common, region, plan_type).await,
             NodeCmd::Revoke { name } => {
                 let mut l = Ledger::open(&ledger_path())?;
                 let serials = enrol::revoke(&mut l, &enrol::Paths::installation().nodes_dir, &name)?;
@@ -62,7 +72,6 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             NodeCmd::Attach { dir } => nodesrv::attach(dir).await,
             NodeCmd::Top { dir, once, json } => crate::top::node_top(dir, once, json).await,
         },
-        Cmd::Place { cmd } => place::run(cmd).await,
         _ => unreachable!("dispatched to the wrong command group"),
     }
 }
@@ -77,7 +86,7 @@ pub enum NodeCmd {
         #[arg(long, default_value = "1h")]
         ttl: String,
     },
-    /// Enrol a node over ssh: pin its host key, have it make its node key and CA key, and give it a
+    /// Enrol a machine you already have, over ssh: pin its host key, have it make its node key and CA key, and give it a
     /// short-lived identity certificate for its node key, a short-lived CA certificate constrained to
     /// --hosts, the feed root key and the issuer key.
     Enrol {
@@ -109,8 +118,36 @@ pub enum NodeCmd {
         #[arg(long, default_value = "24h")]
         cert_ttl: String,
     },
-    /// List enrolled nodes.
-    List,
+    /// List nodes: each enrolled node, and each node's lease, provider and cost if it has them (a
+    /// node from `wicket node create` or a capacity lease), with any leased node not enrolled.
+    List {
+        /// Also ask the provider (Vultr) for this installation's instances by owner tag: their state,
+        /// cost and next paid hour, and any this ledger doesn't record.
+        #[arg(long)]
+        provider: bool,
+        #[command(flatten)]
+        common: nodecreate::Common,
+    },
+    /// Lease a machine from a provider (Vultr) and enrol it: inside a money envelope, after approval
+    /// on this terminal, with its ssh host key generated here and pinned at creation.
+    Create(Box<nodecreate::CreateArgs>),
+    /// Destroy a node `wicket node create` made, now (refusing anything without the owner tag), and
+    /// revoke its enrolment.
+    Release {
+        #[command(flatten)]
+        common: nodecreate::Common,
+        /// The provider's instance id, or the node's name.
+        id: String,
+    },
+    /// List a provider's (Vultr's) plans in a region, with their hourly price.
+    Plans {
+        #[command(flatten)]
+        common: nodecreate::Common,
+        #[arg(long, default_value = "lhr")]
+        region: String,
+        #[arg(long, default_value = "vc2")]
+        plan_type: String,
+    },
     /// Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates
     /// are revoked, and runs connected to it drop it) and record its CA serials for the feed's
     /// revocation list.

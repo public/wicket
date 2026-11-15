@@ -1681,7 +1681,7 @@ fn dashboard(state: &State) -> Result<Value> {
     }))
 }
 
-/// Nodes `wicket place create` made that are still owned (#294), each with whether its lease has
+/// Nodes `wicket node create` made that are still owned (#294), each with whether its lease has
 /// ended and the runs still holding it past then (the reconciler keeps those and warns).
 pub(crate) fn placed_view(l: &wicket_store::Ledger, now: i64) -> Result<Vec<Value>> {
     Ok(l.placed_nodes(&["active"])?
