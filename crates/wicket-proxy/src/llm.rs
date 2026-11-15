@@ -791,6 +791,10 @@ impl Llm {
             }
             Err(e) => {
                 self.settle(reserved, Usage::default(), true);
+                if let Some(r) = crate::egress::tripped_response(&e) {
+                    self.event(f.model, 403, Usage::default(), &format!("{e}"));
+                    return r;
+                }
                 self.event(f.model, 502, Usage::default(), &format!("upstream error: {e:#}"));
                 problem(502, "upstream", "Model upstream error", &format!("{e:#}"), None)
             }

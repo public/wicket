@@ -44,22 +44,27 @@ impl Egress {
         if via == Via::H3 && scheme == "https" && !self.upstream.no_h3 {
             if let Some(up) = self.h3_up().await {
                 if let Some(r) = up.try_send(host, &out).await {
-                    return r.map(|r| self.clean(r, &out.injected));
+                    return r.map(|r| self.clean(r, host, &out.method, &out.injected));
                 }
             }
         }
-        let Outgoing { method, url, headers, body, injected } = out;
+        let Outgoing { method, url, headers, body, injected, tripped } = out;
         let body = match body {
             OutBody::Buffered(b) => reqwest::Body::from(b),
             OutBody::Streamed(b) => b,
         };
-        let resp = self.client.request(method, &url).headers(headers).body(body).send().await?;
+        let sent = self.client.request(method.clone(), &url).headers(headers).body(body).send().await;
+        // A streamed body the tripwire cut off (#362): refused, not an upstream error.
+        if let Some(what) = tripped.get() {
+            return Err(self.trip(host, what));
+        }
+        let resp = sent?;
         let mut head = Response::builder().status(StatusCode::from_u16(resp.status().as_u16())?);
         for (name, value) in resp.headers().iter() {
             head = head.header(name, value);
         }
         let stream = resp.bytes_stream().map_ok(Frame::data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-        Ok(self.clean(head.body(BodyExt::boxed(StreamBody::new(stream)))?, &injected))
+        Ok(self.clean(head.body(BodyExt::boxed(StreamBody::new(stream)))?, host, &method, &injected))
     }
 
     /// The HTTP/3 upstream (made on first use); None if its UDP socket can't be had.
@@ -80,25 +85,130 @@ impl Egress {
 
     /// Drops hop-by-hop response headers, and any that would reflect an injected credential back into
     /// the box. `content-length` stays: the body passes through unchanged (#142), so clients keep
-    /// download sizes and progress.
-    pub(super) fn clean(&self, resp: Response<BoxBody>, injected: &[String]) -> Response<BoxBody> {
+    /// download sizes and progress. From a host a credential was attached to, the body must come
+    /// unencoded, and every form of the credential in it is masked as it streams (#362).
+    pub(super) fn clean(&self, resp: Response<BoxBody>, host: &str, method: &Method, injected: &[String]) -> Response<BoxBody> {
         let (mut parts, body) = resp.into_parts();
+        let scan = canary::Scanner::secrets(injected);
+        if !injected.is_empty() {
+            if let Some(enc) = encoded(&parts.headers).filter(|_| *method != Method::HEAD && !matches!(parts.status.as_u16(), 204 | 304)) {
+                let why = format!(
+                    "{host} answered with a {enc}-encoded body, which wicket can't check for the credential it attached to the request"
+                );
+                self.anomaly(host, "response.encoded", &why);
+                return problem(
+                    502,
+                    "upstream",
+                    "Upstream error",
+                    &format!("refused: {why} (it was asked for an unencoded one). {}", crate::SANDBOX_FACT),
+                    None,
+                );
+            }
+        }
         let names: Vec<http::HeaderName> = parts.headers.keys().cloned().collect();
         for name in names {
             if HOP_BY_HOP.contains(&name.as_str()) {
                 parts.headers.remove(&name);
                 continue;
             }
-            let leaks = parts
-                .headers
-                .get_all(&name)
-                .iter()
-                .any(|v| injected.iter().any(|s| v.as_bytes().windows(s.len()).any(|w| w == s.as_bytes())));
+            let leaks = parts.headers.get_all(&name).iter().any(|v| scan.first(v.as_bytes()).is_some());
             if leaks {
                 parts.headers.remove(&name);
             }
         }
+        if scan.is_empty() {
+            return Response::from_parts(parts, body);
+        }
+        let (ledger, tenant, run, h) = (self.ctx.ledger.clone(), self.ctx.tenant.clone(), self.ctx.run.clone(), host.to_string());
+        let body = canary::guard_response(body, scan, move || {
+            let why = format!("{h} reflected the credential wicket attached to the request; it was masked before the box saw it");
+            tracing::warn!(host = %h, "{why}");
+            if let Ok(l) = ledger.lock() {
+                let _ = l.audit_deferred(
+                    &tenant,
+                    Some(&run),
+                    "anomaly",
+                    &serde_json::json!({ "anomaly": "secret.reflected", "host": h, "why": why }),
+                );
+            }
+        });
         Response::from_parts(parts, body)
+    }
+
+    /// Audits an anomaly (#362): something the box (or an upstream) did that wicket refused or
+    /// masked, kept apart from ordinary refusals.
+    fn anomaly(&self, host: &str, anomaly: &str, why: &str) {
+        tracing::warn!(host, anomaly, "{why}");
+        if let Ok(l) = self.ctx.ledger.lock() {
+            let _ = l.audit_deferred(
+                &self.ctx.tenant,
+                Some(&self.ctx.run),
+                "anomaly",
+                &serde_json::json!({ "anomaly": anomaly, "host": host, "why": why }),
+            );
+        }
+    }
+
+    /// The tripwire went off (#362): audited as an anomaly, counted as a strike, and the error that
+    /// refuses the request.
+    pub(super) fn trip(&self, host: &str, what: &str) -> anyhow::Error {
+        self.anomaly(host, "placeholder.moved", what);
+        let note = self.strike(&format!("placeholder {host}"));
+        canary::Tripped { what: what.to_string(), note }.into()
+    }
+
+    /// The tripwire on the request's URL and headers (#362): this run's placeholders (and any other
+    /// run's) appear only as `Authorization: Bearer <placeholder>` to the placeholder's own host.
+    fn tripwire(&self, headers: &http::HeaderMap, host: &str, pq: &str, scan: &canary::Scanner) -> Result<()> {
+        let tag = self.ctx.run.0.replace('_', "-");
+        let whose = |seen: &[u8]| {
+            let seen = String::from_utf8_lossy(seen);
+            match self.ctx.swaps.iter().find(|s| s.placeholder == seen) {
+                Some(s) => format!("the placeholder for {}", s.name),
+                None if seen.contains(&tag) => "one of this run's credential placeholders".to_string(),
+                None => "another run's credential placeholder".to_string(),
+            }
+        };
+        let decoded = canary::percent_decode(pq);
+        for url in [pq.as_bytes(), &decoded] {
+            if let Some(r) = scan.first(url) {
+                return Err(self.trip(host, &format!("{} in the URL for {host}", whose(&url[r]))));
+            }
+        }
+        for (name, value) in headers {
+            if name == http::header::AUTHORIZATION {
+                if let Some(p) = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")) {
+                    if self.ctx.swaps.iter().any(|s| s.placeholder == p && host_matches(&s.host, host)) {
+                        continue; // its one slot, on its own host
+                    }
+                    if let Some(s) = self.ctx.swaps.iter().find(|s| s.placeholder == p) {
+                        return Err(
+                            self.trip(host, &format!("the placeholder for {} sent to {host}, which isn't its host ({})", s.name, s.host))
+                        );
+                    }
+                }
+            }
+            if let Some(r) = scan.first(value.as_bytes()) {
+                return Err(self.trip(host, &format!("{} in the {name} header to {host}", whose(&value.as_bytes()[r]))));
+            }
+        }
+        Ok(())
+    }
+
+    /// A bearer the box presented to a host it holds a placeholder for, that isn't the placeholder
+    /// (often a stale or forged one): dropped, and audited once per host per run (#362).
+    fn unknown_placeholder(&self, host: &str) {
+        let first = self.skipped.lock().expect("skipped").insert(format!("unknown-placeholder\n{host}"));
+        if first {
+            if let Ok(l) = self.ctx.ledger.lock() {
+                let _ = l.audit_deferred(
+                    &self.ctx.tenant,
+                    Some(&self.ctx.run),
+                    "placeholder.unknown",
+                    &serde_json::json!({ "host": host, "why": "a bearer that isn't this run's placeholder for the host was dropped" }),
+                );
+            }
+        }
     }
 
     /// Strips the box's credentials and headers, injects the zone's, and readies the body: streamed
@@ -113,6 +223,13 @@ impl Egress {
         // What the box put in Authorization: only ever a placeholder, to be swapped (below) or dropped.
         let box_auth = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
         let url = format!("{scheme}://{host}{pq}");
+        // The tripwire (#362). A model call's body is the conversation, which may quote a
+        // placeholder (an agent reading its own files): it isn't scanned; its URL and headers are.
+        let scan = canary::Scanner::placeholders(self.ctx.swaps.iter().map(|s| s.placeholder.as_str()));
+        self.tripwire(&parts.headers, host, pq, &scan)?;
+        let path = pq.split('?').next().unwrap_or("/");
+        let scan_body = !self.model_gate.get().is_some_and(|l| l.is_model_call(host, path));
+        let tripped: Arc<std::sync::OnceLock<String>> = Arc::default();
         // Only allow-listed headers go upstream (#130); credentials are added below, by wicket.
         let mut headers = http::HeaderMap::new();
         for (name, value) in parts.headers.iter() {
@@ -138,12 +255,19 @@ impl Egress {
             if let Some(n) = length {
                 headers.insert(http::header::CONTENT_LENGTH, n.into());
             }
-            let limited = Limited::new(body, usize::try_from(MAX_STREAMED_BODY).unwrap_or(usize::MAX));
-            OutBody::Streamed(reqwest::Body::wrap_stream(limited.into_data_stream()))
+            let limited = Limited::new(body, usize::try_from(MAX_STREAMED_BODY).unwrap_or(usize::MAX)).into_data_stream();
+            if scan_body {
+                OutBody::Streamed(reqwest::Body::wrap_stream(canary::guard_request(limited, scan, tripped.clone())))
+            } else {
+                OutBody::Streamed(reqwest::Body::wrap_stream(limited))
+            }
         } else {
             let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
             if matches!(parts.method, Method::GET | Method::HEAD) && !body.is_empty() {
                 anyhow::bail!("refused: a {} request with a body", parts.method);
+            }
+            if scan_body && scan.first(&body).is_some() {
+                return Err(self.trip(host, &format!("a credential placeholder in the body of a request to {host}")));
             }
             OutBody::Buffered(body)
         };
@@ -211,11 +335,20 @@ impl Egress {
                         headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(auth)?);
                         tracing::debug!(host, "the box's own bearer passed (box_bearers)");
                     }
+                    None if self.ctx.swaps.iter().any(|s| host_matches(&s.host, host)) => {
+                        tracing::debug!(host, "box-supplied authorization dropped (not this run's placeholder)");
+                        self.unknown_placeholder(host);
+                    }
                     None => tracing::debug!(host, "box-supplied authorization dropped (not a known placeholder)"),
                 }
             }
         }
-        Ok(Outgoing { method: parts.method, url, headers, body, injected })
+        // What comes back from a host a credential went to is scanned for it (#362), so it must come
+        // unencoded.
+        if !injected.is_empty() {
+            headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
+        }
+        Ok(Outgoing { method: parts.method, url, headers, body, injected, tripped })
     }
 }
 
@@ -252,4 +385,18 @@ pub fn render_credential(format: &str, secret: &str) -> String {
         out.replace_range(start..start + len + 1, &enc);
     }
     out
+}
+
+/// A response's content or transfer coding other than identity (and chunked), if it has one.
+fn encoded(h: &http::HeaderMap) -> Option<String> {
+    let codings = h.get_all(http::header::CONTENT_ENCODING).iter().chain(h.get_all(http::header::TRANSFER_ENCODING).iter());
+    for v in codings {
+        for c in String::from_utf8_lossy(v.as_bytes()).split(',') {
+            let c = c.trim().to_ascii_lowercase();
+            if !c.is_empty() && c != "identity" && c != "chunked" {
+                return Some(c);
+            }
+        }
+    }
+    None
 }

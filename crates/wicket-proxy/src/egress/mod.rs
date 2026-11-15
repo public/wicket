@@ -23,10 +23,12 @@ use std::path::Path;
 use std::sync::Arc;
 use wicket_core::{canonical_path, manifest::host_matches};
 
+mod canary;
 mod connect;
 mod hosts;
 mod outgoing;
 
+pub(crate) use canary::tripped_response;
 #[cfg(test)]
 use connect::parse_head;
 use outgoing::refused_shape;
@@ -123,6 +125,8 @@ pub(crate) struct Outgoing {
     pub body: OutBody,
     /// What must never be reflected back into the box (injected secrets and their rendering).
     pub injected: Vec<String>,
+    /// Set when a streamed body is cut off by the tripwire (#362): what it held.
+    pub tripped: Arc<std::sync::OnceLock<String>>,
 }
 
 /// A request body on its way upstream.
@@ -490,6 +494,7 @@ impl Egress {
         }
         match self.forward(req, &host, scheme, &pq, via).await {
             Ok(r) => r,
+            Err(e) if canary::tripped_response(&e).is_some() => canary::tripped_response(&e).expect("tripped"),
             // The whole chain: a refused dial (#116) says why at its end.
             Err(e) => problem(502, "upstream", "Upstream error", &format!("{e:#}"), None),
         }
