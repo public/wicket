@@ -139,7 +139,11 @@ async fn link(node: &Rc<Node>, s: turmoil::net::TcpStream) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_rx = tokio::time::Instant::now();
     loop {
+        // `biased`: unbiased, `select!` picks among ready branches with tokio's own RNG, which
+        // the seed doesn't reach, so a frame and a tick due at the same simulated instant ran in
+        // either order (#324). What has arrived is handled before the tick acts on it.
         tokio::select! {
+            biased;
             f = rx.recv() => {
                 let Some((kind, body)) = f else { return };
                 last_rx = tokio::time::Instant::now();
