@@ -1062,8 +1062,10 @@ mod tests {
         assert!(s.woke && s.run.is_none(), "{s:?}");
         assert_eq!(woken.lock().unwrap().len(), 1);
         assert_eq!(woken.lock().unwrap()[0].0, agent);
-        // The new activation's identity takes both held messages, and it reads them in order.
+        // The waker's claim takes both held messages (its first turn can say so), and the new
+        // activation reads them in order.
         assert_eq!(w.ledger.lock().unwrap().claim_wake(&agent, "run_new", wicket_store::now() + 30).unwrap(), Some(2));
+        assert_eq!(w.ledger.lock().unwrap().waiting_messages("run_new").unwrap(), 2);
         let mut new = w.agent("t0", "z", "peer", "run_new", None, &["z"]);
         new.fence = Some(crate::Fence { agent: agent.clone(), generation: 2 });
         assert_eq!(w.ledger.lock().unwrap().waiting_messages("run_new").unwrap(), 2);
