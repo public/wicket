@@ -747,7 +747,7 @@ impl Ledger {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let m: Option<StoredMessage> = tx
             .query_row(
-                "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, id LIMIT 1",
+                "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, rowid LIMIT 1",
                 params![run],
                 |r| Ok(StoredMessage { id: r.get(0)?, from_run: r.get(1)?, envelope: r.get(2)?, created_at: r.get(3)? }),
             )
