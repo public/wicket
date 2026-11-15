@@ -47,6 +47,9 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   and every grant covers nothing riskier than the request you were shown: approving an R2 prefix doesn't
   allow the R4 operations (workflow edits, merges, access changes) under it. An agent whose identity
   doesn't verify (or was revoked since you were shown the ask) can be denied, not approved.
+- **register a device for notifications, and show the request on one** (`push_subscribe`,
+  `push_details`): see [notifications](#notifications). Removing a device and hiding the request
+  need only the session.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
@@ -127,15 +130,30 @@ update, spawn and link asks. It works in desktop browsers and in the console add
 iPad home screen (iOS 16.4 or later; Safari tabs can't get pushes). [Get notified of
 approvals](../how-to/get-notified-of-approvals.md) sets it up.
 
-- **Subscribing** takes a signed-in session. The **Enable notifications** button in the
-  *Notifications* section asks for the browser's permission (only on that tap, as iOS requires),
-  registers the service worker (`/sw.js`), subscribes with the console's VAPID public key, and posts
-  the subscription (`POST /api/push/subscribe`). Listing (`GET /api/push`), removing
-  (`POST /api/push/remove`) and the per-device setting (`POST /api/push/details`) take a session
-  too. Each device belongs to the passkey that was signed in when it subscribed. An operator sees
-  and changes only their own devices, and a passkey that is no longer enrolled gets no pushes.
-  Every change is audited (`operator.push_subscribed`, `operator.push_details`,
-  `operator.push_removed`) with the device's id, never its endpoint.
+- **Registering a device is a signed action**, `push_subscribe`, like approving or starting a run:
+  a stolen session cookie alone can't add a device that receives notifications. The **Enable
+  notifications** button in the *Notifications* section asks for the browser's permission (only on
+  that tap, as iOS requires), registers the service worker at `/sw.js` with scope `/`, subscribes
+  with the console's VAPID public key, and asks your passkey to sign the registration. The
+  confirmation, and the JSON the passkey signs, name the device by its id (the first 16 hex digits
+  of the endpoint's sha256), its label and push service and whether it shows details, with the
+  sha256 of its endpoint and of its keys (never the endpoint or keys themselves). The endpoint and
+  keys are checked at `begin`, before anything is signed.
+- **Showing the request on a device is signed too**, `push_details` (ticking *Show the agent and
+  what it asks for*), as it widens what the device's lock screen shows.
+- **What a session alone may do**: list devices (`GET /api/push`), remove one
+  (`POST /api/push/remove`) and turn a device's details off (`POST /api/push/details` with
+  `"details": false`). These only narrow what a device receives. `POST /api/push/subscribe`, and
+  `POST /api/push/details` with `"details": true`, are refused with 403 and audited as
+  `operator.push_refused` (with the passkey the session belongs to and the reason).
+- **Whose devices.** Each device belongs to the passkey that was signed in when it was registered
+  (any of the operator's passkeys may sign). An operator sees and changes only their own devices,
+  and a passkey that is no longer enrolled gets no pushes.
+- **Audit.** Every change is audited with the device's id, never its endpoint:
+  `operator.push_subscribed` and `operator.push_details` (details on) with the passkey and the signed
+  record, which `wicket audit --verify` re-verifies offline; `operator.push_details` (details off)
+  and `operator.push_removed` with the session's passkey; `operator.push_refused` for an unsigned
+  attempt to widen.
 - **Where pushes go.** A subscription's endpoint must be an `https://` URL on the default port with
   no user info, on a known push service: `fcm.googleapis.com` (Chrome, Edge on Android),
   `*.push.apple.com` (Safari, iOS), `updates.push.services.mozilla.com` (Firefox) or
@@ -156,6 +174,14 @@ approvals](../how-to/get-notified-of-approvals.md) sets it up.
   identities are never sent. Push services see only ciphertext, its size and when it was sent.
 - **Tapping a notification** focuses the console if it is open and marks that request's card, or
   opens `/#pending/<id>`. Approving still needs a sign-in and a passkey signature, as always.
+- **A replaced subscription.** A browser may replace a device's subscription (Chrome and Firefox
+  fire `pushsubscriptionchange`; Safari doesn't). The service worker can't register the new one: a
+  registration is signed, and only the page can ask for the passkey. So it subscribes again with the
+  same VAPID key if the browser hasn't already, tells any open console, and shows one notification
+  ("Notifications on this device need renewing"); tapping it opens `/#notifications`. Whenever the
+  console is open and this browser holds a subscription it doesn't know, *Notifications* says so and
+  offers **Re-register this device**, a signed `push_subscribe`. Until then the device gets nothing;
+  the old subscription is dropped when its push service answers 404 or 410.
 - **Gone devices.** A push service that answers 404 or 410 has dropped the subscription. The
   console removes it and audits `operator.push_removed` with `"by": "push service"`. Other failures
   are logged with the device id and push service host, never the endpoint.
@@ -198,7 +224,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
 - **Sessions** are `__Host-wicket_sid` cookies (Secure, HttpOnly, SameSite=Strict, Path=/), new at every
   sign-in, ending after 15 minutes idle or 8 hours in any case. `wicket operator sessions` lists them on the
   host and `wicket operator revoke-session ID` (or `--all`) ends them. Every action is still separately
-  passkey-signed, so a stolen cookie alone approves nothing.
+  passkey-signed, so a stolen cookie alone approves nothing, and registers no notification device.
 - **Browser.** No inline script or style (the script and stylesheet are hashed static files with Subresource
   Integrity), `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src
   'self'; img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
