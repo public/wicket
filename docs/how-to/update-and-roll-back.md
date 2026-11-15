@@ -33,7 +33,7 @@ is the one not to run: the new build refuses to run as root from there anyway.
 
 ## Once: trust a release key
 
-An update is accepted only if a release key this installation trusts signed it, or a human approved
+An update is accepted only if a release key this installation trusts signed it, or an operator approved
 its sha256 ([run wicket in wicket](run-wicket-in-wicket.md)). There is no switch that skips this.
 
 ```sh

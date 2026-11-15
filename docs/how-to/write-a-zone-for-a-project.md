@@ -48,7 +48,7 @@ narrowly as the work allows; `*` matches one path segment and `**` any number:
 - R3 and R4 requests (pushes, merges, workflow edits, comments on GitHub; cloud APIs) need a grant
   even inside reach unless the rule says `allow_dangerous: true`. Leave that off unless you mean it
   ([risk classes](../reference/risk-classes.md)).
-- What you would approve only sometimes stays out of reach: a human decides each one.
+- What you would approve only sometimes stays out of reach: an operator decides each one.
 
 ## 3. Forbid what must never happen
 

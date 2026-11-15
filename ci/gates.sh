@@ -12,7 +12,7 @@
 #   --only-e2e     the end-to-end suites only (a build of wicket-cli first)
 #   --suites "…"   these suites instead of the selected ones
 #
-# Always: rustfmt, ci/check-public.py and the Markdown link check. Rust: clippy and the tests of the
+# Always: rustfmt, ci/check-public.py, the Markdown link check and the term check. Rust: clippy and the tests of the
 # selected crates, with cargo-nextest when it is installed (a retried test that then passed is
 # reported as flaky, never hidden), else cargo test. End-to-end suites run against
 # target/debug/wicket; they need what each script says (Docker with runsc, the agent image, sudo).
@@ -80,6 +80,7 @@ if [ "$rust" = 1 ]; then
   step "rustfmt" cargo fmt --all -- --check
   step "no secrets or machine details" python3 ci/check-public.py
   step "Markdown links" ci/check-doc-links.sh
+  step "terms" ci/check-terms.sh
 fi
 
 # ---- Rust ----

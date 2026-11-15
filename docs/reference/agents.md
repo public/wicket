@@ -18,10 +18,10 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
   sender. A message names a principal (its identity above, or `"parent"`), never a run: it reaches the
   agent's live run, or waits for its next one. Parent and child may always talk; others only if the
   recipient's `accept_from` lists their principal or zone.
-- `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own sandbox and identity, in a
+- `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own box and identity, in a
   zone the agent writes. That zone must be a subset of the agent's own: reach, credentials, model budget (carved
   out), resources, time, isolation, images and `max_children` (a child's own count against the parent's). Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
-  exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
+  exactly that zone to an operator. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
   `in_box_subagents: false` to make wicket children the only kind of subagent.
 - A run's model budget and box slots are quota grants (#256, `wicket grant list`): a root run's are recorded
   from its zone when it starts, made by whoever started it; a child's are what its parent carved for it, recorded
@@ -31,13 +31,13 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - Boxes reach each other's ports only through links, which wicket relays (boxes still have no network):
   `expose(port)` offers a port, `connect(box, port)` returns `<name>.wicket.internal:<port>` in the caller's box,
   and `link(from, to, port)` wires two boxes the caller controls. A box's own children are connectable without
-  `expose`; others need its `expose` and its zone's `accept_from`, or a human. The target's reach must be within
-  the connector's, or a human approves. Every link is audited (`wicket links`, `wicket unlink <id>`), and closes
+  `expose`; others need its `expose` and its zone's `accept_from`, or an operator. The target's reach must be within
+  the connector's, or an operator approves. Every link is audited (`wicket links`, `wicket unlink <id>`), and closes
   when cut, when either end is revoked or when either run ends. See `examples/links/`.
 - Identities are short-lived: valid 10 minutes, re-issued every 5 with a fresh key (`WICKET_IDENTITY_TTL` to change).
   `wicket identity revoke <run>` stops the run's box and everything it started, and refuses its messages
   and approvals.
-- Every identity records who it acts for, back to the human: `acting for: alice (cli, unix-user) → lead → fetcher`.
+- Every identity records who it acts for, back to the operator: `acting for: alice (cli, unix-user) → lead → fetcher`.
 - `wicket audit --verify` re-checks every identity ever issued (rotations included) and every message signature,
   offline.
 
@@ -131,10 +131,10 @@ Not yet: signing of bundles, an S3 backend, and the gVisor checkpoint fast path.
 and its working directory at the same path, and a node's channel may drop output while disconnected, which
 that protocol can't survive.
 
-## Remote sessions and wrapped agents
+## Remote Control sessions and wrapped agents
 
 Three [harness modes](manifest.md#harness-modes) put an agent in a box in the vendor's apps:
-remote (`agent.remote`), which boots the harness's own remote-session feature in the box (#169) for
+remote (`agent.remote`), which boots the harness's own Remote Control feature in the box (#169) for
 the owner to drive; driven remote (`agent.remote.drive`), which wicket drives as any agent while the
 owner watches and steers it from the app (#285); and wrapped (`wicket wrap`), which boxes an agent
 process another program launches. Each is its harness adapter's; one without the mode refuses it. [Drive a box from the Claude apps](../how-to/drive-a-box-from-the-claude-apps.md)
@@ -156,7 +156,7 @@ What wicket sends:
 - `initialize` with no `fs`, `terminal` or `auth.terminal` capability. The agent works with its own tools
   in its box; wicket never reads or writes files or runs commands for it.
 - `session/new` with the box's `/workspace` as `cwd`, wicket's gateway as the only MCP server, and the
-  sandbox notice as a `systemPrompt` append. For an agent that takes no system prompt, the notice
+  box notice as a `systemPrompt` append. For an agent that takes no system prompt, the notice
   leads the first prompt instead. Agent-specific `_meta` comes from wicket only, for a known
   `acp.profile`.
 - The task as the first `session/prompt`, and each follow-up (`wicket say`, a peer's message notice,
