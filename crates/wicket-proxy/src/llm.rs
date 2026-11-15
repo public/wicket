@@ -792,6 +792,13 @@ const REQUEST_FIELDS: &[&str] = &[
     "speed",
     "cache_control",
     "thread",
+    // Prompt-cache diagnosis (#307), sent with the `cache-diagnosis-2026-04-07` beta:
+    // `{"previous_message_id": "msg_…" | null}`, the id of this conversation's previous response,
+    // so the provider can say why the prompt cache missed (`diagnostics` on the response). It
+    // names a message only: nothing runs on the provider's side and nothing is fetched. Claude
+    // Code sends it when the base URL counts as first party, as in driven Remote Control mode,
+    // and the provider refuses the request with 400 when the beta comes without it.
+    "diagnostics",
 ];
 
 /// Fields that run things on the provider's side (the MCP connector, code-execution containers and
@@ -1516,6 +1523,26 @@ mod tests {
         assert!(llm.filter(Some(&spec), &parts("GET", "/v1/models", None), bytes::Bytes::new()).is_ok());
     }
 
+    /// #307: Claude Code's prompt-cache `diagnostics` field (as captured from `claude` 2.1.319 with
+    /// the `cache-diagnosis-2026-04-07` beta) passes the gate unchanged, with or without a
+    /// previous message id, and nothing is noted as stripped.
+    #[test]
+    fn the_cache_diagnostics_field_passes_unchanged() {
+        let parts = http::Request::builder().method("POST").uri("/v1/messages?beta=true").body(()).unwrap().into_parts().0;
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        for diag in [r#"{"previous_message_id":null}"#, r#"{"previous_message_id":"msg_01AbC"}"#] {
+            let body = format!(
+                r#"{{"model":"m","max_tokens":10,"messages":[{{"role":"user","content":"hi"}}],"diagnostics":{diag},"stream":true}}"#
+            );
+            let f = llm.filter(Some(&spec), &parts, bytes::Bytes::from(body.clone())).ok().unwrap();
+            let sent: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+            let asked: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(sent, asked, "{diag}");
+            assert_eq!(f.note, "ok");
+        }
+    }
+
     /// #307: names are distinct, sorted, clipped and printable, and only a handful are listed.
     #[test]
     fn stripped_names_are_listed_briefly() {
@@ -1537,7 +1564,7 @@ mod tests {
         let (port, _) = sse_upstream(chunks, std::time::Duration::ZERO).await;
         let (llm, dir) = llm_to(port, 1000, "named");
         let body = r#"{"model":"m","max_tokens":30,"stream":true,"messages":[{"role":"user","content":"hi"}],
-            "program_use_case_id":"secret-use-case","diagnostics":{"previous_message_id":"msg_secret"},
+            "program_use_case_id":"secret-use-case","some_future_field":{"nested":"secret-nested"},
             "tools":[{"name":"a","input_schema":{}},{"type":"web_search_20260209","name":"secret_search"}]}"#;
         assert_eq!(call(llm.clone(), "named", body, true).await, 200);
         let mut op = None;
@@ -1550,9 +1577,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let op = op.expect("an llm op record");
-        assert!(op.contains("stripped 2 request field(s): diagnostics, program_use_case_id"), "{op}");
+        assert!(op.contains("stripped 2 request field(s): program_use_case_id, some_future_field"), "{op}");
         assert!(op.contains("stripped 1 server-side tool(s): web_search_20260209"), "{op}");
-        for value in ["secret-use-case", "msg_secret", "secret_search", "previous_message_id"] {
+        for value in ["secret-use-case", "secret-nested", "nested", "secret_search"] {
             assert!(!op.contains(value), "{value} in {op}");
         }
         let _ = std::fs::remove_dir_all(dir);
