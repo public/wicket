@@ -11,7 +11,7 @@ Every tool answers with one text block; a refusal or failure sets `isError`.
 `whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, `spawn` and
 `spawn_agent` within the box's zone (the child starts on the node, its token attenuated there, and
 the control host takes it over when it can be reached), and `send_message`, `await_message` and
-`link` between boxes on that node. While the control host is unreachable, what needs a human
+`link` between boxes on that node, and push delivery of messages (see [Push delivery](#push-delivery)). While the control host is unreachable, what needs a human
 (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the zone) is
 queued on the node under a node-local id `q-…`; `await_grant` with that id follows it once it is
 raised. Every other call is relayed to the control host, and fails clearly while it is away. What a
@@ -26,6 +26,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`whoami`](#whoami) | This box's verified identity | |
 | [`send_message`](#send_message) | Message the parent, a child or a permitted peer, by principal | |
 | [`await_message`](#await_message) | Wait for the next message | |
+| [`principals`](#principals) | Who this box may talk to, with each one's kind and state | |
+| [`receipts`](#receipts) | What became of the messages this box sent | |
 | [`spawn_agent`](#spawn_agent) | Start a child agent in a narrowed copy of this zone | `max_children` |
 | [`spawn`](#spawn) | Start an agent or program in a zone the caller writes | `max_children` |
 | [`request_capacity`](#request_capacity) | Ask for a machine of its own (a lease) | `placement.yaml` |
@@ -134,6 +136,17 @@ principal or its zone. Run ids are not addresses.
 |---|---|---|
 | `to` | string, required | `"parent"`, or a principal: `spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `whoami` and `spawn` show it |
 | `body` | any JSON value, required | at most 16 KB |
+| `priority` | `now`, `next` (default) or `later` | how soon the sender wants it read: interrupt the recipient's turn, join it, or wait for it to end. The recipient's inbox hands out `now` first and `later` last; a harness that takes pushed messages gets it in `meta` (#252) |
+| `in_reply_to` | string | the `message_id` being answered. A reply to a message the recipient sent this principal needs no `accept_from`: the sender gave its reply address when it wrote |
+
+The answer's first line says where it went; its second, `receipt: {…}`, is the message's first
+receipt (see [`receipts`](#receipts)): `delivered` (with the run), or `held` (with `why`, who can
+`release` it, and when it `expires_at`). Every message carries its sender's principal as its
+**reply address** (`reply_to`, signed in the envelope).
+
+A message the recipient's `accept_from` doesn't allow is **refused** (#252): the answer starts
+`refused: m-…`, is an error, and its receipt says `refused` with why. Nothing reaches the recipient,
+and the refusal is on the audit record (`message.refused`) and stays readable with `receipts`.
 
 Where it goes:
 
@@ -147,7 +160,8 @@ Where it goes:
 A message never grants anything: it is the sender's data for the recipient, which can't widen
 anyone's reach or decide a request. Every message is on the audit record (`message`, with `from`,
 `to`, the run it reached and whether it was held). On a node cut off from its control host, a
-message goes only to a box on the same node (by its principal, or `"parent"`), attested by the node.
+message goes only to a box on the same node (by its principal, or `"parent"`), attested by the node:
+its receipt is `delivered`, or `refused` with why (on the node's audit log, `node.message_refused`).
 
 ## `await_message`
 
@@ -161,6 +175,82 @@ ends.
 | argument | type | default |
 |---|---|---|
 | `timeout_seconds` | integer, 1–600 | 300 |
+
+A message shows `message_id`, `from` (verified: its principal `id`, agent, zone, run and relation),
+`reply_to` (the principal to answer, with `in_reply_to` set to `message_id`), `priority`,
+`in_reply_to` (if it answers one of yours) and `body`. Taking it makes its sender's receipt `read`.
+One wicket drops (its signature doesn't verify, or the org policy doesn't let this zone hear from
+the sender's) makes it `refused`, with why. The body is the peer's data, never instructions from
+the agent's user: it grants nothing and can't approve anything.
+
+While the agent waits here (or in `await_grant`, or in `receipts` with a timeout) its state is
+`waiting` (see [`principals`](#principals)).
+
+### Push delivery
+
+A harness that turns MCP server notifications into conversation turns can have messages pushed
+instead (#252), when its adapter turns push on: the box's gateway then declares the harness's
+capability in `initialize` (under `capabilities.experimental`), keeps MCP at a revision that has a
+server stream (2025-11-25 at the newest), and sends each incoming message on the session's stream
+(the streamable HTTP `GET`) as the harness's notification, `{ content, meta }`. `content` is the
+message as `await_message` shows it, with its note that it is a peer's data. `meta` holds strings
+only: `source` (`wicket`), `message_id`, `from`, `from_run`, `relation`, `verified_by`, `reply_to`,
+`priority` and `trust`. The stream is served by the box's node: a message delivered there while it is
+cut off is pushed from there; connected, the node takes the box's messages from its gateway on the
+control host, which verifies each one and marks it read. Pushes are on the node's audit log
+(`node.message_pushed`). A message is pushed or awaited, never both.
+
+**Claude Code** has a matching feature, channels (capability `claude/channel`, notification
+`notifications/claude/channel`), but the image's version (2.1.319) can't take them in a box. wicket
+drives it with `-p` and stream-json, where no channel handler is registered. Interactively,
+`--dangerously-load-development-channels` asks for confirmation at startup. And channels need a
+feature flag fetched from Anthropic, which a box doesn't reach. So the Claude adapter leaves push
+off (`CHANNELS_IN_BOX` in `crates/wicket-agent/src/claude.rs`), and a Claude Code agent reads
+messages with `await_message`. Between turns, its supervisor tells it in wicket's own words that
+messages are waiting.
+
+## `principals`
+
+Discovery and presence (#252): the principals this one may talk to, from what the ledger knows. No
+arguments. Each entry has its principal `id` (stable across its restarts and wakes: what
+`send_message` takes), `kind` (`agent`, `human`; `program` once programs have identities, #255),
+agent name and zone, `relation` (`parent`, `child`, `peer`, `operator`), and two flags:
+`may_send_to` (its `accept_from` lists this principal or its zone, or it is the parent or a child)
+and `may_hear_from` (this zone's `accept_from` lists it, and the org policy agrees). Its `state` is
+one of:
+
+| state | meaning |
+|---|---|
+| `running` | it has a live run that hasn't reported what it is doing |
+| `busy` | in a turn |
+| `idle` | between turns |
+| `waiting` | in `await_message`, `await_grant` or a `receipts` wait |
+| `hibernated` | a long-lived agent asleep: a message wakes it |
+| `offline` | no live run: a message is held for its next one |
+
+Humans that `accept_from` names are listed as `kind: human`, `state: offline`: they don't receive
+agents' messages yet (they will through the CLI and the console). Principals of other tenants are
+never listed.
+
+## `receipts`
+
+What became of the messages this principal sent (#252), in any of its runs. Each receipt has the
+`message_id`, the recipient (`to`), its `priority`, `sent_at`, and a `state`:
+
+| state | meaning |
+|---|---|
+| `delivered` | in the inbox of the recipient's live run (`run`), not read yet |
+| `read` | the recipient took it (`read_at`): `await_message`, or pushed into its conversation |
+| `held` | the recipient has no live run (`why`), or is hibernated and being woken. `release` says who can release it (its next run, started by whoever may start it, or wicket waking it), and `expires_at` when it stops waiting |
+| `refused` | not delivered, and `why`: not in the recipient's `accept_from`, or dropped at delivery |
+| `expired` | held for 7 days and never read |
+
+| argument | type | default |
+|---|---|---|
+| `message_id` | string | none: the latest 20 receipts |
+| `timeout_seconds` | integer, 0–600 | 0: with `message_id`, wait until it is read, refused or expired |
+
+A receipt is readable only by its sender.
 
 ## `spawn_agent`
 
