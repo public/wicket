@@ -69,3 +69,26 @@ fn egress_requests_reach_the_origins() {
     let (_, u) = wicket_fuzz::egress::exchange(b"\x00CONNECT other.example:443 HTTP/1.1\r\n\r\n");
     assert!(u.is_empty());
 }
+
+/// A request the proxy forwards after the box's connection ended reaches the origin during the
+/// next run (fuzzing found it as `regressions/egress/late-upstream-after-http01`, whose own bytes
+/// decide nothing): it matches the earlier run's decision, and a request nobody decided still fails.
+#[test]
+fn egress_late_requests_match_earlier_decisions() {
+    use wicket_fuzz::egress::{check_with, Seen};
+    let post = Seen { method: "POST".into(), host: "fuzz.example".into(), path: "/a".into() };
+    let get = Seen { method: "GET".into(), host: "fuzz.example".into(), path: "/b".into() };
+    // Run 1 decides POST /a; nothing reaches the origin in time.
+    let late = check_with(vec![], std::slice::from_ref(&post), &[]);
+    assert_eq!(late, vec![post.clone()]);
+    // Run 2 decides GET /b; the origin gets GET /b, then the late POST /a.
+    assert!(check_with(late, std::slice::from_ref(&get), &[get.clone(), post.clone()]).is_empty());
+    // Run 2 also decides POST /a itself, and the late POST /a matches that decision first: the
+    // earlier one is still carried, for run 2's own POST /a arriving in run 3.
+    let late = check_with(vec![post.clone()], std::slice::from_ref(&post), std::slice::from_ref(&post));
+    assert_eq!(late, vec![post.clone()]);
+    assert!(check_with(late, &[], std::slice::from_ref(&post)).is_empty());
+    // Without the earlier decision, the same POST /a is smuggled.
+    let smuggled = std::panic::catch_unwind(|| check_with(vec![], std::slice::from_ref(&get), &[get.clone(), post.clone()]));
+    assert!(smuggled.is_err());
+}

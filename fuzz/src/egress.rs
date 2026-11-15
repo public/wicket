@@ -174,8 +174,15 @@ pub(crate) fn half_closing() -> hyper::server::conn::http1::Builder {
 }
 
 pub fn run(data: &[u8]) {
+    // The proxy writes an allowed request upstream from its own task: when the box's connection ends
+    // first, the origin can receive it after this run, during the next one. So the decisions a run
+    // made that didn't reach an origin are carried into the next run's check: a late request
+    // matches the decision it had, and one never decided still fails.
+    static CARRY: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
     let (decided, upstream) = exchange(data);
-    check(&decided, &upstream);
+    let mut carry = CARRY.lock().unwrap_or_else(|e| e.into_inner());
+    let late = std::mem::take(&mut *carry);
+    *carry = check_with(late, &decided, &upstream);
 }
 
 /// Runs one connection; what was decided, and what the origins received.
@@ -225,18 +232,35 @@ pub fn exchange(data: &[u8]) -> (Vec<Seen>, Vec<Seen>) {
 
 /// Every request the origins got must be one decided, in order, and the same request.
 pub fn check(decided: &[Seen], upstream: &[Seen]) {
-    let mut d = decided.iter();
+    check_with(vec![], decided, upstream);
+}
+
+/// [`check`], where a request may also be one of `late` (decided by an earlier run, in any order).
+/// Returns the decisions no request matched (the last [`LATE`] of them, oldest first).
+pub fn check_with(mut late: Vec<Seen>, decided: &[Seen], upstream: &[Seen]) -> Vec<Seen> {
+    let mut next = 0;
+    let mut unmatched = Vec::new();
     for u in upstream {
         let want = op_of(u).unwrap_or_else(|e| panic!("{e}"));
-        loop {
-            match d.next() {
-                Some(x) if *x == want => break,
-                // A decided request may not reach the origin (refused when readied, an upstream error).
-                Some(_) => continue,
-                None => panic!(
-                    "smuggled: the origin received {u:?} (decided as {want:?}), which was never decided; decided: {decided:?}, upstream: {upstream:?}"
-                ),
-            }
+        // A decided request may not reach the origin (refused when readied, an upstream error).
+        if let Some(k) = decided[next..].iter().position(|x| *x == want) {
+            unmatched.extend_from_slice(&decided[next..next + k]);
+            next += k + 1;
+        } else if let Some(k) = late.iter().position(|x| *x == want) {
+            late.remove(k);
+        } else {
+            panic!(
+                "smuggled: the origin received {u:?} (decided as {want:?}), which was never decided; decided: {decided:?}, upstream: {upstream:?}"
+            );
         }
     }
+    unmatched.extend_from_slice(&decided[next..]);
+    // A late decision a request of this run's own matched instead is still on its way.
+    late.extend(unmatched);
+    let drop = late.len().saturating_sub(LATE);
+    late.drain(..drop);
+    late
 }
+
+/// How many decisions not (yet) seen upstream are kept for later runs.
+const LATE: usize = 64;
