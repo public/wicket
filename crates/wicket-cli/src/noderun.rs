@@ -94,7 +94,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+            getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
             f.write_all_sync(hex::encode(seed).as_bytes())?;
             wicket_identity::SigningKey::from_bytes(&seed)

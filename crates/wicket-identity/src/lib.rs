@@ -165,7 +165,7 @@ pub struct Issuer {
 
 impl Issuer {
     pub fn generate(trust_domain: &str) -> Issuer {
-        Issuer { key: SigningKey::generate(&mut rand_core::OsRng), trust_domain: trust_domain.into() }
+        Issuer { key: SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng)), trust_domain: trust_domain.into() }
     }
 
     /// Loads the installation's issuer: its key from `path` (hex seed, mode 0600) and its trust domain
@@ -296,7 +296,7 @@ pub fn load_or_create_feed_root_signing(path: &Path) -> Result<SigningKey> {
             if let Some(d) = path.parent() {
                 std::fs::create_dir_all(d)?;
             }
-            let k = SigningKey::generate(&mut rand_core::OsRng);
+            let k = SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
             f.write_all(hex::encode(k.to_bytes()).as_bytes())?;
             k
@@ -324,7 +324,7 @@ pub struct AgentKey(SigningKey);
 
 impl AgentKey {
     pub fn generate() -> AgentKey {
-        AgentKey(SigningKey::generate(&mut rand_core::OsRng))
+        AgentKey(SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng)))
     }
     pub fn public(&self) -> VerifyingKey {
         self.0.verifying_key()

@@ -122,7 +122,7 @@ fn row_to_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRow> {
 
 pub fn new_lease_id() -> String {
     let mut b = [0u8; 6];
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     format!("l-{}", hex::encode(b))
 }
 

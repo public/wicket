@@ -2562,7 +2562,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let why = refused(handshake(&node, 8, chan::PROTOCOL, &inst, &inst.issuer).await.1);
         assert!(why.contains("no identity certificate"), "{why}");
         // A node whose key isn't the enrolled one (re-keyed or replaced), with a certificate for it.
-        let other = wicket_identity::SigningKey::generate(&mut rand_core::OsRng);
+        let other = wicket_identity::SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
         let (theirs, _) = inst.issuer.issue_node_cert("n1", &other.verifying_key(), wicket_store::now(), 3600);
         std::fs::write(&cert_path, &theirs).unwrap();
         let why = refused(handshake(&node, 9, chan::PROTOCOL, &inst, &inst.issuer).await.1);
