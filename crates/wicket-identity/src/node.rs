@@ -72,7 +72,7 @@ impl Issuer {
     /// Issues a certificate for node `node` whose key is `key`, valid from `iat` for `ttl_secs`.
     pub fn issue_node_cert(&self, node: &str, key: &VerifyingKey, iat: i64, ttl_secs: i64) -> (String, NodeCertClaims) {
         let mut serial = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut serial);
+        getrandom::fill(&mut serial).expect("the OS random source");
         let claims = NodeCertClaims {
             iss: self.issuer_id(),
             sub: node_spiffe_id(&self.trust_domain, node),
@@ -139,7 +139,7 @@ pub fn signing_key_from_pkcs8_pem(pem: &str) -> Result<SigningKey> {
 /// A fresh nonce, base64url.
 pub fn nonce() -> String {
     let mut b = [0u8; 32];
-    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+    getrandom::fill(&mut b).expect("the OS random source");
     B64.encode(b)
 }
 
@@ -277,7 +277,7 @@ mod tests {
 
     fn setup() -> (Issuer, SigningKey, String) {
         let i = Issuer::generate("test.wicket.example");
-        let k = SigningKey::generate(&mut rand_core::OsRng);
+        let k = SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
         let (cert, _) = i.issue_node_cert("n1", &k.verifying_key(), NOW, 3600);
         (i, k, cert)
     }
@@ -325,7 +325,7 @@ mod tests {
         let e = exchange(&n2, &k, &i, &i.verifying_key(), &vk, NOW).unwrap_err();
         assert!(e.contains("not node n1"), "{e}");
         // A valid certificate held by something without the node key (a copied certificate).
-        let thief = SigningKey::generate(&mut rand_core::OsRng);
+        let thief = SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(getrandom::SysRng));
         let e = exchange(&cert, &thief, &i, &i.verifying_key(), &vk, NOW).unwrap_err();
         assert!(e.contains("proof does not verify"), "{e}");
         // A certificate for a key that isn't the one enrolled.

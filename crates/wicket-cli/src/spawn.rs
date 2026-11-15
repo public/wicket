@@ -154,6 +154,14 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
         }
         _ => s.image.clone(),
     };
+    // Its task is a delegation (#252), under the id its node's handle gave the parent.
+    if cm.agent.is_some() {
+        let own = c.ledger.lock().ok().and_then(|l| l.identity(&c.run.0).ok().flatten());
+        if let Some(o) = own.and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id)) {
+            let cp = wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, &name);
+            delegate(c, &RunId(s.child.clone()), &cp, &name, &cm.task);
+        }
+    }
     if let Err(e) = launch_as(c, &RunId(s.child.clone()), &s.manifest, &image, None, Some(&adopt)) {
         unrecord_quotas(c, &ids);
         return Err(e);
@@ -325,6 +333,11 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
         }
     };
     z.forbid = p.zone.forbid.iter().cloned().chain(z.forbid).collect();
+    // The parent's memory advice (#348), unless the caller's limits give their own (empty: none).
+    let said_advice = req.zone.as_ref().and_then(|v| v.get("limits")).is_some_and(|l| l.get("memory_advice").is_some());
+    if !said_advice {
+        z.limits.memory_advice = p.zone.limits.memory_advice.clone();
+    }
     if is_agent {
         let derived_from_parent = req.zone.as_ref().is_none_or(|v| v.get("llm").is_none());
         if derived_from_parent {
@@ -511,10 +524,24 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         _ => None,
     };
     drop(reserved);
+    // Its principal (#250): what send_message names it by, the same in every run it has.
+    let child_principal = {
+        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
+        let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
+        own.map(|o| wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name))
+    };
+    // An agent's task is a delegation (#252), recorded before it starts so its first turn's report
+    // finds it: its report comes back as a message, and the parent may continue it by name.
+    if let (Some(cp), true) = (&child_principal, is_agent) {
+        delegate(c, &child, cp, name, &cm.task);
+    }
     let launched = launch_as(c, &child, &yaml, &image, placed.as_ref(), None);
     let child = match launched {
         Ok(child) => child,
         Err(e) => {
+            if let Ok(l) = c.ledger.lock() {
+                let _ = l.delegation_ended(&child.0, None);
+            }
             // Nothing started: give the slots, the budget and its quotas back.
             unrecord_quotas(c, &ids);
             if let Ok(mut r) = c.slots.lock() {
@@ -532,24 +559,46 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let budget =
         cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
     let at = placed.as_ref().map(|p| format!(" on node {}", p.node)).unwrap_or_default();
-    // Its principal (#250): what send_message names it by, the same in every run it has.
-    let principal = {
-        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
-        let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
-        own.map(|o| format!(", principal {}", wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name)))
-            .unwrap_or_default()
+    let principal = child_principal.as_deref().map(|p| format!(", principal {p}")).unwrap_or_default();
+    let handle = match (&child_principal, is_agent) {
+        (Some(cp), true) => format!("\nhandle: {}", wicket_proxy::delegate::handle(cp, &child, name)),
+        _ => String::new(),
     };
     Ok(format!(
-        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}",
+        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}{handle}",
         req.kind,
         child,
         if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
         if is_agent {
-            "Message it with send_message to its principal; use await_message for its messages and its final run_finished."
+            "When its turn on the task ends, its report comes to you as a message (kind report, with a receipt; use await_message); continue_child gives it another brief, its context intact. Its final run_finished comes when its run ends."
         } else {
             "It sends you run_finished when it exits."
         }
     ))
+}
+
+/// Records child `child`'s task as this run's delegation to it (#252), audited. Its record only:
+/// what the child may do is its zone, already checked within this run's.
+fn delegate(c: &SpawnCtx, child: &RunId, child_principal: &str, name: &str, brief: &str) {
+    let Ok(l) = c.ledger.lock() else { return };
+    let Some(parent) = l.identity(&c.run.0).ok().flatten() else { return };
+    let id = wicket_proxy::delegate::delegation_id(&child.0);
+    let recorded = l.record_delegation(&wicket_store::NewDelegation {
+        id: &id,
+        tenant: &c.parent.tenant.0,
+        parent_run: &c.run.0,
+        parent_principal: &parent.spiffe_id,
+        child_run: &child.0,
+        child_principal,
+        name,
+        brief,
+    });
+    let _ = l.audit(
+        &c.parent.tenant,
+        Some(&c.run),
+        "delegation.started",
+        &serde_json::json!({ "delegation": id, "child": child_principal, "child_run": child.0, "name": name, "recorded": recorded.is_ok() }),
+    );
 }
 
 /// What a beyond-parent spawn card says, from wicket's own record of the child (#118): what it
@@ -829,6 +878,47 @@ mod tests {
         };
         assert!(plan(Some("tool:latest"), Some(&org)).is_ok());
         assert!(plan(Some("other:1"), Some(&org)).err().unwrap_or_default().contains("org policy"));
+    }
+
+    /// #348: a spawned zone inherits its parent's `limits.memory_advice` whether it states limits
+    /// or not, may replace it (or clear it, empty), and a replacement past the cap is refused.
+    #[test]
+    fn a_spawned_zone_inherits_its_parents_memory_advice_and_may_replace_it() {
+        let p = wicket_agent::load(
+            "task: t\nagent: { name: lead, max_children: 4 }\nzone:\n  name: z\n  llm: { secret: m }\n  limits: { memory: 1g, cpus: 1, timeout: 1h, memory_advice: 'CARGO_BUILD_JOBS=1' }\n",
+        )
+        .unwrap();
+        let plan = |zone: Option<serde_json::Value>| {
+            let req = SpawnRequest { name: "kid".into(), kind: "agent".into(), task: Some("t".into()), zone, ..Default::default() };
+            plan_child(
+                &PlanIn {
+                    parent: &p,
+                    run: &RunId("run_x".into()),
+                    image: "wicket/claude-code:dev",
+                    time_left: std::time::Duration::from_secs(3600),
+                    llm_left: None,
+                    llm_input_left: None,
+                    slots: 4,
+                    org: None,
+                },
+                &req,
+            )
+        };
+        let advice = |zone| plan(zone).map(|c| c.cm.zone.limits.memory_advice().map(String::from));
+        let lim = |extra: serde_json::Value| {
+            let mut l = json!({ "memory": "128m", "cpus": 1, "timeout": "5m" });
+            l.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            Some(json!({ "limits": l }))
+        };
+        let inherited = Ok(Some("CARGO_BUILD_JOBS=1".to_string()));
+        assert_eq!(advice(None), inherited, "no zone: the parent's");
+        assert_eq!(advice(Some(json!({}))), inherited, "no limits: the parent's");
+        assert_eq!(advice(lim(json!({}))), inherited, "limits without advice: the parent's");
+        assert_eq!(advice(lim(json!({ "memory_advice": "one query at a time" }))), Ok(Some("one query at a time".into())), "replaced");
+        assert_eq!(advice(lim(json!({ "memory_advice": "" }))), Ok(None), "cleared");
+        let long = "x".repeat(wicket_core::manifest::MEMORY_ADVICE_MAX + 1);
+        assert!(advice(lim(json!({ "memory_advice": long }))).unwrap_err().contains("memory_advice"), "capped");
+        assert!(advice(lim(json!({ "memory_advice": "a\nb" }))).unwrap_err().contains("memory_advice"), "one line");
     }
 
     const NOW: i64 = 1_000_000;

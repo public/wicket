@@ -193,7 +193,7 @@ pub(super) fn gateway_offline(rpc: &serde_json::Value, why: &str) -> hyper::Resp
         _ if id.is_null() => return gw_reply(202, serde_json::Value::Null),
         _ => serde_json::json!({
             "content": [{ "type": "text", "text": format!(
-                "the control plane is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
+                "the control host is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
             ) }],
             "isError": true,
         }),

@@ -52,7 +52,12 @@ plan, and each of wicket's answers to it:
 [agent] finished: end_turn
 ```
 
-Follow-ups (`wicket say`), hibernation (the `hibernate` tool or `wicket hibernate`), `finish` and
+To watch the session live, prompt it and decide its escalations from a browser or phone, open it
+in the console: [work with a running agent in the console](work-with-a-running-agent-in-the-console.md).
+At the host's shell, `wicket session <run>` shows the same session in the terminal, and each line
+you type is a prompt; `wicket session <run> "…"` sends one prompt and returns when its turn ends.
+
+Prompts, hibernation (the `hibernate` tool or `wicket hibernate`), `finish` and
 `wicket wake` work as for any agent. A
 woken agent continues its own ACP session.
 

@@ -20,8 +20,8 @@ zone:
 ```
 
 A program zone has no `llm` section, and a program may not ask for more: its zone's
-`escalation.request` defaults to `false`, so out-of-reach requests fail and nothing is queued for a
-human. `zone.escalation: { request: true }` makes them pending, as an agent's are, for a program
+`escalation.request` defaults to `false`, so out-of-reach requests fail and nothing is queued for an
+operator. `zone.escalation: { request: true }` makes them pending, as an agent's are, for a program
 that waits with `await_grant`. `program.image` runs it in another image
 (the default agent image has bash, curl, jq, git and python3).
 

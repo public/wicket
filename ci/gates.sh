@@ -12,7 +12,7 @@
 #   --only-e2e     the end-to-end suites only (a build of wicket-cli first)
 #   --suites "…"   these suites instead of the selected ones
 #
-# Always: rustfmt, ci/check-public.py and the Markdown link check. Rust: clippy and the tests of the
+# Always: rustfmt, ci/check-public.py, the Markdown link check and the term check. Rust: clippy and the tests of the
 # selected crates, with cargo-nextest when it is installed (a retried test that then passed is
 # reported as flaky, never hidden), else cargo test. End-to-end suites run against
 # target/debug/wicket; they need what each script says (Docker with runsc, the agent image, sudo).
@@ -63,7 +63,7 @@ else
   crates=all suites=all doc_crates=all
 fi
 [ -n "$only_suites" ] && suites=$only_suites
-all_suites="docs policy smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update"
+all_suites="docs policy lean smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update tla"
 [ "$suites" = all ] && suites=$all_suites
 has() { [[ " $suites " == *" $1 "* ]]; }
 
@@ -80,6 +80,7 @@ if [ "$rust" = 1 ]; then
   step "rustfmt" cargo fmt --all -- --check
   step "no secrets or machine details" python3 ci/check-public.py
   step "Markdown links" ci/check-doc-links.sh
+  step "terms" ci/check-terms.sh
 fi
 
 # ---- Rust ----
@@ -99,6 +100,12 @@ fi
 export WICKET=${WICKET:-target/debug/wicket}
 if has policy && [ "$rust" = 1 ]; then
   hstep "SymCC policy diffs" ci/policy-diff.sh "$base"
+fi
+if has lean && [ "$rust" = 1 ]; then
+  hstep "Lean spec and oracle" ci/lean.sh
+fi
+if has tla; then
+  hstep "TLA+ models (TLC)" ci/tla.sh
 fi
 if [ "$e2e" = 1 ]; then
   e2e_suites=()

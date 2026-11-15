@@ -161,7 +161,7 @@ pub trait ControlLink: Send + Sync {
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// What the agent is told when the node can't reach the control host to escalate.
-pub const UNREACHABLE: &str = "wicket's control plane is unreachable from this node, so nothing new can be approved right now; retry later";
+pub const UNREACHABLE: &str = "wicket's control host is unreachable from this node, so nothing new can be approved right now; retry later";
 
 /// Decisions from a node's verified feed replica.
 pub struct NodeDecider {
@@ -468,6 +468,45 @@ mod tests {
 
     fn op(method: &str, path: &str) -> Op {
         Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", method, "api.example.com", path)
+    }
+
+    /// #352: a node that has a statement for an epoch whose delta it hasn't received yet is catching
+    /// up: it can't decide (Unavailable, which the egress proxy answers 503 with Retry-After) until
+    /// the delta arrives, and then decides as before. A refusal is still Forbidden.
+    #[tokio::test]
+    async fn a_node_catching_up_with_its_feed_is_unavailable_until_it_has() {
+        let (mut p, replica, dir, authz_root) = feed();
+        let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock: Clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let link = Arc::new(Link { up: AtomicBool::new(true), asks: AtomicI64::new(0) });
+        let d = NodeDecider { replica: replica.clone(), clock, control: link };
+        let c = ctx(true);
+        let t0 = now.load(Ordering::SeqCst);
+        let tenant = TenantId::single().0;
+        let issuer = Issuer::root(&authz_root, &tenant, "run:run_a", "run_a", 0, &zone(), &[], 3_600, vec![approver.public()]).unwrap();
+        p.commit(vec![Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() }], t0).unwrap();
+        let hello = replica.lock().unwrap().hello();
+        for f in p.catch_up(&hello, t0).unwrap() {
+            replica.lock().unwrap().accept(&f, t0).unwrap();
+        }
+        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(_)));
+        // A new epoch is published; the node hears its statement before its delta.
+        let t1 = t0 + 100;
+        now.store(t1, Ordering::SeqCst);
+        let delta =
+            p.commit(vec![Change::Revoke { kind: wicket_feed::RevokeKind::Grant, id: "g-x".into(), until: t1 + 60_000 }], t1).unwrap();
+        replica.lock().unwrap().accept(&p.statement(t1), t1).unwrap();
+        assert_eq!(replica.lock().unwrap().mode(t1), Mode::Lagging);
+        let got = d.decide(&c, &op("GET", "/v1/a"), None).await;
+        assert!(matches!(&got, Outcome::Unavailable(w) if w.contains("catching up")), "{got:?}");
+        replica.lock().unwrap().accept(&delta, t1).unwrap();
+        assert_eq!(replica.lock().unwrap().mode(t1), Mode::Fresh);
+        assert!(matches!(d.decide(&c, &op("GET", "/v1/a"), None).await, Outcome::Allow(_)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

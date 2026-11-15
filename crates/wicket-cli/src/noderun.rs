@@ -94,7 +94,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+            getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("random: {e}"))?;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
             f.write_all_sync(hex::encode(seed).as_bytes())?;
             wicket_identity::SigningKey::from_bytes(&seed)
@@ -392,7 +392,7 @@ pub struct Start {
     /// Keep the box's files on the node after it exits, until [`NodeCtl::forget`] (its state is
     /// fetched first).
     pub keep: bool,
-    /// The run's own model proxy: it leases the node budget slices and takes the node's spend
+    /// The run's own model proxy: it sends the node budget slices and takes the node's spend
     /// (#152). None: no model route.
     pub llm: Option<Arc<wicket_proxy::llm::Llm>>,
     /// Where the secrets the node fetches come from (#152).
@@ -788,7 +788,7 @@ struct Progress {
     renew_after: i64,
     /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
     proto: u32,
-    /// Whether a lease went on this connection, and the slice in the last one (#152).
+    /// Whether a budget slice went on this connection, and the last one sent (#152).
     slice_sent: bool,
     slice: Option<wicket_proxy::llm::Slice>,
     /// The secrets released to the node for this run, and what each was (to tell a change).
@@ -968,9 +968,9 @@ async fn session(
     for f in sh.ctl.publisher.lock()?.catch_up(&feed, now)? {
         send(feed_frame(f));
     }
-    let leasing = std::time::Instant::now();
+    let slicing = std::time::Instant::now();
     if first {
-        sh.timings.record("feed.catch_up", catching, leasing);
+        sh.timings.record("feed.catch_up", catching, slicing);
     }
     // The run's secrets and budget slice, sealed to the node (#152), before anything the box does.
     p.slice_sent = false;
@@ -978,7 +978,7 @@ async fn session(
         send(f);
     }
     if first {
-        sh.timings.since("budget.lease", leasing);
+        sh.timings.since("budget.slice", slicing);
     }
     if sh.attach && !p.ever_resumed && !runs.iter().any(|r| r.run == sh.run.0) {
         p.ever = false;
@@ -1475,7 +1475,7 @@ fn timeout_end(run_dir: &Path) -> Option<i64> {
     Some(v["started_ms"].as_i64()? + secs * 1000 + 120_000)
 }
 
-/// What this host has released and leased to a run's node (#152), kept beside the run
+/// What this host has released to a run's node, secrets and budget slices (#152), kept beside the run
 /// (`ctl/holdings.json`) for `wicket node list`: the secrets the node fetched for the run (by name,
 /// never values) and its budget slice. An upper bound: the node may have dropped some already, never
 /// holds more.
@@ -1549,7 +1549,7 @@ pub fn fmt_ms(ms: i64) -> String {
         .unwrap_or_else(|| format!("{ms} ms"))
 }
 
-/// The fraction of a run's model budget leased to its node at a time (#152):
+/// The fraction of a run's model budget sent to its node as a slice at a time (#152):
 /// `WICKET_NODE_BUDGET_SLICE` on the control host, default 0.25. Offline, the node can spend what is
 /// left of its slice and nothing more; connected, it is renewed before half of it is gone.
 fn slice_fraction() -> f64 {
@@ -1778,7 +1778,8 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         wicket_feed::Policy::compile(&a, &ctx, &|_, _| false).map(|_| ())
     };
     let before = p.live.len();
-    p.live.retain(|g| g.grant.not_after > u64::try_from(now_s).unwrap_or(0));
+    // Live while `now < expires_at`, published as `not_after = expires_at - 1` (#342).
+    p.live.retain(|g| g.grant.not_after >= u64::try_from(now_s).unwrap_or(0));
     let mut rebuild = p.live.len() != before || reminted.is_some();
     rebuild |= renew_live(&mut p.live, &grants, &sh.node, now_s);
     let mut handed: Vec<String> = vec![];
@@ -1798,7 +1799,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
-        // As the node routes it: a host injected with a secret leased to the node is decided there,
+        // As the node routes it: a host injected with a secret released to the node is decided there,
         // and so is a swapped one (#257), unless a control host before protocol 10 started the box
         // and swaps it here.
         if sh.swap_hosts.iter().any(|h| wicket_core::manifest::host_matches(h, &g.host)) {
@@ -1923,7 +1924,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
 fn renew_live(live: &mut [LiveGrant], grants: &[wicket_store::GrantRow], node: &str, now_s: i64) -> bool {
     let mut changed = false;
     for g in grants.iter().filter(|g| g.node.as_deref() == Some(node) && !g.revoked && g.expires_at > now_s) {
-        let end = u64::try_from(g.expires_at).unwrap_or(0);
+        let end = wicket_authz::Grant::not_after_for(g.expires_at);
         if let Some(l) = live.iter_mut().find(|l| l.grant.gid == g.id && l.grant.not_after != end) {
             l.grant.not_after = end;
             changed = true;
@@ -1966,7 +1967,8 @@ fn live_grant(tenant: &TenantId, run: &RunId, zone: &str, issuer: &wicket_feed::
             host: op.host.clone(),
             method: op.method.clone(),
             path: op.path.clone(),
-            not_after: u64::try_from(g.expires_at).unwrap_or(0),
+            // The ledger's end, as the token's inclusive whole-second check reads it (#342).
+            not_after: wicket_authz::Grant::not_after_for(g.expires_at),
             approver: g.request_id.as_deref().map_or_else(|| "operator".to_string(), |r| format!("request:{r}")),
             digest: hex::decode(op.digest()).unwrap_or_default(),
         },
@@ -2009,10 +2011,14 @@ mod tests {
         assert!(!renew_live(&mut live, &[row("g-1", Some("n1"), now + 60)], "n1", now), "unchanged");
         let renewed = [row("g-1", Some("n1"), now + 3600), row("g-2", None, now + 3600)];
         assert!(renew_live(&mut live, &renewed, "n1", now));
-        assert_eq!((live.len(), live[0].grant.not_after, live[0].uses), (1, (now + 3600) as u64, Some(2)));
+        assert_eq!(
+            (live.len(), live[0].grant.not_after, live[0].uses),
+            (1, (now + 3600 - 1) as u64, Some(2)),
+            "published as expires_at - 1 (#342)"
+        );
         let revoked = wicket_store::GrantRow { revoked: true, ..row("g-1", Some("n1"), now + 7200) };
         assert!(!renew_live(&mut live, &[revoked, row("g-1", Some("n2"), now + 7200)], "n1", now));
-        assert_eq!(live[0].grant.not_after, (now + 3600) as u64);
+        assert_eq!(live[0].grant.not_after, (now + 3600 - 1) as u64);
     }
 
     /// #152: `wicket node list` shows, per run on a node, its authority, the secrets released to it

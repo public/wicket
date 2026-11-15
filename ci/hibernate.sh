@@ -16,7 +16,7 @@
 #     survive hibernate and wake;
 #   - a box with a background process isn't hibernated: it goes on running, never paused (#249);
 #   - two concurrent wakes: exactly one wins, and the generation goes up by one;
-#   - `wicket say` to a hibernated agent wakes it, with the message as its turn;
+#   - a prompt to a hibernated agent's session (`wicket session`) wakes it, with the prompt as its turn;
 #   - the zone's model budget is the agent's over all its activations: a wake continues it, and an
 #     agent that has spent it isn't woken (and makes no model call);
 #   - the agents' state is sealed at rest: every object in the store is encrypted (#146).
@@ -164,14 +164,14 @@ check "the loser was told it lost" 'grep -q "not woken" "$work/w1.log" "$work/w2
 check "the generation went up by exactly one" '[ "$(agent_field "$A" generation)" = $((gen2 + 1)) ]'
 check "A hibernated again after the winner's turn" '[ "$(agent_field "$A" state)" = hibernated ]'
 
-echo "== agent A: wicket say wakes it"
-"$WICKET" say "$r1" "A message for a sleeping agent." | tee "$work/say.log"
+echo "== agent A: a prompt to its session wakes it"
+"$WICKET" session "$r1" "A message for a sleeping agent." | tee "$work/say.log"
 for _ in $(seq 120); do [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ] && break; sleep 1; done
-check "say woke it, and it went back to sleep" '[ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ]'
-check "the message was its turn" 'grep "the user said:" "$work/mock.log" | grep "woken (wicket say" | grep -q "A message for a sleeping agent."'
+check "the prompt woke it, and it went back to sleep" '[ "$(agent_field "$A" generation)" = $((gen2 + 2)) ] && [ "$(agent_field "$A" state)" = hibernated ]'
+check "the message was its turn" 'grep "the user said:" "$work/mock.log" | grep "woken (wicket session" | grep -q "A message for a sleeping agent."'
 check "four activations spent the whole budget" '[ "$(agent_field "$A" used.requests)" = 12 ]'
 calls=$(grep -c "^mock: /v1/messages" "$work/mock.log" || true)
-out=$("$WICKET" say "$A" "One more?" 2>&1 || true); echo "   $out"
+out=$("$WICKET" session "$A" "One more?" 2>&1 || true); echo "   $out"
 check "a spent agent isn't woken" 'grep -q "request budget is spent" <<<"$out"'
 "$WICKET" wake "$A" >"$work/w3.log" 2>&1 || true
 check "nor by wicket wake, and its generation stays" 'grep -q "request budget is spent" "$work/w3.log" && [ "$(agent_field "$A" generation)" = $((gen2 + 2)) ]'

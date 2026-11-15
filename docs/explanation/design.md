@@ -276,7 +276,7 @@ pub struct Op {
     pub effects: EffectSet,             // read.scoped, notify.external, exec.ci, ...
     pub risk: RiskClass,                // max(floor(effects)), raised by dangerous patterns
     pub args: BTreeMap<SmolStr, Value>, // declared args only
-    pub digest: [u8; 32],               // canonical hash; escalation requests bind to it
+    pub digest: [u8; 32],               // canonical hash; requests bind to it
 }
 ```
 
@@ -475,7 +475,7 @@ authenticates both ends whatever carries it:
   never takes over the control connection.
 
 Built since (#24): the console starts runs (from allowlisted manifest directories, the manifest's digest
-signed), sends follow-ups, revokes identities and answers prefix asks, each with a passkey assertion over
+signed), opens runs' sessions (prompts are sent there, #198), revokes identities and answers prefix asks, each with a passkey assertion over
 exactly that action. A console-started run's principal is the passkey-authenticated operator
 (`{type: human, id: passkey:<name>, via: console, assurance: passkey (user verification)}`), handed to
 the detached `wicket run` in `WICKET_PRINCIPAL`; the signed audit record binds operator, run id and
@@ -1503,8 +1503,8 @@ Built in the PoC and verified with two concurrent Claude Code subagents ([poc-re
   `trust.json`. They are read-only or discarded, and never fed from approvals.
 - **Recovery by forking.** A tainted agent's session can be forked at a clean point instead of being
   discarded (#177).
-- **Covert channels** (timing, sizes, file names, escalation request contents) are not closed. Escalation
-  requests are rate- and size-limited, and anomalies are logged.
+- **Covert channels** (timing, sizes, file names, request contents) are not closed. Requests
+  are rate- and size-limited, and anomalies are logged.
 
 ---
 
@@ -1617,8 +1617,8 @@ gate exists for. A skill is an instruction to every future activation, so it is 
   host runs the box and persist across runs.
 - **An in-place workspace** (`--workspace-dir`): a host directory mounted read-write, with the run's outbox
   mounted over its `out/`.
-- **Follow-up messages to a running agent** (`wicket say <run> …`), carried over Claude Code's stream-json
-  input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
+- **Follow-up messages to a running agent** (`wicket say <run> …`, since replaced by sessions: `wicket
+  session` and the console's session page, #198), carried over Claude Code's stream-json input. The session stays open after each turn until the agent asks to finish or exits (#249). Operator
   text is trusted task text from the principal, unlike anything an agent or a page says.
 
 **Hibernate and wake (#70, 2026-11-12; #249).** Built as experiment #70 recommended: rebuild plus `claude --resume` (H0). The Idle tier and its `docker pause` were removed by #249.
@@ -2009,7 +2009,7 @@ level, with stricter rules:
   Single-tenant mode is tenant `t0`; the PoC already works this way. The authority check becomes
   platform ∧ plan ∧ tenant ∧ workspace ∧ zones ∧ grant ∧ labels ∧ ledger, and tenant admins can only narrow.
   The prover checks that on save, and evaluation enforces it anyway.
-- **Pooled nodes hold no credentials.** On nodes that run several tenants' code, sandbox nodes run a plain
+- **Pooled nodes hold no credentials.** On nodes that run several tenants' code, the nodes running their boxes run a plain
   forwarder and hold no tokens, CA keys or model keys. Per-tenant enforcement runs on separate enforcement
   nodes, which also own each tenant's static egress IPs. The PoC's remote node already has this shape: its
   sockets are forwarded to proxies on the control host.

@@ -120,7 +120,7 @@ async fn grants(env: Rc<Env>, st: Rc<RefCell<State>>) {
             apply(&env, &mut st.borrow_mut(), a.run, Some((a.path, &a.gid, &a.kind)), t);
             env.control_disk.borrow_mut().done += 1;
         }
-        // Expired grants leave the token (noderun's `p.live.retain(not_after > now)`).
+        // Expired grants leave the token (noderun's `p.live.retain`: live while `now < expires_at`).
         for (run, name) in RUNS.iter().enumerate() {
             let expired = env.control_disk.borrow().live.get(*name).is_some_and(|l| l.values().any(|(_, na)| *na as i64 <= t / 1000));
             if expired {
@@ -182,7 +182,11 @@ fn apply(env: &Env, st: &mut State, run_i: usize, action: Option<(usize, &str, &
                     host: op.host.clone(),
                     method: op.method.clone(),
                     path: op.path.clone(),
-                    not_after: *na,
+                    // As noderun's `live_grant` publishes the ledger's end (#342).
+                    not_after: match env.options.grant_end_fix {
+                        true => wicket_authz::Grant::not_after_for(*na as i64),
+                        false => *na,
+                    },
                     approver: "human:sim".into(),
                     digest: hex::decode(op.digest()).unwrap_or_default(),
                 },

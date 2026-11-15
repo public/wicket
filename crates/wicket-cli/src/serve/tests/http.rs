@@ -75,6 +75,10 @@ const ROUTES: &[&str] = &[
     "/api/policy",
     "/api/runs/run_01authz0000000000000000000/authority",
     "/api/explain/1",
+    "/api/push",
+    "/api/push/subscribe",
+    "/api/push/remove",
+    "/api/push/details",
     "/api",
     "/admin",
     "/.env",
@@ -136,7 +140,7 @@ async fn unauthenticated_requests_reach_only_the_sign_in_surface() {
         if let Some(c) = &c {
             h.push(("cookie", c.as_str()));
         }
-        for path in ["/", "/manifest.webmanifest", "/static/icon.svg", "/static/icon-192.png"] {
+        for path in ["/", "/session", "/session?run=run_secret", "/manifest.webmanifest", "/static/icon.svg", "/static/icon-192.png"] {
             let (status, _, body) = call(&t.state, "GET", path, &h, b"").await;
             assert_eq!(status, StatusCode::OK, "{path}");
             for s in secrets {
@@ -180,12 +184,14 @@ async fn every_response_carries_the_security_headers() {
     let mut t = setup("headers");
     let sid = t.sid.clone().unwrap();
     let cookie = format!("__Host-wicket_sid={sid}");
-    let js = ASSETS.files.keys().find(|k| k.ends_with(".js")).unwrap().clone();
+    // The hashed console.js (not the service worker, which isn't immutable).
+    let js = ASSETS.files.keys().find(|k| k.ends_with(".js") && *k != "/sw.js").unwrap().clone();
     for https in [false, true] {
         t.state.hsts = https;
         type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
         let requests: Vec<Req> = vec![
             ("GET", "/", vec![]),
+            ("GET", "/session", vec![]),
             ("GET", &js, vec![]),
             ("GET", "/manifest.webmanifest", vec![]),
             ("GET", "/api/state", vec![]),
@@ -233,19 +239,21 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
     assert_eq!(scripts.len(), 1);
     assert!(scripts[0].starts_with("<script src=\"/static/console.") && scripts[0].contains("></script>"), "{}", scripts[0]);
     assert!(!page.contains("{{"), "every placeholder filled");
-    for (path, a) in &ASSETS.files {
-        if path.ends_with(".js") || path.ends_with(".css") {
-            let digest = sha2::Sha256::digest(&a.body);
-            assert!(path.contains(&hex::encode(digest)[..16]), "{path} is named by its hash");
-            let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
-            assert!(
-                page.contains(&format!("href=\"{path}\" integrity=\"{sri}\""))
-                    || page.contains(&format!("src=\"{path}\" integrity=\"{sri}\"")),
-                "{path}"
-            );
-        }
+    for (path, a) in ASSETS.files.iter().filter(|(p, _)| p.starts_with("/static/console.")) {
+        let digest = sha2::Sha256::digest(&a.body);
+        assert!(path.contains(&hex::encode(digest)[..16]), "{path} is named by its hash");
+        let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
+        assert!(
+            page.contains(&format!("href=\"{path}\" integrity=\"{sri}\"")) || page.contains(&format!("src=\"{path}\" integrity=\"{sri}\"")),
+            "{path}"
+        );
     }
-    let js = ASSETS.files.iter().find(|(k, _)| k.ends_with(".js")).map(|(_, a)| std::str::from_utf8(&a.body).unwrap()).unwrap();
+    let js = ASSETS
+        .files
+        .iter()
+        .find(|(k, _)| k.starts_with("/static/console.") && k.ends_with(".js"))
+        .map(|(_, a)| std::str::from_utf8(&a.body).unwrap())
+        .unwrap();
     for bad in ["prompt(", "innerHTML", "eval(", "new Function", "document.write", "setAttribute(\"style\"", ".cssText"] {
         assert!(!js.contains(bad), "console.js uses {bad}");
     }
@@ -263,6 +271,61 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
         }
     }
     assert!(page.contains("rel=\"manifest\" href=\"/manifest.webmanifest\"") && page.contains("apple-touch-icon"));
+}
+
+/// #327: the session view's page, as embedded (the built bundle, or the placeholder a build without
+/// it has): its script and stylesheet named by hash with SRI, nothing inline, the console's CSP,
+/// and no eval in the bundle (the CSP would refuse it).
+#[tokio::test]
+async fn the_session_page_serves_its_embedded_bundle_under_the_csp() {
+    use crate::serve::web::{SESSION_CSS, SESSION_JS, SESSION_VIEW_BUILT};
+    let page = std::str::from_utf8(&ASSETS.session_page).unwrap();
+    assert!(!page.contains("{{"), "every placeholder filled");
+    assert!(!page.contains("<style") && !page.contains("style="), "inline style");
+    let scripts: Vec<&str> = page.match_indices("<script").map(|(i, _)| &page[i..]).collect();
+    assert_eq!(scripts.len(), 1);
+    assert!(
+        scripts[0].starts_with("<script type=\"module\" src=\"/static/session.") && scripts[0].contains("></script>"),
+        "{}",
+        scripts[0]
+    );
+    assert!(page.contains("name=\"viewport\"") && page.contains("rel=\"manifest\""), "a phone web app, as the console");
+    let t = setup("session-page");
+    let (status, h, body) = call(&t.state, "GET", "/session?run=run_x", &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h["content-type"], "text/html; charset=utf-8");
+    assert_eq!(h["content-security-policy"], CSP);
+    assert_eq!(h["cache-control"], "no-store");
+    assert_eq!(body, page, "the same page for every run: it reads the run from its URL");
+    for (ext, ctype, bytes) in [("js", "text/javascript; charset=utf-8", SESSION_JS), ("css", "text/css; charset=utf-8", SESSION_CSS)] {
+        let digest = sha2::Sha256::digest(bytes);
+        let path = format!("/static/session.{}.{ext}", &hex::encode(digest)[..16]);
+        let sri = format!("sha256-{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest));
+        assert!(page.contains(&format!("=\"{path}\" integrity=\"{sri}\"")), "{path} with its SRI on the page");
+        let (status, h, body) = call(&t.state, "GET", &path, &[], b"").await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(h["content-type"], ctype);
+        assert!(h["cache-control"].to_str().unwrap().contains("immutable"));
+        assert_eq!(h["content-security-policy"], CSP);
+        assert_eq!(body.as_bytes(), bytes);
+    }
+    let js = std::str::from_utf8(SESSION_JS).unwrap();
+    for bad in ["eval(", "new Function", "document.write"] {
+        assert!(!js.contains(bad), "the session bundle uses {bad}");
+    }
+    // The built view mounts on the page's #app; the placeholder says it wasn't built.
+    assert!(page.contains("<div id=\"app\"></div>"));
+    if SESSION_VIEW_BUILT {
+        assert!(js.len() > 10_000 && js.contains("acp.v1") && js.contains("wicket.ticket."), "the built view");
+    } else {
+        assert!(js.contains("no session view"), "the placeholder");
+    }
+    // Only these two files: nothing else under /static/session.
+    assert_eq!(ASSETS.files.keys().filter(|k| k.starts_with("/static/session.")).count(), 2);
+    // In CI's session-view job the bundle must be in (ci/session-view.sh sets this).
+    if std::env::var_os("WICKET_SESSION_VIEW_REQUIRED").is_some() {
+        assert!(std::hint::black_box(SESSION_VIEW_BUILT), "WICKET_SESSION_VIEW_REQUIRED: this build has the placeholder");
+    }
 }
 
 /// An assertion `t` signs for a login challenge, from a fresh /api/login/begin.
@@ -446,7 +509,7 @@ async fn a_sign_in_flood_never_blocks_signed_actions() {
             }
         }
     }
-    let b = t.begin(json!({ "action": "say", "run": "run_a", "text": "still here" }));
+    let b = t.begin(json!({ "action": "revoke", "run": "run_a", "reason": "still here" }));
     assert_eq!(b.status, StatusCode::OK, "the flood blocked a signed action: {:?}", b.body);
     let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
     assert_eq!(t.post("/api/action/finish", a).status, StatusCode::OK);
@@ -458,9 +521,9 @@ async fn a_sign_in_flood_never_blocks_signed_actions() {
     }
     // And repeatedly: a session's own ceremonies replace its oldest rather than running out.
     for _ in 0..(MAX_CHALLENGES_PER_OWNER * 3) {
-        assert_eq!(t.begin(json!({ "action": "say", "run": "run_a", "text": "x" })).status, StatusCode::OK);
+        assert_eq!(t.begin(json!({ "action": "revoke", "run": "run_a", "reason": "x" })).status, StatusCode::OK);
     }
-    let r = t.act(json!({ "action": "say", "run": "run_a", "text": "and again" }));
+    let r = t.act(json!({ "action": "revoke", "run": "run_a", "reason": "and again" }));
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     // Expired challenges free their room.
     for p in t.state.challenges.lock().unwrap().values_mut() {
@@ -564,7 +627,7 @@ fn attestation(challenge: &str, key: &SigningKey, id: &[u8]) -> Value {
     ad.extend_from_slice(&[0u8; 16]);
     ad.extend_from_slice(&(id.len() as u16).to_be_bytes());
     ad.extend_from_slice(id);
-    let p = key.verifying_key().to_encoded_point(false);
+    let p = key.verifying_key().to_sec1_point(false);
     let cose = ciborium::Value::Map(vec![
         (1.into(), 2.into()),
         (3.into(), (-7).into()),
@@ -606,7 +669,7 @@ async fn the_enrolment_link_is_single_use_and_its_failures_look_like_any_401() {
     let (status, _, body) = call(&t.state, "GET", "/api/me", &[("cookie", &c)], b"").await;
     assert_eq!((status, json_of(&body)["who"]["state"].as_str()), (StatusCode::OK, Some("bootstrap")));
     assert_eq!(call(&t.state, "GET", "/api/state", &[("cookie", &c)], b"").await.0, StatusCode::UNAUTHORIZED);
-    let say = json!({ "action": "say", "run": "r", "text": "hi" });
+    let say = json!({ "action": "revoke", "run": "r", "reason": "hi" });
     assert_eq!(post_json(&t.state, "/api/action/begin", Some(&boot), &say).await.0, StatusCode::UNAUTHORIZED);
     // Used: the same link is now just another 401, from anywhere.
     assert!(open_link(&t, PEER, &link).await.is_none());
@@ -624,7 +687,7 @@ async fn a_host_link_enrols_one_passkey_audited_with_the_link_and_client() {
     let boot = open_link(&t, "192.0.2.44:1", &link).await.unwrap();
     let (status, ch) = register_begin_as(&t, &boot).await;
     assert_eq!(status, StatusCode::OK);
-    let key = SigningKey::random(&mut rand_core::OsRng);
+    let key = SigningKey::generate();
     let (status, _, body) = post_json(&t.state, "/api/register/finish", Some(&boot), &attestation(&ch.unwrap(), &key, b"cred-2")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let creds = t.ledger().operator_credentials(&TenantId::single()).unwrap();
@@ -652,7 +715,7 @@ async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
     // Finish: refused, even with a valid registration challenge (issued to an enrolment session).
     let boot = open_link(&t, PEER, &host_link(&t, 600)).await.unwrap();
     let ch = register_begin_as(&t, &boot).await.1.unwrap();
-    let key = SigningKey::random(&mut rand_core::OsRng);
+    let key = SigningKey::generate();
     let (status, _, _) = post_json(&t.state, "/api/register/finish", Some(&op), &attestation(&ch, &key, b"stolen")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // And without any session: the uniform 401.
@@ -666,7 +729,7 @@ async fn a_signed_in_operator_session_cannot_enrol_a_passkey() {
 async fn posts_need_the_csrf_header_and_the_consoles_origin() {
     let t = setup("origin");
     let cookie = format!("__Host-wicket_sid={}", t.sid.clone().unwrap());
-    let body = br#"{"action":"say","run":"run_x","text":"hi"}"#;
+    let body = br#"{"action":"revoke","run":"run_x","reason":"hi"}"#;
     let base = [("cookie", cookie.as_str()), ("content-type", "application/json")];
     let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
         (vec![("origin", ORIGIN)], StatusCode::FORBIDDEN),

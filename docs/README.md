@@ -29,10 +29,12 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)
 - [Run an ACP agent](how-to/run-an-acp-agent.md)
+- [Work with a running agent in the console](how-to/work-with-a-running-agent-in-the-console.md): its live session, prompts, escalations
 - [Use HTTP/3](how-to/use-http3.md)
 - [Export audit](how-to/export-audit.md)
 - [Inspect a run's authority in the console](how-to/inspect-authority-in-the-console.md), and explain a decision
 - [Edit a manifest in the console](how-to/edit-a-manifest-in-the-console.md), with its authority diff
+- [Get notified of approvals](how-to/get-notified-of-approvals.md) on your phone or desktop (Web Push)
 - [Keep state off the host, and restore](how-to/state-off-host-and-restore.md)
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
 - [Update from CI-signed builds](how-to/update-from-ci.md), and follow main
@@ -56,7 +58,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [The box](reference/box.md): what a workload sees from inside
 - [Agents](reference/agents.md): identity, children, messages, sessions, hibernation
 - [Nodes](reference/nodes.md): enrolment, `node serve`, placement, leases, the reconciler
-- [Console](reference/console.md): passkeys, signed actions, authority views, manifests, what it enforces on the internet
+- [Console](reference/console.md): passkeys, signed actions, sessions, authority views, manifests, what it enforces on the internet
 - [Audit](reference/audit.md): the writer, export, checkpoints, record kinds
 
 ## Explanation
@@ -77,4 +79,5 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
   [security review before 0.0.1](explanation/security-review-0.0.1.md)
 
 Changes are in [CHANGELOG.md](../CHANGELOG.md), assembled at release time from the fragments pull requests add under [changes/](../changes/README.md). `ci/check-doc-links.sh` checks every relative link
-in these pages; `ci/gen-cli-reference.sh` writes the command-line reference.
+in these pages, `ci/check-terms.sh` that they use the [glossary's words](explanation/concepts.md#the-nouns), and
+`ci/gen-cli-reference.sh` writes the command-line reference.

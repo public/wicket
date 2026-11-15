@@ -10,7 +10,7 @@ publish.workspace = true
 wicket-core.workspace = true
 wicket-authz.workspace = true
 wicket-identity.workspace = true
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 base64 = "0.22"
 sha2.workspace = true
 hex.workspace = true
@@ -19,5 +19,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+getrandom = { workspace = true, features = ["sys_rng"] }

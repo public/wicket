@@ -328,11 +328,16 @@ pub struct Options {
     /// `nodesrv` does since #324). Off: only the one-second spend file, as before. The simulation
     /// then finds the overspend that journal fixes (`tests/scenario.rs`).
     pub spend_journal: bool,
+    /// The control host publishes a grant with `not_after = expires_at - 1` (`Grant::not_after_for`,
+    /// as noderun does since #342), so the node's inclusive whole-second check ends it at the
+    /// ledger's `expires_at`. Off: `not_after = expires_at`, as before, and the strict oracle finds
+    /// allows up to 999 ms past it (`tests/scenario.rs`).
+    pub grant_end_fix: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { keep_trace: false, spend_journal: true }
+        Options { keep_trace: false, spend_journal: true, grant_end_fix: true }
     }
 }
 

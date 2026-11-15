@@ -1,9 +1,8 @@
 //! Hostile tokens: everything outside wicket's block shapes is refused at load, before any
 //! evaluation; and the step budget bounds the cost of whatever the structural check lets through.
 
-mod common;
+use crate::common::{self, *};
 use biscuit_auth::{BlockBuilder, PrivateKey};
-use common::*;
 use std::time::Instant;
 use wicket_authz::*;
 

@@ -14,8 +14,9 @@ explains why it is built this way.
   `--memory`), so a box on a host with swap can't swap past it. `/tmp` is capped at 512 MiB, checked every
   5 s.
 - **Memory** (#185): the node samples the box's cgroup every 5 s. When the box reaches 90% of its memory
-  limit, its agent gets a message from wicket (at its next turn) saying so and asking it to reduce
-  parallelism and save its work; it is warned again only after dropping below 75%. A box over its limit is
+  limit, its agent gets a message from wicket (at its next turn) saying so and asking it to use
+  less memory and save its work, followed by its zone's `limits.memory_advice` if it has one
+  ([manifest](manifest.md#limits), #348); it is warned again only after dropping below 75%. A box over its limit is
   killed whole by the kernel's OOM killer (gVisor's sandbox included).
 - **How a box ended** (#185): when a box ends abnormally its node says why, and `wicket run` prints it
   with the status, for example `failed (exit status: 137; killed: out of memory (limit 3 GiB, peak 3 GiB))`.
@@ -61,7 +62,7 @@ port stay the agent's.
 ## What the box holds
 
 - No secrets: placeholders only. The model credential is a placeholder `CLAUDE_CODE_OAUTH_TOKEN` (or,
-  for a remote session, a placeholder login file); the proxies swap in the real value on the hosts
+  for a Remote Control session, a placeholder login file); the proxies swap in the real value on the hosts
   the secret is bound to.
 - The run's CA (or, on a node, the installation root for the node CA's leaves and the run's CA), in
   the trust store and `SSL_CERT_FILE`.
