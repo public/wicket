@@ -125,7 +125,7 @@ wicket run run_…  tenant t0  zone research  agent explorer (claude-code)
   isolation Gvisor, no network; egress and model calls via wicket only
   identity spiffe://wicket.example.com/t/t0/z/research/a/explorer  (valid 600s, re-issued every 300s)
   acting for you (cli, unix-user) → explorer
-  approve escalations from another terminal: wicket pending / wicket approve <id>
+  decide requests from another terminal: wicket pending / wicket approve <id>
   run dir /home/you/.local/share/wicket/runs/run_…
 ```
 
@@ -136,7 +136,7 @@ Then every model call and every request the box makes, as wicket decides them:
 [egress] ALLOW   GET api.github.com/repos/octocat/Hello-World  (R1ReadScoped; …)
 …
 [egress] PENDING GET example.com/  (R1ReadScoped; r-… …)
-         → a human decides: wicket approve r-…   or   wicket deny r-…
+         → an operator decides: wicket approve r-…   or   wicket deny r-…
 ```
 
 The agent's request for example.com got a 403 that says a human must decide, and a request id. The

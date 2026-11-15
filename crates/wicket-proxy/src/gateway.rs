@@ -956,7 +956,7 @@ fn tools() -> Value {
         },
         {
             "name": "spawn_agent",
-            "description": "Start a child agent in its own sandbox with its own wicket identity, for work that should be separately identified and approved. It gets the task text and (optionally) a narrower reach. Returns its run id; use await_message for its messages and result.",
+            "description": "Start a child agent in its own box with its own wicket identity, for work that should be separately identified and approved. It gets the task text and (optionally) a narrower reach. Returns its run id; use await_message for its messages and result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

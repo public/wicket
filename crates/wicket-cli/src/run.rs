@@ -1009,7 +1009,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let proxies_lap = std::time::Instant::now();
     let egress = Egress::new(ctx.clone(), ca.clone())?;
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
-    // of record (#152, #257), whose reports are merged in here and whose slices are leased from here.
+    // of record (#152, #257), whose reports are merged in here and whose budget slices are sent from here.
     // Nothing listens for model calls on this side.
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
     let llm = Llm::with_quota(ctx.clone(), limits.model)?;
@@ -1147,7 +1147,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if node.is_some() {
         println!("  node {node_name} via wicket node serve (egress decided there from the signed feed; secrets stay here)");
     }
-    println!("  approve escalations from another terminal: wicket pending / wicket approve <id>");
+    println!("  decide requests from another terminal: wicket pending / wicket approve <id>");
     println!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
     let lap = std::time::Instant::now();
@@ -2364,7 +2364,7 @@ fn print_event(ev: &Event) {
             );
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
-                    println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
+                    println!("         → an operator decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
         }
