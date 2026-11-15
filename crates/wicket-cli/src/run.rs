@@ -1626,7 +1626,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         println!("[remote] {}", wicket_agent::clip(&l, 300));
                         if remote_url.is_none() {
                             if let Some(u) = harness.and_then(|h| h.remote_session_url(&l)) {
-                                println!("[wicket] remote session: {u}");
+                                println!("[wicket] Remote Control session: {u}");
                                 if let Ok(lg) = ledger.lock() {
                                     let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
                                 }
@@ -1703,14 +1703,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if driven_remote && remote_url.is_none() {
                             match harness.and_then(|h| h.driven_remote_status(&l)) {
                                 Some(Ok(u)) => {
-                                    println!("[wicket] remote session: {u}");
+                                    println!("[wicket] Remote Control session: {u}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
                                     }
                                     remote_url = Some(u);
                                 }
                                 Some(Err(why)) => {
-                                    println!("[wicket] the remote session didn't start (the agent carries on, driven by wicket only): {why}");
+                                    println!("[wicket] the Remote Control session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
                                     }

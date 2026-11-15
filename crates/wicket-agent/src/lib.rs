@@ -53,7 +53,7 @@ pub fn user_message(text: &str) -> String {
 }
 
 /// What every agent under wicket is told about where it is. Shared by batch runs and wrapped sessions.
-pub const SANDBOX_NOTICE: &str = "You are running inside a wicket sandbox: a gVisor container with no network interface of its own. Everything you send leaves through wicket's proxy, which decides what you may reach. Rules of this environment:\n\
+pub const BOX_NOTICE: &str = "You are running inside a wicket sandbox: a gVisor container with no network interface of its own. Everything you send leaves through wicket's proxy, which decides what you may reach. Rules of this environment:\n\
 - You hold no credentials and need none: authentication for allowed services is added outside the sandbox. Do not look for or ask for tokens.\n\
 - A request outside what you may reach fails with HTTP 403 and a status line starting \"Blocked by wicket sandbox\", which says which case it is. \"never allowed\": it will never work from here, and nobody can approve it; do not retry. \"needs human approval\": the response has a request_id; call the wicket MCP tool await_grant with it to wait for the decision, then retry the same request once. \"denied by a human\": final for that request.\n\
 - There is no other route out of the sandbox. Do not try other tools, other hosts, mirrors, caches or proxies to get the same thing; it wastes time and is logged.\n\
@@ -152,7 +152,7 @@ pub fn claude_code_wrapped_plan(
         let file_arg = |path: &str, files: &mut Vec<(String, Vec<u8>)>| -> anyhow_free::Result<String> {
             let mut body = std::fs::read(path).map_err(|e| anyhow_free::Error(format!("reading {path}: {e}")))?;
             // The launcher's system-prompt addition, followed by wicket's notice.
-            body.extend_from_slice(format!("\n\n{SANDBOX_NOTICE}\n").as_bytes());
+            body.extend_from_slice(format!("\n\n{BOX_NOTICE}\n").as_bytes());
             let rel = format!("launcher/file{}", files.len());
             files.push((rel.clone(), body));
             Ok(format!("{STATE_DIR}/{rel}"))
@@ -175,7 +175,7 @@ pub fn claude_code_wrapped_plan(
     }
     if !files.iter().any(|(rel, _)| rel.starts_with("launcher/")) {
         out.push("--append-system-prompt".into());
-        out.push(SANDBOX_NOTICE.into());
+        out.push(BOX_NOTICE.into());
     }
     // wicket's tools (await_grant, whoami, …) as the only MCP server: the account's connectors and any
     // project servers stay out of the box.
@@ -286,13 +286,13 @@ fn remote_login_files(run: &RunId, login_placeholder: &str, login_meta: &Value, 
     files
 }
 
-/// What a Remote Control agent is told, besides the sandbox notice: its messages come from the app.
+/// What a Remote Control agent is told, besides the box notice: its messages come from the app.
 const RC_NOTICE: &str = "- You are a Remote Control session: the user talks to you from the Claude app. Work in /workspace.";
 
 /// A Remote Control agent (#169): Claude Code booted in the box as `claude remote-control`, so the
 /// box registers its own session in the owner's Claude apps. The account login is a placeholder
 /// (swapped by the egress proxy toward `api.anthropic.com`, refreshed only on the host); wicket's
-/// gateway is the only MCP server, the sandbox notice is the user memory, and `/workspace` is
+/// gateway is the only MCP server, the box notice is the user memory, and `/workspace` is
 /// trusted, so nothing waits on a terminal that isn't there.
 ///
 /// `permission_mode` is `agent.remote.permission_mode` as `--permission-mode` takes it (#285).
@@ -307,7 +307,7 @@ pub fn claude_code_remote_control_plan(
     let login_placeholder = login_placeholder(run);
     let mcp: Value = serde_json::from_str(WICKET_MCP).unwrap_or_default();
     let mut files = remote_login_files(run, &login_placeholder, login_meta, Some(&mcp["mcpServers"]));
-    files.push(("claude/CLAUDE.md".into(), format!("{SANDBOX_NOTICE}\n{RC_NOTICE}\n").into_bytes()));
+    files.push(("claude/CLAUDE.md".into(), format!("{BOX_NOTICE}\n{RC_NOTICE}\n").into_bytes()));
     let argv = [
         "wicket-entry",
         "claude",
@@ -394,7 +394,7 @@ pub fn claude_code_driven_remote_plan(
     let at = plan.argv.iter().position(|a| a == "--permission-mode").expect("the driven plan sets a permission mode");
     plan.argv[at + 1] = permission_mode.into();
     if let Some(p) = plan.argv.iter().position(|a| a == "--append-system-prompt") {
-        plan.argv[p + 1] = format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}\n{DRIVEN_RC_NOTICE}");
+        plan.argv[p + 1] = format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}\n{DRIVEN_RC_NOTICE}");
     }
     let on = serde_json::json!({
         "type": "control_request",
@@ -562,7 +562,7 @@ pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     });
     let mut argv = vec!["wicket-entry".to_string()];
     argv.extend(spec.command.iter().cloned());
-    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}"), meta, resume: None };
+    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}"), meta, resume: None };
     Some(LaunchPlan { env, argv, stdin_task: None, acp: Some(cfg) })
 }
 
@@ -589,7 +589,7 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
         // to start a subagent is wicket's spawn_agent (its own sandbox and identity).
         if m.agent.as_ref().map(|a| a.in_box_subagents).unwrap_or(true) { "WebSearch".into() } else { "WebSearch,Agent,Task".into() },
         "--append-system-prompt".into(),
-        format!("{SANDBOX_NOTICE}\n{LIFETIME_NOTICE}"),
+        format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}"),
         // The only MCP server is wicket's gateway; repo-supplied MCP config is ignored.
         "--mcp-config".into(),
         WICKET_MCP.into(),
@@ -698,7 +698,7 @@ mod tests {
         assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"), "a generic agent gets no Claude placeholder");
         let cfg = p.acp.unwrap();
         assert_eq!((cfg.cwd.as_str(), cfg.meta.is_none()), (WORKSPACE, true));
-        assert!(cfg.system_prompt.starts_with(SANDBOX_NOTICE));
+        assert!(cfg.system_prompt.starts_with(BOX_NOTICE));
         assert!(!uses_claude_settings(&m));
         // The Claude adapter: Claude Code's placeholders, and wicket's lockdown in _meta.
         let m = crate::load(&y(", profile: claude-agent-acp", ", llm: {}")).unwrap();

@@ -787,7 +787,7 @@ impl Manifest {
                             return Err(ManifestError::Invalid("agent.acp.command: the agent's command and arguments, none empty".into()));
                         }
                         if a.remote.is_some() {
-                            return Err(ManifestError::Invalid("agent.remote: an ACP agent has no remote session of its own".into()));
+                            return Err(ManifestError::Invalid("agent.remote: an ACP agent has no Remote Control session of its own".into()));
                         }
                         if a.max_turns.is_some() {
                             return Err(ManifestError::Invalid(
