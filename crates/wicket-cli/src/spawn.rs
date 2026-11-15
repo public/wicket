@@ -889,7 +889,7 @@ mod tests {
         )
         .unwrap();
         let plan = |zone: Option<serde_json::Value>| {
-            let req = SpawnRequest { name: "kid".into(), kind: "program".into(), command: vec!["true".into()], zone, ..Default::default() };
+            let req = SpawnRequest { name: "kid".into(), kind: "agent".into(), task: Some("t".into()), zone, ..Default::default() };
             plan_child(
                 &PlanIn {
                     parent: &p,
