@@ -731,6 +731,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #310: a model call through the egress gate is charged its real usage, as one through the model
+    /// proxy is. The box asks for a compressed response; the gate asks upstream for identity (an
+    /// upstream given the box's `Accept-Encoding` answers gzip here, whose usage can't be read), and
+    /// sends the rewritten body with its own length (a field stripped makes it shorter).
+    #[tokio::test]
+    async fn a_streamed_model_call_through_egress_is_charged_its_real_usage() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let origin = crate::ca::RunCa::generate("origin").unwrap();
+        let mut cfg = (*origin.server_config("api.anthropic.com").unwrap()).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        // What the stand-in got: (Accept-Encoding, body).
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let (acceptor, seen) = (acceptor.clone(), seen2.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let enc = req.headers().get("accept-encoding").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                            let body = req.into_body().collect().await?.to_bytes();
+                            seen.lock().unwrap().push((enc.clone(), String::from_utf8_lossy(&body).into_owned()));
+                            let sse = [
+                                (
+                                    "message_start",
+                                    r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":5,"output_tokens":1}}}"#,
+                                ),
+                                ("content_block_delta", r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#),
+                                ("message_delta", r#"{"type":"message_delta","usage":{"output_tokens":42}}"#),
+                                ("message_stop", r#"{"type":"message_stop"}"#),
+                            ];
+                            let mut r = http::Response::builder().header("content-type", "text/event-stream");
+                            let frames: Vec<bytes::Bytes> = if enc == "identity" {
+                                sse.iter().map(|(e, d)| bytes::Bytes::from(format!("event: {e}\ndata: {d}\n\n"))).collect()
+                            } else {
+                                r = r.header("content-encoding", "gzip");
+                                vec![bytes::Bytes::from_static(b"\x1f\x8b\x08\x00compressed")]
+                            };
+                            let stream =
+                                futures_util::stream::iter(frames.into_iter().map(|b| Ok::<_, hyper::Error>(hyper::body::Frame::data(b))));
+                            Ok::<_, hyper::Error>(r.body(http_body_util::StreamBody::new(stream)).unwrap())
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
+                });
+            }
+        });
+        let (c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [POST]}]", vec![], "model-usage");
+        let up = super::Upstream {
+            resolve: [("api.anthropic.com".to_string(), addr)].into(),
+            roots_pem: Some(origin.cert_pem()),
+            ..Default::default()
+        };
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with_upstream(c.clone(), ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let llm = crate::llm::Llm::new(c).unwrap();
+        e.set_model_gate(llm.clone());
+        let body =
+            r#"{"model":"m","max_tokens":300,"stream":true,"messages":[{"role":"user","content":"hi"}],"some_future_field":{"x":1}}"#;
+        let req = http::Request::post("/v1/messages")
+            .header("host", "api.anthropic.com")
+            .header("content-type", "application/json")
+            .header("accept-encoding", "gzip, deflate, br")
+            .header("content-length", body.len())
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .unwrap();
+        let r = e.clone().handle(req, "api.anthropic.com".into(), "https", super::Via::Tcp).await;
+        assert_eq!(r.status(), 200);
+        let got = String::from_utf8_lossy(&r.into_body().collect().await.unwrap().to_bytes()).into_owned();
+        assert!(got.contains("message_stop"), "{got}");
+        let (enc, sent) = seen.lock().unwrap()[0].clone();
+        assert_eq!(enc, "identity");
+        assert!(!sent.contains("some_future_field") && sent.contains("\"max_tokens\":300"), "{sent}");
+        for _ in 0..300 {
+            if llm.inflight_output_tokens.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(llm.inflight_output_tokens.load(SeqCst), 0, "settled");
+        assert_eq!(llm.output_tokens.load(SeqCst), 42, "charged its real output, not the 300 reserved");
+        assert_eq!((llm.input_tokens.load(SeqCst), llm.cache_read_tokens.load(SeqCst)), (12, 5));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// #129: no credential is ever sent over plain HTTP: requests to a host with an inject rule or a
     /// swap are refused with a 403 that says to use https, before the vault is read.
     #[tokio::test]

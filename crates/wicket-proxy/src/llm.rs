@@ -617,6 +617,33 @@ impl Llm {
                     )));
                 };
                 if r < asked {
+                    // Extended thinking's budget counts within max_tokens and must stay below it (and
+                    // at or above the provider's minimum), or the lowered request is refused upstream
+                    // (#310): lower it with max_tokens, or refuse here when no valid request fits.
+                    if let Some(thinking) = json.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+                        let enabled = thinking.get("type").and_then(|t| t.as_str()) == Some("enabled");
+                        if let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_u64()).filter(|b| enabled && *b >= r) {
+                            if r <= THINKING_MIN_BUDGET {
+                                self.settle(r, Usage::default(), true);
+                                let why = format!(
+                                    "budget left: {r} output tokens, too few for this request's extended thinking (thinking.budget_tokens {budget}; it must be at least {THINKING_MIN_BUDGET} and below max_tokens)"
+                                );
+                                self.event(model.clone(), 429, Usage::default(), &format!("budget: {why}"));
+                                return Err(Box::new(problem(
+                                    429,
+                                    "budget",
+                                    "Model token budget too low for this request",
+                                    &format!(
+                                        "{why}. Send it without extended thinking or with a smaller max_tokens, or ask for more budget. {}",
+                                        crate::SANDBOX_FACT
+                                    ),
+                                    None,
+                                )));
+                            }
+                            thinking.insert("budget_tokens".into(), (r - 1).into());
+                            notes.push(format!("thinking.budget_tokens {budget} lowered to {}", r - 1));
+                        }
+                    }
                     json.insert("max_tokens".into(), r.into());
                     notes.push(format!("max_tokens {asked} lowered to the {r} output tokens left"));
                 }
@@ -665,6 +692,13 @@ impl Llm {
             Err(r) => return *r,
         };
         let reserved = f.reserved;
+        let mut parts = parts;
+        // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
+        // up, not the one the box declared. And the response is asked for unencoded, as the model
+        // proxy asks for it, so its usage can be read as it streams past (#310): the box's
+        // `Accept-Encoding` would get a compressed stream that the usage scanner can't read.
+        parts.headers.insert(http::header::CONTENT_LENGTH, f.body.len().into());
+        parts.headers.insert(http::header::ACCEPT_ENCODING, http::HeaderValue::from_static("identity"));
         let req = Request::from_parts(parts, http_body_util::Full::new(f.body));
         match egress.forward(req, host, "https", pq, via).await {
             Ok(resp) => {
@@ -674,8 +708,15 @@ impl Llm {
                     .get(http::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.starts_with("text/event-stream"));
+                let mut note = f.note;
+                // An upstream that encodes anyway: its usage can't be read, so say why it is charged.
+                if let Some(enc) =
+                    resp.headers().get(http::header::CONTENT_ENCODING).filter(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+                {
+                    note.push_str(&format!("; response Content-Encoding {}", String::from_utf8_lossy(enc.as_bytes())));
+                }
                 let (head, body) = resp.into_parts();
-                Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, f.note))
+                Response::from_parts(head, self.account(f.model, status, sse, body.into_data_stream(), reserved, note))
             }
             Err(e) => {
                 self.settle(reserved, Usage::default(), true);
@@ -757,6 +798,10 @@ impl Llm {
 
 /// The host Claude Code's model calls go to.
 pub(crate) const MODEL_HOST: &str = wicket_core::splice::MODEL_HOST;
+
+/// The provider's smallest `thinking.budget_tokens` (Anthropic's Messages API): a request lowered
+/// to fit the budget keeps its thinking budget at least this and below its `max_tokens` (#310).
+const THINKING_MIN_BUDGET: u64 = 1024;
 
 /// The only model endpoints that take a request body (#112). Batches, files and anything else are
 /// refused: a batch carries requests (and tools) of its own.
@@ -1400,6 +1445,54 @@ mod tests {
         assert_eq!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(url)).err().map(|r| r.status().as_u16()), Some(403));
         let b64 = r#"{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}]}"#;
         assert!(llm.filter(Some(&spec), &parts(), bytes::Bytes::from(b64)).is_ok());
+    }
+
+    /// #310: a request lowered to what is left of the budget stays valid with extended thinking: its
+    /// thinking budget is lowered below the new max_tokens, never under the provider's minimum, and
+    /// a request no valid lowering fits is refused with the reason (its reservation released).
+    #[tokio::test]
+    async fn a_lowered_request_with_thinking_stays_valid_or_is_refused() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 90000}")).unwrap();
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        let parts = || http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let ask = |max: u64, thinking: &str| {
+            bytes::Bytes::from(format!(r#"{{"model":"m","max_tokens":{max},"thinking":{thinking},"messages":[]}}"#))
+        };
+        let enabled = |b: u64| format!(r#"{{"type":"enabled","budget_tokens":{b}}}"#);
+        // 2000 spent: 88000 left. Thinking within the lowered max_tokens stays as it is.
+        llm.spent_before(0, 0, 2000);
+        let f = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(31999))).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["budget_tokens"].as_u64()), (Some(88000), Some(31999)));
+        llm.settle(f.reserved, Usage::default(), true);
+        // A thinking budget at or above it is lowered below it.
+        let f = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(127999))).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["budget_tokens"].as_u64()), (Some(88000), Some(87999)));
+        assert!(f.note.contains("thinking.budget_tokens 127999 lowered to 87999"), "{}", f.note);
+        llm.settle(f.reserved, Usage::default(), true);
+        // Adaptive thinking has no budget of its own: only max_tokens is lowered.
+        let f = llm.filter(Some(&spec), &parts(), ask(128000, r#"{"type":"adaptive"}"#)).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["type"].as_str()), (Some(88000), Some("adaptive")));
+        llm.settle(f.reserved, Usage::default(), true);
+        // 1024 left: no thinking budget is both at least 1024 and below max_tokens. Refused, clearly.
+        llm.spent_before(0, 0, 90000 - 1024);
+        let r = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(4000))).err().expect("refused");
+        assert_eq!(r.status().as_u16(), 429);
+        let body = http_body_util::BodyExt::collect(r.into_body()).await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("budget left: 1024 output tokens") && body.contains("thinking.budget_tokens 4000"), "{body}");
+        assert_eq!(llm.inflight_output_tokens.load(std::sync::atomic::Ordering::SeqCst), 0, "the reservation is released");
+        // Without thinking (or with it disabled) the same request is lowered and sent.
+        let f = llm.filter(Some(&spec), &parts(), ask(128000, r#"{"type":"disabled"}"#)).ok().unwrap();
+        assert_eq!(f.reserved, 1024);
+        // 1025 left: the smallest valid lowering, thinking 1024 below max_tokens 1025.
+        llm.settle(f.reserved, Usage::default(), true);
+        llm.spent_before(0, 0, 90000 - 1025);
+        let f = llm.filter(Some(&spec), &parts(), ask(128000, &enabled(4000))).ok().unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert_eq!((out["max_tokens"].as_u64(), out["thinking"]["budget_tokens"].as_u64()), (Some(1025), Some(1024)));
     }
 
     /// #113: parallel calls reserve from what is left, so together they can't overshoot.
