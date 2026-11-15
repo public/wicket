@@ -305,33 +305,33 @@ pub fn render_node(f: &NodeFrame, width: usize) -> Vec<String> {
     out.push(format!("wicket node top — node {} — {}", clean(&s.node, 64), clock(now)));
     let id = match (&s.identity, s.identity_until, &s.identity_error) {
         (_, _, Some(e)) => format!("identity UNUSABLE: {}", clean(e, 120)),
-        (Some(id), Some(u), _) => format!("identity {} {}", clean(id, 80), until(u * 1000, now)),
+        (id, Some(u), _) => format!("identity {} {}", clean(id.as_deref().unwrap_or("certificate"), 80), until(u * 1000, now)),
         _ => "identity: no certificate".into(),
     };
     let ca = match s.ca_until {
         Some(u) => format!("CA {}", until(u * 1000, now)),
         None => "CA: none (every host goes to the control host)".into(),
     };
-    out.push(format!("{id}   {ca}"));
+    out.push(id);
+    out.push(ca);
     let control = match (s.control.connections, s.control.since_ms) {
         (0, 0) => "control: not connected since serve started".to_string(),
         (0, t) => format!("control: CUT OFF since {} ({} ago)", clock(t), dur((now - t) / 1000)),
-        (n, t) => format!("control: connected ({n} link{}) since {} ({})", if n == 1 { "" } else { "s" }, clock(t), dur((now - t) / 1000)),
+        (n, t) => format!("control: connected ({n} link{}) since {} ({})", plural(n), clock(t), dur((now - t) / 1000)),
     };
-    let feed = match (s.feed.mode.as_str(), s.feed.fresh_until_ms) {
-        (m, Some(u)) if u > now => {
-            format!("feed {m}, epoch {}, {} left", s.feed.epoch.map_or("-".into(), |e| e.to_string()), dur((u - now) / 1000))
-        }
-        (m, Some(u)) => format!("feed {m}, epoch {}, stale {}", s.feed.epoch.map_or("-".into(), |e| e.to_string()), dur((now - u) / 1000)),
+    let epoch = s.feed.epoch.map_or("-".into(), |e| e.to_string());
+    let feed = match (clean(&s.feed.mode, 16), s.feed.fresh_until_ms) {
+        (m, Some(u)) if u > now => format!("feed {m}, epoch {epoch}, {} left", dur((u - now) / 1000)),
+        (m, Some(u)) => format!("feed {m}, epoch {epoch}, stale {}", dur((now - u) / 1000)),
         (m, None) => format!("feed {m}, nothing vouches for it"),
     };
-    out.push(format!("{control}   {feed}"));
+    out.push(control);
+    out.push(feed);
     out.push(host_line(&f.host));
     out.push(String::new());
-    out.push(format!(
-        "{:<12} {:<18} {:<8} {:>6} {:>5} {:>11} {:>5} {:>11} {:>11} {:>8} {:>3}",
-        "RUN", "AGENT/ZONE", "STATE", "UP", "CPU%", "MEM/LIMIT", "REQ", "TOK in/out", "SLICE LEFT", "EGR +/-", "ASK"
-    ));
+    // Two lines a box, so a box's row reads on an 80-column console: what it is and takes, then its
+    // model use, slice, egress and asks.
+    out.push(format!("{:<8}  {:<22} {:<11} {:>6} {:>6} {:>10}", "RUN", "AGENT/ZONE", "STATE", "UP", "CPU%", "MEM/LIMIT"));
     if s.boxes.is_empty() {
         out.push("(no boxes on this node)".into());
     }
@@ -345,22 +345,24 @@ pub fn render_node(f: &NodeFrame, width: usize) -> Vec<String> {
         let who = format!("{}/{}", clean(b.agent.as_deref().unwrap_or("-"), 40), clean(&b.zone, 40));
         let state = if b.state == "running" && !b.connected { "running*".to_string() } else { clean(&b.state, 12) };
         out.push(format!(
-            "{:<12} {:<18} {:<8} {:>6} {:>5} {:>11} {:>5} {:>11} {:>11} {:>8} {:>3}",
+            "{:<8}  {:<22} {:<11} {:>6} {:>6} {:>10}",
             short_run(&b.run),
-            cut(&who, 18),
-            cut(&state, 8),
+            cut(&who, 22),
+            cut(&state, 11),
             dur((now - b.started_ms) / 1000),
             cpu,
-            mem,
+            mem
+        ));
+        let input = b.spent.input_tokens + b.spent.cache_read_tokens + b.spent.cache_creation_tokens;
+        out.push(format!(
+            "          model {} req {}/{} tok | left {} | egress +{} -{} | asks {}",
             b.spent.requests,
-            format!(
-                "{}/{}",
-                count(b.spent.input_tokens + b.spent.cache_read_tokens + b.spent.cache_creation_tokens),
-                count(b.spent.output_tokens)
-            ),
+            count(input),
+            count(b.spent.output_tokens),
             slice_left(b.slice.as_ref(), &b.spent),
-            format!("{}/{}", count(b.egress_allowed), count(b.egress_refused)),
-            b.asks,
+            count(b.egress_allowed),
+            count(b.egress_refused),
+            b.asks
         ));
     }
     if s.boxes.iter().any(|b| b.state == "running" && !b.connected) {
@@ -395,7 +397,9 @@ fn host_line(h: &HostStats) -> String {
 /// budget, or none was leased yet).
 fn slice_left(slice: Option<&Slice>, spent: &Spent) -> String {
     match slice {
-        Some(s) => format!("{}r/{}", s.requests.saturating_sub(spent.requests), count(s.output_tokens.saturating_sub(spent.output_tokens))),
+        Some(s) => {
+            format!("{} req {}", s.requests.saturating_sub(spent.requests), count(s.output_tokens.saturating_sub(spent.output_tokens)))
+        }
         None => "-".into(),
     }
 }
@@ -590,7 +594,7 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
         out.push(format!("{:<16} {:<26} {:>5} {:>10} {:>12}", cut(&clean(&n.name, 64), 16), link, n.boxes, cpu, mem));
     }
     out.push(String::new());
-    out.push(format!("{:<12} {:<10} {:<20} {:<10} {:>6} {:>5} {:>11}", "RUN", "NODE", "AGENT/ZONE", "STATUS", "UP", "REQ", "TOK in/out"));
+    out.push(format!("{:<8}  {:<12} {:<20} {:<11} {:>6} {:>5} {:>9}", "RUN", "NODE", "AGENT/ZONE", "STATUS", "UP", "REQ", "TOK in/out"));
     if f.runs.is_empty() {
         out.push("(no runs)".into());
     }
@@ -607,11 +611,11 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
             None => ("-".into(), "-".into()),
         };
         out.push(format!(
-            "{:<12} {:<10} {:<20} {:<10} {:>6} {:>5} {:>11}",
+            "{:<8}  {:<12} {:<20} {:<11} {:>6} {:>5} {:>9}",
             short_run(&r.run),
-            cut(&clean(r.node.as_deref().unwrap_or("-"), 64), 10),
+            cut(&clean(r.node.as_deref().unwrap_or("-"), 64), 12),
             cut(&format!("{}/{}", clean(&r.agent, 40), clean(&r.zone, 40)), 20),
-            cut(&status, 10),
+            cut(&status, 11),
             if r.status != "hibernated" { dur((now - r.started_ms) / 1000) } else { "-".into() },
             req,
             tok
@@ -619,14 +623,14 @@ pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
     }
     if !f.leases.is_empty() {
         out.push(String::new());
-        out.push(format!("{:<28} {:<8} {:<12} {:<14} {:>10} {:>9}", "LEASE", "PROVIDER", "RUN", "NODE", "ENDS IN", "RESERVED"));
+        out.push(format!("{:<26}  {:<8} {:<8}  {:<12} {:>7} {:>9}", "LEASE", "PROVIDER", "RUN", "NODE", "ENDS IN", "RESERVED"));
         for x in &f.leases {
             out.push(format!(
-                "{:<28} {:<8} {:<12} {:<14} {:>10} {:>9}",
-                cut(&clean(&x.id, 64), 28),
+                "{:<26}  {:<8} {:<8}  {:<12} {:>7} {:>9}",
+                cut(&clean(&x.id, 64), 26),
                 cut(&clean(&x.provider, 16), 8),
                 short_run(&x.run),
-                cut(&clean(x.node.as_deref().unwrap_or("-"), 64), 14),
+                cut(&clean(x.node.as_deref().unwrap_or("-"), 64), 12),
                 x.not_after.map_or("-".into(), |t| dur(t - now / 1000)),
                 format!("${:.2}", x.reserved_micro_usd as f64 / 1e6)
             ));
@@ -643,11 +647,12 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-/// A run id cut to what tells runs apart on a screen: `run_` and the first 8 characters after it.
+/// A run id cut to what tells runs apart on a screen: its last 8 characters (a run id is `run_`
+/// and a ULID, whose first characters are its time, so runs started together share them).
 pub fn short_run(run: &str) -> String {
     let r = clean(run, 64);
-    let body = r.strip_prefix("run_").unwrap_or(&r);
-    cut(&format!("run_{}", body.chars().take(8).collect::<String>()), 12)
+    let n = r.chars().count();
+    r.chars().skip(n.saturating_sub(8)).collect()
 }
 
 /// Text from a node, a box or the ledger, with terminal escapes, bidi and zero-width characters
@@ -713,13 +718,14 @@ pub fn bytes(b: u64) -> String {
     }
 }
 
-/// A count in at most five characters: `999`, `12.3k`, `4.5M`.
+/// A count in at most four characters: `999`, `1.2k`, `40k`, `1.2M`, `12M`.
 pub fn count(n: u64) -> String {
+    let short = |v: f64, unit: &str| if v < 10.0 { format!("{v:.1}{unit}") } else { format!("{v:.0}{unit}") };
     match n {
         n if n < 1000 => n.to_string(),
-        n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1e3),
-        n if n < 1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        n => format!("{:.1}G", n as f64 / 1e9),
+        n if n < 999_500 => short(n as f64 / 1e3, "k"),
+        n if n < 999_500_000 => short(n as f64 / 1e6, "M"),
+        n => short(n as f64 / 1e9, "G"),
     }
 }
 
@@ -970,6 +976,15 @@ mod tests {
         }
     }
 
+    /// WICKET_UPDATE_FIXTURES=1 rewrites a frame's fixture from what is rendered now (read it
+    /// before committing it).
+    fn fixture(name: &str, got: &str) {
+        if std::env::var_os("WICKET_UPDATE_FIXTURES").is_some() {
+            std::fs::write(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/top/testdata").join(name), format!("{got}\n"))
+                .unwrap();
+        }
+    }
+
     fn host() -> HostStats {
         HostStats {
             load: [0.12, 0.3, 0.25],
@@ -990,6 +1005,7 @@ mod tests {
         );
         let f = NodeFrame { status: Ok(status()), host: host(), stats, now_ms: NOW };
         let got = render_node(&f, 80).join("\n");
+        fixture("node-80.txt", &got);
         let want = include_str!("top/testdata/node-80.txt");
         assert_eq!(got, want.trim_end_matches('\n'), "got:\n{got}");
         for l in got.lines() {
@@ -1085,6 +1101,7 @@ mod tests {
             }],
         };
         let got = render_control(&f, 80).join("\n");
+        fixture("control-80.txt", &got);
         let want = include_str!("top/testdata/control-80.txt");
         assert_eq!(got, want.trim_end_matches('\n'), "got:\n{got}");
         assert!(got.lines().all(|l| l.chars().count() <= 80));
@@ -1102,9 +1119,12 @@ mod tests {
         assert_eq!(bytes(2 << 30), "2.0G");
         assert_eq!(bytes(146 << 30), "146G");
         assert_eq!(count(999), "999");
-        assert_eq!(count(12_345), "12.3k");
+        assert_eq!(count(1_234), "1.2k");
+        assert_eq!(count(40_000), "40k");
+        assert_eq!(count(999_999), "1.0M");
+        assert_eq!(count(1_200_000), "1.2M");
         assert_eq!(clock(NOW), "09:46:40Z");
-        assert_eq!(short_run("run_01JCXYZABCDEFGH"), "run_01JCXYZA");
+        assert_eq!(short_run("run_01JCXYZABCDEFGH"), "ABCDEFGH");
         assert_eq!(cut("abcdef", 4), "abc…");
         assert_eq!(egress_kind("spliced"), EgressKind::Allowed);
         assert_eq!(egress_kind("unavailable"), EgressKind::Refused);

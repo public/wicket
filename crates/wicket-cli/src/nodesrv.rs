@@ -263,12 +263,15 @@ impl Node {
         let now = (self.clock)();
         let mut st = NodeStatus { node: self.name.clone(), build: self.build.clone(), now_ms: now, ..Default::default() };
         match std::fs::read_to_string(self.paths.root.join(crate::nodeauth::CERT_FILE)) {
-            Ok(c) => match wicket_identity::node::verify_node_cert(c.trim(), &self.ident.issuer, &self.name, 0) {
+            Ok(c) => match self.ident.check_cert(c.trim(), &self.name, now / 1000) {
                 Ok(c) => {
                     st.identity = Some(c.sub);
                     st.identity_until = Some(c.exp);
                 }
-                Err(e) => st.identity_error = Some(e.to_string()),
+                Err(e) => match e.downcast_ref::<wicket_identity::IdError>() {
+                    Some(wicket_identity::IdError::Expired(exp)) => st.identity_until = Some(*exp),
+                    _ => st.identity_error = Some(format!("{e:#}")),
+                },
             },
             Err(_) => st.identity_error = Some("no identity certificate".into()),
         }
@@ -2516,6 +2519,102 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             Frame::Data { stream: b.streams[1], offset: at, bytes: bytes.to_vec() }
         };
         node.send_run("run_a", f);
+    }
+
+    /// `wicket node top`'s status: the node's identity, connections, boxes (with their state, agent,
+    /// model use and egress counts) and its last egress decisions, newest first.
+    #[tokio::test]
+    async fn the_status_names_the_node_its_boxes_and_its_last_decisions() {
+        let inst = Install::new("nodesrv-status");
+        let dir = inst.dir.clone();
+        let node = test_node(&inst);
+        let st = node.status();
+        assert_eq!((st.node.as_str(), st.identity.as_deref()), ("n1", Some(inst.cert.sub.as_str())));
+        assert_eq!(st.identity_until, Some(inst.cert.exp));
+        assert_eq!((st.control.connections, st.control.since_ms, st.feed.mode.as_str()), (0, 0, "closed"));
+        assert!(st.boxes.is_empty() && st.egress.is_empty());
+
+        let mut rec = fake_record("run_a");
+        rec.started_ms = 1000;
+        rec.start.edge = Some(Box::new(chan::EdgeStart { who: serde_json::json!({ "agent": "coder", "id": "x" }), spawn: None }));
+        node.boxes.lock().unwrap().insert(
+            "run_a".into(),
+            BoxState {
+                streams: [1, 2, 3],
+                name: "wicket-run-a".into(),
+                dir: dir.join("runs/run_a"),
+                stdin: None,
+                stdin_next: 0,
+                out: [OutBuf::new(OUTPUT_CAP), OutBuf::new(OUTPUT_CAP)],
+                exited: None,
+                tasks: vec![],
+                user: String::new(),
+                cpus: 1.5,
+                memory_mib: 2048,
+                listeners: HashMap::new(),
+                owner: Some(1),
+                record: rec,
+            },
+        );
+        node.seen.starting("run_b", "z2", 2000);
+        let line = |o: &str| {
+            let ev = wicket_proxy::Event::Egress {
+                method: "GET".into(),
+                host: "api.example.com".into(),
+                path: "/x".into(),
+                risk: "read".into(),
+                outcome: o.into(),
+                detail: "d".into(),
+            };
+            crate::run::egress_line(&ev).unwrap()
+        };
+        for (i, o) in ["allow", "blocked", "spliced", "pending"].iter().enumerate() {
+            node.seen.egress("run_a", o, line(o), 10 + i as i64);
+        }
+        for i in 0..12 {
+            node.seen.egress("run_a", "denied", line("denied"), 100 + i);
+        }
+        let _c = connect_run(&node, 1, &inst, "run_a").await;
+        let st = node.status();
+        assert_eq!(st.control.connections, 1);
+        assert!(st.control.since_ms > 0);
+        let runs: Vec<(&str, &str)> = st.boxes.iter().map(|b| (b.run.as_str(), b.state.as_str())).collect();
+        assert_eq!(runs, [("run_a", "running"), ("run_b", "starting")]);
+        let a = &st.boxes[0];
+        assert_eq!(
+            (a.agent.as_deref(), a.zone.as_str(), a.name.as_str(), a.cpus, a.memory_mib),
+            (Some("coder"), "z", "wicket-run-a", 1.5, 2048)
+        );
+        assert!(a.connected, "its owner's connection is up");
+        // Allowed: allow and spliced; refused: blocked and twelve denials; the ask counts as neither.
+        assert_eq!((a.egress_allowed, a.egress_refused), (2, 13));
+        assert_eq!(st.egress.len(), crate::top::RECENT);
+        assert_eq!(st.egress[0].at_ms, 111, "newest first");
+        assert_eq!(st.egress[0].line, "[egress] DENIED  GET api.example.com/x  (read; d)");
+        // An expired certificate says when it expired.
+        let (jws, _) = crate::nodeauth::issue(
+            &inst.ledger.lock().unwrap(),
+            &inst.issuer,
+            "n1",
+            &inst.key.verifying_key(),
+            wicket_store::now() - 7200,
+            3600,
+        )
+        .unwrap();
+        std::fs::write(dir.join(crate::nodeauth::CERT_FILE), jws).unwrap();
+        let st = node.status();
+        assert_eq!((st.identity.as_deref(), st.identity_error.as_deref()), (None, None));
+        assert!(st.identity_until.is_some_and(|u| u < wicket_store::now()));
+        // Paused, then stopped: so it says; a long-lived agent's box on its way down is hibernating.
+        node.seen.paused("run_a", true);
+        assert_eq!(node.status().boxes[0].state, "paused");
+        node.stopped.lock().unwrap().insert("run_a".into(), "its control host stopped it".into());
+        assert_eq!(node.status().boxes[0].state, "stopping");
+        node.boxes.lock().unwrap().get_mut("run_a").unwrap().record.start.long_lived = true;
+        assert_eq!(node.status().boxes[0].state, "hibernating");
+        // The status carries no secret: nothing of the box's start but its names.
+        let json = serde_json::to_string(&node.status()).unwrap();
+        assert!(!json.contains("ca_pem") && !json.contains("env") && !json.contains("workspace_tar"), "{json}");
     }
 
     #[tokio::test]
