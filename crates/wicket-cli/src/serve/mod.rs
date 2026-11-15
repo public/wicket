@@ -1954,6 +1954,7 @@ mod tests {
     mod https;
     mod manifests;
     mod notify;
+    mod secrets;
     mod session;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {

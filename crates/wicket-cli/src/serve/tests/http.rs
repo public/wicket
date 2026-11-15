@@ -41,7 +41,7 @@ pub(super) async fn call(
 }
 
 /// A browser's POST: the CSRF header, our origin, JSON.
-async fn post_json(state: &State, path: &str, cookie: Option<&str>, body: &Value) -> (StatusCode, HeaderMap, String) {
+pub(super) async fn post_json(state: &State, path: &str, cookie: Option<&str>, body: &Value) -> (StatusCode, HeaderMap, String) {
     post_json_from(state, PEER, path, cookie, body).await
 }
 
