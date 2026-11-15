@@ -436,6 +436,19 @@ theorem tokM_ci_of_spelling {ts s y} (h : TokM csEq ts s) (hr : CiRel s y) : Tok
 
 abbrev CiSegs (ss ys : List Str) : Prop := Forall2 CiRel ss ys
 
+theorem Forall2.trans {α} {R : α → α → Prop} (htr : ∀ a b c, R a b → R b c → R a c) :
+    ∀ {x y z : List α}, Forall2 R x y → Forall2 R y z → Forall2 R x z := by
+  intro x y z h1 h2
+  induction h1 generalizing z with
+  | nil => cases h2; exact .nil
+  | cons hab _ ih => cases h2 with | cons hbc t => exact .cons (htr _ _ _ hab hbc) (ih t)
+
+theorem ciRel_trans {a b c : Str} (h1 : CiRel a b) (h2 : CiRel b c) : CiRel a c :=
+  Forall2.trans (R := fun x y => ciEq x y = true) (fun _ _ _ => ciEq_trans) h1 h2
+
+theorem ciSegs_trans {a b c : List Str} (h1 : CiSegs a b) (h2 : CiSegs b c) : CiSegs a c :=
+  Forall2.trans (R := CiRel) (fun _ _ _ => ciRel_trans) h1 h2
+
 theorem segsM_ci_spelling {ps ys} (h : SegsM ciEq ps ys) : ∃ ss, SegsM csEq ps ss ∧ CiSegs ss ys := by
   induction h with
   | nil => exact ⟨[], .nil, .nil⟩
