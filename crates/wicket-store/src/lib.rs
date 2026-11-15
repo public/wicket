@@ -10,6 +10,7 @@ use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
 pub mod bundle;
+pub mod cas;
 mod links;
 mod node;
 pub mod objects;

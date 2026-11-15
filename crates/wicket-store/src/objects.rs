@@ -12,6 +12,10 @@ pub trait ObjectStore: Send + Sync {
     fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool>;
     /// Opens `key` for reading, or None if there is no such object.
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>>;
+    /// Whether `key` exists, without reading it (a backend with a cheaper way says so).
+    fn has(&self, key: &str) -> io::Result<bool> {
+        Ok(self.get(key)?.is_some())
+    }
     fn delete(&self, key: &str) -> io::Result<()>;
     /// Every key under `prefix` (garbage collection only).
     fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>>;
@@ -24,6 +28,9 @@ impl ObjectStore for Box<dyn ObjectStore> {
     }
     fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
         (**self).get(key)
+    }
+    fn has(&self, key: &str) -> io::Result<bool> {
+        (**self).has(key)
     }
     fn delete(&self, key: &str) -> io::Result<()> {
         (**self).delete(key)
@@ -98,6 +105,10 @@ impl ObjectStore for DirStore {
         }
     }
 
+    fn has(&self, key: &str) -> io::Result<bool> {
+        Ok(self.path(key)?.is_file())
+    }
+
     fn delete(&self, key: &str) -> io::Result<()> {
         match std::fs::remove_file(self.path(key)?) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -148,6 +159,7 @@ mod tests {
         s.get("a/agt_x/p/abc").unwrap().unwrap().read_to_string(&mut got).unwrap();
         assert_eq!(got, "one");
         assert!(s.get("a/agt_x/p/none").unwrap().is_none());
+        assert!(s.has("a/agt_x/p/abc").unwrap() && !s.has("a/agt_x/p/none").unwrap());
         for bad in ["../x", "/etc/passwd", "a//b", "a/./b", "A/b", ""] {
             assert!(s.put_if_absent(bad, &mut &b""[..]).is_err(), "{bad}");
         }

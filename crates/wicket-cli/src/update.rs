@@ -1069,10 +1069,16 @@ async fn control_switch(
     audit(
         ledger,
         "self.snapshot",
-        serde_json::json!({ "path": snap.display().to_string(), "version": from, "schema": schema, "store_key": stored }),
+        serde_json::json!({
+            "path": snap.display().to_string(),
+            "version": from,
+            "schema": schema,
+            "store_key": stored.as_ref().map(|(k, _)| k),
+            "store_digest": stored.as_ref().map(|(_, d)| d),
+        }),
     );
-    if let Some(k) = &stored {
-        say(format!("ledger snapshot {} (and in the state store as {k})", snap.display()));
+    if let Some((k, d)) = &stored {
+        say(format!("ledger snapshot {} (and in the state store as {k}, {d})", snap.display()));
     }
     v.switch(to)?;
     let kind = if rollback { "self.rolled_back" } else { "self.switched" };
@@ -1205,30 +1211,25 @@ impl std::fmt::Display for SnapshotNotStored {
 impl std::error::Error for SnapshotNotStored {}
 
 /// Pushes a snapshot to the state store, if there is one, then prunes the store's copies as the
-/// local ones are; returns its key (None: no state store).
-async fn push_snapshot(snap: PathBuf, keep: usize, protect: Vec<String>) -> Result<Option<String>> {
-    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+/// local ones are; returns its ref and digest (None: no state store).
+async fn push_snapshot(snap: PathBuf, keep: usize, protect: Vec<String>) -> Result<Option<(String, String)>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
         let Some(st) = crate::snapstore::store()? else { return Ok(None) };
-        let key = crate::snapstore::push(&st, &snap)?;
+        let (key, digest) = crate::snapstore::push(&st, &snap)?;
         if let Err(e) = prune_store_snapshots(&st, keep, &protect, false) {
             say(format!("warning: pruning the state store's snapshots: {e:#}"));
         }
-        Ok(Some(key))
+        Ok(Some((key, digest.to_string())))
     })
     .await?
 }
 
 /// Deletes the store's snapshots `snapshots_to_prune` picks; returns their names.
-fn prune_store_snapshots(
-    st: &dyn wicket_store::objects::ObjectStore,
-    keep: usize,
-    protect: &[String],
-    dry_run: bool,
-) -> Result<Vec<String>> {
+fn prune_store_snapshots(st: &wicket_store::cas::Cas, keep: usize, protect: &[String], dry_run: bool) -> Result<Vec<String>> {
     let gone = snapshots_to_prune(crate::snapstore::list(st)?, keep, protect);
     if !dry_run {
         for n in &gone {
-            st.delete(&format!("{}{n}", crate::snapstore::PREFIX))?;
+            crate::snapstore::remove(st, n)?;
         }
     }
     Ok(gone)

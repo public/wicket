@@ -38,7 +38,7 @@ store_checks() {
   echo "   store: $store_names"
   check "every switch's snapshot is in the state store too, pruned alike" '[ -n "$local_names" ] && [ "$local_names" = "$store_names" ]'
   check "  sealed there: no object in the store is a SQLite database" \
-    '[ -n "$(find "$work/s3/wicket-upd/upd/sealed/ledger-snapshots" -type f)" ] && ! find "$work/s3/wicket-upd" -type f -exec head -c 15 {} \; -exec echo \; | grep -q "SQLite format 3"'
+    '[ -n "$(find "$work/s3/wicket-upd/upd/sealed/r/ledger-snapshots" -type f)" ] && [ -n "$(find "$work/s3/wicket-upd/upd/sealed/o" -type f)" ] && ! find "$work/s3/wicket-upd" -type f -exec head -c 15 {} \; -exec echo \; | grep -q "SQLite format 3"'
   check "  the audit names its key" 'w audit --tail 2000 | grep self.snapshot | grep -q "\"store_key\":\"ledger-snapshots/"'
   # A standby with only the kit's state.key and state-store.yaml, and the store's secret: the control
   # host's files aren't needed to read one back.
