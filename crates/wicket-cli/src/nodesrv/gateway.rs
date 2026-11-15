@@ -7,7 +7,74 @@ use super::*;
 /// box's token, connected or not ([`gw`]); every other call is relayed to the run's gateway on the
 /// control host, whole (the answers are small), so a call cut short by the control host going
 /// away gets a clear, retryable tool error instead of a broken response.
-pub(super) async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<GwBody> {
+///
+/// With push delivery on for the box's harness (#252, [`chan::EdgeStart::push`]), a `GET` opens the
+/// session's stream, which carries incoming messages as notifications ([`gw::push`]), and
+/// `initialize` declares the capability the harness looks for.
+pub(super) async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<GwOut> {
+    use http_body_util::BodyExt;
+    let push = node.edge_start(run).and_then(|e| e.push);
+    if let (&http::Method::GET, Some(p)) = (req.method(), &push) {
+        return push_stream(gw::push(node, run, p.clone()));
+    }
+    let resp = gateway_rpc(node, run, req, push.as_ref()).await;
+    resp.map(|b| b.map_err(|never| match never {}).boxed_unsync())
+}
+
+/// What a box's gateway answers: a body sent whole, or a stream (#252).
+pub(super) type GwOut = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, std::io::Error>;
+
+/// The session's stream (MCP's streamable HTTP `GET`, server-sent events): each notification as
+/// an event, and a comment every 15 s to keep it open. It ends when the box's client closes it.
+pub(super) fn push_stream(rx: tokio::sync::mpsc::Receiver<serde_json::Value>) -> hyper::Response<GwOut> {
+    use http_body_util::BodyExt;
+    let events = futures_util::stream::unfold(rx, |mut rx| async move {
+        let chunk = match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await {
+            Ok(Some(v)) => format!("event: message\ndata: {v}\n\n"),
+            Ok(None) => return None,
+            Err(_) => ": keepalive\n\n".to_string(),
+        };
+        Some((Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes::Bytes::from(chunk))), rx))
+    });
+    hyper::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(http_body_util::StreamBody::new(events).boxed_unsync())
+        .expect("response")
+}
+
+/// `initialize`'s answer with push on (#252): the harness's capability declared, and MCP's
+/// protocol held at a revision with a stream for server notifications (2026-07-28's has none).
+pub(super) fn with_push(resp: hyper::Response<GwBody>, p: &wicket_agent::harness::MessagePush, asked: Option<&str>) -> hyper::Response<GwBody> {
+    const LAST_WITH_STREAM: &str = "2025-11-25";
+    let (parts, body) = resp.into_parts();
+    let bytes = futures_util::FutureExt::now_or_never(http_body_util::BodyExt::collect(body)).map(|b| b.expect("infallible").to_bytes());
+    let Some(mut v) = bytes.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
+        return hyper::Response::from_parts(parts, GwBody::new(bytes::Bytes::new()));
+    };
+    if let Some(r) = v.get_mut("result").and_then(|r| r.as_object_mut()) {
+        let version = asked.filter(|a| *a <= LAST_WITH_STREAM).unwrap_or(LAST_WITH_STREAM);
+        r.insert("protocolVersion".into(), serde_json::json!(version));
+        let caps = r.entry("capabilities").or_insert_with(|| serde_json::json!({}));
+        if let Some(c) = caps.as_object_mut() {
+            let ex = c.entry("experimental").or_insert_with(|| serde_json::json!({}));
+            if let Some(ex) = ex.as_object_mut() {
+                ex.insert(p.capability.clone(), serde_json::json!({}));
+            }
+        }
+    }
+    let mut out = hyper::Response::from_parts(parts, GwBody::new(bytes::Bytes::from(v.to_string())));
+    out.headers_mut().remove(http::header::CONTENT_LENGTH);
+    out
+}
+
+async fn gateway_rpc(
+    node: &Arc<Node>,
+    run: &str,
+    req: hyper::Request<hyper::body::Incoming>,
+    push: Option<&wicket_agent::harness::MessagePush>,
+) -> hyper::Response<GwBody> {
     use http_body_util::BodyExt;
     let (parts, body) = req.into_parts();
     let body = match http_body_util::Limited::new(body, 1 << 20).collect().await {
@@ -33,9 +100,24 @@ pub(super) async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Reques
             );
         }
     }
+    let init = rpc.get("method").and_then(|m| m.as_str()) == Some("initialize");
+    let resp = relay_or_offline(node, run, &parts, &body, &rpc).await;
+    match push {
+        Some(p) if init => with_push(resp, p, rpc["params"]["protocolVersion"].as_str()),
+        _ => resp,
+    }
+}
+
+async fn relay_or_offline(
+    node: &Arc<Node>,
+    run: &str,
+    parts: &http::request::Parts,
+    body: &bytes::Bytes,
+    rpc: &serde_json::Value,
+) -> hyper::Response<GwBody> {
     let mut tries = 0;
     loop {
-        match relay_rpc(node, run, Some(&parts), body.clone()).await {
+        match relay_rpc(node, run, Some(parts), body.clone()).await {
             Ok(r) => return r,
             // A child this node started (#164) is relayed to once its control host has taken it
             // over and supervises it: a call before that waits for it (while its parent's control
@@ -44,7 +126,7 @@ pub(super) async fn gateway_call(node: &Arc<Node>, run: &str, req: hyper::Reques
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            Err(e) => return gateway_offline(&rpc, &e.to_string()),
+            Err(e) => return gateway_offline(rpc, &e.to_string()),
         }
     }
 }

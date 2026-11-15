@@ -1278,6 +1278,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }),
                     _ => None,
                 },
+                // Push delivery of messages (#252), if the harness takes it in a box.
+                push: harness.and_then(|h| h.message_push(&m)),
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
@@ -1545,6 +1547,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut hib_asked = false;
     let mut finish_asked = false;
     let mut notified_msgs = 0i64;
+    // The turn state last reported as the run's presence (#252).
+    let mut reported_turn: Option<bool> = None;
     let mut superseded = false;
     let mut saw_assistant = false;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1780,6 +1784,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
             }
             _ = tick.tick(), if stdin.is_some() => {
+                // Presence (#252): busy in a turn, idle between turns (the gateway says waiting
+                // while the agent is in a wait).
+                if !is_program && reported_turn != Some(turn_running) {
+                    if let Ok(l) = ledger.lock() {
+                        let _ = l.set_run_activity(&run.0, Some(if turn_running { "busy" } else { "idle" }));
+                    }
+                    reported_turn = Some(turn_running);
+                }
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
                 for (text, by) in msgs {
                     use tokio::io::AsyncWriteExt;

@@ -218,6 +218,10 @@ pub struct EdgeStart {
     /// What the node decides the box's spawns from: None, they are the control host's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<EdgeSpawn>,
+    /// How the box's gateway pushes incoming messages into its harness's conversation (#252), as
+    /// its adapter says. None: the agent reads them with `await_message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<wicket_agent::harness::MessagePush>,
 }
 
 /// What a node decides a box's spawns from (#164): a child within the box's authority starts on

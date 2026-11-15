@@ -64,10 +64,27 @@ pub enum SwapSource {
     Value(String),
 }
 
+/// How wicket's MCP gateway pushes an incoming message into a harness's conversation (#252): the
+/// capability it declares in `initialize` (under `experimental`), and the notification it sends on
+/// the session's stream, `{ content, meta }`, with the verified sender in `meta` and the content
+/// marked as data from a peer. A harness that turns that notification into a turn gets the message
+/// as one; without push, the agent reads messages with `await_message` (long-poll).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessagePush {
+    pub capability: String,
+    pub method: String,
+}
+
 /// A harness's adapter. Every method takes the agent's manifest, so a harness can vary by its own
 /// settings (an ACP agent's profile, say).
 pub trait Adapter: Send + Sync {
     fn harness(&self) -> Harness;
+
+    /// Whether the gateway pushes messages into this harness's conversation, and how (#252). None
+    /// (the default): it reads them with `await_message`.
+    fn message_push(&self, _m: &Manifest) -> Option<MessagePush> {
+        None
+    }
 
     /// Directories under the box's state dir the harness keeps its own configuration in, which wicket
     /// creates (as real directories) before the box starts.
@@ -299,6 +316,10 @@ impl Adapter for ClaudeCode {
         let mut p = crate::claude_code_plan(m, run, session);
         p.stdin_task = Some(crate::user_message(first));
         Ok(p)
+    }
+
+    fn message_push(&self, _m: &Manifest) -> Option<MessagePush> {
+        claude::CHANNELS_IN_BOX.then(|| MessagePush { capability: claude::CHANNEL_CAPABILITY.into(), method: claude::CHANNEL_NOTIFICATION.into() })
     }
 
     fn is_runtime(&self, _m: &Manifest, cmd: &str) -> bool {
