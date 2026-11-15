@@ -197,7 +197,7 @@ theorem pathCovered_sound {ps : List Str} {c : Str} (hcov : pathCovered ps c = t
     exact .one .nil (.anyLast ht)
   · split at hcov
     · rename_i hmeta
-      simp only [Bool.not_eq_true', Bool.not_eq_eq_eq_not, Bool.not_true] at hmeta
+      simp only [Bool.not_eq_eq_eq_not, Bool.not_true] at hmeta
       obtain ⟨g, hg, hgm⟩ := List.any_eq_true.mp hcov
       have hplain := plain_of_split (all_plain_of_not_hasMeta hmeta)
       rw [globParse_of_head (head_plain (all_plain_of_not_hasMeta hmeta))] at hm
@@ -498,15 +498,15 @@ theorem check_within {a : Ask} {b : Bounds} (h : check a b = true) : Within a.zo
       · exact hllm.1.1.1.2
       · have := hllm.1.1.2
         cases hps : pl.serverTools <;> simp_all
-  · match hx : a.zone.limits.cpus, hy : b.zone.limits.cpus, hcpu with
-    | some _, some _, h => simp only [hx, hy, decide_eq_true_eq] at h; exact h.2
-    | none, _, h => simp [hx] at h
-    | some _, none, h => simp [hx, hy] at h
+  · match a.zone.limits.cpus, b.zone.limits.cpus, hcpu with
+    | some _, some _, h => simp only [decide_eq_true_eq] at h; exact h.2
+    | none, _, h => simp at h
+    | some _, none, h => simp at h
   · intro hp; cases hc : a.zone.limits.stopOnFull <;> simp_all
-  · match hx : a.zone.limits.authority, hy : b.zone.limits.authority, hauth with
-    | some _, some _, h => simp only [hx, hy] at h; simpa [OptLe] using h
-    | none, _, h => simp [hx] at h
-    | some _, none, h => simp [hx, hy] at h
+  · match a.zone.limits.authority, b.zone.limits.authority, hauth with
+    | some _, some _, h => simpa [OptLe] using h
+    | none, _, h => simp at h
+    | some _, none, h => simp at h
 
 /-- **A grandchild stays within its grandparent's authority**: two admitted spawns compose. -/
 theorem grandchild_within {a1 a2 : Ask} {b1 b2 : Bounds} (h1 : check a1 b1 = true) (h2 : check a2 b2 = true)
