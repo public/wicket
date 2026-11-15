@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use wicket_auth::{b64u, decision_challenge, unb64u, Credential, RelyingParty};
-use wicket_core::{Manifest, RunId, TenantId};
+use wicket_core::{RunId, TenantId};
 use wicket_store::{ConsoleSession, Ledger, OperatorCredential};
 
 /// A signed-in session ends after this long without a request (seconds)...
@@ -993,7 +993,7 @@ fn list_manifests(state: &State) -> Vec<Value> {
         names.sort();
         for name in names {
             if let Ok((_, bytes)) = resolve_manifest(state, root, &name) {
-                let m = std::str::from_utf8(&bytes).ok().and_then(|t| Manifest::from_yaml(t).ok());
+                let m = std::str::from_utf8(&bytes).ok().and_then(|t| wicket_agent::load(t).ok());
                 out.push(json!({
                     "root": root, "name": name,
                     "agent": m.as_ref().and_then(|m| m.agent.as_ref().map(|a| a.name.clone())),
@@ -1126,7 +1126,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             }
             let (path, bytes) = resolve_manifest(state, root, name).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
             let text = std::str::from_utf8(&bytes).map_err(|_| bad("the manifest is not UTF-8"))?;
-            let m = Manifest::from_yaml(text).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{root}/{name}: {e}")))?;
+            let m = wicket_agent::load(text).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{root}/{name}: {e}")))?;
             if task.is_some() && m.agent.is_none() {
                 return Err(bad("a task override applies to agent manifests only"));
             }

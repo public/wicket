@@ -54,7 +54,7 @@ pub struct AgentRow {
     pub generation: i64,
     /// The current (or last) activation's run.
     pub run: String,
-    /// The agent's Claude Code session, resumed on every wake.
+    /// The agent's harness session, resumed on every wake.
     pub session_id: String,
     /// The effective manifest (YAML) the agent was started with; a wake rebuilds from it.
     pub manifest: String,

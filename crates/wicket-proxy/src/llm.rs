@@ -1,4 +1,4 @@
-//! The LLM proxy (design §9.3): holds the Claude subscription token (never an API key), strips
+//! The LLM proxy (design §9.3): holds the zone's model credential (a subscription login, never an API key), strips
 //! whatever credential the agent sends,
 //! enforces request and token budgets, strips server-side tools the zone doesn't allow (they would
 //! bypass the egress proxy), and is the run's liveness sensor.
@@ -278,6 +278,25 @@ impl Llm {
         self.first_request_ms.get().copied()
     }
 
+    /// The zone's model provider's profile, if it has a model route wicket has a profile for.
+    fn profile(&self) -> Option<&'static crate::provider::Profile> {
+        self.ctx.zone.llm.as_ref().and_then(|l| crate::provider::profile(&l.provider))
+    }
+
+    /// Whether `host` is one of this run's model hosts: its provider's API host, or its route's
+    /// upstream.
+    pub(crate) fn is_model_host(&self, host: &str) -> bool {
+        let upstream = self.ctx.zone.llm.as_ref().and_then(|l| reqwest::Url::parse(&l.upstream).ok());
+        self.profile().is_some_and(|p| p.host.eq_ignore_ascii_case(host))
+            || upstream.as_ref().and_then(|u| u.host_str()).is_some_and(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    /// Whether a request to a model host is a model call, vetted and accounted as one, when it
+    /// arrives at the egress proxy (a wrapped session's).
+    pub(crate) fn is_model_call(&self, host: &str, path: &str) -> bool {
+        self.is_model_host(host) && self.profile().is_some_and(|p| (p.model_call)(path))
+    }
+
     async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
         self.first_request_ms
             .get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
@@ -439,11 +458,11 @@ impl Llm {
         // Allow-listed headers only (#112, as on the egress proxy): never a client credential.
         for (name, value) in parts.headers.iter() {
             let n = name.as_str();
-            if n != "accept-encoding" && (FORWARD_REQUEST.contains(&n) || crate::provider_request_header(MODEL_HOST, n)) {
+            if n != "accept-encoding" && (FORWARD_REQUEST.contains(&n) || self.profile().is_some_and(|p| (p.request_header)(n))) {
                 rb = rb.header(n, value.as_bytes());
             }
         }
-        // The real subscription token, injected into the one slot Claude Code uses for it.
+        // The real credential, attached as the provider's profile says (the one slot it uses).
         // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
         let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
         let token = self.ctx.vault.get_for(&spec.secret, &up_host)?;
@@ -741,9 +760,6 @@ impl Llm {
     }
 }
 
-/// The host Claude Code's model calls go to.
-pub(crate) const MODEL_HOST: &str = wicket_core::splice::MODEL_HOST;
-
 /// The provider's smallest `thinking.budget_tokens` (Anthropic's Messages API): a request lowered
 /// to fit the budget keeps its thinking budget at least this and below its `max_tokens` (#310).
 const THINKING_MIN_BUDGET: u64 = 1024;
@@ -751,12 +767,6 @@ const THINKING_MIN_BUDGET: u64 = 1024;
 /// The only model endpoints that take a request body (#112). Batches, files and anything else are
 /// refused: a batch carries requests (and tools) of its own.
 const MODEL_ENDPOINTS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
-
-/// Whether a request to the model host is a model call, vetted and accounted as one, when it
-/// arrives at the egress proxy (a wrapped session's).
-pub(crate) fn is_model_call(host: &str, path: &str) -> bool {
-    host == MODEL_HOST && (path == "/v1/messages" || path.starts_with("/v1/messages/") || path == "/v1/complete")
-}
 
 /// Top-level Messages request fields that are forwarded (#112): none of them makes the provider
 /// reach another host.
@@ -941,7 +951,8 @@ mod tests {
     /// A run context for zone `z` (with a model route), fenced as `fence` if given.
     fn ctx(ledger: wicket_store::Ledger, fence: Option<crate::Fence>, llm: &str) -> crate::RunCtx {
         use std::sync::{Arc, Mutex};
-        let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {llm}}}")).unwrap();
+        let mut m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {llm}}}")).unwrap();
+        crate::provider::fill_test_route(&mut m);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         crate::RunCtx {
             tenant: wicket_core::TenantId::single(),

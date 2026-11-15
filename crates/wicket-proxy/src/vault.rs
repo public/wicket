@@ -2,14 +2,15 @@
 //! only by the enforcement points and never written into a sandbox, a log or the audit chain.
 //!
 //! A secret can also be a **reference** (`<name>.ref`): a file plus a JSON pointer, re-read on every
-//! use. That is how wicket uses the Claude login already on the host: it reads the current access
-//! token at request time and never touches the refresh token or writes the file, so the host's Claude
-//! Code keeps refreshing its own login.
+//! use. That is how wicket uses a login another program on the host keeps (a harness's own): it
+//! reads the current access token at request time and never touches the refresh token or writes the
+//! file, so that program keeps refreshing its own login.
 //!
 //! **Each secret is bound to the hosts it may be sent to** (`<name>.hosts`, written by whoever stores
 //! it: root, on a system install). The egress proxy, credential swaps and the model proxy send a
-//! secret only to those hosts, whatever a manifest asks; a secret with no hosts is sent nowhere.
-//! `claude-oauth` defaults to `api.anthropic.com`.
+//! secret only to those hosts, whatever a manifest asks; a secret with no hosts is sent nowhere. The
+//! vault has no defaults of its own: `wicket secret set` and `link` bind a harness's default model
+//! secret to its model host, as its adapter says, when they store it with no binding.
 
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -68,7 +69,7 @@ impl Vault {
     }
 
     /// When a reference's current value expires upstream (Unix ms), if its file says so (e.g. the
-    /// Claude login's access token): a node holding a copy drops it then (#152).
+    /// linked login's access token): a node holding a copy drops it then (#152).
     pub fn expires_at(&self, name: &str) -> Option<i64> {
         let r = self.path(name).ok()?.with_extension("ref");
         let spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(r).ok()?).ok()?;
@@ -131,7 +132,7 @@ impl Vault {
             if let Some(ms) = doc.pointer(ep).and_then(|v| v.as_i64()) {
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
                 if ms <= now_ms {
-                    bail!("secret {name}: the referenced token has expired; its owner (e.g. Claude Code on the host) must refresh it");
+                    bail!("secret {name}: the referenced token has expired; its owner (the program on the host whose login it is) must refresh it");
                 }
             }
         }
@@ -143,7 +144,7 @@ impl Vault {
     }
 
     /// For a secret linked to a JSON field, the object that holds it, as the file has it now (e.g.
-    /// the Claude login's `claudeAiOauth`, for its non-secret fields: scopes, subscription type).
+    /// a harness login's object, for its non-secret fields: scopes, plan).
     /// None for a stored secret or a whole-file link.
     pub fn linked_object(&self, name: &str) -> Option<serde_json::Value> {
         let r = self.path(name).ok()?.with_extension("ref");
@@ -192,8 +193,7 @@ impl Vault {
         self.get(name).map(|_| ())
     }
 
-    /// The hosts `name` may be sent to: its `.hosts` list, else the default for well-known names,
-    /// else none.
+    /// The hosts `name` may be sent to: its `.hosts` list, else none.
     pub fn hosts(&self, name: &str) -> Vec<String> {
         if let Some(s) = &self.source {
             return s.hosts(name);
@@ -201,7 +201,7 @@ impl Vault {
         let Ok(p) = self.path(name) else { return vec![] };
         match std::fs::read(p.with_extension("hosts")) {
             Ok(b) => serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default(),
-            Err(_) => default_hosts(name),
+            Err(_) => vec![],
         }
     }
 
@@ -295,14 +295,6 @@ impl Vault {
             .unwrap_or_default();
         v.sort();
         v
-    }
-}
-
-/// Hosts a well-known secret may go to when nobody bound it.
-fn default_hosts(name: &str) -> Vec<String> {
-    match name {
-        "claude-oauth" => vec!["api.anthropic.com".into()],
-        _ => vec![],
     }
 }
 
@@ -473,11 +465,11 @@ mod tests {
             assert!(v.get_for("gh", bad).is_err(), "{bad}");
         }
         assert_eq!(v.list(), ["gh"], "the binding isn't a secret of its own");
-        // claude-oauth has a default; an explicit binding replaces it.
-        v.set("claude-oauth", "t").unwrap();
-        assert!(v.allows("claude-oauth", "api.anthropic.com") && !v.allows("claude-oauth", "attacker.example"));
-        v.set_hosts("claude-oauth", &["127.0.0.1".into()]).unwrap();
-        assert!(!v.allows("claude-oauth", "api.anthropic.com") && v.allows("claude-oauth", "127.0.0.1"));
+        // No name has a default of its own: a model login is as unbound as any other secret.
+        v.set("model-login", "t").unwrap();
+        assert!(v.hosts("model-login").is_empty() && !v.allows("model-login", "models.example"));
+        v.set_hosts("model-login", &["127.0.0.1".into()]).unwrap();
+        assert!(!v.allows("model-login", "models.example") && v.allows("model-login", "127.0.0.1"));
         for bad in ["*", "*.com", "a/b", "", "-a.com", "a..com", "*.*.com"] {
             assert!(v.set_hosts("gh", &[bad.into()]).is_err(), "{bad:?}");
         }
@@ -497,14 +489,14 @@ mod tests {
         let far = 32503680000000i64; // year 3000, in ms
         write("tok-1", far);
         let v = Vault::new(dir.join("vault"));
-        v.link("claude-oauth", creds.to_str().unwrap(), Some("/o/accessToken"), Some("/o/expiresAt"), None).unwrap();
-        assert_eq!(v.get("claude-oauth").unwrap(), "tok-1");
+        v.link("login", creds.to_str().unwrap(), Some("/o/accessToken"), Some("/o/expiresAt"), None).unwrap();
+        assert_eq!(v.get("login").unwrap(), "tok-1");
         write("tok-2", far); // the owner refreshed it: we see the new value
-        assert_eq!(v.get("claude-oauth").unwrap(), "tok-2");
+        assert_eq!(v.get("login").unwrap(), "tok-2");
         write("tok-3", 1000); // expired
-        assert!(v.get("claude-oauth").unwrap_err().to_string().contains("expired"));
+        assert!(v.get("login").unwrap_err().to_string().contains("expired"));
         std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(v.get("claude-oauth").is_err(), "world-readable source refused");
+        assert!(v.get("login").is_err(), "world-readable source refused");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

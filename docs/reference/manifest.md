@@ -30,7 +30,7 @@ zone:
 |---|---|---|---|
 | `tenant` | string | `t0` | The tenant. 0.0.1 is single-tenant: leave it out. |
 | `task` | string | `""` | The trusted task text, given to the agent as its first turn (or to a program, which may ignore it). It is the only input policy derivation ever sees. Required for agents, except a remote session (`agent.remote`) that wicket doesn't drive, whose messages come from the vendor's app. `wicket run --task` replaces it. |
-| `agent` | [agent](#agent) | none | A Claude Code agent. |
+| `agent` | [agent](#agent) | none | An agent, run by its [harness](#harness-modes). |
 | `program` | [program](#program) | none | A deterministic workload with no model. |
 | `zone` | [zone](#zone) | required | Where the workload runs, and what it may reach. |
 
@@ -104,10 +104,13 @@ A manifest can't set `_meta`, MCP servers or a system prompt for an ACP agent: w
 | `command` | list of strings | required, not empty | The command run in the box, in `/workspace`. |
 | `source` | string | none | A directory, relative to the manifest, copied into `/workspace`. |
 | `digest` | string | none | The approved source digest (`wicket program digest DIR`: the source's plain tree, [store.md](../explanation/store.md)). When set, a run refuses any other source. Without it, the run prints the digest and is a development run. An earlier build's `wicket-program-v1` digest is accepted with a warning until `wicket zone pin` rewrites it. |
-| `on_pending` | `fail` or `wait` | `fail` | What happens to a request outside the zone's reach. `fail`: refused, nothing queued. `wait`: it becomes a pending request, as an agent's would, and the program may wait with `await_grant`. |
 | `image` | string | the agent image | The image the program runs in, by tag or [pinned](#image-pins). The agent image has bash, curl, jq, git and python3. |
 
-A program's zone has no model: a `zone.llm` section is an error.
+A program is an agent without a model: a program's zone has no model (a `zone.llm` section is an
+error), and it may not ask for more by default. Its zone's [`escalation.request`](#zone) defaults to
+`false`, so a request outside its reach is refused and nothing is queued. With `escalation: {
+request: true }` it becomes a pending request, as an agent's would, and the program may wait with
+`await_grant`.
 
 ## `zone`
 
@@ -120,11 +123,11 @@ A program's zone has no model: a `zone.llm` section is an error.
 | `wildcards` | `{ forbid, max_names }` | `{ forbid: false, max_names: 32 }` | Wildcard reach rules (`*.cdn.example`). wicket resolves every name under one on the host, so the names are a narrow channel out of the box. It resolves a name only after a request to it is allowed, and reaches at most `max_names` (at least 1) distinct names under each rule per run. With `forbid: true`, no reach rule may be a wildcard. `wicket zone` warns about each one. |
 | `forbid` | list of [forbid rules](#forbid) | `[]` | Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked before `reach`. |
 | `inject` | list of [inject rules](#inject) | `[]` | Credentials the egress proxy adds to requests. |
-| `llm` | [llm](#llm) | none | The model route. Required for agents (`llm: {}` takes every default), refused for programs. |
+| `llm` | [llm](#llm) | none | The model route. Required for an agent whose harness takes one (`llm: {}` takes the harness's route), refused for programs and for a generic `acp` agent. |
 | `volumes` | list of [volumes](#volumes) | `[]` | Named directories that persist between runs of the zone. |
 | `images` | list of strings | `[]` | Images boxes in this zone may start children from with `spawn`, besides their own: by tag, or [pinned by digest](#image-pins). |
 | `accept_from` | list of principals or zone names | `[]` | Who may message agents in this zone besides parent and children: a principal (`spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`), or a zone name for every agent in it. Zones listed may also connect to its exposed ports. Senders are identified by wicket, never by their own claim. |
-| `escalation` | `{ request, grant }` | `{ request: true, grant: true }` | Who in this zone may escalate ([#50](https://github.com/public/wicket/issues/50)). `request: false`: anything outside the zone's reach is "never allowed" instead of a pending request (`request_access`, `spawn` with `ask_human`, `request_capacity` and `request_update` ask nobody). `grant: false`: the zone's agents can't [`decide`](mcp-tools.md#decide) their descendants' requests. A spawned zone keeps its parent's unless it narrows them, and can't be given one the parent lacks. |
+| `escalation` | `{ request, grant }` | `{ request: true, grant: true }`; for a program, `request: false` | Who in this zone may escalate ([#50](https://github.com/public/wicket/issues/50)). `request: false`: anything outside the zone's reach is "never allowed" instead of a pending request (`request_access`, `spawn` with `ask_human`, `request_capacity` and `request_update` ask nobody). `grant: false`: the zone's agents can't [`decide`](mcp-tools.md#decide) their descendants' requests. A spawned zone keeps its parent's unless it narrows them, and can't be given one the parent lacks. |
 | `limits` | [limits](#limits) | see below | Resources, time and output. |
 
 ### `reach`
@@ -181,9 +184,17 @@ A credential is only ever sent over HTTPS: plain HTTP to a host with an inject r
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `provider` | string | `anthropic` | The only provider supported. |
-| `secret` | string | `claude-oauth` | The vault secret holding the Claude subscription token (from `claude setup-token`, or linked to the host's Claude login). Never an API key. For `agent.remote`, the account login. |
-| `upstream` | URL | `https://api.anthropic.com` | The model's base URL. Its host must be in the secret's host binding. Changed for a mock model in tests. |
+| `provider` | string | the harness's | The model proxy's profile for the provider's API. `anthropic` is the only one. |
+| `secret` | string | the harness's | The vault secret holding the model credential. Never an API key. For `agent.remote`, the account login. |
+| `upstream` | URL | the harness's | The model's base URL. Its host must be in the secret's host binding. Changed for a mock model in tests. |
+
+The route's defaults belong to the agent's harness, and its adapter fills them in when the
+manifest is loaded, so core and the proxies take them as data (#255). For `claude-code`, and for
+`acp` with `profile: claude-agent-acp`, the route is provider `anthropic`, secret `claude-oauth` (the
+Claude subscription token from `claude setup-token`, or linked to the host's Claude login) and
+upstream `https://api.anthropic.com`. A generic `acp` agent has no route. The vault has no default
+host bindings: `wicket secret set` and `wicket secret link` bind a harness's default secret to its
+upstream's host when it is stored with no binding of its own.
 | `max_requests` | integer | `300` | The most model requests over the agent's life. |
 | `max_output_tokens` | integer | `400000` | The most output tokens over the agent's life. Each call reserves its `max_tokens` up front. |
 | `max_input_tokens` | integer | none | The most input tokens, cache reads and writes included. None: no input cap. |

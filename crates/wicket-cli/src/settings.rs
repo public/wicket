@@ -45,7 +45,7 @@ mod tests {
     use super::*;
 
     fn manifest(agent: &str, llm: bool) -> Manifest {
-        Manifest::from_yaml(&format!("task: t\nagent: {agent}\nzone: {{name: z{}}}", if llm { ", llm: {}" } else { "" })).unwrap()
+        wicket_agent::load(&format!("task: t\nagent: {agent}\nzone: {{name: z{}}}", if llm { ", llm: {}" } else { "" })).unwrap()
     }
 
     fn allowed(yes: bool) -> Settings {

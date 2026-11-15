@@ -1,7 +1,7 @@
 //! The console's manifest viewer and editor (#172).
 //!
 //! - **Viewer** (`GET /api/manifests/<root>/<name>`): the raw YAML and whether it validates (the
-//!   same `Manifest::from_yaml` `wicket run` uses), every field with its effective value and whether
+//!   same `wicket_agent::load` `wicket run` uses), every field with its effective value and whether
 //!   it was written or defaulted, the hosts the egress proxy splices or inspects, the image, each
 //!   injection's secret by name and whether the vault has it (never a value), and the effective
 //!   policy with the installation's org policy, if one is applied. The installation's manifests also
@@ -155,7 +155,7 @@ fn org_effect(state: &State, m: &Manifest) -> Value {
 
 /// A manifest's text, checked: (parsed, or the error `wicket run` would give).
 fn parse(text: &str) -> std::result::Result<Manifest, String> {
-    Manifest::from_yaml(text).map_err(|e| e.to_string())
+    wicket_agent::load(text).map_err(|e| e.to_string())
 }
 
 fn j<T: serde::Serialize>(v: &[T]) -> Vec<Value> {

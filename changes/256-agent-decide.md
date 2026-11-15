@@ -12,6 +12,6 @@ type: Added
 - A zone setting `escalation: { request, grant }`, both on by default: `request: false` makes
   anything outside the zone's reach "never allowed" instead of a pending request, `grant: false`
   takes away `decide`. A spawned zone can't be given a right its parent lacks.
-- A blocked request from a run that doesn't escalate (a zone with `request: false`, or a program
-  with `on_pending: fail`) now answers with the "Blocked by wicket sandbox: never allowed" status
+- A blocked request from a run that doesn't escalate (a zone with `request: false`, which is a
+  program's default) now answers with the "Blocked by wicket sandbox: never allowed" status
   line, instead of "Outside this program's reach".

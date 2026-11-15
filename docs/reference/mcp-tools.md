@@ -198,7 +198,9 @@ Returns the new run id.
 | `placement` | `{"lease": "l-…"}` or `{"node": "<name>"}` | where the caller runs | an active lease from `request_capacity`, or the node the caller runs on |
 
 What `zone` leaves out: no reach and no credentials; the caller's limits, isolation,
-`unlisted_hosts` and `wildcards`; for an agent, half the model budget the caller has left. The spawned zone is named
+`unlisted_hosts` and `wildcards`; for an agent, half the model budget the caller has left, and the
+caller's `escalation`. A program may not ask for more (`escalation.request: false`) unless `zone`
+says `escalation: { request: true }`, which the caller's zone must allow too. The spawned zone is named
 `<caller's zone>.<name>.<caller's run>`.
 
 ## `request_capacity`

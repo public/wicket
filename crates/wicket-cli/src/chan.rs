@@ -137,7 +137,7 @@ pub struct BoxStart {
     /// The node kills the box itself at this deadline (seconds from start), whether or not the
     /// control host is reachable then.
     pub timeout_secs: u64,
-    /// False for programs with `on_pending: fail`.
+    /// The zone's `escalation.request` (false by default for a program, #255).
     pub escalate: bool,
     /// The box's CA bundle: the installation root (node-minted leaves) and the run's own CA (hosts the
     /// control host terminates).

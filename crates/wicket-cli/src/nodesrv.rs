@@ -1206,7 +1206,7 @@ fn child_start(
         pids: m.zone.limits.pids,
         interactive: launch.stdin_task.is_some(),
         timeout_secs: timeout.min(left),
-        escalate: m.zone.escalation.request && m.program.as_ref().is_none_or(|p| p.on_pending != wicket_core::OnPending::Fail),
+        escalate: m.zone.escalation.request,
         ca_pem: parent.ca_pem.clone(),
         workspace_tar: String::new(),
         state_files,

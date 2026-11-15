@@ -21,7 +21,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use wicket_core::{Manifest, ZoneSpec};
+use wicket_core::ZoneSpec;
 use wicket_proxy::link::{BoxOps, Stream};
 
 /// The Docker name of a run's box (as `wicket run` names it): `wicket-<run>`, or another prefix from
@@ -97,7 +97,7 @@ impl BoxOps for NodeBoxes {
     fn child_zone(&self, child_run: &str) -> Option<ZoneSpec> {
         crate::run::check_run_id(child_run).ok()?;
         let y = std::fs::read_to_string(self.dir.join("children").join(format!("{child_run}.yaml"))).ok()?;
-        Manifest::from_yaml(&y).ok().map(|m| m.zone)
+        wicket_agent::load(&y).ok().map(|m| m.zone)
     }
 
     fn set_hosts<'a>(&'a self, run: &'a str, text: String) -> Fut<'a, Result<(), String>> {

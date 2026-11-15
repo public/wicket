@@ -100,7 +100,7 @@ pub async fn forward_with(sock: &Path, cmd: &Cmd, argv: Vec<String>, stdio: [i32
     let mut program_source = None;
     if let Cmd::Run { manifest, .. } | Cmd::Wrap { manifest, .. } = cmd {
         let raw = std::fs::read_to_string(manifest).with_context(|| format!("reading {}", manifest.display()))?;
-        let m = wicket_core::manifest::Manifest::from_yaml(&raw).with_context(|| manifest.display().to_string())?;
+        let m = wicket_agent::load(&raw).with_context(|| manifest.display().to_string())?;
         manifest_name = Some(manifest.file_name().context("the manifest has no file name")?.to_string_lossy().into_owned());
         uploads.push(("manifest", manifest.clone()));
         program_source = m.program.as_ref().and_then(|p| p.source.clone());

@@ -86,9 +86,9 @@ pub async fn doctor(image: &str) -> Result<()> {
             h => r.good(format!("  {base}: sent only to {}", h.join(", "))),
         }
     }
-    if !v.has("claude-oauth") {
-        r.good("  no 'claude-oauth' secret: real runs need your Claude subscription token");
-        r.good(format!("  (run `claude setup-token`, then: {}wicket secret set claude-oauth)", if system { "sudo " } else { "" }));
+    for s in wicket_agent::harness::model_secrets().iter().filter(|s| !v.has(&s.secret)) {
+        r.good(format!("  no '{}' secret: the {} harness's model route needs it", s.secret, s.harness));
+        r.good(format!("  ({}, then: {}wicket secret set {})", s.how, if system { "sudo " } else { "" }, s.secret));
     }
     placement(&mut r, &v);
     let l = Ledger::open(&ledger_path())?;

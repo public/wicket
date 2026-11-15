@@ -87,7 +87,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a task manifest: one Claude Code agent in one zone.
+    /// Run a task manifest: one workload (an agent, or a program) in one zone.
     Run {
         manifest: PathBuf,
         /// Copy this directory into the box's /workspace first.
@@ -155,8 +155,8 @@ enum Cmd {
     /// still running on its node.
     #[command(hide = true)]
     Attach { run: String },
-    /// Run an agent command line that another program launches, inside a wicket box: e.g. as Claude
-    /// Code Remote Control's CLAUDE_CODE_PROCESS_WRAPPER. Its stdin and stdout stay connected to the
+    /// Run an agent command line that another program launches, inside a wicket box: the harness's
+    /// wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the
     /// launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file.
     Wrap {
         #[arg(long)]
@@ -236,11 +236,12 @@ enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: Option<ImageCmd>,
-        /// The tag to build, kept as given [default: this installation's own image:
-        /// wicket/claude-code:<build id> on an installed version, else wicket/claude-code:poc].
+        /// The tag to build, kept as given [default: this installation's own image: the default
+        /// harness's image repository, tagged with the build id on an installed version, else its
+        /// default tag].
         #[arg(long)]
         tag: Option<String>,
-        /// An image directory to build instead (e.g. images/claude-code, while changing it). If its
+        /// An image directory to build instead (e.g. one under images/, while changing it). If its
         /// Dockerfile declares `ARG BASE`, BASE is this installation's own agent image.
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -361,8 +362,9 @@ enum Cmd {
     },
     /// Check the environment: Docker, gVisor, image, secrets, ledger, orphaned boxes.
     Doctor {
-        #[arg(long, default_value = crate::image::DEFAULT)]
-        image: String,
+        /// The agent image to check [default: the default harness's agent image].
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Remote sandbox nodes (#16): one-time join tokens, enrolment with a pinned ssh host key, a node
     /// key and a name-constrained node CA; listing, revoking, renewing the CA.

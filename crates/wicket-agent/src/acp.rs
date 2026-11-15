@@ -74,7 +74,7 @@ pub fn control_file(path: &str) -> Option<&'static str> {
 /// the Claude Agent SDK: by wicket's profile for it, or by a command that starts the adapter (its
 /// package or binary, under its current or earlier names).
 pub fn is_claude_adapter(spec: &wicket_core::AcpSpec) -> bool {
-    spec.profile.as_deref() == Some("claude-agent-acp")
+    spec.profile.as_deref() == Some(crate::claude::ACP_PROFILE)
         || spec.command.iter().any(|c| {
             let c = c.to_ascii_lowercase();
             ["claude-agent-acp", "claude-code-acp"].iter().any(|n| c.contains(n))
@@ -103,7 +103,7 @@ pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings
         return Ok(());
     }
     // Claude Code through its adapter goes through wicket's profile, and so through the check below.
-    if spec.profile.as_deref() != Some("claude-agent-acp") {
+    if spec.profile.as_deref() != Some(crate::claude::ACP_PROFILE) {
         return Err("agent.acp.command starts Claude Code's ACP adapter: set agent.acp.profile: claude-agent-acp".into());
     }
     // The zone's model route is a Claude subscription (wicket never uses an API key).

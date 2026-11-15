@@ -215,7 +215,7 @@ impl Egress {
         }))
     }
 
-    /// Model calls to the model host that come through this proxy (a wrapped Claude Code session's)
+    /// Model calls to the model host that come through this proxy (a wrapped harness session's)
     /// go through `llm`'s budget, body filter and accounting (#112).
     pub fn set_model_gate(&self, llm: Arc<crate::llm::Llm>) {
         let _ = self.model_gate.set(llm);
@@ -418,13 +418,13 @@ impl Egress {
                 ), None);
             }
             Outcome::NoEscalation(why) => {
-                emit("forbidden", format!("{why}; this run does not escalate (escalation.request: false, or on_pending: fail)"));
+                emit("forbidden", format!("{why}; this run does not escalate (escalation.request: false)"));
                 return problem(
                     403,
                     "forbidden",
                     "Blocked by wicket sandbox: never allowed",
                     &format!(
-                        "{why}. This sandbox may not ask for anything outside its reach (its zone's escalation.request is false, or it is a program with on_pending: fail), so this will never be allowed from here. {} Do not retry it; tell the user it is blocked.",
+                        "{why}. This sandbox may not ask for anything outside its reach (its zone's escalation.request is false), so this will never be allowed from here. {} Do not retry it; tell the user it is blocked.",
                         crate::SANDBOX_FACT
                     ),
                     None,
@@ -468,7 +468,7 @@ impl Egress {
             }
             Outcome::Error(e) => return problem(500, "error", "Ledger error", &e, None),
         }
-        if let Some(llm) = self.model_gate.get().filter(|_| crate::llm::is_model_call(&host, &path)) {
+        if let Some(llm) = self.model_gate.get().filter(|l| l.is_model_call(&host, &path)) {
             return llm.clone().through_egress(&self, req, &host, &pq, via).await;
         }
         match self.forward(req, &host, scheme, &pq, via).await {
@@ -500,8 +500,10 @@ mod tests {
         let vault = crate::vault::Vault::new(dir.join("vault"));
         vault.set("gh", "the-real-token").unwrap();
         vault.set_hosts("gh", &["api.github.com".into()]).unwrap();
-        let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, {zone}}}"))
-            .unwrap();
+        let mut m =
+            wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, llm: {{secret: m}}, {zone}}}"))
+                .unwrap();
+        crate::provider::fill_test_route(&mut m);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let c = crate::RunCtx {
             tenant: wicket_core::TenantId::single(),
