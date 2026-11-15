@@ -37,7 +37,8 @@ CONSTANTS
     Journal,         \* the node journals spend before a call goes upstream (#324, PR #333)
     SeparateCounters,\* the control host keeps its own calls apart from the node's reports
     SliceReserved,   \* a leased slice is held against the budget until returned
-    EdgeCarveKept    \* a node keeps an edge child's carve-out against its parent until adopted
+    EdgeCarveKept,   \* a node keeps an edge child's carve-out against its parent
+    SliceAtStart     \* the box start carries its first slice: no spend before a slice
 
 ASSUME Stacks \in {"today", "slice3", "end"}
 ASSUME Boundary \in {"token", "ledger"}
@@ -127,8 +128,10 @@ Init ==
     /\ up = TRUE /\ conn = TRUE /\ faults = 0
     /\ billed = 0 /\ carved = 0
     /\ chCount = 0 /\ chOwn = 0 /\ chNode = 0 /\ chReserved = 0
-    /\ chSlice = NoSlice /\ sliceSent = FALSE
-    /\ nCount = 0 /\ nJournal = 0 /\ nSlice = NoSlice /\ nInflight = 0
+    /\ chSlice = (IF SliceAtStart THEN Min(Budget, Part) ELSE NoSlice)
+    /\ sliceSent = SliceAtStart
+    /\ nCount = 0 /\ nJournal = 0 /\ nInflight = 0
+    /\ nSlice = (IF SliceAtStart THEN Min(Budget, Part) ELSE NoSlice)
     /\ nCarved = 0 /\ unadopted = 0 /\ spawns = 0
     /\ boxDone = FALSE /\ released = FALSE
     /\ pastLife = FALSE /\ pastRevoke = FALSE
