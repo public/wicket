@@ -1245,7 +1245,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm_prior: llm.spent_total(),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
-            swap_hosts: ctx.swaps.iter().map(|s| s.host.clone()).collect(),
+            // Swapped on the node (#257): their names and placeholders only, the credentials
+            // fetched by the node on first use.
+            swap_hosts: vec![],
+            swaps: crate::chan::swap_starts(&ctx.swaps),
             durable: match long_lived {
                 true => m
                     .zone
@@ -1316,6 +1319,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             attribute: ctx.attribute.clone(),
             llm: Some(llm.clone()),
             vault: ctx.vault.clone(),
+            swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
             adopt: adopter.clone(),
             timings: timings.clone(),
