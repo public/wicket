@@ -19,5 +19,5 @@ type: Added
     `session.escalation_answered`, `session.closed`).
   - ACP runs now keep what wicket said to the agent next to the transcript, in `acp-client.jsonl`
     in the run directory, kept up to the zone's `limits.output`.
-  - Two candidate views are in `experiments/web-sessions/`, with a comparison and a
-    recommendation. The console doesn't serve either yet.
+  - The choice of view (an acp-ui fork, over the ACP SDK with assistant-ui) is written up in
+    `experiments/web-sessions/`.

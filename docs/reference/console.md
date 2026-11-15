@@ -39,7 +39,8 @@ exactly its parameters, checked again when applied, audited with the passkey tha
   is you, the passkey-signed-in operator (`passkey:<name>, via console`, with your operator identity
   `spiffe://<domain>/t/<tenant>/op/passkey/<name>` as its `sub`), not the host's unix user. What you may
   approve is your authority in [`operators.yaml`](configuration.md#operatorsyaml) (anything by default);
-- **send a follow-up** to a running agent (`wicket say`);
+- **open a run's session** (an ACP agent's: the row's *session* link), below;
+- **send a follow-up** to a running agent (`wicket say`; for an ACP agent, the session's prompts replace it);
 - **revoke an identity** with a reason (`wicket identity revoke`);
 - **answer `request_access` asks**, including prefix asks: the passkey signs that the grant covers every path
   under the prefix, and, as for every approval, the agent's verified identity. A prefix covers whole path
@@ -53,6 +54,80 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
+
+## Sessions
+
+A running ACP agent's session, live, on its own page (#327): `/session?run=<run>`, opened from the
+run's *session* link in **Runs** (shown for running ACP runs, whose supervisor keeps
+`acp-client.jsonl`). How-to: [work with a running agent in the console](../how-to/work-with-a-running-agent-in-the-console.md).
+
+**What the page shows,** as it streams:
+- the agent's messages and thoughts (thoughts folded), as plain text: no markdown or HTML is
+  rendered, so nothing the agent writes becomes page markup;
+- its tool calls with their arguments and results (text and diffs), and how wicket's policy answered
+  each of the agent's own permission requests ("allowed by wicket's policy");
+- its plan, with each entry's status;
+- other principals' prompts (the task, other operators, wicket's notices), each with who sent it;
+- **wicket's escalations** for the run, inline: what was asked (method, host, path, risk, reason)
+  with **Approve once (passkey)** and **Deny (passkey)**. A tap asks `/api/decide/begin` for the
+  decision, the confirmation at the top states it (as on the front page), and its own button has the
+  passkey sign it through `/api/decide/finish`: the same signed decide action as the front page's
+  cards (#256), approving once for 10 minutes. An escalation decided elsewhere (the front page,
+  another device) updates in place.
+
+**Prompts** typed on the page are ACP `session/prompt`s on the endpoint: each becomes an operator
+message from your principal (`passkey:<name>`), which the supervisor hands to the agent as its next
+turn (queued if a turn is running). **Stop** sends `session/cancel`: the supervisor cancels the
+agent's running turn within a second or so (ACP's own `session/cancel`), the turn ends with
+`cancelled`, and prompts queued behind it stay queued. With no turn running, Stop does nothing (and
+says so in the audit).
+
+**Opening** takes your passkey: a tap on *Open session* shows the `open_session` action (run,
+agent, your principal), and signing it gets a single-use ticket for that run and this console
+session, valid 60 s. The page then opens the WebSocket `GET /api/runs/<run>/acp` (ACP v1, wicket as
+the agent, the session id being the run id) with the `acp.v1` subprotocol and the ticket as a
+`wicket.ticket.<hex>` subprotocol, never in the URL. The upgrade needs the session cookie, the
+console's own `Origin` and the ticket; the cookie alone opens nothing. A reload or a reconnect signs
+a new open; the session replays from the start of the kept transcript. The socket closes when your
+console session ends (sign-out, idle, expiry, a revoked passkey) or the run ends.
+
+**What the endpoint filters** (`crates/wicket-cli/src/serve/session.rs` is the reference): the
+agent's `_meta` is dropped everywhere and only ACP v1's `session/update` kinds pass; the agent's
+own requests are never forwarded; tool-call ids starting `wicket:` are reserved for wicket's
+escalations, so nothing the agent sends can raise one. **An ACP answer to an escalation prompt
+decides nothing**: only the signed decide action does; the endpoint records what the client said
+next to the ledger's status (`session.escalation_answered`).
+
+**Limits:** prompts of up to 16 KiB of text (no images or resources yet), 16 waiting per socket,
+messages from the browser up to 256 KiB, one cancel a second per socket. Session sockets are capped
+at **4 per console session** and **32 in all** (upgraded sockets leave `--max-connections`): over a
+cap the open is refused before a ticket is issued, and an upgrade gets 429 without spending its
+ticket, which still works within its 60 s once a socket closes.
+
+**Audit:** `session.opened` (with the signed assertion), `session.attached`, `session.prompt` (by
+principal, with the operator message it queued and the text's length and sha256), `session.cancel`
+and the supervisor's `run.turn_cancel` (whether a turn was running), `session.escalation_answered`,
+and `session.closed`; decisions are `decision` records, as from anywhere.
+
+**The view** is `web/session/` in the repository: a Vue fork of
+[acp-ui](https://github.com/formulahendry/acp-ui) (MIT; `web/session/FORK.md` says what was kept and
+changed), about 33 KB gzipped. CI builds it from its committed lockfile (`ci/session-view.sh`:
+`npm ci --ignore-scripts`, a licence check, then the build twice from fresh installs, which must give
+the same bytes; then a UI check under jsdom and the view's client against the real endpoint) and
+the binary embeds it (`crates/wicket-cli/build.rs`, from the directory in
+`WICKET_SESSION_VIEW`), served as `/static/session.<hash>.js` and `.css` with Subresource Integrity
+under the console's CSP. A build without `WICKET_SESSION_VIEW` (a plain `cargo build`) embeds a
+placeholder page saying the view wasn't built, and `wicket serve` says so at start-up. To build one
+with the view:
+
+```sh
+ci/session-view.sh                                  # needs Node 20.19+ or 22.12+ and npm; prints the dist path
+WICKET_SESSION_VIEW=$PWD/web/session/dist cargo build --release -p wicket-cli
+```
+
+Not yet: answering the agent's own permission requests from the page (wicket's policy answers
+them, #67), images and resources in prompts, and the box tree, budgets and hibernate controls
+next to the session (#327's later slices).
 
 ## Authority views
 
@@ -210,7 +285,8 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` (submitting the domain to the
   preload list is your step). ACME keeps its account and certificate in `$WICKET_HOME/acme` (0700/0600) and
   renews 30 days before expiry; binding :443 needs `CAP_NET_BIND_SERVICE` (or a port redirect).
-- **Before sign-in** a client can fetch only the page, its static files (script, stylesheet, service worker, manifest, icons)
+- **Before sign-in** a client can fetch only the page and the session page (`/session`, the same
+  for every run, with no data in it), their static files (scripts, stylesheets, service worker, manifest, icons)
   and the passkey sign-in endpoints. Everything else, whatever the method or path, gets the same 401 and body:
   no runs, counts, passkey ids or version. Enrolment is only via a one-time link issued on the host (`wicket operator enrol-link`).
 - **Sign-in** needs user verification; there is no password or fallback. Attempts are limited per client
@@ -232,7 +308,7 @@ console on the internet](../how-to/put-the-console-on-the-internet.md).
   `x-wicket-csrf` header and the console's own `Origin`. Requests for another `Host` get the 401.
 - **HTTP limits:** 256 connections (`--max-connections`), 16 per client address, 10 s each for the TLS
   handshake, the request headers and the body, 2 minutes per connection, 16 KiB and 64 header lines, 64 KiB
-  bodies. A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
+  bodies. Session WebSockets have their own caps, 4 per console session and 32 in all ([sessions](#sessions)). A fuzz-style test throws random methods, paths, headers and bytes at the router and the wire and
   checks it never panics and never reaches a signed-in handler.
 - **Installable:** the console has a web app manifest and icons, so it can be added to a phone's home screen.
 - **Privilege separation** is #12: the console is meant to run as the unprivileged wicket system user. Nothing

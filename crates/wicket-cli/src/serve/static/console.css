@@ -56,6 +56,7 @@ button.approve:disabled { background:var(--accent); }
 .row:first-child { padding-top:0; } .row:last-child { border-bottom:0; padding-bottom:0; }
 .row .acts { display:flex; gap:6px; flex-shrink:0; } .row .acts button { min-height:32px; padding:7px 11px; font-size:13px; }
 .mono { font:13px/1.45 var(--mono); word-break:break-all; }
+a.session { color:var(--accent); font-weight:600; padding:6px 2px; }
 .log { font:12px/1.6 var(--mono); white-space:pre-wrap; word-break:break-all; color:var(--soft); }
 .ok { color:var(--good); } .pend { color:var(--warn); } .blocked { color:var(--bad); }
 

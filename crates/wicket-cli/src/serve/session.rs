@@ -44,9 +44,17 @@
 //! `session.closed`. Decisions themselves are audited by the decide path, and wicket's answers to the
 //! agent's permission requests by the supervisor (`run.agent_prompt`).
 //!
-//! Not in this slice: `session/cancel` (the supervisor has no cancel channel yet: ignored), the
-//! human answering the agent's own permission requests (#67's `answer_agent_prompts`), images and
-//! resources in prompts, and more than one run per socket.
+//! **Cancel.** `session/cancel` is queued in the ledger for the run's supervisor (`session.cancel`),
+//! which sends the agent ACP's own `session/cancel` for its running turn within a second or so
+//! (`run.turn_cancel`); the turn ends with `cancelled`, which answers that turn's `session/prompt`.
+//! Prompts queued behind it stay queued.
+//!
+//! **Caps.** Upgraded sockets leave the console's connection cap, so they have their own:
+//! [`MAX_SOCKETS_PER_SESSION`] per console session and [`MAX_SOCKETS`] in all, checked when the
+//! ticket is issued and taken at the upgrade (429 over a cap, without spending the ticket).
+//!
+//! Not in this slice: the human answering the agent's own permission requests (#67's
+//! `answer_agent_prompts`), images and resources in prompts, and more than one run per socket.
 
 use super::{check_running, session as console_session, Ctx, OperatorCredential, SessionKind, State};
 use anyhow::Result;
@@ -79,10 +87,77 @@ const READ_CHUNK: usize = 4 << 20;
 const POLL: Duration = Duration::from_millis(250);
 /// How often the console session and the run are re-checked.
 const RECHECK: Duration = Duration::from_secs(15);
+/// How often one socket may ask for a cancel.
+const CANCEL_EVERY: Duration = Duration::from_secs(1);
 /// Prompts one socket may have waiting for their turn.
 const MAX_WAITING: usize = 16;
 /// Pending tickets in all.
 const MAX_TICKETS: usize = 64;
+/// Session sockets one console session may hold open at once (a few tabs or devices' worth: each
+/// is one run's session).
+pub const MAX_SOCKETS_PER_SESSION: usize = 4;
+/// Session sockets open at once, in all. Upgraded connections leave the console's connection cap
+/// (`--max-connections`), so they have this one of their own.
+pub const MAX_SOCKETS: usize = 32;
+
+/// The open session sockets, counted at the upgrade and freed when each one ends ([`Slot`]).
+#[derive(Debug, Default)]
+pub struct Sockets {
+    total: usize,
+    by_session: HashMap<String, usize>,
+}
+
+impl Sockets {
+    /// Why another socket for `console_session` would be refused, if it would.
+    fn full(&self, console_session: &str) -> Option<&'static str> {
+        if self.total >= MAX_SOCKETS {
+            return Some("too many sessions are open on this console; close one and try again");
+        }
+        if self.by_session.get(console_session).copied().unwrap_or(0) >= MAX_SOCKETS_PER_SESSION {
+            return Some("this sign-in has too many sessions open; close one (another tab or device) and try again");
+        }
+        None
+    }
+
+    /// How many are open, in all and for `console_session`.
+    #[cfg(test)]
+    pub fn open(&self, console_session: &str) -> (usize, usize) {
+        (self.total, self.by_session.get(console_session).copied().unwrap_or(0))
+    }
+}
+
+/// One open (or opening) session socket's place under the caps; dropping it frees the place.
+#[derive(Debug)]
+pub struct Slot {
+    sockets: std::sync::Arc<std::sync::Mutex<Sockets>>,
+    console_session: String,
+}
+
+impl Slot {
+    /// Takes a place for `console_session`, or says why not.
+    pub fn take(sockets: &std::sync::Arc<std::sync::Mutex<Sockets>>, console_session: &str) -> Result<Slot, &'static str> {
+        let mut s = sockets.lock().expect("lock");
+        if let Some(why) = s.full(console_session) {
+            return Err(why);
+        }
+        s.total += 1;
+        *s.by_session.entry(console_session.to_string()).or_default() += 1;
+        Ok(Slot { sockets: sockets.clone(), console_session: console_session.to_string() })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut s = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+        s.total = s.total.saturating_sub(1);
+        if let Some(n) = s.by_session.get_mut(&self.console_session) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                s.by_session.remove(&self.console_session);
+            }
+        }
+    }
+}
 
 /// The `sessionUpdate` kinds forwarded from the agent (ACP v1's).
 const UPDATES: &[&str] = &[
@@ -106,10 +181,20 @@ pub struct Ticket {
     pub expires: Instant,
 }
 
+/// Why another session socket for `console_session` would be refused now, if it would.
+pub(super) fn over_cap(state: &State, console_session: &str) -> Option<&'static str> {
+    state.sockets.lock().expect("lock").full(console_session)
+}
+
 /// Issues a ticket after the `open_session` action verified, and audits the signed open.
 pub(super) fn open(state: &State, run: &str, oc: &OperatorCredential, console_session: &str, signed: Value) -> Result<Value> {
     let l = state.ledger()?;
     check_running(&l, run).map_err(|r| anyhow::anyhow!("{}", r.body["error"].as_str().unwrap_or("not running")))?;
+    // Checked again here (sockets may have opened since the action began): no ticket for a socket
+    // that would be refused.
+    if let Some(why) = over_cap(state, console_session) {
+        anyhow::bail!("{why}");
+    }
     let op = crate::operators::Operator::console(&state.tenant.0, &oc.name)?;
     let ticket = super::random_hex(32);
     {
@@ -151,13 +236,14 @@ pub fn run_of(path: &str) -> Option<&str> {
 /// Why an upgrade is refused (status and the one message the client sees).
 pub type Refused = (http::StatusCode, &'static str);
 
-/// Checks an upgrade request and takes its ticket: what the socket runs as, or why not.
+/// Checks an upgrade request and takes its ticket and a place under the socket caps: what the
+/// socket runs as, or why not.
 pub(super) fn check_upgrade(
     state: &State,
     h: &http::HeaderMap,
     run: &str,
     sess: &(String, SessionKind),
-) -> Result<(Ticket, String), Refused> {
+) -> Result<(Ticket, String, Slot), Refused> {
     use http::StatusCode as S;
     let SessionKind::Operator { cred } = &sess.1 else { return Err((S::UNAUTHORIZED, "sign in with your passkey")) };
     let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -182,6 +268,8 @@ pub(super) fn check_upgrade(
     let Some(tk) = protocols.iter().find_map(|p| p.strip_prefix(TICKET_PREFIX)) else {
         return Err((S::FORBIDDEN, "open the session with your passkey first"));
     };
+    // Over a cap, the ticket isn't spent: the operator can close a socket and use it within its TTL.
+    let slot = Slot::take(&state.sockets, &sess.0).map_err(|why| (S::TOO_MANY_REQUESTS, why))?;
     // Single use, whatever happens next.
     let t = state.tickets.lock().expect("lock").remove(tk);
     let Some(t) = t.filter(|t| t.expires > Instant::now()) else { return Err((S::FORBIDDEN, "unknown, used or expired ticket")) };
@@ -193,7 +281,7 @@ pub(super) fn check_upgrade(
         return Err((S::CONFLICT, "the run is not running"));
     }
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-    Ok((t, accept))
+    Ok((t, accept, slot))
 }
 
 /// What the socket runs as.
@@ -317,6 +405,8 @@ pub struct Bridge {
     asked: BTreeMap<String, String>,
     next_id: u64,
     pub prompts: u64,
+    /// When this socket last asked for a cancel.
+    last_cancel: Option<Instant>,
 }
 
 fn rpc_key(id: &Value) -> String {
@@ -355,6 +445,7 @@ impl Bridge {
             asked: BTreeMap::new(),
             next_id: 0,
             prompts: 0,
+            last_cancel: None,
         }
     }
 
@@ -400,7 +491,8 @@ impl Bridge {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         match (method, id) {
             (Some(m), Some(id)) => self.request(m, id, &params),
-            // Notifications: session/cancel isn't bridged yet; the rest have no meaning here.
+            (Some("session/cancel"), None) => self.cancel(&params),
+            // Other notifications have no meaning here.
             (Some(_), None) => vec![],
             (None, Some(id)) => self.answer(&id, &v),
             (None, None) => vec![],
@@ -479,6 +571,35 @@ impl Bridge {
         );
         self.waiting.insert(op, Waiting { rpc: id });
         vec![]
+    }
+
+    /// `session/cancel`: asks the run's supervisor, through the ledger, to cancel the agent's running
+    /// turn (it sends the agent ACP's own `session/cancel`, and the turn ends with `cancelled`, which
+    /// answers its prompt). Audited; at most one a second per socket.
+    fn cancel(&mut self, p: &Value) -> Vec<Value> {
+        if p.get("sessionId").and_then(|s| s.as_str()) != Some(self.run.as_str()) {
+            return vec![];
+        }
+        let now = Instant::now();
+        if self.last_cancel.is_some_and(|t| now.duration_since(t) < CANCEL_EVERY) {
+            return vec![];
+        }
+        self.last_cancel = Some(now);
+        let Some(l) = self.ledger() else { return vec![self.notice("couldn't ask for the cancel: the ledger is unavailable")] };
+        if check_running(&l, &self.run).is_err() {
+            return vec![];
+        }
+        let id = match l.request_turn_cancel(&self.run, &self.who.label) {
+            Ok(id) => id,
+            Err(_) => return vec![self.notice("couldn't ask for the cancel")],
+        };
+        let _ = l.audit(
+            &self.tenant,
+            Some(&RunId(self.run.clone())),
+            "session.cancel",
+            &json!({ "run": self.run, "by": self.who.label, "principal": self.who.principal, "via": "acp", "cancel": id }),
+        );
+        vec![self.notice("asked the agent to stop its running turn")]
     }
 
     /// The browser's answer to one of wicket's requests (an escalation prompt).

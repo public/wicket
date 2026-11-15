@@ -236,6 +236,8 @@ struct State {
     authz_root: Option<wicket_authz::PublicKey>,
     /// Signed `open_session` tickets waiting for their WebSocket ([`session`]).
     tickets: Mutex<HashMap<String, session::Ticket>>,
+    /// Open session WebSockets, overall and per console session ([`session::Sockets`]).
+    sockets: Arc<Mutex<session::Sockets>>,
     /// Web Push to the operators' devices ([`push`]); None if its state couldn't be opened.
     push: Option<push::Push>,
 }
@@ -280,6 +282,7 @@ impl State {
             vault_dir: wicket_proxy::vault::Vault::default_dir(),
             authz_root: crate::roots::authz_root_public().ok(),
             tickets: Mutex::new(HashMap::new()),
+            sockets: Arc::new(Mutex::new(session::Sockets::default())),
             push,
         }
     }
@@ -361,6 +364,9 @@ pub async fn serve(opts: ServeOpts, bootstrap_link: bool) -> Result<()> {
         (None, false) => "HTTP, loopback only",
     };
     println!("wicket console on {}/  (listening on {}, {how})", plan.origin, plan.addr);
+    if !web::SESSION_VIEW_BUILT {
+        println!("this build has no session view (built without web/session's bundle): runs' session pages say so");
+    }
     for (name, dir) in &state.roots {
         println!("runs can be started from {name}: {}", dir.display());
     }
@@ -672,6 +678,10 @@ where
         if path == "/" {
             return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.page.clone());
         }
+        // A run's session view (#327): a static page, as `/` is; it asks for a passkey to open.
+        if path == "/session" {
+            return resp(StatusCode::OK, "text/html; charset=utf-8", web::ASSETS.session_page.clone());
+        }
         if let Some(a) = web::ASSETS.files.get(&path) {
             let mut r = resp(StatusCode::OK, a.ctype, a.body.clone());
             let cache = if a.immutable {
@@ -775,7 +785,7 @@ fn ws_upgrade<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer:
     }
     let Some(sess) = session(state, &ctx.sid) else { return denied() };
     state.authed.fetch_add(1, Ordering::Relaxed);
-    let (ticket, accept) = match session::check_upgrade(state, req.headers(), &run, &sess) {
+    let (ticket, accept, slot) = match session::check_upgrade(state, req.headers(), &run, &sess) {
         Ok(x) => x,
         Err((status, msg)) => return to_response(err(status, msg)),
     };
@@ -786,6 +796,9 @@ fn ws_upgrade<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer:
     let on = hyper::upgrade::on(req);
     let state = state.clone();
     tokio::spawn(async move {
+        // The slot is held for as long as the socket is served, and freed when it ends or the
+        // upgrade fails.
+        let _slot = slot;
         if let Ok(up) = on.await {
             session::serve(hyper_util::rt::TokioIo::new(up), state, run, who, ctx.client).await;
         }
@@ -1330,6 +1343,12 @@ fn action_begin(state: &State, sess: &Option<(String, SessionKind)>, body: &Valu
         Ok(x) => x,
         Err(r) => return r,
     };
+    // A session socket over its caps is refused before the passkey is asked for (#327).
+    if matches!(action, Action::OpenSession { .. }) {
+        if let Some(why) = session::over_cap(state, &sid) {
+            return err(StatusCode::TOO_MANY_REQUESTS, why);
+        }
+    }
     let action_json = v.to_string();
     let nonce = random_bytes(16);
     let challenge = decision_challenge(&nonce, &action_json).to_vec();
@@ -1658,6 +1677,11 @@ fn dashboard(state: &State) -> Result<Value> {
             let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
             v["has_identity"] = l.identity(&id).ok().flatten().is_some().into();
             v["revoked"] = l.revoked(&id).ok().flatten().is_some().into();
+            // An ACP run's session can be opened in the console (#327): its supervisor keeps the log
+            // the session view reads.
+            v["acp"] = (session::run_of(&format!("/api/runs/{id}/acp")).is_some()
+                && state.data.join("runs").join(&id).join(crate::transcript::ACP_LOG).is_file())
+            .into();
             // A remote session's address (#169), as its run recorded it.
             if let Some(u) = l
                 .audit_latest(&id, "run.remote_session")

@@ -1,5 +1,11 @@
 # Web session views (#327, first slice)
 
+> **Outcome.** The acp-ui fork was chosen, and it is now the console's session view: its source is
+> [`web/session/`](../../web/session/) (with [FORK.md](../../web/session/FORK.md)), the console
+> serves it at `/session?run=<run>`, and [the console reference](../../docs/reference/console.md#sessions)
+> describes it. The assistant-ui view and the dev proxy were removed when it moved; they are in
+> this directory's history (#335). This write-up stays as the record of the comparison.
+
 This is the spike for [#327](https://github.com/public/wicket/issues/327): one boxed agent's session
 in the browser, over ACP, with wicket's escalations decided inline. It has three parts:
 
@@ -7,7 +13,7 @@ in the browser, over ACP, with wicket's escalations decided inline. It has three
   `serve/tests/session.rs`. It stays when the views are chosen.
 - **Two minimal views** on that endpoint, which stay here until one is picked:
   - `assistant-ui/`: the ACP TypeScript SDK with assistant-ui (React).
-  - `acp-ui/`: a fork of formulahendry/acp-ui (Vue). See [acp-ui/FORK.md](acp-ui/FORK.md).
+  - `acp-ui/`: a fork of formulahendry/acp-ui (Vue). See [FORK.md](../../web/session/FORK.md).
 - **A comparison and a recommendation** (below).
 
 **Recommendation: build on the acp-ui fork's approach** (Vue, a thin client of our own over the

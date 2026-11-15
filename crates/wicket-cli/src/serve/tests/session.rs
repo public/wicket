@@ -1,7 +1,7 @@
 //! A run's ACP session socket (#327): who may open it, what it bridges, and what it audits.
 
 use super::*;
-use crate::serve::session::{Bridge, Who, SUBPROTOCOL, TICKET_PREFIX};
+use crate::serve::session::{Bridge, Slot, Sockets, Who, MAX_SOCKETS, MAX_SOCKETS_PER_SESSION, SUBPROTOCOL, TICKET_PREFIX};
 use futures_util::{SinkExt, StreamExt};
 use std::io::Write;
 use std::path::Path;
@@ -429,7 +429,96 @@ async fn the_socket_needs_a_session_the_consoles_origin_and_a_fresh_passkey_tick
     panic!("session.closed was not audited");
 }
 
-// ---- the experiments' clients against the real endpoint (#327) ----
+#[test]
+fn a_cancel_is_queued_for_the_supervisor_audited_and_limited() {
+    let (t, mut b, _dir) = bridged("sess-cancel");
+    let cancel = |sid: &str| json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": sid } }).to_string();
+    // Another session's id: nothing.
+    assert!(b.on_client(&cancel("run_other")).is_empty());
+    let out = b.on_client(&cancel(RUN));
+    assert_eq!(out.len(), 1, "a notice, and no JSON-RPC answer (it is a notification)");
+    assert!(out[0]["params"]["update"]["content"]["text"].as_str().unwrap().contains("stop its running turn"));
+    assert_eq!(out[0]["params"]["update"]["_meta"]["wicket"]["notice"], true);
+    // At most one a second per socket.
+    assert!(b.on_client(&cancel(RUN)).is_empty());
+    let mut l = t.ledger();
+    assert_eq!(l.take_turn_cancels(RUN, 30).unwrap(), vec!["passkey:laptop".to_string()], "queued once, by the operator's label");
+    let audited: Vec<Value> = t.audit_kinds().into_iter().filter(|(k, _)| k == "session.cancel").map(|(_, b)| b).collect();
+    assert_eq!(audited.len(), 1);
+    assert_eq!(audited[0]["principal"], who().principal);
+    // An ended run: nothing to cancel.
+    l.run_ended(&RunId(RUN.into()), "succeeded", "").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(b.on_client(&cancel(RUN)).is_empty());
+    assert!(l.take_turn_cancels(RUN, 30).unwrap().is_empty());
+}
+
+#[test]
+fn socket_slots_are_capped_per_console_session_and_in_all_and_freed_on_drop() {
+    let socks = Arc::new(std::sync::Mutex::new(Sockets::default()));
+    let mine: Vec<Slot> = (0..MAX_SOCKETS_PER_SESSION).map(|_| Slot::take(&socks, "a").unwrap()).collect();
+    assert!(Slot::take(&socks, "a").unwrap_err().contains("this sign-in"));
+    assert_eq!(socks.lock().unwrap().open("a"), (MAX_SOCKETS_PER_SESSION, MAX_SOCKETS_PER_SESSION));
+    // Other sessions fill the rest, then everyone is refused.
+    let mut others = vec![];
+    for i in 0.. {
+        match Slot::take(&socks, &format!("s{i}")) {
+            Ok(s) => others.push(s),
+            Err(e) => {
+                assert!(e.contains("this console"), "{e}");
+                break;
+            }
+        }
+    }
+    assert_eq!(mine.len() + others.len(), MAX_SOCKETS);
+    drop(mine);
+    assert_eq!(socks.lock().unwrap().open("a"), (MAX_SOCKETS - MAX_SOCKETS_PER_SESSION, 0));
+    let again = Slot::take(&socks, "a").expect("freed");
+    drop((again, others));
+    assert_eq!(socks.lock().unwrap().open("a"), (0, 0));
+}
+
+#[tokio::test]
+async fn over_the_socket_cap_the_upgrade_is_refused_without_spending_its_ticket() {
+    let mut t = setup("sess-caps");
+    t.running(RUN, "lead");
+    std::fs::create_dir_all(t.dir.join("runs").join(RUN).join("ctl")).unwrap();
+    let cookie = t.sid.clone().unwrap();
+    // The console's runs list links an ACP run's session: one whose supervisor keeps the ACP log.
+    let acp = |t: &T| dashboard(&t.state).unwrap()["runs"].as_array().unwrap().iter().find(|r| r["id"] == RUN).unwrap()["acp"].clone();
+    assert_eq!(acp(&t), false);
+    std::fs::write(t.dir.join("runs").join(RUN).join(crate::transcript::ACP_LOG), "").unwrap();
+    assert_eq!(acp(&t), true);
+    // With this sign-in's places taken, the open is refused before the passkey is asked for.
+    let sid = session_id(&cookie);
+    let held: Vec<Slot> = (0..MAX_SOCKETS_PER_SESSION).map(|_| Slot::take(&t.state.sockets, &sid).unwrap()).collect();
+    let r = t.begin(json!({ "action": "open_session", "run": RUN }));
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{:?}", r.body);
+    drop(held);
+    let tickets: Vec<String> = (0..=MAX_SOCKETS_PER_SESSION).map(|_| ticket(&mut t, RUN)).collect();
+    let socks = t.state.sockets.clone();
+    let addr = serve(t.state).await;
+    let mut open = vec![];
+    for tk in &tickets[..MAX_SOCKETS_PER_SESSION] {
+        open.push(connect(addr, RUN, &browser(&cookie, tk)).await.expect("under the cap"));
+    }
+    let last = &tickets[MAX_SOCKETS_PER_SESSION];
+    let (status, body) = connect(addr, RUN, &browser(&cookie, last)).await.unwrap_err();
+    assert_eq!(status, 429);
+    assert!(body.contains("too many sessions open"), "{body}");
+    // Closing one frees its place, and the refused ticket still opens.
+    let mut first = open.remove(0);
+    first.close(None).await.unwrap();
+    for _ in 0..100 {
+        if socks.lock().unwrap().open("").0 < MAX_SOCKETS_PER_SESSION {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    connect(addr, RUN, &browser(&cookie, last)).await.expect("the same ticket, once there is room");
+}
+
+// ---- the session view's client against the real endpoint (#327) ----
 
 /// A run's history as a supervisor would leave it: the task's turn, a tool call with its input and
 /// output, a plan, and a permission request wicket answered.
@@ -465,11 +554,22 @@ fn history(dir: &Path) {
     agent(dir, json!({ "jsonrpc": "2.0", "id": 2, "result": { "stopReason": "end_turn" } }));
 }
 
-/// Plays the supervisor: each operator message becomes a turn the agent answers.
+/// Plays the supervisor: each operator message becomes a turn the agent answers, except one that
+/// says "wait", whose turn runs until a `session/cancel` (taken from the ledger, as `wicket run` does)
+/// ends it with `cancelled`.
 async fn supervisor(ledger: PathBuf, dir: PathBuf) {
     let mut id = 10;
+    let mut waiting: Option<i64> = None;
     loop {
-        let msgs = Ledger::open(&ledger).unwrap().take_operator_messages_with_ids(RUN).unwrap();
+        let mut l = Ledger::open(&ledger).unwrap();
+        if let Some(w) = waiting {
+            if !l.take_turn_cancels(RUN, 30).unwrap().is_empty() {
+                wicket_wrote(&dir, json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "s1" } }));
+                agent(&dir, json!({ "jsonrpc": "2.0", "id": w, "result": { "stopReason": "cancelled" } }));
+                waiting = None;
+            }
+        }
+        let msgs = if waiting.is_none() { l.take_operator_messages_with_ids(RUN).unwrap() } else { vec![] };
         for (op, text, by) in msgs {
             wicket_queued(&dir, &by, Some(op));
             wicket_wrote(
@@ -482,6 +582,11 @@ async fn supervisor(ledger: PathBuf, dir: PathBuf) {
                     json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": format!("you said: {text}") } }),
                 ),
             );
+            if text.contains("wait") {
+                waiting = Some(id);
+                id += 1;
+                break;
+            }
             agent(&dir, json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } }));
             id += 1;
         }
@@ -489,58 +594,56 @@ async fn supervisor(ledger: PathBuf, dir: PathBuf) {
     }
 }
 
-/// Runs each view's client stack (`<view>/check-dist/check.js`, built from the view's own session
-/// code) against the endpoint. Needs node and the views built: set WICKET_WEB_SESSIONS to
-/// experiments/web-sessions (see its README).
+/// Runs the session view's own client stack (web/session's transport, JSON-RPC bridge and update
+/// handler, built into `web/session/check-dist/check.js` by `npm run check:build`) against the
+/// endpoint, with a simulated supervisor: history, an escalation, a prompt, and a cancelled turn.
+/// Needs node and the check built; `ci/session-view.sh` runs it.
 #[tokio::test]
-#[ignore = "needs node and the experiments' views built"]
-async fn the_views_clients_drive_the_endpoint() {
-    let Ok(views) = std::env::var("WICKET_WEB_SESSIONS") else { panic!("set WICKET_WEB_SESSIONS") };
-    for view in ["assistant-ui", "acp-ui"] {
-        let mut t = setup(&format!("sess-view-{view}"));
-        t.running(RUN, "lead");
-        let dir = t.dir.join("runs").join(RUN);
-        std::fs::create_dir_all(dir.join("ctl")).unwrap();
-        history(&dir);
-        let op = wicket_core::Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "GET", "api.example.com", "/v1");
-        let (rid, _) = t.ledger().pending_for(&op, "needs approval", None).unwrap();
-        let tk = ticket(&mut t, RUN);
-        let cookie = t.sid.clone().unwrap();
-        let ledger = t.dir.join("ledger.db");
-        // The console's origin is the address the client reaches.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let mut state = t.state;
-        state.rp.origin = format!("http://localhost:{port}");
-        state.authority = format!("localhost:{port}");
-        tokio::spawn(net::run(listener, None, Arc::new(state)));
-        let sup = tokio::spawn(supervisor(ledger.clone(), dir.clone()));
-        let out = tokio::process::Command::new("node")
-            .arg(format!("{views}/{view}/check-dist/check.js"))
-            .env("WS_URL", format!("ws://localhost:{port}/api/runs/{RUN}/acp"))
-            .env("ORIGIN", format!("http://localhost:{port}"))
-            .env("COOKIE", format!("__Host-wicket_sid={cookie}"))
-            .env("TICKET", &tk)
-            .env("RUN", RUN)
-            .output()
-            .await
-            .unwrap();
-        sup.abort();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "{view}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-        let seen: Value = serde_json::from_str(stdout.lines().last().unwrap_or("")).unwrap_or_else(|_| panic!("{view}: {stdout}"));
-        eprintln!("{view}: {seen}");
-        assert_eq!(seen["stop"], "end_turn", "{view}");
-        assert_eq!(seen["escalation"], rid, "{view}");
-        // The client's "approve" was audited and decided nothing.
-        let l = Ledger::open(&ledger).unwrap();
-        assert_eq!(l.request(&rid).unwrap().status, "pending", "{view}");
-        let audit: Vec<(String, Value)> =
-            l.audit_tail(200).unwrap().into_iter().map(|r| (r.2, serde_json::from_str(&r.4).unwrap())).collect();
-        assert!(
-            audit.iter().any(|(k, b)| k == "session.escalation_answered" && b["said"] == "approve" && b["status"] == "pending"),
-            "{view}"
-        );
-        assert!(audit.iter().any(|(k, b)| k == "session.prompt" && b["by"] == "passkey:laptop"), "{view}");
-    }
+#[ignore = "needs node and web/session's check built (ci/session-view.sh)"]
+async fn the_views_client_drives_the_endpoint() {
+    let check = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/session/check-dist/check.js");
+    assert!(check.is_file(), "build it first: (cd web/session && npm ci && npm run check:build)");
+    let mut t = setup("sess-view");
+    t.running(RUN, "lead");
+    let dir = t.dir.join("runs").join(RUN);
+    std::fs::create_dir_all(dir.join("ctl")).unwrap();
+    history(&dir);
+    let op = wicket_core::Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "GET", "api.example.com", "/v1");
+    let (rid, _) = t.ledger().pending_for(&op, "needs approval", None).unwrap();
+    let tk = ticket(&mut t, RUN);
+    let cookie = t.sid.clone().unwrap();
+    let ledger = t.dir.join("ledger.db");
+    // The console's origin is the address the client reaches.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut state = t.state;
+    state.rp.origin = format!("http://localhost:{port}");
+    state.authority = format!("localhost:{port}");
+    tokio::spawn(net::run(listener, None, Arc::new(state)));
+    let sup = tokio::spawn(supervisor(ledger.clone(), dir.clone()));
+    let out = tokio::process::Command::new("node")
+        .arg(&check)
+        .env("WS_URL", format!("ws://localhost:{port}/api/runs/{RUN}/acp"))
+        .env("ORIGIN", format!("http://localhost:{port}"))
+        .env("COOKIE", format!("__Host-wicket_sid={cookie}"))
+        .env("TICKET", &tk)
+        .env("RUN", RUN)
+        .output()
+        .await
+        .unwrap();
+    sup.abort();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let seen: Value = serde_json::from_str(stdout.lines().last().unwrap_or("")).unwrap_or_else(|_| panic!("{stdout}"));
+    eprintln!("the view's client saw: {seen}");
+    assert_eq!(seen["stop"], "end_turn");
+    assert_eq!(seen["cancelled"], "cancelled", "the waiting turn was cancelled");
+    assert_eq!(seen["escalation"], rid);
+    // The client's "approve" was audited and decided nothing.
+    let l = Ledger::open(&ledger).unwrap();
+    assert_eq!(l.request(&rid).unwrap().status, "pending");
+    let audit: Vec<(String, Value)> = l.audit_tail(200).unwrap().into_iter().map(|r| (r.2, serde_json::from_str(&r.4).unwrap())).collect();
+    assert!(audit.iter().any(|(k, b)| k == "session.escalation_answered" && b["said"] == "approve" && b["status"] == "pending"));
+    assert!(audit.iter().any(|(k, b)| k == "session.prompt" && b["by"] == "passkey:laptop"));
+    assert!(audit.iter().any(|(k, b)| k == "session.cancel" && b["by"] == "passkey:laptop"));
 }
