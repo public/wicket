@@ -64,7 +64,7 @@ pub enum PlaceCmd {
         /// Node name (hostname, label and enrolled name).
         #[arg(long)]
         name: String,
-        /// Hosts the node's CA may issue for, as for `wicket node enrol --hosts`.
+        /// Host names the node's CA may issue for, as for `wicket node enrol --hosts`.
         #[arg(long, value_delimiter = ',', required_unless_present = "no_enrol")]
         hosts: Vec<String>,
         #[arg(long, default_value = "lhr")]

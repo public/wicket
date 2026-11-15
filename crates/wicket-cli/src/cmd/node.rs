@@ -98,7 +98,7 @@ pub enum NodeCmd {
         /// No --host-key: pin whatever key the node presents now, and print its fingerprint.
         #[arg(long)]
         trust_first_use: bool,
-        /// Hosts the node's CA may mint certificates for: `api.example.com`, `*.example.org` (comma-separated).
+        /// Host names the node's CA may mint certificates for: `api.example.com`, `*.example.org` (comma-separated).
         #[arg(long, value_delimiter = ',', required = true)]
         hosts: Vec<String>,
         /// Node CA lifetime.
@@ -148,7 +148,7 @@ pub enum NodeCmd {
     /// expired while it was unreachable gets back in.
     RenewCa {
         name: String,
-        /// Replace the hosts it is constrained to (default: keep them).
+        /// Replace the host names it is constrained to (default: keep them).
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
         #[arg(long, default_value = "24h")]
