@@ -410,6 +410,16 @@ where
             })
             .collect();
         let by_key: HashMap<String, LeaseRow> = leases.into_iter().map(|l| (lease_key(&l.id), l)).collect();
+        // Every lease's idempotency tag, ended ones too: a node with none of them is one nothing records.
+        let recorded: HashSet<String> = self.ledger.leases(&[])?.iter().map(|l| owner.idem_tag(&lease_key(&l.id))).collect();
+        let now = self.now;
+        let young = |id: &NodeId| {
+            observed
+                .iter()
+                .find(|n| &n.id == id)
+                .filter(|n| Owner::idem_tag_of(n).is_none_or(|t| !recorded.contains(t)))
+                .and_then(|n| plan::too_new_to_judge(n, now))
+        };
         // Destroys first, so the envelope sees room before anything is created.
         let mut actions = plan::reconcile(&owner, &desired, &observed, self.now, warm, &PoolRules::default());
         actions.sort_by_key(|a| !matches!(a, plan::Action::Destroy { .. }));
@@ -419,14 +429,16 @@ where
                 plan::Action::Pool { node, until } => {
                     self.note("kept_warm", &node.0, &format!("no lease; paid until {}, destroyed then", capacity::fmt_time(until)))
                 }
-                plan::Action::Young { node, until } => self.note(
-                    "young",
-                    &node.0,
-                    &format!(
-                        "no lease asks for it, but it was just created: left for its creator to record until {}",
-                        capacity::fmt_time(until)
-                    ),
-                ),
+                plan::Action::Destroy { node, reason: plan::DestroyReason::NoLease } if young(&node).is_some() => {
+                    // Nothing records it, and it is new: its creator (`wicket place create`) may not
+                    // have recorded it yet (#324).
+                    let until = young(&node).unwrap_or(self.now);
+                    self.note(
+                        "young",
+                        &node.0,
+                        &format!("nothing records it, and it was just created: left for its creator until {}", capacity::fmt_time(until)),
+                    )
+                }
                 plan::Action::Destroy { node, reason } => self.destroy(&node, &format!("{reason:?}")).await?,
                 plan::Action::Keep { node, idempotency_key } => {
                     let Some(lease) = by_key.get(&idempotency_key).cloned() else { continue };
@@ -1711,6 +1723,75 @@ mod tests {
         let d = full_pass(&w, &mut l, end + 60, false).await;
         assert!(!d.iter().any(|x| x.target == "placed-idle"), "{d:?}");
         assert_eq!(audited(&l, "reconcile.placed_released"), 1);
+    }
+
+    /// #324: `wicket place create` records its node once the provider answers. A pass that lists the
+    /// instance before that leaves it alone while it is new, rather than destroying a node its human
+    /// was just given; once the grace is over, a node still unrecorded is an orphan and goes.
+    #[tokio::test]
+    async fn a_node_just_created_and_not_yet_recorded_is_left_for_its_creator() {
+        let (base, st) = vultr_mock::serve().await;
+        let o = Owner::new("example");
+        let mut l = Ledger::open_in_memory().unwrap();
+        // Created just before NOW, not recorded yet.
+        let new = |id: &str, key: &str| {
+            let mut i = vultr_mock::instance(id, &[o.tag(), o.idem_tag(key)]);
+            i["date_created"] = serde_json::json!("2023-11-14T22:13:00+00:00"); // NOW - 20
+            i
+        };
+        st.lock().unwrap().instances.push(new("just-made", "place-create:p0"));
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, NOW + 30, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        assert!(d.iter().any(|x| x.kind == "young" && x.target == "just-made"), "{d:?}");
+        // Recorded meanwhile: it is the placed node's from then on, kept to its lease.
+        let end = NOW + 3000;
+        l.record_placed_node(&wicket_store::PlacedNodeRow {
+            id: "just-made".into(),
+            backend: "vultr".into(),
+            name: "p0".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: NOW,
+            lease_until: end,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+        })
+        .unwrap();
+        full_pass(&w, &mut l, NOW + 700, false).await;
+        assert!(deletes(&st).is_empty(), "recorded: kept to its lease");
+        // One never recorded is an orphan once the grace is over.
+        st.lock().unwrap().instances.push(new("crashed", "place-create:p1"));
+        full_pass(&w, &mut l, NOW + 60, false).await;
+        assert!(deletes(&st).is_empty());
+        full_pass(&w, &mut l, NOW - 20 + wicket_placement::reconcile::UNRECORDED_GRACE_SECS, false).await;
+        assert_eq!(deletes(&st), vec!["crashed"]);
+    }
+
+    /// #300, #324: a run whose files a fetch didn't bring back holds its placed node past its lease,
+    /// as a running run does: releasing it would destroy them. A human's `place release` decides.
+    #[tokio::test]
+    async fn a_placed_node_keeping_a_runs_uncollected_files_is_not_released() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-files", "files-node", end);
+        started(&l, "run_done", "alive:1");
+        l.set_run_node("run_done", "files-node").unwrap();
+        l.run_ended(&RunId("run_done".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_done", Some("files-node")).unwrap();
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        let x = d.iter().find(|x| x.kind == "placed_held").expect("flagged");
+        assert!(x.detail.contains("run_done") && x.detail.contains("didn't bring back"), "{}", x.detail);
+        assert_eq!(l.placed_node("placed-files").unwrap().unwrap().held_by.as_deref(), Some("run_done"));
+        // Collected (or given up by a human): released at the next pass.
+        l.set_run_uncollected("run_done", None).unwrap();
+        full_pass(&w, &mut l, end + 60, false).await;
+        assert_eq!(deletes(&st), vec!["placed-files"]);
     }
 
     #[tokio::test]

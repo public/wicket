@@ -1079,8 +1079,13 @@ async fn reconcile_pass(env: &Rc<Env>) {
     let placed: BTreeSet<String> = ledger.placed_nodes(&[]).expect("placed nodes").into_iter().map(|p| p.id).collect();
     let observed: Vec<NodeHandle> = observed.into_iter().filter(|n| !placed.contains(&n.id.0)).collect();
     for a in plan::reconcile(&owner, &[], &observed, now, false, &PoolRules::default()) {
-        if let plan::Action::Young { node, until } = &a {
-            env.note(format!("reconcile.young {node} until {until}"));
+        // `reconcile_machines`: nothing records it, and it is new, so its creator may not have
+        // recorded it yet (#324). (No capacity leases here: no lease records any node.)
+        if let plan::Action::Destroy { node, .. } = &a {
+            if let Some(until) = observed.iter().find(|n| n.id == *node).and_then(|n| plan::too_new_to_judge(n, now)) {
+                env.note(format!("reconcile.young {node} until {until}"));
+                continue;
+            }
         }
         if let plan::Action::Destroy { node, reason } = a {
             match placer.release(&node, ReleaseMode::Now).await {
