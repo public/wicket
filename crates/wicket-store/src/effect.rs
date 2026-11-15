@@ -61,6 +61,55 @@ pub struct EgressSeen {
     pub outcome: String,
 }
 
+/// The terms a decision approves a request with, as [`descriptor`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTerms {
+    /// None: unlimited uses until it expires.
+    pub uses: Option<u32>,
+    pub ttl_secs: u64,
+    /// The prefix the decider grants instead of the exact path, if any.
+    pub prefix: Option<String>,
+    pub zone_wide: bool,
+}
+
+/// The effect descriptor of `req` (#369): as asked (`t` None), or as approving it with terms `t`
+/// would grant it: the path or prefix, uses and lifetime [`Ledger::approve`] then records. The CLI,
+/// the console and an agent's `decide` show it, and the decision is made only on it.
+pub fn descriptor(req: &crate::Request, t: Option<&DecisionTerms>) -> wicket_core::effect::Effect {
+    use wicket_core::effect;
+    let (path, prefix, terms) = match t {
+        None => (req.path.clone(), req.scope_prefix, None),
+        Some(t) => {
+            let (path, prefix) = crate::granted_scope(req, t.prefix.as_deref());
+            let (uses, ttl_secs) = wicket_core::git::grant_terms(&req.method, &path, t.uses, t.ttl_secs);
+            let scope = if t.zone_wide { "zone" } else { "run" };
+            (path, prefix, Some(effect::Terms { uses, ttl_secs, scope: scope.into() }))
+        }
+    };
+    effect::Effect {
+        v: 1,
+        kind: effect::kind_of(&req.method),
+        tenant: req.tenant.clone(),
+        zone: req.zone.clone(),
+        run: req.run.clone(),
+        requested_by: req.attribution.iter().flat_map(requesters).collect(),
+        method: req.method.clone(),
+        host: req.host.clone(),
+        path,
+        prefix,
+        args_sha256: req.args_sha256.clone(),
+        terms,
+    }
+}
+
+/// The agents an attribution object names (its `requesters[].agent`).
+pub fn requesters(v: &serde_json::Value) -> Vec<String> {
+    v.get("requesters")
+        .and_then(|r| r.as_array())
+        .map(|rs| rs.iter().filter_map(|r| r.get("agent").and_then(|a| a.as_str()).map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 impl Ledger {
     /// Records a pending request for `op` asked with arguments hashed `args` (#369), or returns
     /// the one already pending; or, while a related request from the same run is pending, files

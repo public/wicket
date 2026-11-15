@@ -209,6 +209,18 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
     if let Err(why) = bounds(by, v) {
         return Err(refused(l, by, id, v, why));
     }
+    // #369: the decision is made on the effect the decider was shown, or not at all.
+    let shown = extra.as_object_mut().and_then(|o| o.remove(crate::effect::SHOWN_EFFECT));
+    if let (Verdict::Approve(t), Some(shown)) = (v, shown) {
+        let now = crate::effect::descriptor(&l.request(id)?, Some(t)).sha256();
+        if shown.as_str() != Some(now.as_str()) {
+            let why = anyhow::anyhow!(
+                "request {id} is not the effect that was shown (shown {}, now {now}): it changed since; look at it again and decide that",
+                shown.as_str().unwrap_or("?")
+            );
+            return Err(refused(l, by, id, v, why));
+        }
+    }
     if let Granter::Human(o) = by {
         if let Err(why) = asked(l, id, v).and_then(|a| o.may_decide(&a).map_err(anyhow::Error::msg)) {
             return Err(refused(l, by, id, v, why));
@@ -458,8 +470,15 @@ fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json:
     check_terms(&req, t)?;
     let lease = capacity::lease_of_request(l, &req)?;
     let label = by.label();
+    // The effect this grant is for (#369): on the grant, and on the decision's record.
+    let effect = crate::effect::descriptor(&req, Some(t));
+    let effect_sha256 = effect.sha256();
     let a = Approval { uses: t.uses, ttl: t.ttl, path_prefix: t.prefix.clone(), decided_by: label.clone() };
     let gid = if t.zone_wide { l.approve_zone_wide(id, &a)? } else { l.approve(id, &a)? };
+    if let Err(e) = l.bind_grant_effect(&gid, &effect_sha256) {
+        let _ = l.revoke_grant(&gid);
+        return Err(anyhow::Error::from(e).context("the approval's effect could not be bound to its grant, so the grant was revoked"));
+    }
     // What the grant is made with: a push gets its window, whatever was picked (#26).
     let (uses, ttl_secs) = match t.prefix.is_some() || req.scope_prefix {
         true => (t.uses, t.ttl.as_secs()),
@@ -472,6 +491,7 @@ fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json:
         "agent_identity": crate::verified_identity(l, &req.run, None),
         "uses": uses, "ttl_secs": ttl_secs, "prefix": t.prefix, "scope_prefix": req.scope_prefix,
         "scope": if t.zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone, "lease": lease,
+        "effect": effect, "effect_sha256": effect_sha256,
     });
     merge(&mut record, extra);
     if let Err(e) = l.audit(&TenantId::single(), None, "decision", &record) {
