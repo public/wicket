@@ -30,6 +30,9 @@ wicket@wicket` do it at once. Claude Code then uses a skill when a task matches 
 and you can call one yourself: `/wicket:wicket-operator`, say. `/plugin marketplace update wicket`
 takes the newest skills from the repository.
 
+On Claude Code 2.1.275 or later, `/plugin install wicket --marketplace public/wicket` does both in
+one step.
+
 To try a change to the skills before it is merged, add your checkout instead:
 `/plugin marketplace add ./path/to/wicket`.
 
