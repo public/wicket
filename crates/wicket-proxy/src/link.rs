@@ -849,6 +849,13 @@ mod tests {
             let a = wicket_store::Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() };
             l.approve(&rid, &a).unwrap();
         }
+        // #369: approved under the name it was asked under; carol renaming it after the approval
+        // is refused and audited, and doesn't use the grant up.
+        assert!(!expose(&carol, 6379, Some("github")).1);
+        let (text, err) = connect(&alice, "run_carol", Some(6379)).await;
+        assert!(err && text.contains("name changed after the approval"), "{text}");
+        assert!(w.ledger.lock().unwrap().audit_tail(20).unwrap().iter().any(|a| a.2 == "effect.refused"));
+        assert!(!expose(&carol, 6379, None).1);
         let (text, err) = connect(&alice, "run_carol", Some(6379)).await;
         assert!(!err && text.contains("carol.wicket.internal:6379") && text.contains("approved"), "{text}");
         // Another tenant's or nobody's box: no such box.

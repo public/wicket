@@ -1263,6 +1263,50 @@ mod tests {
         assert!(r.reason.chars().all(|c| !wicket_core::text::is_unsafe(c)), "{:?}", r.reason);
     }
 
+    /// #369: a spawn beyond the parent is approved for exactly its arguments. While it is pending,
+    /// the same child with other arguments waits on it; once granted, other arguments are refused
+    /// and audited; the approved ones start it once, and a replay doesn't start it again.
+    #[test]
+    fn a_spawn_approval_is_for_exactly_its_arguments_once() {
+        let zone = "  llm: { secret: model-key }\n  reach:\n    - { host: api.example.com, methods: [GET] }\n  limits: { memory: 1g, cpus: 1, timeout: 1h }\n";
+        let p = parent(2, zone);
+        let wide = |task: &str| SpawnRequest {
+            kind: "agent".into(),
+            task: Some(task.into()),
+            command: vec![],
+            zone: Some(json!({ "llm": { "max_requests": 5 }, "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org" }] })),
+            escalate: true,
+            ..program("worker")
+        };
+        let asked = spawn(&p.ctx, wide("build it")).unwrap();
+        assert!(asked.starts_with("needs approval: request r-"), "{asked}");
+        let pending = |p: &Parent| p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap();
+        let rid = pending(&p)[0].id.clone();
+        // The effect is the child, by zone and name; its arguments are hashed beside it.
+        let r = &pending(&p)[0];
+        assert!(r.path.starts_with("/zones/") && r.path.ends_with("/worker") && r.args_sha256.as_ref().is_some_and(|a| a.len() == 64), "{r:?}");
+        // A sibling call for the same child with another task, while it is pending: it waits on it.
+        let held = spawn(&p.ctx, wide("delete everything")).unwrap();
+        assert!(held.starts_with(&format!("waiting: request {rid}")), "{held}");
+        assert_eq!(pending(&p).len(), 1, "nothing else was asked");
+        // Approved for "build it".
+        p.ctx
+            .ledger
+            .lock()
+            .unwrap()
+            .approve(&rid, &wicket_store::Approval { uses: Some(1), ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "op".into() })
+            .unwrap();
+        let e = spawn(&p.ctx, wide("delete everything")).unwrap_err();
+        assert!(e.contains("changed after the approval"), "{e}");
+        let l = p.ctx.ledger.lock().unwrap();
+        assert!(l.audit_tail(20).unwrap().iter().any(|r| r.2 == "effect.refused"), "the refusal is on the record");
+        drop(l);
+        let started = spawn(&p.ctx, wide("build it")).unwrap();
+        assert!(!started.starts_with("needs approval") && !started.starts_with("waiting"), "{started}");
+        let again = spawn(&p.ctx, wide("build it")).unwrap_err();
+        assert!(again.contains("already started under its approval"), "{again}");
+    }
+
     fn at(node: &str, lease: Option<&str>) -> Option<Placed> {
         Some(Placed { node: node.into(), lease: lease.map(String::from) })
     }
