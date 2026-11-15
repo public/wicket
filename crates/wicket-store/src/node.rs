@@ -21,8 +21,8 @@ use crate::{chain_hash_v2, ChainFields, Ledger, Result, StoreError, CHAIN_ZERO a
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-/// A grant, as the control host hands it to a node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A grant, as the control host hands it to a node (and as `wicket grant list` shows it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GrantRow {
     pub id: String,
     pub tenant: String,
@@ -43,6 +43,8 @@ pub struct GrantRow {
     pub max_risk: Option<i64>,
     /// The run it is bound to; None: any run in its zone (#127).
     pub run: Option<String>,
+    /// A quota grant's amount (#256, [`crate::Quota`]); None for every other grant.
+    pub amount: Option<i64>,
 }
 
 /// One audit record with its chain fields, as a node ships it.
@@ -67,10 +69,10 @@ pub struct NodeAuditSummary {
     pub restarts: i64,
 }
 
-const GRANT_COLS: &str =
-    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node, g.max_risk, g.run";
+pub(crate) const GRANT_COLS: &str =
+    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node, g.max_risk, g.run, g.amount";
 
-fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
+pub(crate) fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         id: r.get(0)?,
         tenant: r.get(1)?,
@@ -86,6 +88,7 @@ fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
         node: r.get(11)?,
         max_risk: r.get(12)?,
         run: r.get(13)?,
+        amount: r.get(14)?,
     })
 }
 

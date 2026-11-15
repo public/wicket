@@ -64,9 +64,9 @@ pub struct Llm {
     first_request_ms: std::sync::OnceLock<i64>,
 }
 
-/// A budget slice leased to a node (#152): this activation may count up to these totals of its own
+/// A budget slice sent to a node (#152): this activation may count up to these totals of its own
 /// (requests; output tokens, in flight included; input tokens, cached ones included) before the
-/// control host leases it more. Offline, the node spends its current slice and nothing more.
+/// control host sends it more. Offline, the node spends its current slice and nothing more.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Slice {
     pub requests: u64,

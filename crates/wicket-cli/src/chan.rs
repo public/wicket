@@ -41,6 +41,7 @@
 //!   handshake.
 
 use serde::{Deserialize, Serialize};
+use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks.
 ///
@@ -48,7 +49,7 @@ use serde::{Deserialize, Serialize};
 /// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
 ///   (`BoxAuthority::issuer_cert`, #154).
 /// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
-///   [`Msg::Lease`], [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
+///   `Msg::Lease` (now [`Msg::BudgetSlice`]), [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
 ///   [`Msg::Spent`]; the control host's per-run lease message is gone (a box's authority decides
 ///   when it stops).
 /// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51).
@@ -64,7 +65,10 @@ use serde::{Deserialize, Serialize};
 ///   connections talking [`IMAGE_DELIVERY`] or later; an older node must have the image already.
 /// - 8: images pulled by the node from a registry, host-side (#191): [`Msg::PullImage`] and
 ///   [`Msg::ImagePulled`], sent only on connections talking [`IMAGE_PULL`] or later.
-pub const PROTOCOL: u32 = 8;
+/// - 9: a run's budget slice is [`Msg::BudgetSlice`] (it was `Lease`, #256: "lease" names one
+///   thing, a grant of capacity). Unreleased, so no alias: a node talking 8 is sent no slice, and a
+///   box with a model budget doesn't start there ([`BUDGET_SLICE`]).
+pub const PROTOCOL: u32 = 9;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -73,6 +77,8 @@ pub const IMAGE_PINS: u32 = 6;
 pub const IMAGE_DELIVERY: u32 = 7;
 /// The first protocol version whose nodes pull an image from a registry themselves (#191).
 pub const IMAGE_PULL: u32 = 8;
+/// The first protocol version whose nodes take a budget slice as [`Msg::BudgetSlice`] (#256).
+pub const BUDGET_SLICE: u32 = 9;
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -317,10 +323,11 @@ pub enum Msg {
     StdinClose {
         run: String,
     },
-    /// A run's model budget slice (#152).
-    Lease {
+    /// A run's model budget slice (#152): what its node may spend of the run's model budget, offline
+    /// too. Not a lease: that is a grant of capacity (#256).
+    BudgetSlice {
         run: String,
-        lease: Box<crate::nodesecrets::Lease>,
+        slice: Slice,
     },
     /// The answer to a [`Msg::SecretFetch`]: the secret, released for that run, or why not.
     SecretFetched {
@@ -1012,6 +1019,21 @@ mod tests {
         assert!(negotiate(5, 3).unwrap_err().contains("at most 1 apart"));
         assert!(negotiate(3, 5).is_err());
         assert!(negotiate(PROTOCOL, 0).unwrap_err().contains("before protocol versions"));
+    }
+
+    /// #256: a budget slice is `budget_slice` on the wire, from protocol 9; the old name is gone
+    /// (unreleased, so no alias), and a node talking 8 is sent none.
+    #[test]
+    fn a_budget_slice_is_its_own_message_from_protocol_9() {
+        let slice = Slice { requests: 3, output_tokens: 100, input_tokens: Some(7) };
+        let v = serde_json::to_value(Msg::BudgetSlice { run: "r".into(), slice }).unwrap();
+        assert_eq!(v, serde_json::json!({"m":"budget_slice","run":"r","slice":{"requests":3,"output_tokens":100,"input_tokens":7}}));
+        let back: Msg = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, Msg::BudgetSlice { slice: s, .. } if s == slice));
+        let old = serde_json::json!({"m":"lease","run":"r","lease":{"slice":{"requests":3,"output_tokens":100}}});
+        assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
+        assert_eq!((PROTOCOL, BUDGET_SLICE), (9, 9));
+        assert!(negotiate(PROTOCOL, 8).unwrap() < BUDGET_SLICE, "a node at 8 talks 8: no slice goes to it");
     }
 
     #[test]

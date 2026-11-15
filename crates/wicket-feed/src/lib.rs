@@ -21,8 +21,8 @@
 //!
 //! | mode | when | allowed |
 //! |---|---|---|
-//! | [`Mode::Fresh`] | a statement names an epoch the node holds, and its effective `fresh_until` hasn't passed | everything the box's token and its live grants allow; leases, spawns, approvals |
-//! | [`Mode::Offline`] | verified state, but no live statement (the control host is unreachable) | everything the box's token and its live grants allow, each until its own expiry; no leases, spawns or approvals; asks are queued by the caller |
+//! | [`Mode::Fresh`] | a statement names an epoch the node holds, and its effective `fresh_until` hasn't passed | everything the box's token and its live grants allow; grant holds, spawns, approvals |
+//! | [`Mode::Offline`] | verified state, but no live statement (the control host is unreachable) | everything the box's token and its live grants allow, each until its own expiry; no grant holds, spawns or approvals; asks are queued by the caller |
 //! | [`Mode::Lagging`] | a live statement names an epoch the node doesn't hold yet | nothing, until the missing deltas arrive |
 //! | [`Mode::Closed`] | no state, or a feed key past its certificate | nothing |
 //!
