@@ -1,0 +1,5 @@
+POST /a HTTP/1.1
+host: fuzz.example
+x-http-method-override: DELETE
+content-length: 0
+

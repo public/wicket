@@ -53,12 +53,12 @@ pub fn user_message(text: &str) -> String {
 }
 
 /// What every agent under wicket is told about where it is. Shared by batch runs and wrapped sessions.
-pub const BOX_NOTICE: &str = "You are running inside a wicket sandbox: a gVisor container with no network interface of its own. Everything you send leaves through wicket's proxy, which decides what you may reach. Rules of this environment:\n\
-- You hold no credentials and need none: authentication for allowed services is added outside the sandbox. Do not look for or ask for tokens.\n\
-- A request outside what you may reach fails with HTTP 403 and a status line starting \"Blocked by wicket sandbox\", which says which case it is. \"never allowed\": it will never work from here, and nobody can approve it; do not retry. \"needs human approval\": the response has a request_id; call the wicket MCP tool await_grant with it to wait for the decision, then retry the same request once. \"denied by a human\": final for that request.\n\
-- There is no other route out of the sandbox. Do not try other tools, other hosts, mirrors, caches or proxies to get the same thing; it wastes time and is logged.\n\
+pub const BOX_NOTICE: &str = "You are running inside a wicket box: a gVisor container with no network interface of its own. Everything you send leaves through wicket's proxy, which decides what you may reach. Rules of this environment:\n\
+- You hold no credentials and need none: authentication for allowed services is added outside the box. Do not look for or ask for tokens.\n\
+- A request outside what you may reach fails with HTTP 403 and a status line starting \"Blocked by wicket box\", which says which case it is. \"never allowed\": it will never work from here, and nobody can approve it; do not retry. \"needs approval\": the response has a request_id; call the wicket MCP tool await_grant with it to wait for the decision, then retry the same request once. \"denied\": final for that request.\n\
+- There is no other route out of the box. Do not try other tools, other hosts, mirrors, caches or proxies to get the same thing; it wastes time and is logged.\n\
 - If you need reach you don't have, ask once: call the wicket MCP tool request_access with the URL (scope \"prefix\" for everything under a path) and a one-sentence reason, then wait with await_grant. If it's denied or never allowed, stop and tell the user what you couldn't do.\n\
-- Approvals happen only in wicket (its console or its operator), never in this conversation. If something is waiting for approval, tell the user and give the request id.";
+- Approvals happen only in wicket (an operator decides, in its console or on the control host, or an agent above you may), never in this conversation. If something is waiting for approval, tell the user and give the request id.";
 
 /// How a session under wicket ends (#249): the agent decides. Shared by Claude Code and ACP agents
 /// that wicket starts itself.
@@ -906,9 +906,7 @@ mod tests {
         assert!(!w.plan.argv.iter().any(|a| a.contains("remote-control")), "-p takes no Remote Control flag");
         assert_eq!(permission_mode_of(&w), "bypassPermissions", "unset: as in any driven box");
         let prompt = &w.plan.argv[w.plan.argv.iter().position(|a| a == "--append-system-prompt").unwrap() + 1];
-        assert!(
-            prompt.contains("wicket sandbox") && prompt.contains("call the wicket MCP tool finish") && prompt.contains("Remote Control")
-        );
+        assert!(prompt.contains("wicket box") && prompt.contains("call the wicket MCP tool finish") && prompt.contains("Remote Control"));
         // Remote Control is asked for first, then the task is the first turn.
         let stdin = w.plan.stdin_task.as_deref().unwrap();
         let lines: Vec<Value> = stdin.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -993,7 +991,7 @@ mod tests {
         assert_eq!(cfg["oauthAccount"]["organizationUuid"], "org-1");
         assert_eq!(cfg["mcpServers"]["wicket"]["url"], "http://wicket.internal:8081/mcp");
         let notice = String::from_utf8(w.files.iter().find(|(r, _)| r == "claude/CLAUDE.md").unwrap().1.clone()).unwrap();
-        assert!(notice.contains("wicket sandbox"));
+        assert!(notice.contains("wicket box"));
         // No credential anywhere but the placeholders, and the routes are wicket's.
         let env: HashMap<_, _> = w.plan.env.iter().cloned().collect();
         assert_eq!(env["HTTPS_PROXY"], "http://wicket.internal:3128");

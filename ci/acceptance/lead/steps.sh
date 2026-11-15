@@ -46,7 +46,7 @@ say "narrow spawned"
 # A wider zone (a host the lead can't reach) waits for a human, then starts. It fetches the narrow
 # box's page once a link gives it one, and stays up.
 fetch='for i in $(seq 180); do b=$(curl -s -m 5 --noproxy "*" http://narrow.wicket.internal:8000/ 2>/dev/null); if [ -n "$b" ]; then echo "acc-fetched:$b"; break; fi; sleep 1; done; exec sleep 3000'
-wide=$(jq -nc --argjson l "$lim" --arg c "$fetch" '{name:"wide",kind:"program",ask_human:true,
+wide=$(jq -nc --argjson l "$lim" --arg c "$fetch" '{name:"wide",kind:"program",escalate:true,
   zone:{reach:[{host:"example.com",methods:["GET"],paths:["/"]},{host:"www.iana.org",methods:["GET"],paths:["/"]}],limits:$l},
   command:["sh","-c",$c]}')
 first=$(gw spawn "$wide")

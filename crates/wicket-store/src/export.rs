@@ -176,7 +176,7 @@ impl Ledger {
     /// After a restore (#154): moves every agent's generation past any a lost control host may have
     /// handed out after the restore point, so a box still running at one of those is fenced off.
     pub fn bump_agent_generations(&self, by: i64) -> Result<usize> {
-        Ok(self.conn.execute("UPDATE agents SET generation = generation + ?1, lease_until = 0", params![by])?)
+        Ok(self.conn.execute("UPDATE agents SET generation = generation + ?1, claim_until = 0, lease_until = 0", params![by])?)
     }
 }
 
