@@ -137,11 +137,11 @@ mod tests {
 
     #[test]
     fn causes_read_as_people_would_say_them() {
-        let oom = ExitInfo { code: 137, oom_killed: true, error: None };
+        let oom = ExitInfo { code: 137, oom_killed: true, error: None, ..Default::default() };
         let mem = Mem { current: 0, max: Some(3 * GIB), peak: 3 * GIB - (1 << 20), oom_kills: 1 };
         assert_eq!(describe(137, None, Some(&oom), Some(&mem), None).unwrap(), "killed: out of memory (limit 3 GiB, peak 3 GiB)");
         // The cgroup's count alone is enough, and the limit can come from the zone.
-        let quiet = ExitInfo { code: 137, oom_killed: false, error: None };
+        let quiet = ExitInfo { code: 137, oom_killed: false, error: None, ..Default::default() };
         let m2 = Mem { oom_kills: 2, peak: 600 << 20, ..Mem::default() };
         assert_eq!(
             describe(137, None, Some(&quiet), Some(&m2), Some(512 << 20)).unwrap(),
@@ -156,7 +156,7 @@ mod tests {
         // A signal from elsewhere, and a crash.
         assert!(describe(137, None, Some(&quiet), None, None).unwrap().starts_with("killed by signal 9 (SIGKILL), not by wicket"));
         assert_eq!(describe(139, None, None, None, None).unwrap(), "crashed: signal 11 (SIGSEGV)");
-        let err = ExitInfo { code: 127, oom_killed: false, error: Some("OCI runtime create failed".into()) };
+        let err = ExitInfo { code: 127, oom_killed: false, error: Some("OCI runtime create failed".into()), ..Default::default() };
         assert!(describe(127, None, Some(&err), None, None).unwrap().contains("OCI runtime create failed"));
         // A program's own exit codes need no cause.
         assert_eq!(describe(0, None, Some(&quiet), None, None), None);

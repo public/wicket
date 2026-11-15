@@ -627,6 +627,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         let n = node.clone();
         crate::audit_export::flush_on_signal(node.audit.clone(), move || n.ship_audit());
     }
+    // A box start's Docker calls go to its Engine API where this process can reach it (#287).
+    eprintln!("[node] docker: {}", node.docker.backend().await);
     // Image identities are reused between box starts while nothing changes the images (#287).
     tokio::spawn(node.docker.clone().watch_images(node.idents.clone()));
     adopt_previous(&node).await;
@@ -1415,38 +1417,25 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
     );
     // A box read before (adopted): Docker's logs since a little before the last save, lined up on
     // the last bytes read (rotation may have dropped their start).
-    let since = (rec.out_saved_ms > 0).then(|| {
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis((rec.out_saved_ms - 10_000).max(0) as u64);
-        humantime::format_rfc3339_millis(t).to_string()
-    });
-    let logs = node.docker.logs(&name, since.as_deref()).spawn();
-    let readers: Vec<_> = match logs {
-        Err(e) => {
-            eprintln!("[node] {}: reading the box's output failed: {e}", bs.run);
-            vec![]
+    let since =
+        (rec.out_saved_ms > 0).then(|| std::time::UNIX_EPOCH + std::time::Duration::from_millis((rec.out_saved_ms - 10_000).max(0) as u64));
+    let logs = node.docker.logs(&name, since);
+    let mut readers: Vec<_> = [logs.stdout, logs.stderr]
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            use base64::Engine;
+            let tail = base64::engine::general_purpose::STANDARD.decode(&rec.out_tail[i]).unwrap_or_default();
+            tokio::spawn(read_output(node.clone(), bs.run.clone(), name.clone(), i, r, tail, bs.output_cap, bs.output_stop))
+        })
+        .collect();
+    // The log reader lives as long as its readers.
+    let (run, done) = (bs.run.clone(), logs.done);
+    readers.push(tokio::spawn(async move {
+        if let Ok(Err(e)) = done.await {
+            eprintln!("[node] {run}: reading the box's output failed: {e:#}");
         }
-        Ok(mut child) => {
-            let rs: Vec<_> = [
-                child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-                child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-            ]
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.map(|r| (i, r)))
-            .map(|(i, r)| {
-                use base64::Engine;
-                let tail = base64::engine::general_purpose::STANDARD.decode(&rec.out_tail[i]).unwrap_or_default();
-                tokio::spawn(read_output(node.clone(), bs.run.clone(), name.clone(), i, r, tail, bs.output_cap, bs.output_stop))
-            })
-            .collect();
-            // The log reader lives as long as its readers.
-            let mut rs = rs;
-            rs.push(tokio::spawn(async move {
-                let _ = child.wait().await;
-            }));
-            rs
-        }
-    };
+    }));
     // The node enforces the run's timeout itself, connected or not, from when the box started.
     let (n, run, box_name) = (node.clone(), bs.run.clone(), name.clone());
     let left = (rec.started_ms + (bs.timeout_secs.max(1) as i64) * 1000 - wicket_feed::now_ms()).max(1000);
@@ -1463,10 +1452,12 @@ fn wire(node: &Arc<Node>, owner: Option<u64>, rec: BoxRecord, dir: PathBuf, task
                 n.docker.wait(&box_name).await.unwrap_or(-1)
             }
         };
+        let mut t = ExitTimings::new();
         for r in readers {
             let _ = r.await;
         }
-        finish(&n, &run, &box_name, code).await;
+        t.step("node.teardown.output");
+        finish(&n, &run, &box_name, code, t).await;
     });
 }
 
@@ -1628,8 +1619,112 @@ fn save_output(b: &mut BoxState) {
     let _ = b.record.save(&b.dir);
 }
 
+/// Where a box's end goes on its node (#287), from when Docker said it exited, and its own start,
+/// sent with its exit (`Msg::Exited`): spans placed by the wall clock (`timing::wall_span`).
+struct ExitTimings {
+    spans: Vec<wicket_core::timing::Span>,
+    began: std::time::SystemTime,
+    lap: std::time::SystemTime,
+}
+
+impl ExitTimings {
+    fn new() -> ExitTimings {
+        let now = std::time::SystemTime::now();
+        ExitTimings { spans: vec![], began: now, lap: now }
+    }
+
+    /// A step: from the last one's end until now.
+    fn step(&mut self, name: &str) {
+        let now = std::time::SystemTime::now();
+        self.spans.push(wicket_core::timing::wall_span(name, self.lap, now));
+        self.lap = now;
+    }
+
+    /// What the box and Docker said: its runtime's start (`box.started`) and end (`box.finished`,
+    /// then `node.teardown.wait` until Docker's wait returned), and its own start in between
+    /// ([`entry_spans`]).
+    fn the_box(&mut self, info: Option<&wicket_sandbox::ExitInfo>, entry: Option<&str>) {
+        use wicket_core::timing::wall_span;
+        let at = |t: &Option<String>| t.as_deref().and_then(|t| humantime::parse_rfc3339_weak(t).ok());
+        let started = info.and_then(|i| at(&i.started_at));
+        if let Some(s) = started {
+            self.spans.push(wall_span("box.started", s, s));
+        }
+        if let Some(e) = entry {
+            self.spans.extend(entry_spans(started, e));
+        }
+        if let Some(f) = info.and_then(|i| at(&i.finished_at)) {
+            self.spans.push(wall_span("box.finished", f, f));
+            self.spans.push(wall_span("node.teardown.wait", f, self.began));
+        }
+    }
+
+    /// All of it, with the whole of the node's part (`node.teardown`).
+    fn done(mut self) -> Vec<wicket_core::timing::Span> {
+        self.spans.push(wicket_core::timing::wall_span("node.teardown", self.began, std::time::SystemTime::now()));
+        self.spans
+    }
+}
+
+/// Where wicket-entry writes when it reached each step of the box's start (in the box's socket
+/// directory: `/wicket/sock/entry.times`).
+const ENTRY_TIMES: &str = "entry.times";
+
+/// What wicket-entry wrote (the box's to write: read without following a link, nor blocking on a
+/// FIFO, and bounded).
+fn read_entry_times(dir: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("sock").join(ENTRY_TIMES))
+        .ok()?;
+    if !f.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut s = String::new();
+    f.take(4096).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+/// The box's own start (#287), from wicket-entry's `<step> <Unix seconds>` lines (start, addrs,
+/// setup, fwd, exec): `box.entry.init` from when the runtime started its first process (`started`,
+/// docker-init) to the script's start, then a span per step, named after it, from the step before;
+/// and `box.exec`, the moment the program was started. A line that doesn't read
+/// as one is skipped.
+fn entry_spans(started: Option<std::time::SystemTime>, text: &str) -> Vec<wicket_core::timing::Span> {
+    use wicket_core::timing::wall_span;
+    let steps = text.lines().take(16).filter_map(|l| {
+        let (name, at) = l.trim().split_once(' ')?;
+        let ok = !name.is_empty() && name.len() <= 16 && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+        // Bash's EPOCHREALTIME has the locale's decimal point.
+        let secs: f64 = at.trim().replace(',', ".").parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0)?;
+        ok.then(|| (name.to_string(), std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs)))
+    });
+    let mut out = vec![];
+    let mut last: Option<std::time::SystemTime> = None;
+    for (name, at) in steps {
+        match (last, name.as_str()) {
+            (None, "start") => {
+                if let Some(s) = started {
+                    out.push(wall_span("box.entry.init", s, at));
+                }
+            }
+            (None, _) => {}
+            (Some(l), _) => out.push(wall_span(format!("box.entry.{name}"), l, at)),
+        }
+        if name == "exec" {
+            out.push(wall_span("box.exec", at, at));
+        }
+        last = Some(at);
+    }
+    out
+}
+
 /// A box exited: its exit and result are kept for the control host, and its container removed.
-async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
+/// `t` has timed its end so far (from when Docker said it exited).
+async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: ExitTimings) {
     let dir = n.boxes.lock().expect("boxes").get(run).map(|b| b.dir.clone());
     let result = dir.as_ref().and_then(|d| crate::hibernate::read_outbox(d, 64 * 1024)).and_then(|b| String::from_utf8(b).ok());
     let output = n.boxes.lock().expect("boxes").get_mut(run).map(|b| {
@@ -1654,6 +1749,8 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     // Why it ended (#185): wicket's own stop, the OOM killer, the runtime, or a signal; read before
     // the box is removed.
     let info = n.docker.exit_info(box_name).await.ok().flatten();
+    t.step("node.teardown.inspect");
+    t.the_box(info.as_ref(), dir.as_deref().and_then(read_entry_times).as_deref());
     let mem = n.mem.lock().expect("mem").remove(run).map(|(_, m, _)| m);
     let limit = n.boxes.lock().expect("boxes").get(run).map(|b| b.memory_mib << 20).filter(|l| *l > 0);
     let stopped = n.stopped.lock().expect("stopped").get(run).cloned();
@@ -1669,6 +1766,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
         n.causes.lock().expect("causes").insert(run.to_string(), c.clone());
     }
     let _ = n.docker.remove(box_name).await;
+    t.step("node.teardown.rm");
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
@@ -1685,8 +1783,9 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32) {
     if let Some(l) = llm {
         n.send_run(run, Frame::Msg(Msg::Spent { run: run.to_string(), spent: l.spent(), first_request_ms: l.first_request_ms() }));
     }
+    t.step("node.teardown.release");
     eprintln!("[node] {run}: box exited ({code})");
-    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause }));
+    n.send_run(run, Frame::Msg(Msg::Exited { run: run.to_string(), code, result, reason: cause, timings: t.done() }));
 }
 
 /// The box's enforcement points: egress decided here; the model proxy and the MCP gateway reached
@@ -1986,6 +2085,54 @@ pub async fn probe_tamper(dir: Option<PathBuf>) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_boxs_own_start_reads_as_a_span_per_step() {
+        let at = |s: f64| std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(s);
+        let text = "start 1700000000.100000\naddrs 1700000000.160000\nsetup 1700000000,170000\nBAD 1\nfwd x\nfwd 1700000000.200000\nexec 1700000000.215000\n";
+        let spans = entry_spans(Some(at(1_700_000_000.0)), text);
+        let got: Vec<(&str, i64)> = spans.iter().map(|s| (s.name.as_str(), s.ms.round() as i64)).collect();
+        assert_eq!(
+            got,
+            [
+                ("box.entry.init", 100),
+                ("box.entry.addrs", 60),
+                ("box.entry.setup", 10),
+                ("box.entry.fwd", 30),
+                ("box.entry.exec", 15),
+                ("box.exec", 0)
+            ]
+        );
+        assert!((spans[1].at_ms - 1_700_000_000_100.0).abs() < 0.01, "placed by Unix ms: {:?}", spans[1]);
+        // No runtime start known: the steps alone; nothing usable: nothing.
+        assert_eq!(entry_spans(None, text).len(), 5);
+        assert!(entry_spans(None, "garbage\n\n").is_empty());
+        // What bash itself writes reads.
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                r#"T="start $EPOCHREALTIME"; T="$T
+exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
+            ])
+            .output()
+            .unwrap();
+        let s = entry_spans(None, &String::from_utf8_lossy(&out.stdout));
+        assert_eq!(s.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["box.entry.exec", "box.exec"]);
+    }
+
+    #[test]
+    fn the_entry_times_are_read_only_from_a_plain_file() {
+        let dir = std::env::temp_dir().join(format!("wicket-entry-times-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sock")).unwrap();
+        std::fs::write(dir.join("secret"), "start 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("sock").join(ENTRY_TIMES)).unwrap();
+        assert_eq!(read_entry_times(&dir), None, "a link the box made isn't followed");
+        std::fs::remove_file(dir.join("sock").join(ENTRY_TIMES)).unwrap();
+        std::fs::write(dir.join("sock").join(ENTRY_TIMES), "start 1\n").unwrap();
+        assert_eq!(read_entry_times(&dir).as_deref(), Some("start 1\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_kill_names_pids_never_the_init() {

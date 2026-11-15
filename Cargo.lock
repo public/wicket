@@ -4385,6 +4385,10 @@ name = "wicket-sandbox"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "tokio",
  "tracing",

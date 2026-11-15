@@ -1099,7 +1099,10 @@ async fn on_frame(
                     });
                 }
             }
-            Msg::Exited { run, code, result, reason } if run == sh.run.0 => {
+            Msg::Exited { run, code, result, reason, timings } if run == sh.run.0 => {
+                // The box's own start and its end on the node (#287), where they happened.
+                sh.timings.nest_wall(&timings);
+                sh.timings.mark("box.exited");
                 // The node says the box has stopped: nothing fences a wake of its agent any more.
                 confirm_stopped(&sh.dir);
                 if let Some(why) = &reason {

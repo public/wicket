@@ -118,12 +118,27 @@ impl Timings {
         }
     }
 
+    /// Takes in spans placed by the wall clock ([`wall_span`]: their `at_ms` is Unix milliseconds),
+    /// as another host measured them (a node, a box: #287). They line up up to the clocks' skew.
+    pub fn nest_wall(&self, spans: &[Span]) {
+        for s in spans {
+            let from = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(s.at_ms.max(0.0) / 1000.0);
+            self.record_wall(s.name.clone(), from, from + std::time::Duration::from_secs_f64(s.ms.max(0.0) / 1000.0));
+        }
+    }
+
     /// Every span so far, in the order they started.
     pub fn spans(&self) -> Vec<Span> {
         let mut v = self.spans.lock().map(|v| v.clone()).unwrap_or_default();
         v.sort_by(|a, b| a.at_ms.total_cmp(&b.at_ms));
         v
     }
+}
+
+/// A span placed by the wall clock, for another host to take in ([`Timings::nest_wall`]): its
+/// `at_ms` is Unix milliseconds.
+pub fn wall_span(name: impl Into<String>, from: SystemTime, to: SystemTime) -> Span {
+    Span { name: name.into(), at_ms: wall_ms(SystemTime::UNIX_EPOCH, from), ms: wall_ms(from, to).max(0.0) }
 }
 
 /// Records its span when dropped ([`Timings::span`]).
@@ -191,6 +206,19 @@ mod tests {
         assert!(held.ms >= 2.0, "{held:?}");
         assert!(t.has("ended") && t.has("moment") && !t.has("other"));
         assert_eq!(s.iter().find(|s| s.name == "moment").unwrap().ms, 0.0);
+    }
+
+    #[test]
+    fn wall_spans_from_elsewhere_land_where_they_happened() {
+        let t = Timings::new();
+        let w = t.origin_wall + Duration::from_millis(40);
+        let theirs = [wall_span("box.entry.fwd", w, w + Duration::from_millis(25)), wall_span("box.exited", w, w)];
+        assert!(theirs[0].at_ms > 1.0e12, "Unix ms on the wire");
+        t.nest_wall(&theirs);
+        let s = t.spans();
+        let fwd = s.iter().find(|s| s.name == "box.entry.fwd").unwrap();
+        assert!((fwd.at_ms - 40.0).abs() < 0.01 && (fwd.ms - 25.0).abs() < 0.01, "{fwd:?}");
+        assert_eq!(s.iter().find(|s| s.name == "box.exited").unwrap().ms, 0.0);
     }
 
     #[test]
