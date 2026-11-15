@@ -630,7 +630,9 @@ fn deliver(
 fn sent_text(s: &crate::Sent) -> String {
     match (&s.run, s.woke) {
         (Some(r), _) => format!("sent {} to {} (its run {r}), signed with your wicket identity", s.id, s.to),
-        (None, true) => format!("sent {} to {}, signed with your wicket identity: it is hibernated and is being woken to read it", s.id, s.to),
+        (None, true) => {
+            format!("sent {} to {}, signed with your wicket identity: it is hibernated and is being woken to read it", s.id, s.to)
+        }
         (None, false) => format!(
             "sent {} to {}, signed with your wicket identity: it isn't running, so wicket holds the message for its next run",
             s.id, s.to
@@ -1146,7 +1148,10 @@ mod tests {
         assert!(e.contains("is not a principal"), "{e}");
         let e = lead.send_message(&to("spiffe://test.local/t/t0/op/unix/alice"), "message", serde_json::json!("x")).unwrap_err();
         assert!(e.contains("is an operator"), "{e}");
-        assert!(lead.send_message(&to("spiffe://test.local/t/t0/z/research/a/nobody"), "message", json!(1)).unwrap_err().starts_with("no agent"));
+        assert!(lead
+            .send_message(&to("spiffe://test.local/t/t0/z/research/a/nobody"), "message", json!(1))
+            .unwrap_err()
+            .starts_with("no agent"));
 
         // Another tenant's agent can't reach this tenant at all, whatever its accept_from says.
         assert!(other.send_message(&to(&id_of(&lead)), "message", serde_json::json!("x")).unwrap_err().starts_with("no agent"));

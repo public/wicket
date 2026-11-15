@@ -479,7 +479,8 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let principal = {
         let l = c.ledger.lock().map_err(|_| "ledger lock")?;
         let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
-        own.map(|o| format!(", principal {}", wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name))).unwrap_or_default()
+        own.map(|o| format!(", principal {}", wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name)))
+            .unwrap_or_default()
     };
     Ok(format!(
         "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}",

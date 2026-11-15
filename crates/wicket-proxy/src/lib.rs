@@ -379,7 +379,9 @@ impl RunCtx {
         }
         let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
             "child"
-        } else if prefer.is_some() || me.claims.parent_run.as_deref().is_some_and(|p| l.identity(p).ok().flatten().is_some_and(|i| i.spiffe_id == principal)) {
+        } else if prefer.is_some()
+            || me.claims.parent_run.as_deref().is_some_and(|p| l.identity(p).ok().flatten().is_some_and(|i| i.spiffe_id == principal))
+        {
             "parent"
         } else if rec.accept_from.iter().any(|a| a == &self.zone.name || a == &me.claims.sub) {
             "peer"

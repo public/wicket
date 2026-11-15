@@ -585,7 +585,11 @@ mod tests {
 
     fn human(label: &str) -> Granter {
         let a = crate::operators::Authority::Anything;
-        Granter::Human(crate::operators::Operator { id: format!("spiffe://wicket.test/t/default/op/unix/{label}"), label: label.into(), authority: a })
+        Granter::Human(crate::operators::Operator {
+            id: format!("spiffe://wicket.test/t/default/op/unix/{label}"),
+            label: label.into(),
+            authority: a,
+        })
     }
 
     /// #11: an operator decides only within its authority, through the same function; a decision
@@ -616,12 +620,16 @@ mod tests {
         assert!(r["why"].as_str().unwrap().contains("its hosts: docs.example.com"), "{r}");
         // Unlisted, alice has the default (anything): her approval is recorded with her identity.
         let alice = Granter::Human(crate::operators::Operator::new("default", "unix", "alice", "alice@cli".into(), &policy));
-        assert!(matches!(decide(&mut l, &alice, &id, &Verdict::Approve(terms(60)), serde_json::json!({})).unwrap(), Decided::Approved { .. }));
+        assert!(matches!(
+            decide(&mut l, &alice, &id, &Verdict::Approve(terms(60)), serde_json::json!({})).unwrap(),
+            Decided::Approved { .. }
+        ));
         let d = decisions(&l);
         assert!(d[0]["granter_identity"].as_str().unwrap().ends_with("/op/unix/alice") && d[0]["granter"] == "human", "{:?}", d[0]);
         // A renewal is a decision too: bob may not renew alice's grant for that host.
         let g = l.grant_for_request(&id).unwrap().unwrap().id;
-        assert!(format!("{:#}", decide(&mut l, &bob, &g, &Verdict::Renew(Duration::from_secs(600)), serde_json::json!({})).unwrap_err()).contains("api.example.com"));
+        assert!(format!("{:#}", decide(&mut l, &bob, &g, &Verdict::Renew(Duration::from_secs(600)), serde_json::json!({})).unwrap_err())
+            .contains("api.example.com"));
     }
 
     fn asked(l: &Ledger, path: &str) -> String {

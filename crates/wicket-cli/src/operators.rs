@@ -307,7 +307,12 @@ mod tests {
 
     #[test]
     fn a_policy_that_doesnt_parse_is_refused() {
-        for bad in ["default: everything\n", "operators:\n  unix/x: { kinds: [root] }\n", "operators:\n  unix/x: { max_risk: R9 }\n", "default: anything\nroles: []\n"] {
+        for bad in [
+            "default: everything\n",
+            "operators:\n  unix/x: { kinds: [root] }\n",
+            "operators:\n  unix/x: { max_risk: R9 }\n",
+            "default: anything\nroles: []\n",
+        ] {
             assert!(Policy::parse(bad).is_err(), "{bad}");
         }
     }

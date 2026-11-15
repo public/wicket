@@ -506,7 +506,9 @@ mod tests {
         assert_eq!(o, "spiffe://w.example/t/t0/op/passkey/Alice-s-laptop");
         assert!(matches!(Principal::parse(&o), Some(Principal::Operator { ref via, .. }) if via == "passkey"));
         assert_eq!(operator_id("d", "t", "unix", ".."), "spiffe://d/t/t/op/unix/-");
-        for bad in ["run_01abc", "parent", "spiffe://d/t/t0/z/z", "spiffe://d/t/t0/z//a/x", "spiffe://d/node/n1", "spiffe://d/t/t0/z/z/a/x/y"] {
+        for bad in
+            ["run_01abc", "parent", "spiffe://d/t/t0/z/z", "spiffe://d/t/t0/z//a/x", "spiffe://d/node/n1", "spiffe://d/t/t0/z/z/a/x/y"]
+        {
             assert_eq!(Principal::parse(bad), None, "{bad}");
         }
     }
