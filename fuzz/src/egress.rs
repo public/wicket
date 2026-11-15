@@ -76,7 +76,9 @@ fn world() -> &'static World {
         let upstream: Arc<Mutex<Vec<Seen>>> = Default::default();
         let decided: Arc<Mutex<Vec<Seen>>> = Default::default();
         let (plain, tls, roots) = rt.block_on(origins(upstream.clone()));
-        let ctx = crate::util::ctx("reach: []", crate::util::scratch("egress-vault"));
+        let (ctx, events) = crate::util::ctx("reach: []", crate::util::scratch("egress-vault"));
+        // The world lives as long as the process: so does its event channel (unread).
+        std::mem::forget(events);
         let ca = Arc::new(wicket_proxy::ca::RunCa::generate("run_fuzz").expect("run CA"));
         let up = Upstream {
             resolve: HashMap::from([(PLAIN_HOST.to_string(), plain), (TLS_HOST.to_string(), tls)]),

@@ -14,13 +14,12 @@ pub fn scratch(tag: &str) -> PathBuf {
 }
 
 /// A run context for a zone (YAML flow mapping body, e.g. `reach: [...]`), with an in-memory
-/// ledger and an empty vault.
-pub fn ctx(zone: &str, vault: PathBuf) -> wicket_proxy::RunCtx {
+/// ledger and an empty vault, and the receiving end of its events: the caller holds it for as long
+/// as the context lives (forgetting it leaked the channel on every run, which LeakSanitizer reports).
+pub fn ctx(zone: &str, vault: PathBuf) -> (wicket_proxy::RunCtx, tokio::sync::mpsc::UnboundedReceiver<wicket_proxy::Event>) {
     let m = wicket_core::Manifest::from_yaml(&format!("task: t\nagent: {{name: a}}\nzone: {{name: z, {zone}}}")).expect("the harness's zone");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // Events are dropped; the channel stays open.
-    std::mem::forget(rx);
-    wicket_proxy::RunCtx {
+    let ctx = wicket_proxy::RunCtx {
         tenant: wicket_core::TenantId::single(),
         run: wicket_core::RunId("run_0123456789abcdefghijklmnop".into()),
         zone: Arc::new(wicket_core::CompiledZone::new(m.zone.clone()).expect("the harness's zone compiles")),
@@ -39,5 +38,6 @@ pub fn ctx(zone: &str, vault: PathBuf) -> wicket_proxy::RunCtx {
         fence: None,
         waker: None,
         lifecycle: None,
-    }
+    };
+    (ctx, rx)
 }

@@ -26,7 +26,7 @@ pub fn run(data: &[u8]) {
         w.extend_from_slice(data);
         w
     };
-    let ctx = crate::util::ctx("reach: [{host: api.example.com, methods: [GET], paths: ['/**']}]", vault());
+    let (ctx, _events) = crate::util::ctx("reach: [{host: api.example.com, methods: [GET], paths: ['/**']}]", vault());
     let out = rt.block_on(async {
         let gw = wicket_proxy::gateway::Gateway::new(ctx);
         let (mut client, server) = tokio::io::duplex(64 * 1024);
