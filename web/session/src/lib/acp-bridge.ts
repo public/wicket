@@ -7,7 +7,7 @@
 //   replaced the first's dialog while its resolver was still waiting).
 import type { AcpTransport, Unsubscribe } from './transport/types';
 import type { PermissionRequest } from './types';
-import { escalationOf } from '../../../common/wicket';
+import { escalationOf } from './wicket';
 import { ref, type Ref } from 'vue';
 
 const JSONRPC_METHOD_NOT_FOUND = -32601;
@@ -91,6 +91,12 @@ export class AcpClientBridge {
   }
   prompt(params: unknown) {
     return this.sendRequest<{ stopReason: string }>('session/prompt', params, null);
+  }
+
+  /** `session/cancel`: asks wicket to cancel the running turn. A notification: the turn's own
+   * `session/prompt` answers, with the stop reason `cancelled`, when the agent ends it. */
+  cancel(sessionId: string) {
+    return this.transport.send(JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } }));
   }
 
   private requestPermission(rpcId: number | string, p: any): Promise<unknown> {

@@ -241,7 +241,8 @@ function placedRow(p) {
   return d;
 }
 
-// A running agent can be sent a follow-up or have its identity revoked; both are signed.
+// A running agent can be sent a follow-up or have its identity revoked; both are signed. An ACP
+// agent's session opens on its own page.
 function renderRun(s, x) {
   const d = el("div", "row");
   const left = el("span"); left.append(el("span", "mono", x.id), document.createTextNode(" " + strip(x.zone + " · " + (x.revoked ? "revoked" : x.status) + " · " + ago(s.now, x.started_at))));
@@ -250,6 +251,12 @@ function renderRun(s, x) {
   if (x.remote_url && x.remote_url.startsWith("https://")) {
     const a = el("a", "mono", "open session");
     a.href = x.remote_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    left.append(document.createTextNode(" · "), a);
+  }
+  // An ACP run's live session (#327): its own page, opened with a passkey there.
+  if (x.acp && x.status === "running" && !x.revoked) {
+    const a = el("a", "mono session", "session");
+    a.href = "/session?run=" + encodeURIComponent(x.id);
     left.append(document.createTextNode(" · "), a);
   }
   const auth = el("button", "link", "authority");

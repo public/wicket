@@ -1,5 +1,6 @@
-// The fork's own client stack (its WebSocket transport, JSON-RPC bridge and update handler) against
-// wicket's endpoint, in node. Run by the endpoint's ignored test `the_views_clients_drive_the_endpoint`.
+// The session view's own client stack (its WebSocket transport, JSON-RPC bridge and update handler)
+// against wicket's endpoint, in node. Run by the endpoint's ignored test
+// `the_views_client_drives_the_endpoint` (ci/session-view.sh), which plays the supervisor.
 import { WebSocketTransport } from '../src/lib/transport/websocket';
 import { AcpClientBridge } from '../src/lib/acp-bridge';
 import { addUser, handleSessionUpdate, messages } from '../src/session';
@@ -42,5 +43,12 @@ b.answerPermission(r.rpcId!, 'approve');
 addUser('and now?');
 const { stopReason } = await b.prompt({ sessionId: env('RUN'), prompt: [{ type: 'text', text: 'and now?' }] });
 await until('the reply', () => msgs().some((m) => m.content.includes('you said: and now?')));
-console.log(JSON.stringify({ stop: stopReason, escalation: r.escalation?.id, messages: msgs().length }));
+// A turn that runs until it is cancelled: session/cancel goes through the ledger to the supervisor.
+addUser('wait for me');
+const waiting = b.prompt({ sessionId: env('RUN'), prompt: [{ type: 'text', text: 'wait for me' }] });
+await until('the waiting turn', () => msgs().some((m) => m.content.includes('you said: wait for me')));
+await b.cancel(env('RUN'));
+const cancelled = (await waiting).stopReason;
+await until("wicket's notice of the cancel", () => msgs().some((m) => m.role === 'system' && m.content.includes('stop its running turn')));
+console.log(JSON.stringify({ stop: stopReason, cancelled, escalation: r.escalation?.id, messages: msgs().length }));
 process.exit(0);

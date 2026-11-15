@@ -101,9 +101,10 @@ export interface ToolCallInfo {
   locations?: { path: string }[];
   /** wicket fork: what upstream didn't keep. */
   rawInput?: unknown;
+  rawOutput?: unknown;
   output?: ToolOutput[];
   permission?: { outcome: string; optionId: string | null; by: string };
-  escalation?: import('../../../common/wicket').Escalation;
+  escalation?: import('./wicket').Escalation;
 }
 
 /** wicket fork: a tool call's content: text, or a diff. */
@@ -115,7 +116,7 @@ export interface PermissionRequest {
   options: PermissionOption[];
   /** wicket fork: the JSON-RPC id it answers, and wicket's escalation if it is one. */
   rpcId?: number | string;
-  escalation?: import('../../../common/wicket').Escalation;
+  escalation?: import('./wicket').Escalation;
 }
 
 export interface PermissionOption {

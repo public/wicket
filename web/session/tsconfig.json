@@ -11,5 +11,5 @@
     "jsx": "preserve",
     "types": []
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "../common"]
+  "include": ["src/**/*.ts", "src/**/*.vue"]
 }

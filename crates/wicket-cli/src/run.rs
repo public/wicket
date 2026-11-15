@@ -1855,6 +1855,33 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     turn_running = true;
                 }
+                // A `session/cancel` from the console's session view (#327): the running turn, if any.
+                // Prompts still queued behind it stay queued.
+                let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                if let Some(by) = cancels.last() {
+                    use tokio::io::AsyncWriteExt;
+                    let out = acp.as_mut().map(|c| c.cancel()).unwrap_or_default();
+                    let sent = !out.is_empty();
+                    if sent {
+                        println!("[operator] {by}: cancel the running turn");
+                        if let Some(c) = &acp {
+                            let _ = write_json(&acp_state, c);
+                        }
+                        let input: String = out.iter().map(|l| format!("{l}\n")).collect();
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        if let Some(si) = stdin.as_mut() {
+                            if si.write_all(input.as_bytes()).await.is_err() {
+                                stdin = None;
+                            }
+                        }
+                    }
+                    if let Ok(l) = ledger.lock() {
+                        let why = if sent { "cancelled" } else if acp.is_some() { "no turn was running" } else { "not an ACP run: nothing to cancel" };
+                        let _ = l.audit(&m.tenant, Some(&run), "run.turn_cancel", &serde_json::json!({ "by": by, "asked": cancels.len(), "outcome": why }));
+                    }
+                }
                 if let Some(f) = &fence {
                     // An operator's `wicket hibernate`.
                     if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
@@ -2466,6 +2493,10 @@ fn write_secret(p: &Path, body: &str) -> Result<()> {
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
 }
+
+/// How old a `session/cancel` may be when the supervisor takes it (#327): older ones were meant for
+/// a turn that has likely ended.
+const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;

@@ -1,5 +1,5 @@
 {
-  "name": "wicket-session-acp-ui",
+  "name": "wicket-session-view",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -17,5 +17,9 @@
     "typescript": "5.9.3",
     "vite": "8.3.8",
     "vue-tsc": "3.3.14"
+  },
+  "description": "wicket console's session view (#327): a fork of acp-ui",
+  "engines": {
+    "node": ">=22.12.0"
   }
 }
