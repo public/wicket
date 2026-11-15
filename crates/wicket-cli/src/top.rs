@@ -545,7 +545,7 @@ pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> 
             Some(k) => Some((true, k.since_ms)),
             None => links.iter().map(|k| k.since_ms).max().map(|t| (false, t)),
         };
-        f.nodes.push(NodeLine { name, status, link, boxes, capacity: freshest.and_then(|k| k.capacity.clone()) });
+        f.nodes.push(NodeLine { name, status, link, boxes, capacity: freshest.and_then(|k| k.capacity) });
     }
     f.pending = l.pending(&tenant)?.len();
     for x in l.leases(&["active"])? {
@@ -890,7 +890,9 @@ pub async fn node_top(dir: Option<std::path::PathBuf>, once: bool, json: bool) -
 pub async fn control_top(once: bool) -> Result<()> {
     show(once, |w| async move {
         let now = wicket_feed::now_ms();
-        let f = wicket_store::Ledger::open(&crate::ledger_path()).map_err(anyhow::Error::from).and_then(|l| control_frame(&l, &crate::data_dir().join("runs"), now));
+        let f = wicket_store::Ledger::open(&crate::ledger_path())
+            .map_err(anyhow::Error::from)
+            .and_then(|l| control_frame(&l, &crate::data_dir().join("runs"), now));
         match f {
             Ok(mut f) => {
                 // This host's own node answers its status socket here.
@@ -1048,7 +1050,7 @@ mod tests {
                     status: "active".into(),
                     link: Some((true, NOW - 600_000)),
                     boxes: 1,
-                    capacity: Some(cap.clone()),
+                    capacity: Some(cap),
                 },
                 NodeLine {
                     name: "hyperv1".into(),
