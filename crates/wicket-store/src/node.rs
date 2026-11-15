@@ -41,6 +41,8 @@ pub struct GrantRow {
     pub node: Option<String>,
     /// The riskiest op it covers (`RiskClass::rank`); None for grants from older ledgers (#119).
     pub max_risk: Option<i64>,
+    /// The run it is bound to; None: any run in its zone (#127).
+    pub run: Option<String>,
 }
 
 /// One audit record with its chain fields, as a node ships it.
@@ -66,7 +68,7 @@ pub struct NodeAuditSummary {
 }
 
 const GRANT_COLS: &str =
-    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node, g.max_risk";
+    "g.id, g.tenant, g.zone, g.method, g.host, g.path, g.prefix, g.uses_left, g.expires_at, g.request_id, g.revoked, g.node, g.max_risk, g.run";
 
 fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
@@ -83,6 +85,7 @@ fn row_to_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
         revoked: r.get::<_, i64>(10)? != 0,
         node: r.get(11)?,
         max_risk: r.get(12)?,
+        run: r.get(13)?,
     })
 }
 
@@ -157,6 +160,29 @@ impl Ledger {
             })
             .optional()?
             .is_some())
+    }
+
+    /// Renews live grant `id` to end at `expires_at` (Unix seconds), keeping its uses: false if it
+    /// is revoked, has already expired (ask again), or doesn't exist. A grant handed to a node is
+    /// renewed there by whoever publishes its box's token (the run's control-host process), which
+    /// rebuilds the token with the grant's new end.
+    pub fn renew_grant(&self, id: &str, expires_at: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE grants SET expires_at = ?2 WHERE id = ?1 AND revoked = 0 AND expires_at > ?3",
+            params![id, expires_at, crate::now()],
+        )? == 1)
+    }
+
+    /// The live grant made for request `id`, if any (the latest).
+    pub fn grant_for_request(&self, request_id: &str) -> Result<Option<GrantRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {GRANT_COLS} FROM grants g WHERE g.request_id = ?1 AND g.revoked = 0 ORDER BY g.created_at DESC, g.id DESC LIMIT 1"),
+                params![request_id],
+                row_to_grant,
+            )
+            .optional()?)
     }
 
     /// Revokes a grant. Grants handed to a node are revoked there through the feed by whoever

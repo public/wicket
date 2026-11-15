@@ -608,3 +608,54 @@ fn pinned_images_are_decided_by_the_token_on_the_node() {
     assert!(peek("tool7:latest").is_err(), "a tag isn't the pinned entry");
     assert!(r.peek_spawn("nobody", TENANT, &pins[0], 2, 1, 1, 1, 1, T0).is_err());
 }
+
+/// #56: renewals reach the node in the box's rebuilt token, with nothing new on the feed. A grant
+/// renewed past its old end is honoured until its new one. A box whose authority was renewed (its
+/// block 0 minted again with a later end) is held past its old end, while one nobody renewed ends
+/// there: its `authority_until` has passed, which is when its node stops it. The base token the
+/// node was given before the renewal is no longer the box's (its spawns go to the control host).
+#[test]
+fn renewals_reach_the_node_in_the_rebuilt_token() {
+    let mut cp = Cp::new();
+    let z = zone("z", &["/repos/acme/**"]);
+    let mint = |cp: &Cp, run: &str, end: u64| {
+        Issuer::root(&cp.authz_root, TENANT, "trigger:t", run, 0, &z, &[], end, vec![cp.approver.public()]).unwrap()
+    };
+    let old_end = secs(T0) + 60;
+    let (renewed, kept) = (mint(&cp, "r1", old_end), mint(&cp, "r2", old_end));
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 30_000), uses: Some(5) };
+    cp.put(renewed.publish(&cp.approver, std::slice::from_ref(&g)).unwrap(), T0 - 100);
+    cp.put(kept.publish(&cp.approver, &[]).unwrap(), T0 - 100);
+    let mut r = cp.replica();
+    sync(&mut cp.p, &mut r, T0);
+    let hook = gh("z", "r1", "POST", "/repos/acme/app/hooks");
+    let read = |run: &str| gh("z", run, "GET", "/repos/acme/app");
+    let old_until = (old_end as i64 + 1) * 1000;
+    assert_eq!((r.authority_until("r1"), r.authority_until("r2")), (Some(old_until), Some(old_until)));
+    assert_eq!(r.decide(&hook, T0), Decision::Allow(Allowed::Grant("g1".into())));
+    let base = renewed.record().unwrap().token;
+    assert!(r.base_is_current("r1", &base));
+
+    // Renewed: the grant to T0 + 5 min, the box's authority to T0 + 10 min.
+    let reminted = mint(&cp, "r1", secs(T0) + 600);
+    let g = LiveGrant { grant: authz_grant("g1", "POST", "/repos/acme/app/hooks", T0 + 300_000), uses: Some(5) };
+    cp.put(reminted.publish(&cp.approver, std::slice::from_ref(&g)).unwrap(), T0 + 1_000);
+    sync(&mut cp.p, &mut r, T0 + 1_000);
+    assert_eq!(r.authority_until("r1"), Some((secs(T0) as i64 + 601) * 1000));
+    assert!(!r.base_is_current("r1", &base), "the old base is no longer the box's");
+    assert!(r.base_is_current("r1", &reminted.record().unwrap().token));
+
+    // Past both old ends.
+    let later = T0 + 120_000;
+    sync(&mut cp.p, &mut r, later);
+    assert_eq!(r.decide(&hook, later), Decision::Allow(Allowed::Grant("g1".into())), "the grant lasts its new lifetime");
+    assert_eq!(kind(&r.decide(&read("r1"), later)), "allow", "the renewed box keeps its authority");
+    assert!(r.authority_until("r1").is_some_and(|u| u > later));
+    assert!(r.authority_until("r2").is_some_and(|u| u <= later), "the box nobody renewed is stopped");
+    assert_ne!(kind(&r.decide(&read("r2"), later)), "allow");
+    // And past the new grant's end, though not the box's: the grant has ended.
+    let past = T0 + 400_000;
+    sync(&mut cp.p, &mut r, past);
+    assert_ne!(r.decide(&hook, past), Decision::Allow(Allowed::Grant("g1".into())));
+    assert_eq!(kind(&r.decide(&read("r1"), past)), "allow");
+}

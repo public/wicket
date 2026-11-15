@@ -361,7 +361,10 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
         .as_ref()
         .is_none_or(|p| p.get("node").and_then(|n| n.as_str()) == Some(node.name.as_str()) && p.get("lease").is_none());
     let up = connected(node, run);
-    if !here || !sp.org_alike {
+    // A box whose authority was renewed (#56) holds a re-minted token: the base it started with is
+    // no longer its own, so its control host decides its spawns (queued while unreachable).
+    let renewed = !node.replica.lock().expect("replica").base_is_current(run, &sp.base);
+    if !here || !sp.org_alike || renewed {
         return match up {
             true => None,
             false => Some(queue_call(node, run, tool, args)),

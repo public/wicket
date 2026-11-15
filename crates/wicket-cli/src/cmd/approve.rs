@@ -118,6 +118,26 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
+            let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
+            let mut l = Ledger::open(&ledger_path())?;
+            let grant::Decided::Renewed { what, until } =
+                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Renew(ttl), serde_json::json!({}))?
+            else {
+                unreachable!("a renewal renews")
+            };
+            let left = humantime::format_duration(std::time::Duration::from_secs(u64::try_from(until - wicket_store::now()).unwrap_or(0)));
+            match what {
+                grant::Renewed::Grant(g) => match l.grant(&g)?.and_then(|g| g.node) {
+                    Some(n) => println!("renewed grant {g} for {left}; its run republishes it to node {n}"),
+                    None => println!("renewed grant {g} for {left}"),
+                },
+                grant::Renewed::Authority(r) => {
+                    println!("renewed box {r}'s authority for {left}; its run re-mints the box's token on its node")
+                }
+            }
+            Ok(())
+        }
         _ => unreachable!("dispatched to the wrong command group"),
     }
 }
@@ -127,4 +147,15 @@ pub enum GrantCmd {
     /// Revoke a grant. A grant handed to a node is revoked there through its feed by the run that
     /// published it (at once if the node is reachable).
     Revoke { id: String },
+    /// Renew a live grant, or a running box's authority, so it lasts --ttl from now (#56): a grant
+    /// by its id (or the request it answers), a box's authority by its run id. Every grant keeps a
+    /// lifetime: at most 24h, and a box's authority never past its run's timeout. Audited as a
+    /// decision; the run publishes it to the box's node.
+    Renew {
+        /// A grant id (`g-…`), a request id (`r-…`: the grant made for it), or a running box's run id.
+        id: String,
+        /// The new lifetime, from now.
+        #[arg(long, default_value = "10m")]
+        ttl: String,
+    },
 }

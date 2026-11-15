@@ -525,12 +525,22 @@ impl Gateway {
             );
         };
         let Some(cell) = &self.ctx.identity else { return ("this run has no wicket identity".into(), true) };
-        let Some(id) = args.get("request_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
-            return ("request_id is required".into(), true);
-        };
         let decision = match args.get("decision").and_then(|v| v.as_str()) {
-            Some(d @ ("approve" | "deny")) => d,
-            _ => return ("decision must be approve or deny".into(), true),
+            Some(d @ ("approve" | "deny" | "renew")) => d,
+            _ => return ("decision must be approve, deny or renew".into(), true),
+        };
+        let named = |k: &str| args.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        // A renewal names what it renews (#56): a grant, the grant made for a request, or a
+        // descendant box's authority (its run id). Exactly one.
+        let id = match decision {
+            "renew" => match (named("grant_id"), named("request_id"), named("run")) {
+                (Some(t), None, None) | (None, Some(t), None) | (None, None, Some(t)) => t,
+                _ => return ("renew names exactly one of grant_id, request_id or run".into(), true),
+            },
+            _ => match named("request_id") {
+                Some(id) => id,
+                None => return ("request_id is required".into(), true),
+            },
         };
         let uses = match args.get("uses") {
             None | Some(Value::Null) => 1,
@@ -551,10 +561,17 @@ impl Gateway {
         if me.claims.exp <= now {
             return ("not decided: this agent's identity has expired and was not refreshed".into(), true);
         }
-        let payload = json!({
-            "jti": format!("d-{}", ulid::Ulid::new().to_string().to_lowercase()), "iat": now, "kind": crate::DECISION_KIND,
-            "run": self.ctx.run.0, "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
-        });
+        let jti = format!("d-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let payload = match decision {
+            "renew" => json!({
+                "jti": jti, "iat": now, "kind": crate::DECISION_KIND,
+                "run": self.ctx.run.0, "target": id, "decision": decision, "ttl_secs": ttl,
+            }),
+            _ => json!({
+                "jti": jti, "iat": now, "kind": crate::DECISION_KIND,
+                "run": self.ctx.run.0, "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
+            }),
+        };
         let signed = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         match hook.decide(&signed) {
             Ok(text) => (text, false),
@@ -871,16 +888,18 @@ fn tools() -> Value {
         },
         {
             "name": "decide",
-            "description": "Approve or deny a request from one of your descendants (a box you started, or one they started), listed by pending_requests. You may approve only what your own zone reaches; an approval grants exactly the asked path, to the asking run only, for a bounded number of uses and at most until your own authority ends. A request you can't or don't decide stays pending for a human.",
+            "description": "Approve or deny a request from one of your descendants (a box you started, or one they started), listed by pending_requests; or renew a grant you could make, or a descendant box's authority, so it lasts ttl_seconds from now. You may approve only what your own zone reaches; an approval grants exactly the asked path, to the asking run only, for a bounded number of uses and at most until your own authority ends. A renewal is bounded the same way, and never outlasts the renewed box's timeout. A request you can't or don't decide stays pending for a human.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "request_id": { "type": "string" },
-                    "decision": { "type": "string", "enum": ["approve", "deny"] },
+                    "request_id": { "type": "string", "description": "the request to approve or deny; for renew, the request whose grant to renew" },
+                    "decision": { "type": "string", "enum": ["approve", "deny", "renew"] },
+                    "grant_id": { "type": "string", "description": "renew: the grant to renew" },
+                    "run": { "type": "string", "description": "renew: the descendant box (its run id) whose authority to renew" },
                     "uses": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
-                    "ttl_seconds": { "type": "integer", "minimum": 1, "default": 600, "description": "how long the grant lasts: at most 24h, and not past your own authority" }
+                    "ttl_seconds": { "type": "integer", "minimum": 1, "default": 600, "description": "how long the grant (or renewal) lasts from now: at most 24h, and not past your own authority" }
                 },
-                "required": ["request_id", "decision"],
+                "required": ["decision"],
                 "additionalProperties": false
             }
         },
@@ -1347,6 +1366,18 @@ mod tests {
             (Some(crate::DECISION_KIND), Some("run_lead"), Some("r-1"), Some(3), Some(120))
         );
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "decide"));
+        // #56: a renewal names exactly one thing, and is signed the same way.
+        let (text, err) = call(&gw, json!({ "decision": "renew", "grant_id": "g-1", "ttl_seconds": 300 })).await;
+        assert!(!err && text == "recorded", "{text}");
+        for bad in [json!({ "decision": "renew" }), json!({ "decision": "renew", "grant_id": "g-1", "run": "run_c" })] {
+            assert!(call(&gw, bad.clone()).await.1, "{bad}");
+        }
+        let seen = rec.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            (seen[1]["decision"].as_str(), seen[1]["target"].as_str(), seen[1]["ttl_secs"].as_u64(), seen[1]["kind"].as_str()),
+            (Some("renew"), Some("g-1"), Some(300), Some(crate::DECISION_KIND))
+        );
     }
 
     /// #50: a peer message never decides anything. A child's message reading as a decision reaches

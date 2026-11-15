@@ -395,6 +395,36 @@ impl Replica<BoxAuthority> {
         c.loaded.not_after().map(|s| i64::try_from(s).unwrap_or(i64::MAX / 1000).saturating_add(1).saturating_mul(1000))
     }
 
+    /// Box `parent`'s record and `base`, verified as its base token: against the authority root (or
+    /// the issuing key that minted it), and exactly the start of the token the feed holds for it,
+    /// without its grants (appended last), so a child never inherits its parent's grants.
+    fn base_of(&self, parent: &str, base: &str) -> Result<(BoxAuthority, authz::Token), String> {
+        let (spec, ids) = match self.entry(parent) {
+            Some(Zone { spec, compiled: Ok(c) }) => (spec.clone(), c.ids.clone()),
+            Some(Zone { compiled: Err(e), .. }) => return Err(format!("box {parent}'s authority is invalid: {e}")),
+            None => return Err(format!("no authority for box {parent} on this node")),
+        };
+        let key = match &spec.issuer_cert {
+            Some(c) => AuthzKeyCert::open(c, self.ctx())?.0,
+            None => *self.ctx(),
+        };
+        let bytes = B64.decode(base).map_err(|e| format!("base token encoding: {e}"))?;
+        let base = authz::Token::from_bytes(&bytes, &key).map_err(|e| e.to_string())?;
+        let base_ids: Vec<String> = base.revocation_ids().iter().map(|i| revocation_id(i)).collect();
+        let first_party = ids.len().saturating_sub(spec.grants.len());
+        if base_ids.is_empty() || base_ids.len() != first_party || base_ids[..] != ids[..first_party] {
+            return Err(format!("the base token isn't box {parent}'s, without its grants"));
+        }
+        Ok((spec, base))
+    }
+
+    /// Whether `base` is still box `run`'s base token ([`Self::derive_child`] would take it). Not
+    /// once its authority was renewed (#56): its block 0 was minted again, and the base a node was
+    /// given at the box's start is the old one; that box's spawns are then the control host's.
+    pub fn base_is_current(&self, run: &str, base: &str) -> bool {
+        self.base_of(run, base).is_ok()
+    }
+
     /// Derives box `child`'s authority on this node (#164), from box `parent`'s base token (its
     /// block 0 and spawn links, without grants, as its control host handed it to the node): the
     /// base must verify against the authority root (or the issuing key that minted it), and be the
@@ -410,24 +440,7 @@ impl Replica<BoxAuthority> {
         zone: &ZoneSpec,
         ceiling: &authz::Ceiling,
     ) -> Result<BoxAuthority, String> {
-        let (spec, ids) = match self.entry(parent) {
-            Some(Zone { spec, compiled: Ok(c) }) => (spec.clone(), c.ids.clone()),
-            Some(Zone { compiled: Err(e), .. }) => return Err(format!("box {parent}'s authority is invalid: {e}")),
-            None => return Err(format!("no authority for box {parent} on this node")),
-        };
-        let key = match &spec.issuer_cert {
-            Some(c) => AuthzKeyCert::open(c, self.ctx())?.0,
-            None => *self.ctx(),
-        };
-        let bytes = B64.decode(base).map_err(|e| format!("base token encoding: {e}"))?;
-        let base = authz::Token::from_bytes(&bytes, &key).map_err(|e| e.to_string())?;
-        let base_ids: Vec<String> = base.revocation_ids().iter().map(|i| revocation_id(i)).collect();
-        // Exactly the token without its grant blocks (appended last): a child never inherits its
-        // parent's grants.
-        let first_party = ids.len().saturating_sub(spec.grants.len());
-        if base_ids.is_empty() || base_ids.len() != first_party || base_ids[..] != ids[..first_party] {
-            return Err(format!("the base token isn't box {parent}'s, without its grants"));
-        }
+        let (spec, base) = self.base_of(parent, base)?;
         let issuer = Issuer {
             base,
             run: spec.run.clone(),
