@@ -184,7 +184,8 @@ async fn every_response_carries_the_security_headers() {
     let mut t = setup("headers");
     let sid = t.sid.clone().unwrap();
     let cookie = format!("__Host-wicket_sid={sid}");
-    let js = ASSETS.files.keys().find(|k| k.ends_with(".js")).unwrap().clone();
+    // The hashed console.js (not the service worker, which isn't immutable).
+    let js = ASSETS.files.keys().find(|k| k.ends_with(".js") && *k != "/sw.js").unwrap().clone();
     for https in [false, true] {
         t.state.hsts = https;
         type Req<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
@@ -250,7 +251,12 @@ fn the_page_has_no_inline_script_or_style_and_names_its_files_by_hash() {
             );
         }
     }
-    let js = ASSETS.files.iter().find(|(k, _)| k.ends_with(".js")).map(|(_, a)| std::str::from_utf8(&a.body).unwrap()).unwrap();
+    let js = ASSETS
+        .files
+        .iter()
+        .find(|(k, _)| k.ends_with(".js") && *k != "/sw.js")
+        .map(|(_, a)| std::str::from_utf8(&a.body).unwrap())
+        .unwrap();
     for bad in ["prompt(", "innerHTML", "eval(", "new Function", "document.write", "setAttribute(\"style\"", ".cssText"] {
         assert!(!js.contains(bad), "console.js uses {bad}");
     }

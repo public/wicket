@@ -36,7 +36,7 @@ fn recorder(t: &mut T, status: fn(&str) -> u16) -> Arc<Mutex<Vec<push::PushReque
 
 #[tokio::test]
 async fn devices_are_subscribed_listed_and_removed_by_a_signed_in_operator_only() {
-    let t = setup("pushapi");
+    let mut t = setup("pushapi");
     let (p, a) = keys();
     let sub = json!({ "endpoint": "https://web.push.apple.com/QGh1dGxp", "p256dh": p, "auth": a, "label": "iPhone · Safari" });
     // Without a session: the one 401, for every push route and method.
@@ -54,18 +54,47 @@ async fn devices_are_subscribed_listed_and_removed_by_a_signed_in_operator_only(
     let v: Value = serde_json::from_str(&b).unwrap();
     assert_eq!(v["public_key"].as_str().unwrap(), t.state.push.as_ref().unwrap().vapid.public_b64());
     assert_eq!(v["devices"], json!([]));
-    // Only known push services, and no arbitrary URL.
+    // Only known push services, and no arbitrary URL: refused before anything is signed.
     for ep in
         ["https://169.254.169.254/latest", "http://fcm.googleapis.com/x", "https://example.com/push", "https://localhost:8787/api/state"]
     {
-        let (s, body) = post_as(&t, "/api/push/subscribe", json!({ "endpoint": ep, "p256dh": p, "auth": a })).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST, "{ep}: {body}");
+        let r = t.begin(json!({ "action": "push_subscribe", "endpoint": ep, "p256dh": p, "auth": a }));
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{ep}: {:?}", r.body);
     }
+    let r = t.begin(json!({ "action": "push_subscribe", "endpoint": "https://fcm.googleapis.com/x", "p256dh": "AAAA", "auth": a }));
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "a bad key is refused at begin: {:?}", r.body);
+    // A session alone (a stolen cookie) can't register a device: refused, and the refusal audited.
     let (s, body) = post_as(&t, "/api/push/subscribe", sub.clone()).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    let id = body["device"]["id"].as_str().unwrap().to_string();
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("signed action"), "{body}");
+    assert!(t.state.push.as_ref().unwrap().store.all().is_empty(), "nothing registered");
+    let refused = t.audit_kinds().into_iter().find(|(k, _)| k == "operator.push_refused").expect("audited");
+    assert_eq!((refused.1["reason"].as_str(), refused.1["credential"].as_str()), (Some("unsigned subscribe"), Some(t.cred.as_str())));
+    // Nor can a begun action be finished without the passkey's signature.
+    let b = t.begin(json!({ "action": "push_subscribe", "endpoint": sub["endpoint"], "p256dh": p, "auth": a, "label": "iPhone · Safari" }));
+    assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+    let signed = &b.body["action"];
+    assert_eq!(signed["device"].as_str().unwrap(), push::subscription_id("https://web.push.apple.com/QGh1dGxp"));
+    assert_eq!(
+        (signed["service"].as_str(), signed["label"].as_str(), signed["details"].as_bool()),
+        (Some("web.push.apple.com"), Some("iPhone · Safari"), Some(false))
+    );
+    assert!(
+        !signed.to_string().contains("QGh1dGxp") && !signed.to_string().contains(&a),
+        "the signed JSON holds digests, not the endpoint or keys"
+    );
+    let ch = b.body["publicKey"]["challenge"].as_str().unwrap().to_string();
+    let mut forged = t.sign(&ch);
+    forged["signature"] = json!(b64u(b"not a signature"));
+    assert_eq!(t.post("/api/action/finish", forged).status, StatusCode::FORBIDDEN);
+    assert!(t.state.push.as_ref().unwrap().store.all().is_empty(), "nothing registered without a valid signature");
+    // Signed with the passkey: registered, and audited with the signature.
+    let r = t.act(json!({ "action": "push_subscribe", "endpoint": sub["endpoint"], "p256dh": p, "auth": a, "label": "iPhone · Safari" }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let id = push::subscription_id("https://web.push.apple.com/QGh1dGxp");
     let (_, _, b) = call(&t.state, "GET", "/api/push", &[("cookie", c.as_str())], b"").await;
     let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["devices"][0]["id"], id.as_str());
     assert_eq!(v["devices"][0]["label"], "iPhone · Safari");
     assert_eq!(v["devices"][0]["service"], "web.push.apple.com");
     assert_eq!(v["devices"][0]["details"], false);
@@ -74,19 +103,56 @@ async fn devices_are_subscribed_listed_and_removed_by_a_signed_in_operator_only(
     assert!(push_view(&t.state, "someone-else").body["devices"].as_array().unwrap().is_empty());
     assert_eq!(push_post(&t.state, "someone-else", "/api/push/remove", &json!({ "id": id })).status, StatusCode::NOT_FOUND);
     assert_eq!(
-        push_post(&t.state, "someone-else", "/api/push/details", &json!({ "id": id, "details": true })).status,
+        push_post(&t.state, "someone-else", "/api/push/details", &json!({ "id": id, "details": false })).status,
         StatusCode::NOT_FOUND
     );
-    // The device's own operator opts in to details, then removes it.
-    assert_eq!(post_as(&t, "/api/push/details", json!({ "id": id, "details": true })).await.0, StatusCode::OK);
+    // Turning details on with the session alone is refused and audited; only signed is it done.
+    let (s, body) = post_as(&t, "/api/push/details", json!({ "id": id, "details": true })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert!(!t.state.push.as_ref().unwrap().store.all()[0].details);
+    assert_eq!(t.begin(json!({ "action": "push_details", "id": id, "details": false })).status, StatusCode::BAD_REQUEST);
+    assert_eq!(t.begin(json!({ "action": "push_details", "id": "0000000000000000", "details": true })).status, StatusCode::NOT_FOUND);
+    let r = t.act(json!({ "action": "push_details", "id": id, "details": true }));
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert!(t.state.push.as_ref().unwrap().store.all()[0].details);
+    // Turning them off, and removing the device, only narrow: the session is enough.
+    assert_eq!(post_as(&t, "/api/push/details", json!({ "id": id, "details": false })).await.0, StatusCode::OK);
+    assert!(!t.state.push.as_ref().unwrap().store.all()[0].details);
     assert_eq!(post_as(&t, "/api/push/remove", json!({ "id": id })).await.0, StatusCode::OK);
     assert_eq!(post_as(&t, "/api/push/remove", json!({ "id": id })).await.0, StatusCode::NOT_FOUND);
     assert!(t.state.push.as_ref().unwrap().store.all().is_empty());
-    // Every change is audited, with the device's id (never its endpoint).
-    let kinds: Vec<String> = t.audit_kinds().into_iter().map(|(k, _)| k).filter(|k| k.starts_with("operator.push")).collect();
-    assert_eq!(kinds, ["operator.push_subscribed", "operator.push_details", "operator.push_removed"]);
-    assert!(!t.audit_kinds().iter().any(|(_, b)| b.to_string().contains("QGh1dGxp")));
+    // A signed action whose device was removed in between is not applied.
+    let r = t.act(json!({ "action": "push_subscribe", "endpoint": sub["endpoint"], "p256dh": p, "auth": a }));
+    assert_eq!(r.status, StatusCode::OK);
+    let b = t.begin(json!({ "action": "push_details", "id": id, "details": true }));
+    assert_eq!(post_as(&t, "/api/push/remove", json!({ "id": id })).await.0, StatusCode::OK);
+    let a2 = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+    assert_eq!(t.post("/api/action/finish", a2).status, StatusCode::CONFLICT);
+    // Every change is audited, with the device's id (never its endpoint); the signed ones with the
+    // passkey's signature, which `wicket audit --verify` re-verifies offline.
+    let audit = t.audit_kinds();
+    let kinds: Vec<&str> = audit.iter().map(|(k, _)| k.as_str()).filter(|k| k.starts_with("operator.push")).collect();
+    assert_eq!(
+        kinds,
+        [
+            "operator.push_refused",
+            "operator.push_subscribed",
+            "operator.push_refused",
+            "operator.push_details",
+            "operator.push_details",
+            "operator.push_removed",
+            "operator.push_subscribed",
+            "operator.push_removed",
+        ]
+    );
+    let signed: Vec<&Value> = audit.iter().filter(|(_, b)| b.get("signed").is_some()).map(|(_, b)| b).collect();
+    assert_eq!(signed.len(), 3);
+    assert!(signed.iter().all(|b| b["by"] == "passkey:laptop"));
+    let on = audit.iter().filter(|(k, _)| k == "operator.push_details").map(|(_, b)| b).collect::<Vec<_>>();
+    assert_eq!((on[0]["details"].as_bool(), on[0]["signed"].is_object()), (Some(true), true));
+    assert_eq!((on[1]["details"].as_bool(), on[1].get("signed")), (Some(false), None));
+    assert!(!audit.iter().any(|(_, b)| b.to_string().contains("QGh1dGxp")));
+    assert_eq!(crate::verify_signed_decisions(&t.ledger()).unwrap(), (3, 0), "re-verifies offline");
 }
 
 #[tokio::test]
@@ -100,6 +166,7 @@ async fn the_service_worker_is_served_at_the_root_under_the_same_csp() {
     // Workers fall back to script-src 'self': the CSP needs no change.
     assert!(web::CSP.contains("script-src 'self'") && !web::CSP.contains("worker-src"));
     assert!(body.contains("showNotification") && body.contains("notificationclick") && body.contains("#pending"));
+    assert!(body.contains("pushsubscriptionchange") && body.contains("#notifications"));
 }
 
 #[tokio::test]

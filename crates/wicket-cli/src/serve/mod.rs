@@ -19,8 +19,11 @@
 //!    `sha256(nonce || canonical action JSON)`. The actions: approve or deny a request (its id,
 //!    method, host, path, whether it is a prefix ask, decision, uses, lifetime and the agent's
 //!    verified identity), start a run (the allowlisted manifest, its content digest, the task
-//!    override, the run id and the principal it will carry), send a follow-up (run and text) and
-//!    revoke an identity (run and reason). The server builds the JSON from its own reading of the
+//!    override, the run id and the principal it will carry), send a follow-up (run and text),
+//!    revoke an identity (run and reason), and the two that widen what a device receives from Web
+//!    Push ([`push`]): register a device (its id, label, push service and digests of its endpoint and
+//!    keys) and turn its details on (removing a device or turning details off only narrow, and need
+//!    only the session). The server builds the JSON from its own reading of the
 //!    ledger and disk at `begin`, keeps it with the challenge, and at `finish` verifies the signature,
 //!    consumes the challenge (single use, 2-minute expiry, bound to the session that asked for it),
 //!    re-checks what may have changed in between (the manifest's bytes, the run still running, the
@@ -155,6 +158,15 @@ enum Action {
         principal: Value,
         /// An agent's image, passed to its run (a program's comes from its manifest).
         image: Option<String>,
+    },
+    /// Register a device for notifications (Web Push), as checked at `begin`: signed, so a stolen
+    /// session cookie can't add a device that receives them.
+    PushSubscribe(Box<push::Subscription>),
+    /// Turn on a device's details (the agent and what it asks for, shown on its lock screen):
+    /// signed, as it widens what the device receives. Turning them off is session-only.
+    PushDetails {
+        operator: String,
+        device: String,
     },
 }
 
@@ -1179,7 +1191,45 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 manifests::prepare(state, kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             Ok((Action::SaveManifest(Box::new(save)), v))
         }
-        _ => Err(bad("action must be decide, say, revoke, start_run, save_manifest or restore_manifest")),
+        Some("push_subscribe") => {
+            let Some(p) = &state.push else { return Err(err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF)) };
+            let (Some(endpoint), Some(p256dh), Some(auth)) =
+                (str_field(body, "endpoint"), str_field(body, "p256dh"), str_field(body, "auth"))
+            else {
+                return Err(bad("endpoint, p256dh and auth are required"));
+            };
+            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
+            let label = str_field(body, "label").unwrap_or("");
+            let sub = push::Subscription::new(&oc.id, &push::NewDevice { endpoint, p256dh, auth, label, details }, wicket_store::now())
+                .map_err(|e| bad(&format!("{e:#}")))?;
+            let view = sub.view();
+            // The device as the operator sees it, and digests binding the signature to the exact
+            // endpoint and keys (the endpoint is a capability: it is never shown or logged).
+            let v = json!({
+                "v": 1, "action": "push_subscribe", "tenant": state.tenant.0, "credential": oc.id,
+                "device": sub.id, "label": sub.label, "service": view["service"], "details": sub.details,
+                "endpoint_sha256": hex::encode(sha2::Sha256::digest(sub.endpoint.as_bytes())),
+                "keys_sha256": hex::encode(sha2::Sha256::digest(format!("{}.{}", sub.p256dh, sub.auth).as_bytes())),
+                "replaces": p.store.all().iter().any(|s| s.id == sub.id),
+            });
+            Ok((Action::PushSubscribe(Box::new(sub)), v))
+        }
+        Some("push_details") => {
+            let Some(p) = &state.push else { return Err(err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF)) };
+            let Some(id) = str_field(body, "id") else { return Err(bad("id required")) };
+            if body.get("details").and_then(Value::as_bool) != Some(true) {
+                return Err(bad("only turning details on is signed; turn them off with /api/push/details"));
+            }
+            let Some(d) = p.store.list(&oc.id).into_iter().find(|s| s.id == id) else {
+                return Err(err(StatusCode::NOT_FOUND, "no such device"));
+            };
+            let v = json!({
+                "v": 1, "action": "push_details", "tenant": state.tenant.0, "credential": oc.id,
+                "device": d.id, "label": d.label, "service": d.view()["service"], "details": true,
+            });
+            Ok((Action::PushDetails { operator: oc.id.clone(), device: d.id }, v))
+        }
+        _ => Err(bad("action must be decide, say, revoke, start_run, save_manifest, restore_manifest, push_subscribe or push_details")),
     }
 }
 
@@ -1367,8 +1417,37 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             })?;
             Ok(format!("started {run} from {root}/{name} as {} (log: runs/{run}/console.log)", wicket_identity::principal_label(principal)))
         }
+        Action::PushSubscribe(sub) => {
+            let Some(p) = &state.push else { bail!(PUSH_OFF) };
+            let sub = p.store.insert(push::Subscription { created: wicket_store::now(), ..(**sub).clone() })?;
+            let v = sub.view();
+            l.audit(
+                t,
+                None,
+                "operator.push_subscribed",
+                &json!({ "action": "push_subscribe", "credential": sub.operator, "device": v["id"], "label": v["label"],
+                         "service": v["service"], "details": sub.details, "by": by, "signed": signed }),
+            )?;
+            Ok(format!("notifications on for {} (signed with {})", sub.label, oc.name))
+        }
+        Action::PushDetails { operator, device } => {
+            let Some(p) = &state.push else { bail!(PUSH_OFF) };
+            if !p.store.set_details(operator, device, true)? {
+                bail!("no such device (it was removed after you were shown it)");
+            }
+            l.audit(
+                t,
+                None,
+                "operator.push_details",
+                &json!({ "action": "push_details", "credential": operator, "device": device, "details": true, "by": by, "signed": signed }),
+            )?;
+            Ok(format!("notifications on this device show the request (signed with {})", oc.name))
+        }
     }
 }
+
+/// Why there are no notifications: the push state couldn't be opened at start-up.
+const PUSH_OFF: &str = "notifications are off on this console (see its log)";
 
 /// The VAPID public key browsers subscribe with, and the signed-in operator's devices.
 fn push_view(state: &State, cred: &str) -> Reply {
@@ -1378,15 +1457,17 @@ fn push_view(state: &State, cred: &str) -> Reply {
             "devices": p.store.list(cred).iter().map(|s| s.view()).collect::<Vec<_>>(),
             "min_interval_secs": push::MIN_INTERVAL,
         })),
-        None => err(StatusCode::SERVICE_UNAVAILABLE, "notifications are off on this console (see its log)"),
+        None => err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF),
     }
 }
 
-/// Subscribe a device, remove one, or set whether its notifications show the request. A signed-in
-/// operator only, and only their own devices; each change is audited.
+/// The session-only changes to a device, which only narrow what it receives: remove one, or turn
+/// its details off. A signed-in operator only, and only their own devices; each change is audited.
+/// Registering a device and turning its details on widen it, so they are passkey-signed actions
+/// (`push_subscribe`, `push_details`); asked for here without a signature, they are refused and
+/// the refusal is audited (a stolen session cookie alone adds no receiver).
 fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
-    let Some(p) = &state.push else { return err(StatusCode::SERVICE_UNAVAILABLE, "notifications are off on this console (see its log)") };
-    let now = wicket_store::now();
+    let Some(p) = &state.push else { return err(StatusCode::SERVICE_UNAVAILABLE, PUSH_OFF) };
     let audit = |kind: &str, v: Value| {
         if let Ok(l) = state.ledger() {
             let _ = l.audit(&state.tenant, None, kind, &v);
@@ -1400,24 +1481,8 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
     };
     match path {
         "/api/push/subscribe" => {
-            let (Some(endpoint), Some(p256dh), Some(auth)) =
-                (str_field(body, "endpoint"), str_field(body, "p256dh"), str_field(body, "auth"))
-            else {
-                return err(StatusCode::BAD_REQUEST, "endpoint, p256dh and auth are required");
-            };
-            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
-            let label = str_field(body, "label").unwrap_or("");
-            match p.store.add(cred, &push::NewDevice { endpoint, p256dh, auth, label, details }, now) {
-                Ok(s) => {
-                    let v = s.view();
-                    audit(
-                        "operator.push_subscribed",
-                        json!({ "credential": cred, "device": v["id"], "label": v["label"], "service": v["service"], "details": s.details }),
-                    );
-                    ok(json!({ "ok": "notifications on for this device", "device": v }))
-                }
-                Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
-            }
+            audit("operator.push_refused", json!({ "credential": cred, "path": path, "reason": "unsigned subscribe" }));
+            err(StatusCode::FORBIDDEN, "registering a device is a signed action: sign it with your passkey (action push_subscribe)")
         }
         "/api/push/remove" => {
             if let Some(r) = found(p.store.remove(cred, id)) {
@@ -1427,12 +1492,21 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
             ok(json!({ "ok": "device removed" }))
         }
         _ => {
-            let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
-            if let Some(r) = found(p.store.set_details(cred, id, details)) {
+            if body.get("details").and_then(Value::as_bool).unwrap_or(false) {
+                audit("operator.push_refused", json!({ "credential": cred, "path": path, "device": id, "reason": "unsigned details on" }));
+                return err(
+                    StatusCode::FORBIDDEN,
+                    "showing the request on a device is a signed action: sign it with your passkey (action push_details)",
+                );
+            }
+            if let Some(r) = found(p.store.set_details(cred, id, false)) {
                 return r;
             }
-            audit("operator.push_details", json!({ "credential": cred, "device": id, "details": details }));
-            ok(json!({ "ok": if details { "notifications show the request" } else { "notifications show only the count" } }))
+            audit(
+                "operator.push_details",
+                json!({ "action": "push_details", "credential": cred, "device": id, "details": false, "by": "operator" }),
+            );
+            ok(json!({ "ok": "notifications show only the count" }))
         }
     }
 }

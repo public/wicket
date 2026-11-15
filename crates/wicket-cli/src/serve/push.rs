@@ -7,7 +7,9 @@
 //! - **Subscriptions** are kept per operator (the passkey that was signed in when the device
 //!   subscribed) in `<data>/console/push-subscriptions.json` (0600): endpoint, the browser's `p256dh`
 //!   and `auth` keys, when it was made and when a push last got through. A push service answering 404
-//!   or 410 removes it. A passkey that is no longer enrolled gets no pushes.
+//!   or 410 removes it. A passkey that is no longer enrolled gets no pushes. Registering a device and
+//!   opting it in to details widen what it receives, so both are passkey-signed console actions
+//!   (`push_subscribe`, `push_details` in `serve`); removing one or opting out need only the session.
 //! - **Endpoints** must be HTTPS URLs on a known push service ([`PUSH_SERVICES`]); the console never
 //!   sends to an arbitrary URL a client named (SSRF), and its client follows no redirects.
 //! - **What is sent** ([`Notifier`]): one push per subscription for new requests, at most one per
@@ -220,6 +222,32 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Checks a subscription as a browser posts it (a known push service, a P-256 key, a 16-byte
+    /// secret) and makes it `operator`'s. Nothing is stored.
+    pub fn new(operator: &str, d: &NewDevice, now: i64) -> Result<Subscription> {
+        let NewDevice { endpoint, p256dh, auth, label, details } = *d;
+        check_endpoint(endpoint)?;
+        let key = unb64u(p256dh).map_err(|_| anyhow!("p256dh must be base64url"))?;
+        if key.len() != 65 || p256::PublicKey::from_sec1_bytes(&key).is_err() {
+            bail!("p256dh must be an uncompressed P-256 public key");
+        }
+        if unb64u(auth).map(|a| a.len()) != Ok(16) {
+            bail!("auth must be 16 bytes, base64url");
+        }
+        let label: String = wicket_core::text::strip(label).trim().chars().take(MAX_LABEL).collect();
+        Ok(Subscription {
+            id: subscription_id(endpoint),
+            operator: operator.to_string(),
+            endpoint: endpoint.to_string(),
+            p256dh: b64u(&key),
+            auth: auth.trim_end_matches('=').to_string(),
+            label: if label.is_empty() { "device".into() } else { label },
+            details,
+            created: now,
+            last_success: None,
+        })
+    }
+
     /// What the console shows of it: never the endpoint or keys.
     pub fn view(&self) -> Value {
         let host = url::Url::parse(&self.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
@@ -262,29 +290,16 @@ impl Store {
         super::acme::write_private(&self.path, &serde_json::to_vec_pretty(subs)?)
     }
 
-    /// Adds (or replaces, by endpoint) a subscription for `operator`.
+    /// Adds (or replaces, by endpoint) a subscription for `operator`. The console registers devices
+    /// only through a signed action ([`Store::insert`]); tests add them directly.
+    #[cfg(test)]
     pub fn add(&self, operator: &str, d: &NewDevice, now: i64) -> Result<Subscription> {
-        let NewDevice { endpoint, p256dh, auth, label, details } = *d;
-        check_endpoint(endpoint)?;
-        let key = unb64u(p256dh).map_err(|_| anyhow!("p256dh must be base64url"))?;
-        if key.len() != 65 || p256::PublicKey::from_sec1_bytes(&key).is_err() {
-            bail!("p256dh must be an uncompressed P-256 public key");
-        }
-        if unb64u(auth).map(|a| a.len()) != Ok(16) {
-            bail!("auth must be 16 bytes, base64url");
-        }
-        let label: String = wicket_core::text::strip(label).trim().chars().take(MAX_LABEL).collect();
-        let sub = Subscription {
-            id: subscription_id(endpoint),
-            operator: operator.to_string(),
-            endpoint: endpoint.to_string(),
-            p256dh: b64u(&key),
-            auth: auth.trim_end_matches('=').to_string(),
-            label: if label.is_empty() { "device".into() } else { label },
-            details,
-            created: now,
-            last_success: None,
-        };
+        self.insert(Subscription::new(operator, d, now)?)
+    }
+
+    /// Adds (or replaces, by endpoint) a subscription already checked by [`Subscription::new`].
+    pub fn insert(&self, sub: Subscription) -> Result<Subscription> {
+        let (operator, endpoint) = (sub.operator.as_str(), sub.endpoint.as_str());
         let mut subs = self.subs.lock().expect("lock");
         let mut next: Vec<Subscription> = subs.iter().filter(|s| s.endpoint != endpoint).cloned().collect();
         if next.iter().filter(|s| s.operator == operator).count() >= MAX_PER_OPERATOR {
