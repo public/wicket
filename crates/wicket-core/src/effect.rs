@@ -162,19 +162,19 @@ mod tests {
     #[test]
     fn every_field_is_in_the_hash() {
         let base = effect().sha256();
-        let changes: Vec<Box<dyn Fn(&mut Effect)>> = vec![
-            Box::new(|e| e.run = "run_b".into()),
-            Box::new(|e| e.zone = "other".into()),
-            Box::new(|e| e.path = "/zones/child/other".into()),
-            Box::new(|e| e.prefix = true),
-            Box::new(|e| e.risk = "R1ReadScoped".into()),
-            Box::new(|e| e.method = "LINK".into()),
-            Box::new(|e| e.requested_by = vec!["sub".into()]),
-            Box::new(|e| e.args_sha256 = None),
-            Box::new(|e| e.terms.as_mut().unwrap().uses = Some(2)),
-            Box::new(|e| e.terms.as_mut().unwrap().ttl_secs = 601),
-            Box::new(|e| e.terms.as_mut().unwrap().scope = "zone".into()),
-            Box::new(|e| e.terms = None),
+        let changes: Vec<fn(&mut Effect)> = vec![
+            |e| e.run = "run_b".into(),
+            |e| e.zone = "other".into(),
+            |e| e.path = "/zones/child/other".into(),
+            |e| e.prefix = true,
+            |e| e.risk = "R1ReadScoped".into(),
+            |e| e.method = "LINK".into(),
+            |e| e.requested_by = vec!["sub".into()],
+            |e| e.args_sha256 = None,
+            |e| e.terms.as_mut().unwrap().uses = Some(2),
+            |e| e.terms.as_mut().unwrap().ttl_secs = 601,
+            |e| e.terms.as_mut().unwrap().scope = "zone".into(),
+            |e| e.terms = None,
         ];
         for (i, f) in changes.iter().enumerate() {
             let mut e = effect();

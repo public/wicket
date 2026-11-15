@@ -731,7 +731,8 @@ mod tests {
         let shown = crate::effect::descriptor(&l.request(&id).unwrap(), Some(&terms(600))).sha256();
         let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", "/v1/y");
         l.pending_for(&op, "blocked", Some(&serde_json::json!({ "requesters": [{ "agent": "planted" }] }))).unwrap();
-        let e = decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
+        let e =
+            decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
         assert!(format!("{e:#}").contains("it changed since"), "{e:#}");
     }
 

@@ -151,7 +151,8 @@ mod tests {
         let t = TenantId::single();
         let op = Op::egress(&t, &run, "z", "GET", "files.example", "/docs/a");
         let (id, _) = l.pending_for(&op, "", None).unwrap();
-        let ev = |m: &str, p: &str| serde_json::json!({ "kind": "egress", "method": m, "host": "files.example", "path": p, "outcome": "allow" });
+        let ev =
+            |m: &str, p: &str| serde_json::json!({ "kind": "egress", "method": m, "host": "files.example", "path": p, "outcome": "allow" });
         for (m, p) in [("GET", "/docs/a"), ("GET", "/docs/b"), ("GET", "/docs/c/d"), ("GET", "/other"), ("POST", "/docs/b")] {
             l.audit(&t, Some(&run), "op", &ev(m, p)).unwrap();
         }
@@ -176,7 +177,8 @@ mod tests {
         let (l, req) = setup();
         assert_eq!(blast_radius(&l, None, &req, &terms(Some(1), 600, None, false)).unwrap(), None);
         let zone: ZoneSpec =
-            serde_yaml::from_str("name: z\nreach:\n  - host: files.example\n    paths: [/docs/public/**]\n  - host: other.example\n").unwrap();
+            serde_yaml::from_str("name: z\nreach:\n  - host: files.example\n    paths: [/docs/public/**]\n  - host: other.example\n")
+                .unwrap();
         let b = blast_radius(&l, Some(&zone), &req, &terms(None, 7200, Some("/docs"), true)).unwrap().expect("it widens");
         assert_eq!(b.widens.len(), 4, "{b:?}");
         assert_eq!((b.covered, b.recent), (3, 5), "GET /docs/a, /docs/b and /docs/c/d, not /other or the POST");

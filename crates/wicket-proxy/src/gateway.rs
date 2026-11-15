@@ -586,7 +586,7 @@ impl Gateway {
             return (format!("an operator denied exactly this update ({rid}) a few minutes ago; don't ask again"), true);
         }
         // The artifact's hash is the argument the approval is for (#369), as well as its path.
-        match l.file_request(&op, Some(&sha), &format!("update wicket to the build with sha256 {sha}: {reason}"), None).map(|f| f.id().to_string()) {
+        match l.file_request(&op, Some(sha), &format!("update wicket to the build with sha256 {sha}: {reason}"), None).map(|f| f.id().to_string()) {
             Ok(rid) => (
                 format!(
                     "needs an operator: request {rid}. This does not update wicket, and nothing you can call does. If an operator approves it, they run `wicket self update <artifact>` on the control host, which accepts the artifact with sha256 {sha} once. Call await_grant with {rid} to wait for the decision."

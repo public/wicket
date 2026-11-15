@@ -344,8 +344,8 @@ async fn open(
                 let rid = match l.file_request(&op, Some(&args), &reason, None).map_err(|e| e.to_string())? {
                     Filed::Held { pending } => {
                         return Ok(format!(
-                            "waiting: request {pending} for this link under another name is not decided yet. Call await_grant with {pending}."
-                        ))
+                        "waiting: request {pending} for this link under another name is not decided yet. Call await_grant with {pending}."
+                    ))
                     }
                     f => f.id().to_string(),
                 };

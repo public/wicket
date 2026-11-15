@@ -483,7 +483,9 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 ));
             }
             EffectUse::Spent { grant } => {
-                return Err(format!("{name} was already started under its approval ({grant}), which allowed it once; it is not started again"));
+                return Err(format!(
+                    "{name} was already started under its approval ({grant}), which allowed it once; it is not started again"
+                ));
             }
             EffectUse::Granted(gid) => {
                 beyond = true;
@@ -1274,7 +1276,9 @@ mod tests {
             kind: "agent".into(),
             task: Some(task.into()),
             command: vec![],
-            zone: Some(json!({ "llm": { "max_requests": 5 }, "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org" }] })),
+            zone: Some(
+                json!({ "llm": { "max_requests": 5 }, "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org" }] }),
+            ),
             escalate: true,
             ..program("worker")
         };
@@ -1284,7 +1288,10 @@ mod tests {
         let rid = pending(&p)[0].id.clone();
         // The effect is the child, by zone and name; its arguments are hashed beside it.
         let r = &pending(&p)[0];
-        assert!(r.path.starts_with("/zones/") && r.path.ends_with("/worker") && r.args_sha256.as_ref().is_some_and(|a| a.len() == 64), "{r:?}");
+        assert!(
+            r.path.starts_with("/zones/") && r.path.ends_with("/worker") && r.args_sha256.as_ref().is_some_and(|a| a.len() == 64),
+            "{r:?}"
+        );
         // A sibling call for the same child with another task, while it is pending: it waits on it.
         let held = spawn(&p.ctx, wide("delete everything")).unwrap();
         assert!(held.starts_with(&format!("waiting: request {rid}")), "{held}");
@@ -1294,7 +1301,15 @@ mod tests {
             .ledger
             .lock()
             .unwrap()
-            .approve(&rid, &wicket_store::Approval { uses: Some(1), ttl: std::time::Duration::from_secs(600), path_prefix: None, decided_by: "op".into() })
+            .approve(
+                &rid,
+                &wicket_store::Approval {
+                    uses: Some(1),
+                    ttl: std::time::Duration::from_secs(600),
+                    path_prefix: None,
+                    decided_by: "op".into(),
+                },
+            )
             .unwrap();
         let e = spawn(&p.ctx, wide("delete everything")).unwrap_err();
         assert!(e.contains("changed after the approval"), "{e}");
