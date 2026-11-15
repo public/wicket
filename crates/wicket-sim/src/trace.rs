@@ -5,7 +5,7 @@
 use std::fmt;
 
 /// The scenarios a seed runs, by the name `WICKET_SIM_SCENARIO` takes.
-pub const SCENARIOS: [&str; 2] = ["feed", "placement"];
+pub const SCENARIOS: [&str; 3] = ["feed", "placement", "messages"];
 
 /// The command that replays `seed` of `scenario`, printed with every failure.
 pub fn replay_command(scenario: &str, seed: u64) -> String {

@@ -4447,6 +4447,7 @@ dependencies = [
  "wicket-authz",
  "wicket-core",
  "wicket-feed",
+ "wicket-identity",
  "wicket-placement",
  "wicket-proxy",
  "wicket-store",

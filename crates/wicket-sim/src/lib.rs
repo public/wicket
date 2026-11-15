@@ -33,6 +33,7 @@
 
 pub mod boxes;
 pub mod control;
+pub mod messages;
 pub mod node;
 pub mod oracle;
 pub mod placement;
@@ -481,6 +482,7 @@ pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> 
             }
         }
         "placement" => placement::run(seed, dir, placement::Options { keep_trace, ..placement::Options::default() }),
+        "messages" => messages::run(seed, dir, messages::Options { keep_trace }),
         other => panic!("no scenario {other:?}: one of {:?}", trace::SCENARIOS),
     }
 }

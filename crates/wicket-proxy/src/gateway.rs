@@ -115,6 +115,14 @@ impl Gateway {
         body(StatusCode::OK, Some(reply))
     }
 
+    /// The deterministic simulation's seam (#324): a `tools/call` without HTTP, as a relayed call
+    /// from a box's node reaches it. The `sim` feature only adds this.
+    #[cfg(feature = "sim")]
+    pub async fn sim_call(&self, name: &str, args: Value) -> (String, bool) {
+        let r = self.call(&json!({ "name": name, "arguments": args })).await;
+        (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
+    }
+
     async fn call(&self, params: &Value) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
