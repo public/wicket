@@ -52,6 +52,9 @@ exit "${IP_FAIL:-0}""#,
         &bin.join("wicket-fwd"),
         r#"args=()
 for a in "$@"; do
+  # Paths already under the test's root (its home) stay as they are: the root's own path may contain
+  # /wicket/ (a checkout named wicket).
+  case $a in "$ROOT"*) args+=("$a"); continue ;; esac
   a=${a//198.18.0.1:8080/127.0.0.1:${FWD_BUSY:-0}}
   a=${a//198.18.0.1:[0-9]*=/127.0.0.1:0=}
   a=${a//0.0.0.0:443/127.0.0.1:0}
