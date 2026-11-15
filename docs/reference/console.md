@@ -110,7 +110,8 @@ and `session.closed`; decisions are `decision` records, as from anywhere.
 [acp-ui](https://github.com/formulahendry/acp-ui) (MIT; `web/session/FORK.md` says what was kept and
 changed), about 33 KB gzipped. CI builds it from its committed lockfile (`ci/session-view.sh`:
 `npm ci --ignore-scripts`, a licence check, then the build twice from fresh installs, which must give
-the same bytes) and the binary embeds it (`crates/wicket-cli/build.rs`, from the directory in
+the same bytes; then a UI check under jsdom and the view's client against the real endpoint) and
+the binary embeds it (`crates/wicket-cli/build.rs`, from the directory in
 `WICKET_SESSION_VIEW`), served as `/static/session.<hash>.js` and `.css` with Subresource Integrity
 under the console's CSP. A build without `WICKET_SESSION_VIEW` (a plain `cargo build`) embeds a
 placeholder page saying the view wasn't built, and `wicket serve` says so at start-up. To build one

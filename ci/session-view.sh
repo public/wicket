@@ -14,8 +14,10 @@
 #     no eval (the console's CSP refuses it) and no source maps;
 #   - reproducible (#190): node_modules and dist removed, `npm ci` and the build again, the same
 #     bytes. The bundle's sha256 is printed (the signed build's log keeps it);
-#   - with --test: the view's client against the real endpoint (the ignored endpoint test, under
-#     node), and the serve tests with the bundle embedded (WICKET_SESSION_VIEW_REQUIRED).
+#   - with --test: the view's UI under jsdom (check/ui.ts: the real App mounted, opening, the stream
+#     rendered, an escalation decided with the passkey, a prompt, a stop), its client against the
+#     real endpoint (the ignored endpoint test, under node), and the serve tests with the bundle
+#     embedded (WICKET_SESSION_VIEW_REQUIRED).
 # Prints the dist directory to use as WICKET_SESSION_VIEW on its last line.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -62,7 +64,7 @@ echo "session view bundle (reproduced):" >&2
 echo "$first" >&2
 
 if $test; then
-  (cd "$view" && npm run --silent check:build >&2)
+  (cd "$view" && npm run --silent check:build >&2 && npm run --silent check:ui >&2)
   cd "$repo"
   WICKET_SESSION_VIEW=$view/dist WICKET_SESSION_VIEW_REQUIRED=1 cargo test -p wicket-cli --bin wicket --locked -- serve:: --include-ignored >&2
 fi
