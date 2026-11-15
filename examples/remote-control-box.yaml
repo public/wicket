@@ -34,18 +34,28 @@ zone:
     # end. Listing the account's sessions (GET /v1/sessions) stays outside reach.
     - { host: api.anthropic.com, methods: [POST], paths: ["/v1/sessions", "/v1/sessions/*/events", "/v1/sessions/*/archive"] }
     - { host: api.anthropic.com, methods: [GET, PATCH], paths: ["/v1/sessions/*"] }
+    # The session's own metadata (its state and title), read back by id. Like `/v1/sessions/*`
+    # above, the glob can't tell the box's session from the account's others, so reading a session
+    # takes knowing its id; listing them stays outside reach.
+    - { host: api.anthropic.com, methods: [GET], paths: ["/v1/code/sessions/*"] }
     # The account's profile, Claude Code's start-up settings, and checking the login's scopes.
     - { host: api.anthropic.com, methods: [GET], paths: ["/api/oauth/profile", "/api/claude_cli/bootstrap"] }
     - { host: api.anthropic.com, methods: [POST], paths: ["/api/oauth/validate"] }
     # Something to try: reads here are allowed; anything else waits for your approval.
     - { host: example.com }
   forbid:
-    # Your claude.ai connectors would hand the box your account-wide tools, and refreshing the login
-    # is the host's job (the box has no refresh token to offer): never. Anything else outside reach
-    # (other sessions, triggers, memory) waits for your approval, so deny those.
+    # Your claude.ai connectors would hand the box your account-wide tools (listing them, the bare
+    # `/v1/mcp_servers`, which `/**` doesn't match; and a session's remote MCP), and refreshing the
+    # login is the host's job (the box has no refresh token to offer): never. Anything else outside
+    # reach (other sessions, triggers, memory) waits for your approval, so deny those.
     - { host: mcp-proxy.anthropic.com }
-    - { host: api.anthropic.com, paths: ["/v1/mcp_servers/**", "/mcp-registry/**"] }
+    - { host: api.anthropic.com, paths: ["/v1/mcp_servers", "/v1/mcp_servers/**", "/v2/ccr-sessions/*/mcp", "/mcp-registry/**"] }
     - { host: platform.claude.com, paths: ["/v1/oauth/token"] }
+    # Account settings a box has no use for, refused quietly rather than waiting for you at every
+    # start: the consumer-terms notice (grove, which a box can't answer), the organization's fast
+    # mode (penguin mode: the box runs without it), and guest-pass referrals. Claude Code carries on
+    # without each.
+    - { host: api.anthropic.com, paths: ["/api/claude_code_grove", "/api/claude_code_penguin_mode", "/api/oauth/organizations/*/referral/eligibility"] }
   llm:
     secret: claude-login
     max_requests: 3000
