@@ -30,6 +30,8 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`receipts`](#receipts) | What became of the messages this box sent | |
 | [`spawn_agent`](#spawn_agent) | Start a child agent in a narrowed copy of this zone | `max_children` |
 | [`spawn`](#spawn) | Start an agent or program in a zone the caller writes | `max_children` |
+| [`continue_child`](#continue_child) | Give a child agent the caller delegated to another brief, its context intact | |
+| [`delegations`](#delegations) | The caller's delegations: each child's state and its latest report's receipt | |
 | [`request_capacity`](#request_capacity) | Ask for a machine of its own (a lease) | `placement.yaml` |
 | [`request_update`](#request_update) | Ask the operator to update wicket to a build | |
 | [`expose`](#expose) | Offer a TCP port to other boxes | |
@@ -168,7 +170,8 @@ its receipt is `delivered`, or `refused` with why (on the node's audit log, `nod
 Waits for the next message to this agent's principal, from its parent, a child or a permitted peer,
 with the sender's identity (`from.id`, its principal) verified by wicket. Messages held while the
 agent wasn't running arrive first, in the order they were sent. An envelope addressed to another
-principal is dropped. A child also sends a final `run_finished` message (its `status`, a
+principal is dropped. A child agent's report on each brief arrives as a `report` message (see
+[delegation](#delegation)), and a parent's next brief as a `brief`. A child also sends a final `run_finished` message (its `status`, a
 `cause` when its box ended abnormally, e.g. out of memory, and its `result`) when it
 ends.
 
@@ -256,7 +259,8 @@ A receipt is readable only by its sender.
 
 Starts a child agent in its own box with its own identity, in the caller's own zone, optionally
 narrowed to some of its hosts. Returns the child's run id and its principal, which `send_message`
-addresses it by; its messages and result come through `await_message`. Refused when `max_children` is 0 or spent.
+addresses it by, and a [handle](#delegation): its task is a delegation, whose report comes back as a
+message. Refused when `max_children` is 0 or spent.
 
 | argument | type | |
 |---|---|---|
@@ -273,7 +277,7 @@ budget (carved out of the caller's), memory, CPUs, PIDs, time, isolation, images
 becomes a pending R4 request, `SPAWN wicket.internal/zones/<zone>/<digest>`, for exactly that zone:
 the caller waits with `await_grant` and calls `spawn` again with the same arguments. A different
 model route or a credential the caller doesn't have is refused outright, with no approval path.
-Returns the new run id.
+Returns the new run id, and for an agent a [handle](#delegation).
 
 | argument | type | default | |
 |---|---|---|---|
@@ -292,6 +296,60 @@ What `zone` leaves out: no reach and no credentials; the caller's limits, isolat
 caller's `escalation`. A program may not ask for more (`escalation.request: false`) unless `zone`
 says `escalation: { request: true }`, which the caller's zone must allow too. The spawned zone is named
 `<caller's zone>.<name>.<caller's run>`.
+
+## Delegation
+
+An agent `spawn` (or `spawn_agent`) starts is a delegation (#252): its task is its first brief.
+`spawn` ends its answer with the child's handle, one line of JSON:
+
+```text
+handle: {"principal":"spiffe://<domain>/t/<tenant>/z/<zone>.<name>.<run>/a/<name>","delegation":"d-…","run":"run_…","name":"<name>"}
+```
+
+- **Reports are messages.** When a top-level turn of the child's on its brief ends, wicket sends the
+  turn's result to the parent's principal as a message of kind `report`, signed with the child's
+  identity: `body` is `{ delegation, turn, status, report }` (`status` is `turn_ended` or
+  `turn_failed`; `report` is the turn's result, its last 12 KiB). The parent reads it with
+  `await_message`, and it has a receipt like any message (the child reads it with `receipts`; the
+  parent sees it in `delegations`). The child's session stays open after it: wicket never ends it.
+  When the child's run ends, its `run_finished` names the delegation too.
+- **Continuing a child.** `continue_child` gives the same child another brief, in the same run, so
+  its context is intact: a `brief` message the child's session wakes with (its next turn), and its
+  report on it comes back as the next `report`. A child is continued only once it has reported on
+  its last brief; one still working is refused (add to its brief with `send_message`), and one
+  whose run ended is refused (spawn a new one).
+- **What holds.** A brief or a report is a message: data, which grants nothing. The child keeps the
+  zone it was spawned with, within its parent's (#256): continuing it changes no authority. Only the
+  agent that delegated (its principal) may continue a child: anyone else, by name, principal or
+  delegation id, is refused, and isn't told whose child it is. Every step is audited:
+  `delegation.started`, `delegation.reported`, `delegation.continued`, `delegation.refused` and
+  `delegation.ended`.
+
+## `continue_child`
+
+Another brief for a child agent the caller delegated to, once it has reported on its last one.
+Returns the brief's message id, the handle and the brief's first receipt.
+
+| argument | type | default | |
+|---|---|---|---|
+| `child` | string, required | | the child's name, principal or delegation id (`d-…`); the newest of the caller's by that name |
+| `brief` | string or object, required | | what to do next, at most 16 KB |
+| `priority` | `now`, `next` or `later` | `next` | as for `send_message` |
+
+Refused, with why: no child by that name (`no child`), another agent's child (`is not your
+child`), a child still working on its brief, or one whose run has ended.
+
+## `delegations`
+
+The caller's delegations, newest first (at most 50): each one's `delegation` id, `name`,
+`principal`, `run`, `run_status`, `presence` (as [`principals`](#principals) says it), `state`, `turn`
+(1 for the task, one more per continuation), and the receipts of its latest `report` and `brief`.
+
+| state | meaning |
+|---|---|
+| `working` | on its brief: its first turn, or a continuation |
+| `reported` | its turn ended and its report was sent to the parent: `continue_child` may give it another brief |
+| `ended` | its run is over |
 
 ## `request_capacity`
 
