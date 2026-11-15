@@ -54,7 +54,12 @@ pub struct Llm {
     last_activity: std::sync::Mutex<Instant>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
+    /// Told [`Llm::spent_charged`] as each call is sent upstream ([`Llm::set_journal`]).
+    journal: std::sync::Mutex<Option<Journal>>,
 }
+
+/// Where a node writes its count before a call goes upstream ([`Llm::set_journal`]).
+type Journal = Box<dyn Fn(Spent) + Send + Sync>;
 
 /// A run's model budget, as its model proxy enforces it (#256): the limits every check here reads,
 /// and the only ones. On the control host they are the amounts of the run's live quota grants
@@ -231,6 +236,7 @@ impl Llm {
             quota,
             last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
+            journal: std::sync::Mutex::new(None),
         }))
     }
 
@@ -242,6 +248,30 @@ impl Llm {
             cache_read_tokens: self.cache_read_tokens.load(Ordering::SeqCst),
             cache_creation_tokens: self.cache_creation_tokens.load(Ordering::SeqCst),
             output_tokens: self.output_tokens.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What this activation has counted, with the output tokens reserved by calls in flight charged
+    /// in full: what a node persists (#324). A call in flight when the node's `serve` crashes was
+    /// billed upstream and is never settled here, so a restarted node counts it as a call whose
+    /// final usage wasn't seen is counted: its whole reservation.
+    pub fn spent_charged(&self) -> Spent {
+        let mut s = self.spent();
+        s.output_tokens += self.inflight_output_tokens.load(Ordering::SeqCst);
+        s
+    }
+
+    /// Has `f` told [`Llm::spent_charged`] as each model call is sent, before it goes upstream:
+    /// a node persists it there, so a crash can't lose a call the provider bills (#324).
+    pub fn set_journal(&self, f: impl Fn(Spent) + Send + Sync + 'static) {
+        *self.journal.lock().expect("journal") = Some(Box::new(f));
+    }
+
+    /// Tells the journal [`Llm::spent_charged`] now. The count is read under the journal's lock,
+    /// so of two calls the later write is never the older count.
+    pub fn journal(&self) {
+        if let Some(f) = &*self.journal.lock().expect("journal") {
+            f(self.spent_charged());
         }
     }
 
@@ -473,6 +503,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
+        self.journal();
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
         // the credential (first use while the control host is unreachable), the call fails clearly.
@@ -717,6 +748,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return *r,
         };
+        self.journal();
         let reserved = f.reserved;
         let mut parts = parts;
         // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
@@ -1023,7 +1055,10 @@ impl Llm {
         let (parts, ()) = Request::post("/v1/messages").body(()).expect("a static request").into_parts();
         let body = serde_json::json!({"model": "sim", "max_tokens": max_tokens, "messages": []});
         match self.filter(spec, &parts, Bytes::from(body.to_string())) {
-            Ok(f) => Ok(f.reserved),
+            Ok(f) => {
+                self.journal();
+                Ok(f.reserved)
+            }
             Err(r) => Err(r.status().as_u16()),
         }
     }

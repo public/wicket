@@ -8,8 +8,9 @@
 //!   in whatever mode the replica is in. Cut off, the node keeps deciding on the grants it holds.
 //! - **The model proxy** (`serve_box`'s `Llm::new`): the zone's budget, bounded by the run's slice
 //!   (`set_slice`). It restarts from the spend file and the slice on disk (`SPEND_FILE`,
-//!   `nodesecrets::Slices`). The spend file is written by a one-second ticker when the count moved,
-//!   and spend is reported (`Msg::Spent`) on every tick, as `nodesrv` does.
+//!   `nodesecrets::Slices`). The spend file is written before each call goes upstream, with calls
+//!   in flight charged in full (`Llm::set_journal`), and again by a one-second ticker. Spend is
+//!   reported (`Msg::Spent`) on every tick, as `nodesrv` does.
 //! - **The upstream** is a stand-in: it bills each call it receives (in the oracle) as it
 //!   receives it, then answers after a latency. A crash in between is a call billed and never
 //!   settled here, as with a real provider.
@@ -64,11 +65,18 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
     let mut llms = BTreeMap::new();
     for run in RUNS {
         let l = Llm::new(crate::run_ctx(run, &env.zone)).map_err(|e| e.to_string())?;
-        let disk = env.node_disk.borrow();
+        let disk = env.node_disk.lock().expect("node disk");
         if let Some(sp) = disk.spend.get(run) {
             l.merge_spent(*sp);
         }
         l.set_slice(disk.slices.get(run).copied());
+        drop(disk);
+        if env.options.spend_journal {
+            let (d, r) = (env.node_disk.clone(), run.to_string());
+            l.set_journal(move |s| {
+                d.lock().expect("node disk").spend.insert(r.clone(), s);
+            });
+        }
         llms.insert(run.to_string(), l);
     }
     let node = Rc::new(Node { env: env.clone(), replica: RefCell::new(replica), llms });
@@ -87,16 +95,17 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
     }
 }
 
-/// The spend file, written each second the count moved.
+/// The spend file, written each second the count moved: through the journal, with calls in
+/// flight charged in full (`nodesrv` since #324), or without one, as before, what was settled.
 async fn spend_file(node: Rc<Node>) {
     let mut t = tokio::time::interval(Duration::from_secs(1));
     loop {
         t.tick().await;
-        let mut disk = node.env.node_disk.borrow_mut();
         for (run, l) in &node.llms {
-            let now = l.spent();
-            if disk.spend.get(run) != Some(&now) {
-                disk.spend.insert(run.clone(), now);
+            if node.env.options.spend_journal {
+                l.journal();
+            } else {
+                node.env.node_disk.lock().expect("node disk").spend.insert(run.clone(), l.spent());
             }
         }
     }
@@ -150,7 +159,7 @@ async fn link(node: &Rc<Node>, s: turmoil::net::TcpStream) {
                     wire::KIND_MSG => {
                         if let Ok(Ctl::BudgetSlice { run, slice }) = wire::parse::<Ctl>(&body) {
                             if let Some(l) = node.llms.get(&run) {
-                                env.node_disk.borrow_mut().slices.insert(run.clone(), slice);
+                                env.node_disk.lock().expect("node disk").slices.insert(run.clone(), slice);
                                 l.set_slice(Some(slice));
                             }
                         }

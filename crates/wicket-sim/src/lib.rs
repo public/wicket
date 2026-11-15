@@ -20,8 +20,8 @@
 //!
 //! The hosts' run loops are stand-ins, written to follow `wicket-cli`'s `noderun.rs` (control
 //! host) and `nodesrv.rs` (node). Those files open unix sockets and docker themselves, and live in
-//! the CLI binary. The stand-ins keep what those loops persist: the node's spend file, written every
-//! second when it changed, and its slices, written as they arrive. A box stub stands in for the box
+//! the CLI binary. The stand-ins keep what those loops persist: the node's spend file, written
+//! before each model call goes upstream and every second, and its slices, written as they arrive. A box stub stands in for the box
 //! and its proxies' sockets, and the stand-in upstream bills each call it serves. See [`control`],
 //! [`node`] and [`boxes`].
 //!
@@ -259,7 +259,10 @@ pub struct Env {
     pub issuers: BTreeMap<String, Issuer>,
     pub oracle: Rc<RefCell<Oracle>>,
     pub control_disk: Rc<RefCell<control::Disk>>,
-    pub node_disk: Rc<RefCell<node::Disk>>,
+    /// Shared with the model proxies' journals, which must be `Send`.
+    pub node_disk: std::sync::Arc<std::sync::Mutex<node::Disk>>,
+    /// The options the run was made with.
+    pub options: Options,
     /// The stand-in upstream's choices (output tokens per call, its latency).
     pub upstream: Rc<RefCell<Rng>>,
 }
@@ -313,13 +316,31 @@ pub fn true_now() -> i64 {
     turmoil::since_epoch().map(|d| d.as_millis() as i64).unwrap_or(EPOCH_MS)
 }
 
-/// Runs the scenario for `seed`, with the hosts' directories under `dir` (removed after).
-pub fn run(seed: u64, dir: &Path) -> Report {
-    run_with(seed, dir, false)
+/// How a run is made.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Keep the whole trace in the report (for a replay).
+    pub keep_trace: bool,
+    /// The node persists its spend before each model call goes upstream (`Llm::set_journal`, as
+    /// `nodesrv` does since #324). Off: only the one-second spend file, as before. The simulation
+    /// then finds the overspend that journal fixes (`tests/scenario.rs`).
+    pub spend_journal: bool,
 }
 
-/// As [`run`], keeping the whole trace in the report if `keep_trace`.
-pub fn run_with(seed: u64, dir: &Path, keep_trace: bool) -> Report {
+impl Default for Options {
+    fn default() -> Options {
+        Options { keep_trace: false, spend_journal: true }
+    }
+}
+
+/// Runs the scenario for `seed`, with the hosts' directories under `dir` (removed after).
+pub fn run(seed: u64, dir: &Path) -> Report {
+    run_with(seed, dir, Options::default())
+}
+
+/// As [`run`], with `options`.
+pub fn run_with(seed: u64, dir: &Path, options: Options) -> Report {
+    let keep_trace = options.keep_trace;
     let plan = Plan::new(seed);
     let dir = dir.join(format!("seed-{seed}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -355,7 +376,8 @@ pub fn run_with(seed: u64, dir: &Path, keep_trace: bool) -> Report {
         issuers,
         oracle: Rc::new(RefCell::new(Oracle::new(QUOTA, TTL_MS, MAX_SKEW_MS, keep_trace))),
         control_disk: Rc::new(RefCell::new(control::Disk::default())),
-        node_disk: Rc::new(RefCell::new(node::Disk::default())),
+        node_disk: Default::default(),
+        options,
         upstream: Rc::new(RefCell::new(rngs.fork())),
     });
 

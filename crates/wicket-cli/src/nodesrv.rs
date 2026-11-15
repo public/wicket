@@ -1892,11 +1892,17 @@ async fn serve_box(
                 }
             }
         }));
-        // Spend: persisted and reported when it moves, and every 10 s anyway (a new connection
-        // learns it without waiting for the next call).
-        let (n, run, l2, path) = (node.clone(), bs.run.clone(), l.clone(), dir.join(SPEND_FILE));
+        // Spend: persisted before each call goes upstream, with the calls in flight charged their
+        // whole reservation (#324): a `serve` that crashes mid-call, or within a second of one,
+        // restarts counting every call the provider billed, so its slice still bounds the spend.
+        let path = dir.join(SPEND_FILE);
+        l.set_journal(move |s| write_spend(&path, &s));
+        // And reported when it moves, and every 10 s anyway (a new connection learns it without
+        // waiting for the next call); persisted again as calls settle.
+        let (n, run, l2) = (node.clone(), bs.run.clone(), l.clone());
         tasks.push(tokio::spawn(async move {
             let mut last = wicket_proxy::llm::Spent::default();
+            let mut last_charged = wicket_proxy::llm::Spent::default();
             let mut last_first = None;
             let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut i = 0u64;
@@ -1904,8 +1910,10 @@ async fn serve_box(
                 t.tick().await;
                 i += 1;
                 let now = l2.spent();
-                if now != last {
-                    let _ = std::fs::write(&path, serde_json::to_vec(&now).unwrap_or_default());
+                let charged = l2.spent_charged();
+                if charged != last_charged {
+                    l2.journal();
+                    last_charged = charged;
                 }
                 // When the box's first model request came (#287): reported with its spend, as soon
                 // as there is one.
@@ -2028,6 +2036,16 @@ async fn sample_memory(n: &Arc<Node>) {
 
 /// A box's model spend as its node counted it (#152), beside its record.
 const SPEND_FILE: &str = "node-spend.json";
+
+/// Writes a box's spend file whole or not at all (a temporary file renamed over it): a crash
+/// mid-write must not leave a short file, which a restarted `serve` would read as nothing spent.
+/// Called under the model proxy's journal lock only ([`wicket_proxy::llm::Llm::journal`]).
+fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) {
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
 fn box_name_ok(name: &str, run: &str) -> bool {
