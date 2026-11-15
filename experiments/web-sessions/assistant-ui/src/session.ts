@@ -58,14 +58,15 @@ export class Session {
     this.listeners.forEach((l) => l());
   }
 
-  async connect(ticket: string) {
+  /** `via`: another URL and WebSocket constructor (the check script runs in node). */
+  async connect(ticket: string, via?: { url: string; WebSocket: any }) {
     this.state = "connecting";
     this.changed();
-    const { url, protocols } = socket(this.run, ticket);
+    const { url, protocols } = via ? { url: via.url, protocols: ["acp.v1", `wicket.ticket.${ticket}`] } : socket(this.run, ticket);
     const app = client({ name: "wicket-console" })
       .onNotification(methods.client.session.update, ({ params }: { params: SessionNotification }) => this.update(params))
       .onRequest(methods.client.session.requestPermission, ({ params }: { params: RequestPermissionRequest }) => this.permission(params));
-    const conn = app.connect(createWebSocketStream(url, { protocols }));
+    const conn = app.connect(createWebSocketStream(url, { protocols, WebSocket: via?.WebSocket }));
     this.conn = conn;
     conn.closed.then(() => {
       this.state = "closed";
@@ -88,18 +89,21 @@ export class Session {
     this.changed();
   }
 
-  async prompt(text: string) {
-    if (!this.conn) return;
+  /** Sends a prompt; resolves with the turn's stop reason. */
+  async prompt(text: string): Promise<string> {
+    if (!this.conn) return "not connected";
     this.messages.push({ id: `u${this.n++}`, role: "user", by: "you", parts: [{ type: "text", text }] });
     this.running = true;
     this.changed();
+    let stop = "error";
     try {
-      await this.conn.agent.request(methods.agent.session.prompt, { sessionId: this.run, prompt: [{ type: "text", text }] });
+      stop = (await this.conn.agent.request(methods.agent.session.prompt, { sessionId: this.run, prompt: [{ type: "text", text }] })).stopReason;
     } catch (e) {
       this.error = String((e as Error).message ?? e);
     }
     this.running = false;
     this.changed();
+    return stop;
   }
 
   /** The assistant message the next part goes into (a new one after a user message). */

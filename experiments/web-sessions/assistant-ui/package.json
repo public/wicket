@@ -6,7 +6,8 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc --noEmit && vite build",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "check:build": "vite build --ssr check/check.ts --outDir check-dist"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "2.7.0",

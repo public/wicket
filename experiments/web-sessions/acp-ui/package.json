@@ -6,7 +6,8 @@
   "license": "MIT",
   "scripts": {
     "build": "vue-tsc --noEmit && vite build",
-    "check": "vue-tsc --noEmit"
+    "check": "vue-tsc --noEmit",
+    "check:build": "vite build --ssr check/check.ts --outDir check-dist"
   },
   "dependencies": {
     "vue": "3.5.45"
