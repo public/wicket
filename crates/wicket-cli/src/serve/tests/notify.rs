@@ -108,10 +108,34 @@ async fn new_requests_push_once_per_device_coalesced_and_gone_devices_are_droppe
     let sent = recorder(&mut t, |u| if u.contains("gone") { 410 } else { 201 });
     let (p, a) = keys();
     let store = &t.state.push.as_ref().unwrap().store;
-    let live = store.add(&t.cred, "https://fcm.googleapis.com/fcm/send/live", &p, &a, "laptop", true, 0).unwrap();
-    store.add(&t.cred, "https://web.push.apple.com/gone", &p, &a, "phone", false, 0).unwrap();
+    let live = store
+        .add(
+            &t.cred,
+            &push::NewDevice { endpoint: "https://fcm.googleapis.com/fcm/send/live", p256dh: &p, auth: &a, label: "laptop", details: true },
+            0,
+        )
+        .unwrap();
+    store
+        .add(
+            &t.cred,
+            &push::NewDevice { endpoint: "https://web.push.apple.com/gone", p256dh: &p, auth: &a, label: "phone", details: false },
+            0,
+        )
+        .unwrap();
     // A device of a passkey that's no longer enrolled gets nothing.
-    store.add("revoked-passkey", "https://updates.push.services.mozilla.com/wpush/v2/x", &p, &a, "", false, 0).unwrap();
+    store
+        .add(
+            "revoked-passkey",
+            &push::NewDevice {
+                endpoint: "https://updates.push.services.mozilla.com/wpush/v2/x",
+                p256dh: &p,
+                auth: &a,
+                label: "",
+                details: false,
+            },
+            0,
+        )
+        .unwrap();
     t.running("run_n", "lead");
     let (tn, rn) = (TenantId::single(), RunId("run_n".into()));
     let ask = |path: &str| {

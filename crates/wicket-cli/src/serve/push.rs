@@ -50,6 +50,7 @@ pub const MAX_PER_OPERATOR: usize = 10;
 pub const MAX_TOTAL: usize = 100;
 /// A VAPID JWT's lifetime (RFC 8292 allows at most 24 hours).
 const JWT_LIFETIME: i64 = 12 * 3600;
+const _: () = assert!(JWT_LIFETIME <= 24 * 3600);
 /// The longest request summary a details-on device gets.
 const MAX_SUMMARY: usize = 200;
 
@@ -231,6 +232,16 @@ pub fn subscription_id(endpoint: &str) -> String {
     hex::encode(sha2::Sha256::digest(endpoint.as_bytes()))[..16].to_string()
 }
 
+/// A subscription as a browser posts it.
+#[derive(Clone, Copy, Debug)]
+pub struct NewDevice<'a> {
+    pub endpoint: &'a str,
+    pub p256dh: &'a str,
+    pub auth: &'a str,
+    pub label: &'a str,
+    pub details: bool,
+}
+
 /// The subscriptions, in a 0600 JSON file.
 pub struct Store {
     path: PathBuf,
@@ -252,16 +263,8 @@ impl Store {
     }
 
     /// Adds (or replaces, by endpoint) a subscription for `operator`.
-    pub fn add(
-        &self,
-        operator: &str,
-        endpoint: &str,
-        p256dh: &str,
-        auth: &str,
-        label: &str,
-        details: bool,
-        now: i64,
-    ) -> Result<Subscription> {
+    pub fn add(&self, operator: &str, d: &NewDevice, now: i64) -> Result<Subscription> {
+        let NewDevice { endpoint, p256dh, auth, label, details } = *d;
         check_endpoint(endpoint)?;
         let key = unb64u(p256dh).map_err(|_| anyhow!("p256dh must be base64url"))?;
         if key.len() != 65 || p256::PublicKey::from_sec1_bytes(&key).is_err() {
@@ -589,7 +592,6 @@ mod tests {
         assert_eq!(head, json!({ "typ": "JWT", "alg": "ES256" }));
         let claims: Value = serde_json::from_slice(&d(parts[1])).unwrap();
         assert_eq!(claims, json!({ "aud": "https://fcm.googleapis.com", "exp": 1_000 + JWT_LIFETIME, "sub": "https://console.example" }));
-        assert!(JWT_LIFETIME <= 24 * 3600);
         let sig = d(parts[2]);
         assert_eq!(sig.len(), 64, "ES256 is r || s, not DER");
         let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&pk).unwrap();
@@ -645,17 +647,37 @@ mod tests {
         let path = dir.0.join("console/push-subscriptions.json");
         let s = Store::open(&path).unwrap();
         let (p, a) = browser_keys();
-        let one = s.add("cred-a", "https://fcm.googleapis.com/fcm/send/1", &p, &a, "phone\u{202e}", false, 10).unwrap();
+        let one = s
+            .add(
+                "cred-a",
+                &NewDevice {
+                    endpoint: "https://fcm.googleapis.com/fcm/send/1",
+                    p256dh: &p,
+                    auth: &a,
+                    label: "phone\u{202e}",
+                    details: false,
+                },
+                10,
+            )
+            .unwrap();
         assert_eq!(one.label, "phone");
-        let two = s.add("cred-b", "https://web.push.apple.com/2", &p, &a, "", true, 11).unwrap();
+        let two = s
+            .add("cred-b", &NewDevice { endpoint: "https://web.push.apple.com/2", p256dh: &p, auth: &a, label: "", details: true }, 11)
+            .unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(s.list("cred-a"), vec![one.clone()]);
         assert!(!one.view().to_string().contains("fcm/send/1"), "the view never shows the endpoint");
         // Bad keys, unknown services.
-        assert!(s.add("cred-a", "https://evil.example/x", &p, &a, "", false, 12).is_err());
-        assert!(s.add("cred-a", "https://fcm.googleapis.com/x", "AAAA", &a, "", false, 12).is_err());
-        assert!(s.add("cred-a", "https://fcm.googleapis.com/x", &p, "AAAA", "", false, 12).is_err());
+        assert!(s
+            .add("cred-a", &NewDevice { endpoint: "https://evil.example/x", p256dh: &p, auth: &a, label: "", details: false }, 12)
+            .is_err());
+        assert!(s
+            .add("cred-a", &NewDevice { endpoint: "https://fcm.googleapis.com/x", p256dh: "AAAA", auth: &a, label: "", details: false }, 12)
+            .is_err());
+        assert!(s
+            .add("cred-a", &NewDevice { endpoint: "https://fcm.googleapis.com/x", p256dh: &p, auth: "AAAA", label: "", details: false }, 12)
+            .is_err());
         // Another operator can't remove or change it.
         assert!(!s.remove("cred-b", &one.id).unwrap());
         assert!(!s.set_details("cred-b", &one.id, true).unwrap());
@@ -673,11 +695,33 @@ mod tests {
         assert!(Store::open(&path).unwrap().all().is_empty());
         // Bounded per operator.
         for i in 0..MAX_PER_OPERATOR {
-            s.add("cred-a", &format!("https://fcm.googleapis.com/fcm/send/{i}"), &p, &a, "", false, 30).unwrap();
+            s.add(
+                "cred-a",
+                &NewDevice {
+                    endpoint: &format!("https://fcm.googleapis.com/fcm/send/{i}"),
+                    p256dh: &p,
+                    auth: &a,
+                    label: "",
+                    details: false,
+                },
+                30,
+            )
+            .unwrap();
         }
-        assert!(s.add("cred-a", "https://fcm.googleapis.com/fcm/send/more", &p, &a, "", false, 30).is_err());
+        assert!(s
+            .add(
+                "cred-a",
+                &NewDevice { endpoint: "https://fcm.googleapis.com/fcm/send/more", p256dh: &p, auth: &a, label: "", details: false },
+                30
+            )
+            .is_err());
         // Re-subscribing the same endpoint replaces it.
-        s.add("cred-a", "https://fcm.googleapis.com/fcm/send/0", &p, &a, "", true, 31).unwrap();
+        s.add(
+            "cred-a",
+            &NewDevice { endpoint: "https://fcm.googleapis.com/fcm/send/0", p256dh: &p, auth: &a, label: "", details: true },
+            31,
+        )
+        .unwrap();
         assert_eq!(s.list("cred-a").len(), MAX_PER_OPERATOR);
     }
 
@@ -754,8 +798,17 @@ mod tests {
         let push = Push::open(&dir.0.join("console"), "https://console.example", transport).unwrap();
         let ua = random_secret();
         let (p, a) = (b64u(&public_bytes(&ua)), b64u(&[9u8; 16]));
-        let live = push.store.add("c", "https://fcm.googleapis.com/fcm/send/live", &p, &a, "laptop", false, 1).unwrap();
-        push.store.add("c", "https://web.push.apple.com/gone", &p, &a, "phone", false, 1).unwrap();
+        let live = push
+            .store
+            .add(
+                "c",
+                &NewDevice { endpoint: "https://fcm.googleapis.com/fcm/send/live", p256dh: &p, auth: &a, label: "laptop", details: false },
+                1,
+            )
+            .unwrap();
+        push.store
+            .add("c", &NewDevice { endpoint: "https://web.push.apple.com/gone", p256dh: &p, auth: &a, label: "phone", details: false }, 1)
+            .unwrap();
         let mut n = Notifier::default();
         n.tick(&[], &push.store.all(), 0);
         let out = n.tick(&[w("r-1")], &push.store.all(), 5);

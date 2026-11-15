@@ -1406,7 +1406,8 @@ fn push_post(state: &State, cred: &str, path: &str, body: &Value) -> Reply {
                 return err(StatusCode::BAD_REQUEST, "endpoint, p256dh and auth are required");
             };
             let details = body.get("details").and_then(Value::as_bool).unwrap_or(false);
-            match p.store.add(cred, endpoint, p256dh, auth, str_field(body, "label").unwrap_or(""), details, now) {
+            let label = str_field(body, "label").unwrap_or("");
+            match p.store.add(cred, &push::NewDevice { endpoint, p256dh, auth, label, details }, now) {
                 Ok(s) => {
                     let v = s.view();
                     audit(
