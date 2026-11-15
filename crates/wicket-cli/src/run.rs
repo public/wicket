@@ -1468,6 +1468,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let acp_state = dir.join("ctl/acp.json");
     let mut acp_audits: u32 = 0;
     let mut acp: Option<wicket_agent::acp::AcpClient> = None;
+    // What wicket says to the agent, for the console's session view (#327): only ACP runs keep it.
+    let mut acp_log = acp_cfg
+        .is_some()
+        .then(|| crate::transcript::AcpLog::open(&dir, m.zone.limits.output_bytes().unwrap_or(64 << 20), record.is_some()));
     if let Some(cfg) = acp_cfg {
         if record.is_some() {
             let c =
@@ -1475,7 +1479,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             acp = Some(c);
         } else {
             let (mut c, mut out) = wicket_agent::acp::AcpClient::start(cfg);
+            if let Some(log) = acp_log.as_mut() {
+                log.queued(0, if wake.is_some() { "wake" } else { "task" }, None);
+            }
             out.extend(c.prompt(wake.as_ref().map(|w| w.first.as_str()).unwrap_or(&m.task)));
+            if let Some(log) = acp_log.as_mut() {
+                log.wrote(0, &out.join("\n"));
+            }
             if let Some(si) = stdin.as_mut() {
                 use tokio::io::AsyncWriteExt;
                 for l in out {
@@ -1623,6 +1633,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
                             }
                         };
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &st.write.join("\n"));
+                        }
                         if let Some(si) = stdin.as_mut() {
                             use tokio::io::AsyncWriteExt;
                             for w in &st.write {
@@ -1780,12 +1793,19 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
             }
             _ = tick.tick(), if stdin.is_some() => {
-                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
-                for (text, by) in msgs {
+                let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default();
+                for (op, text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
                     println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
-                        if si.write_all(turn_input(&mut acp, &acp_state, &text).as_bytes()).await.is_err() {
+                        if let Some(log) = acp_log.as_mut() {
+                            log.queued(transcript_f.offset(), &by, Some(op));
+                        }
+                        let input = turn_input(&mut acp, &acp_state, &text);
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        if si.write_all(input.as_bytes()).await.is_err() {
                             stdin = None;
                             break;
                         }
@@ -1812,7 +1832,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let t = format!("[wicket] {waiting} message(s) from other agents are waiting: read them with wicket's await_message tool.");
                     println!("{t}");
                     if let Some(si) = stdin.as_mut() {
-                        let _ = si.write_all(turn_input(&mut acp, &acp_state, &t).as_bytes()).await;
+                        if let Some(log) = acp_log.as_mut() {
+                            log.queued(transcript_f.offset(), "wicket", None);
+                        }
+                        let input = turn_input(&mut acp, &acp_state, &t);
+                        if let Some(log) = acp_log.as_mut() {
+                            log.wrote(transcript_f.offset(), &input);
+                        }
+                        let _ = si.write_all(input.as_bytes()).await;
                     }
                     notified_msgs = waiting;
                     turn_running = true;

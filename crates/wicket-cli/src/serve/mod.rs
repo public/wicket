@@ -54,6 +54,7 @@ mod authority;
 mod limits;
 mod manifests;
 mod net;
+mod session;
 mod tls;
 mod web;
 
@@ -142,6 +143,10 @@ enum Action {
         run: String,
         reason: String,
     },
+    /// Open a run's ACP session socket as the operator (#327): issues a single-use ticket.
+    OpenSession {
+        run: String,
+    },
     /// Save (or restore) a manifest in the installation's manifests directory (#172).
     SaveManifest(Box<manifests::Save>),
     Start {
@@ -216,6 +221,8 @@ struct State {
     vault_dir: PathBuf,
     /// The authority root's public key, which runs' tokens load against (`authority.rs`).
     authz_root: Option<wicket_authz::PublicKey>,
+    /// Signed `open_session` tickets waiting for their WebSocket ([`session`]).
+    tickets: Mutex<HashMap<String, session::Ticket>>,
 }
 
 impl State {
@@ -250,6 +257,7 @@ impl State {
             authed: AtomicU64::new(0),
             vault_dir: wicket_proxy::vault::Vault::default_dir(),
             authz_root: crate::roots::authz_root_public().ok(),
+            tickets: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -710,6 +718,53 @@ where
     }
 }
 
+/// A WebSocket upgrade for a run's ACP session (#327), if `req` is one: the same origin and
+/// session checks as every request, then [`session::check_upgrade`]. The connection is served
+/// once hyper hands it over.
+fn ws_route<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer: SocketAddr) -> Option<Response<Full<Bytes>>> {
+    let run = session::run_of(req.uri().path())?.to_string();
+    let mut r = ws_upgrade(req, state, peer, run);
+    web::secure_headers(r.headers_mut(), state.hsts);
+    Some(r)
+}
+
+fn ws_upgrade<B: Send + 'static>(req: &mut Request<B>, state: &Arc<State>, peer: SocketAddr, run: String) -> Response<Full<Bytes>> {
+    let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).or(req.uri().authority().map(|a| a.as_str()));
+    if !host.is_some_and(|h| h.eq_ignore_ascii_case(&state.authority)) {
+        return denied();
+    }
+    let forwarded: Vec<Option<&str>> = req.headers().get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect();
+    let ctx = Ctx { sid: cookie_sid(req.headers()), client: limits::client_ip(peer.ip(), &forwarded, &state.trusted) };
+    if req.method() != Method::GET {
+        return denied();
+    }
+    let Some(sess) = session(state, &ctx.sid) else { return denied() };
+    state.authed.fetch_add(1, Ordering::Relaxed);
+    let (ticket, accept) = match session::check_upgrade(state, req.headers(), &run, &sess) {
+        Ok(x) => x,
+        Err((status, msg)) => return to_response(err(status, msg)),
+    };
+    let who = match crate::operators::Operator::console(&state.tenant.0, &ticket.name) {
+        Ok(op) => session::Who { principal: op.id, label: op.label, token: ctx.sid.clone() },
+        Err(e) => return to_response(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    };
+    let on = hyper::upgrade::on(req);
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Ok(up) = on.await {
+            session::serve(hyper_util::rt::TokioIo::new(up), state, run, who, ctx.client).await;
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", accept)
+        .header("sec-websocket-protocol", session::SUBPROTOCOL)
+        .body(Full::new(Bytes::new()))
+        .expect("response")
+}
+
 /// The one-time enrolment link. Any failure (no enrolment open, wrong or used token, throttled)
 /// looks exactly like any other unauthenticated request.
 fn enrol(state: &State, query: &str, ctx: &Ctx) -> Response<Full<Bytes>> {
@@ -1098,6 +1153,17 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             });
             Ok((Action::Say { run: run.into(), text: text.into() }, v))
         }
+        Some("open_session") => {
+            let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
+            check_running(&l, run)?;
+            let identity = (state.identity)(&l, run);
+            let v = json!({
+                "v": 1, "action": "open_session", "tenant": state.tenant.0, "run": run,
+                "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
+                "principal": console_principal(oc),
+            });
+            Ok((Action::OpenSession { run: run.into() }, v))
+        }
         Some("revoke") => {
             let Some(run) = str_field(body, "run") else { return Err(bad("run required")) };
             let reason = str_field(body, "reason").map(str::trim).filter(|r| !r.is_empty()).unwrap_or("revoked by the operator");
@@ -1152,7 +1218,7 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 manifests::prepare(state, kind, body, &state.tenant.0).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             Ok((Action::SaveManifest(Box::new(save)), v))
         }
-        _ => Err(bad("action must be decide, say, revoke, start_run, save_manifest or restore_manifest")),
+        _ => Err(bad("action must be decide, say, open_session, revoke, start_run, save_manifest or restore_manifest")),
     }
 }
 
@@ -1201,6 +1267,7 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     let Some(ch) = body.get("challenge").and_then(|c| c.as_str()) else { return err(StatusCode::BAD_REQUEST, "challenge required") };
     let Some(p) = take_challenge(state, ch) else { return err(StatusCode::FORBIDDEN, "unknown, used or expired challenge") };
     let same_session = p.session.is_some() && p.session == sess.as_ref().map(|s| s.0.clone());
+    let console_session = p.session.clone().unwrap_or_default();
     let Purpose::Action { action_json, nonce, action } = p.purpose else {
         return err(StatusCode::FORBIDDEN, "challenge was issued for something else");
     };
@@ -1218,6 +1285,12 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     // Decisions keep the field name they have always had, so older records and verifiers agree.
     let field = if matches!(*action, Action::Decide { .. }) { "decision_json" } else { "action_json" };
     signed[field] = action_json.into();
+    if let Action::OpenSession { run } = &*action {
+        return match session::open(state, run, &a.oc, &console_session, signed) {
+            Ok(v) => ok(v),
+            Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
     match apply(state, &action, &a.oc, signed) {
         Ok(msg) => ok(json!({ "ok": msg })),
         Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
@@ -1293,6 +1366,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 oc.name
             ))
         }
+        Action::OpenSession { .. } => unreachable!("action_finish opens sessions"),
         Action::SaveManifest(save) => {
             manifests::apply(state, save)?;
             let signed_action: Value =
@@ -1567,6 +1641,7 @@ mod tests {
     mod http;
     mod https;
     mod manifests;
+    mod session;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
         assert_eq!(r.status, status, "{:?}", r.body);

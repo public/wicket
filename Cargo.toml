@@ -39,6 +39,9 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 futures-util = "0.3"
+# WebSocket framing for the console's ACP session endpoint (#327): no TLS or client connector of its own
+# (the console's rustls stack carries it), only the handshake helpers.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

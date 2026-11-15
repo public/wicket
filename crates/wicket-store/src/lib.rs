@@ -526,6 +526,12 @@ impl Ledger {
 
     /// Takes every queued follow-up for `run`, oldest first: (text, by). Each is handed out once.
     pub fn take_operator_messages(&mut self, run: &str) -> Result<Vec<(String, String)>> {
+        Ok(self.take_operator_messages_with_ids(run)?.into_iter().map(|(_, t, b)| (t, b)).collect())
+    }
+
+    /// [`Ledger::take_operator_messages`] with each message's id (what [`Ledger::add_operator_message`]
+    /// returned), so a session that queued one can tell when the agent took it up (#327).
+    pub fn take_operator_messages_with_ids(&mut self, run: &str) -> Result<Vec<(i64, String, String)>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, String, String)> = {
             let mut st = tx.prepare("SELECT id, text, by FROM operator_messages WHERE run = ?1 AND consumed_at IS NULL ORDER BY id")?;
@@ -536,7 +542,7 @@ impl Ledger {
             tx.execute("UPDATE operator_messages SET consumed_at = ?2 WHERE id = ?1", params![id, now()])?;
         }
         tx.commit()?;
-        Ok(rows.into_iter().map(|(_, t, b)| (t, b)).collect())
+        Ok(rows)
     }
 
     // ---- identities and messages (design §3.2) ----
