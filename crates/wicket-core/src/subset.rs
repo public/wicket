@@ -648,3 +648,7 @@ mod tests {
         assert_eq!(parse_bytes("lots"), None);
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/host.rs"]
+mod host_proofs;

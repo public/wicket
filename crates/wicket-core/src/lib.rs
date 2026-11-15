@@ -89,3 +89,6 @@ pub fn new_link_id() -> String {
     let u = ulid::Ulid::new().to_string().to_lowercase();
     format!("l-{}", &u[u.len() - 10..])
 }
+
+#[cfg(kani)]
+mod proofs;
