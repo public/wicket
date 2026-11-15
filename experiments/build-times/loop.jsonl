@@ -30,3 +30,9 @@
 {"label":"base-j1","case":"proxy","phase":"build","secs":15.97,"peak_mib":1872,"commit":"4b1149c","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
 {"label":"base-j1","case":"proxy","phase":"test-build","secs":191.05,"peak_mib":2499,"commit":"4b1149c","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
 {"label":"base-j1","case":"proxy","phase":"test-run-failed","secs":31.45,"peak_mib":357,"commit":"4b1149c","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"all","phase":"prime","secs":3.07,"peak_mib":105,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"core","phase":"build","secs":29.53,"peak_mib":1853,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"core","phase":"test-build","secs":73.57,"peak_mib":1996,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"all","phase":"prime","secs":4.15,"peak_mib":106,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"proxy","phase":"build","secs":21.28,"peak_mib":1858,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}
+{"label":"base-j1","case":"proxy","phase":"test-build","secs":43.91,"peak_mib":2010,"commit":"6de3b4f","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","cargo_args":"","nextest":"","load":"0.00"}

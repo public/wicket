@@ -1,0 +1,5 @@
+{"label":"base-j1","step":"touch-core","secs":110.36,"peak_mib":1987,"commit":"9b0e41b","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j1","step":"touch-cli","secs":47.22,"peak_mib":1991,"commit":"408e279","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j1","step":"test-build","secs":3.46,"peak_mib":106,"commit":"408e279","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j1","step":"test-run-failed","secs":399.92,"peak_mib":814,"commit":"408e279","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j1","step":"sizes","secs":0,"peak_mib":0,"commit":"6de3b4f","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00","test_and_bin_executables":48,"executables_mib":1720,"target_mib":7694,"biggest_mib":"wicket-d7b1ee9e57937612=132,wicket-6dc6d9979456ab9f=132,wicket-f1afa79451537251=131,wicket-b8d6e585e0c572e6=130,wicket_proxy-5de7f6b1d7bb1beb=70"}
