@@ -2490,11 +2490,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             .unwrap();
         // A lease's slice: kept on disk for a restarted `serve`.
         let slice = wicket_proxy::llm::Slice { requests: 3, output_tokens: 300, input_tokens: None };
-        c.write_all(
-            &Frame::Msg(Msg::Lease { run: RUN.into(), lease: Box::new(crate::nodesecrets::Lease { slice: Some(slice) }) }).encode(),
-        )
-        .await
-        .unwrap();
+        c.write_all(&Frame::Msg(Msg::BudgetSlice { run: RUN.into(), slice }).encode()).await.unwrap();
         for _ in 0..200 {
             if node.queue.of(RUN).is_empty() && node.slices.get(RUN).is_some() {
                 break;

@@ -155,9 +155,9 @@ wicket node revoke n1
 - **What a node holds** shows in `wicket node list`, one line per run this host supervises there: when
   the box's authority ends (or that the node confirmed it stopped), the secrets released to the node for
   it (by name, never values) and its budget slice. It is this host's record of what it released and
-  leased (`ctl/holdings.json` beside the run), so an upper bound: the node may have dropped a secret
+  sent (`ctl/holdings.json` beside the run), so an upper bound: the node may have dropped a secret
   already, and never holds more.
-- **Budget slices are leased to the node** (#152), per run: a quarter of the zone's model budget by
+- **Budget slices are sent to the node** (#152, the `BudgetSlice` message), per run: a quarter of the zone's model budget by
   default (`WICKET_NODE_BUDGET_SLICE` on the control host, a fraction), renewed while connected once less
   than half of it is left, and lowered at once when what is left shrinks (a spawn's carve-out). Offline, a
   node spends what is left of its slice and nothing more; a slice is kept on the node's disk
