@@ -23,6 +23,11 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
   out), resources, time, isolation, images and `max_children` (a child's own count against the parent's). Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
   exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
   `in_box_subagents: false` to make wicket children the only kind of subagent.
+- A run's model budget and box slots are quota grants (#256, `wicket grant list`): a root run's are recorded
+  from its zone when it starts, made by whoever started it; a child's are what its parent carved for it, recorded
+  before the child starts. Their amounts are the limits the run's model proxy and its `spawn` check, with the
+  same refusals as before. Each lasts the run's timeout, at most 24h, and the run's supervisor renews it while
+  the run lives; it is revoked when the run ends. A node's budget slices are cut from the same limits.
 - Boxes reach each other's ports only through links, which wicket relays (boxes still have no network):
   `expose(port)` offers a port, `connect(box, port)` returns `<name>.wicket.internal:<port>` in the caller's box,
   and `link(from, to, port)` wires two boxes the caller controls. A box's own children are connectable without

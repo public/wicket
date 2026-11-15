@@ -173,6 +173,12 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
 fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     let g = &r.grant;
     let what = match (g.quota(), g.amount) {
+        // A lease's money (#256): micro-USD, and the lease it is for.
+        (Some(res @ (wicket_store::MONEY_HOURLY | wicket_store::MONEY_RESERVED)), Some(n)) => {
+            let lease = g.path.rsplit('/').next().unwrap_or_default();
+            let unit = if res == wicket_store::MONEY_HOURLY { "/h" } else { "" };
+            format!("quota {res} = ${}.{:06}{unit} (lease {})", n / 1_000_000, n % 1_000_000, wicket_agent::clip(lease, 64))
+        }
         (Some(res), Some(n)) => format!("quota {res} = {n}"),
         _ => format!(
             "{} {}{}",
@@ -203,8 +209,10 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
 
 #[derive(Subcommand)]
 pub enum GrantCmd {
-    /// List grants, newest first: approvals, and the quotas carved for runs (model budget,
-    /// children, bytes; #256). Every grant has a lifetime; only live ones unless --all.
+    /// List grants, newest first: approvals, and runs' quotas (#256): model budget, children and
+    /// bytes (a root run's own zone budget, or what its parent carved for a child: the limits its
+    /// run enforces), and money (a capacity lease's hourly cap and reservation, micro-USD shown as
+    /// USD). Every grant has a lifetime; only live ones unless --all.
     List {
         /// Also revoked and expired grants.
         #[arg(long)]

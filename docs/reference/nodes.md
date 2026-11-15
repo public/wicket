@@ -341,6 +341,11 @@ region, duration, an hourly price cap, a reason). Capacity is a **lease**, never
 1. The ask becomes a pending lease in the ledger with its worst case reserved (every started hour at the
    agent's own cap), atomically against `max_hourly_usd`/`max_total_usd` in `placement.yaml`
    (`examples/placement/placement.yaml`; without it the tool is off). Over budget is refused before a human sees it.
+   Its money is also recorded, in the same transaction, as two quota grants bound to the asking run (#256):
+   `QUOTA wicket.internal /quota/money.hourly/<lease>` (the hourly cap) and `/quota/money.reserved/<lease>` (the
+   worst case), micro-USD, made by `wicket:lease-budget`, lasting the lease's duration plus an hour (at most 24h,
+   renewable), and revoked when the lease ends. `wicket grant list` shows them; they decide nothing and never go to a
+   node. The check stays the budget over the live leases' reservations.
 2. A human decides it like any escalation (`wicket pending`, `wicket approve`/`deny`, or the console). The
    approval is bound to that lease: the placer may spend only on its node, and only up to its reservation.
 3. The reconciler acquires the node (a static host, or a fresh Vultr node with its host key pinned before it
