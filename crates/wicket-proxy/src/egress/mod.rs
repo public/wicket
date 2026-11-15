@@ -2,14 +2,14 @@
 //! decide, then forward with client credentials stripped and the zone's credential injected into
 //! its one declared header slot.
 //!
-//! The same proxy runs on a remote node (`wicket node serve`, #57) with a different [`Decider`]
-//! (the node's feed replica), a different [`Minter`] (the node's name-constrained CA), and a
-//! [`Relay`] to the control host: CONNECTs the node must not terminate (see [`crate::decide::route`])
-//! are tunnelled, raw, to the control host's own egress proxy for the run, which decides and
-//! terminates them there.
+//! It runs on the box's node (`wicket node serve`, #57) with the node's [`Decider`] (its feed
+//! replica), the node's name-constrained CA as its [`Minter`], and a [`Router`] that says which
+//! hosts that CA covers. A host it doesn't cover (see [`crate::decide::route`]) is spliced through
+//! if the box's token allows it wholesale, and refused otherwise: since #257's slice 3 nothing is
+//! forwarded to the control host, which decides no request.
 
-use crate::ca::{Minter, RunCa};
-use crate::decide::{Central, Decider, Outcome, Route};
+use crate::ca::Minter;
+use crate::decide::{Decider, Outcome, Route};
 use crate::{full, problem, BoxBody, Event, RunCtx, FORWARD_METHODS, FORWARD_REQUEST, HOP_BY_HOP, REFUSE_REQUEST};
 use anyhow::Result;
 use bytes::Bytes;
@@ -27,8 +27,6 @@ mod connect;
 mod hosts;
 mod outgoing;
 
-#[cfg(test)]
-use connect::parse_head;
 use outgoing::refused_shape;
 pub use outgoing::render_credential;
 
@@ -48,7 +46,7 @@ pub struct Egress {
     pub(crate) ctx: RunCtx,
     pub(crate) ca: Arc<dyn Minter>,
     pub(crate) decider: Arc<dyn Decider>,
-    pub(crate) relay: Option<Arc<dyn Relay>>,
+    pub(crate) router: Option<Arc<dyn Router>>,
     client: reqwest::Client,
     /// Where upstream connections go and what they trust, beyond DNS and the public roots (tests).
     pub(crate) upstream: Upstream,
@@ -138,31 +136,17 @@ impl OutBody {
     }
 }
 
-/// A byte stream to the control host (one tunnel over the node's control channel).
-pub trait RelayStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream for T {}
-
-/// A node's way to the control host's egress proxy for this run.
-pub trait Relay: Send + Sync {
-    /// Whether the node terminates this host or tunnels it to the control host.
+/// Which hosts a node's proxy can terminate (its CA's name constraints and lifetime).
+pub trait Router: Send + Sync {
+    /// Whether the node terminates this host, or can only splice it (or refuse it).
     fn route(&self, host: &str) -> Route;
-    /// Opens a stream to the run's egress proxy on the control host; an error if the control host is
-    /// unreachable.
-    fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>>;
 }
 
-/// The largest response head (and refusal body) read back from a forwarded CONNECT.
-const MAX_FORWARDED_HEAD: usize = 64 * 1024;
-
 impl Egress {
-    /// The control host's egress proxy for a run: the run's own CA, decisions from the ledger.
-    pub fn new(ctx: RunCtx, ca: Arc<RunCa>) -> Result<Arc<Egress>> {
-        Egress::with(ctx, ca, Arc::new(Central), None)
-    }
-
-    /// An egress proxy with its own decision source, CA and (on a node) relay to the control host.
-    pub fn with(ctx: RunCtx, ca: Arc<dyn Minter>, decider: Arc<dyn Decider>, relay: Option<Arc<dyn Relay>>) -> Result<Arc<Egress>> {
-        Egress::with_upstream(ctx, ca, decider, relay, Upstream::default())
+    /// An egress proxy with its own decision source, CA and (on a node) router: which hosts that CA
+    /// covers. Without one, the CA covers every host.
+    pub fn with(ctx: RunCtx, ca: Arc<dyn Minter>, decider: Arc<dyn Decider>, router: Option<Arc<dyn Router>>) -> Result<Arc<Egress>> {
+        Egress::with_upstream(ctx, ca, decider, router, Upstream::default())
     }
 
     /// As [`Egress::with`], with upstream connections made as `upstream` says.
@@ -170,7 +154,7 @@ impl Egress {
         ctx: RunCtx,
         ca: Arc<dyn Minter>,
         decider: Arc<dyn Decider>,
-        relay: Option<Arc<dyn Relay>>,
+        router: Option<Arc<dyn Router>>,
         upstream: Upstream,
     ) -> Result<Arc<Egress>> {
         let mut b = reqwest::Client::builder()
@@ -203,7 +187,7 @@ impl Egress {
             ctx,
             ca,
             decider,
-            relay,
+            router,
             client,
             upstream,
             h3_up: Default::default(),
@@ -264,13 +248,13 @@ impl Egress {
             if let Some(r) = self.judge_unlisted(&host, "CONNECT").await {
                 return Ok(r);
             }
-            if let Some(relay) = &self.relay {
-                if let Route::Forward(why) = relay.route(&host) {
-                    return Ok(self.clone().forward_connect(req, host, why).await);
-                }
-            }
+            // A host the node's CA can't cover is spliced if its token allows it wholesale (nothing is
+            // terminated then), and refused otherwise (#257: never forwarded).
             if let Some(rule) = self.splice_rule(&host) {
                 return Ok(self.clone().splice_connect(req, host, rule).await);
+            }
+            if let Some(Route::Uncovered(why)) = self.router.as_ref().map(|r| r.route(&host)) {
+                return Ok(self.refuse_uncovered(&host, &why));
             }
             let me = self.clone();
             tokio::spawn(async move {
@@ -304,10 +288,7 @@ impl Egress {
                 if let Some(r) = self.judge_unlisted(&h, req.method().as_str()).await {
                     return Ok(r);
                 }
-                if let Some(Route::Forward(why)) = self.relay.as_ref().map(|r| r.route(&h)) {
-                    let method = req.method().to_string();
-                    return Ok(self.refuse(&h, &method, "/", &format!("plain HTTP to {h} isn't served on this node ({why}); use https")));
-                }
+                // Plain HTTP needs no certificate: the node decides it whatever its CA covers.
                 let me = self.clone();
                 Ok(me.handle(req, h, "http", Via::Tcp).await)
             }
@@ -481,17 +462,6 @@ impl Egress {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn forwarded_response_heads_parse_and_garbage_does_not() {
-        let (st, reason, h) =
-            super::parse_head(b"HTTP/1.1 403 Blocked by wicket sandbox: x\r\nContent-Length: 12\r\nX-Wicket: pending-approval\r\n\r\n")
-                .unwrap();
-        assert_eq!((st, reason.as_str()), (403, "Blocked by wicket sandbox: x"));
-        assert!(h.contains(&("x-wicket".into(), "pending-approval".into())));
-        assert!(super::parse_head(b"\xff\xfe").is_none());
-        assert!(super::parse_head(b"HTTP/1.1 x\r\n\r\n").is_none());
-    }
-
     /// A run context for a zone, with a vault where `gh` may go only to api.github.com.
     fn ctx(zone: &str, swaps: Vec<crate::CredentialSwap>, tag: &str) -> (crate::RunCtx, std::path::PathBuf) {
         use std::sync::{Arc, Mutex};
@@ -530,7 +500,7 @@ mod tests {
 
     async fn prepare(c: crate::RunCtx, host: &str, auth: Option<&str>) -> anyhow::Result<super::Outgoing> {
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::new(c, ca).unwrap();
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         let mut b = http::Request::get("/x").header("host", host);
         if let Some(a) = auth {
             b = b.header("authorization", a);
@@ -579,7 +549,7 @@ mod tests {
         let (c, dir) = ctx(&inject(true), vec![], "optional-unset");
         let ledger = c.ledger.clone();
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::new(c, ca).unwrap();
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         assert!(!e.credentials_for("api.github.com"), "no credential goes to the host");
         for auth in [None, Some("Bearer the-box-own")] {
             let mut b = http::Request::get("/x").header("host", "api.github.com");
@@ -646,7 +616,7 @@ mod tests {
         use http_body_util::BodyExt;
         let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "shape");
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::new(c, ca).unwrap();
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         let empty = || http_body_util::Full::new(bytes::Bytes::new());
         let refused = [
             http::Request::builder().method("TRACE").uri("/x").body(empty()).unwrap(),
@@ -707,7 +677,7 @@ mod tests {
         use http_body_util::BodyExt;
         let (c, dir) = ctx("reach: [{host: api.anthropic.com, methods: [GET, POST]}]", vec![], "model-gate");
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::new(c.clone(), ca).unwrap();
+        let e = super::Egress::with(c.clone(), ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         let llm = crate::llm::Llm::new(c).unwrap();
         e.set_model_gate(llm.clone());
         let send = |path: &str, enc: Option<&str>| {
@@ -793,7 +763,7 @@ mod tests {
             ..Default::default()
         };
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::with_upstream(c.clone(), ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let e = super::Egress::with_upstream(c.clone(), ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
         let llm = crate::llm::Llm::new(c).unwrap();
         e.set_model_gate(llm.clone());
         let body =
@@ -842,7 +812,7 @@ mod tests {
         {
             let (c, dir) = ctx(zone, swaps, tag);
             let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-            let e = super::Egress::new(c, ca).unwrap();
+            let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
             let req = http::Request::get("/user")
                 .header("host", "api.github.com")
                 .header("authorization", "Bearer ph-123")
@@ -866,7 +836,7 @@ mod tests {
         let mut up = super::Upstream::default();
         up.dns.insert("rebind.example".into(), vec!["127.0.0.1".parse().unwrap()]);
         up.dns.insert("meta.example".into(), vec!["8.8.8.8".parse().unwrap(), "169.254.169.254".parse().unwrap()]);
-        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
         for host in ["rebind.example", "meta.example"] {
             let req =
                 http::Request::get("/latest/user-data").header("host", host).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
@@ -900,7 +870,7 @@ mod tests {
         let mut up = super::Upstream::default();
         up.domains.insert("no-such-domain-wkt.com".into(), false);
         up.domains.insert("example.co.uk".into(), true);
-        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
 
         let (st, body) = get(&e, "c2vjcmv0.payload.no-such-domain-wkt.com").await;
         assert_eq!(st, 502, "{body}");
@@ -922,7 +892,7 @@ mod tests {
         let (mut c, _) = ctx("reach: []", vec![], "nxdomain-noesc");
         c.escalate = false;
         let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
-        let e = super::Egress::new(c, ca).unwrap();
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
         assert!(e.judge_unlisted("a.no-such-domain-wkt.com", "CONNECT").await.is_none());
         assert!(e.domains_checked().is_empty());
         for t in ["nxdomain", "nxdomain-noesc"] {
@@ -940,7 +910,7 @@ mod tests {
         let mut up = super::Upstream::default();
         // Loopback answers: a dial is refused (and says so) instead of reaching anything.
         up.dns.insert("a.cdn.example".into(), vec!["127.0.0.1".parse().unwrap()]);
-        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
         assert!(e.splice_rule("exact.example").is_some(), "an exact host splices from the first connection");
         assert!(e.splice_rule("a.cdn.example").is_none(), "inspected until a request is allowed");
         assert!(!e.wildcard_reached("a.cdn.example"));
@@ -965,7 +935,7 @@ mod tests {
         for h in ["a.cdn.example", "b.cdn.example", "c.cdn.example", "x.cdn.example", "a.other.example"] {
             up.dns.insert(h.into(), vec!["127.0.0.1".parse().unwrap()]);
         }
-        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::decide::Central), None, up).unwrap();
+        let e = super::Egress::with_upstream(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None, up).unwrap();
         let resolved = |(st, body): (u16, String)| st == 502 && body.contains("non-public address");
         assert!(resolved(get(&e, "a.cdn.example").await));
         assert!(resolved(get(&e, "b.cdn.example").await));

@@ -18,6 +18,14 @@ pub mod sockpath;
 mod splice;
 pub mod vault;
 
+// The tests' stand-in decision source, shared with the integration tests (which reach it by
+// `#[path]`), written against this crate's public items as `wicket_proxy::`.
+#[cfg(test)]
+extern crate self as wicket_proxy;
+#[cfg(test)]
+#[path = "../tests/support/zone_decider.rs"]
+pub(crate) mod zone_decider;
+
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -764,7 +772,7 @@ mod fence_tests {
     async fn the_egress_proxy_refuses_a_stale_generation() {
         let ctx = stale_ctx();
         let ca = Arc::new(ca::RunCa::generate("run_old").unwrap());
-        let egress = egress::Egress::new(ctx, ca).unwrap();
+        let egress = egress::Egress::with(ctx, ca, Arc::new(zone_decider::ZoneDecider), None).unwrap();
         let d = dir("egress");
         let sock = d.join("egress.sock");
         let server = tokio::spawn({

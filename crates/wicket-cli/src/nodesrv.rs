@@ -49,7 +49,7 @@ use wicket_core::timing::Timings;
 use wicket_feed::{BoxAuthority, Replica, ReplicaConfig};
 use wicket_proxy::ca::{Minter, NodeCa};
 use wicket_proxy::decide::{Asked, Clock, ControlLink, NodeDecider, Route};
-use wicket_proxy::egress::{Egress, Relay, RelayStream};
+use wicket_proxy::egress::{Egress, Router};
 use wicket_sandbox::{Docker, Mount, SandboxSpec};
 use wicket_store::Ledger;
 
@@ -456,7 +456,7 @@ impl Node {
         match loaded {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
-                eprintln!("[node] the node CA is unusable ({e:#}); every host is forwarded to the control host");
+                eprintln!("[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused");
                 None
             }
         }
@@ -464,7 +464,7 @@ impl Node {
 
     /// Opens a tunnel to the run's `target` socket on the control host: over the control channel, or
     /// for the control host's own node, the socket itself (the run's `ctl/` directory, on this host).
-    async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<Box<dyn RelayStream>> {
+    async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<Box<dyn TunnelStream>> {
         if self.paths.shares_host() && chan::TUNNEL_TARGETS.contains(&target) {
             crate::run::check_run_id(run).map_err(std::io::Error::other)?;
             let s = UnixStream::connect(self.paths.runs().join(run).join("ctl").join(format!("{target}.sock"))).await?;
@@ -594,44 +594,32 @@ impl ControlLink for Control {
     }
 }
 
-/// Where a run's CONNECTs go, and the way to the control host's egress proxy for it.
-struct NodeRelay {
-    node: Arc<Node>,
-    run: String,
-    zone: Arc<wicket_core::CompiledZone>,
+/// A byte stream to one of the run's sockets on the control host (a tunnel over the run's channel).
+pub(crate) trait TunnelStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TunnelStream for T {}
+
+/// Which of a run's CONNECTs this node can terminate: what its CA covers (#257). The rest are
+/// spliced where the box's token allows the host wholesale, and refused otherwise; none is
+/// forwarded to the control host.
+struct NodeRouter {
     ca: Option<Arc<NodeCa>>,
-    /// Hosts a control host before protocol 10 swaps a credential in for itself (#169): always
-    /// forwarded to it. A box started since #257 has its swaps made here and none of these.
-    kept: Vec<String>,
+    clock: Clock,
 }
 
-impl Relay for NodeRelay {
+impl Router for NodeRouter {
     fn route(&self, host: &str) -> Route {
-        // The zone as the feed has it now (inject rules may have changed since the box started).
-        let spec = {
-            let r = self.node.replica.lock().expect("replica");
-            r.zone_of(&self.run).filter(|z| z.name == self.zone.name).cloned()
-        };
-        let spec = spec.unwrap_or_else(|| (*self.zone).clone());
-        let now = (self.node.clock)() / 1000;
-        // Injected and swapped hosts are decided here too, their secret fetched on first use (#152,
-        // #257): only what the CA can't cover is forwarded.
-        wicket_proxy::decide::route_sealed(host, &spec, &self.kept, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now, &|_| {
-            true
-        })
-    }
-
-    fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn RelayStream>>> {
-        Box::pin(async move { self.node.open_tunnel(&self.run, "egress").await })
+        let now = (self.clock)() / 1000;
+        wicket_proxy::decide::route(host, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
     }
 }
 
-/// A minter for a node without a usable CA: every host is forwarded, so it is never asked.
+/// A minter for a node without a usable CA: every host is uncovered (spliced or refused), so it is
+/// never asked.
 struct NoCa;
 
 impl Minter for NoCa {
     fn server_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
-        bail!("this node has no usable CA: {host} must be forwarded")
+        bail!("this node has no usable CA: {host} can't be terminated here")
     }
 }
 
@@ -1345,7 +1333,6 @@ fn child_start(
         llm_prior: (0, 0, 0),
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
-        swap_hosts: vec![],
         swaps: vec![],
         edge: Some(Box::new(chan::EdgeStart { who, spawn: None, push: None })),
         image_pin: plan.image_pin.clone(),
@@ -1942,8 +1929,9 @@ fn node_swaps(swaps: &[chan::SwapStart]) -> Vec<wicket_proxy::CredentialSwap> {
         .collect()
 }
 
-/// The box's enforcement points: egress and the model proxy decided here; the MCP gateway's tools
-/// this node doesn't decide yet, and hosts it forwards, reached on the control host (#257). Started
+/// The box's enforcement points: egress and the model proxy decided here, every host included
+/// (#257: nothing is forwarded); the MCP gateway's tools this node doesn't decide yet reached on
+/// the control host. Started
 /// for a new box, and again for one a restarted `serve` adopts.
 async fn serve_box(
     node: &Arc<Node>,
@@ -1988,7 +1976,7 @@ async fn serve_box(
         clock: node.clock.clone(),
         control: Arc::new(Control(node.clone(), bs.run.clone())),
     });
-    let relay = Arc::new(NodeRelay { node: node.clone(), run: bs.run.clone(), zone: compiled, ca, kept: bs.swap_hosts.clone() });
+    let router = Arc::new(NodeRouter { ca, clock: node.clock.clone() });
     let mut tasks = vec![];
     // The model proxy (#151, #152), the box's only one (#257): the run's checks here (allowed routes
     // and models, server tools, the budget and this node's slice of it). It calls the model itself
@@ -2053,14 +2041,14 @@ async fn serve_box(
         }));
         l
     };
-    let egress = Egress::with(ctx, minter, decider, Some(relay))?;
+    let egress = Egress::with(ctx, minter, decider, Some(router))?;
     // A wrapped session's model calls reach the model host through egress, their login swapped here
     // (#257): they get this node's budget, filter and accounting, as they did on the control host
     // (#112).
     egress.set_model_gate(llm.clone());
     // DNS and HTTP/3 for the box (#92), decided here like CONNECT: by the node's policy, with the
-    // node's CA; hosts the node forwards to the control host get a 403 over HTTP/3 that points at
-    // the proxy, which forwards them.
+    // node's CA; hosts it can't cover get a 403 over HTTP/3 that points at the proxy, which
+    // splices them if the box's token allows them wholesale (#257).
     let h3 = wicket_proxy::h3::H3::new(egress.clone(), wicket_proxy::h3::Options::from_env())?;
     let sock = dir.join("sock");
     // Each socket is bound and listening before the box can start (#287): the box's forwarder's
@@ -2444,8 +2432,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 llm_prior: (0, 0, 0),
                 output_cap: 64 << 20,
                 output_stop: false,
-                swap_hosts: vec![],
-                swaps: vec![],
+                        swaps: vec![],
                 edge: None,
                 image_pin: None,
                 timings: false,
@@ -3268,8 +3255,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(audit.iter().filter(|r| r.2 == "node.message_pushed").count(), 3, "{audit:?}");
     }
 
-    /// #257: a box's swapped host is decided on its node, terminated there with the node's CA (not
-    /// forwarded, unless a control host before protocol 10 keeps it), and its credentials are
+    /// #257: a box's swapped host is decided on its node, terminated there with the node's CA (never
+    /// forwarded), and its credentials are
     /// fetched over the run's own connection on first use: a vault secret released for the swap's
     /// host only, a value by its key. Neither is in the box's start, so neither is in the node's
     /// box record.
@@ -3318,19 +3305,13 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             assert!(kept.contains("ph-login") && !kept.contains(LOGIN) && !kept.contains(VALUE), "{kept}");
         }
         // Decided here: both swapped hosts are terminated by the node's own egress proxy, which
-        // decides them from the box's token in the feed; a host outside the CA is still forwarded.
-        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
-        let relay = |kept: Vec<String>| NodeRelay {
-            node: node.clone(),
-            run: RUN.into(),
-            zone: Arc::new(wicket_core::CompiledZone::new(z.clone()).unwrap()),
-            ca: node.ca(),
-            kept,
-        };
-        assert_eq!(relay(vec![]).route("rc.api.test"), Route::Terminate);
-        assert_eq!(relay(vec![]).route("wrap.api.test"), Route::Terminate);
-        assert!(matches!(relay(vec![]).route("elsewhere.test"), Route::Forward(r) if r.contains("name constraints")));
-        assert!(matches!(relay(vec!["rc.api.test".into()]).route("rc.api.test"), Route::Forward(r) if r.contains("swapped")));
+        // decides them from the box's token in the feed; a host outside the CA is uncovered (spliced
+        // or refused, never forwarded, slice 3).
+        let router = NodeRouter { ca: node.ca(), clock: node.clock.clone() };
+        assert_eq!(router.route("rc.api.test"), Route::Terminate);
+        assert_eq!(router.route("wrap.api.test"), Route::Terminate);
+        assert!(matches!(router.route("elsewhere.test"), Route::Uncovered(r) if r.contains("name constraints")));
+        assert!(matches!(NodeRouter { ca: None, clock: node.clock.clone() }.route("rc.api.test"), Route::Uncovered(r) if r.contains("no CA")));
         let op = |m: &str, p: &str| {
             wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", m, "rc.api.test", p)
         };
@@ -3395,7 +3376,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     #[test]
     fn a_box_with_swaps_is_refused_by_a_node_before_protocol_10() {
         let mut start = fake_record("run_a").start;
-        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true).is_ok(), "no swaps: protocol 9 will do");
+        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true, None).is_ok(), "no swaps: protocol 9 will do");
         start.swaps = chan::swap_starts(&[wicket_proxy::CredentialSwap {
             name: "account login".into(),
             host: "rc.api.test".into(),
@@ -3403,15 +3384,50 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             real: wicket_proxy::SwapSource::Vault("login".into()),
             box_bearers: true,
         }]);
-        let why = crate::noderun::refuse_older_node("n1", 9, &start, true).unwrap_err().to_string();
+        let why = crate::noderun::refuse_older_node("n1", 9, &start, true, None).unwrap_err().to_string();
         assert!(why.contains("node n1 talks protocol 9") && why.contains("credential swaps") && why.contains("from protocol 10"), "{why}");
         assert!(why.contains("wicket node install n1"), "{why}");
-        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true).is_ok());
+        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true, None).is_ok());
         // The others still hold: a pin below 6, a budget below 9.
         start.swaps.clear();
         start.image_pin = Some("sha256:00".into());
-        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false).unwrap_err().to_string().contains("pinned"));
+        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false, None).unwrap_err().to_string().contains("pinned"));
         start.image_pin = None;
-        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true).unwrap_err().to_string().contains("model budget"));
+        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true, None).unwrap_err().to_string().contains("model budget"));
+    }
+
+    /// #257, slice 3: a box a node before protocol 11 would forward a host of (outside its CA, or
+    /// every host without one) starts only on a node at 11 or later, which splices or refuses such
+    /// a host instead; a box whose hosts the CA covers still starts at 10.
+    #[test]
+    fn a_box_a_node_would_forward_is_refused_by_a_node_before_protocol_11() {
+        use crate::noderun::{forwarded_host, refuse_older_node};
+        let start = fake_record("run_a").start;
+        let zone: wicket_core::ZoneSpec = serde_json::from_value(serde_json::json!({
+            "name": "z",
+            "reach": [{"host": "api.example.com"}, {"host": "*.example.org"}],
+        }))
+        .unwrap();
+        let covered = ["api.example.com".to_string(), ".example.org".to_string()];
+        assert_eq!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 1_000), None);
+        assert!(refuse_older_node("n1", 10, &start, false, None).is_ok(), "nothing forwarded: protocol 10 will do");
+        let narrow = ["api.example.com".to_string()];
+        let host = forwarded_host(&zone, &[], Some((&narrow[..], 2_000)), 1_000).unwrap();
+        assert!(host.starts_with("*.example.org") && host.contains("name constraints"), "{host}");
+        assert!(forwarded_host(&zone, &[], None, 1_000).unwrap().contains("no CA"));
+        assert!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 2_000).unwrap().contains("expired"));
+        let swap = wicket_proxy::CredentialSwap {
+            name: "login".into(),
+            host: "rc.api.test".into(),
+            placeholder: "ph".into(),
+            real: wicket_proxy::SwapSource::Vault("login".into()),
+            box_bearers: true,
+        };
+        assert!(forwarded_host(&zone, &[swap], Some((&covered[..], 2_000)), 1_000).unwrap().starts_with("rc.api.test"));
+        let why = refuse_older_node("n1", 10, &start, false, Some(&host)).unwrap_err().to_string();
+        assert!(why.contains("node n1 talks protocol 10") && why.contains("*.example.org") && why.contains("from protocol 11"), "{why}");
+        assert!(why.contains("wicket node install n1"), "{why}");
+        assert!(refuse_older_node("n1", chan::NO_FORWARDED_EGRESS, &start, false, Some(&host)).is_ok());
+
     }
 }

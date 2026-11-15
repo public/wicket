@@ -877,11 +877,11 @@ mod tests {
         // The grant is the child's own, for the exact path, with the uses given.
         let mut l = t.ledger.lock().unwrap();
         let op = |run: &str, path: &str| Op::egress(&TenantId::single(), &RunId(run.into()), "z.c", "GET", "api.example.com", path);
-        assert!(l.consume_grant(&op("run_x", "/v1/items")).unwrap().is_none(), "another run can't use it");
-        assert!(l.consume_grant(&op("run_c", "/v1/items/more")).unwrap().is_none(), "exact path only");
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_some());
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_some());
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_none(), "two uses");
+        assert!(l.grant_covering(&op("run_x", "/v1/items")).unwrap().is_none(), "another run can't use it");
+        assert!(l.grant_covering(&op("run_c", "/v1/items/more")).unwrap().is_none(), "exact path only");
+        let gid = l.grant_covering(&op("run_c", "/v1/items")).unwrap().unwrap();
+        // Its uses are the node's to count (#257): published with them.
+        assert_eq!(l.grant(&gid).unwrap().unwrap().uses_left, Some(2), "two uses");
         // Signed by the granter, with the chain, on the record.
         let d = decisions(&l);
         assert_eq!(d[0]["by"], "agent:run_p");

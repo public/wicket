@@ -1,10 +1,8 @@
 //! Where the egress proxy's decisions come from (#57). The proxy itself (CONNECT, TLS, canonical
-//! paths, forwarding, the problem texts) is the same everywhere; only the decision differs:
+//! paths, forwarding, the problem texts) is the same everywhere; only the decision differs. Since
+//! #257's slice 3 there is one decision path, the node's:
 //!
-//! - [`Central`]: the control host's ledger, today's path and behaviour, unchanged: the zone decides
-//!   by reach, else a live ledger grant is consumed, else a pending request is raised (or a recent
-//!   denial repeated).
-//! - [`NodeDecider`]: a remote node's verified feed replica (`wicket_feed::Replica::decide`), so a box
+//! - [`NodeDecider`]: the node's verified feed replica (`wicket_feed::Replica::decide`), so a box
 //!   keeps working while the control host is unreachable (#153): connected or not, everything the
 //!   box's token and its live grants allow, each until its own expiry; nothing while the replica is
 //!   lagging or closed. The feed carries each box's authority as a Biscuit token chain
@@ -14,11 +12,15 @@
 //!   control host is back (no approvals on the node alone). Grant uses are counted on the node, for
 //!   its boxes only. Hosts the box's token allows wholesale are spliced through unless the replica
 //!   is lagging or closed, and inspected otherwise (#141).
+//!
+//! The control host decides no request: what it held before slice 3 (`Central`, its ledger
+//! consuming grants for hosts a node forwarded to it) is gone. A host the node's CA can't cover is
+//! [`Route::Uncovered`]: spliced if the box's token allows it wholesale, refused otherwise.
 
 use crate::RunCtx;
 use futures_util::future::BoxFuture;
 use std::sync::{Arc, Mutex};
-use wicket_core::{HostVerdict, Op, Verdict, ZoneSpec};
+use wicket_core::{HostVerdict, Op};
 use wicket_feed::{Allowed, BoxAuthority, Decision, Mode, Replica};
 
 /// What the egress proxy does with one request.
@@ -63,76 +65,6 @@ pub trait Decider: Send + Sync {
     /// What the audit row of a spliced connection adds about where it was decided.
     fn splice_note(&self) -> &'static str {
         ""
-    }
-}
-
-/// The control host's ledger: the decision every local run gets.
-pub struct Central;
-
-impl Decider for Central {
-    fn host_verdict(&self, ctx: &RunCtx, host: &str) -> HostVerdict {
-        ctx.zone.host_verdict(host)
-    }
-
-    fn decide<'a>(&'a self, ctx: &'a RunCtx, op: &'a Op, who: Option<&'a (serde_json::Value, String)>) -> BoxFuture<'a, Outcome> {
-        Box::pin(async move { central(ctx, op, who) })
-    }
-
-    /// The zone alone decides (a reach allow comes before grants, denials and pending requests).
-    /// Under an org policy (#51), only a host it allows wholesale (its rules can depend on any path).
-    fn splice(&self, ctx: &RunCtx, host: &str) -> Option<usize> {
-        if ctx.org.as_ref().is_some_and(|o| !o.allows_host_wholesale(host)) {
-            return None;
-        }
-        match wicket_core::splice::inspection(ctx.zone.spec(), host) {
-            wicket_core::splice::Inspection::Spliced { rule } => Some(rule),
-            wicket_core::splice::Inspection::Inspected(_) => None,
-        }
-    }
-}
-
-fn central(ctx: &RunCtx, op: &Op, who: Option<&(serde_json::Value, String)>) -> Outcome {
-    // The org layer first: hard, no grant lifts it (#51; on a node the token's org checks do this).
-    if let Some(why) = ctx.org.as_ref().and_then(|o| o.refuses_http(&op.host, &op.method, &op.path, op.risk.rank())) {
-        return Outcome::Forbidden(why);
-    }
-    let why = match ctx.zone.evaluate(op) {
-        Verdict::AllowByReach(i) => return Outcome::Allow(format!("reach rule {i}")),
-        Verdict::Forbidden(why) => return Outcome::Forbidden(why),
-        Verdict::NeedsGrant(why) if !ctx.escalate => return Outcome::NoEscalation(why),
-        Verdict::NeedsGrant(why) => wicket_core::git::ask_reason(op, &why),
-    };
-    let mut ledger = ctx.ledger.lock().expect("ledger lock");
-    match ledger.consume_grant(op) {
-        Ok(Some(gid)) => {
-            let approved_for: Vec<String> = ledger
-                .request_for_grant(&gid)
-                .ok()
-                .flatten()
-                .map(|r| r.attribution.iter().flat_map(crate::attributed_agents).collect())
-                .unwrap_or_default();
-            drop(ledger);
-            let mut detail = format!("grant {gid}");
-            if let Some((v, line)) = who {
-                detail.push_str(&format!("; used by {line}"));
-                let users = crate::attributed_agents(v);
-                // The grant is usable by anything in the box; flag use by someone else.
-                if !approved_for.is_empty() && !users.is_empty() && !users.iter().any(|u| approved_for.contains(u)) {
-                    detail.push_str(&format!("; WARNING: approved for {}", approved_for.join(" | ")));
-                }
-            }
-            Outcome::Allow(detail)
-        }
-        Ok(None) => {
-            if let Ok(Some(rid)) = ledger.denied_recently(op) {
-                return Outcome::Denied { request: rid };
-            }
-            match ledger.pending_for(op, &why, who.map(|(v, _)| v)) {
-                Ok((rid, fresh)) => Outcome::Pending { request: rid, fresh, why },
-                Err(e) => Outcome::Error(e.to_string()),
-            }
-        }
-        Err(e) => Outcome::Error(e.to_string()),
     }
 }
 
@@ -254,14 +186,16 @@ impl NodeDecider {
     }
 }
 
-/// Where a node's egress proxy sends a CONNECT.
+/// Whether a node's egress proxy can terminate TLS for a host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// Terminate TLS here with the node CA, and decide here.
+    /// Terminate TLS here with the node CA, and decide each request here.
     Terminate,
-    /// Tunnel the raw CONNECT to the control host's egress proxy, which decides and terminates TLS
-    /// with the run's own CA (the box trusts both). The reason is logged.
-    Forward(String),
+    /// The node's CA can't cover the host (or there is no usable CA): the node never mints a leaf
+    /// for it. A CONNECT to it is spliced through if the box's token allows the host wholesale
+    /// (nothing to inspect, so nothing to terminate), and refused otherwise; since #257's slice 3
+    /// nothing is forwarded to the control host. The reason is logged.
+    Uncovered(String),
 }
 
 /// Whether a host is inside one X.509 permitted DNS subtree, as a verifier reads it: `api.example.com`
@@ -279,40 +213,16 @@ pub fn subtree_permits(subtree: &str, host: &str) -> bool {
     }
 }
 
-/// The node's forwarding rule. It never terminates TLS for:
-/// - a host with an `inject` rule whose secret isn't sealed to the node ([`route_sealed`]);
-/// - a host a control host before protocol 10 swaps a credential in for itself (`kept`); since
-///   #257 a node makes a box's swaps itself, and decides their hosts like any other;
-/// - a host outside the node CA's name constraints (e.g. one approved later under
-///   `unlisted_hosts: escalate`): a leaf for it wouldn't verify anyway;
-/// - anything at all once the node CA has expired, or without one: never mint.
-pub fn route(host: &str, zone: &ZoneSpec, kept: &[String], ca: Option<(&[String], i64)>, now_secs: i64) -> Route {
-    route_sealed(host, zone, kept, ca, now_secs, &|_| false)
-}
-
-/// [`route`] on a node that holds some secrets sealed to it (#152): a host whose `inject` rules all
-/// name a secret the node holds (`held`) is terminated and injected on the node, within the CA's
-/// constraints like any other.
-pub fn route_sealed(
-    host: &str,
-    zone: &ZoneSpec,
-    kept: &[String],
-    ca: Option<(&[String], i64)>,
-    now_secs: i64,
-    held: &dyn Fn(&str) -> bool,
-) -> Route {
-    use wicket_core::manifest::host_matches;
-    if zone.inject.iter().any(|r| host_matches(&r.host, host) && !held(&r.secret)) {
-        return Route::Forward("the zone injects a credential for this host".into());
-    }
-    if kept.iter().any(|h| host_matches(h, host)) {
-        return Route::Forward("a credential is swapped for this host".into());
-    }
+/// Whether the node can terminate `host` (#257): never outside the node CA's name constraints (e.g.
+/// a host approved later under `unlisted_hosts: escalate`, for which a leaf wouldn't verify
+/// anyway), and never at all once the node CA has expired, or without one. Injected and swapped
+/// hosts are terminated like any other: the node fetches their secrets on first use (#152, #257).
+pub fn route(host: &str, ca: Option<(&[String], i64)>, now_secs: i64) -> Route {
     match ca {
-        None => Route::Forward("this node has no CA".into()),
-        Some((_, not_after)) if now_secs >= not_after => Route::Forward("the node CA has expired".into()),
+        None => Route::Uncovered("this node has no CA".into()),
+        Some((_, not_after)) if now_secs >= not_after => Route::Uncovered("the node CA has expired".into()),
         Some((permitted, _)) if !permitted.iter().any(|s| subtree_permits(s, host)) => {
-            Route::Forward("outside the node CA's name constraints".into())
+            Route::Uncovered("outside the node CA's name constraints".into())
         }
         Some(_) => Route::Terminate,
     }
@@ -322,7 +232,7 @@ pub fn route_sealed(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-    use wicket_core::{Manifest, RunId, TenantId};
+    use wicket_core::{Manifest, RunId, TenantId, ZoneSpec};
     use wicket_feed::{Change, Issuer, KeyCert, LiveGrant, Publisher, PublisherConfig, ReplicaConfig};
 
     fn zone() -> ZoneSpec {
@@ -331,39 +241,6 @@ mod tests {
         )
         .unwrap()
         .zone
-    }
-
-    /// #51: the control host decides hosts it forwards for (credentials injected here) and its own
-    /// boxes' egress: the org layer refuses there too, hard, and nothing splices under it.
-    #[test]
-    fn the_org_layer_refuses_on_the_control_host_and_stops_splicing() {
-        use wicket_authz::{HostPat, HttpMatch, OrgLayer, PathPat};
-        let op = |m: &str, h: &str, p: &str| Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", m, h, p);
-        let mut c = ctx(true);
-        // Without an org layer: the zone allows this.
-        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)));
-        c.org = Some(Arc::new(OrgLayer {
-            version: "v1".into(),
-            http: None,
-            forbid: vec![
-                HttpMatch {
-                    hosts: vec![HostPat::Exact("api.example.com".into())],
-                    paths: vec![PathPat::Glob("/v1/admin/**".into())],
-                    ..Default::default()
-                },
-                HttpMatch { hosts: vec![HostPat::Exact("secret.example.com".into())], ..Default::default() },
-            ],
-            spawn: None,
-            msg_from: None,
-            inject: None,
-        }));
-        assert!(matches!(central(&c, &op("GET", "api.example.com", "/v1/x"), None), Outcome::Allow(_)), "other paths still allowed");
-        assert!(
-            matches!(central(&c, &op("GET", "api.example.com", "/v1/admin/users"), None), Outcome::Forbidden(w) if w.contains("org policy"))
-        );
-        // The host the zone injects into, forwarded to the control host: refused, not a grant away.
-        assert!(matches!(central(&c, &op("GET", "secret.example.com", "/"), None), Outcome::Forbidden(w) if w.contains("org policy")));
-        assert_eq!(Central.splice(&c, "api.example.com"), None, "not a host the org layer allows wholesale");
     }
 
     #[test]
@@ -389,23 +266,17 @@ mod tests {
     }
 
     #[test]
-    fn the_node_forwards_secret_hosts_out_of_constraint_hosts_and_everything_once_its_ca_expires() {
-        let z = zone();
+    fn the_node_terminates_only_what_its_ca_covers_and_nothing_once_it_expires() {
         let permitted = ["api.example.com".to_string(), "secret.example.com".to_string()];
         let ca = Some((&permitted[..], 2_000));
-        assert_eq!(route("api.example.com", &z, &[], ca, 1_000), Route::Terminate);
-        assert!(matches!(route("secret.example.com", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("injects")));
-        // A control host before #257 swaps its hosts itself: forwarded to it.
-        let kept = ["api.example.com".to_string()];
-        assert!(matches!(route("api.example.com", &z, &kept, ca, 1_000), Route::Forward(r) if r.contains("swapped")));
-        assert!(matches!(route("later.example.net", &z, &[], ca, 1_000), Route::Forward(r) if r.contains("name constraints")));
-        assert!(matches!(route("api.example.com", &z, &[], ca, 2_000), Route::Forward(r) if r.contains("expired")));
-        assert!(matches!(route("api.example.com", &z, &[], None, 0), Route::Forward(_)));
-        // #152: a node holding the injected secret sealed to it terminates and injects itself.
-        let held = |n: &str| n == "s";
-        let wide = Some((&[".example.com".to_string()][..], 1_500));
-        assert_eq!(route_sealed("secret.example.com", &z, &[], wide, 1_000, &held), Route::Terminate);
-        assert!(matches!(route_sealed("secret.example.com", &z, &[], wide, 1_000, &|_| false), Route::Forward(r) if r.contains("injects")));
+        assert_eq!(route("api.example.com", ca, 1_000), Route::Terminate);
+        // An injected host is terminated and injected on the node (#152), like any covered host.
+        assert_eq!(route("secret.example.com", ca, 1_000), Route::Terminate);
+        assert!(matches!(route("later.example.net", ca, 1_000), Route::Uncovered(r) if r.contains("name constraints")));
+        assert!(matches!(route("api.example.com", ca, 2_000), Route::Uncovered(r) if r.contains("expired")));
+        assert!(matches!(route("api.example.com", None, 0), Route::Uncovered(r) if r.contains("no CA")));
+        // The control host's own node's CA: any name.
+        assert_eq!(route("later.example.net", Some((&["*".to_string()][..], 2_000)), 1_000), Route::Terminate);
     }
 
     struct Link {
