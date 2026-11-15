@@ -147,7 +147,7 @@ for a kind to see its body):
 
 | area | kinds |
 |---|---|
-| requests | `op` (an egress or model decision), `decision` (an approve or deny), `grant.revoked`, `daemon.refused` |
+| requests | `op` (an egress or model decision), `decision` (an approve, deny or renewal), `decision.refused` (a decision outside the decider's authority: an operator's `operators.yaml`, or an agent's own reach), `grant.revoked`, `daemon.refused` |
 | runs | `run.start`, `run.image`, `run.end`, `run.lost`, `run.attach`, `run.console_start`, `run.output`, `run.remote_session`, `run.remote_session_failed`, `run.exit_cause`, `run.agent_prompt`, `run.agent_call_refused`, `box.output`, `box.output.gap`, `box.reaped`, `box.exit_cause`, `box.memory_pressure` |
 | agents | `identity.issued`, `identity.rotated`, `identity.revoked`, `message`, `spawn.beyond_parent`, `agent.hibernate`, `agent.wake`, `agent.wake_refused` |
 | links | `link.expose`, `link.open`, `link.close`, `link.cut` |

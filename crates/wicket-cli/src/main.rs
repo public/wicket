@@ -29,6 +29,7 @@ mod noderun;
 mod nodesecrets;
 mod nodesrv;
 mod oci;
+mod operators;
 mod owner;
 mod pin;
 mod place;

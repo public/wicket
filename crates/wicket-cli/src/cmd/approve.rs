@@ -31,8 +31,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
-            let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Approve(t), serde_json::json!({}))?
+            let grant::Decided::Approved { grant: gid, lease, uses: made_uses, ttl } = grant::decide(
+                &mut l,
+                &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?),
+                &id,
+                &grant::Verdict::Approve(t),
+                serde_json::json!({}),
+            )?
             else {
                 unreachable!("an approval approves")
             };
@@ -99,9 +104,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         }
         Cmd::Deny { id } => {
             let mut l = Ledger::open(&ledger_path())?;
-            if let grant::Decided::Denied { lease: Some(lease) } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Deny, serde_json::json!({}))?
-            {
+            if let grant::Decided::Denied { lease: Some(lease) } = grant::decide(
+                &mut l,
+                &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?),
+                &id,
+                &grant::Verdict::Deny,
+                serde_json::json!({}),
+            )? {
                 println!("lease {lease} denied: its reservation is released");
             }
             println!("denied {id}");
@@ -133,8 +142,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
         Cmd::Grant { cmd: GrantCmd::Renew { id, ttl } } => {
             let ttl = humantime::parse_duration(&ttl).context("bad --ttl")?;
             let mut l = Ledger::open(&ledger_path())?;
-            let grant::Decided::Renewed { what, until } =
-                grant::decide(&mut l, &grant::Granter::Human(operator()), &id, &grant::Verdict::Renew(ttl), serde_json::json!({}))?
+            let grant::Decided::Renewed { what, until } = grant::decide(
+                &mut l,
+                &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?),
+                &id,
+                &grant::Verdict::Renew(ttl),
+                serde_json::json!({}),
+            )?
             else {
                 unreachable!("a renewal renews")
             };

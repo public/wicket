@@ -24,7 +24,7 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`decide`](#decide) | Approve, deny or renew a descendant's request, grant or box authority within the caller's own reach | `escalation.grant` |
 | [`request_access`](#request_access) | Ask a human for reach ahead of time | |
 | [`whoami`](#whoami) | This box's verified identity | |
-| [`send_message`](#send_message) | Message the parent, a child or a permitted peer | |
+| [`send_message`](#send_message) | Message the parent, a child or a permitted peer, by principal | |
 | [`await_message`](#await_message) | Wait for the next message | |
 | [`spawn_agent`](#spawn_agent) | Start a child agent in a narrowed copy of this zone | `max_children` |
 | [`spawn`](#spawn) | Start an agent or program in a zone the caller writes | `max_children` |
@@ -117,23 +117,44 @@ only.
 
 ## `whoami`
 
-The box's wicket-issued identity: agent name, zone, run, parent and children. No arguments.
+The box's wicket-issued identity: its principal (`id`, `spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`),
+agent name, zone, run, parent, children (each with its principal), what its `accept_from` lists
+(`accepts_messages_from`), and the principal it acts for (a run an operator started names the
+operator's identity in `principal.sub`). No arguments.
 
 ## `send_message`
 
 Sends a message through wicket, which signs it with the sender's identity; the recipient sees who
-sent it, verified. Parent and child may always message each other; anyone else only if the
-recipient's zone lists the sender's in `accept_from`.
+sent it, verified. A message names a **principal**, not a run (#250): an agent is the same principal
+across its restarts and wakes, so a message reaches it by the same name each time. Parent and child
+may always message each other; anyone else only if the recipient's `accept_from` lists the sender's
+principal or its zone. Run ids are not addresses.
 
 | argument | type | |
 |---|---|---|
-| `to` | string, required | `"parent"`, or a run id |
+| `to` | string, required | `"parent"`, or a principal: `spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>`, as `whoami` and `spawn` show it |
 | `body` | any JSON value, required | at most 16 KB |
+
+Where it goes:
+
+- to the principal's live run (for `"parent"`, the parent run itself while it runs);
+- if it has none: a hibernated long-lived agent is woken to read it; otherwise wicket holds the
+  message, and the principal's next run takes it (for up to 7 days). A message its run ended
+  without reading goes to the principal's next run the same way. The answer says which happened.
+- An operator's principal (`spiffe://<domain>/t/<tenant>/op/…`) is refused for now: operators
+  don't receive messages from agents yet.
+
+A message never grants anything: it is the sender's data for the recipient, which can't widen
+anyone's reach or decide a request. Every message is on the audit record (`message`, with `from`,
+`to`, the run it reached and whether it was held). On a node cut off from its control host, a
+message goes only to a box on the same node (by its principal, or `"parent"`), attested by the node.
 
 ## `await_message`
 
-Waits for the next message to this agent, from its parent, a child or a permitted peer, with the
-sender's identity verified by wicket. A child also sends a final `run_finished` message (its `status`, a
+Waits for the next message to this agent's principal, from its parent, a child or a permitted peer,
+with the sender's identity (`from.id`, its principal) verified by wicket. Messages held while the
+agent wasn't running arrive first, in the order they were sent. An envelope addressed to another
+principal is dropped. A child also sends a final `run_finished` message (its `status`, a
 `cause` when its box ended abnormally, e.g. out of memory, and its `result`) when it
 ends.
 
@@ -144,8 +165,8 @@ ends.
 ## `spawn_agent`
 
 Starts a child agent in its own box with its own identity, in the caller's own zone, optionally
-narrowed to some of its hosts. Returns the child's run id; its messages and result come through
-`await_message`. Refused when `max_children` is 0 or spent.
+narrowed to some of its hosts. Returns the child's run id and its principal, which `send_message`
+addresses it by; its messages and result come through `await_message`. Refused when `max_children` is 0 or spent.
 
 | argument | type | |
 |---|---|---|

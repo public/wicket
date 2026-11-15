@@ -284,6 +284,19 @@ impl Node {
         c
     }
 
+    /// The box on this node running as principal `id` (#250), as its control host named it in the
+    /// box's start (`who.id`): the newest-started one still running.
+    fn run_of_principal(&self, id: &str) -> Option<String> {
+        let boxes = self.boxes.lock().expect("boxes");
+        let mut found: Vec<(&String, &BoxState)> = boxes
+            .iter()
+            .filter(|(_, b)| b.exited.is_none())
+            .filter(|(_, b)| b.record.start.edge.as_ref().is_some_and(|e| e.who.get("id").and_then(|v| v.as_str()) == Some(id)))
+            .collect();
+        found.sort_by_key(|(r, _)| std::cmp::Reverse(r.to_string()));
+        found.first().map(|(r, _)| r.to_string())
+    }
+
     /// What this node decides `run`'s gateway tools from (#164): None, they are all relayed (a
     /// control host before protocol 5 started it, or one of those is connected now).
     fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
@@ -2733,7 +2746,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let mut rec = fake_record(run);
         rec.start.zone = z.name.clone();
         rec.start.edge = Some(Box::new(chan::EdgeStart {
-            who: serde_json::json!({ "id": format!("spiffe://wicket.test/t0/{run}"), "run": run, "zone": z.name }),
+            who: serde_json::json!({ "id": format!("spiffe://wicket.test/t/t0/z/{}/a/{run}", z.name), "run": run, "zone": z.name }),
             spawn: None,
         }));
         let st = BoxState {
@@ -2801,7 +2814,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             async move { gw::tool(&node, RUN, &name, &args).await.expect("decided on the node") }
         };
         let (who, err) = call("whoami", serde_json::json!({})).await;
-        assert!(!err && who.contains(&format!("spiffe://wicket.test/t0/{RUN}")) && who.contains("node n1"), "{who}");
+        assert!(!err && who.contains(&format!("spiffe://wicket.test/t/t0/z/z/a/{RUN}")) && who.contains("node n1"), "{who}");
         let access = |path: &str, scope: &str| serde_json::json!({ "url": format!("https://api.example{path}"), "reason": "to read the docs", "scope": scope });
         let (t, _) = call("request_access", access("/ok/a", "exact")).await;
         assert!(t.contains("already allowed"), "{t}");
@@ -2876,12 +2889,16 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             let node = node.clone();
             async move { gw::tool(&node, run, name, &args).await.expect("decided on the node") }
         };
-        let (t, err) = call(A, "send_message", serde_json::json!({ "to": B, "body": { "hello": 1 } })).await;
+        // Boxes are named by their principals (#250), never by a run id.
+        let to = |zone: &str, run: &str| format!("spiffe://wicket.test/t/t0/z/{zone}/a/{run}");
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zb", B), "body": { "hello": 1 } })).await;
         assert!(!err && t.starts_with("sent m-node-") && t.contains("attested by the node"), "{t}");
-        let (t, err) = call(A, "send_message", serde_json::json!({ "to": C, "body": {} })).await;
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zc", C), "body": {} })).await;
         assert!(err && t.contains("does not accept messages from zone za"), "{t}");
-        let (t, err) = call(A, "send_message", serde_json::json!({ "to": "run_zzzzzzzzzzzzzzzzzzzzzzzzzz", "body": {} })).await;
-        assert!(err && t.contains("isn't on your node"), "{t}");
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": to("zz", "run_zzzzzzzzzzzzzzzzzzzzzzzzzz"), "body": {} })).await;
+        assert!(err && t.contains("isn't running on your node"), "{t}");
+        let (t, err) = call(A, "send_message", serde_json::json!({ "to": B, "body": {} })).await;
+        assert!(err && t.contains("is not an agent's principal"), "{t}");
         let (t, _) = call(B, "await_message", serde_json::json!({ "timeout_seconds": 1 })).await;
         let v: serde_json::Value = serde_json::from_str(&t).unwrap();
         assert_eq!((v["from"]["run"].as_str(), v["body"]["hello"].as_i64()), (Some(A), Some(1)), "{t}");

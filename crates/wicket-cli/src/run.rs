@@ -754,7 +754,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let env: Vec<(String, String)> = std::env::vars().collect();
                     (harness.expect("a wrapped agent").wrapped_principal(&env), None)
                 }
-                None => (crate::cli_principal(), None),
+                // An operator (#11): its principal id (`sub`) next to how wicket knew them.
+                None => (crate::operators::with_identity(crate::cli_principal(), &m.tenant.0), None),
             };
             let spec = wicket_identity::IdentitySpec {
                 tenant: m.tenant.0.clone(),
@@ -2132,8 +2133,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         } else {
             serde_json::json!({ "status": status, "cause": cause, "note": end_note, "result": result })
         };
-        match ctx.send_message(p, "run_finished", body) {
-            Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
+        match ctx.send_message(&wicket_proxy::Recipient::Parent, "run_finished", body) {
+            Ok(s) => println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to),
             Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),
         }
     }

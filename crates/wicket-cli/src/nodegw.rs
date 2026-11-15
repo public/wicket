@@ -247,8 +247,24 @@ pub(super) async fn tool(node: &Arc<Node>, run: &str, name: &str, args: &Value) 
 /// control host decides it from their identities: to its parent or a child (their box paths), or
 /// to a box whose zone accepts messages from this one's; and the receiver's org layer must accept
 /// this zone. Delivered here; to a box elsewhere it can't go until the control host is back.
+///
+/// `to` is "parent" or a principal (#250): one of this node's boxes, by the identity its control
+/// host named it with. Run ids aren't addresses.
 fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
-    let Some(to) = args.get("to").and_then(|v| v.as_str()) else { return ("`to` is required: a run id, or \"parent\"".into(), true) };
+    let Some(to) = args.get("to").and_then(|v| v.as_str()) else {
+        return ("`to` is required: a principal (spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>), or \"parent\"".into(), true);
+    };
+    let principal = match to {
+        "parent" => None,
+        p if matches!(wicket_identity::Principal::parse(p), Some(wicket_identity::Principal::Agent { .. })) => Some(p),
+        p => {
+            return (
+                format!("not sent: {p:?} is not an agent's principal (spiffe://<domain>/t/<tenant>/z/<zone>/a/<agent>), or \"parent\""),
+                true,
+            )
+        }
+    };
+    let by_principal = principal.map(|p| node.run_of_principal(p));
     let body = args.get("body").cloned().unwrap_or(Value::Null);
     let size = body.to_string().len();
     if size > wicket_proxy::MAX_MESSAGE_BYTES {
@@ -260,10 +276,16 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         let me = r.box_path_of(run).zip(r.zone_of(run).map(|z| z.name.clone())).filter(|_| r.authority_until(run).is_some_and(|u| u > now));
         let Some((my_path, my_zone)) = me else { return ("not sent: this box holds no authority on its node".into(), true) };
         let parent = my_path.rsplit_once('/').map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string());
-        let to_run = match (to, &parent) {
-            ("parent", Some(p)) => p.clone(),
-            ("parent", None) => return ("not sent: this agent has no parent".into(), true),
-            (t, _) => t.to_string(),
+        let to_run = match (by_principal, &parent) {
+            (None, Some(p)) => p.clone(),
+            (None, None) => return ("not sent: this agent has no parent".into(), true),
+            (Some(Some(r)), _) => r,
+            (Some(None), _) => {
+                return (
+                    format!("not sent: {to} isn't running on your node, and wicket's control host is unreachable from it; send it again when it is back"),
+                    true,
+                )
+            }
         };
         let them = r.box_path_of(&to_run).zip(r.zone_of(&to_run).cloned()).filter(|_| r.authority_until(&to_run).is_some_and(|u| u > now));
         let Some((to_path, to_zone)) = them else {
@@ -280,7 +302,11 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         "child"
     } else if my_path.rsplit_once('/').is_some_and(|(p, _)| p == to_path) {
         "parent"
-    } else if to_zone.accept_from.contains(&my_zone) {
+    } else if to_zone.accept_from.contains(&my_zone)
+        || node
+            .edge_start(run)
+            .is_some_and(|e| e.who.get("id").and_then(|v| v.as_str()).is_some_and(|me| to_zone.accept_from.iter().any(|a| a == me)))
+    {
         "peer"
     } else {
         return (
@@ -620,7 +646,7 @@ fn whoami(node: &Arc<Node>, run: &str) -> (String, bool) {
         (r.authority_until(run), r.zone_of(run).map(|z| z.accept_from.clone()))
     };
     if let Some(o) = v.as_object_mut() {
-        o.insert("accepts_messages_from_zones".into(), json!(accepts.unwrap_or_default()));
+        o.insert("accepts_messages_from".into(), json!(accepts.unwrap_or_default()));
         o.insert("authority_until".into(), json!(until.map(|ms| ms / 1000)));
         o.insert("decided_on".into(), json!(format!("node {}", node.name)));
         o.insert(

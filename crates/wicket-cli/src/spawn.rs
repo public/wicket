@@ -520,13 +520,20 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let budget =
         cm.zone.llm.as_ref().map(|l| format!(", a model budget of {} requests carved from yours", l.max_requests)).unwrap_or_default();
     let at = placed.as_ref().map(|p| format!(" on node {}", p.node)).unwrap_or_default();
+    // Its principal (#250): what send_message names it by, the same in every run it has.
+    let principal = {
+        let l = c.ledger.lock().map_err(|_| "ledger lock")?;
+        let own = l.identity(&c.run.0).ok().flatten().and_then(|i| wicket_identity::Principal::parse(&i.spiffe_id));
+        own.map(|o| format!(", principal {}", wicket_identity::spiffe_id(o.trust_domain(), &p.tenant.0, &zone_name, name)))
+            .unwrap_or_default()
+    };
     Ok(format!(
-        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{}{budget}. {}",
+        "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}",
         req.kind,
         child,
         if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
         if is_agent {
-            "Use await_message for its messages and its final run_finished."
+            "Message it with send_message to its principal; use await_message for its messages and its final run_finished."
         } else {
             "It sends you run_finished when it exits."
         }
