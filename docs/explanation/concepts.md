@@ -39,7 +39,23 @@ One word for each thing, used the same way in the CLI's help, the docs and wicke
   lifetime, and an amount or a number of uses. Every approval is a grant, and so is a box's own
   authority.
 - A **lease** is a grant of capacity: a node for a time, its worst-case cost reserved
-  ([placement and leases](#placement-and-leases)). Nothing else is a lease.
+  ([placement and leases](#placement-and-leases)). Nothing else is a lease: a long-lived agent's
+  holder has a **claim** on it, and a node has a budget slice.
+- A **quota grant** is a grant of an amount, not of reach: a run's model budget and box slots, or a
+  lease's money (`QUOTA wicket.internal/quota/…`, `wicket grant list`). A child's are carved from its
+  parent's ([#256](https://github.com/public/wicket/issues/256), [agents](../reference/agents.md#agent-identity-and-child-agents)).
+- A **budget slice** is the part of a run's model budget the control host sends to the node the run
+  is on, a quarter at a time by default, so the node can decide model calls while it is cut off. The
+  node spends what is left of it and nothing more ([nodes](../reference/nodes.md#wicket-node-serve-boxes-that-outlive-the-control-channel)).
+- A **delegation** is the task a parent agent gives a child agent it spawns (`d-…`). Its task is the
+  first **brief**, and `continue_child` gives it another; the child's result on each brief comes back
+  as its **report**, a message of kind `report`. A brief and a report are messages: they grant
+  nothing. `spawn` returns the child's **handle**: its principal, delegation, run and name
+  ([delegation](../reference/mcp-tools.md#delegation)).
+- A **receipt** is what became of a message, for its sender only: delivered, read, held, refused or
+  expired ([receipts](../reference/mcp-tools.md#receipts)).
+- A **device** is a browser an operator registered for push notifications of waiting requests; adding
+  one is a signed action ([notifications](../reference/console.md#notifications)).
 - A **run** is one box running one workload, from start to end, with its own id (`run_…`). For a
   long-lived agent (`agt_…`), each run is one **activation** of it: starting and every wake begin a
   new one. Its **generation** counts those activations; a stale one is refused
@@ -51,6 +67,10 @@ One word for each thing, used the same way in the CLI's help, the docs and wicke
   - a **console session**, an operator signed in to the console with a passkey
     ([console](../reference/console.md#passkeys));
   - an **ACP session**, an ACP agent's `session/new` ([ACP agents](../reference/agents.md#acp-agents)).
+
+  A **session page** is the console's live page for one running ACP agent's ACP session
+  (`/session?run=…`), where an operator reads it, prompts it and decides its requests
+  ([console](../reference/console.md#sessions)).
 
 ## The box and the control host
 
