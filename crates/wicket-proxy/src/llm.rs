@@ -47,9 +47,36 @@ pub struct Llm {
     /// On a node (#152): the slice of the budget the control host has leased it, as caps on this
     /// activation's own counters. None: no slice (the zone's budget alone bounds it).
     slice: std::sync::Mutex<Option<Slice>>,
+    /// The model budget this proxy enforces (#256): on the control host, the amounts of the run's
+    /// quota grants ([`Llm::with_quota`]); on a node, the zone its token carries, its slices
+    /// bounding it. None: the zone has no model route.
+    quota: Option<ModelQuota>,
     last_activity: std::sync::Mutex<Instant>,
     /// When the box's first request reached this proxy (Unix ms, #287).
     first_request_ms: std::sync::OnceLock<i64>,
+    /// Told [`Llm::spent_charged`] as each call is sent upstream ([`Llm::set_journal`]).
+    journal: std::sync::Mutex<Option<Journal>>,
+}
+
+/// Where a node writes its count before a call goes upstream ([`Llm::set_journal`]).
+type Journal = Box<dyn Fn(Spent) + Send + Sync>;
+
+/// A run's model budget, as its model proxy enforces it (#256): the limits every check here reads,
+/// and the only ones. On the control host they are the amounts of the run's live quota grants
+/// (`model.requests`, `model.output_tokens`, `model.input_tokens`); on a node, its token's zone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelQuota {
+    pub requests: u64,
+    pub output_tokens: u64,
+    /// Input tokens, cached ones included; None: uncapped.
+    pub input_tokens: Option<u64>,
+}
+
+impl ModelQuota {
+    /// The budget a zone states.
+    pub fn of_zone(l: &wicket_core::manifest::LlmSpec) -> ModelQuota {
+        ModelQuota { requests: l.max_requests, output_tokens: l.max_output_tokens, input_tokens: l.max_input_tokens }
+    }
 }
 
 /// A budget slice sent to a node (#152): this activation may count up to these totals of its own
@@ -61,6 +88,30 @@ pub struct Slice {
     pub output_tokens: u64,
     #[serde(default)]
     pub input_tokens: Option<u64>,
+}
+
+impl Slice {
+    /// The slice to lease a node next (#152), given the one it holds (`cur`, None before the first),
+    /// the control host's [`Llm::next_slice`], what it has counted (`spent`, and `input_total` with
+    /// cached tokens): `cur` until less than half a slice of it is left, else `next`; and `next` at
+    /// once if it is lower than `cur` (what is left of the budget shrank, a spawn's carve-out). The
+    /// control host's rule (`noderun::slice_due`), here so the simulation (#324) runs the same one.
+    pub fn renewed(cur: Option<Slice>, next: Slice, spent: Spent, input_total: u64) -> Slice {
+        let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
+        match cur {
+            Some(cur)
+                if !low(cur.requests, next.requests, spent.requests)
+                    && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
+                    && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, input_total))
+                    && cur.requests <= next.requests
+                    && cur.output_tokens <= next.output_tokens
+                    && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
+            {
+                cur
+            }
+            _ => next,
+        }
+    }
 }
 
 /// What a run's model proxy has counted, as a node reports it to its control host (#152).
@@ -89,11 +140,11 @@ impl Spent {
 impl Llm {
     /// Model requests and output tokens this run has left to spend or hand on.
     pub fn remaining(&self) -> Option<(u64, u64)> {
-        let spec = self.ctx.zone.llm.as_ref()?;
+        let spec = self.quota()?;
         let used_r = self.requests.load(Ordering::SeqCst)
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        Some((spec.max_requests.saturating_sub(used_r), spec.max_output_tokens.saturating_sub(self.output_committed())))
+        Some((spec.requests.saturating_sub(used_r), spec.output_tokens.saturating_sub(self.output_committed())))
     }
 
     /// Output tokens spent, handed to children, spent by earlier activations, or reserved by calls
@@ -144,13 +195,27 @@ impl Llm {
 
     /// Input tokens this run has left to spend or hand on, if its zone caps them.
     pub fn remaining_input(&self) -> Option<u64> {
-        let max = self.ctx.zone.llm.as_ref()?.max_input_tokens?;
+        let max = self.quota()?.input_tokens?;
         Some(max.saturating_sub(
             self.input_total() + self.reserved_input_tokens.load(Ordering::SeqCst) + self.prior_input_tokens.load(Ordering::SeqCst),
         ))
     }
 
+    /// The model budget this proxy enforces: see [`ModelQuota`].
+    pub fn quota(&self) -> Option<ModelQuota> {
+        self.quota
+    }
+
+    /// A model proxy enforcing its zone's budget: a node's, whose slices bound it.
     pub fn new(ctx: RunCtx) -> Result<Arc<Llm>> {
+        let quota = ctx.zone.llm.as_ref().map(ModelQuota::of_zone);
+        Self::with_quota(ctx, quota)
+    }
+
+    /// A model proxy enforcing `quota` (#256): the control host's, from the run's quota grants. A
+    /// zone with a model route and no quota is given none to spend.
+    pub fn with_quota(ctx: RunCtx, quota: Option<ModelQuota>) -> Result<Arc<Llm>> {
+        let quota = ctx.zone.llm.as_ref().map(|_| quota.unwrap_or_default());
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(Arc::new(Llm {
             ctx,
@@ -168,8 +233,10 @@ impl Llm {
             prior_output_tokens: AtomicU64::new(0),
             inflight_output_tokens: AtomicU64::new(0),
             slice: std::sync::Mutex::new(None),
+            quota,
             last_activity: std::sync::Mutex::new(Instant::now()),
             first_request_ms: std::sync::OnceLock::new(),
+            journal: std::sync::Mutex::new(None),
         }))
     }
 
@@ -181,6 +248,30 @@ impl Llm {
             cache_read_tokens: self.cache_read_tokens.load(Ordering::SeqCst),
             cache_creation_tokens: self.cache_creation_tokens.load(Ordering::SeqCst),
             output_tokens: self.output_tokens.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What this activation has counted, with the output tokens reserved by calls in flight charged
+    /// in full: what a node persists (#324). A call in flight when the node's `serve` crashes was
+    /// billed upstream and is never settled here, so a restarted node counts it as a call whose
+    /// final usage wasn't seen is counted: its whole reservation.
+    pub fn spent_charged(&self) -> Spent {
+        let mut s = self.spent();
+        s.output_tokens += self.inflight_output_tokens.load(Ordering::SeqCst);
+        s
+    }
+
+    /// Has `f` told [`Llm::spent_charged`] as each model call is sent, before it goes upstream:
+    /// a node persists it there, so a crash can't lose a call the provider bills (#324).
+    pub fn set_journal(&self, f: impl Fn(Spent) + Send + Sync + 'static) {
+        *self.journal.lock().expect("journal") = Some(Box::new(f));
+    }
+
+    /// Tells the journal [`Llm::spent_charged`] now. The count is read under the journal's lock,
+    /// so of two calls the later write is never the older count.
+    pub fn journal(&self) {
+        if let Some(f) = &*self.journal.lock().expect("journal") {
+            f(self.spent_charged());
         }
     }
 
@@ -206,14 +297,14 @@ impl Llm {
     /// The slice this activation may be leased next (#152): what it has counted plus `fraction` of
     /// the zone's budget, never past what is left of it.
     pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
-        let spec = self.ctx.zone.llm.as_ref()?;
+        let spec = self.quota()?;
         let part = |max: u64| ((max as f64) * fraction).ceil().max(1.0) as u64;
         let (left_r, left_o) = self.remaining()?;
         let s = self.spent();
         Some(Slice {
-            requests: s.requests + left_r.min(part(spec.max_requests)),
-            output_tokens: s.output_tokens + left_o.min(part(spec.max_output_tokens)),
-            input_tokens: spec.max_input_tokens.map(|m| self.input_total() + self.remaining_input().unwrap_or(0).min(part(m))),
+            requests: s.requests + left_r.min(part(spec.requests)),
+            output_tokens: s.output_tokens + left_o.min(part(spec.output_tokens)),
+            input_tokens: spec.input_tokens.map(|m| self.input_total() + self.remaining_input().unwrap_or(0).min(part(m))),
         })
     }
 
@@ -357,28 +448,29 @@ impl Llm {
             + 1
             + self.reserved_requests.load(Ordering::SeqCst)
             + self.prior_requests.load(Ordering::SeqCst);
-        let spec = spec?;
-        if n > spec.max_requests {
+        spec?;
+        let spec = self.quota()?;
+        if n > spec.requests {
             self.event(None, 429, Usage::default(), "budget: request cap reached");
             return Some(problem(
                 429,
                 "budget",
                 "Model request budget exhausted",
-                &format!("{} may make at most {} model requests", self.whose(), spec.max_requests),
+                &format!("{} may make at most {} model requests", self.whose(), spec.requests),
                 None,
             ));
         }
-        if self.output_committed() >= spec.max_output_tokens {
+        if self.output_committed() >= spec.output_tokens {
             self.event(None, 429, Usage::default(), "budget: output token cap reached");
             return Some(problem(
                 429,
                 "budget",
                 "Model token budget exhausted",
-                &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                &format!("{} may generate at most {} output tokens", self.whose(), spec.output_tokens),
                 None,
             ));
         }
-        if let (Some(max), Some(0)) = (spec.max_input_tokens, self.remaining_input()) {
+        if let (Some(max), Some(0)) = (spec.input_tokens, self.remaining_input()) {
             self.event(None, 429, Usage::default(), "budget: input token cap reached");
             return Some(problem(
                 429,
@@ -411,6 +503,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
+        self.journal();
         // On a node (#152), the credential comes from the node's cache (fetched from the control host
         // on first use) and the call goes from here; the control host isn't asked per call. Without
         // the credential (first use while the control host is unreachable), the call fails clearly.
@@ -560,15 +653,15 @@ impl Llm {
             let Some(asked) = json.get("max_tokens").and_then(|v| v.as_u64()) else {
                 return Err(refuse(400, "a messages request without an integer max_tokens".into()));
             };
-            if let Some(spec) = spec {
+            if let (Some(_), Some(q)) = (spec, self.quota()) {
                 // A node's slice (#152) caps this activation's own output, in flight included.
                 let cap = match self.slice() {
-                    Some(sl) => spec.max_output_tokens.min(
+                    Some(sl) => q.output_tokens.min(
                         sl.output_tokens
                             + self.reserved_output_tokens.load(Ordering::SeqCst)
                             + self.prior_output_tokens.load(Ordering::SeqCst),
                     ),
-                    None => spec.max_output_tokens,
+                    None => q.output_tokens,
                 };
                 let Some(r) = self.reserve_output(cap, asked) else {
                     self.event(model.clone(), 429, Usage::default(), "budget: output token cap reached");
@@ -576,7 +669,7 @@ impl Llm {
                         429,
                         "budget",
                         "Model token budget exhausted",
-                        &format!("{} may generate at most {} output tokens", self.whose(), spec.max_output_tokens),
+                        &format!("{} may generate at most {} output tokens", self.whose(), q.output_tokens),
                         None,
                     )));
                 };
@@ -655,6 +748,7 @@ impl Llm {
             Ok(f) => f,
             Err(r) => return *r,
         };
+        self.journal();
         let reserved = f.reserved;
         let mut parts = parts;
         // The body may have been rewritten (fields stripped, max_tokens lowered): its own length goes
@@ -944,6 +1038,38 @@ fn max_after(s: &str, key: &str) -> u64 {
     best
 }
 
+/// The deterministic simulation's seam (#324, `wicket-sim`): one model call through this proxy's
+/// own checks and accounting, without HTTP or an upstream. [`Llm::sim_begin`] is what
+/// [`Llm::handle`] does before it sends a call (the slice and budget checks of `admit`, then
+/// `filter`'s reservation of `max_tokens`); [`Llm::sim_settle`] is what the call's end does
+/// (`settle`). Built only with the `sim` feature.
+#[cfg(feature = "sim")]
+impl Llm {
+    /// Admits a `POST /v1/messages` asking for `max_tokens`: the output tokens reserved for it
+    /// (possibly lowered to what is left), or the status it is refused with (429 for a budget).
+    pub fn sim_begin(&self, max_tokens: u64) -> std::result::Result<u64, u16> {
+        let spec = self.ctx.zone.llm.as_ref();
+        if let Some(r) = self.admit(spec) {
+            return Err(r.status().as_u16());
+        }
+        let (parts, ()) = Request::post("/v1/messages").body(()).expect("a static request").into_parts();
+        let body = serde_json::json!({"model": "sim", "max_tokens": max_tokens, "messages": []});
+        match self.filter(spec, &parts, Bytes::from(body.to_string())) {
+            Ok(f) => {
+                self.journal();
+                Ok(f.reserved)
+            }
+            Err(r) => Err(r.status().as_u16()),
+        }
+    }
+
+    /// Settles a call [`Llm::sim_begin`] admitted with `reserved`: charged `output` and `input`
+    /// tokens if its final usage was seen (`settled`), else its whole reservation.
+    pub fn sim_settle(&self, reserved: u64, input: u64, output: u64, settled: bool) {
+        self.settle(reserved, Usage { input, output, ..Default::default() }, settled);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{usage, Usage};
@@ -1188,6 +1314,31 @@ mod tests {
         llm.spent_before(1, 0, 100);
         let (status, _) = post(llm, "tokens").await;
         assert_eq!(status, 429);
+    }
+
+    /// #256: on the control host the run's quota grants are its budget: their amounts are the
+    /// limits every check reads, with the same refusals, whatever the zone says.
+    #[tokio::test]
+    async fn the_quota_grants_amounts_are_the_budget() {
+        let zone = "{max_requests: 50, max_output_tokens: 1000, max_input_tokens: 9000}";
+        let q = super::ModelQuota { requests: 2, output_tokens: 100, input_tokens: Some(500) };
+        let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), Some(q)).unwrap();
+        assert_eq!(llm.quota(), Some(q));
+        assert_eq!((llm.remaining(), llm.remaining_input()), (Some((2, 100)), Some(500)));
+        let sl = llm.next_slice(0.5).unwrap();
+        assert_eq!((sl.requests, sl.output_tokens, sl.input_tokens), (1, 50, Some(250)), "slices are cut from the grant's amount");
+        llm.spent_before(2, 0, 0);
+        let (status, body) = post(llm.clone(), "quota").await;
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("at most 2 model requests"), "{body}");
+        // A zone with a model route and no quota granted has nothing to spend.
+        let llm = super::Llm::with_quota(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone), None).unwrap();
+        assert_eq!(llm.remaining(), Some((0, 0)));
+        let (status, _) = post(llm, "none").await;
+        assert_eq!(status, 429);
+        // A node's proxy enforces the zone in its token, as before.
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, zone)).unwrap();
+        assert_eq!(llm.quota(), Some(super::ModelQuota { requests: 50, output_tokens: 1000, input_tokens: Some(9000) }));
     }
 
     /// A model upstream that answers every request with `chunks` (an SSE stream, chunked), pausing
@@ -1481,6 +1632,28 @@ mod tests {
         assert_eq!(llm.spent().requests, 7, "a node's count only raises this one");
         llm.merge_spent(super::Spent { requests: 1, ..Default::default() });
         assert_eq!(llm.spent().requests, 7);
+    }
+
+    /// #324: what a node persists counts the calls in flight at their whole reservation, so a node
+    /// restarted mid-call never counts less than its upstream billed. The journal reads the count
+    /// when it is told, not when its caller looked.
+    #[test]
+    fn the_journal_charges_calls_in_flight_in_full() {
+        let llm = super::Llm::new(ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, "{max_output_tokens: 1000}")).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let s = seen.clone();
+        llm.set_journal(move |sp| s.lock().unwrap().push(sp.output_tokens));
+        let spec = llm.ctx.zone.llm.clone().unwrap();
+        assert!(llm.admit(Some(&spec)).is_none());
+        let parts = http::Request::post("/v1/messages").body(()).unwrap().into_parts().0;
+        let f =
+            llm.filter(Some(&spec), &parts, bytes::Bytes::from_static(br#"{"model":"m","max_tokens":300,"messages":[]}"#)).ok().unwrap();
+        assert_eq!((llm.spent().output_tokens, llm.spent_charged().output_tokens), (0, 300));
+        llm.journal();
+        llm.settle(f.reserved, Usage { output: 40, ..Usage::default() }, true);
+        llm.journal();
+        assert_eq!(*seen.lock().unwrap(), vec![300, 40], "in flight: its reservation; settled: what it used");
+        assert_eq!(llm.spent_charged(), llm.spent());
     }
 
     #[test]

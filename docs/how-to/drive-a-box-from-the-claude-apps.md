@@ -92,8 +92,9 @@ What it protects, and how:
   reach whatever the mode: egress outside the zone's reach is still a decision for a human, and the
   login is still only a placeholder in the box. An unknown mode is refused, and a harness with no
   permission modes refuses any but `default`.
-- **Nodes.** It runs on any node: the node forwards the provider's host to the control host, where the
-  login is swapped in, so the secret stays with the control host.
+- **Nodes.** It runs on any node at protocol 10 or later. The node swaps the login in itself
+  (#257). It fetches the login's current access token from the control host on first use and keeps
+  it in memory only. The refresh token and refreshing stay with the control host.
 - **Not with hibernation.** The session lives in the vendor's apps, so the `hibernate` tool is refused;
   the box ends with its session. A supervisor that is handed over (`wicket self update`, #151) rebuilds
   the swap from the manifest.

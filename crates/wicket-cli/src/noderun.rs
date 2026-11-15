@@ -397,6 +397,9 @@ pub struct Start {
     pub llm: Option<Arc<wicket_proxy::llm::Llm>>,
     /// Where the secrets the node fetches come from (#152).
     pub vault: wicket_proxy::vault::Vault,
+    /// The run's credential swaps, with their real sources (#257): `start.swaps` names them for the
+    /// node, which fetches each on first use.
+    pub swaps: Vec<wicket_proxy::CredentialSwap>,
     /// A re-attached long-lived agent: its earlier spend, this activation's included, is already in
     /// the model proxy's `prior` counters, so the node's first report is the base its later ones
     /// count from (#152).
@@ -439,9 +442,12 @@ struct Shared {
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
-    /// Hosts this host swaps a credential in for (#169): the node forwards them here, so their
-    /// grants stay here too.
+    /// Hosts this host swaps a credential in for (#169), for a box a control host before protocol
+    /// 10 started: the node forwards them here, so their grants stay here too.
     swap_hosts: Vec<String>,
+    /// The run's credential swaps, which its node makes (#257): what this host releases to it for
+    /// them ([`fetch_secret`]).
+    swaps: Vec<wicket_proxy::CredentialSwap>,
     adopt: Option<Adopter>,
     /// Where the node may pull the box's pinned image from (#191), and the registry's secret, which
     /// it may fetch for that pull only.
@@ -599,6 +605,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
         swap_hosts: s.start.swap_hosts.clone(),
+        swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
         carried,
@@ -650,23 +657,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
             start.edge = None;
         }
-        // A node before #256 would take no budget slice: a box with a model budget goes only where
-        // its node is bounded by one.
-        if shared.llm.is_some() && ctl.proto.load(Ordering::SeqCst) < crate::chan::BUDGET_SLICE {
-            bail!(
-                "node {name} talks protocol {}, and this box has a model budget, whose slice needs {}: update the node (`wicket node install {name}`)",
-                ctl.proto.load(Ordering::SeqCst),
-                crate::chan::BUDGET_SLICE
-            );
-        }
-        // A node before #192 wouldn't check a pin: a pinned box goes only where it is checked.
-        if start.image_pin.is_some() && ctl.proto.load(Ordering::SeqCst) < crate::chan::IMAGE_PINS {
-            bail!(
-                "node {name} talks protocol {}, and this box's image is pinned by digest, which needs {}: update the node (`wicket node install {name}`)",
-                ctl.proto.load(Ordering::SeqCst),
-                crate::chan::IMAGE_PINS
-            );
-        }
+        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst), &start, shared.llm.is_some())?;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
@@ -1559,21 +1550,7 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
-    let spent = l.spent();
-    let low = |cap: u64, next_cap: u64, used: u64| cap.saturating_sub(used) * 2 < next_cap.saturating_sub(used);
-    let slice = match p.slice {
-        Some(cur)
-            if !low(cur.requests, next.requests, spent.requests)
-                && !low(cur.output_tokens, next.output_tokens, spent.output_tokens)
-                && !matches!((cur.input_tokens, next.input_tokens), (Some(c), Some(n)) if low(c, n, l.input_total()))
-                && cur.requests <= next.requests
-                && cur.output_tokens <= next.output_tokens
-                && cur.input_tokens.zip(next.input_tokens).is_none_or(|(c, n)| c <= n) =>
-        {
-            cur
-        }
-        _ => next,
-    };
+    let slice = wicket_proxy::llm::Slice::renewed(p.slice, next, l.spent(), l.input_total());
     if p.slice_sent && p.slice == Some(slice) {
         return None;
     }
@@ -1586,8 +1563,38 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
+/// Why a box can't start on node `name` talking `proto`: it needs something an older node wouldn't
+/// do, and so would run unbounded or unchecked there (or fail closed, as a swap would).
+pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool) -> Result<()> {
+    // A node before #256 would take no budget slice: a box with a model budget goes only where its
+    // node is bounded by one.
+    if budget && proto < crate::chan::BUDGET_SLICE {
+        bail!(
+            "node {name} talks protocol {proto}, and this box has a model budget, whose slice needs {}: update the node (`wicket node install {name}`)",
+            crate::chan::BUDGET_SLICE
+        );
+    }
+    // A node before #257 would neither make a swap nor forward its host: a box with swaps goes only
+    // where they are made.
+    if !start.swaps.is_empty() && proto < crate::chan::CREDENTIAL_SWAPS {
+        bail!(
+            "node {name} talks protocol {proto}, and this box has credential swaps, which its node makes from protocol {}: update the node (`wicket node install {name}`)",
+            crate::chan::CREDENTIAL_SWAPS
+        );
+    }
+    // A node before #192 wouldn't check a pin: a pinned box goes only where it is checked.
+    if start.image_pin.is_some() && proto < crate::chan::IMAGE_PINS {
+        bail!(
+            "node {name} talks protocol {proto}, and this box's image is pinned by digest, which needs {}: update the node (`wicket node install {name}`)",
+            crate::chan::IMAGE_PINS
+        );
+    }
+    Ok(())
+}
+
 /// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone
-/// uses it and the vault's binding covers the hosts it uses it for. Audited either way.
+/// (or one of its credential swaps, #257) uses it and the vault's binding covers the hosts it uses
+/// it for. Audited either way.
 fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
     // The registry's credential, for the pull of the box's image only (#191): bound to its host
     // and its token service's, and only while that pull is under way. The node holds it for the
@@ -1598,7 +1605,7 @@ fn fetch_secret(sh: &Shared, p: &mut Progress, id: u64, name: &str) -> Msg {
             let hosts: Vec<String> = std::iter::once(src.host.clone()).chain(src.auth_hosts.iter().cloned()).collect();
             crate::nodesecrets::release_for_hosts(&sh.vault, name, &hosts, sh.ctl.authority_until())
         }
-        None => crate::nodesecrets::release(&sh.zone, &sh.vault, name, sh.ctl.authority_until()),
+        None => crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, name, sh.ctl.authority_until()),
     };
     let (ok, why) = match &r {
         Ok(f) => {
@@ -1628,8 +1635,9 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
     let mut out = vec![];
     let names: Vec<String> = p.fetched.keys().cloned().collect();
     for name in names {
-        let now =
-            crate::nodesecrets::release(&sh.zone, &sh.vault, &name, sh.ctl.authority_until()).ok().map(|f| crate::nodesecrets::digest(&f));
+        let now = crate::nodesecrets::release_run(&sh.zone, &sh.swaps, &sh.vault, &name, sh.ctl.authority_until())
+            .ok()
+            .map(|f| crate::nodesecrets::digest(&f));
         if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
             p.fetched.remove(&name);
             save_holdings(sh, p);
@@ -1773,7 +1781,9 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if Op::egress(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path).refused_for_agents().is_some() {
             continue;
         }
-        // As the node routes it: a host injected with a secret leased to the node is decided there.
+        // As the node routes it: a host injected with a secret leased to the node is decided there,
+        // and so is a swapped one (#257), unless a control host before protocol 10 started the box
+        // and swaps it here.
         if sh.swap_hosts.iter().any(|h| wicket_core::manifest::host_matches(h, &g.host)) {
             continue;
         }

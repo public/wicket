@@ -14,13 +14,15 @@ pub mod cas;
 mod links;
 mod node;
 mod quota;
-pub use quota::{GrantListing, Quota, QUOTA_HOST, QUOTA_METHOD};
+mod receipts;
+pub use quota::{GrantListing, Quota, QuotaAmounts, MAX_QUOTA_TTL_SECS, MONEY_HOURLY, MONEY_RESERVED, QUOTA_HOST, QUOTA_METHOD};
+pub use receipts::{MessageMeta, MessageRow, Priority, Receipt};
 pub mod objects;
 pub mod sealed;
 pub use agents::{new_agent_id, valid_agent_id, AgentRow, AgentUsage, NewAgent, HELD as AGENT_HELD};
 pub use links::{ExposeRow, LinkRow};
 mod lease;
-pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, PlacedNodeRow, LIVE as LIVE_LEASES};
+pub use lease::{new_lease_id, BudgetRefusal, LeaseBudget, LeaseRow, PlacedNodeRow, LEASE_QUOTA_BY, LIVE as LIVE_LEASES};
 pub use node::{AuditRecord, GrantRow, NodeAuditSummary};
 mod writer;
 pub use writer::{AuditWriter, Ticket, WriterConfig};
@@ -66,7 +68,10 @@ pub enum StoreError {
 /// running box's renewable authority (#56). Version 3 (expand) adds `grants.amount`: a quota
 /// grant's amount (model budget, children, bytes), recorded as a grant (#256). Version 4
 /// (expand) adds `messages.to_principal`: messages are addressed to principals, not runs (#250).
-pub const SCHEMA_VERSION: u32 = 4;
+/// Version 5 (expand) adds the agent-to-agent protocol's record (#252): `messages.from_principal`
+/// (the reply address), `messages.priority`, `messages.in_reply_to`, the `message_refusals` table,
+/// and `runs.activity` (busy, idle, waiting) for presence.
+pub const SCHEMA_VERSION: u32 = 5;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -237,7 +242,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
-  authority_until INTEGER, authority_cap INTEGER
+  authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -274,7 +279,7 @@ CREATE TABLE IF NOT EXISTS revocations (
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
-  created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT
+  created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT, from_principal TEXT, priority TEXT, in_reply_to TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
 CREATE TABLE IF NOT EXISTS node_tokens (
@@ -376,6 +381,7 @@ impl Ledger {
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
+        conn.execute_batch(receipts::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -405,6 +411,13 @@ impl Ledger {
         // Ledgers created before messages were addressed to principals (#250).
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN to_principal TEXT", []);
         conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at)")?;
+        // Ledgers created before the agent-to-agent protocol's receipts and presence (#252).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN from_principal TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN priority TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN activity_at INTEGER", []);
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_sent ON messages (from_principal, created_at)")?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -436,6 +449,7 @@ impl Ledger {
         conn.execute_batch(links::SCHEMA)?;
         conn.execute_batch(export::SCHEMA)?;
         conn.execute_batch(agents::SCHEMA)?;
+        conn.execute_batch(receipts::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
@@ -738,7 +752,9 @@ impl Ledger {
     /// the principal has a live run, which then takes it ([`Ledger::put_identity`] moves held
     /// messages to a principal's new run, for [`MESSAGE_HOLD_SECS`]). A held message is checked
     /// again for a live run in the same transaction, so one started meanwhile isn't missed. Returns
-    /// the run it is for, if any yet.
+    /// the run it is for, if any yet. `meta` is its reply address, priority and the message it
+    /// answers (#252).
+    #[allow(clippy::too_many_arguments)]
     pub fn post_message(
         &mut self,
         id: &str,
@@ -747,6 +763,7 @@ impl Ledger {
         to: &str,
         to_run: Option<&str>,
         envelope: &str,
+        meta: &MessageMeta,
     ) -> Result<Option<String>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let to_run = match to_run {
@@ -761,8 +778,20 @@ impl Ledger {
                 .optional()?,
         };
         tx.execute(
-            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, tenant.0, from_run, to_run.as_deref().unwrap_or(""), envelope, now(), to],
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal, from_principal, priority, in_reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                tenant.0,
+                from_run,
+                to_run.as_deref().unwrap_or(""),
+                envelope,
+                now(),
+                to,
+                meta.from_principal,
+                meta.priority.as_str(),
+                meta.in_reply_to
+            ],
         )?;
         tx.commit()?;
         Ok(to_run)
@@ -793,14 +822,18 @@ impl Ledger {
         Ok(())
     }
 
-    /// Takes the oldest undelivered message for `run`. Marked delivered in the same transaction, so
-    /// each message is handed out once. `created_at` is when wicket recorded it: the time its
-    /// sender's identity must have been valid.
+    /// Takes the next undelivered message for `run`: the most urgent (#252's priority), then the
+    /// oldest. Marked delivered (read, on its receipt) in the same transaction, so each message is
+    /// handed out once. `created_at` is when wicket recorded it: the time its sender's identity
+    /// must have been valid.
     pub fn take_message(&mut self, run: &str) -> Result<Option<StoredMessage>> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let m: Option<StoredMessage> = tx
             .query_row(
-                "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY created_at, rowid LIMIT 1",
+                &format!(
+                    "SELECT id, from_run, envelope, created_at FROM messages WHERE to_run = ?1 AND delivered_at IS NULL ORDER BY {} LIMIT 1",
+                    receipts::INBOX_ORDER
+                ),
                 params![run],
                 |r| Ok(StoredMessage { id: r.get(0)?, from_run: r.get(1)?, envelope: r.get(2)?, created_at: r.get(3)? }),
             )
@@ -1365,7 +1398,7 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
     })
 }
 
-fn row_to_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityRow> {
+pub(crate) fn row_to_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityRow> {
     Ok(IdentityRow {
         run: r.get(0)?,
         tenant: r.get(1)?,
@@ -2058,12 +2091,12 @@ mod tests {
             issued_at: now(),
         };
         // Never run: held.
-        assert_eq!(l.post_message("m-1", &t, "run_s", p, None, "e1").unwrap(), None);
+        assert_eq!(l.post_message("m-1", &t, "run_s", p, None, "e1", &MessageMeta::default()).unwrap(), None);
         l.run_started(&t, &RunId("run_1".into()), "z", "peer").unwrap();
         l.put_identity(&row("run_1", p)).unwrap();
         assert_eq!(l.waiting_messages("run_1").unwrap(), 1, "the held message is its first run's");
         assert_eq!(l.live_run_of(&t.0, p).unwrap().as_deref(), Some("run_1"));
-        assert_eq!(l.post_message("m-2", &t, "run_s", p, None, "e2").unwrap().as_deref(), Some("run_1"));
+        assert_eq!(l.post_message("m-2", &t, "run_s", p, None, "e2", &MessageMeta::default()).unwrap().as_deref(), Some("run_1"));
         // Another principal's run takes none of it.
         l.run_started(&t, &RunId("run_o".into()), "z", "other").unwrap();
         l.put_identity(&row("run_o", "spiffe://x/t/default/z/z/a/other")).unwrap();
@@ -2072,7 +2105,7 @@ mod tests {
         assert_eq!(l.take_message("run_1").unwrap().unwrap().id, "m-1");
         l.run_ended(&RunId("run_1".into()), "succeeded", "{}").unwrap();
         assert_eq!(l.live_run_of(&t.0, p).unwrap(), None);
-        assert_eq!(l.post_message("m-3", &t, "run_s", p, None, "e3").unwrap(), None);
+        assert_eq!(l.post_message("m-3", &t, "run_s", p, None, "e3", &MessageMeta::default()).unwrap(), None);
         l.run_started(&t, &RunId("run_2".into()), "z", "peer").unwrap();
         l.put_identity(&row("run_2", p)).unwrap();
         assert_eq!(l.take_message("run_2").unwrap().unwrap().id, "m-2");
