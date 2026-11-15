@@ -4245,6 +4245,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rcgen 0.13.2",
  "reqwest",
+ "ring",
  "rpassword",
  "rusqlite",
  "rustls",
