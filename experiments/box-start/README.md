@@ -64,12 +64,38 @@ one-way latency late):
 | `docker.image_inspect`, `docker.image_cached` | `docker image inspect` (twice for a pinned image not found by its reference); or, instead, the node's cached identity, while no image event has come since it was inspected (#287) |
 | `layout` | the box's directories, CA bundle, hosts file, workspace archive, state files, volumes |
 | `proxies`, `proxies.sockets` | the node's per-box egress, model, HTTP/3 and DNS, gateway proxies; binding their sockets (no wait, #287) |
-| `docker.run` | `docker run -d`: the CLI, dockerd, containerd, the shim and runsc |
-| `docker.run.create` | from the CLI starting until Docker had created the container (Docker's `Created`) |
+| `docker.run` | `docker run -d`: through the Engine API (#287), its create and start calls; else the CLI. Then dockerd, containerd, the shim and runsc |
+| `docker.run.create` | from the call (or the CLI) starting until Docker had created the container (Docker's `Created`) |
 | `docker.run.runtime` | from then until the runtime had started the box's first process (`State.StartedAt`): containerd, the shim, runsc's sandbox and gofer boot |
-| `docker.run.return` | from then until the CLI returned |
+| `docker.run.return` | from then until the start call (or the CLI) returned |
 | `docker.inspect` | the extra `docker inspect` the three spans above are read from (only with `WICKET_TIMINGS=1`) |
-| `record`, `wire` | the box's record saved; its stdin socket, and `docker logs --follow` and `docker wait` spawned |
+| `record`, `wire` | the box's record saved; its stdin socket, and its logs (followed) and wait started |
+
+After `Started`, the box's own start and its end (#287). These are measured by the box and its node,
+sent with the box's exit, and placed by the node's wall clock (so another node's spans are only as
+good as the two clocks agree):
+
+| span | what |
+|---|---|
+| `box.started` | a moment: the runtime started the box's first process (Docker's `State.StartedAt`) |
+| `box.entry.init` | from then until `wicket-entry` began (docker-init, bash) |
+| `box.entry.addrs` | wicket.internal's, the links' and the synthetic addresses added |
+| `box.entry.setup` | wicket-fwd spawned, the CA bundle written |
+| `box.entry.fwd` | waiting for wicket-fwd to listen |
+| `box.entry.exec` | the agent's directories made and these steps written (one process) |
+| `box.exec` | a moment: the program is started (then `box.first_output` is the program's own start) |
+| `box.finished` | a moment: the program exited (Docker's `State.FinishedAt`) |
+| `node.teardown.wait` | from then until Docker's wait returned to the node |
+| `node.teardown.output` | the node reading the last of the box's logs |
+| `node.teardown.inspect` | how it ended (`docker inspect`) |
+| `node.teardown.rm` | the container removed |
+| `node.teardown.release` | the run's leases dropped, its spend sent |
+| `node.teardown` | all of the node's part, from Docker's wait returning until `Exited` is sent |
+| `box.exited` | a moment: the supervisor has the exit |
+| `teardown.output`, `teardown.fetch` | on the control host, from the exit: the box's last output and stderr; its files fetched from a node that kept them |
+| `teardown` | the control host's part, from the exit until the timings are saved (the process's own exit after that is in the wall time only) |
+
+The `box.entry.*` steps need an image with this `wicket-entry` (`wicket image`).
 
 So `node.start` − `node.start.total` is the channel (both ways) and the node's own scheduling, and
 `docker.run` − `docker.run.runtime` is what the CLI and dockerd add to runsc.

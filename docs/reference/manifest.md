@@ -208,7 +208,7 @@ one reads.
 | `cpus` | number | `1` | CPUs. At least 0.01. |
 | `pids` | integer | `512` | Processes. At least 1. |
 | `timeout` | duration | `30m` | Total time in a box over the agent's life, time waiting between turns included. Not zero. The box is stopped when it is reached. |
-| `authority` | duration | the `timeout` | How long the box's authority lasts from the run's start: its token's block 0, and so how long its node keeps working for it without the control host. Never longer than `timeout`, never zero. The node stops the box when it ends. |
+| `authority` | duration | the `timeout` | How long the box's authority lasts from the run's start: its token's block 0, and so how long its node keeps working for it without the control host. Never longer than `timeout`, never zero. The node stops the box when it ends, unless a principal who may grant it renews it first (`wicket grant renew <run> --ttl`, or a parent agent's `decide`; [#56](https://github.com/public/wicket/issues/56)), never past the `timeout`. |
 | `output` | size | `64m` | How much of the box's output (stdout and stderr) its node's host and the control host's transcript keep, each. At least `64k`. |
 | `on_output_full` | `keep_newest` or `stop` | `keep_newest` | When output passes `output`: keep the newest (the oldest goes, and the bytes dropped are recorded), or stop the box. |
 | `exit_grace` | duration | `30s` | How long the harness has to exit by itself once its session is over: after the agent called [`finish`](mcp-tools.md#finish) and its session closed (then the box is stopped, the run recorded as succeeded with the processes left named), or when it asked to [`hibernate`](mcp-tools.md#hibernate) while other processes ran in the box (then they are stopped and it hibernates). |

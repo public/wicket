@@ -60,8 +60,9 @@ pub enum StoreError {
 ///   after the one whose expand step made it unnecessary to read the old shape.
 ///
 /// Version 1 is every migration up to #162 (all of them expand steps: `CREATE ... IF NOT EXISTS`
-/// and `ADD COLUMN`).
-pub const SCHEMA_VERSION: u32 = 1;
+/// and `ADD COLUMN`). Version 2 (expand) adds `runs.authority_until` and `runs.authority_cap`, a
+/// running box's renewable authority (#56).
+pub const SCHEMA_VERSION: u32 = 2;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -227,7 +228,8 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
-  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT
+  status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
+  authority_until INTEGER, authority_cap INTEGER
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -345,6 +347,9 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN policy TEXT", []);
         // Ledgers created before runs recorded the node they were placed on (#120).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN node TEXT", []);
+        // Ledgers created before a running box's authority could be renewed (#56).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_until INTEGER", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_cap INTEGER", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -578,6 +583,36 @@ impl Ledger {
     pub fn set_run_policy(&self, run: &str, version: Option<&str>) -> Result<()> {
         self.conn.execute("UPDATE runs SET policy = ?2 WHERE id = ?1", params![run, version])?;
         Ok(())
+    }
+
+    /// Records when `run`'s box authority ends (Unix seconds) as its token was minted, and the latest
+    /// a renewal may take it to (its hard end: the run's timeout). Every authority has an end.
+    pub fn set_run_authority(&self, run: &str, until: i64, cap: i64) -> Result<()> {
+        self.conn.execute("UPDATE runs SET authority_until = ?2, authority_cap = ?3 WHERE id = ?1", params![run, until.min(cap), cap])?;
+        Ok(())
+    }
+
+    /// When `run`'s box authority ends and the latest a renewal may take it to (Unix seconds), if
+    /// its box was started with one recorded.
+    pub fn run_authority(&self, run: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT authority_until, authority_cap FROM runs WHERE id = ?1", params![run], |r| {
+                Ok(r.get::<_, Option<i64>>(0)?.zip(r.get::<_, Option<i64>>(1)?))
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// Renews running `run`'s box authority to end at `until` (Unix seconds): never past its cap,
+    /// never unlimited. Its supervisor re-mints the box's token with that end. False if the run
+    /// isn't running, has no authority recorded, or `until` is past its cap.
+    pub fn renew_run_authority(&self, run: &str, until: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE runs SET authority_until = ?2
+             WHERE id = ?1 AND status = 'running' AND authority_until IS NOT NULL AND authority_cap >= ?2",
+            params![run, until],
+        )? == 1)
     }
 
     /// The org policy version `run`'s token was minted under (None: none, or no such run).
@@ -1917,6 +1952,41 @@ mod tests {
             .approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() })
             .unwrap();
         assert_eq!(l.request_for_grant(&gid).unwrap().unwrap().id, id);
+    }
+
+    /// #56: a live grant is renewed to a new end with its uses kept; a revoked or expired one isn't.
+    /// A running box's authority is renewed up to its cap, never past it, and not once it ended.
+    #[test]
+    fn grants_and_box_authority_are_renewed_within_their_limits() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let (id, _) = l.pending_for(&op("/o/r/issues"), "x", None).unwrap();
+        let gid =
+            l.approve(&id, &Approval { uses: Some(3), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "op".into() }).unwrap();
+        let t = now();
+        assert!(l.renew_grant(&gid, t + 3600).unwrap());
+        let g = l.grant(&gid).unwrap().unwrap();
+        assert_eq!((g.expires_at, g.uses_left, g.run.as_deref()), (t + 3600, Some(3), Some("run_t")));
+        assert_eq!(l.grant_for_request(&id).unwrap().unwrap().id, gid);
+        l.revoke_grant(&gid).unwrap();
+        assert!(!l.renew_grant(&gid, t + 7200).unwrap(), "revoked");
+        assert!(l.grant_for_request(&id).unwrap().is_none());
+        let (id2, _) = l.pending_for(&op("/o/r/pulls"), "x", None).unwrap();
+        let g2 =
+            l.approve(&id2, &Approval { uses: Some(1), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "op".into() }).unwrap();
+        l.conn.execute("UPDATE grants SET expires_at = ?2 WHERE id = ?1", params![g2, t - 1]).unwrap();
+        assert!(!l.renew_grant(&g2, t + 600).unwrap(), "expired: ask again");
+
+        let run = RunId("run_t".into());
+        l.run_started(&TenantId::single(), &run, "z", "a").unwrap();
+        assert_eq!(l.run_authority("run_t").unwrap(), None);
+        assert!(!l.renew_run_authority("run_t", t + 60).unwrap(), "no authority recorded");
+        l.set_run_authority("run_t", t + 60, t + 600).unwrap();
+        assert_eq!(l.run_authority("run_t").unwrap(), Some((t + 60, t + 600)));
+        assert!(!l.renew_run_authority("run_t", t + 601).unwrap(), "past its cap");
+        assert!(l.renew_run_authority("run_t", t + 600).unwrap());
+        assert_eq!(l.run_authority("run_t").unwrap(), Some((t + 600, t + 600)));
+        l.run_ended(&run, "succeeded", "").unwrap();
+        assert!(!l.renew_run_authority("run_t", t + 300).unwrap(), "ended");
     }
 
     #[test]

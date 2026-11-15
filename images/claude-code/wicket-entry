@@ -24,6 +24,11 @@ if [ "${1:-}" = --restore-hook ]; then
   esac
   exit 0
 fi
+# When each step of the box's start was reached (#287), on the host's clock (bash's EPOCHREALTIME, no
+# process), written for its node as the program starts: the node times the box's start with them.
+T="start ${EPOCHREALTIME:-}"
+mark() { T="$T
+$1 ${EPOCHREALTIME:-}"; }
 AS="${WICKET_AS_USER:?wicket-entry needs WICKET_AS_USER=uid:gid}"
 U=${AS%%:*}
 G=${AS##*:}
@@ -36,6 +41,7 @@ drop() { setpriv --reuid="$U" --regid="$G" --clear-groups --inh-caps=-all --boun
 seq 1 32 | sed 's|.*|addr replace 198.18.1.&/32 dev lo|' | ip -batch -
 ip addr replace "$WICKET_ADDR/32" dev lo
 ip addr replace "$SYNTHETIC" dev lo
+mark addrs
 
 # One forwarder for all of them (crates/wicket-fwd): TCP_NODELAY, large buffers, splice, a thread per
 # direction; and datagrams, in frames over one unix connection each: QUIC (HTTP/3) to any synthetic
@@ -53,8 +59,7 @@ drop sh -c 'cat /etc/ssl/certs/ca-certificates.crt /wicket/ca/ca.pem > /tmp/ca-b
 export SSL_CERT_FILE=/tmp/ca-bundle.pem CURL_CA_BUNDLE=/tmp/ca-bundle.pem GIT_SSL_CAINFO=/tmp/ca-bundle.pem \
        REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem
 
-drop mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-drop mkdir -p /workspace/out 2>/dev/null || true   # absent when the workspace is mounted elsewhere
+mark setup
 
 # Wait (briefly) for the forwarder to listen.
 i=0
@@ -62,6 +67,15 @@ while [ $i -lt 50 ]; do
   if (exec 3<>/dev/tcp/$WICKET_ADDR/8080) 2>/dev/null; then break; fi
   i=$((i + 1)); sleep 0.1
 done
+mark fwd
+
+# The agent's directories (/workspace/out is absent when the workspace is mounted elsewhere), and the
+# start's steps for the node (best effort: an older node's socket directory may not take them), in
+# one process as the agent's user.
+drop bash -c 'mkdir -p "$HOME" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" || exit 1
+mkdir -p /workspace/out 2>/dev/null
+printf "%s\nexec %s\n" "$1" "${EPOCHREALTIME:-}" > /wicket/sock/entry.times 2>/dev/null
+exit 0' wicket-entry "$T"
 
 # An interactive box's stdin comes from wicket's node over a socket (#151), so it outlives the node
 # process writing it: the forwarder runs the agent and feeds it.
