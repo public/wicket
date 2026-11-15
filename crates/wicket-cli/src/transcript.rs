@@ -146,6 +146,116 @@ impl Newest {
     }
 }
 
+/// What wicket itself said to an ACP agent (#327), next to the transcript of what the agent said:
+/// `acp-client.jsonl`, one entry per line, each with `at`, the transcript offset (in the box's stdout)
+/// it was written at, so a reader can put both sides back in order. Entries are either `msg` (a
+/// JSON-RPC message wicket wrote to the agent's stdin) or `queued` (a prompt handed to wicket's ACP
+/// client, with who it is from and the operator message it came from, if any; the client sends its
+/// queued prompts in order, one `session/prompt` each). Kept up to a cap, then no longer written.
+pub const ACP_LOG: &str = "acp-client.jsonl";
+
+pub struct AcpLog {
+    f: Option<std::fs::File>,
+    len: u64,
+    cap: u64,
+}
+
+impl AcpLog {
+    /// Opens the log of a fresh run (emptied) or a re-attached one (appended to).
+    pub fn open(dir: &Path, cap: u64, resume: bool) -> AcpLog {
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(ACP_LOG)).ok();
+        if let (Some(f), false) = (&f, resume) {
+            let _ = f.set_len(0);
+        }
+        let len = f.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        AcpLog { f, len, cap }
+    }
+
+    fn entry(&mut self, e: serde_json::Value) {
+        let line = e.to_string();
+        if self.len + line.len() as u64 + 1 > self.cap {
+            self.f = None;
+        }
+        if let Some(f) = self.f.as_mut() {
+            if writeln!(f, "{line}").is_ok() {
+                self.len += line.len() as u64 + 1;
+            }
+        }
+    }
+
+    /// wicket wrote `lines` (JSON-RPC, newline-separated) to the agent at transcript offset `at`.
+    pub fn wrote(&mut self, at: u64, lines: &str) {
+        for l in lines.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(l) {
+                self.entry(serde_json::json!({ "at": at, "msg": msg }));
+            }
+        }
+    }
+
+    /// A prompt was queued in wicket's ACP client: from `by`, for operator message `op`.
+    pub fn queued(&mut self, at: u64, by: &str, op: Option<i64>) {
+        self.entry(serde_json::json!({ "at": at, "queued": { "by": by, "op": op } }));
+    }
+}
+
+/// The whole lines of a run's transcript from absolute offset `pos` (in the box's stdout), each with
+/// the offset it starts at, at most about `max` bytes of them, and the offset after the last one.
+/// What is no longer kept is skipped (the returned lines then start later than `pos`).
+pub fn read_since(dir: &Path, pos: u64, max: usize) -> (Vec<(u64, String)>, u64) {
+    let s = resumed_readonly(dir);
+    let mut out = Vec::new();
+    let mut pos = pos.max(s.prev);
+    let mut budget = max;
+    let files = [(PREVIOUS, s.prev, s.cur), (FILE, s.cur, u64::MAX)];
+    for (name, start, end) in files {
+        if pos >= end || budget == 0 {
+            continue;
+        }
+        let Ok(b) = std::fs::read(dir.join(name)) else { continue };
+        let from = (pos.saturating_sub(start)) as usize;
+        if from > b.len() {
+            continue;
+        }
+        let mut at = from;
+        while let Some(n) = b[at..].iter().position(|&c| c == b'\n') {
+            let line = String::from_utf8_lossy(&b[at..at + n]).into_owned();
+            out.push((start + at as u64, line));
+            at += n + 1;
+            budget = budget.saturating_sub(n + 1);
+            if budget == 0 {
+                break;
+            }
+        }
+        pos = start + at as u64;
+        if name == PREVIOUS && at == b.len() {
+            pos = pos.max(s.cur);
+        }
+    }
+    (out, pos)
+}
+
+/// Where the transcript's files start, as saved (a reader never repairs the state, as [`resumed`] does).
+fn resumed_readonly(dir: &Path) -> State {
+    crate::run::read_json(&dir.join(STATE)).unwrap_or_default()
+}
+
+/// The whole lines of the run's [`ACP_LOG`] from byte `pos`, and the byte after the last one.
+pub fn read_acp_log(dir: &Path, pos: u64, max: usize) -> (Vec<serde_json::Value>, u64) {
+    let Ok(b) = std::fs::read(dir.join(ACP_LOG)) else { return (vec![], pos) };
+    let mut at = (pos as usize).min(b.len());
+    let mut out = Vec::new();
+    while let Some(n) = b[at..].iter().position(|&c| c == b'\n') {
+        if let Ok(v) = serde_json::from_slice(&b[at..at + n]) {
+            out.push(v);
+        }
+        at += n + 1;
+        if out.len() >= max {
+            break;
+        }
+    }
+    (out, at as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
