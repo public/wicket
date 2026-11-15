@@ -754,7 +754,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let env: Vec<(String, String)> = std::env::vars().collect();
                     (harness.expect("a wrapped agent").wrapped_principal(&env), None)
                 }
-                None => (crate::cli_principal(), None),
+                // An operator (#11): its principal id (`sub`) next to how wicket knew them.
+                None => (crate::operators::with_identity(crate::cli_principal(), &m.tenant.0), None),
             };
             let spec = wicket_identity::IdentitySpec {
                 tenant: m.tenant.0.clone(),
@@ -845,13 +846,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     timings.since("policy.org", lap);
+    // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as
+    // its own first, made by who started it; a child's its parent recorded before starting it.
+    let limits = {
+        let start = match (&record, &parent_run) {
+            (Some(_), _) => crate::quotas::Start::Reattached,
+            (None, Some(_)) => crate::quotas::Start::Child,
+            (None, None) => crate::quotas::Start::Root { by: &principal },
+        };
+        crate::quotas::at_start(&ledger.lock().expect("ledger"), &m, &run, start)?
+    };
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(Arc::new(crate::spawn::SpawnCtx {
             parent: m.clone(),
             // A re-attached run (#151) starts from the slots its children already hold.
-            slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, a.max_children))),
+            slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, limits.max_children))),
+            max_children: limits.max_children,
             exe: None,
             run: run.clone(),
             dir: dir.clone(),
@@ -999,7 +1011,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
     // of record (#152, #257), whose reports are merged in here and whose slices are leased from here.
     // Nothing listens for model calls on this side.
-    let llm = Llm::new(ctx.clone())?;
+    // Its budget is its quota grants' amounts (#256), whatever its zone says.
+    let llm = Llm::with_quota(ctx.clone(), limits.model)?;
     let _ = llm_slot.set(llm.clone());
     // A wrapped session's model calls reach the model host through the egress proxy: they get the
     // model proxy's budget, filter and accounting there (#112).
@@ -1244,7 +1257,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             llm_prior: llm.spent_total(),
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
-            swap_hosts: ctx.swaps.iter().map(|s| s.host.clone()).collect(),
+            // Swapped on the node (#257): their names and placeholders only, the credentials
+            // fetched by the node on first use.
+            swap_hosts: vec![],
+            swaps: crate::chan::swap_starts(&ctx.swaps),
             durable: match long_lived {
                 true => m
                     .zone
@@ -1277,6 +1293,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }),
                     _ => None,
                 },
+                // Push delivery of messages (#252), if the harness takes it in a box.
+                push: harness.and_then(|h| h.message_push(&m)),
             })),
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
@@ -1315,6 +1333,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             attribute: ctx.attribute.clone(),
             llm: Some(llm.clone()),
             vault: ctx.vault.clone(),
+            swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
             adopt: adopter.clone(),
             timings: timings.clone(),
@@ -1404,6 +1423,21 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket wake {}", f.agent, session.id, run, f.agent);
         }
     }
+    // Its quota grants are its limits (#256): kept live while it runs, at most a day ahead each
+    // time, never past its timeout. A revoked one is not brought back.
+    let quota_task = {
+        let (ledger, run2) = (ledger.clone(), run.0.clone());
+        let end = wicket_store::now() + i64::try_from(m.zone.limits.timeout()?.as_secs()).unwrap_or(i64::MAX / 2);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::quotas::RENEW_EVERY);
+            loop {
+                tick.tick().await;
+                if let Ok(l) = ledger.lock() {
+                    let _ = l.renew_quota_grants(&run2, end);
+                }
+            }
+        })
+    };
     // Keep the identity fresh, and act on revocation: a revoked agent's box is stopped.
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rotate_task = match (&identity, id_spec) {
@@ -1544,6 +1578,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut hib_asked = false;
     let mut finish_asked = false;
     let mut notified_msgs = 0i64;
+    // The turn state last reported as the run's presence (#252).
+    let mut reported_turn: Option<bool> = None;
     let mut superseded = false;
     let mut saw_assistant = false;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1564,6 +1600,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     };
     let mut remote_url: Option<String> = None;
+    // A woken driven remote box's session before it hibernated (#330): Claude Code reattaches to it
+    // if it can, and otherwise starts a new one, which the owner has to be told of.
+    let prior_remote_url = match &wake {
+        Some(w) if driven_remote => ledger.lock().ok().and_then(|l| prior_remote_session(&l, &w.agent.id, &run.0)),
+        _ => None,
+    };
     loop {
         tokio::select! {
             ex = child.exited(), if lines.is_none() => {
@@ -1667,13 +1709,31 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if driven_remote && remote_url.is_none() {
                             match harness.and_then(|h| h.driven_remote_status(&l)) {
                                 Some(Ok(u)) => {
-                                    println!("[wicket] remote session: {u}");
+                                    let mut body = serde_json::json!({ "url": u });
+                                    match prior_remote_url.as_deref() {
+                                        Some(old) if same_remote_session(old, &u) => {
+                                            println!("[wicket] remote session resumed: {u}");
+                                            body["resumed"] = true.into();
+                                        }
+                                        // A new session, as at the start, and the old one is no longer
+                                        // this box's: said as loudly as the start's address.
+                                        Some(old) => {
+                                            println!("[wicket] the woken box couldn't reattach to its remote session {old}; it started a new one");
+                                            println!("[wicket] remote session (NEW): {u}");
+                                            body["resumed"] = false.into();
+                                            body["previous"] = old.into();
+                                        }
+                                        None => println!("[wicket] remote session: {u}"),
+                                    }
                                     if let Ok(lg) = ledger.lock() {
-                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
+                                        let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &body);
                                     }
                                     remote_url = Some(u);
                                 }
                                 Some(Err(why)) => {
+                                    if let Some(old) = &prior_remote_url {
+                                        println!("[wicket] the woken box's remote session {old} wasn't resumed");
+                                    }
                                     println!("[wicket] the remote session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
@@ -1779,6 +1839,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
             }
             _ = tick.tick(), if stdin.is_some() => {
+                // Presence (#252): busy in a turn, idle between turns (the gateway says waiting
+                // while the agent is in a wait).
+                if !is_program && reported_turn != Some(turn_running) {
+                    if let Ok(l) = ledger.lock() {
+                        let _ = l.set_run_activity(&run.0, Some(if turn_running { "busy" } else { "idle" }));
+                    }
+                    reported_turn = Some(turn_running);
+                }
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages(&run.0).ok()).unwrap_or_default();
                 for (text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
@@ -1975,6 +2043,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     if let Some(t) = &rotate_task {
         t.abort();
     }
+    quota_task.abort();
     if revoked.load(std::sync::atomic::Ordering::SeqCst) {
         status = "revoked".into();
     }
@@ -2132,8 +2201,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         } else {
             serde_json::json!({ "status": status, "cause": cause, "note": end_note, "result": result })
         };
-        match ctx.send_message(p, "run_finished", body) {
-            Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
+        match ctx.send_message(&wicket_proxy::Recipient::Parent, "run_finished", body) {
+            Ok(s) => println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to),
             Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),
         }
     }
@@ -2294,29 +2363,28 @@ fn check_fetched(tree: &str, here: &Path, got: &Path, skip: &[&str]) -> Result<(
     Ok(())
 }
 
+/// An egress decision's line, as the run log prints it (and `wicket node top` shows it). A node sends
+/// these events, and an agent chose the method, host and path: printed only stripped (#128).
+pub fn egress_line(ev: &Event) -> Option<String> {
+    let Event::Egress { method, host, path, risk, outcome, detail } = ev else { return None };
+    let tag = match outcome.as_str() {
+        "allow" => "ALLOW  ",
+        "pending" => "PENDING",
+        "denied" => "DENIED ",
+        "forwarded" => "FORWARD",
+        "spliced" => "SPLICE ",
+        "unavailable" => "STALE  ",
+        _ => "BLOCKED",
+    };
+    let clip = wicket_agent::clip;
+    Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
+}
+
 fn print_event(ev: &Event) {
     match ev {
-        Event::Egress { method, host, path, risk, outcome, detail } => {
-            let tag = match outcome.as_str() {
-                "allow" => "ALLOW  ",
-                "pending" => "PENDING",
-                "denied" => "DENIED ",
-                "forwarded" => "FORWARD",
-                "spliced" => "SPLICE ",
-                "unavailable" => "STALE  ",
-                _ => "BLOCKED",
-            };
-            // A node sends these events, and an agent chose the method, host and path: printed only
-            // stripped (#128), and the hint only for what is shaped like a request id (#121).
-            let clip = wicket_agent::clip;
-            println!(
-                "[egress] {tag} {} {}{}  ({}; {})",
-                clip(method, 16),
-                clip(host, 120),
-                clip(path, 120),
-                clip(risk, 24),
-                clip(detail, 240)
-            );
+        Event::Egress { outcome, detail, .. } => {
+            println!("{}", egress_line(ev).unwrap_or_default());
+            // The hint only for what is shaped like a request id (#121).
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
                     println!("         → a human decides: wicket approve {id}   or   wicket deny {id}");
@@ -2411,9 +2479,41 @@ fn turn_input(acp: &mut Option<wicket_agent::acp::AcpClient>, state: &Path, text
     }
 }
 
+/// The remote session an agent's earlier activations last recorded (`run.remote_session`), newest
+/// first, not counting the run `now`.
+fn prior_remote_session(l: &Ledger, agent: &str, now: &str) -> Option<String> {
+    let runs = l.agent_runs(agent).ok()?;
+    runs.iter().rev().filter(|(r, _)| r != now).find_map(|(r, _)| {
+        let body = l.audit_latest(r, "run.remote_session").ok()??;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        v["url"].as_str().filter(|u| u.starts_with("https://")).map(String::from)
+    })
+}
+
+/// Whether two remote session addresses are the same session: the last path segment, without a
+/// query, and with Claude's two forms of a session id (`session_…`, `cse_…`) taken as one.
+fn same_remote_session(a: &str, b: &str) -> bool {
+    fn id(u: &str) -> &str {
+        let path = u.split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+        let last = path.rsplit('/').next().unwrap_or("");
+        last.strip_prefix("session_").or_else(|| last.strip_prefix("cse_")).unwrap_or(last)
+    }
+    let (a, b) = (id(a), id(b));
+    !a.is_empty() && a == b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_woken_remote_session_is_the_same_one_whichever_form_its_id_takes() {
+        let old = "https://claude.ai/code/session_01abc";
+        assert!(same_remote_session(old, "https://claude.ai/code/session_01abc?from=cli"));
+        assert!(same_remote_session(old, "https://claude.ai/code/cse_01abc/"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/session_01def"));
+        assert!(!same_remote_session(old, "https://claude.ai/code/"));
+    }
 
     #[test]
     fn a_fetch_that_brings_back_less_than_the_box_started_with_fails() {

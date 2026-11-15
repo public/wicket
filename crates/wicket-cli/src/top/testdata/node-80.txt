@@ -1,0 +1,17 @@
+wicket node top — node hyperv1 — 09:46:40Z
+identity spiffe://example.org/node/hyperv1 until 07:46:40Z (in 22h00m)
+CA until 09:46:40Z (in 3d00h)
+control: connected (2 links) since 09:26:35Z (20m05s)
+feed fresh, epoch 42, 18s left
+load 0.12 0.30 0.25 (2 cpu)   mem 1.0G used of 4.0G   disk 60G free of 100G
+
+RUN       AGENT/ZONE             STATE           UP   CPU%  MEM/LIMIT
+ABCDEFGH  coder/dev              running      1h02m   12.3  412M/2.0G
+          model 34 req 1.2M/40k tok | left 66 req 60k | egress +120 -3 | asks 1
+BBBBCCCC  -/ci [2J               running*       42s      -     -/512M
+          model 0 req 0/0 tok | left - | egress +0 -0 | asks 0
+* its control host is not connected: it decides from what the node holds
+
+RECENT EGRESS (newest first)
+09:46:39Z ABCDEFGH [egress] ALLOW   GET api.github.com/repos/x  (read; allowed …
+09:46:31Z BBBBCCCC [egress] BLOCKED POST evil.example/ ]0;pwn   (write; not in …

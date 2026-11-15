@@ -47,6 +47,11 @@ psl = "2"
 # The org layer's IR (#51): what the control host's proxies check (no Cedar here).
 wicket-authz.workspace = true
 
+[features]
+# The deterministic simulation's seam (#324): `Llm::sim_begin` and `Llm::sim_settle`, the model
+# proxy's own accounting without HTTP. Only `wicket-sim` turns it on.
+sim = []
+
 [dev-dependencies]
 # HTTP/2 origins in the tests (#142).
 hyper = { workspace = true, features = ["http2"] }

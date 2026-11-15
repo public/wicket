@@ -14,6 +14,7 @@ dir>`) and, in brackets, for development mode (`~/.local/share/wicket`, or `$WIC
 | `<data dir>/audit-sinks.yaml` (or `$WICKET_AUDIT_SINKS`) | `wicket run`, `wicket serve`, `wicket audit export` | Where audit records are exported, and how often checkpoints are signed. | [audit](audit.md#the-sinks-file) |
 | `<data dir>/state-store.yaml` | `wicket state …`, hibernation, `type: store` sinks | The S3-compatible state store, where bundles go, the ledger's stream. | [state off the host](../how-to/state-off-host-and-restore.md) |
 | `<data dir>/placement.yaml` (or `$WICKET_PLACEMENT`) | the gateway (`request_capacity`), `wicket reconcile` | The placement backend (static hosts or Vultr) and the money envelope for leases. Without it `request_capacity` is off. | [place nodes on Vultr](../how-to/place-nodes-on-vultr.md#3-leases-for-agents) |
+| `<data dir>/operators.yaml` | `wicket approve`, `deny`, `grant renew`, the console | Each operator's authority: what it may decide. Without it every operator may decide anything. | [below](#operatorsyaml) |
 | `<data dir>/manifests/*.yaml` | `wicket serve` | Manifests the console may start, besides `examples/` of the directory `wicket serve` started in. | [console](console.md#actions) |
 | `<data dir>/release-keys/*.pub` | `wicket self update` | Release keys whose signatures an update accepts. | [update and roll back](../how-to/update-and-roll-back.md) |
 
@@ -40,6 +41,33 @@ Unknown keys are errors, so a misspelt setting can't silently stay at its defaul
 | `vultr` | object | none | For `vultr`: `region`, `ssh_key_ids` (keys in the Vultr account), `ssh_key` (the private half's path on this host), `give_up_silent` (default `4m`: a new node that gives no answer of any kind on port 22 for this long fails its lease and is destroyed; once the port answers, setup is waited for up to 15 minutes). The API key is the vault secret `vultr-api-key`. |
 | `node_hosts` | list of strings | | Hosts the CA of a node enrolled for a lease may issue for (`node enrol --hosts`). |
 | `warm_pool` | boolean | `false` | Keep a node whose lease ended until minute 50 of its paid hour instead of destroying it at once. |
+
+### `operators.yaml`
+
+Operators are principals under the same rules as agents (#11). Each has an identity,
+`spiffe://<trust domain>/t/<tenant>/op/<via>/<name>`: `unix/<user>` for the unix user running the
+CLI (as wicketd's peer credentials name them), `passkey/<name>` for a console passkey. A run an
+operator starts records that identity in its principal (`sub`, next to how wicket knew them).
+
+Each operator also has an authority. A decision (approve, deny, or renew a grant or a box's
+authority) is accepted only if the authority covers it. Agents decide through the same function.
+A decision outside the authority is refused, the request stays pending, and the refusal is on the
+audit record (`decision.refused`: who, their identity, what and why).
+
+```yaml
+default: anything            # for operators not listed: anything (the default), nothing, or a scope
+operators:
+  unix/alice: anything
+  passkey/laptop:
+    kinds: [http]            # what it may decide: http, spawn, link, capacity, update, authority
+    hosts: ["*.example.com"] # for http requests: these hosts only (absent: any)
+    max_risk: R2             # the highest risk it may decide (absent: any)
+  unix/auditor: nothing      # may list requests, decides none
+```
+
+An operator is named by `<via>/<name>` or by its full identity. A file that doesn't parse stops every
+human decision until it is fixed: an authority is never guessed. Roles, several operators with their
+own enrolment, and two-person approval are later steps of #11.
 
 ## Environment variables
 

@@ -68,7 +68,11 @@ use wicket_proxy::llm::Slice;
 /// - 9: a run's budget slice is [`Msg::BudgetSlice`] (it was `Lease`, #256: "lease" names one
 ///   thing, a grant of capacity). Unreleased, so no alias: a node talking 8 is sent no slice, and a
 ///   box with a model budget doesn't start there ([`BUDGET_SLICE`]).
-pub const PROTOCOL: u32 = 9;
+/// - 10: credential swaps on the node (#257): [`BoxStart::swaps`], each fetched with
+///   [`Msg::SecretFetch`] on first use and swapped by the node's own egress proxy, which then
+///   decides the swapped hosts from the feed. A box with swaps goes only to nodes talking
+///   [`CREDENTIAL_SWAPS`] or later.
+pub const PROTOCOL: u32 = 10;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -79,6 +83,8 @@ pub const IMAGE_DELIVERY: u32 = 7;
 pub const IMAGE_PULL: u32 = 8;
 /// The first protocol version whose nodes take a budget slice as [`Msg::BudgetSlice`] (#256).
 pub const BUDGET_SLICE: u32 = 9;
+/// The first protocol version whose nodes swap a box's credentials themselves (#257).
+pub const CREDENTIAL_SWAPS: u32 = 10;
 /// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its egress
 /// proxy, for hosts the node forwards, and its MCP gateway, for the tools the node relays. Not the
 /// model proxy: that is the node's alone (#257).
@@ -186,12 +192,18 @@ pub struct BoxStart {
     pub output_cap: u64,
     #[serde(default)]
     pub output_stop: bool,
-    /// Hosts whose credential the control host swaps in for the box (a remote session's login,
-    /// #169): the node forwards them to the run's egress proxy, never terminating them itself, so
-    /// the swap happens where the secret is. Names only. An older node ignores it and terminates
-    /// them, so the box's placeholder never reaches the host and the request fails, closed.
+    /// Hosts whose credential a control host before protocol 10 swaps in for the box (a remote
+    /// session's login, #169): the node forwards them to the run's egress proxy, never terminating
+    /// them itself. Names only. A control host talking [`CREDENTIAL_SWAPS`] sends [`Self::swaps`]
+    /// instead and leaves this empty.
     #[serde(default)]
     pub swap_hosts: Vec<String>,
+    /// The box's credential swaps, made by the node's egress proxy (#257): the box holds only each
+    /// one's placeholder, and the node fetches the real credential on first use
+    /// ([`Msg::SecretFetch`]), as it does injected secrets. Never a value: this is kept in the
+    /// node's box record. Sent only to nodes talking [`CREDENTIAL_SWAPS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swaps: Vec<SwapStart>,
     /// What the node needs to decide the box's gateway tools itself (#164). Sent only to nodes
     /// talking [`EDGE_DECISIONS`]; without it the node relays every tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,6 +220,67 @@ pub struct BoxStart {
     pub timings: bool,
 }
 
+/// One credential the node swaps in for a box (#257): toward `host`, a request carrying exactly
+/// `Authorization: Bearer <placeholder>` goes with the real credential instead.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SwapStart {
+    /// For logs: what this credential is (never its value).
+    pub name: String,
+    pub host: String,
+    /// What the box holds instead of the credential (it is in the box already: not a secret).
+    pub placeholder: String,
+    /// Where the real one comes from.
+    pub real: SwapReal,
+    /// Whether a bearer the box presents that isn't the placeholder goes upstream as sent
+    /// (`wicket_proxy::CredentialSwap::box_bearers`).
+    #[serde(default)]
+    pub box_bearers: bool,
+}
+
+/// Where a swapped credential comes from. Either way the node fetches it with
+/// [`Msg::SecretFetch`], under the name given here, and keeps it in memory only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapReal {
+    /// A vault secret, by name: released only for the swap's hosts, if its binding covers them.
+    Secret(String),
+    /// A value the process that launched the agent handed the control host (a wrapped session's),
+    /// fetched under this key (`swap.<n>`, never a vault secret's name).
+    Value(String),
+}
+
+impl SwapReal {
+    /// The name the node fetches it under.
+    pub fn fetch_name(&self) -> &str {
+        match self {
+            SwapReal::Secret(n) | SwapReal::Value(n) => n,
+        }
+    }
+}
+
+/// The swaps a control host sends a node for `swaps` (the run's own): names and placeholders only.
+pub fn swap_starts(swaps: &[wicket_proxy::CredentialSwap]) -> Vec<SwapStart> {
+    swaps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SwapStart {
+            name: s.name.clone(),
+            host: s.host.clone(),
+            placeholder: s.placeholder.clone(),
+            real: match &s.real {
+                wicket_proxy::SwapSource::Vault(n) => SwapReal::Secret(n.clone()),
+                wicket_proxy::SwapSource::Value(_) => SwapReal::Value(swap_value_key(i)),
+            },
+            box_bearers: s.box_bearers,
+        })
+        .collect()
+}
+
+/// The key a node fetches the `i`th swap's value under: a `.` is in no vault secret's name.
+pub fn swap_value_key(i: usize) -> String {
+    format!("swap.{i}")
+}
+
 /// What a node decides a box's gateway tools from (#164), beyond its token in the feed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EdgeStart {
@@ -218,6 +291,10 @@ pub struct EdgeStart {
     /// What the node decides the box's spawns from: None, they are the control host's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<EdgeSpawn>,
+    /// How the box's gateway pushes incoming messages into its harness's conversation (#252), as
+    /// its adapter says. None: the agent reads them with `await_message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<wicket_agent::harness::MessagePush>,
 }
 
 /// What a node decides a box's spawns from (#164): a child within the box's authority starts on
@@ -1044,8 +1121,47 @@ mod tests {
         assert!(matches!(back, Msg::BudgetSlice { slice: s, .. } if s == slice));
         let old = serde_json::json!({"m":"lease","run":"r","lease":{"slice":{"requests":3,"output_tokens":100}}});
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
-        assert_eq!((PROTOCOL, BUDGET_SLICE), (9, 9));
-        assert!(negotiate(PROTOCOL, 8).unwrap() < BUDGET_SLICE, "a node at 8 talks 8: no slice goes to it");
+        assert_eq!(BUDGET_SLICE, 9);
+        assert!(negotiate(BUDGET_SLICE, 8).unwrap() < BUDGET_SLICE, "a node at 8 talks 8: no slice goes to it");
+    }
+
+    /// #257: a box's swaps go in its start as names and placeholders, never values; a control host
+    /// before protocol 10 sends none (a node takes its start as having none), and a node at 9
+    /// talks 9 to a control host at 10, below [`CREDENTIAL_SWAPS`].
+    #[test]
+    fn a_start_carries_its_swaps_by_name_from_protocol_10() {
+        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS), (10, 10));
+        assert!(negotiate(PROTOCOL, 9).unwrap() < CREDENTIAL_SWAPS);
+        let swaps = vec![
+            wicket_proxy::CredentialSwap {
+                name: "account login".into(),
+                host: "api.example.com".into(),
+                placeholder: "wkt-placeholder".into(),
+                real: wicket_proxy::SwapSource::Vault("login".into()),
+                box_bearers: true,
+            },
+            wicket_proxy::CredentialSwap {
+                name: "session".into(),
+                host: "sessions.example.com".into(),
+                placeholder: "wkt-other".into(),
+                real: wicket_proxy::SwapSource::Value("the-real-session-token".into()),
+                box_bearers: false,
+            },
+        ];
+        let sent = swap_starts(&swaps);
+        assert_eq!(sent[0].real, SwapReal::Secret("login".into()));
+        assert_eq!(sent[1].real, SwapReal::Value("swap.1".into()));
+        assert!(sent[0].box_bearers && !sent[1].box_bearers);
+        let wire = serde_json::to_string(&sent).unwrap();
+        assert!(!wire.contains("the-real-session-token"), "a value never goes in a start: {wire}");
+        let v = serde_json::to_value(&sent[1]).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"name":"session","host":"sessions.example.com","placeholder":"wkt-other","real":{"value":"swap.1"},"box_bearers":false})
+        );
+        assert_eq!(serde_json::from_value::<SwapStart>(v).unwrap(), sent[1]);
+        assert_eq!(sent[1].real.fetch_name(), "swap.1");
+        assert!(!wicket_proxy::vault::Vault::new("/nonexistent".into()).has("swap.1"), "not a vault name");
     }
 
     #[test]

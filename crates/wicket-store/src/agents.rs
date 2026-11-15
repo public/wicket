@@ -247,6 +247,12 @@ impl Ledger {
             "UPDATE messages SET to_run = ?2 WHERE delivered_at IS NULL AND to_run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2)",
             params![id, run],
         )?;
+        // And so is whatever is held for the agent's principal (#250), sent while no run held it.
+        tx.execute(
+            "UPDATE messages SET to_run = ?2 WHERE delivered_at IS NULL AND to_run = '' AND created_at >= ?3 AND to_principal IN
+             (SELECT spiffe_id FROM identities WHERE run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2))",
+            params![id, run, t - crate::MESSAGE_HOLD_SECS],
+        )?;
         tx.execute(
             "UPDATE operator_messages SET run = ?2 WHERE consumed_at IS NULL \
              AND (run = ?1 OR run IN (SELECT run FROM agent_runs WHERE agent = ?1 AND run != ?2))",

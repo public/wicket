@@ -12,6 +12,7 @@ humantime strings (`90s`, `10m`, `1h`).
 - [`wicket say`](#wicket-say)
 - [`wicket hibernate`](#wicket-hibernate)
 - [`wicket wake`](#wicket-wake)
+- [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket wrap`](#wicket-wrap)
 - [`wicket pending`](#wicket-pending)
@@ -78,6 +79,7 @@ humantime strings (`90s`, `10m`, `1h`).
   - [`wicket node revoke`](#wicket-node-revoke)
   - [`wicket node install`](#wicket-node-install)
   - [`wicket node serve`](#wicket-node-serve)
+  - [`wicket node top`](#wicket-node-top)
   - [`wicket node renew-ca`](#wicket-node-renew-ca)
 - [`wicket place`](#wicket-place)
   - [`wicket place plans`](#wicket-place-plans)
@@ -112,6 +114,7 @@ Commands:
   say        Send a follow-up message to a running agent, as its operator. It arrives as the agent's next turn; the session stays open until the agent finishes or exits. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
   wake       Wake a hibernated agent: rebuild its box, restore its state and resume its session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
+  top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
   agents     Long-lived agents: state, generation, current run and bundle size
   wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its remote sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
   pending    List pending escalation requests
@@ -208,6 +211,18 @@ Arguments:
   [TEXT]...  
 
 Options:
+  -h, --help  Print help
+```
+
+## `wicket top`
+
+```text
+A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
+
+Usage: wicket top [OPTIONS]
+
+Options:
+      --once  Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
   -h, --help  Print help
 ```
 
@@ -318,7 +333,7 @@ Grants made by approvals
 Usage: wicket grant <COMMAND>
 
 Commands:
-  list    List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
+  list    List grants, newest first: approvals, and runs' quotas (#256): model budget, children and bytes (a root run's own zone budget, or what its parent carved for a child: the limits its run enforces), and money (a capacity lease's hourly cap and reservation, micro-USD shown as USD). Every grant has a lifetime; only live ones unless --all
   revoke  Revoke a grant. A grant handed to a node is revoked there through its feed by the run that published it (at once if the node is reachable)
   renew   Renew a live grant, or a running box's authority, so it lasts --ttl from now (#56): a grant by its id (or the request it answers), a box's authority by its run id. Every grant keeps a lifetime: at most 24h, and a box's authority never past its run's timeout. Audited as a decision; the run publishes it to the box's node
   help    Print this message or the help of the given subcommand(s)
@@ -330,7 +345,7 @@ Options:
 ### `wicket grant list`
 
 ```text
-List grants, newest first: approvals, and the quotas carved for runs (model budget, children, bytes; #256). Every grant has a lifetime; only live ones unless --all
+List grants, newest first: approvals, and runs' quotas (#256): model budget, children and bytes (a root run's own zone budget, or what its parent carved for a child: the limits its run enforces), and money (a capacity lease's hourly cap and reservation, micro-USD shown as USD). Every grant has a lifetime; only live ones unless --all
 
 Usage: wicket grant list [OPTIONS]
 
@@ -1104,6 +1119,7 @@ Commands:
   revoke    Revoke a node: refuse it from now on (its pinned host key is deleted, its identity certificates are revoked, and runs connected to it drop it) and record its CA serials for the feed's revocation list
   install   Copy this wicket binary to an enrolled node (sha256-checked) and install the `wicket-node` systemd user service that runs `wicket node serve` there
   serve     On the node: run its boxes and decide their egress locally from the signed feed (the `wicket-node` service runs this)
+  top       On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
   renew-ca  Issue a node a fresh CA certificate (and CA key, made on the node) and a fresh identity certificate for its node key, over its pinned ssh: also how a node whose identity certificate expired while it was unreachable gets back in
   help      Print this message or the help of the given subcommand(s)
 
@@ -1196,6 +1212,20 @@ Usage: wicket node serve [OPTIONS]
 
 Options:
       --dir <DIR>  The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+  -h, --help       Print help
+```
+
+### `wicket node top`
+
+```text
+On the node, as its `wicket` user: a live view of the node (read-only): its identity and CA, its control connections, feed, load, memory and disk; each box's state, uptime, CPU and memory, model use and budget slice left, egress counts and queued asks; and the last egress decisions. Redrawn every 2 s; q or Ctrl-C quits
+
+Usage: wicket node top [OPTIONS]
+
+Options:
+      --dir <DIR>  The node's directory (default: $WICKET_NODE_HOME or ~/.local/share/wicket-node)
+      --once       Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it)
+      --json       Print the node's status once, as JSON
   -h, --help       Print help
 ```
 

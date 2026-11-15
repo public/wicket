@@ -57,6 +57,64 @@ pub fn spiffe_id(trust_domain: &str, tenant: &str, zone: &str, agent: &str) -> S
     format!("spiffe://{trust_domain}/t/{tenant}/z/{zone}/a/{agent}")
 }
 
+/// `spiffe://<trust domain>/t/<tenant>/op/<via>/<name>`: a human operator (#11), named by how wicket
+/// knows them: `unix` (the local user, on the CLI) or `passkey` (a console passkey's name).
+pub fn operator_id(trust_domain: &str, tenant: &str, via: &str, name: &str) -> String {
+    format!("spiffe://{trust_domain}/t/{tenant}/op/{}/{}", id_segment(via), id_segment(name))
+}
+
+/// One path segment of a principal id: a character outside `[A-Za-z0-9._-]` becomes `-`.
+pub fn id_segment(s: &str) -> String {
+    let s: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' }).collect();
+    if s.is_empty() || s == "." || s == ".." {
+        return "-".into();
+    }
+    s
+}
+
+/// A principal, named by its identity (#11, #250): what messages are addressed to and
+/// `accept_from` lists. An agent is the same principal across its runs (a restart, a wake).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Principal {
+    /// `spiffe://<trust domain>/t/<tenant>/z/<zone>/a/<agent>`.
+    Agent { trust_domain: String, tenant: String, zone: String, agent: String },
+    /// `spiffe://<trust domain>/t/<tenant>/op/<via>/<name>` ([`operator_id`]).
+    Operator { trust_domain: String, tenant: String, via: String, name: String },
+}
+
+impl Principal {
+    /// Parses a principal id; None if it is neither an agent's nor an operator's.
+    pub fn parse(id: &str) -> Option<Principal> {
+        let rest = id.strip_prefix("spiffe://")?;
+        let segs: Vec<&str> = rest.split('/').collect();
+        if id.len() > 512 || segs.iter().any(|s| s.is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control())) {
+            return None;
+        }
+        let s = |x: &&str| x.to_string();
+        match segs.as_slice() {
+            [td, "t", tenant, "z", zone, "a", agent] => {
+                Some(Principal::Agent { trust_domain: s(td), tenant: s(tenant), zone: s(zone), agent: s(agent) })
+            }
+            [td, "t", tenant, "op", via, name] => {
+                Some(Principal::Operator { trust_domain: s(td), tenant: s(tenant), via: s(via), name: s(name) })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn trust_domain(&self) -> &str {
+        match self {
+            Principal::Agent { trust_domain, .. } | Principal::Operator { trust_domain, .. } => trust_domain,
+        }
+    }
+
+    pub fn tenant(&self) -> &str {
+        match self {
+            Principal::Agent { tenant, .. } | Principal::Operator { tenant, .. } => tenant,
+        }
+    }
+}
+
 /// What wicket asserts about one agent instance.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentClaims {
@@ -430,6 +488,30 @@ fn jws_verify(jws: &str, key: &VerifyingKey) -> Result<(Value, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #11, #250: agents and operators are named the same way, and nothing else parses as one.
+    #[test]
+    fn principal_ids_name_agents_and_operators() {
+        let a = spiffe_id("w.example", "t0", "research.fetcher.01abc", "fetcher");
+        assert_eq!(
+            Principal::parse(&a),
+            Some(Principal::Agent {
+                trust_domain: "w.example".into(),
+                tenant: "t0".into(),
+                zone: "research.fetcher.01abc".into(),
+                agent: "fetcher".into()
+            })
+        );
+        let o = operator_id("w.example", "t0", "passkey", "Alice's laptop");
+        assert_eq!(o, "spiffe://w.example/t/t0/op/passkey/Alice-s-laptop");
+        assert!(matches!(Principal::parse(&o), Some(Principal::Operator { ref via, .. }) if via == "passkey"));
+        assert_eq!(operator_id("d", "t", "unix", ".."), "spiffe://d/t/t/op/unix/-");
+        for bad in
+            ["run_01abc", "parent", "spiffe://d/t/t0/z/z", "spiffe://d/t/t0/z//a/x", "spiffe://d/node/n1", "spiffe://d/t/t0/z/z/a/x/y"]
+        {
+            assert_eq!(Principal::parse(bad), None, "{bad}");
+        }
+    }
 
     fn spec(zone: &str, agent: &str, act: Option<Value>) -> IdentitySpec {
         IdentitySpec {

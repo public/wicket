@@ -29,11 +29,13 @@ mod noderun;
 mod nodesecrets;
 mod nodesrv;
 mod oci;
+mod operators;
 mod owner;
 mod pin;
 mod place;
 mod policy;
 mod program;
+mod quotas;
 mod reconcile;
 mod registry;
 mod rootcopy;
@@ -46,6 +48,7 @@ mod snapstore;
 mod spawn;
 mod state;
 mod statestore;
+mod top;
 mod transcript;
 mod units;
 mod update;
@@ -144,6 +147,14 @@ enum Cmd {
         /// What woke it (recorded and told to the agent).
         #[arg(long, hide = true)]
         by: Option<String>,
+    },
+    /// A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes,
+    /// what their boxes are given), runs (node, agent, status, uptime, model usage), pending
+    /// requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`.
+    Top {
+        /// Print one frame and exit (also what a stdout that isn't a terminal gets, every 2 s, without it).
+        #[arg(long)]
+        once: bool,
     },
     /// Long-lived agents: state, generation, current run and bundle size.
     Agents {
@@ -599,6 +610,7 @@ async fn main() -> Result<()> {
         | Cmd::Hibernate { .. }
         | Cmd::Wake { .. }
         | Cmd::Agents { .. }) => cmd::run::dispatch(c).await,
+        Cmd::Top { once } => top::control_top(once).await,
         c @ (Cmd::Pending | Cmd::Approve { .. } | Cmd::Deny { .. } | Cmd::Grant { .. } | Cmd::Links { .. } | Cmd::Unlink { .. }) => {
             cmd::approve::dispatch(c).await
         }

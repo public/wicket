@@ -194,6 +194,11 @@ impl Egress {
                 let presented = auth.strip_prefix("Bearer ").unwrap_or("");
                 match self.ctx.swaps.iter().find(|s| host_matches(&s.host, host) && !presented.is_empty() && s.placeholder == presented) {
                     Some(sw) => {
+                        // On a node, the credential is fetched from the control host on its first use
+                        // (#257), as an injected one is.
+                        if let crate::SwapSource::Vault(name) = &sw.real {
+                            self.ctx.vault.ensure(name).await?;
+                        }
                         let real = match &sw.real {
                             crate::SwapSource::Vault(name) => self.ctx.vault.get_for(name, host)?,
                             crate::SwapSource::Value(v) => v.clone(),

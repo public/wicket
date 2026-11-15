@@ -48,7 +48,35 @@ fn the_driven_remote_example_reaches_its_session_and_refuses_the_account_s_mcp()
         assert!(matches!(verdict(&z, method, path), Verdict::Forbidden(_)), "{method} {path}: {:?}", verdict(&z, method, path));
     }
     // The rest of the account is a human's decision.
-    for (method, path) in [("GET", "/v1/sessions"), ("GET", "/v1/code/sessions"), ("DELETE", "/v1/code/sessions/cse_01x")] {
+    for (method, path) in [
+        ("GET", "/v1/sessions"),
+        ("GET", "/v1/code/sessions"),
+        ("DELETE", "/v1/code/sessions/cse_01x"),
+        // Only POST unarchives; reading or changing a session through that path is not the resume's.
+        ("GET", "/v1/sessions/session_01x/unarchive"),
+        ("DELETE", "/v1/sessions/session_01x"),
+    ] {
         assert!(matches!(verdict(&z, method, path), Verdict::NeedsGrant(_)), "{method} {path}: {:?}", verdict(&z, method, path));
+    }
+}
+
+#[test]
+fn a_woken_driven_remote_box_resumes_its_session_with_nothing_pending() {
+    // What a resumed Claude Code calls to reattach to its Remote Control session (#330): unarchive the
+    // session (the v1 path takes its `session_` id, the v2 one its `cse_` id), fetch its bridge
+    // credentials again, then the worker channel as at the start. None of it waits for a human.
+    let z = zone();
+    let resume = [
+        ("POST", "/v1/sessions/session_01x/unarchive"),
+        ("POST", "/v1/code/sessions/cse_01x/unarchive"),
+        ("POST", "/v1/code/sessions/cse_01x/bridge"),
+        ("POST", "/v1/code/sessions/cse_01x/worker/register"),
+        ("PUT", "/v1/code/sessions/cse_01x/worker"),
+        ("GET", "/v1/code/sessions/cse_01x/worker/events/stream"),
+        ("POST", "/v1/code/sessions/cse_01x/worker/events"),
+        ("POST", "/v1/code/sessions/cse_01x/worker/heartbeat"),
+    ];
+    for (method, path) in resume {
+        assert!(matches!(verdict(&z, method, path), Verdict::AllowByReach(_)), "{method} {path}: {:?}", verdict(&z, method, path));
     }
 }

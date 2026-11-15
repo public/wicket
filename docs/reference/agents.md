@@ -15,13 +15,19 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - Pending requests show the requesting agent's verified identity. The console won't approve for an agent
   whose identity doesn't verify.
 - Agents talk only through wicket: `send_message` and `await_message` in the gateway. wicket sets and signs the
-  sender. Parent and child may always talk; other zones only if the recipient's zone lists them in
-  `accept_from`.
+  sender. A message names a principal (its identity above, or `"parent"`), never a run: it reaches the
+  agent's live run, or waits for its next one. Parent and child may always talk; others only if the
+  recipient's `accept_from` lists their principal or zone.
 - `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own sandbox and identity, in a
   zone the agent writes. That zone must be a subset of the agent's own: reach, credentials, model budget (carved
   out), resources, time, isolation, images and `max_children` (a child's own count against the parent's). Otherwise `spawn` lists what exceeds it, and with `ask_human` puts
   exactly that zone to a human. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
   `in_box_subagents: false` to make wicket children the only kind of subagent.
+- A run's model budget and box slots are quota grants (#256, `wicket grant list`): a root run's are recorded
+  from its zone when it starts, made by whoever started it; a child's are what its parent carved for it, recorded
+  before the child starts. Their amounts are the limits the run's model proxy and its `spawn` check, with the
+  same refusals as before. Each lasts the run's timeout, at most 24h, and the run's supervisor renews it while
+  the run lives; it is revoked when the run ends. A node's budget slices are cut from the same limits.
 - Boxes reach each other's ports only through links, which wicket relays (boxes still have no network):
   `expose(port)` offers a port, `connect(box, port)` returns `<name>.wicket.internal:<port>` in the caller's box,
   and `link(from, to, port)` wires two boxes the caller controls. A box's own children are connectable without

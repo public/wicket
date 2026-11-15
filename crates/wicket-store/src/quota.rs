@@ -8,12 +8,23 @@
 //! grant renew`). It answers no request, and decides no op: [`crate::Ledger::consume_grant`] and
 //! every other lookup skip it, it is never handed to a node (only grants answering a run's requests
 //! are, [`crate::Ledger::grants_for_run`]), and the reserved method keeps agents from asking for one.
-//! Enforcement stays where it is (the model proxy's counters, the spawn slots, the box's limits);
-//! this is the record. It is revoked with the rest of its run's grants when the run ends.
+//! It is revoked with the rest of its run's grants when the run ends.
+//!
+//! **What is recorded.** A child's carve-out, by its parent at spawn or adopt; a root run's own
+//! zone budget, by whoever started it, when it starts; a capacity lease's money (`money.hourly`,
+//! `money.reserved`, one grant each per lease: [`crate::lease`]).
+//!
+//! **Enforcement** (#256): a run's model budget and its box slots are read from its live quota
+//! grants ([`Ledger::quota_amounts`]) when its supervisor starts: the grant's amount is the limit
+//! its model proxy and its spawns check against. The run's supervisor keeps them live while it runs
+//! ([`Ledger::renew_quota_grants`], at most a day at a time). Memory stays the box's limits on its
+//! node, and money the installation's lease budget over the live leases; a node's budget slices
+//! are unchanged.
 
 use crate::{now, GrantRow, Ledger, Result};
 use rusqlite::params;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use wicket_core::{new_grant_id, RunId, TenantId};
 
 /// The method of a quota grant.
@@ -48,12 +59,78 @@ pub struct GrantListing {
 }
 
 impl GrantRow {
-    /// The quota's resource, for a quota grant.
+    /// The quota's resource, for a quota grant: `model.requests`, `children`, `money.reserved`…
+    /// (a money quota's path also names its lease: `/quota/money.reserved/<lease>`).
     pub fn quota(&self) -> Option<&str> {
         (self.method == QUOTA_METHOD && self.host == QUOTA_HOST && self.amount.is_some())
             .then(|| self.path.strip_prefix("/quota/"))
             .flatten()
+            .map(|r| r.split('/').next().unwrap_or(r))
     }
+}
+
+/// The resources of a money quota (#256): a capacity lease's price cap per hour and the worst case
+/// reserved for it, micro-USD.
+pub const MONEY_HOURLY: &str = "money.hourly";
+pub const MONEY_RESERVED: &str = "money.reserved";
+
+/// The amounts of a run's live quota grants, by resource: what its limits are read from (#256).
+/// A resource with no live grant has none: an amount of 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuotaAmounts(pub BTreeMap<String, u64>);
+
+impl QuotaAmounts {
+    /// The amount granted of `resource`, if a live grant records one.
+    pub fn get(&self, resource: &str) -> Option<u64> {
+        self.0.get(resource).copied()
+    }
+
+    /// Whether a live grant records `resource`.
+    pub fn has(&self, resource: &str) -> bool {
+        self.0.contains_key(resource)
+    }
+}
+
+/// Inserts quota grants `(path, amount)` for `run`, each lasting until `until`, keeping one already
+/// live for the same run and path. Shared by [`Ledger::record_quota_grants`] and the lease
+/// transaction ([`Ledger::create_lease`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_quotas(
+    conn: &rusqlite::Connection,
+    tenant: &str,
+    zone: &str,
+    run: &str,
+    by: &str,
+    items: &[(String, u64)],
+    until: i64,
+) -> Result<Vec<String>> {
+    let t = now();
+    let mut ids = vec![];
+    for (path, amount) in items.iter().filter(|(_, a)| *a > 0) {
+        let held: Option<String> = rusqlite::OptionalExtension::optional(conn.query_row(
+            "SELECT id FROM grants WHERE run = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND amount IS NOT NULL
+               AND revoked = 0 AND expires_at > ?5 LIMIT 1",
+            params![run, QUOTA_METHOD, QUOTA_HOST, path, t],
+            |r| r.get(0),
+        ))?;
+        if let Some(id) = held {
+            ids.push(id);
+            continue;
+        }
+        let id = new_grant_id();
+        conn.execute(
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, amount)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, NULL, ?8, ?9, NULL, ?10, ?11)",
+            params![id, tenant, zone, QUOTA_METHOD, QUOTA_HOST, path, until, by, t, run, i64::try_from(*amount).unwrap_or(i64::MAX)],
+        )?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// The end a quota grant lasting `ttl_secs` from now is recorded with: at most a day.
+pub(crate) fn quota_until(ttl_secs: i64) -> i64 {
+    now() + ttl_secs.clamp(1, MAX_QUOTA_TTL_SECS)
 }
 
 impl Ledger {
@@ -70,30 +147,44 @@ impl Ledger {
         quotas: &[Quota],
         ttl_secs: i64,
     ) -> Result<Vec<String>> {
-        let t = now();
-        let until = t + ttl_secs.clamp(1, MAX_QUOTA_TTL_SECS);
-        let mut ids = vec![];
-        for q in quotas.iter().filter(|q| q.amount > 0) {
-            let path = q.path();
-            let held: Option<String> = rusqlite::OptionalExtension::optional(self.conn.query_row(
-                "SELECT id FROM grants WHERE run = ?1 AND method = ?2 AND host = ?3 AND path = ?4 AND amount IS NOT NULL
-                   AND revoked = 0 AND expires_at > ?5 LIMIT 1",
-                params![run.0, QUOTA_METHOD, QUOTA_HOST, path, t],
-                |r| r.get(0),
-            ))?;
-            if let Some(id) = held {
-                ids.push(id);
-                continue;
-            }
-            let id = new_grant_id();
-            self.conn.execute(
-                "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, amount)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, NULL, ?8, ?9, NULL, ?10, ?11)",
-                params![id, tenant.0, zone, QUOTA_METHOD, QUOTA_HOST, path, until, by, t, run.0, i64::try_from(q.amount).unwrap_or(i64::MAX)],
-            )?;
-            ids.push(id);
+        let items: Vec<(String, u64)> = quotas.iter().map(|q| (q.path(), q.amount)).collect();
+        insert_quotas(&self.conn, &tenant.0, zone, &run.0, by, &items, quota_until(ttl_secs))
+    }
+
+    /// The amounts of `run`'s live quota grants (#256), by resource: the limits its model proxy and
+    /// its spawns enforce. Money quotas (one per lease) are summed.
+    pub fn quota_amounts(&self, run: &str) -> Result<QuotaAmounts> {
+        let mut st = self.conn.prepare(
+            "SELECT path, amount FROM grants WHERE run = ?1 AND method = ?2 AND host = ?3 AND amount IS NOT NULL
+               AND revoked = 0 AND expires_at > ?4",
+        )?;
+        let rows = st.query_map(params![run, QUOTA_METHOD, QUOTA_HOST, now()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut m = BTreeMap::new();
+        for row in rows {
+            let (path, amount) = row?;
+            let Some(res) = path.strip_prefix("/quota/").map(|r| r.split('/').next().unwrap_or(r).to_string()) else { continue };
+            let e: &mut u64 = m.entry(res).or_default();
+            *e = e.saturating_add(u64::try_from(amount).unwrap_or(0));
         }
-        Ok(ids)
+        Ok(QuotaAmounts(m))
+    }
+
+    /// Keeps `run`'s live quota grants live until `until` (at most a day from now): what the run's
+    /// supervisor does while the run lives, so a run longer than a day keeps its limits. Returns
+    /// how many were renewed. A lapsed or revoked grant is not brought back.
+    pub fn renew_quota_grants(&self, run: &str, until: i64) -> Result<usize> {
+        let t = now();
+        let until = until.min(t + MAX_QUOTA_TTL_SECS);
+        Ok(self.conn.execute(
+            "UPDATE grants SET expires_at = ?4 WHERE run = ?1 AND method = ?2 AND host = ?3 AND amount IS NOT NULL
+               AND revoked = 0 AND expires_at > ?5 AND expires_at < ?4",
+            params![run, QUOTA_METHOD, QUOTA_HOST, until, t],
+        )?)
+    }
+
+    /// Revokes the money quotas of lease `lease` (it ended, was denied, withdrawn or failed).
+    pub fn revoke_lease_quotas(&self, lease: &str) -> Result<usize> {
+        revoke_lease_quotas(&self.conn, lease)
     }
 
     /// The quota grants recorded for `run`, live or not, oldest first.
@@ -120,6 +211,19 @@ impl Ledger {
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+}
+
+/// The paths of lease `lease`'s money quotas.
+pub(crate) fn lease_quota_paths(lease: &str) -> [String; 2] {
+    [format!("/quota/{MONEY_HOURLY}/{lease}"), format!("/quota/{MONEY_RESERVED}/{lease}")]
+}
+
+pub(crate) fn revoke_lease_quotas(conn: &rusqlite::Connection, lease: &str) -> Result<usize> {
+    let [h, r] = lease_quota_paths(lease);
+    Ok(conn.execute(
+        "UPDATE grants SET revoked = 1 WHERE method = ?1 AND host = ?2 AND path IN (?3, ?4) AND amount IS NOT NULL AND revoked = 0",
+        params![QUOTA_METHOD, QUOTA_HOST, h, r],
+    )?)
 }
 
 #[cfg(test)]
@@ -167,6 +271,29 @@ mod tests {
         assert!(l.grants(&t, false, 100).unwrap().is_empty());
         assert_eq!(l.grants(&t, true, 100).unwrap().len(), 3);
         assert!(l.quota_grants(&run.0).unwrap().iter().all(|g| g.revoked));
+    }
+
+    #[test]
+    fn a_runs_limits_are_its_live_quota_grants_amounts_and_its_supervisor_keeps_them_live() {
+        let l = Ledger::open_in_memory().unwrap();
+        let (t, run) = (TenantId::single(), RunId("run_root".into()));
+        let ids = l.record_quota_grants(&t, "z", &run, "user:alex", &quotas(), 600).unwrap();
+        let q = l.quota_amounts(&run.0).unwrap();
+        assert_eq!((q.get("model.requests"), q.get("children"), q.get("bytes")), (Some(50), Some(3), Some(1 << 30)));
+        assert!(!q.has("model.output_tokens"), "a quota of 0 is no grant: nothing to spend");
+        assert_eq!(l.quota_amounts("run_other").unwrap(), QuotaAmounts::default());
+        // Renewed while the run lives: never more than a day ahead, never shortened.
+        assert_eq!(l.renew_quota_grants(&run.0, now() + 7 * 24 * 3600).unwrap(), 3);
+        assert!(l.quota_grants(&run.0).unwrap().iter().all(|g| g.expires_at <= now() + MAX_QUOTA_TTL_SECS && g.expires_at > now() + 600));
+        assert_eq!(l.renew_quota_grants(&run.0, now() + 60).unwrap(), 0);
+        // A revoked one is not brought back, and is no limit.
+        l.revoke_grant(&ids[1]).unwrap();
+        assert_eq!(l.renew_quota_grants(&run.0, now() + 2 * MAX_QUOTA_TTL_SECS).unwrap(), 0);
+        assert!(!l.quota_amounts(&run.0).unwrap().has("children"));
+        // Recording again records only what has no live grant.
+        let again = l.record_quota_grants(&t, "z", &run, "wicket", &quotas(), 600).unwrap();
+        assert_eq!((again[0].as_str(), again[2].as_str()), (ids[0].as_str(), ids[2].as_str()));
+        assert_ne!(again[1], ids[1]);
     }
 
     #[test]
