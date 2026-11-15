@@ -364,7 +364,7 @@ impl Node {
     /// Opens a tunnel to the run's `target` socket on the control host: over the control channel, or
     /// for the control host's own node, the socket itself (the run's `ctl/` directory, on this host).
     async fn open_tunnel(self: &Arc<Self>, run: &str, target: &str) -> std::io::Result<Box<dyn RelayStream>> {
-        if self.paths.shares_host() && ["egress", "gateway"].contains(&target) {
+        if self.paths.shares_host() && chan::TUNNEL_TARGETS.contains(&target) {
             crate::run::check_run_id(run).map_err(std::io::Error::other)?;
             let s = UnixStream::connect(self.paths.runs().join(run).join("ctl").join(format!("{target}.sock"))).await?;
             return Ok(Box::new(s));

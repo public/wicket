@@ -73,6 +73,10 @@ pub const IMAGE_PINS: u32 = 6;
 pub const IMAGE_DELIVERY: u32 = 7;
 /// The first protocol version whose nodes pull an image from a registry themselves (#191).
 pub const IMAGE_PULL: u32 = 8;
+/// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its egress
+/// proxy, for hosts the node forwards, and its MCP gateway, for the tools the node relays. Not the
+/// model proxy: that is the node's alone (#257).
+pub const TUNNEL_TARGETS: [&str; 2] = ["egress", "gateway"];
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -815,6 +819,13 @@ impl Tunnels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #257: a box's model proxy is its node's only; a node can't reach the control host's.
+    #[test]
+    fn a_node_tunnels_to_the_runs_egress_and_gateway_only() {
+        assert_eq!(TUNNEL_TARGETS, ["egress", "gateway"]);
+        assert!(!TUNNEL_TARGETS.contains(&"llm"));
+    }
 
     fn samples() -> Vec<Frame> {
         let op = wicket_core::Op::egress(

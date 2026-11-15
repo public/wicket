@@ -1238,8 +1238,7 @@ async fn on_frame(
                 }
             }
             Msg::TunnelOpen { stream, run, target } => {
-                // The model proxy is the node's alone (#257): only forwarded hosts and the gateway.
-                let ok_target = ["egress", "gateway"].contains(&target.as_str());
+                let ok_target = chan::TUNNEL_TARGETS.contains(&target.as_str());
                 let conn = match (run == sh.run.0, ok_target) {
                     (true, true) => {
                         tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
