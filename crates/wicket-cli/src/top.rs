@@ -266,12 +266,15 @@ impl HostStats {
             h.mem_total = kib("MemTotal:");
             h.mem_available = kib("MemAvailable:");
         }
-        if let Ok(p) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
+        // The filesystem holding the node's directory (or the nearest directory above it there is).
+        for d in dir.ancestors() {
+            let Ok(p) = std::ffi::CString::new(d.as_os_str().as_encoded_bytes()) else { break };
             // SAFETY: statvfs fills the struct it is given, from a NUL-terminated path.
             let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
             if unsafe { libc::statvfs(p.as_ptr(), &mut v) } == 0 {
                 h.disk_total = v.f_blocks as u64 * v.f_frsize as u64;
                 h.disk_free = v.f_bavail as u64 * v.f_frsize as u64;
+                break;
             }
         }
         h
