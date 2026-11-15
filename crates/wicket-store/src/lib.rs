@@ -61,10 +61,15 @@ pub enum StoreError {
 ///
 /// Version 1 is every migration up to #162 (all of them expand steps: `CREATE ... IF NOT EXISTS`
 /// and `ADD COLUMN`). Version 2 (expand) adds `runs.authority_until` and `runs.authority_cap`, a
-/// running box's renewable authority (#56).
-pub const SCHEMA_VERSION: u32 = 2;
+/// running box's renewable authority (#56). Version 3 (expand) adds `messages.to_principal`: messages
+/// are addressed to principals, not runs (#250).
+pub const SCHEMA_VERSION: u32 = 3;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
+
+/// How long a message waits for its principal to have a live run (#250): a principal that starts
+/// within it gets the message; after it, it stays undelivered on the record.
+pub const MESSAGE_HOLD_SECS: i64 = 7 * 24 * 3600;
 
 /// A ledger's recorded schema: the newest version that has opened it, and its floor (both 0 for a
 /// ledger from before #162).
@@ -266,7 +271,7 @@ CREATE TABLE IF NOT EXISTS revocations (
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, from_run TEXT NOT NULL, to_run TEXT NOT NULL, envelope TEXT NOT NULL,
-  created_at INTEGER NOT NULL, delivered_at INTEGER
+  created_at INTEGER NOT NULL, delivered_at INTEGER, to_principal TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages (to_run, delivered_at, created_at);
 CREATE TABLE IF NOT EXISTS node_tokens (
@@ -350,6 +355,9 @@ impl Ledger {
         // Ledgers created before a running box's authority could be renewed (#56).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_until INTEGER", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN authority_cap INTEGER", []);
+        // Ledgers created before messages were addressed to principals (#250).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN to_principal TEXT", []);
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS messages_held ON messages (to_principal, delivered_at)")?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -557,7 +565,41 @@ impl Ledger {
             "INSERT INTO identity_history (run, jws, issued_at, expires_at) VALUES (?1, ?2, ?3, 0)",
             params![id.run, id.jws, id.issued_at],
         )?;
+        // Messages held for this principal (#250), or left unread by one of its runs that no longer
+        // runs, are this run's now.
+        self.conn.execute(
+            "UPDATE messages SET to_run = ?1 WHERE delivered_at IS NULL AND tenant = ?2 AND to_principal = ?3 AND created_at >= ?4
+             AND to_run != ?1 AND (to_run = '' OR to_run NOT IN (SELECT id FROM runs WHERE status = 'running'))",
+            params![id.run, id.tenant, id.spiffe_id, now() - MESSAGE_HOLD_SECS],
+        )?;
         Ok(())
+    }
+
+    /// The identity of the principal `spiffe_id`'s latest run in `tenant`, if it has had one: who
+    /// it is, its parent, and what it accepts messages from (#250).
+    pub fn principal_identity(&self, tenant: &str, spiffe_id: &str) -> Result<Option<IdentityRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT run, tenant, spiffe_id, zone, agent, parent_run, accept_from, jws, issued_at FROM identities
+                 WHERE tenant = ?1 AND spiffe_id = ?2 ORDER BY issued_at DESC, rowid DESC LIMIT 1",
+                params![tenant, spiffe_id],
+                row_to_identity,
+            )
+            .optional()?)
+    }
+
+    /// The principal `spiffe_id`'s live run in `tenant` (its newest running one), if it has one.
+    pub fn live_run_of(&self, tenant: &str, spiffe_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
+                 WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
+                params![tenant, spiffe_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn identity(&self, run: &str) -> Result<Option<IdentityRow>> {
@@ -639,6 +681,41 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Records a message to the principal `to` (#250): for its run `to_run`, or (None) held until
+    /// the principal has a live run, which then takes it ([`Ledger::put_identity`] moves held
+    /// messages to a principal's new run, for [`MESSAGE_HOLD_SECS`]). A held message is checked
+    /// again for a live run in the same transaction, so one started meanwhile isn't missed. Returns
+    /// the run it is for, if any yet.
+    pub fn post_message(
+        &mut self,
+        id: &str,
+        tenant: &TenantId,
+        from_run: &str,
+        to: &str,
+        to_run: Option<&str>,
+        envelope: &str,
+    ) -> Result<Option<String>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let to_run = match to_run {
+            Some(r) => Some(r.to_string()),
+            None => tx
+                .query_row(
+                    "SELECT i.run FROM identities i JOIN runs r ON r.id = i.run
+                     WHERE i.tenant = ?1 AND i.spiffe_id = ?2 AND r.status = 'running' ORDER BY i.issued_at DESC, i.rowid DESC LIMIT 1",
+                    params![tenant.0, to],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?,
+        };
+        tx.execute(
+            "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at, to_principal) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, tenant.0, from_run, to_run.as_deref().unwrap_or(""), envelope, now(), to],
+        )?;
+        tx.commit()?;
+        Ok(to_run)
+    }
+
+    /// Records a message for run `to_run` only (tests, and envelopes made outside the gateway).
     pub fn add_message(&self, id: &str, tenant: &TenantId, from_run: &str, to_run: &str, envelope: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, tenant, from_run, to_run, envelope, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1899,6 +1976,48 @@ mod tests {
         assert_eq!(l.take_message("run_b").unwrap().unwrap().id, "m-2");
         assert!(l.take_message("run_b").unwrap().is_none());
         assert_eq!(l.envelopes().unwrap().len(), 3);
+    }
+
+    /// #250: a message to a principal goes to its live run, or waits for its next one; one left
+    /// unread by a run that has ended moves to the principal's next run, never to another's.
+    #[test]
+    fn a_message_to_a_principal_waits_for_its_next_run() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let p = "spiffe://x/t/default/z/z/a/peer";
+        let row = |run: &str, sub: &str| IdentityRow {
+            run: run.into(),
+            tenant: t.0.clone(),
+            spiffe_id: sub.into(),
+            zone: "z".into(),
+            agent: "peer".into(),
+            parent_run: None,
+            accept_from: vec![],
+            jws: "j".into(),
+            issued_at: now(),
+        };
+        // Never run: held.
+        assert_eq!(l.post_message("m-1", &t, "run_s", p, None, "e1").unwrap(), None);
+        l.run_started(&t, &RunId("run_1".into()), "z", "peer").unwrap();
+        l.put_identity(&row("run_1", p)).unwrap();
+        assert_eq!(l.waiting_messages("run_1").unwrap(), 1, "the held message is its first run's");
+        assert_eq!(l.live_run_of(&t.0, p).unwrap().as_deref(), Some("run_1"));
+        assert_eq!(l.post_message("m-2", &t, "run_s", p, None, "e2").unwrap().as_deref(), Some("run_1"));
+        // Another principal's run takes none of it.
+        l.run_started(&t, &RunId("run_o".into()), "z", "other").unwrap();
+        l.put_identity(&row("run_o", "spiffe://x/t/default/z/z/a/other")).unwrap();
+        assert_eq!(l.waiting_messages("run_o").unwrap(), 0);
+        // run_1 ends with both unread; the principal's next run gets them, in order.
+        assert_eq!(l.take_message("run_1").unwrap().unwrap().id, "m-1");
+        l.run_ended(&RunId("run_1".into()), "succeeded", "{}").unwrap();
+        assert_eq!(l.live_run_of(&t.0, p).unwrap(), None);
+        assert_eq!(l.post_message("m-3", &t, "run_s", p, None, "e3").unwrap(), None);
+        l.run_started(&t, &RunId("run_2".into()), "z", "peer").unwrap();
+        l.put_identity(&row("run_2", p)).unwrap();
+        assert_eq!(l.take_message("run_2").unwrap().unwrap().id, "m-2");
+        assert_eq!(l.take_message("run_2").unwrap().unwrap().id, "m-3");
+        assert!(l.take_message("run_2").unwrap().is_none());
+        assert_eq!(l.principal_identity(&t.0, p).unwrap().unwrap().run, "run_2");
     }
 
     #[test]

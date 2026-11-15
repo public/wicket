@@ -2126,8 +2126,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         } else {
             serde_json::json!({ "status": status, "cause": cause, "note": end_note, "result": result })
         };
-        match ctx.send_message(p, "run_finished", body) {
-            Ok(id) => println!("[wicket] sent {id} (run_finished) to parent {p}"),
+        match ctx.send_message(&wicket_proxy::Recipient::Parent, "run_finished", body) {
+            Ok(s) => println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to),
             Err(e) => println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub),
         }
     }
