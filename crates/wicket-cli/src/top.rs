@@ -830,12 +830,10 @@ where
     }
     loop {
         let lines = frame(width(true)).await;
-        let mut s = String::from("\x1b[H");
-        for l in lines.iter().take(height()) {
-            s.push_str(l);
-            s.push_str("\x1b[K\r\n");
-        }
-        s.push_str("\x1b[J");
+        // Each line cleared to its end, and no newline after the last: a frame as tall as the
+        // screen doesn't scroll it.
+        let shown: Vec<&str> = lines.iter().take(height()).map(String::as_str).collect();
+        let s = format!("\x1b[H{}\x1b[K\x1b[J", shown.join("\x1b[K\n"));
         {
             let mut out = std::io::stdout().lock();
             out.write_all(s.as_bytes())?;
