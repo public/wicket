@@ -48,3 +48,7 @@
 {"label":"after-j1c","step":"cli-clippy","secs":7.19,"peak_mib":1465,"commit":"6dba7b8","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1c","step":"cli-clippy","secs":7.41,"peak_mib":1464,"commit":"6dba7b8","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1c","step":"cli-clippy","secs":7.37,"peak_mib":1468,"commit":"6dba7b8","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-test-cold","secs":40,"peak_mib":2782,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-test","secs":6.62,"peak_mib":2183,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-test","secs":6.81,"peak_mib":2170,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-test","secs":6.58,"peak_mib":2169,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
