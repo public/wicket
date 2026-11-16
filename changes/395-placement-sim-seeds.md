@@ -14,3 +14,12 @@ type: Fixed
   [#397](https://github.com/public/wicket/issues/397) and
   [#399](https://github.com/public/wicket/issues/399) report a node billing past its lease, where
   the real node forgets the box and is released. The five seeds are regression tests.
+- A node takes a late freshness statement older than the history it holds as superseded, not as a
+  rollback (found by a fresh-seed sweep of the placement scenario, seed 50002077). Another run's
+  statement, signed before the newest one the node holds and delivered later over its own
+  connection, named an epoch from before the snapshot the node had been caught up from. It can't
+  take effect, and the node no longer refuses it. A newer statement for such an epoch is still a
+  rollback.
+- The placement simulation's provider latency is per run. It was a process-wide static, so runs in
+  one `cargo test` process set it for each other, which made `deterministic` and the seed tests
+  flaky when run in parallel.
