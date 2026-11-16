@@ -1486,21 +1486,30 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // written the same way while the session is open. wicket closes stdin only when the agent asked
     // to finish or hibernate (#249): the harness decides when it is done.
     let mut stdin = stdin;
-    // A child its node started (#164) has its task from the node already.
-    if let (Some(si), Some(t), None, None) = (stdin.as_mut(), &stdin_task, &record, &adopt) {
-        use tokio::io::AsyncWriteExt;
-        si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
-    }
     // An ACP agent (#66): wicket is its client. A re-attached supervisor carries on with the last
     // one's client state; otherwise `initialize`, with the task (or a wake's message) queued as the
     // first prompt.
     let acp_state = dir.join("ctl/acp.json");
     let mut acp_audits: u32 = 0;
     let mut acp: Option<wicket_agent::acp::AcpClient> = None;
-    // What wicket says to the agent, for the console's session view (#327): only ACP runs keep it.
-    let mut acp_log = acp_cfg
-        .is_some()
+    // What wicket says to the agent, for the console's session view (#327): ACP runs, and runs of a
+    // harness the view reads through its adapter's translation (#364), such as Claude Code's
+    // stream-json, which keep it as the harness has it.
+    let view_format = if acp_cfg.is_none() && stdin_task.is_some() { harness.and_then(|h| h.session_view(&m)) } else { None };
+    let mut acp_log = (acp_cfg.is_some() || view_format.is_some())
         .then(|| crate::transcript::AcpLog::open(&dir, m.zone.limits.output_bytes().unwrap_or(64 << 20), record.is_some()));
+    if let (Some(log), Some(f), None) = (acp_log.as_mut(), view_format, &record) {
+        log.format(f);
+    }
+    // A child its node started (#164) has its task from the node already.
+    if let (Some(si), Some(t), None, None) = (stdin.as_mut(), &stdin_task, &record, &adopt) {
+        use tokio::io::AsyncWriteExt;
+        if let Some(log) = acp_log.as_mut() {
+            log.queued(0, if wake.is_some() { "wake" } else { "task" }, None);
+            log.wrote(0, t);
+        }
+        si.write_all(format!("{t}\n").as_bytes()).await.context("sending the task to the agent")?;
+    }
     if let Some(cfg) = acp_cfg {
         if record.is_some() {
             let c =
@@ -1738,6 +1747,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if let Some(c) = control.as_mut() {
                             let out = ledger.lock().map(|mut lg| c.on_line(&mut lg, &l)).unwrap_or_default();
                             control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                            log_lines(&mut acp_log, transcript_f.offset(), &out.write);
                             write_lines(&mut stdin, &out.write).await;
                         }
                         // A driven remote session's answer to wicket's Remote Control request: its
@@ -1948,6 +1958,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if let Some(c) = control.as_mut() {
                     let out = ledger.lock().map(|mut lg| c.poll(&mut lg)).unwrap_or_default();
                     control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                    log_lines(&mut acp_log, transcript_f.offset(), &out.write);
                     write_lines(&mut stdin, &out.write).await;
                 }
                 let modes = ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
@@ -1956,6 +1967,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         (Some(mode), Some(c)) => {
                             println!("[operator] {by}: permission mode {mode}");
                             let out = c.set_mode(mode);
+                            log_lines(&mut acp_log, transcript_f.offset(), &out);
                             write_lines(&mut stdin, &out).await;
                             "asked"
                         }
@@ -2600,6 +2612,13 @@ const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;
+
+/// Records lines wicket writes to the agent at transcript offset `at`, if the run keeps the log.
+fn log_lines(log: &mut Option<crate::transcript::AcpLog>, at: u64, lines: &[String]) {
+    if let (Some(l), false) = (log.as_mut(), lines.is_empty()) {
+        l.wrote(at, &lines.join("\n"));
+    }
+}
 
 /// Writes lines to the agent's stdin; a stdin that can't be written is dropped.
 async fn write_lines<W: tokio::io::AsyncWrite + Unpin>(stdin: &mut Option<W>, lines: &[String]) {

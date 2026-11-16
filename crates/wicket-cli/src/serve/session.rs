@@ -410,6 +410,9 @@ pub struct Bridge {
     pub prompts: u64,
     /// When this socket last asked for a cancel.
     last_cancel: Option<Instant>,
+    /// For a harness that doesn't speak ACP (#364): its adapter's translation of both sides, named
+    /// by the log's `format` entry.
+    view: Option<Box<dyn wicket_agent::harness::SessionView>>,
 }
 
 fn rpc_key(id: &Value) -> String {
@@ -449,6 +452,7 @@ impl Bridge {
             next_id: 0,
             prompts: 0,
             last_cancel: None,
+            view: None,
         }
     }
 
@@ -657,13 +661,23 @@ impl Bridge {
         out
     }
 
-    /// One line the agent wrote.
+    /// One line the agent wrote: an ACP message, or (through the run's view) what it amounts to.
     fn on_agent(&mut self, line: &str, out: &mut Vec<Value>) {
         if line.len() > MAX_LINE {
             out.push(self.notice(&format!("the agent sent a {} KiB message, too large to show here", line.len() >> 10)));
             return;
         }
-        let Ok(mut v) = serde_json::from_str::<Value>(line) else { return };
+        let msgs = match self.view.as_mut() {
+            Some(view) => view.agent(line),
+            None => serde_json::from_str::<Value>(line).into_iter().collect(),
+        };
+        for v in msgs {
+            self.on_agent_msg(v, out);
+        }
+    }
+
+    /// One ACP message from the agent.
+    fn on_agent_msg(&mut self, mut v: Value, out: &mut Vec<Value>) {
         let method = v.get("method").and_then(|m| m.as_str()).map(String::from);
         let id = v.get("id").cloned().filter(|i| !i.is_null());
         match (method.as_deref(), id) {
@@ -708,11 +722,34 @@ impl Bridge {
 
     /// One entry of what wicket said to the agent.
     fn on_wicket(&mut self, e: &Value, out: &mut Vec<Value>) {
+        if let Some(f) = e.get("format").and_then(|f| f.as_str()) {
+            self.view = wicket_agent::harness::session_view(f);
+            if self.view.is_none() {
+                out.push(
+                    self.notice(&format!(
+                        "this run's session is kept as {}, which this console can't show",
+                        wicket_core::text::clip(f, 60)
+                    )),
+                );
+            }
+            return;
+        }
         if let Some(q) = e.get("queued") {
             self.queued.push_back(Queued { by: q["by"].as_str().unwrap_or("wicket").to_string(), op: q["op"].as_i64() });
             return;
         }
         let Some(msg) = e.get("msg") else { return };
+        let msgs = match self.view.as_mut() {
+            Some(view) => view.wicket(msg),
+            None => vec![msg.clone()],
+        };
+        for m in &msgs {
+            self.on_wicket_msg(m, out);
+        }
+    }
+
+    /// One ACP message from wicket's client to the agent.
+    fn on_wicket_msg(&mut self, msg: &Value, out: &mut Vec<Value>) {
         let id = msg.get("id").cloned().filter(|i| !i.is_null());
         match (msg.get("method").and_then(|m| m.as_str()), id) {
             (Some("session/prompt"), Some(id)) => {

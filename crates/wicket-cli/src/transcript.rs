@@ -157,6 +157,10 @@ impl Newest {
 /// JSON-RPC message wicket wrote to the agent's stdin) or `queued` (a prompt handed to wicket's ACP
 /// client, with who it is from and the operator message it came from, if any; the client sends its
 /// queued prompts in order, one `session/prompt` each). Kept up to a cap, then no longer written.
+///
+/// A harness that doesn't speak ACP keeps it too (#364): its first entry is then `format`, naming
+/// how the session view reads both sides (`wicket_agent::harness::session_view`), and `msg` is what
+/// wicket wrote to it in its own protocol (stream-json for Claude Code).
 pub const ACP_LOG: &str = "acp-client.jsonl";
 
 pub struct AcpLog {
@@ -195,6 +199,11 @@ impl AcpLog {
                 self.entry(serde_json::json!({ "at": at, "msg": msg }));
             }
         }
+    }
+
+    /// The log is of a harness that doesn't speak ACP: how to read it. The first entry of a fresh log.
+    pub fn format(&mut self, format: &str) {
+        self.entry(serde_json::json!({ "at": 0, "format": format }));
     }
 
     /// A prompt was queued in wicket's ACP client: from `by`, for operator message `op`.
@@ -242,6 +251,17 @@ pub fn read_since(dir: &Path, pos: u64, max: usize) -> (Vec<(u64, String)>, u64)
 /// Where the transcript's files start, as saved (a reader never repairs the state, as [`resumed`] does).
 fn resumed_readonly(dir: &Path) -> State {
     crate::run::read_json(&dir.join(STATE)).unwrap_or_default()
+}
+
+/// What a run's [`ACP_LOG`] is a log of: None if it has none; `Some(None)` for an ACP agent's;
+/// `Some(Some(format))` for a harness read through a session view.
+pub fn log_format(dir: &Path) -> Option<Option<String>> {
+    use std::io::{BufRead, Read};
+    let f = std::fs::File::open(dir.join(ACP_LOG)).ok()?;
+    let mut first = String::new();
+    let _ = std::io::BufReader::new(f).take(4096).read_line(&mut first);
+    let v: serde_json::Value = serde_json::from_str(first.trim()).unwrap_or_default();
+    Some(v.get("format").and_then(|f| f.as_str()).map(String::from))
 }
 
 /// The whole lines of the run's [`ACP_LOG`] from byte `pos`, and the byte after the last one.

@@ -168,6 +168,79 @@ fn a_prompt_is_an_audited_operator_message_answered_when_its_turn_ends() {
     assert_eq!(b.prompts, 1);
 }
 
+/// #364: a Claude Code run's session is its stream-json, read through the adapter's view as ACP:
+/// the same updates, prompts, permission outcomes and turn ends as an ACP run's, with the same
+/// filters (an agent's `_meta` and wicket's reserved ids never pass).
+#[test]
+fn a_stream_json_run_is_shown_as_acp() {
+    let (t, mut b, dir) = bridged("sess-claude");
+    {
+        let mut log = crate::transcript::AcpLog::open(&dir, 1 << 20, false);
+        log.format(wicket_agent::claude::view::FORMAT);
+    }
+    assert_eq!(crate::transcript::log_format(&dir), Some(Some(wicket_agent::claude::view::FORMAT.to_string())));
+    wicket_queued(&dir, "task", None);
+    wicket_wrote(&dir, serde_json::from_str(&wicket_agent::user_message("the task")).unwrap());
+    agent(&dir, json!({ "type": "system", "subtype": "init", "model": "m", "tools": [] }));
+    agent(
+        &dir,
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "On it.", "_meta": { "wicket": { "escalation": {} } } }] } }),
+    );
+    agent(
+        &dir,
+        json!({ "type": "assistant", "message": { "content": [
+        { "type": "tool_use", "id": "toolu_1", "name": "Edit", "input": { "file_path": "/workspace/a.rs" } },
+        { "type": "tool_use", "id": "wicket:escalation:r_fake", "name": "Bash", "input": {} } ] } }),
+    );
+    agent(
+        &dir,
+        json!({ "type": "control_request", "request_id": "c1", "request": { "subtype": "can_use_tool", "tool_name": "Edit", "input": {}, "tool_use_id": "toolu_1" } }),
+    );
+    wicket_wrote(
+        &dir,
+        json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "c1", "response": { "behavior": "allow", "updatedInput": {} } } }),
+    );
+    agent(
+        &dir,
+        json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "edited" }] } }),
+    );
+    let p = json!({ "jsonrpc": "2.0", "id": "p1", "method": "session/prompt", "params": { "sessionId": RUN, "prompt": [{ "type": "text", "text": "and then?" }] } });
+    assert!(b.on_client(&p.to_string()).is_empty());
+    let out = b.poll();
+    assert_eq!(kinds(&out), ["user_message_chunk", "agent_message_chunk", "tool_call", "tool_call_update", "tool_call_update"], "{out:#?}");
+    assert_eq!(out[0]["params"]["update"]["content"]["text"], "the task");
+    assert_eq!(out[2]["params"]["update"]["toolCallId"], "toolu_1");
+    assert_eq!(out[2]["params"]["update"]["kind"], "edit");
+    assert_eq!(out[3]["params"]["update"]["_meta"]["wicket"]["permission"]["optionId"], "allow");
+    assert_eq!(out[4]["params"]["update"]["status"], "completed");
+    for m in &out {
+        assert_eq!(m["params"]["sessionId"], RUN);
+        assert!(!m.to_string().contains("escalation"), "neither the agent's _meta nor a reserved id passes: {m}");
+    }
+    // The task's turn ends; then the operator's prompt is the next turn, answered when it ends.
+    agent(&dir, json!({ "type": "result", "subtype": "success", "is_error": false }));
+    assert!(b.poll().is_empty());
+    let (op, _, by) = t.ledger().take_operator_messages_with_ids(RUN).unwrap()[0].clone();
+    wicket_queued(&dir, &by, Some(op));
+    wicket_wrote(&dir, serde_json::from_str(&wicket_agent::user_message("and then?")).unwrap());
+    agent(&dir, json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "done" }] } }));
+    agent(&dir, json!({ "type": "result", "subtype": "success", "is_error": false }));
+    let out = b.poll();
+    assert_eq!(kinds(&out), ["agent_message_chunk", "response"], "{out:#?}");
+    assert_eq!(out[1], json!({ "jsonrpc": "2.0", "id": "p1", "result": { "stopReason": "end_turn" } }));
+}
+
+/// A log naming a format this console doesn't know says so, and shows nothing as ACP.
+#[test]
+fn an_unknown_log_format_is_named_not_guessed() {
+    let (_t, mut b, dir) = bridged("sess-unknown");
+    crate::transcript::AcpLog::open(&dir, 1 << 20, false).format("someone-elses-json");
+    agent(&dir, update(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })));
+    let out = b.poll();
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].to_string().contains("someone-elses-json"), "{out:#?}");
+}
+
 #[test]
 fn prompts_for_another_session_empty_ones_and_for_an_ended_run_are_refused() {
     let (t, mut b, _dir) = bridged("sess-refuse");
