@@ -2084,10 +2084,10 @@ mod tests {
         let r = t.post("/api/action/finish", a);
         assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
         assert!(r.body["ok"].as_str().unwrap().contains("every path under"));
-        let mut l = t.ledger();
+        let l = t.ledger();
         assert_eq!(l.request(&rid).unwrap().status, "granted");
         let deeper = wicket_core::Op::egress(&TenantId::single(), &RunId("run_e".into()), "z", "GET", "news.example", "/items/42");
-        assert!(l.consume_grant(&deeper).unwrap().is_some(), "the grant covers paths under the prefix");
+        assert!(l.grant_covering(&deeper).unwrap().is_some(), "the grant covers paths under the prefix");
         let (kind, body) = t.audit_kinds().pop().unwrap();
         assert_eq!((kind.as_str(), body["scope_prefix"].as_bool()), ("decision", Some(true)));
         // An agent whose identity doesn't verify: approval is refused, denial works.
@@ -2122,16 +2122,16 @@ mod tests {
         let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
         let r = t.post("/api/action/finish", a);
         assert!(r.body["ok"].as_str().unwrap().contains("every path under news.example/items/a/"), "{:?}", r.body);
-        let mut l = t.ledger();
-        assert!(l.consume_grant(&op("run_e", "/items/a/1")).unwrap().is_some());
-        assert!(l.consume_grant(&op("run_e", "/items/b/1")).unwrap().is_none(), "narrowed to what the human named");
+        let l = t.ledger();
+        assert!(l.grant_covering(&op("run_e", "/items/a/1")).unwrap().is_some());
+        assert!(l.grant_covering(&op("run_e", "/items/b/1")).unwrap().is_none(), "narrowed to what the human named");
         // Zone-wide: another run in the zone may use it too.
         let (rid, _) = t.ledger().ask(&op("run_e", "/feed"), "the feed", false, None).unwrap();
         let b = t.begin(json!({ "action": "decide", "id": rid, "decision": "approve", "unlimited": true, "zone_wide": true }));
         assert_eq!(b.body["action"]["scope"], "zone");
         let a = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
         assert!(t.post("/api/action/finish", a).body["ok"].as_str().unwrap().contains("any run in zone z"));
-        assert!(t.ledger().consume_grant(&op("run_g", "/feed")).unwrap().is_some(), "zone-wide");
+        assert!(t.ledger().grant_covering(&op("run_g", "/feed")).unwrap().is_some(), "zone-wide");
         let (_, rec) = t.audit_kinds().pop().unwrap();
         assert_eq!((rec["scope"].as_str(), rec["action"].as_str()), (Some("zone"), Some("decide")));
         // A capacity ask: denying it releases its lease's reservation at once.

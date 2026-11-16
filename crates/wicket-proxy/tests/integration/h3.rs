@@ -3,6 +3,7 @@
 //! destination, as `wicket-fwd` does from `IP_PKTINFO`), wicket's DNS and QUIC termination, the
 //! egress proxy's decisions, and local origins (HTTP/3 + HTTP/1.1, and HTTP/1.1 only) with their own CA.
 
+use crate::zone_decider::ZoneDecider;
 use bytes::{Buf, Bytes};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -15,7 +16,6 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_fwd::frame::{self, Head, HDR, MAX_FRAME};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::Central;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::h3::{Options, H3};
 use wicket_proxy::{Event, RunCtx};
@@ -142,12 +142,12 @@ impl World {
         World::with_relay(stream, opts, None).await
     }
 
-    async fn with_relay(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Relay>>) -> World {
+    async fn with_relay(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Router>>) -> World {
         World::build(stream, opts, relay, false).await
     }
 
     /// `stale`: this run is an activation of an agent that has since been woken again (#70).
-    async fn build(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Relay>>, stale: bool) -> World {
+    async fn build(stream: bool, opts: Options, relay: Option<Arc<dyn wicket_proxy::egress::Router>>, stale: bool) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca).await;
@@ -194,7 +194,7 @@ impl World {
         };
         let run_ca = Arc::new(RunCa::generate("run_h3").unwrap());
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), no_h3: false, ..Default::default() };
-        let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(Central), relay, up).unwrap();
+        let egress = Egress::with_upstream(ctx, run_ca.clone(), Arc::new(ZoneDecider), relay, up).unwrap();
         let h3 = H3::new(egress, opts).unwrap();
         let names = h3.names().clone();
         let sock = dir.join("udp.sock");
@@ -686,30 +686,27 @@ async fn a_server_name_other_than_the_addresss_host_is_refused_even_unverified()
     assert_eq!(get(&ep, to, "h3.test", "GET", "https://h3.test/allowed/a").await.unwrap().0, 200);
 }
 
-/// A node's relay that forwards `h1only.test` to the control host and terminates the rest.
-struct NodeRelay;
+/// A node's router whose CA can't cover `h1only.test`, and covers the rest.
+struct NodeRouter;
 
-impl wicket_proxy::egress::Relay for NodeRelay {
+impl wicket_proxy::egress::Router for NodeRouter {
     fn route(&self, host: &str) -> wicket_proxy::decide::Route {
         if host == "h1only.test" {
-            wicket_proxy::decide::Route::Forward("the zone injects a credential for this host".into())
+            wicket_proxy::decide::Route::Uncovered("outside the node CA's name constraints".into())
         } else {
             wicket_proxy::decide::Route::Terminate
         }
     }
-    fn open(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<Box<dyn wicket_proxy::egress::RelayStream>>> {
-        Box::pin(async { Err(std::io::Error::other("no control host in this test")) })
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_a_node_forwarded_hosts_refuse_http3_and_say_why() {
-    let w = World::with_relay(false, Options::default(), Some(Arc::new(NodeRelay))).await;
+async fn on_a_node_uncovered_hosts_refuse_http3_and_say_why() {
+    let w = World::with_relay(false, Options::default(), Some(Arc::new(NodeRouter))).await;
     let b = FakeBox::connect(&w, false);
     let b1 = FakeBox::connect(&w, false);
     let (b, b1, ip, ip1) = tokio::task::spawn_blocking(move || {
         let ip = b.resolve("h3.test").unwrap();
-        let ip1 = b.resolve("h1only.test").expect("forwarded hosts still resolve (TCP through the proxy reaches them)");
+        let ip1 = b.resolve("h1only.test").expect("uncovered hosts still resolve (TCP through the proxy may splice them)");
         (b, b1, ip, ip1)
     })
     .await

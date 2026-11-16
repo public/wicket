@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{ca::RunCa, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 
@@ -1007,16 +1007,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
     };
     let proxies_lap = std::time::Instant::now();
-    let egress = Egress::new(ctx.clone(), ca.clone())?;
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
     // of record (#152, #257), whose reports are merged in here and whose budget slices are sent from here.
     // Nothing listens for model calls on this side.
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
     let llm = Llm::with_quota(ctx.clone(), limits.model)?;
     let _ = llm_slot.set(llm.clone());
-    // A wrapped session's model calls reach the model host through the egress proxy: they get the
-    // model proxy's budget, filter and accounting there (#112).
-    egress.set_model_gate(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70); a re-attached
     // long-lived agent's from what its agent row records (this activation's spend included, up to its
     // supervisor's last heartbeat), any other re-attached run's from what its supervisor last saved.
@@ -1037,33 +1033,30 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         (None, None, Some(r)) => {
             use std::sync::atomic::Ordering::SeqCst;
             let p: RunProgress = read_json(&dir.join("ctl/progress.json")).unwrap_or_default();
-            llm.requests.store(p.requests, SeqCst);
-            llm.input_tokens.store(p.input_tokens, SeqCst);
-            llm.cache_read_tokens.store(p.cache_read_tokens, SeqCst);
-            llm.cache_creation_tokens.store(p.cache_creation_tokens, SeqCst);
-            llm.output_tokens.store(p.output_tokens, SeqCst);
+            llm.count.requests.store(p.requests, SeqCst);
+            llm.count.input_tokens.store(p.input_tokens, SeqCst);
+            llm.count.cache_read_tokens.store(p.cache_read_tokens, SeqCst);
+            llm.count.cache_creation_tokens.store(p.cache_creation_tokens, SeqCst);
+            llm.count.output_tokens.store(p.output_tokens, SeqCst);
             r.prior_secs + u64::try_from((wicket_feed::now_ms() - r.started_ms).max(0) / 1000).unwrap_or(0)
         }
         // Taken over from its node (#164): its time counts from when it started there.
         (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
-    let (es, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/gateway.sock"));
+    let gs = dir.join("ctl/gateway.sock");
     // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
-    for s in [&es, &gs] {
-        wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
-    }
+    wicket_proxy::sockpath::resolve(&gs).with_context(|| format!("the run proxy socket {}", gs.display()))?;
     let gateway = Gateway::new(ctx.clone());
-    // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
-    // forwards, the MCP gateway's tools it doesn't decide yet): `ctl/`, not the box's `sock/`, which
-    // is the node's. The model proxy is the node's alone (#257).
-    // Each is bound and listening before it is served, so it is ready here, with no wait for its
+    // The run's own gateway, which its node reaches for the MCP tools it doesn't decide yet: `ctl/`,
+    // not the box's `sock/`, which is the node's. The model and egress proxies are the node's alone
+    // (#257: no egress is forwarded here since slice 3, so nothing listens on `ctl/egress.sock`).
+    // It is bound and listening before it is served, so it is ready here, with no wait for its
     // socket to appear (#287), and one that can't be bound fails the run, naming it.
     let waited = std::time::Instant::now();
     let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
-    let (gl, el) = (listen(&gs)?, listen(&es)?);
+    let gl = listen(&gs)?;
     timings.since("proxies.sockets", waited);
     let g_task = tokio::spawn(gateway.serve_on(gl));
-    let e_task = tokio::spawn(egress.serve_on(el));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 
@@ -1259,7 +1252,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             // Swapped on the node (#257): their names and placeholders only, the credentials
             // fetched by the node on first use.
-            swap_hosts: vec![],
             swaps: crate::chan::swap_starts(&ctx.swaps),
             durable: match long_lived {
                 true => m
@@ -1808,11 +1800,11 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 use std::sync::atomic::Ordering::SeqCst;
                 let (o, e) = stopper.0.offsets();
                 let _ = write_json(&dir.join("ctl/progress.json"), &RunProgress {
-                    requests: llm.requests.load(SeqCst),
-                    input_tokens: llm.input_tokens.load(SeqCst),
-                    cache_read_tokens: llm.cache_read_tokens.load(SeqCst),
-                    cache_creation_tokens: llm.cache_creation_tokens.load(SeqCst),
-                    output_tokens: llm.output_tokens.load(SeqCst),
+                    requests: llm.count.requests.load(SeqCst),
+                    input_tokens: llm.count.input_tokens.load(SeqCst),
+                    cache_read_tokens: llm.count.cache_read_tokens.load(SeqCst),
+                    cache_creation_tokens: llm.count.cache_creation_tokens.load(SeqCst),
+                    output_tokens: llm.count.output_tokens.load(SeqCst),
                     stdout: o,
                     stderr: e,
                 });
@@ -2249,7 +2241,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("    {}", wicket_agent::clip(l, 300));
         }
     }
-    e_task.abort();
     g_task.abort();
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its
@@ -2304,12 +2295,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Pending requests are withdrawn by run_ended below; report them first.
     let summary = serde_json::json!({
         "status": status, "cause": cause, "note": end_note, "seconds": started.elapsed().as_secs(),
-        "model_requests": llm.requests.load(std::sync::atomic::Ordering::SeqCst),
-        "input_tokens": llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
-        "cache_read_input_tokens": llm.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
-        "cache_creation_input_tokens": llm.cache_creation_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "model_requests": llm.count.requests.load(std::sync::atomic::Ordering::SeqCst),
+        "input_tokens": llm.count.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_read_input_tokens": llm.count.cache_read_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "cache_creation_input_tokens": llm.count.cache_creation_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "input_tokens_total": llm.input_total(),
-        "output_tokens": llm.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        "output_tokens": llm.count.output_tokens.load(std::sync::atomic::Ordering::SeqCst),
         "pending_requests": pending, "result": result,
     });
     {
@@ -2333,7 +2324,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         summary["seconds"],
         summary["model_requests"],
         summary["input_tokens_total"],
-        llm.input_total() - llm.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
+        llm.input_total() - llm.count.input_tokens.load(std::sync::atomic::Ordering::SeqCst),
         summary["output_tokens"]
     );
     match &result {

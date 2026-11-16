@@ -76,9 +76,6 @@ impl std::fmt::Debug for AgentAuthority {
     }
 }
 
-/// How far up a spawn chain a request is routed to a granter.
-const MAX_CHAIN: usize = 64;
-
 /// Whether the agent `a` may decide `req`, and the chain from the asking run up to `a` (the
 /// asking run first). Each rule's refusal names it; a request refused here stays pending for a
 /// human. An agent may decide a request when:
@@ -121,22 +118,13 @@ pub fn within_authority(l: &Ledger, a: &AgentAuthority, req: &Request) -> Result
 }
 
 /// The chain from run `run` up to the agent `a` (`run` first), if `run` is one of `a`'s
-/// descendants (the ledger's identities, `parent_run` upwards), never `a` itself.
+/// descendants (the ledger's identities, `parent_run` upwards), never `a` itself
+/// ([`wicket_core::authority::descendant_chain`], which Kani checks).
 fn descendant_chain(l: &Ledger, a: &AgentAuthority, run: &str) -> Result<Vec<String>> {
-    let mut chain = vec![run.to_string()];
-    let mut at = l.identity(run)?.and_then(|i| i.parent_run);
-    loop {
-        match at {
-            Some(p) if p == a.run.0 => {
-                chain.push(p);
-                return Ok(chain);
-            }
-            Some(p) if chain.len() < MAX_CHAIN && !chain.contains(&p) => {
-                at = l.identity(&p)?.and_then(|i| i.parent_run);
-                chain.push(p);
-            }
-            _ => bail!("{run} is not one of your descendants"),
-        }
+    let parent = |r: &String| -> Result<Option<String>> { Ok(l.identity(r)?.and_then(|i| i.parent_run)) };
+    match wicket_core::authority::descendant_chain(parent, &a.run.0, &run.to_string())? {
+        Some(chain) => Ok(chain),
+        None => bail!("{run} is not one of your descendants"),
     }
 }
 
@@ -154,7 +142,8 @@ fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
     if wicket_core::git::grant_terms(&req.method, &req.path, Some(uses), t.ttl.as_secs()) != (Some(uses), t.ttl.as_secs()) {
         bail!("a git push is decided by an operator");
     }
-    outlasts(a, wicket_store::now().saturating_add(i64::try_from(t.ttl.as_secs()).unwrap_or(i64::MAX)), "grant")
+    let now = wicket_store::now();
+    outlasts(a, now, wicket_core::authority::end_of(now, t.ttl.as_secs()), "grant")
 }
 
 /// What an approval grants, within what was asked.
@@ -555,7 +544,7 @@ fn renew(l: &mut Ledger, by: &Granter, id: &str, ttl: Duration, extra: serde_jso
                 if !a.zone.escalation.grant {
                     bail!("your zone may not grant (escalation.grant: false)");
                 }
-                outlasts(a, until, "authority")?;
+                outlasts(a, wicket_store::now(), Some(until), "authority")?;
                 merge(&mut extra, serde_json::json!({ "granter": "agent", "chain": chain }));
             }
             if !l.renew_run_authority(&run, until)? {
@@ -591,19 +580,18 @@ fn agent_renews(a: &AgentAuthority, g: &wicket_store::GrantRow, req: &Request, u
     if wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
         bail!("a git push is decided by an operator");
     }
-    outlasts(a, until, "grant")
+    outlasts(a, wicket_store::now(), Some(until), "grant")
 }
 
-/// Refuses an end past the agent's own authority.
-fn outlasts(a: &AgentAuthority, until: i64, what: &str) -> Result<()> {
-    let now = wicket_store::now();
-    if a.until <= now {
-        bail!("your own authority has ended");
+/// Refuses an end past the agent's own authority (`None`: past `i64::MAX`;
+/// [`wicket_core::authority::ends_by`], which Kani checks).
+fn outlasts(a: &AgentAuthority, now: i64, until: Option<i64>, what: &str) -> Result<()> {
+    use wicket_core::authority::Outlasts;
+    match wicket_core::authority::ends_by(now, until, a.until) {
+        Ok(()) => Ok(()),
+        Err(Outlasts::Ended) => bail!("your own authority has ended"),
+        Err(Outlasts::Later) => bail!("the {what} would outlast your own authority, which ends in {}s", a.until - now),
     }
-    if until > a.until {
-        bail!("the {what} would outlast your own authority, which ends in {}s", a.until - now);
-    }
-    Ok(())
 }
 
 /// Whether terms may be granted for `req` at all, whoever grants them.
@@ -1113,13 +1101,13 @@ mod tests {
         assert!(text.starts_with("approved:"), "{text}");
         assert_eq!(t.status(&child), "granted");
         // The grant is the child's own, for the exact path, with the uses given.
-        let mut l = t.ledger.lock().unwrap();
+        let l = t.ledger.lock().unwrap();
         let op = |run: &str, path: &str| Op::egress(&TenantId::single(), &RunId(run.into()), "z.c", "GET", "api.example.com", path);
-        assert!(l.consume_grant(&op("run_x", "/v1/items")).unwrap().is_none(), "another run can't use it");
-        assert!(l.consume_grant(&op("run_c", "/v1/items/more")).unwrap().is_none(), "exact path only");
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_some());
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_some());
-        assert!(l.consume_grant(&op("run_c", "/v1/items")).unwrap().is_none(), "two uses");
+        assert!(l.grant_covering(&op("run_x", "/v1/items")).unwrap().is_none(), "another run can't use it");
+        assert!(l.grant_covering(&op("run_c", "/v1/items/more")).unwrap().is_none(), "exact path only");
+        let gid = l.grant_covering(&op("run_c", "/v1/items")).unwrap().unwrap();
+        // Its uses are the node's to count (#257): published with them.
+        assert_eq!(l.grant(&gid).unwrap().unwrap().uses_left, Some(2), "two uses");
         // Signed by the granter, with the chain, on the record.
         let d = decisions(&l);
         assert_eq!(d[0]["by"], "agent:run_p");

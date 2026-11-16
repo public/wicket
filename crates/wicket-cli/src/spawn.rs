@@ -132,9 +132,9 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
     *reserved += weight;
     if let (Some(cl), Some(llm)) = (&cm.zone.llm, c.llm.get()) {
         use std::sync::atomic::Ordering;
-        llm.reserved_requests.fetch_add(cl.max_requests, Ordering::SeqCst);
-        llm.reserved_output_tokens.fetch_add(cl.max_output_tokens, Ordering::SeqCst);
-        llm.reserved_input_tokens.fetch_add(cl.max_input_tokens.unwrap_or(0), Ordering::SeqCst);
+        llm.count.reserved_requests.fetch_add(cl.max_requests, Ordering::SeqCst);
+        llm.count.reserved_output_tokens.fetch_add(cl.max_output_tokens, Ordering::SeqCst);
+        llm.count.reserved_input_tokens.fetch_add(cl.max_input_tokens.unwrap_or(0), Ordering::SeqCst);
     }
     drop(reserved);
     let _ = c.ledger.lock().map(|l| {
@@ -531,13 +531,18 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
     let child = RunId::new();
     let ids = record_quotas(c, &cm, &child.0, weight)?;
     *reserved += weight;
+    // The budget checked above may have been spent since (a model call isn't under this lock): the
+    // carve-out is checked again as it is made, under the counter's claims lock, so the two can't
+    // both take the last of it (#325, wicket_core::budget).
     let carve = match (&cm.zone.llm, c.llm.get()) {
         (Some(cl), Some(llm)) => {
-            use std::sync::atomic::Ordering;
-            llm.reserved_requests.fetch_add(cl.max_requests, Ordering::SeqCst);
-            llm.reserved_output_tokens.fetch_add(cl.max_output_tokens, Ordering::SeqCst);
-            llm.reserved_input_tokens.fetch_add(cl.max_input_tokens.unwrap_or(0), Ordering::SeqCst);
-            Some((llm.clone(), cl.max_requests, cl.max_output_tokens, cl.max_input_tokens.unwrap_or(0)))
+            let child_quota = wicket_proxy::llm::ModelQuota::of_zone(cl);
+            if let Err(short) = llm.count.carve(llm.quota().unwrap_or_default(), child_quota) {
+                unrecord_quotas(c, &ids);
+                *reserved = reserved.saturating_sub(weight);
+                return Err(format!("its model budget no longer fits in what is left of yours ({short}): it was spent since"));
+            }
+            Some((llm.clone(), child_quota))
         }
         _ => None,
     };
@@ -565,11 +570,8 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
             if let Ok(mut r) = c.slots.lock() {
                 *r = r.saturating_sub(weight);
             }
-            if let Some((llm, r, t, i)) = carve {
-                use std::sync::atomic::Ordering;
-                llm.reserved_requests.fetch_sub(r, Ordering::SeqCst);
-                llm.reserved_output_tokens.fetch_sub(t, Ordering::SeqCst);
-                llm.reserved_input_tokens.fetch_sub(i, Ordering::SeqCst);
+            if let Some((llm, child_quota)) = carve {
+                llm.count.uncarve(child_quota);
             }
             return Err(e);
         }

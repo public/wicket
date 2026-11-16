@@ -22,7 +22,7 @@ pub const MAX_DECIDE_USES: u32 = 100;
 const DEFAULT_DECIDE_TTL: u64 = 600;
 
 /// How long `await_grant` waits for a fresh grant to be handed to the box's node (#231): several of
-/// the run's 250 ms ticks, which a grant the control host keeps deciding also waits, once.
+/// the run's 250 ms ticks, which a grant it can't hand over (#257) also waits, once.
 const HAND_OFF: Duration = Duration::from_millis(1500);
 
 pub struct Gateway {
@@ -188,8 +188,9 @@ impl Gateway {
             match req.status.as_str() {
                 // The box's retry must find the grant where it is decided, or it asks again. A grant
                 // handed to the box's node: answer once the node has it (at most 15 s). One not yet
-                // handed: the run's process hands it over on its next tick (every 250 ms), or keeps
-                // deciding it here; wait a few ticks for that before answering.
+                // handed: the run's process hands it over on its next tick (every 250 ms), or never
+                // can (#257: then the box's retry is asked about again); wait a few ticks for that
+                // before answering.
                 "granted"
                     if {
                         let since = granted_at.get_or_insert_with(Instant::now).elapsed();

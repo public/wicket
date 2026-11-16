@@ -8,6 +8,7 @@
 //!   (a scoped token, branch rules); the body goes upstream byte for byte.
 //! - A fetch is unaffected: still reads, allowed by reach, never asked about (#179).
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::net::SocketAddr;
@@ -19,7 +20,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::Central;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
 use wicket_store::{Approval, Ledger};
@@ -116,7 +116,7 @@ impl World {
             lifecycle: None,
         };
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
-        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_push").unwrap()), Arc::new(Central), None, up).unwrap();
+        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_push").unwrap()), Arc::new(ZoneDecider), None, up).unwrap();
         let sock = dir.join("egress.sock");
         let s2 = sock.clone();
         tokio::spawn(async move { egress.serve(&s2).await });
