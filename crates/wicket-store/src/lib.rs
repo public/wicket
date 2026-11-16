@@ -95,7 +95,11 @@ pub enum StoreError {
 /// (`requests_run`) are read by.
 /// Version 11 (expand) adds `runs.uncollected`: the node keeping a run's files that a fetch didn't
 /// bring back (#300, #324), which holds the node.
-pub const SCHEMA_VERSION: u32 = 11;
+/// Version 12 (expand) adds the `node_health` table: each node's latest health report, for
+/// `wicket top`, the console and its alerts (#377). Version 13 (expand) adds the `run_collected`
+/// table: when and how a run's work was collected, which a cleanup checks before it deletes the
+/// run's workspace (#377).
+pub const SCHEMA_VERSION: u32 = 13;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -304,6 +308,10 @@ CREATE TABLE IF NOT EXISTS turn_cancels (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, by TEXT NOT NULL,
   created_at INTEGER NOT NULL, consumed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS mode_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT NOT NULL, mode TEXT NOT NULL, by TEXT NOT NULL,
+  created_at INTEGER NOT NULL, consumed_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS identity_history (
   run TEXT NOT NULL, jws TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
 );
@@ -356,6 +364,8 @@ CREATE TABLE IF NOT EXISTS placed_nodes (
   created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT,
   hourly INTEGER
 );
+CREATE TABLE IF NOT EXISTS node_health (node TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, health TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS run_collected (run TEXT NOT NULL, how TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (run, how));
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
@@ -686,6 +696,29 @@ impl Ledger {
         tx.execute("UPDATE turn_cancels SET consumed_at = ?2 WHERE run = ?1 AND consumed_at IS NULL", params![run, t])?;
         tx.commit()?;
         Ok(by)
+    }
+
+    /// Asks `run`'s supervisor to change its driven session's permission mode while it runs (#363),
+    /// to `mode` as the manifest spells it. Taken within a second or so, like a turn cancel.
+    pub fn request_mode_change(&self, run: &str, mode: &str, by: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO mode_changes (run, mode, by, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, mode, by, now()])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Takes `run`'s mode changes: (mode, who asked), oldest first, of those made within the last
+    /// `fresh_secs` (older ones are dropped, as stale cancels are).
+    pub fn take_mode_changes(&mut self, run: &str, fresh_secs: i64) -> Result<Vec<(String, String)>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let t = now();
+        let asked: Vec<(String, String)> = {
+            let mut st =
+                tx.prepare("SELECT mode, by FROM mode_changes WHERE run = ?1 AND consumed_at IS NULL AND created_at >= ?2 ORDER BY id")?;
+            let rows = st.query_map(params![run, t - fresh_secs], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        tx.execute("UPDATE mode_changes SET consumed_at = ?2 WHERE run = ?1 AND consumed_at IS NULL", params![run, t])?;
+        tx.commit()?;
+        Ok(asked)
     }
 
     // ---- identities and messages (design §3.2) ----
@@ -2220,6 +2253,14 @@ mod tests {
         assert!(l.take_turn_cancels("run_a", 30).unwrap().is_empty());
         l.conn.execute("UPDATE turn_cancels SET created_at = created_at - 60 WHERE run = 'run_b'", []).unwrap();
         assert!(l.take_turn_cancels("run_b", 30).unwrap().is_empty());
+        // Mode changes (#363): the same.
+        l.request_mode_change("run_a", "acceptEdits", "alex").unwrap();
+        l.request_mode_change("run_a", "default", "alex").unwrap();
+        l.request_mode_change("run_b", "plan", "bob").unwrap();
+        assert_eq!(l.take_mode_changes("run_a", 30).unwrap(), [("acceptEdits".into(), "alex".into()), ("default".into(), "alex".into())]);
+        assert!(l.take_mode_changes("run_a", 30).unwrap().is_empty());
+        l.conn.execute("UPDATE mode_changes SET created_at = created_at - 60 WHERE run = 'run_b'", []).unwrap();
+        assert!(l.take_mode_changes("run_b", 30).unwrap().is_empty());
     }
 
     #[test]

@@ -244,6 +244,37 @@ pub(crate) mod tests {
         assert_eq!(off[7], 0, "no HTTPS answer when they're off");
     }
 
+    /// #361, DNS exfiltration: wicket answers every query itself, so data in a name goes nowhere. A
+    /// name carrying data under a host the zone doesn't reach is NXDOMAIN with no answer; no record
+    /// type a channel could use (TXT, NULL, CNAME, MX) answers anything, even for a reachable host;
+    /// the answer carries back only the question; and the names refused are bounded, so a stream of
+    /// unique names can't grow wicket's memory or its audit without end.
+    #[test]
+    fn dns_exfiltration_goes_nowhere_and_is_bounded() {
+        let n = Names::new();
+        for (name, t) in
+            [("c2vjcmv0.payload.evil.example", T_A), ("bWFkZQ.evil.example", T_A), ("x.evil.example", 16), ("x.evil.example", 10)]
+        {
+            let q = query(name, t);
+            let (r, what) = answer(&n, &q, true, reach).unwrap();
+            assert_eq!(r[3] & 0x0f, 3, "{name}: NXDOMAIN");
+            assert_eq!((r.len(), &r[12..]), (q.len(), &q[12..]), "{name}: the question, and nothing else");
+            assert!(matches!(what, Answered::Refused { .. }), "{name}");
+        }
+        for t in [16u16, 10, 5, 15, 255] {
+            let q = query("h3.test", t);
+            let (r, _) = answer(&n, &q, true, reach).unwrap();
+            assert_eq!((r[3] & 0x0f, u16::from_be_bytes([r[6], r[7]])), (0, 0), "type {t}: NOERROR, no answer");
+            assert_eq!(r.len(), q.len(), "type {t}");
+        }
+        for i in 0..5000 {
+            answer(&n, &query(&format!("d{i}.evil.example"), T_A), true, reach).unwrap();
+        }
+        let (_, last) = answer(&n, &query("one-more.evil.example", T_A), true, reach).unwrap();
+        assert_eq!(last, Answered::Refused { name: "one-more.evil.example".into(), first: false }, "past the bound, nothing is audited");
+        assert!(n.inner.lock().unwrap().refused.len() <= 4096);
+    }
+
     #[test]
     fn garbage_is_dropped() {
         let n = Names::new();

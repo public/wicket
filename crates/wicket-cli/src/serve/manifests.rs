@@ -92,7 +92,7 @@ fn grants(state: &State, m: &Manifest) -> Value {
     let llm = z.llm.as_ref().map(|l| {
         json!({ "provider": l.provider, "upstream": l.upstream, "secret": l.secret, "secret_set": vault.has(&l.secret),
                 "max_requests": l.max_requests, "max_output_tokens": l.max_output_tokens, "max_input_tokens": l.max_input_tokens,
-                "allow_server_tools": l.allow_server_tools })
+                "allow_server_tools": l.allow_server_tools, "models": l.models })
     });
     json!({
         "task": m.task,

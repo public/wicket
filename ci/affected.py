@@ -29,7 +29,7 @@ TABLE = ROOT / "ci" / "affected.map"
 E2E = ["docs", "policy", "lean", "kani", "smoke", "hibernate", "restore", "acceptance", "daemon-uids", "install-test",
        "node-e2e", "acceptance-nodes", "update", "tla"]
 # The fuzz targets (#323, fuzz/), each a suite `fuzz-<target>` that ci/fuzz.sh runs for a short while.
-FUZZ = ["egress", "gateway", "chan", "feed", "token", "manifest", "store", "git"]
+FUZZ = ["egress", "gateway", "chan", "feed", "token", "manifest", "store", "git", "canon"]
 SUITES = E2E + [f"fuzz-{t}" for t in FUZZ]
 ALL = "all"
 # Crates with a library target (doctests run only on those), filled by workspace().

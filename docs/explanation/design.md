@@ -860,8 +860,9 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
 
 **Workdir and output:** the base repo is a read-only lower layer, and the agent writes to an upper layer.
 `extract(Patch)` computes the diff host-side, in user space; we never mount a guest-written image with the
-host kernel. Host-side git runs with `core.hooksPath=/dev/null`, so the workdir's `.git` is never
-executed on the host. Launch-time path scans are not protection. The diff is untrusted, and
+host kernel. wicket runs no git on the host. The operator's own git would run a workspace's
+`.git/hooks` and obey its `.git/config`, so those stay the host's: read-only in an in-place mount,
+and put back from the host's copy before a workspace fetched from another node is synced in (#366). Launch-time path scans are not protection. The diff is untrusted, and
 stays so up to any push or merge, because code is delayed execution. Its *summary*
 (files touched, test result) crosses gates as typed fields. After an approved file escalation, a later
 `Instance::grant_fd` can inject the opened file via `SECCOMP_IOCTL_NOTIF_ADDFD` without a restart (nono).
