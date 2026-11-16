@@ -64,8 +64,8 @@ port stay the agent's.
 - No secrets: placeholders only. The model credential is a placeholder `CLAUDE_CODE_OAUTH_TOKEN` (or,
   for a Remote Control session, a placeholder login file); the proxies swap in the real value on the hosts
   the secret is bound to.
-- The run's CA (or, on a node, the installation root for the node CA's leaves and the run's CA), in
-  the trust store and `SSL_CERT_FILE`.
+- The installation root, which signs the leaves of the node CA its node terminates TLS with, in the
+  trust store and `SSL_CERT_FILE`. The control host terminates no TLS, so a run has no CA of its own.
 - Claude Code's settings, written by wicket: its MCP config names wicket's gateway as the only
   server, `cleanupPeriodDays` is wicket's, and only the [allowed adapter
   settings](manifest.md#agent) come from the manifest.

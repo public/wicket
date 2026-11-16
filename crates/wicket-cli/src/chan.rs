@@ -153,8 +153,9 @@ pub struct BoxStart {
     pub timeout_secs: u64,
     /// The zone's `escalation.request` (false by default for a program, #255).
     pub escalate: bool,
-    /// The box's CA bundle: the installation root (node-minted leaves) and the run's own CA (hosts the
-    /// control host terminates).
+    /// More of the box's CA bundle, after the installation root (which signs its node CA's leaves).
+    /// Empty: the control host terminates no TLS, so it has no CA of the run's to add (#257 slice 5).
+    /// Still sent, for nodes at 13 that read it.
     pub ca_pem: String,
     /// The workspace, as a tar archive (base64).
     pub workspace_tar: String,
