@@ -1227,6 +1227,13 @@ async fn on_frame(
                     let _ = out.send(Frame::Msg(Msg::Adopted { child, error }));
                 });
             }
+            // The node's health (#377): its latest, per node, for `wicket top`, the console and its
+            // alerts (each run's connection to the node reports it; the latest wins).
+            Msg::Health { health } => {
+                if let Ok(j) = serde_json::to_string(&health) {
+                    let _ = sh.ledger.lock().expect("ledger").set_node_health(&sh.node, wicket_feed::now_ms(), &j);
+                }
+            }
             Msg::Spent { run, spent, first_request_ms } if run == sh.run.0 => {
                 if p.link.spent != spent {
                     p.link.spent = spent;

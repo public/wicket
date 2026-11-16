@@ -78,8 +78,9 @@ pub enum StoreError {
 /// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
 /// Version 8 (expand) adds `placed_nodes.hourly`: what a node from `wicket node create` costs per
-/// hour, for `wicket node list` (#358).
-pub const SCHEMA_VERSION: u32 = 8;
+/// hour, for `wicket node list` (#358). Version 9 (expand) adds the `node_health` table: each
+/// node's latest health report, for `wicket top`, the console and its alerts (#377).
+pub const SCHEMA_VERSION: u32 = 9;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -334,6 +335,7 @@ CREATE TABLE IF NOT EXISTS placed_nodes (
   created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT,
   hourly INTEGER
 );
+CREATE TABLE IF NOT EXISTS node_health (node TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, health TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL

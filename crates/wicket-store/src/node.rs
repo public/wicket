@@ -134,6 +134,23 @@ impl Ledger {
     }
 
     /// Node `node` reports its feed at `epoch`: grants published up to it have reached it.
+    /// Records `node`'s latest health report (#377): JSON, as the node sent it, received at `at_ms`.
+    pub fn set_node_health(&self, node: &str, at_ms: i64, health: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_health (node, at_ms, health) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node) DO UPDATE SET at_ms = excluded.at_ms, health = excluded.health",
+            params![node, at_ms, health],
+        )?;
+        Ok(())
+    }
+
+    /// Every node's latest health report: (node, received at ms, JSON), by node.
+    pub fn node_health(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.conn.prepare("SELECT node, at_ms, health FROM node_health ORDER BY node")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
         Ok(())
@@ -487,5 +504,20 @@ mod tests {
         fresh.audit(&t, None, "op", &serde_json::json!({})).unwrap();
         ctl.append_node_audit("n1", &t, &fresh.audit_records_after(0, 10).unwrap()).unwrap();
         assert_eq!(ctl.verify_node_audit().unwrap()[0].restarts, 1);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use crate::Ledger;
+
+    /// #377: the latest report per node is kept, replacing the one before.
+    #[test]
+    fn a_nodes_latest_health_replaces_the_last() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.set_node_health("n2", 1, "{\"a\":1}").unwrap();
+        l.set_node_health("n1", 2, "{}").unwrap();
+        l.set_node_health("n2", 3, "{\"a\":2}").unwrap();
+        assert_eq!(l.node_health().unwrap(), [("n1".to_string(), 2, "{}".to_string()), ("n2".to_string(), 3, "{\"a\":2}".to_string())]);
     }
 }

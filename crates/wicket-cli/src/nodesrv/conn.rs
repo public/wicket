@@ -163,6 +163,9 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
             let r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
             if let Err(e) = &r {
                 eprintln!("[node] feed frame refused: {} ({e})", e.kind());
+                if e.kind() == "storage" {
+                    node.persists.note(now, format!("feed: {e}"));
+                }
                 let _ = node.audit.lock().expect("audit").audit(
                     &wicket_core::TenantId::single(),
                     None,

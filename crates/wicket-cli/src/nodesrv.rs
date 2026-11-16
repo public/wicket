@@ -203,7 +203,6 @@ struct Link {
     /// Tunnels opened for the boxes this connection owns; they die with it.
     tunnels: Arc<Tunnels>,
     /// The protocol version it talks ([`chan::negotiate`]): a message newer than this isn't sent on it.
-    #[allow(dead_code)]
     proto: u32,
 }
 
@@ -253,6 +252,9 @@ struct Node {
     images: images::Incoming,
     /// What `wicket node top` shows beyond the rest: boxes starting, egress decisions, connections.
     seen: crate::top::NodeSeen,
+    /// Boxes killed for memory, and failures to persist the node's own state (#377), for its health.
+    ooms: Arc<crate::health::Counter>,
+    persists: Arc<crate::health::Counter>,
 }
 
 impl Node {
@@ -338,6 +340,7 @@ impl Node {
         }
         st.boxes.sort_by(|a, b| a.started_ms.cmp(&b.started_ms).then_with(|| a.run.cmp(&b.run)));
         st.egress = self.seen.recent();
+        st.health = Some(self.health());
         st
     }
 
@@ -370,6 +373,37 @@ impl Node {
             c.boxes += 1;
         }
         c
+    }
+
+    /// This node's health (#377): its data directory's disk, memory, feed, and what went wrong.
+    fn health(&self) -> crate::health::NodeHealth {
+        let now = (self.clock)();
+        let (total_mib, available_mib) = crate::health::memory();
+        let (mode, fresh_until) = {
+            let r = self.replica.lock().expect("replica");
+            (serde_json::to_value(r.mode(now)).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(), r.fresh_until())
+        };
+        let (oom_kills, last_oom) = self.ooms.get();
+        let (persist_failures, last_persist_failure) = self.persists.get();
+        crate::health::NodeHealth {
+            at_ms: now,
+            disk: crate::health::disk(&self.paths.root),
+            memory: crate::health::Memory { total_mib, available_mib, committed_mib: self.capacity().used_memory_mib },
+            feed_mode: mode,
+            feed_fresh_until_ms: fresh_until,
+            oom_kills,
+            last_oom,
+            persist_failures,
+            last_persist_failure,
+        }
+    }
+
+    /// Sends this node's health on every connection that takes it (#377).
+    fn report_health(&self) {
+        let h = self.health();
+        for l in self.links.lock().expect("links").values().filter(|l| l.proto >= chan::NODE_HEALTH) {
+            let _ = l.out.send(Frame::Msg(Msg::Health { health: h.clone() }));
+        }
     }
 
     /// The box on this node running as principal `id` (#250), as its control host named it in the
@@ -723,6 +757,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         llms: Mutex::new(HashMap::new()),
         images: Default::default(),
         seen: Default::default(),
+        ooms: Default::default(),
+        persists: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -799,6 +835,10 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 tick5 = tick5.wrapping_add(1);
                 if tick5.is_multiple_of(5) {
                     sample_memory(&n).await;
+                }
+                // Its health, to the control host (#377).
+                if tick5.is_multiple_of(crate::health::REPORT_EVERY.as_secs()) {
+                    n.report_health();
                 }
                 // Secrets past their expiry are dropped (#152); their use already ended.
                 n.secrets.sweep();
@@ -1903,6 +1943,9 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
                 "memory_peak": mem.map(|m| m.peak), "memory_limit": mem.and_then(|m| m.max).or(limit) }),
         );
         n.causes.lock().expect("causes").insert(run.to_string(), c.clone());
+        if info.as_ref().is_some_and(|i| i.oom_killed) || mem.is_some_and(|m| m.oom_kills > 0) {
+            n.ooms.note((n.clock)(), format!("{run}: {c}"));
+        }
     }
     let _ = n.docker.remove(box_name).await;
     t.step("node.teardown.rm");
@@ -2023,7 +2066,12 @@ async fn serve_box(
         // whole reservation (#324): a `serve` that crashes mid-call, or within a second of one,
         // restarts counting every call the provider billed, so its slice still bounds the spend.
         let path = dir.join(SPEND_FILE);
-        l.set_journal(move |s| write_spend(&path, &s));
+        let (persists, clock) = (node.persists.clone(), node.clock.clone());
+        l.set_journal(move |s| {
+            if let Err(e) = write_spend(&path, &s) {
+                persists.note(clock(), format!("spend journal {}: {e}", path.display()));
+            }
+        });
         // And reported when it moves, and every 10 s anyway (a new connection learns it without
         // waiting for the next call); persisted again as calls settle.
         let (n, run, l2) = (node.clone(), bs.run.clone(), l.clone());
@@ -2183,11 +2231,10 @@ fn ca_not_after(pem: &[u8]) -> Option<i64> {
 /// Writes a box's spend file whole or not at all (a temporary file renamed over it): a crash
 /// mid-write must not leave a short file, which a restarted `serve` would read as nothing spent.
 /// Called under the model proxy's journal lock only ([`wicket_proxy::llm::Llm::journal`]).
-fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) {
+fn write_spend(path: &std::path::Path, s: &wicket_proxy::llm::Spent) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    std::fs::write(&tmp, serde_json::to_vec(s).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
 }
 
 /// A box name a control host may choose: a prefix and the run (`<prefix>-run-…`).
@@ -2379,6 +2426,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             llms: Mutex::new(HashMap::new()),
             images: Default::default(),
             seen: Default::default(),
+            ooms: Default::default(),
+            persists: Default::default(),
         })
     }
 

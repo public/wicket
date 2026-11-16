@@ -72,7 +72,7 @@ use wicket_proxy::llm::Slice;
 ///   [`Msg::SecretFetch`] on first use and swapped by the node's own egress proxy, which then
 ///   decides the swapped hosts from the feed. A box with swaps goes only to nodes talking
 ///   [`CREDENTIAL_SWAPS`] or later.
-pub const PROTOCOL: u32 = 10;
+pub const PROTOCOL: u32 = 11;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -85,6 +85,8 @@ pub const IMAGE_PULL: u32 = 8;
 pub const BUDGET_SLICE: u32 = 9;
 /// The first protocol version whose nodes swap a box's credentials themselves (#257).
 pub const CREDENTIAL_SWAPS: u32 = 10;
+/// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
+pub const NODE_HEALTH: u32 = 11;
 /// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its egress
 /// proxy, for hosts the node forwards, and its MCP gateway, for the tools the node relays. Not the
 /// model proxy: that is the node's alone (#257).
@@ -688,6 +690,11 @@ pub enum Msg {
     Audit {
         records: Vec<wicket_store::AuditRecord>,
     },
+    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection that
+    /// speaks [`NODE_HEALTH`].
+    Health {
+        health: crate::health::NodeHealth,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1134,8 +1141,8 @@ mod tests {
     /// talks 9 to a control host at 10, below [`CREDENTIAL_SWAPS`].
     #[test]
     fn a_start_carries_its_swaps_by_name_from_protocol_10() {
-        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS), (10, 10));
-        assert!(negotiate(PROTOCOL, 9).unwrap() < CREDENTIAL_SWAPS);
+        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS, NODE_HEALTH), (11, 10, 11));
+        assert!(negotiate(CREDENTIAL_SWAPS, 9).unwrap() < CREDENTIAL_SWAPS);
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),
