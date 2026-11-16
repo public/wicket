@@ -53,6 +53,10 @@ fn store() {
 fn git() {
     replay("git", wicket_fuzz::git::run);
 }
+#[test]
+fn canon() {
+    replay("canon", wicket_fuzz::canon::run);
+}
 
 /// The egress oracle is only as good as its view of the origins: allowed requests get there.
 #[test]

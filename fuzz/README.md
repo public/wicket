@@ -15,6 +15,7 @@ These [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets fuzz those p
 | `manifest` | manifests through `wicket_agent::load`, zone compilation, Cedar ceilings and subset admission | a manifest that parses compiles or is refused; an admitted child's zone reaches nothing its parent's doesn't |
 | `store` | tree decoding and `Cas::checkout` | a tree that decodes re-encodes to its bytes; nothing is written outside the target, and no tampered object is checked out |
 | `git` | how a git push's requests are decided (`wicket_core::git`) | a push is decided as the push of its repository |
+| `canon` | canonicalize-or-reject: `canonical_host` and `canonical_path` (#361) | a host or path taken is taken again unchanged, and is what a URL parser makes of it (never an IP address; the path decided is the path sent) |
 
 Each target is a one-line binary in `fuzz_targets/` calling `wicket_fuzz::<target>::run`; the
 harnesses live in `src/`, with their oracles documented at the top of each file. The seed corpora in

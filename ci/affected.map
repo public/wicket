@@ -15,7 +15,7 @@
 # harnesses and the loom test, ci/kani.sh, #325), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
 # install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update. And one per fuzz target (#323, ci/fuzz.sh): fuzz-egress,
-# fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git.
+# fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git, fuzz-canon.
 #
 # In a crate, a rule naming only fuzz targets (crates `-`) adds them without narrowing anything: the
 # file still selects what the other rules (or none) say. An unmapped crate file selects every
@@ -159,11 +159,11 @@ ci/policy-diff.sh                  | -   | policy
 # ---- fuzz targets (#323): the harnesses and their inputs ----
 # fuzz/ is its own workspace (not a crate here): a change to it selects targets, never the crates
 # (its Cargo.toml and Cargo.lock select everything, by the rules at the top).
-fuzz/src/lib.rs                    | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
-fuzz/tests/**                      | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
-fuzz/examples/**                   | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+fuzz/src/lib.rs                    | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
+fuzz/tests/**                      | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
+fuzz/examples/**                   | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
 fuzz/.gitignore                    | -   | -
-ci/fuzz.sh                         | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+ci/fuzz.sh                         | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
 fuzz/src/util.rs                   | -   | fuzz-egress fuzz-gateway
 fuzz/src/egress.rs                 | -   | fuzz-egress fuzz-gateway
 fuzz/src/node_chan.rs              | -   | fuzz-chan
@@ -175,6 +175,7 @@ fuzz/*/token.rs                    | -   | fuzz-token
 fuzz/*/manifest.rs                 | -   | fuzz-manifest
 fuzz/*/store.rs                    | -   | fuzz-store
 fuzz/*/git.rs                      | -   | fuzz-git
+fuzz/*/canon.rs                    | -   | fuzz-canon
 fuzz/corpus/egress/**              | -   | fuzz-egress
 fuzz/corpus/gateway/**             | -   | fuzz-gateway
 fuzz/corpus/chan/**                | -   | fuzz-chan
@@ -183,6 +184,7 @@ fuzz/corpus/token/**               | -   | fuzz-token
 fuzz/corpus/manifest/**            | -   | fuzz-manifest
 fuzz/corpus/store/**               | -   | fuzz-store
 fuzz/corpus/git/**                 | -   | fuzz-git
+fuzz/corpus/canon/**               | -   | fuzz-canon
 fuzz/regressions/egress/**         | -   | fuzz-egress
 fuzz/regressions/gateway/**        | -   | fuzz-gateway
 fuzz/regressions/chan/**           | -   | fuzz-chan
@@ -191,10 +193,11 @@ fuzz/regressions/token/**          | -   | fuzz-token
 fuzz/regressions/manifest/**       | -   | fuzz-manifest
 fuzz/regressions/store/**          | -   | fuzz-store
 fuzz/regressions/git/**            | -   | fuzz-git
+fuzz/regressions/canon/**          | -   | fuzz-canon
 
 # ---- fuzz targets: the code each one fuzzes (tags; see the top) ----
 # Every target depends on wicket-core.
-crates/wicket-core/src/**          | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+crates/wicket-core/src/**          | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git fuzz-canon
 # The chan target compiles the CLI's channel modules, which carry proxy, feed and identity types.
 crates/wicket-proxy/src/**         | -   | fuzz-egress fuzz-gateway fuzz-chan
 crates/wicket-cli/src/chan.rs      | -   | fuzz-chan

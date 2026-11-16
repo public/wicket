@@ -20,6 +20,7 @@ fn main() {
     manifest();
     store();
     git();
+    canon();
 }
 
 const OLD: &str = "0000000000000000000000000000000000000000";
@@ -275,4 +276,29 @@ fn git() {
     w("upper", "POST /ACME/App.Git/Git-Receive-Pack");
     w("root", "POST /git-receive-pack");
     w("encoded", "POST /a/%67it-receive-pack");
+}
+
+/// Hosts and paths from the conformance pack (#361) and canon.rs's own tests.
+fn canon() {
+    let w = |name: &str, s: &str| write("canon", name, s.as_bytes());
+    for (name, s) in [
+        ("host", "api.github.com"),
+        ("host-upper-dot", "API.GitHub.com."),
+        ("ip-decimal", "2130706433"),
+        ("ip-octal", "0177.0.0.1"),
+        ("ip-hex", "0x7f.1"),
+        ("ip-mapped", "[::ffff:127.0.0.1]"),
+        ("host-escape", "exa%6dple.com"),
+        ("host-idn", "b\u{fc}cher.example"),
+        ("path", "/repos/acme/app/issues?state=open"),
+        ("path-dots", "/a/%2e%2e/b"),
+        ("path-encoded-slash", "/a%2Fb"),
+        ("path-matrix", "/a;x/b"),
+        ("path-npm", "/@scope%2fname"),
+        ("path-escape-lower", "/a%7bb"),
+        ("path-unreserved-escape", "/%41"),
+        ("path-trailing", "/a/b/"),
+    ] {
+        w(name, s);
+    }
 }
