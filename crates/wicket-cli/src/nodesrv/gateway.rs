@@ -128,9 +128,12 @@ async fn gateway_rpc(
             None => (format!("unknown tool {name}"), true),
         },
     };
-    gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+    gw_reply(
+        200,
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
         "content": [{ "type": "text", "text": answer.0 }], "isError": answer.1,
-    } }))
+    } }),
+    )
 }
 
 /// One of the control host's tools, asked of it; while it can't be reached, a clear refusal.

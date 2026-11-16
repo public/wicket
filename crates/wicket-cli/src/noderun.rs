@@ -17,9 +17,9 @@
 //!   each reconnect the node is caught up (deltas or a snapshot, and a statement signed for the
 //!   occasion), stdout and stderr resume where they left off, unsent stdin is resent, and the node
 //!   ships the audit records it made meanwhile.
-//! - **Tunnels.** The node opens tunnels to this run's MCP gateway socket, and to its egress proxy
-//!   for hosts the node must not terminate; they are connected here. The model proxy runs only on
-//!   the node (#257).
+//! - **Calls.** The node asks this run's gateway for the tools it doesn't answer itself
+//!   (`Msg::Call`, #257 slice 4b), answered by the run's `Gateway` in this process. No socket of this
+//!   run's is a tunnel target: the model, egress and gateway proxies are the node's (#257).
 //! - **Asks.** A request the node can't allow is raised here as an ordinary pending request.
 //! - **Identity.** Every connection starts with the mutual authentication in `nodeauth.rs`; at half
 //!   its life the node's certificate is renewed over the channel, and a node revoked meanwhile (from

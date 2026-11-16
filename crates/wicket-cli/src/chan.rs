@@ -19,9 +19,9 @@
 //!
 //! **Streams.** A box's stdio streams are numbered by the control host when it starts the box
 //! ([`BoxStart::streams`]); their data frames carry the byte offset of their first byte, so after a
-//! reconnect the receiver can say where to resume and duplicates are dropped. Tunnels (a forwarded
-//! CONNECT, or a connection to the run's LLM or MCP gateway socket on the control host) are numbered
-//! by the node with the top bit set, and die with the connection.
+//! reconnect the receiver can say where to resume and duplicates are dropped. Tunnels (a link's
+//! connection to a box on the other side) are numbered by the node with the top bit set, and die
+//! with the connection.
 //!
 //! [`read_frame`] never panics on any input: a bad frame is an error and the connection is dropped.
 //!
@@ -160,7 +160,17 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    let floors = [EDGE_DECISIONS, IMAGE_PINS, IMAGE_DELIVERY, IMAGE_PULL, BUDGET_SLICE, CREDENTIAL_SWAPS, NO_FORWARDED_EGRESS, NODE_HEALTH, ONE_GATEWAY];
+    let floors = [
+        EDGE_DECISIONS,
+        IMAGE_PINS,
+        IMAGE_DELIVERY,
+        IMAGE_PULL,
+        BUDGET_SLICE,
+        CREDENTIAL_SWAPS,
+        NO_FORWARDED_EGRESS,
+        NODE_HEALTH,
+        ONE_GATEWAY,
+    ];
     let mut i = 0;
     while i < floors.len() {
         assert!(floors[i] <= PROTOCOL);

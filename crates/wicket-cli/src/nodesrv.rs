@@ -207,6 +207,10 @@ struct Link {
     proto: u32,
 }
 
+/// One of the control host's tools asked for a box: the connection it went out on, and where its
+/// answer (the tool's text, and whether it is an error) goes.
+type PendingCall = (u64, oneshot::Sender<(String, bool)>);
+
 struct Node {
     name: String,
     paths: NodePaths,
@@ -226,7 +230,7 @@ struct Node {
     asks: Mutex<HashMap<u64, oneshot::Sender<Msg>>>,
     /// The control host's tools asked for a box (#257 slice 4b), waiting on their [`Msg::Called`]:
     /// by call id, with the connection each went out on (dropped with it).
-    calls: Mutex<HashMap<u64, (u64, oneshot::Sender<(String, bool)>)>>,
+    calls: Mutex<HashMap<u64, PendingCall>>,
     opens: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
     next: AtomicU64,
     /// The connection audit records are shipped on (the last to send `AuditFrom`), and how far.
@@ -2660,12 +2664,61 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         }
     }
 
+    /// #257 slice 4b: one of the control host's tools is a typed call on the run's connection,
+    /// answered by id; one whose connection drops fails at once (not after its wait), and with no
+    /// connection at all it isn't sent.
+    #[tokio::test]
+    async fn a_control_call_is_answered_by_id_and_fails_with_its_connection() {
+        const RUN: &str = "run_cccccccccccccccccccccccccc";
+        let inst = Install::new("nodesrv-calls");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let args = serde_json::json!({ "timeout_seconds": 600 });
+        assert_eq!(
+            node.call_control(RUN, chan::ControlTool::AwaitMessage, &args).await.unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        c.write_all(&Frame::Msg(Msg::Resume { run: RUN.into(), stdout_from: 0, stderr_from: 0 }).encode()).await.unwrap();
+        for _ in 0..100 {
+            if node.owner(RUN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (n, a) = (node.clone(), args.clone());
+        let call = tokio::spawn(async move { n.call_control(RUN, chan::ControlTool::Links, &a).await });
+        let id = loop {
+            if let Frame::Msg(Msg::Call { id, run, tool, .. }) = next_msg(&mut c).await {
+                assert_eq!((run.as_str(), tool), (RUN, chan::ControlTool::Links));
+                break id;
+            }
+        };
+        answer_call(&mut c, id, "no links").await;
+        assert_eq!(call.await.unwrap().unwrap(), ("no links".to_string(), false));
+        // A wait cut off by its connection dropping: an error at once, not ten minutes later.
+        let (n, a) = (node.clone(), args.clone());
+        let waiting = tokio::spawn(async move { n.call_control(RUN, chan::ControlTool::AwaitMessage, &a).await });
+        loop {
+            if let Frame::Msg(Msg::Call { .. }) = next_msg(&mut c).await {
+                break;
+            }
+        }
+        drop(c);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await.expect("answered at once").unwrap();
+        assert!(r.is_err(), "{r:?}");
+        assert!(node.calls.lock().unwrap().is_empty());
+    }
+
     /// #257 slice 4b: a box starts only on a node talking protocol 13, where its gateway's control
     /// tools are typed calls; an older one is refused, saying why and what to do.
     #[test]
     fn a_box_is_refused_by_a_node_before_protocol_13() {
         let why = crate::noderun::refuse_older_node("n1", 12).unwrap_err().to_string();
-        assert!(why.contains("node n1 talks protocol 12") && why.contains("from protocol 13") && why.contains("wicket node install n1"), "{why}");
+        assert!(
+            why.contains("node n1 talks protocol 12") && why.contains("from protocol 13") && why.contains("wicket node install n1"),
+            "{why}"
+        );
         assert!(crate::noderun::refuse_older_node("n1", chan::ONE_GATEWAY).is_ok());
     }
 
