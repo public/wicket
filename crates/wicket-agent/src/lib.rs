@@ -64,6 +64,26 @@ pub const BOX_NOTICE: &str = "You are running inside a wicket box: a gVisor cont
 /// that wicket starts itself.
 const LIFETIME_NOTICE: &str = "- Work in /workspace. Your session stays open after each reply: follow-ups from your operator and messages from other agents arrive as new turns, and wicket never ends or pauses it for you. When all your work is done, call the wicket MCP tool finish: your session then closes and the run ends. To sleep until a message arrives instead, call hibernate.";
 
+/// wicket's guide for an agent in a box: the `wicket-box` skill of wicket's Claude Code plugin, as
+/// the repository ships it (frontmatter included). The Claude adapter installs it in the box as one of
+/// Claude Code's skills; a harness without skills gets its body as a file ([`box_guide`]).
+pub const BOX_SKILL: &str = include_str!("../../../plugins/wicket/skills/wicket-box/SKILL.md");
+
+/// [`BOX_SKILL`] without its frontmatter: plain Markdown, for any harness (an AGENTS.md-style notice).
+pub fn box_guide() -> &'static str {
+    BOX_SKILL
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---\n").map(|end| &rest[end + "\n---\n".len()..]))
+        .map(str::trim_start)
+        .unwrap_or(BOX_SKILL)
+}
+
+/// Where a harness that has no skills of its own finds [`box_guide`] in the box, under the state dir.
+pub const BOX_GUIDE_FILE: &str = "wicket/AGENTS.md";
+
+/// What such a harness is told about it, after the box notice: where it is, and when to read it.
+const BOX_GUIDE_NOTICE: &str = "- wicket's guide to working in this box (asking for reach, what 403 and 503 answers mean, memory warnings, finish and hibernate, messages and delegation, habits that keep work) is /wicket/state/wicket/AGENTS.md. Read it before you ask for access, wait on a request, or end your session.";
+
 /// wicket's MCP gateway as the agent's only MCP server; repo- or account-supplied servers are ignored.
 const WICKET_MCP: &str = r#"{"mcpServers":{"wicket":{"type":"http","url":"http://wicket.internal:8081/mcp"}}}"#;
 
@@ -562,7 +582,10 @@ pub fn acp_plan(m: &Manifest, run: &RunId) -> Option<LaunchPlan> {
     });
     let mut argv = vec!["wicket-entry".to_string()];
     argv.extend(spec.command.iter().cloned());
-    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt: format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}"), meta, resume: None };
+    // Claude Code through its adapter has wicket's guide as a skill; any other agent is told where its file is.
+    let system_prompt =
+        if claude { format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}") } else { format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}\n{BOX_GUIDE_NOTICE}") };
+    let cfg = acp::AcpConfig { cwd: WORKSPACE.into(), system_prompt, meta, resume: None };
     Some(LaunchPlan { env, argv, stdin_task: None, acp: Some(cfg) })
 }
 

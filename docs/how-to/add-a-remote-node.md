@@ -4,7 +4,7 @@ Run boxes on another machine. The node runs Docker and gVisor and its own `wicke
 runs the boxes and decides their egress from the signed policy feed, so they keep working while the
 control host is unreachable ([concepts](../explanation/concepts.md#authority-biscuit-tokens-and-the-feed)).
 [Nodes](../reference/nodes.md) has everything the node does. To have wicket create the machine on
-Vultr as well, see [place nodes on Vultr](place-nodes-on-vultr.md).
+Vultr as well, see [create nodes on Vultr](create-nodes-on-vultr.md).
 
 You need a fresh Ubuntu 24.04 machine you can ssh to as root with a key on the control host, and its
 ssh host key's fingerprint from somewhere other than the network (the provider's console, cloud-init

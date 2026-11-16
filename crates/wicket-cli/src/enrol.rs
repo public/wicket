@@ -605,11 +605,16 @@ pub fn revoke(ledger: &mut Ledger, nodes_dir: &Path, name: &str) -> Result<Vec<S
     Ok(serials)
 }
 
+/// `wicket node list`: every enrolled node, with its lease, provider and cost if it has a lease, then
+/// the leased nodes not enrolled.
 pub fn list() -> Result<()> {
     let l = Ledger::open(&crate::ledger_path())?;
     let nodes = l.nodes()?;
-    if nodes.is_empty() {
-        println!("no enrolled nodes (wicket node token, then wicket node enrol)");
+    let now = wicket_store::now();
+    let names: Vec<String> = nodes.iter().filter(|n| n.status != "revoked").map(|n| n.name.clone()).collect();
+    let unenrolled = crate::nodecreate::leased_not_enrolled(&l, &names, now)?;
+    if nodes.is_empty() && unenrolled.is_empty() {
+        println!("no nodes (lease one with wicket node create, or enrol your own: wicket node token, then wicket node enrol)");
     }
     for n in nodes {
         let ca = l.node_cas(&n.name)?.into_iter().find(|c| c.status == "active");
@@ -622,7 +627,6 @@ pub fn list() -> Result<()> {
             }
             None => "no CA".into(),
         };
-        let now = wicket_store::now();
         let id = match l.node_certs(&n.name)?.into_iter().find(|c| c.status == "active") {
             Some(c) if c.not_after > now => format!("identity until {}", fmt_time(c.not_after)),
             Some(c) => format!("identity EXPIRED {} (wicket node renew-ca {})", fmt_time(c.not_after), n.name),
@@ -630,12 +634,20 @@ pub fn list() -> Result<()> {
             None => "no identity certificate".into(),
         };
         println!("{}  {}  {}  host key {}  hosts {}  {}  {}", n.name, n.status, n.target, n.host_key_fp, n.hosts.join(","), ca, id);
+        if n.status != "revoked" {
+            if let Some(lease) = crate::nodecreate::lease_summary(&l, &n.name, now)? {
+                println!("  {lease}");
+            }
+        }
         // What it holds for this host's runs (#152, #153): authority deadlines, secrets fetched (by
         // name), budget slices.
         let now_ms = wicket_feed::now_ms();
         for (run, a, h) in crate::noderun::node_holdings(&l, &n.name)? {
             println!("{}", crate::noderun::holdings_line(&run, a.as_ref(), &h, now_ms));
         }
+    }
+    for line in unenrolled {
+        println!("{line}");
     }
     Ok(())
 }

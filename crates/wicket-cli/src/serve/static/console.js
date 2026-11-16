@@ -69,6 +69,22 @@ function describe(a) {
   if (a.action === "push_subscribe") return (a.replaces ? "Re-register " : "Send notifications to ") + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")" +
     (a.details ? " \u00b7 showing the agent and what it asks for" : " \u00b7 showing only how many requests wait");
   if (a.action === "push_details") return "Show the agent and what it asks for in notifications on " + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")";
+  if (a.action === "set_secret") return (a.replaces ? "Replace the value of secret " : "Store new secret ") + s(a.name) + " with the value you typed (not shown)" +
+    " \u00b7 " + ((a.hosts || []).length ? "sent only to " + a.hosts.map(s).join(", ") : "bound to no host: sent nowhere") +
+    ((a.zones || []).length ? " \u00b7 used by zone " + a.zones.map(s).join(", ") : "");
+  if (a.action === "secret_hosts") return "Send secret " + s(a.name) + " only to " + (a.hosts || []).map(s).join(", ") +
+    " (was: " + ((a.previous_hosts || []).length ? a.previous_hosts.map(s).join(", ") : "no host") + ")";
+  if (a.action === "delete_secret") return "Delete " + (a.kind === "reference" ? "the reference " : "secret ") + s(a.name) +
+    ((a.zones || []).length ? " \u00b7 zones using it: " + a.zones.map(s).join(", ") : " \u00b7 no zone uses it") +
+    ((a.runs || []).length ? " \u00b7 running runs using it: " + a.runs.map(s).join(", ") : "");
+  if (a.action === "capacity_grant" || a.action === "capacity_renew") {
+    const t = a.terms || {};
+    const what = (t.nodes || 0) + " node(s) at once of " + (t.plans || []).map(s).join(", ") + " in " + (t.regions || []).map(s).join(", ") +
+      ", at most " + s(t.hourly_usd) + "/h and " + s(t.daily_usd) + " a day";
+    const hours = Math.round((a.ttl_secs || 0) / 360) / 10;
+    return (a.action === "capacity_grant" ? "Grant " + s(a.principal) + " " + what + ", for " + hours + " h"
+      : "Renew capacity grant " + s(a.grant) + " (" + s(a.principal) + ": " + what + ") for " + hours + " h from now");
+  }
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -82,9 +98,10 @@ let layoutAt = 0;
 const SETTLE_MS = 800;
 const settled = () => performance.now() - layoutAt >= SETTLE_MS;
 
-// `after`, if given, runs once the confirmation closes (signed, refused or cancelled).
+// `after`, if given, runs once the confirmation closes (signed, refused or cancelled). `extra`, if
+// given, adds fields to finish's body only (a secret's value: never sent with begin, never signed).
 let afterConfirm = null;
-async function signed(body, after) {
+async function signed(body, after, extra) {
   if (ceremony) return;
   ceremony = true;
   afterConfirm = after || null;
@@ -94,15 +111,15 @@ async function signed(body, after) {
   const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
   document.getElementById("confirm-state").textContent = "";
-  const deny = begin.action.decision === "deny" || begin.action.action === "revoke";
-  go.textContent = deny ? "Sign: " + (begin.action.action === "revoke" ? "revoke" : "deny") : "Sign with passkey";
+  const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
+  go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
   go.className = deny ? "deny" : "approve";
   // Not tappable at once: a second tap aimed at the card mustn't land on it.
   go.disabled = true; setTimeout(() => { go.disabled = false; }, SETTLE_MS);
   go.onclick = async () => {
     go.disabled = true;
     document.getElementById("confirm-state").textContent = "Waiting for your passkey\u2026";
-    try { const j = await post("/api/action/finish", await assertWith(begin.publicKey)); toast(j.ok); }
+    try { const j = await post("/api/action/finish", { ...(await assertWith(begin.publicKey)), ...(extra ? extra() : {}) }); toast(j.ok); }
     catch (e) { toast(e.message); }
     closeConfirm();
   };
@@ -239,15 +256,67 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
-// A node from `wicket place create` (#294): past its lease it is released by the reconciler, unless
+// A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
   const d = el("div", "row");
   d.append(el("span", "mono", strip(p.name + " " + p.id)));
   if (!p.past_lease) d.append(el("span", "", "lease until " + when(p.lease_until)));
-  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket place release " + strip(p.id) + ")"));
+  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket node release " + strip(p.id) + ")"));
   else d.append(el("span", "pend", "past its lease (" + when(p.lease_until) + "): released at the reconciler's next pass"));
   return d;
+}
+
+// Standing capacity grants (#256): a principal's `wicket node create` within one is approved at once
+// and audited against it; beyond every one, it waits here as a request. Issuing and renewing a grant
+// widen what may be spent, so each is signed with the passkey; revoking one only narrows, so it needs
+// only the session.
+function capacityRow(g) {
+  const t = g.terms || {}, u = g.used || {}, left = g.left || {};
+  const d = el("div", "row cap");
+  const head = el("div");
+  head.append(el("span", "mono", strip(g.id) + " "), el("span", "", strip(g.principal)));
+  const what = el("div", "meta", (t.plans || []).map(strip).join(", ") + " in " + (t.regions || []).map(strip).join(", ") +
+    " · " + t.nodes + " node(s) at once, " + strip(t.hourly_usd) + "/h, " + strip(t.daily_usd) + " a day");
+  const use = el("div", "meta", "used " + u.nodes + " node(s), " + strip(u.hourly_usd) + "/h, " + strip(u.daily_usd) + " today · left " +
+    left.nodes + " node(s), " + strip(left.hourly_usd) + "/h, " + strip(left.daily_usd) + " · until " + when(g.expires_at) + " · by " + strip(g.decided_by));
+  const b = el("div", "buttons");
+  const renew = el("button", "approve", "Renew");
+  renew.onclick = () => signed({ action: "capacity_renew", id: g.id, ttl_secs: capacityTtl() });
+  const revoke = el("button", "deny", "Revoke");
+  revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toast(e.message); } refresh(); };
+  b.append(renew, revoke);
+  d.append(head, what, use, b);
+  return d;
+}
+// The form's inputs, by name; built once, so what the operator types survives the poll.
+const capInputs = {};
+// The lifetime the form asks for (hours, at most 24): also what Renew renews for.
+function capacityTtl() {
+  const h = Number((capInputs.hours && capInputs.hours.value) || 8);
+  return Math.round(Math.min(24, Math.max(0.1, h)) * 3600);
+}
+function renderCapacityForm() {
+  const box = document.getElementById("capacity-form");
+  if (!box || box.dataset.built) return;
+  box.dataset.built = "1";
+  const field = (name, label, placeholder, type) => {
+    const l = el("label", "field"); const i = el("input"); i.placeholder = placeholder; if (type) i.type = type;
+    capInputs[name] = i; l.append(el("span", "meta", label), i); return l;
+  };
+  const go = el("button", "approve", "Grant (sign with passkey)");
+  go.onclick = () => {
+    const v = k => capInputs[k].value;
+    signed({ action: "capacity_grant", principal: v("principal"), plans: v("plans"), regions: v("regions"),
+      max_hourly_usd: v("hourly"), max_daily_usd: v("daily"), nodes: Number(v("nodes") || 0), ttl_secs: capacityTtl() });
+  };
+  const b = el("div", "buttons"); b.append(go);
+  box.append(el("div", "note", "Issue a capacity grant: what a principal may lease with `wicket node create` without asking each time."),
+    field("principal", "To", "unix/alex, passkey/laptop or spiffe://…"),
+    field("plans", "Plans", "vc2-1c-2gb, vc2-2c-4gb"), field("regions", "Regions", "lhr"),
+    field("hourly", "Most per hour, all its nodes ($)", "0.05"), field("daily", "Most a day ($)", "1.00"),
+    field("nodes", "Nodes at once", "2", "number"), field("hours", "Hours (at most 24)", "8", "number"), b);
+  capInputs.hours.value = "8";
 }
 
 // A running agent can have its identity revoked, signed. An ACP agent's session opens on its own
@@ -707,6 +776,147 @@ async function openManifest(root, name) {
   body.replaceChildren(...out);
 }
 
+// ---- secrets ----
+// The vault by name: the server sends no value, nor anything derived from one. Storing or replacing a
+// value, changing a secret's hosts and deleting it are each signed with the passkey. A value is typed
+// into a password field, which is cleared as soon as it is submitted; it goes to the server only in the
+// signed action's finish, over HTTPS, while begin (and so the passkey) signs its salted sha256.
+// References (a file on the host, like a harness's login) are listed and can be rebound, but are made
+// on the host.
+const hexOf = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, "0")).join("");
+async function saltedDigest(value) {
+  const salt = new Uint8Array(16); crypto.getRandomValues(salt);
+  const v = new TextEncoder().encode(value);
+  const buf = new Uint8Array(salt.length + v.length); buf.set(salt); buf.set(v, salt.length);
+  const d = await crypto.subtle.digest("SHA-256", buf);
+  buf.fill(0); v.fill(0);
+  return { value_salt: hexOf(salt), value_sha256: hexOf(d) };
+}
+const utc = t => new Date(t * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+function secretUse(u) {
+  const where = "zone " + u.zone + " (" + u.root + "/" + u.manifest + "): ";
+  return strip(u.use === "llm" ? where + "model credential" + (u.provider ? " (" + u.provider + ")" : "")
+    : where + "inject \u2192 " + u.host + " \u00b7 header " + u.header + " \u00b7 format " + u.format + (u.optional ? " \u00b7 optional" : ""));
+}
+let secretsKey = "";
+function renderSecrets(s) {
+  const box = document.getElementById("secrets");
+  if (!box) return;
+  const v = s.secrets || { secrets: [], missing: [] };
+  // Rebuilt only when it changes, so a button doesn't move under a tap.
+  const key = JSON.stringify(v);
+  if (key === secretsKey) return;
+  secretsKey = key;
+  box.replaceChildren();
+  for (const x of v.secrets || []) {
+    const d = el("div", "secret");
+    const head = el("div", "row");
+    head.append(el("span", "mono", strip(x.name)), el("span", "risk " + (x.kind === "reference" ? "r2" : "r0"), x.kind === "reference" ? "reference" : "value"));
+    d.append(head);
+    d.append(el("div", "meta", (x.hosts || []).length ? "sent only to " + x.hosts.map(strip).join(", ") : "bound to no host: sent nowhere"));
+    if (x.reference) d.append(el("div", "meta", "refers to " + strip(x.reference.file) + (x.reference.pointer ? "#" + strip(x.reference.pointer) : "") + ", read at each use"));
+    d.append(el("div", "meta", x.set_at ? "last set " + utc(x.set_at) : "last set: unknown"));
+    for (const u of x.used_by || []) d.append(el("div", "meta", secretUse(u)));
+    if (!(x.used_by || []).length) d.append(el("div", "meta", "no listed manifest uses it"));
+    if ((x.runs || []).length) d.append(el("div", "meta", "running now: " + x.runs.map(r => strip(r.run)).join(", ")));
+    const b = el("div", "buttons");
+    if (x.kind !== "reference") { const set = el("button", "", "Replace value\u2026"); set.onclick = () => openSecret("set", x); b.append(set); }
+    const h = el("button", "", "Hosts\u2026"); h.onclick = () => openSecret("hosts", x);
+    const rm = el("button", "deny", "Delete\u2026"); rm.onclick = () => openSecret("delete", x);
+    b.append(h, rm); d.append(b); box.append(d);
+  }
+  for (const m of v.missing || []) {
+    const d = el("div", "secret");
+    const head = el("div", "row");
+    head.append(el("span", "mono", strip(m.name)), el("span", "risk r3", "not set"));
+    d.append(head);
+    for (const u of m.used_by || []) d.append(el("div", "meta", secretUse(u)));
+    const b = el("div", "buttons"); const set = el("button", "approve", "Set\u2026");
+    set.onclick = () => openSecret("set", { name: m.name, hosts: (m.used_by || []).filter(u => u.host).map(u => u.host), missing: true });
+    b.append(set); d.append(b); box.append(d);
+  }
+  if (!(v.secrets || []).length && !(v.missing || []).length) box.append(el("div", "empty", "No secrets in the vault."));
+  const b = el("div", "buttons"); const add = el("button", "", "New secret\u2026"); add.onclick = () => openSecret("set", null);
+  b.append(add); box.append(b);
+  box.append(el("div", "note", "Values are never shown, here or anywhere. " + strip(v.link_cli_only ||
+    "References (a file on the host, like a harness login) are made on the host: wicket secret link.")));
+}
+let secretMode = null;
+function secretInput(id, label, value, password) {
+  const l = el("label", "", label); l.htmlFor = id;
+  const i = el("input", "text"); i.id = id; i.type = password ? "password" : "text"; i.value = value || "";
+  i.autocomplete = "off"; i.spellcheck = false;
+  if (i.setAttribute) { i.setAttribute("autocomplete", "off"); i.setAttribute("autocapitalize", "none"); i.setAttribute("autocorrect", "off"); }
+  return [l, i];
+}
+function openSecret(mode, x) {
+  const f = document.getElementById("secret-edit"), body = document.getElementById("secret-edit-body"), go = document.getElementById("secret-edit-go");
+  const title = document.getElementById("secret-edit-title");
+  closeSecret();
+  secretMode = { mode, name: x ? x.name : "", x, inputs: {} };
+  const inputs = secretMode.inputs;
+  const parts = [];
+  const hosts = x && x.hosts ? x.hosts.join(", ") : "";
+  if (mode === "set") {
+    const replacing = x && !x.missing;
+    title.textContent = replacing ? "Replace the value of " + strip(x.name) : "Store a secret";
+    const [nl, ni] = secretInput("secret-name", "Name (letters, digits, - and _)", x ? x.name : "");
+    if (x) ni.readOnly = true;
+    inputs.name = ni;
+    const [vl, vi] = secretInput("secret-value", "Value (not shown, and never shown again)", "", true);
+    const [hl, hi] = secretInput("secret-hosts", "Hosts it may be sent to (comma-separated; *.example.com for every host under it)", hosts);
+    hi.placeholder = replacing ? "empty: keep its hosts" : "api.example.com";
+    inputs.value = vi; inputs.hosts = hi;
+    parts.push(nl, ni, vl, vi, hl, hi, el("div", "note", "The value goes to the server only when you sign, over HTTPS; your passkey signs its salted hash, never the value. " +
+      "A secret is sent only to the hosts it is bound to; a new one with none is sent nowhere. Running boxes use a new value from their next request."));
+    go.textContent = replacing ? "Sign and replace" : "Sign and store"; go.className = "approve";
+  } else if (mode === "hosts") {
+    title.textContent = "Hosts for " + strip(x.name);
+    const [hl, hi] = secretInput("secret-hosts", "Hosts it may be sent to (comma-separated; *.example.com for every host under it)", hosts);
+    inputs.hosts = hi;
+    parts.push(hl, hi, el("div", "note", "A secret is sent only to these hosts, whatever a manifest asks (as wicket secret hosts). This replaces its list."));
+    go.textContent = "Sign: set hosts"; go.className = "approve";
+  } else {
+    title.textContent = "Delete " + (x.kind === "reference" ? "the reference " : "secret ") + strip(x.name) + "?";
+    const zones = x.zones || [], runs = (x.runs || []).map(r => r.run);
+    parts.push(el("div", "warn", zones.length ? "Used by zone " + zones.map(strip).join(", ") + ": their boxes are refused it from their next request." : "No listed manifest uses it."));
+    if (runs.length) parts.push(el("div", "warn", "Running now: " + runs.map(strip).join(", ") + "."));
+    if (x.kind === "reference") parts.push(el("div", "note", "Only the reference is removed; the file it names stays on the host."));
+    go.textContent = "Delete\u2026 (sign next)"; go.className = "deny";
+  }
+  body.replaceChildren(...parts);
+  f.hidden = false;
+  if (f.scrollIntoView) f.scrollIntoView({ block: "nearest" });
+  const first = parts.find(p => p.tagName === "input" && !p.readOnly); if (first) first.focus();
+}
+function closeSecret() {
+  if (secretMode && secretMode.inputs.value) secretMode.inputs.value.value = "";
+  const f = document.getElementById("secret-edit"); if (f) f.hidden = true;
+  const body = document.getElementById("secret-edit-body"); if (body) body.replaceChildren();
+  secretMode = null;
+}
+async function submitSecret(ev) {
+  ev.preventDefault();
+  const m = secretMode;
+  if (!m) return;
+  const hosts = (m.inputs.hosts ? m.inputs.hosts.value : "").split(",").map(h => h.trim()).filter(Boolean);
+  if (m.mode === "set") {
+    const vi = m.inputs.value;
+    let value = vi.value;
+    vi.value = ""; // no echo after submit
+    const name = m.inputs.name.value.trim();
+    closeSecret();
+    if (!name || !value.trim()) { value = ""; toast("A name and a value are needed."); return; }
+    let d;
+    try { d = await saltedDigest(value); } catch (e) { value = ""; toast("This browser can't hash the value here (the console needs HTTPS)."); return; }
+    signed({ action: "set_secret", name, hosts, ...d }, () => { value = ""; }, () => ({ value }));
+    return;
+  }
+  closeSecret();
+  if (m.mode === "hosts") signed({ action: "secret_hosts", name: m.name, hosts });
+  else signed({ action: "delete_secret", name: m.name });
+}
+
 async function refresh() {
   if (ceremony) return;
   try {
@@ -718,8 +928,11 @@ async function refresh() {
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
+    renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
+    renderCapacityForm();
     renderStart(s);
     renderManifests(s);
+    renderSecrets(s);
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");
     renderRows("audit", s.audit.slice().reverse(), line, "No activity yet.");
     renderOperator(s);
@@ -730,6 +943,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("runform").addEventListener("submit", submitRunForm);
   document.getElementById("runform-cancel").addEventListener("click", closeRunForm);
   document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
+  document.getElementById("secret-edit").addEventListener("submit", submitSecret);
+  document.getElementById("secret-edit-cancel").addEventListener("click", closeSecret);
   document.getElementById("mfedit-close").addEventListener("click", () => { document.getElementById("mfedit").hidden = true; });
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
   if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => {

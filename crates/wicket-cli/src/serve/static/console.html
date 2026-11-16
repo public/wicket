@@ -35,6 +35,9 @@
   </form>
   <h2>Nodes</h2>
   <div class="card" id="placed"></div>
+  <!-- Standing capacity grants (#256): issuing and renewing one is passkey-signed; revoking isn't. -->
+  <h2>Capacity</h2>
+  <div class="card"><div id="capacity"></div><div id="capacity-form"></div></div>
   <h2>Manifests</h2>
   <div class="card" id="manifests"></div>
   <!-- A manifest, viewed and edited (#172): every save is passkey-signed. -->
@@ -42,6 +45,15 @@
     <div class="buttons"><span id="mfedit-title" class="mono"></span><button type="button" id="mfedit-close">Close</button></div>
     <div id="mfedit-body"></div>
   </div>
+  <h2>Secrets</h2>
+  <div class="card" id="secrets"></div>
+  <!-- Store, rebind or delete a secret: every change is passkey-signed. Outside the list, so the refresh
+       doesn't wipe what is being typed; the value field is cleared as soon as it is submitted. -->
+  <form class="card" id="secret-edit" autocomplete="off" hidden>
+    <div id="secret-edit-title"></div>
+    <div id="secret-edit-body"></div>
+    <div class="buttons"><button type="submit" id="secret-edit-go"></button><button type="button" id="secret-edit-cancel">Cancel</button></div>
+  </form>
   <h2>Start a run</h2>
   <div class="card" id="start"></div>
   <h2>Recent decisions</h2>

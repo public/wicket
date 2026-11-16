@@ -251,7 +251,7 @@ Measured numbers for the network path, and how they were measured, are in
 
 These are covered by tests against fakes and mocks, but haven't run end to end against the real thing:
 
-- **Vultr provisioning:** the live Vultr API (`wicket place create`), the enrol and `node install` step
+- **Vultr provisioning:** the live Vultr API (`wicket node create`), the enrol and `node install` step
   after it, a child actually running on a leased node, and the `wicket reconcile --every` loop
   ([#89](https://github.com/public/wicket/pull/89), [#98](https://github.com/public/wicket/pull/98)).
   Enrolment and `node serve` themselves have run against a real Vultr node
