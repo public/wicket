@@ -26,7 +26,7 @@ pub struct ImagesPolicy {
     pub require_digests: bool,
     /// Registries a node may pull a pinned image from, host-side (#191). None: images reach nodes
     /// from the control host only.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub registries: Vec<Registry>,
 }
 
@@ -38,9 +38,9 @@ pub struct Registry {
     /// A vault secret (`wicket secret set NAME --host <host>`): `user:password`, or a bearer token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub auth_hosts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub blob_hosts: Vec<String>,
 }
 
@@ -145,5 +145,7 @@ mod tests {
         assert_eq!(p.registry_for("docker.io/library/ubuntu:24.04").unwrap().0.host, "registry-1.docker.io");
         assert!(p.registry_for("other.example.com/x:1").is_none());
         assert!(wicket_core::yaml::from_str::<ImagesPolicy>("registries: [{host: a, typo: 1}]").is_err());
+        // An empty key, as serde_yaml read it: no registries, not an error (#326).
+        assert!(wicket_core::yaml::from_str::<ImagesPolicy>("registries:\n").unwrap().registries.is_empty());
     }
 }

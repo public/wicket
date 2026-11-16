@@ -315,7 +315,7 @@ impl Drop for Remove {
 #[derive(Default, Serialize, Deserialize)]
 struct FollowState {
     /// Builds whose update failed here (its gate, or a refusal): not tried again.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     failed: Vec<String>,
     /// Why the last run didn't update, if it didn't: audited when it changes, not every run.
     #[serde(default)]

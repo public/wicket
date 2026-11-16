@@ -98,7 +98,7 @@ pub struct PlacementConfig {
     pub owner: Option<String>,
     pub backend: Backend,
     /// For `backend: static`: the operator's own machines, each an enrolled node of the same name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub static_hosts: Vec<StaticHost>,
     #[serde(default)]
     pub vultr: Option<VultrSettings>,
@@ -106,7 +106,7 @@ pub struct PlacementConfig {
     pub max_hourly_usd: String,
     pub max_total_usd: String,
     /// Hosts the CA of a node enrolled for a lease may issue for (`wicket node enrol --hosts`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub node_hosts: Vec<String>,
     /// Keep a node whose lease ended warm until shortly before its next paid hour (a later ask may
     /// claim it in-process); default: destroy at once.
