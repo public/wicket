@@ -287,6 +287,10 @@ pub struct World {
     /// Runs whose whole workspace a fetch brought back.
     pub collected: BTreeSet<String>,
     max_total: MicroUsd,
+    /// The provider's latency bound for this run. (It was a process-wide static: runs in parallel
+    /// in one process, as `cargo test` has them, set it for each other, so a seed's run depended
+    /// on what else ran beside it.)
+    cloud_latency_s: u64,
     /// When the control host (and so the reconciler) last started: a node can't be released while
     /// it is down.
     pub control_up_at: i64,
@@ -414,8 +418,13 @@ impl Cloud {
         self.0.lock().expect("world")
     }
 
-    async fn lag(&self, max: u64) {
-        let s = self.world().rng.range(1, max);
+    /// The provider's answer takes 1 to this run's latency bound seconds.
+    async fn lag(&self) {
+        let s = {
+            let mut w = self.world();
+            let max = w.cloud_latency_s;
+            w.rng.range(1, max)
+        };
         tokio::time::sleep(secs(s as i64)).await;
     }
 
@@ -430,25 +439,18 @@ impl Cloud {
     }
 }
 
-/// The provider's latency bound for this run (set before the simulation starts).
-static CLOUD_LATENCY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn cloud_latency() -> u64 {
-    CLOUD_LATENCY.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 impl Provider for Cloud {
     fn id(&self) -> &str {
         BACKEND
     }
 
     async fn offers(&self, _req: &CapacityRequest) -> anyhow::Result<Vec<Offer>> {
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         Ok(vec![Cloud::offer()])
     }
 
     async fn create(&self, spec: &CreateSpec) -> anyhow::Result<NodeHandle> {
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         let n = {
             let mut w = self.world();
             let Some(k) = w.machines.iter().position(|m| m.inst.is_none() && !m.gone) else {
@@ -478,23 +480,23 @@ impl Provider for Cloud {
             n
         };
         // The instance exists from here: the answer takes its time.
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         Ok(n)
     }
 
     async fn get(&self, id: &NodeId) -> anyhow::Result<Option<NodeHandle>> {
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         let w = self.world();
         Ok(w.by_id(id).filter(|k| !w.machines[*k].gone).and_then(|k| w.machines[k].inst.clone()))
     }
 
     async fn list_tagged(&self, tag: &str) -> anyhow::Result<Vec<NodeHandle>> {
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         Ok(self.world().live().filter(|n| n.has_tag(tag)).cloned().collect())
     }
 
     async fn destroy(&self, id: &NodeId) -> anyhow::Result<()> {
-        self.lag(cloud_latency()).await;
+        self.lag().await;
         let mut w = self.world();
         if let Some(k) = w.by_id(id).filter(|k| !w.machines[*k].gone) {
             w.on_destroy(k, now_s());
@@ -1238,7 +1240,6 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
             (r.run.clone(), i)
         })
         .collect();
-    CLOUD_LATENCY.store(plan.cloud_latency_s, std::sync::atomic::Ordering::SeqCst);
     let world = Arc::new(Mutex::new(World {
         machines: (0..MACHINES).map(|_| Machine::default()).collect(),
         rng: Rng::new(seed ^ 0x0063_6c6f_7564),
@@ -1247,6 +1248,7 @@ pub fn run(seed: u64, dir: &Path, options: Options) -> Report {
         stats: Stats::default(),
         collected: BTreeSet::new(),
         max_total: plan.max_total,
+        cloud_latency_s: plan.cloud_latency_s,
         control_up_at: EPOCH_S,
         control_down: false,
         abandoned: BTreeSet::new(),
