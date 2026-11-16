@@ -101,23 +101,25 @@ pub fn blast_radius(l: &Ledger, zone: Option<&ZoneSpec>, req: &Request, t: &Term
     Ok(Some(Blast { widens, examples, zone_rules, covered, recent: seen.len() }))
 }
 
-/// The blast radius as text, for `wicket approve`.
+/// The blast radius as text, for `wicket approve`. Paths and hosts come from audit records a node
+/// or a box influenced, so every line is clipped and stripped of terminal escapes (#128).
 pub fn render(b: &Blast) -> String {
+    let c = |x: &str| wicket_core::text::clip(x, 400);
     let mut out = String::from("This approval is wider than the one request:\n");
     for w in &b.widens {
-        out.push_str(&format!("  - {w}\n"));
+        out.push_str(&format!("  - {}\n", c(w)));
     }
     if !b.examples.is_empty() {
         out.push_str("It would also allow, for example:\n");
         for x in &b.examples {
-            out.push_str(&format!("  - {x}\n"));
+            out.push_str(&format!("  - {}\n", c(x)));
         }
     }
     out.push_str(&format!("It would have covered {} of this run's last {} egress requests.\n", b.covered, b.recent));
     if !b.zone_rules.is_empty() {
         out.push_str("The zone already reaches this host by:\n");
         for r in &b.zone_rules {
-            out.push_str(&format!("  - {r}\n"));
+            out.push_str(&format!("  - {}\n", c(r)));
         }
     }
     out
@@ -185,6 +187,9 @@ mod tests {
         assert_eq!(b.examples[..2], ["GET files.example/docs/c/d (made by this run)", "GET files.example/docs/b (made by this run)"]);
         assert!(b.examples.iter().any(|x| x == "GET files.example/docs/any/deeper/path"), "{b:?}");
         assert_eq!(b.zone_rules, vec!["GET,HEAD files.example /docs/public/**".to_string()]);
+        let mut hostile = b.clone();
+        hostile.examples.push("GET h/\u{1b}]0;x\u{7}\u{202e}".into());
+        assert!(render(&hostile).chars().all(|c| c == '\n' || !wicket_core::text::is_unsafe(c)), "no escapes reach the terminal");
         let text = render(&b);
         assert!(text.contains("every path under /docs/ on files.example") && text.contains("3 of this run's last 5"), "{text}");
         // More uses of the one path: what the run sent there.

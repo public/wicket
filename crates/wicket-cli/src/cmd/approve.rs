@@ -31,7 +31,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             // The effect the grant will be for (#369), and what else it would allow if it widens.
             let shown = crate::effect::descriptor(&req, Some(&t));
             let shown_sha = shown.sha256();
-            println!("effect {}: {}", &shown_sha[..16], shown.canonical());
+            println!("effect {shown_sha}: {}", wicket_core::text::clip(&shown.canonical(), 2000));
             let zone = crate::effect::zone_of_run(&l, &data_dir(), &req.run);
             if let Some(b) = crate::effect::blast_radius(&l, zone.as_ref(), &req, &t)? {
                 print!("{}", crate::effect::render(&b));
