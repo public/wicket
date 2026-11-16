@@ -660,6 +660,11 @@ impl<P: Policy> Replica<P> {
                 match self.heads.get(&f.epoch) {
                     Some(h) if *h == f.head => {}
                     Some(_) => return Err(Refusal::Fork(format!("statement head differs at epoch {}", f.epoch))),
+                    // Signed before the newest statement held, for an epoch older than the history
+                    // the node holds (it was caught up from a later snapshot meanwhile): it can't
+                    // take effect, and there is nothing to check it against. Another run's honest
+                    // statement, delivered late over its own connection, not a rollback (#300).
+                    None if superseded => return Ok(Plan::Superseded),
                     None => {
                         return Err(Refusal::Rollback(format!(
                             "statement epoch {} is older than the history held (epoch {})",
@@ -719,7 +724,15 @@ impl<P: Policy> Replica<P> {
                 }
                 self.apply_delta(&d, head);
                 self.recheck_local();
+                // The statements file is rewritten only if this delta changed what it holds: a
+                // delta leaves the newest statement and the floor alone, and moves `vouched` only
+                // when it reaches the newest statement's epoch. Rewriting the same bytes cost two
+                // fsyncs per delta for nothing (#287: most of a box start's wait on its node).
+                let before = self.vouched.as_ref().map(|v| (v.jws.clone(), v.received_at));
                 self.revouch();
+                if self.vouched.as_ref().map(|v| (v.jws.clone(), v.received_at)) == before {
+                    return Ok(());
+                }
                 self.persist_statements().map_err(io)
             }
             Plan::Fresh(s) => {

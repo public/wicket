@@ -1217,6 +1217,11 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     if zone.name != bs.zone {
         bail!("run {}'s authority is for zone {}, not {}", bs.run, zone.name, bs.zone);
     }
+    // A placed node past its lease starts no box (#395): decided here, where the box starts, not
+    // only when its run began.
+    if let Some(by) = bs.start_by.filter(|by| (node.clock)() / 1000 >= *by) {
+        bail!("{}", crate::nodecreate::past_lease(&node.name, by));
+    }
     // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
     // reference, or the digest alone; a tag moved to another image since changes nothing, and a
     // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
@@ -1513,6 +1518,8 @@ fn child_start(
         durable: vec![],
         name,
         llm_prior: (0, 0, 0),
+        // On the same node as its parent: started no later than its parent could be.
+        start_by: parent.start_by,
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
@@ -2636,6 +2643,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 durable: vec![],
                 name: None,
                 llm_prior: (0, 0, 0),
+                start_by: None,
                 output_cap: 64 << 20,
                 output_stop: false,
                 swaps: vec![],
@@ -3527,6 +3535,28 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     /// fetched over the run's own connection on first use: a vault secret released for the swap's
     /// host only, a value by its key. Neither is in the box's start, so neither is in the node's
     /// box record.
+    /// #395: a placed node past its lease starts no box, decided when the start reaches it (the
+    /// control host checked the lease when the run began, seconds earlier).
+    #[tokio::test]
+    async fn a_start_that_reaches_the_node_past_its_lease_is_refused() {
+        const RUN: &str = "run_llllllllllllllllllllllllll";
+        let inst = Install::new("nodesrv-start-by");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        node.boxes.lock().unwrap().remove(RUN);
+        let now_s = (node.clock)() / 1000;
+        let mut bs = fake_record(RUN).start;
+        bs.zone = "z".into();
+        bs.start_by = Some(now_s);
+        let e = start_box_steps(&node, None, bs.clone(), Arc::new(Timings::new())).await.unwrap_err().to_string();
+        assert!(e.contains("past its lease") && e.contains("takes no new runs"), "{e}");
+        assert!(!node.boxes.lock().unwrap().contains_key(RUN));
+        // Before its lease's end, the lease is no reason (whatever else stops this start here).
+        bs.start_by = Some(now_s + 3600);
+        let e = start_box_steps(&node, None, bs, Arc::new(Timings::new())).await.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!e.contains("past its lease"), "{e}");
+    }
+
     #[tokio::test]
     async fn a_swapped_host_is_decided_on_the_node_and_its_credential_fetched_there() {
         const RUN: &str = "run_ssssssssssssssssssssssssss";

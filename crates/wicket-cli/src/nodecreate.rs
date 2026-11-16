@@ -131,15 +131,23 @@ pub fn release_placer(owner: &str, secret: &str) -> Result<Placer<VultrProvider,
 
 /// Refuses a new run on a placed node past its lease (#294, #324): one started there would hold
 /// the node, so it would go on billing past its lease for as long as new runs came. A run already
-/// on it keeps it until it ends; the reconciler releases it then.
-pub fn refuse_past_lease(ledger: &Ledger, node: &str, now: i64) -> Result<()> {
-    if let Some(p) = ledger.placed_nodes(&["active"])?.into_iter().find(|p| p.name == node && p.lease_until <= now) {
-        bail!(
-            "node {node} is past its lease (it ended {}): it takes no new runs, and the reconciler releases it once nothing is on it. Create another node (wicket node create)",
-            fmt_time(p.lease_until)
-        );
+/// on it keeps it until it ends; the reconciler releases it then. Returns the lease's end, if the
+/// node has one: the run's box start carries it (`BoxStart::start_by`), and the node refuses a start
+/// that reaches it later (#395: this check and the start are seconds apart).
+pub fn refuse_past_lease(ledger: &Ledger, node: &str, now: i64) -> Result<Option<i64>> {
+    let Some(p) = ledger.placed_nodes(&["active"])?.into_iter().find(|p| p.name == node) else { return Ok(None) };
+    if p.lease_until <= now {
+        bail!("{}", past_lease(node, p.lease_until));
     }
-    Ok(())
+    Ok(Some(p.lease_until))
+}
+
+/// Why a placed node takes no new run: it is past its lease, which ended at `until`.
+pub fn past_lease(node: &str, until: i64) -> String {
+    format!(
+        "node {node} is past its lease (it ended {}): it takes no new runs, and the reconciler releases it once nothing is on it. Create another node (wicket node create)",
+        fmt_time(until)
+    )
 }
 
 /// After a placed node is released: revokes its enrolment, if it is still enrolled under its name
@@ -746,10 +754,10 @@ mod tests {
             hourly: None,
         })
         .unwrap();
-        super::refuse_past_lease(&l, "build5", 3_999).unwrap();
+        assert_eq!(super::refuse_past_lease(&l, "build5", 3_999).unwrap(), Some(4_000), "its lease's end, for the box's start");
         let e = super::refuse_past_lease(&l, "build5", 4_000).unwrap_err().to_string();
         assert!(e.contains("past its lease"), "{e}");
-        super::refuse_past_lease(&l, "elsewhere", 9_000).unwrap();
+        assert_eq!(super::refuse_past_lease(&l, "elsewhere", 9_000).unwrap(), None, "an enrolled node has no lease");
         l.placed_node_ended("i-1", "released", "lease ended").unwrap();
         super::refuse_past_lease(&l, "build5", 9_000).unwrap();
     }

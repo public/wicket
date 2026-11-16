@@ -559,11 +559,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.epoch()
     };
     published.end();
+    let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
     // What fences a wake of the agent elsewhere while this box may still run (#153).
     record_authority(&s.dir, &name, token_root.1 + 1000).context("recording the box's authority")?;
     // Records the node ships are filed under this run only once the ledger says it runs there (#120).
     s.ledger.lock().expect("ledger").set_run_node(&s.run.0, &name).context("recording the run's node")?;
+    recording.end();
     let ctl = Arc::new(NodeCtl {
         node: name.clone(),
         run: s.run.0.clone(),

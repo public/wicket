@@ -158,6 +158,11 @@ pub struct BoxStart {
     /// input and output tokens. The node's model proxy starts from it (#151).
     #[serde(default)]
     pub llm_prior: (u64, u64, u64),
+    /// The latest the box may be started (Unix seconds): its placed node's lease end (#395). The
+    /// node refuses a start that reaches it then or later, so the control host's check at the run's
+    /// start (`nodecreate::refuse_past_lease`) and the start itself can't race. None: no lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_by: Option<i64>,
     /// What the box's output may take on the node's disk (#151; the zone's `limits.output`), and
     /// whether the box is stopped when its output passes it (else the oldest output goes).
     #[serde(default = "default_output_cap")]
