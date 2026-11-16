@@ -105,6 +105,8 @@ pub const MAX_SOCKETS: usize = 32;
 pub struct Sockets {
     total: usize,
     by_session: HashMap<String, usize>,
+    /// Open sockets by (passkey credential, run): who watches which run's session now (#364).
+    watching: HashMap<(String, String), usize>,
 }
 
 impl Sockets {
@@ -119,6 +121,11 @@ impl Sockets {
         None
     }
 
+    /// Whether the operator with passkey `cred` has `run`'s session open now.
+    pub fn watching(&self, cred: &str, run: &str) -> bool {
+        self.watching.get(&(cred.to_string(), run.to_string())).is_some_and(|n| *n > 0)
+    }
+
     /// How many are open, in all and for `console_session`.
     #[cfg(test)]
     pub fn open(&self, console_session: &str) -> (usize, usize) {
@@ -131,6 +138,8 @@ impl Sockets {
 pub struct Slot {
     sockets: std::sync::Arc<std::sync::Mutex<Sockets>>,
     console_session: String,
+    /// The (passkey credential, run) this socket watches, once its ticket is checked.
+    watch: Option<(String, String)>,
 }
 
 impl Slot {
@@ -142,7 +151,19 @@ impl Slot {
         }
         s.total += 1;
         *s.by_session.entry(console_session.to_string()).or_default() += 1;
-        Ok(Slot { sockets: sockets.clone(), console_session: console_session.to_string() })
+        Ok(Slot { sockets: sockets.clone(), console_session: console_session.to_string(), watch: None })
+    }
+
+    /// Records that this socket is the operator with passkey `cred` watching `run`, until it drops.
+    pub fn watch(&mut self, cred: &str, run: &str) {
+        let key = (cred.to_string(), run.to_string());
+        let mut s = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = self.watch.replace(key.clone()) {
+            if let Some(n) = s.watching.get_mut(&old) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        *s.watching.entry(key).or_default() += 1;
     }
 }
 
@@ -154,6 +175,14 @@ impl Drop for Slot {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 s.by_session.remove(&self.console_session);
+            }
+        }
+        if let Some(w) = self.watch.take() {
+            if let Some(n) = s.watching.get_mut(&w) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    s.watching.remove(&w);
+                }
             }
         }
     }
@@ -269,7 +298,7 @@ pub(super) fn check_upgrade(
         return Err((S::FORBIDDEN, "open the session with your passkey first"));
     };
     // Over a cap, the ticket isn't spent: the operator can close a socket and use it within its TTL.
-    let slot = Slot::take(&state.sockets, &sess.0).map_err(|why| (S::TOO_MANY_REQUESTS, why))?;
+    let mut slot = Slot::take(&state.sockets, &sess.0).map_err(|why| (S::TOO_MANY_REQUESTS, why))?;
     // Single use, whatever happens next.
     let t = state.tickets.lock().expect("lock").remove(tk);
     let Some(t) = t.filter(|t| t.expires > Instant::now()) else { return Err((S::FORBIDDEN, "unknown, used or expired ticket")) };
@@ -281,6 +310,8 @@ pub(super) fn check_upgrade(
         return Err((S::CONFLICT, "the run is not running"));
     }
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    // The run's pushes don't go to this operator's devices while the socket is open (#364).
+    slot.watch(cred, run);
     Ok((t, accept, slot))
 }
 

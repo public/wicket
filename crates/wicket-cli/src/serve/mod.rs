@@ -1719,7 +1719,18 @@ async fn notify_once(state: &State, n: &mut push::Notifier, now: i64) -> Vec<(St
         }
     };
     let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
-    let results = p.deliver(n.tick(&waiting, &subs, now), now).await;
+    let mut out = n.tick(&waiting, &subs, now);
+    // Runs whose turn or life ended (#364), except to an operator watching that run's session now.
+    // A lock that can't be had counts as not watching: the push goes (fail open).
+    match state.ledger().and_then(|l| l.run_states(&state.tenant, now - 3600).map_err(Into::into)) {
+        Ok(runs) => {
+            let notes = n.runs.changes(&runs);
+            let watching = |s: &push::Subscription, run: &str| state.sockets.try_lock().is_ok_and(|w| w.watching(&s.operator, run));
+            out.extend(n.tick_runs(&notes, &subs, &watching, now));
+        }
+        Err(e) => tracing::warn!("notifier: reading the ledger's runs: {e:#}"),
+    }
+    let results = p.deliver(out, now).await;
     for (id, status) in &results {
         if *status == 404 || *status == 410 {
             if let Ok(l) = state.ledger() {

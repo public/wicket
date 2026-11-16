@@ -17,6 +17,13 @@
 //!   `Topic` so the push service keeps only the latest, `Urgency: high` and a TTL of [`TTL_SECS`].
 //!   The payload says only how many requests are waiting and which one to open, since lock screens
 //!   show it; a device that opts in also gets the agent and what it asks for.
+//! - **Runs** ([`RunWatch`], #364): a push when an agent's turn ends (its run goes from busy to
+//!   idle: it waits for its operator), and when a run ends (finished, or failed with its status's
+//!   first word: `timeout`, `lost`, …). Not for a hibernation or a run another activation
+//!   superseded. Under their own `Topic`, so they never replace a request's push, coalesced per
+//!   device as requests are. A device gets none for a run whose session its operator has open in
+//!   the console at that moment; when that can't be told, it gets the push (fail open). The payload
+//!   names the run, and for a device that opted in the agent; never anything the agent said.
 //!
 //! The crypto is `p256` (ECDH and ES256, already used for passkeys) and `ring` (HKDF-SHA-256 and
 //! AES-128-GCM, already in the tree through rustls), so Web Push adds no new crate.
@@ -41,6 +48,8 @@ pub const MIN_INTERVAL: i64 = 30;
 /// The `Topic` every push carries, so a push service holding undelivered pushes for a device keeps
 /// only the latest. (Also the notification's tag, so the device shows one.)
 pub const TOPIC: &str = "wicket-pending";
+/// The `Topic` (and tag) of pushes about runs (#364).
+pub const RUN_TOPIC: &str = "wicket-runs";
 /// The push services the console sends to: (host, whether subdomains of it are meant instead).
 pub const PUSH_SERVICES: &[(&str, bool)] =
     &[("fcm.googleapis.com", false), ("push.apple.com", true), ("updates.push.services.mozilla.com", false), ("notify.windows.com", true)];
@@ -389,6 +398,8 @@ pub struct Waiting {
 pub struct Outgoing {
     pub sub: Subscription,
     pub payload: Vec<u8>,
+    /// The push's `Topic`: [`TOPIC`] or [`RUN_TOPIC`].
+    pub topic: &'static str,
 }
 
 /// Decides which pushes to send, from successive looks at what is waiting. Requests already waiting
@@ -399,6 +410,10 @@ pub struct Notifier {
     /// Subscriptions owed a push, with the newest new request to open.
     owed: HashMap<String, String>,
     last_sent: HashMap<String, i64>,
+    /// Run changes owed to each subscription, and when it last got one (#364).
+    owed_runs: HashMap<String, Vec<RunNote>>,
+    last_run_sent: HashMap<String, i64>,
+    pub runs: RunWatch,
 }
 
 pub fn payload(waiting: &[Waiting], open: &Waiting, details: bool) -> Vec<u8> {
@@ -436,9 +451,114 @@ impl Notifier {
                 continue; // sent less than MIN_INTERVAL ago: coalesced into the next one
             }
             let open = waiting.iter().find(|w| &w.id == rid).unwrap_or(last);
-            out.push(Outgoing { sub: s.clone(), payload: payload(waiting, open, s.details) });
+            out.push(Outgoing { sub: s.clone(), payload: payload(waiting, open, s.details), topic: TOPIC });
             self.owed.remove(&s.id);
             self.last_sent.insert(s.id.clone(), now);
+        }
+        out
+    }
+}
+
+/// What happened to a run that its operator may want to know (#364).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunEvent {
+    /// A turn ended: the agent waits for its operator.
+    TurnDone,
+    Finished,
+    /// Ended otherwise: its status's first word.
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunNote {
+    pub run: String,
+    pub agent: String,
+    pub event: RunEvent,
+}
+
+/// Run state changes between successive looks at the ledger's runs. What it sees at its first look
+/// is not announced, as for requests.
+#[derive(Default)]
+pub struct RunWatch {
+    seen: Option<HashMap<String, (String, Option<String>)>>,
+}
+
+impl RunWatch {
+    pub fn changes(&mut self, runs: &[wicket_store::RunState]) -> Vec<RunNote> {
+        let now: HashMap<String, (String, Option<String>)> =
+            runs.iter().map(|r| (r.id.clone(), (r.status.clone(), r.activity.clone()))).collect();
+        let Some(seen) = self.seen.replace(now) else { return vec![] };
+        let mut out = vec![];
+        for r in runs {
+            let Some((was, was_activity)) = seen.get(&r.id) else { continue };
+            let event = if was == "running" && r.status != "running" {
+                match r.status.split([' ', '(']).next().unwrap_or("") {
+                    "succeeded" => Some(RunEvent::Finished),
+                    "hibernated" | "superseded" | "" => None,
+                    word => Some(RunEvent::Failed(wicket_core::text::clip(word, 20))),
+                }
+            } else if r.status == "running" && was_activity.as_deref() == Some("busy") && r.activity.as_deref() == Some("idle") {
+                Some(RunEvent::TurnDone)
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                out.push(RunNote { run: r.id.clone(), agent: r.agent.clone(), event });
+            }
+        }
+        out
+    }
+}
+
+/// A run push's payload: what happened (the agent only for a device that opted in), and the run
+/// to open.
+pub fn run_payload(notes: &[RunNote], details: bool) -> Vec<u8> {
+    let last = notes.last().expect("a note");
+    let who = if details { format!("{}: ", wicket_core::text::clip(&last.agent, MAX_LABEL)) } else { String::new() };
+    let what = match &last.event {
+        RunEvent::TurnDone => "the agent's turn ended".to_string(),
+        RunEvent::Finished => "a run finished".to_string(),
+        RunEvent::Failed(w) => format!("a run ended ({w})"),
+    };
+    let more = if notes.len() > 1 { format!(" (and {} more)", notes.len() - 1) } else { String::new() };
+    json!({ "title": "wicket", "body": format!("{who}{what}{more}"), "run": last.run, "count": notes.len(), "tag": RUN_TOPIC })
+        .to_string()
+        .into_bytes()
+}
+
+impl Notifier {
+    /// Pushes for run changes, per device: at most one per [`MIN_INTERVAL`] (notes in between are
+    /// coalesced), none about a run `watching(device, run)` says its operator watches now.
+    pub fn tick_runs(
+        &mut self,
+        notes: &[RunNote],
+        subs: &[Subscription],
+        watching: &dyn Fn(&Subscription, &str) -> bool,
+        now: i64,
+    ) -> Vec<Outgoing> {
+        for s in subs {
+            let owed = self.owed_runs.entry(s.id.clone()).or_default();
+            owed.extend(notes.iter().cloned());
+            let n = owed.len();
+            if n > 32 {
+                owed.drain(..n - 32);
+            }
+        }
+        self.owed_runs.retain(|id, _| subs.iter().any(|s| &s.id == id));
+        self.last_run_sent.retain(|id, t| now - *t < MIN_INTERVAL && subs.iter().any(|s| &s.id == id));
+        let mut out = vec![];
+        for s in subs {
+            if self.last_run_sent.contains_key(&s.id) {
+                continue;
+            }
+            let Some(owed) = self.owed_runs.get_mut(&s.id) else { continue };
+            owed.retain(|n| !watching(s, &n.run));
+            if owed.is_empty() {
+                continue;
+            }
+            out.push(Outgoing { sub: s.clone(), payload: run_payload(owed, s.details), topic: RUN_TOPIC });
+            owed.clear();
+            self.last_run_sent.insert(s.id.clone(), now);
         }
         out
     }
@@ -452,7 +572,8 @@ pub struct PushRequest {
     pub body: Vec<u8>,
 }
 
-pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], contact: &str, now: i64) -> Result<PushRequest> {
+/// `topic` is [`TOPIC`] (a request waiting: urgent) or [`RUN_TOPIC`] (normal urgency).
+pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], topic: &str, contact: &str, now: i64) -> Result<PushRequest> {
     let url = check_endpoint(&sub.endpoint)?;
     let ua = unb64u(&sub.p256dh).map_err(|_| anyhow!("bad p256dh"))?;
     let auth = unb64u(&sub.auth).map_err(|_| anyhow!("bad auth"))?;
@@ -464,8 +585,8 @@ pub fn build_request(vapid: &Vapid, sub: &Subscription, plaintext: &[u8], contac
         ("content-encoding", "aes128gcm".to_string()),
         ("content-type", "application/octet-stream".to_string()),
         ("ttl", TTL_SECS.to_string()),
-        ("urgency", "high".to_string()),
-        ("topic", TOPIC.to_string()),
+        ("urgency", if topic == TOPIC { "high" } else { "normal" }.to_string()),
+        ("topic", topic.to_string()),
     ];
     Ok(PushRequest { url, headers, body })
 }
@@ -515,7 +636,7 @@ impl Push {
         let mut results = Vec::new();
         for o in out {
             let host = url::Url::parse(&o.sub.endpoint).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
-            let req = match build_request(&self.vapid, &o.sub, &o.payload, &self.contact, now) {
+            let req = match build_request(&self.vapid, &o.sub, &o.payload, o.topic, &self.contact, now) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("push to device {} ({host}) not sent: {e:#}", o.sub.id);
