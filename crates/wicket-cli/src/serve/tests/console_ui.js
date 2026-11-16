@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "placed", "capacity", "capacity-form"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -274,6 +274,54 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   swListener({ data: { open: "q-b" } });
   assert.deepStrictEqual(cardsIn().map(c => c.className), ["card req", "card req opened"]);
   console.log("console notifications: ok");
+
+  // Secrets: listed by name, kind, hosts and users; a value is typed into a password field cleared on
+  // submit, begin carries only its salted sha256, and the value goes only with finish.
+  const SECRET = "s3cret-VALUE-typed-in";
+  const gh = { name: "gh", kind: "value", reference: null, hosts: ["api.github.com"], set_at: 1700000000,
+    used_by: [{ root: "manifests", manifest: "d.yaml", zone: "docs", use: "inject", host: "api.github.com", header: "authorization", format: "Bearer {secret}", optional: false }],
+    zones: ["docs"], runs: [{ run: "run_a", zone: "docs" }] };
+  const login = { name: "login", kind: "reference", reference: { file: "/home/you/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
+  state = { ...base, pending: [], secrets: { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [] }], link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" } };
+  await run("refresh()"); await flush();
+  const sx = ids.secrets.textContent;
+  for (const want of ["gh", "sent only to api.github.com", "header authorization", "format Bearer {secret}", "running now: run_a", "reference", "/home/you/.claude/.credentials.json#/a/token", "not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
+  const sbtn = label => ids.secrets.all(n => n.tagName === "button" && n.textContent.startsWith(label));
+  assert.strictEqual(sbtn("Replace value").length, 1, "a reference's value isn't set here");
+  assert.strictEqual(sbtn("Hosts").length, 2, "a reference's hosts can be changed");
+  sbtn("Replace value")[0].click(); await flush();
+  assert.strictEqual(ids["secret-edit"].hidden, false);
+  const input = id => ids["secret-edit-body"].all(n => n.id === id)[0];
+  const vIn = input("secret-value");
+  assert.strictEqual(vIn.type, "password"); assert.strictEqual(vIn.autocomplete, "off");
+  vIn.value = SECRET;
+  nextAction = { v: 1, action: "set_secret", name: "gh", replaces: true, hosts: ["api.github.com"], previous_hosts: ["api.github.com"], zones: ["docs"], value_sha256: "x", value_salt: "y" };
+  const nBegan = began().length;
+  await ids["secret-edit"].listeners.submit({ preventDefault() {} }); await flush(); await flush();
+  assert.strictEqual(vIn.value, "", "no echo after submit");
+  assert.strictEqual(ids["secret-edit"].hidden, true);
+  assert.strictEqual(began().length, nBegan + 1);
+  const sb = began()[nBegan].body;
+  assert.ok(!JSON.stringify(sb).includes(SECRET) && !("value" in sb), "begin never carries the value");
+  const salt = Buffer.from(sb.value_salt, "hex");
+  assert.strictEqual(salt.length, 16);
+  assert.strictEqual(sb.value_sha256, require("crypto").createHash("sha256").update(Buffer.concat([salt, Buffer.from(SECRET)])).digest("hex"));
+  assert.ok(ids["confirm-what"].textContent.startsWith("Replace the value of secret gh") && !ids["confirm-what"].textContent.includes(SECRET));
+  await advance(1000); await ids["confirm-go"].click(); await flush(); await flush();
+  const sfin = calls.filter(c => c.path === "/api/action/finish").pop().body;
+  assert.strictEqual(sfin.value, SECRET, "the value goes with finish");
+  assert.ok(!ids.secrets.textContent.includes(SECRET));
+  // Delete: a warning naming the zones and runs that use it, then the signed confirmation.
+  sbtn("Delete")[0].click(); await flush();
+  const warn = ids["secret-edit-body"].textContent;
+  assert.ok(warn.includes("docs") && warn.includes("run_a"), warn);
+  nextAction = { v: 1, action: "delete_secret", name: "gh", kind: "value", zones: ["docs"], runs: ["run_a"], hosts: [] };
+  await ids["secret-edit"].listeners.submit({ preventDefault() {} }); await flush(); await flush();
+  assert.strictEqual(began().pop().body.action, "delete_secret");
+  assert.strictEqual(ids["confirm-go"].textContent, "Sign: delete");
+  assert.ok(ids["confirm-what"].textContent.includes("running runs using it: run_a"));
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console secrets: ok");
 
   // The Capacity card (#256): each live grant with what it covers, uses and leaves; Renew is a
   // signed action, Revoke only the session; the form issues one through a signed action.
