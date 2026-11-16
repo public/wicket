@@ -34,6 +34,10 @@ jobs:
     name: What this change can affect
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Reading the pull request's labels (#246).
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       crates: ${{ steps.select.outputs.crates }}
       all_crates: ${{ steps.select.outputs.all_crates }}
@@ -50,17 +54,28 @@ jobs:
           persist-credentials: false
       - name: The selection's own test (synthetic changes, every out-of-crate input mapped)
         run: ci/affected.py --self-test
+      - name: The label check's own test
+        run: ci/pr-has-label_test.sh
       - id: select
         name: Select
+        # The full-ci label as the pull request has it now, from the API (#246), not as this event's
+        # payload had it: a label added just after a push is in neither the push's payload nor, once
+        # the push's run has cancelled it, a run of its own. Unreadable labels select the full set.
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.base_ref }}
-          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$EVENT" = pull_request ] && [ "$FULL" != true ]; then
+          FULL=
+          if [ "$EVENT" = pull_request ]; then
+            FULL=$(ci/pr-has-label.sh full-ci) || FULL="unknown (the labels couldn't be read)"
+          fi
+          if [ "$EVENT" = pull_request ] && [ "$FULL" = false ]; then
             ci/affected.py --base "origin/$BASE" --github-output "$GITHUB_OUTPUT"
           else
-            echo "the full set ($EVENT; full-ci label: $FULL)"
+            echo "the full set ($EVENT; full-ci label: ${FULL:-n/a})"
             ci/affected.py --files /dev/null --github-output "$GITHUB_OUTPUT"
           fi
           cat "$GITHUB_OUTPUT" >>"$GITHUB_STEP_SUMMARY"
