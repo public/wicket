@@ -4,8 +4,10 @@
 mod zone_decider;
 
 mod canary;
+
 mod git_push;
 mod h3;
 mod remote_session;
 mod splice;
 mod streaming;
+mod window_caps;

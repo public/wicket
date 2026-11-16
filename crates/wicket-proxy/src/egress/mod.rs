@@ -499,7 +499,23 @@ impl Egress {
             }
         };
         let Some(counter) = counter else { return self.send(req, &host, scheme, &pq, &path, via).await };
-        let r = self.send(caps::counted_request(req, counter.clone()), &host, scheme, &pq, &path, via).await;
+        let r = self.clone().send(caps::counted_request(req, counter.clone()), &host, scheme, &pq, &path, via).await;
+        // An answer that says it won't fit is refused whole (a cut one would end the box's
+        // connection with nothing said); one that doesn't say is cut where it passes.
+        let len = r.headers().get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        if let Some(why) = len.and_then(|n| counter.fits(n).err()) {
+            emit("capped", why.0.clone());
+            return problem(
+                429,
+                "egress-cap",
+                "Blocked by wicket box: egress cap reached",
+                &format!(
+                    "{host} answered with more than is left: {why}. Wait for the window to have room, or ask for less. {}",
+                    crate::BOX_FACT
+                ),
+                None,
+            );
+        }
         caps::counted_response(r, counter)
     }
 

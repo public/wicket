@@ -116,6 +116,15 @@ impl EgressCounter {
         Ok(())
     }
 
+    /// Whether `n` more bytes would fit, without counting them.
+    pub fn fits(&self, n: u64) -> std::result::Result<(), Capped> {
+        let s = self.state.lock().expect("egress counter");
+        match s.1.and_then(|sl| sl.bytes_left(s.0)) {
+            Some(left) if n > left => Err(Capped(format!("a {n}-byte body doesn't fit: {}", self.why("bytes")))),
+            _ => Ok(()),
+        }
+    }
+
     /// Counts `n` bytes passing, or refuses them if they don't fit (the body is cut there).
     pub fn pass(&self, n: u64) -> std::result::Result<(), Capped> {
         let mut s = self.state.lock().expect("egress counter");
