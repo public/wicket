@@ -502,6 +502,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
     let node_name = node.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| crate::localnode::NAME.to_string());
+    if node.is_some() {
+        crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?;
+    }
     // This host's own node shares its filesystem. That is only transport: it lays the box out in the
     // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
     // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
@@ -1084,9 +1087,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // path it has on the host) is mounted as it is, with this run's outbox over its out/. Another
     // node gets a copy and sends it back at the end.
     let outbox = (box_root.join("workspace/out").display().to_string(), format!("{}/out", wicket_agent::WORKSPACE), false);
+    // Its git hooks and config, read-only (#366): the operator's git runs them on this host.
     let binds: Vec<(String, String, bool)> = match (&workspace_dir, shares_host) {
-        (Some(w), true) if wrap_cwd.is_some() => vec![(w.display().to_string(), w.display().to_string(), false), outbox],
-        (Some(w), true) => vec![(w.display().to_string(), wicket_agent::WORKSPACE.into(), false), outbox],
+        (Some(w), true) => {
+            let target = if wrap_cwd.is_some() { w.display().to_string() } else { wicket_agent::WORKSPACE.into() };
+            let git = crate::gitguard::binds(w, &target)?;
+            [(w.display().to_string(), target, false), outbox].into_iter().chain(git).collect()
+        }
         _ => vec![],
     };
     // The harness's own files (its adapter settings: allowlisted keys only, plus what wicket owns,
@@ -1291,6 +1298,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             image_pin: image_pin.clone(),
             timings: wicket_core::timing::enabled(),
             memory_advice: m.zone.limits.memory_advice().map(str::to_string),
+            volume_life: Some(crate::chan::VolumeLife::of(&m)),
         };
         let via = match &node {
             Some(n) => crate::nodecall::Via::Ssh(crate::nodecall::Via::attach_argv(n)),
@@ -1522,6 +1530,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             acp = Some(c);
         }
     }
+    // A driven harness's control channel (#363): its running turn interrupted, its permission mode
+    // changed while it runs, and its prompts before a tool call raised as approvals.
+    let mut control = match (mode, &acp, harness) {
+        (Some(wicket_agent::harness::Mode::Driven | wicket_agent::harness::Mode::DrivenRemote(_)), None, Some(h)) => {
+            h.controller(&m).map(|c| {
+                crate::control::Supervised::new(
+                    c,
+                    crate::control::RunOf {
+                        tenant: m.tenant.clone(),
+                        run: run.clone(),
+                        zone: m.zone.name.clone(),
+                        may_ask: m.zone.escalation.request,
+                    },
+                )
+            })
+        }
+        _ => None,
+    };
     // Re-attached: between turns if the box's last output line was a turn's result.
     let mut turn_running = match &record {
         Some(_) if acp.is_some() => acp.as_ref().is_some_and(|c| c.busy()),
@@ -1713,6 +1739,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             let _ = write_json(&acp_state, &*c);
                         }
                     } else {
+                        // The harness's control lines (#363): its prompts, and its answers to wicket's requests.
+                        if let Some(c) = control.as_mut() {
+                            let out = ledger.lock().map(|mut lg| c.on_line(&mut lg, &l)).unwrap_or_default();
+                            control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                            write_lines(&mut stdin, &out.write).await;
+                        }
                         // A driven remote session's answer to wicket's Remote Control request: its
                         // address, recorded once as a remote session's is; or why there is none (the
                         // session carries on, driven only).
@@ -1781,7 +1813,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 None => break,
             },
-            Some(ev) = rx.recv() => print_event(&ev),
+            Some(ev) = rx.recv() => {
+                note_collected(&ledger, &run.0, &ev);
+                print_event(&ev)
+            }
             Some(w) = want_rx.recv() => {
                 let when = if turn_running { ": at the end of this turn" } else { "" };
                 match w {
@@ -1884,7 +1919,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
                 if let Some(by) = cancels.last() {
                     use tokio::io::AsyncWriteExt;
-                    let out = acp.as_mut().map(|c| c.cancel()).unwrap_or_default();
+                    let out = match (acp.as_mut(), control.as_mut()) {
+                        (Some(c), _) => c.cancel(),
+                        // A driven harness's interrupt (#363): only while a turn runs, as ACP's.
+                        (None, Some(c)) if turn_running => c.interrupt(),
+                        _ => vec![],
+                    };
                     let sent = !out.is_empty();
                     if sent {
                         println!("[operator] {by}: cancel the running turn");
@@ -1902,8 +1942,37 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         }
                     }
                     if let Ok(l) = ledger.lock() {
-                        let why = if sent { "cancelled" } else if acp.is_some() { "no turn was running" } else { "not an ACP run: nothing to cancel" };
+                        let why = if sent {
+                            "cancelled"
+                        } else if acp.is_some() || control.is_some() {
+                            "no turn was running"
+                        } else {
+                            "this run's harness can't be interrupted"
+                        };
                         let _ = l.audit(&m.tenant, Some(&run), "run.turn_cancel", &serde_json::json!({ "by": by, "asked": cancels.len(), "outcome": why }));
+                    }
+                }
+                // Prompts whose approvals were decided (#363), and a live permission mode change.
+                if let Some(c) = control.as_mut() {
+                    let out = ledger.lock().map(|mut lg| c.poll(&mut lg)).unwrap_or_default();
+                    control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                    write_lines(&mut stdin, &out.write).await;
+                }
+                let modes = ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                if let Some((want, by)) = modes.last() {
+                    let outcome = match (crate::control::parse_mode(want), control.as_mut()) {
+                        (Some(mode), Some(c)) => {
+                            println!("[operator] {by}: permission mode {mode}");
+                            let out = c.set_mode(mode);
+                            write_lines(&mut stdin, &out).await;
+                            "asked"
+                        }
+                        (None, _) => "not a permission mode",
+                        (_, None) => "this run's harness takes no live mode change",
+                    };
+                    if let Ok(l) = ledger.lock() {
+                        let body = serde_json::json!({ "by": by, "mode": wicket_agent::clip(want, 40), "asked": modes.len(), "outcome": outcome });
+                        let _ = l.audit(&m.tenant, Some(&run), "run.permission_mode", &body);
                     }
                 }
                 if let Some(f) = &fence {
@@ -2085,6 +2154,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
     }
     while let Ok(ev) = rx.try_recv() {
+        note_collected(&ledger, &run.0, &ev);
         print_event(&ev);
     }
     // (A node box that couldn't be reached has no end of stderr: don't wait for one.)
@@ -2132,10 +2202,16 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         )
         .await
         {
-            Ok(()) => fetched = true,
+            Ok(()) => {
+                fetched = true;
+                let _ = ledger.lock().expect("ledger").record_collected(&run.0, "fetched");
+            }
             Err(e) => {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
+                // The run holds its node until they are collected: the reconciler doesn't release
+                // it with them (#324).
+                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
                 println!("[wicket] {msg}");
                 eprintln!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(
@@ -2176,6 +2252,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
             match pushed {
                 Ok(Some(st)) => {
+                    let _ = ledger.lock().expect("ledger").record_collected(&run.0, "bundled");
                     // The node is released: what was bundled goes (an in-place workspace is the
                     // operator's own directory, and stays).
                     for (name, p, _) in &trees {
@@ -2397,7 +2474,11 @@ async fn fetch_trees(stopper: &Stopper, f: Fetch<'_>) -> Result<()> {
     }
     match (in_place, same_dir) {
         (_, true) => {}
-        (Some(w), false) => crate::hibernate::sync_dir(&ws_staged, w, &["out"])?,
+        (Some(w), false) => {
+            // The host's git hooks and config stay the host's (#366).
+            crate::gitguard::keep_host_git(w, &ws_staged)?;
+            crate::hibernate::sync_dir(&ws_staged, w, &["out"])?
+        }
         (None, false) => crate::hibernate::sync_dir(&ws_staged, &ws_dest, &[])?,
     }
     for (tree, dest) in &wanted {
@@ -2447,6 +2528,15 @@ pub fn egress_line(ev: &Event) -> Option<String> {
     Some(format!("[egress] {tag} {} {}{}  ({}; {})", clip(method, 16), clip(host, 120), clip(path, 120), clip(risk, 24), clip(detail, 240)))
 }
 
+/// A git push the run made, allowed, is its work collected (#377).
+fn note_collected(ledger: &Arc<Mutex<Ledger>>, run: &str, ev: &Event) {
+    if let Event::Egress { method, path, outcome, .. } = ev {
+        if outcome == "allow" && method == "POST" && path.ends_with("/git-receive-pack") {
+            let _ = ledger.lock().expect("ledger").record_collected(run, "pushed");
+        }
+    }
+}
+
 fn print_event(ev: &Event) {
     match ev {
         Event::Egress { outcome, detail, .. } => {
@@ -2460,7 +2550,7 @@ fn print_event(ev: &Event) {
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Box { what, detail } => println!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
-        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
+        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome, .. } => {
             println!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
                 wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
@@ -2536,6 +2626,40 @@ const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;
+
+/// Writes lines to the agent's stdin; a stdin that can't be written is dropped.
+async fn write_lines<W: tokio::io::AsyncWrite + Unpin>(stdin: &mut Option<W>, lines: &[String]) {
+    use tokio::io::AsyncWriteExt;
+    let Some(si) = stdin.as_mut().filter(|_| !lines.is_empty()) else { return };
+    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    if si.write_all(input.as_bytes()).await.is_err() {
+        *stdin = None;
+    }
+}
+
+/// Shows and audits what a driven harness's control channel did (#363); audits are capped per run
+/// with the ACP client's, so an agent can't flood the ledger with prompts.
+fn control_said(
+    out: &crate::control::Out,
+    ledger: &std::sync::Mutex<Ledger>,
+    tenant: &wicket_core::TenantId,
+    run: &RunId,
+    audits: &mut u32,
+) {
+    for s in &out.say {
+        println!("{s}");
+    }
+    for (kind, body) in &out.audit {
+        *audits += 1;
+        if *audits <= ACP_AUDIT_CAP {
+            if let Ok(l) = ledger.lock() {
+                let _ = l.audit(tenant, Some(run), kind, body);
+            }
+        } else if *audits == ACP_AUDIT_CAP + 1 {
+            println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+        }
+    }
+}
 
 /// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
 fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
@@ -2672,5 +2796,27 @@ mod tests {
         let e = format!("{:#}", box_image(None, &m).unwrap_err());
         assert!(e.contains("img:rust") && e.contains("zone.images"), "{e}");
         assert!(wicket_agent::load(&AGENT.replace("image: img:rust", "image: \"\"")).is_err(), "an empty image is invalid");
+    }
+}
+
+#[cfg(test)]
+mod collected_tests {
+    /// #377: an allowed git push is the run's work collected; one refused, or another request, isn't.
+    #[test]
+    fn an_allowed_push_is_collection() {
+        let l = std::sync::Arc::new(std::sync::Mutex::new(wicket_store::Ledger::open_in_memory().unwrap()));
+        let ev = |method: &str, path: &str, outcome: &str| wicket_proxy::Event::Egress {
+            method: method.into(),
+            host: "github.com".into(),
+            path: path.into(),
+            risk: "write".into(),
+            outcome: outcome.into(),
+            detail: String::new(),
+        };
+        super::note_collected(&l, "run_a", &ev("POST", "/o/r.git/git-receive-pack", "pending"));
+        super::note_collected(&l, "run_a", &ev("GET", "/o/r.git/info/refs", "allow"));
+        assert!(l.lock().unwrap().collected("run_a").unwrap().is_empty());
+        super::note_collected(&l, "run_a", &ev("POST", "/o/r.git/git-receive-pack", "allow"));
+        assert_eq!(l.lock().unwrap().collected("run_a").unwrap()[0].0, "pushed");
     }
 }

@@ -16,6 +16,10 @@ jobs:
     name: Changelog fragment
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # Reading the pull request's labels (#246).
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,7 +28,24 @@ jobs:
       - name: the fragments tool's own tests
         run: python3 -I ci/changelog_test.py
       - name: fragments parse, and this pull request adds one if it needs one
+        # The `no changelog` label as the pull request has it now (#246): a run for an earlier event
+        # that finishes after the label was added (or removed) decides as the label is, not as its
+        # payload had it. If the labels can't be read, the payload's answer stands.
         env:
+          EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
-          NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no changelog') && '1' || '' }}
-        run: python3 -I ci/changelog.py check ${BASE:+--base "$BASE"}
+          PAYLOAD_NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no changelog') && '1' || '' }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NO_CHANGELOG=$PAYLOAD_NO_CHANGELOG
+          if [ "$EVENT" = pull_request ]; then
+            if has=$(ci/pr-has-label.sh "no changelog"); then
+              NO_CHANGELOG=$([ "$has" = true ] && echo 1 || true)
+            else
+              echo "::warning::couldn't read the pull request's labels: using the event's (no changelog: ${PAYLOAD_NO_CHANGELOG:-0})"
+            fi
+          fi
+          export NO_CHANGELOG
+          python3 -I ci/changelog.py check ${BASE:+--base "$BASE"}

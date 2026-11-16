@@ -103,6 +103,23 @@ In OTLP, each object becomes one log record. Its body is the object's JSON line,
 are `wicket.audit.type`, `wicket.audit.seq` (int), `wicket.audit.kind`, `wicket.audit.hash`,
 `wicket.run` and `wicket.tenant`. Its time is the record's.
 
+Each log record also has an event name (`eventName`) and the standard OpenTelemetry attributes its
+record carries, so a collector can read decisions without knowing wicket's bodies (#368). The body
+stays the chained record, which is what `--verify --against` checks.
+
+| Record | `eventName` | Attributes besides wicket's own |
+|---|---|---|
+| An egress decision (`op`, body kind `egress`) | `wicket.egress.decision` | `http.request.method`, `server.address`, `url.path`, `wicket.decision.outcome`, `wicket.decision.risk`, `wicket.decision.reason` |
+| A model call (`op`, body kind `llm`) | `gen_ai.client.inference.operation.details` | `gen_ai.operation.name` (`chat`), `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` (cached tokens included), `gen_ai.usage.output_tokens`, `wicket.llm.cached_tokens`, `http.response.status_code`, `wicket.decision.outcome` |
+| A tool call (`op`, body kind `tool`) | `wicket.tool.call` | `gen_ai.operation.name` (`execute_tool`), `gen_ai.tool.name` |
+| A decision on a request (`decision`) | `wicket.approval.decision` | `wicket.decision`, `wicket.request.id`, `wicket.grant.id`, `wicket.decision.by`, and the request's `http.request.method`, `server.address`, `url.path` |
+| A checkpoint | `wicket.audit.checkpoint` | |
+| Anything else | `wicket.audit.<kind>` (`wicket.audit.op.<body kind>` for other `op` records) | |
+
+A refused egress request (any outcome but `allow` or `spliced`) and a model call that failed (HTTP
+status 400 or more) are `WARN` (severity 13), with `error.type` set to the outcome or the status.
+Everything else is `INFO`.
+
 ## Checkpoints and `--verify --against`
 
 Each record's hash covers every field it stores: `seq`, `ts`, `tenant`, `run`, `kind`, `body` and the

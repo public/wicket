@@ -1,6 +1,8 @@
 //! What is Claude's, in one place: names the rest of wicket reaches only through the harness
 //! adapter ([`crate::harness`]), or as the installation's defaults.
 
+pub mod control;
+
 /// The agent image's repository, built from `images/claude-code`, and the tag a box gets when
 /// nothing names another.
 pub const IMAGE_REPO: &str = "wicket/claude-code";

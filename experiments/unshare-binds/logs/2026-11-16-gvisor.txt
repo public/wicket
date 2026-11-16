@@ -1,0 +1,28 @@
+uid in ns: 0
+/wicket/ca   remount,rw: mount: /wicket/ca: permission denied.
+       dmesg(1) may have more information after failed mount system call.
+/wicket/ca   remount,bind,rw: mount: /wicket/ca: permission denied.
+       dmesg(1) may have more information after failed mount system call.
+/etc/hosts   remount,rw: mount: /etc/hosts: mount point is not a directory.
+       dmesg(1) may have more information after failed mount system call.
+/etc/hosts   remount,bind,rw: mount: /etc/hosts: mount point is not a directory.
+       dmesg(1) may have more information after failed mount system call.
+/            remount,rw: mount: /: permission denied.
+       dmesg(1) may have more information after failed mount system call.
+/            remount,bind,rw: mount: /: permission denied.
+       dmesg(1) may have more information after failed mount system call.
+umount /etc/hosts: umount: /etc/hosts: not mounted.
+umount -l /wicket/ca: umount: /wicket/ca: not mounted.
+write /wicket/ca: touch: cannot touch '/wicket/ca/.wicket-exp': Read-only file system
+write /etc/hostname: experiments/unshare-binds/probe.sh: line 11: /etc/hostname: Permission denied
+mount tmpfs: OK
+new bind rw of /wicket/ca: mount: /tmp/expb: permission denied.
+       dmesg(1) may have more information after failed mount system call.
+touch: cannot touch '/tmp/expb/.x': Read-only file system
+none /wicket/ca 9p ro,trans=fd,rfdno=13,wfdno=13,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=1000,cache=remote_revalidating,disable_fifo_open,directfs 0 0
+none /etc/hosts 9p ro,trans=fd,rfdno=16,wfdno=16,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=1000,cache=remote_revalidating,disable_fifo_open,directfs 0 0
+--- umount2
+/wicket/ca umount2 flags 0 -> Invalid argument
+/wicket/ca umount2 flags 2 -> Invalid argument
+/etc/hosts umount2 flags 0 -> Invalid argument
+/etc/hosts umount2 flags 2 -> Invalid argument

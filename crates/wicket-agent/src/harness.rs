@@ -75,6 +75,43 @@ pub struct MessagePush {
     pub method: String,
 }
 
+/// A driven harness's control channel (#363): the requests wicket makes of it besides turns
+/// (interrupt the running turn, change its permission mode), and its prompts before a tool call,
+/// which wicket answers. A state machine with no I/O, like the ACP client: fed the harness's stdout
+/// line by line, it returns the lines to write to its stdin and what happened.
+pub trait Controller: Send {
+    /// One line of the harness's stdout.
+    fn on_line(&mut self, line: &str) -> ControlStep;
+    /// Interrupts the running turn: the lines to write.
+    fn interrupt(&mut self) -> Vec<String>;
+    /// Changes the session's permission mode while it runs: the lines to write.
+    fn set_mode(&mut self, mode: RemotePermissionMode) -> Vec<String>;
+    /// Answers a prompt that [`ControlEvent::Prompt`] left to wicket (`refused: None`): the lines to
+    /// write, none if the harness no longer waits on it.
+    fn answer(&mut self, id: &str, allow: bool, why: &str) -> Vec<String>;
+}
+
+/// What a [`Controller`] made of a line: what to write back, and what happened.
+#[derive(Debug, Default, PartialEq)]
+pub struct ControlStep {
+    pub write: Vec<String>,
+    pub events: Vec<ControlEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlEvent {
+    /// The harness asks before a tool call. `kind` is the call's kind as ACP spells it (`edit`,
+    /// `execute`, `read`, `fetch`, `switch_mode`, `other`), `detail` a short, clipped account of its
+    /// input (agent data, for a human to read), `input` the input itself. `refused`: wicket's rule
+    /// refused it and the answer is already written (why); None: it is wicket's to decide, as an
+    /// approval, and to answer with [`Controller::answer`].
+    Prompt { id: String, tool: String, kind: String, detail: String, input: Value, refused: Option<String> },
+    /// The harness stopped waiting on a prompt (its turn was interrupted).
+    Withdrawn { id: String },
+    /// The harness's answer to one of wicket's control requests: what was asked, and Ok or why not.
+    Answered { what: String, result: Result<(), String> },
+}
+
 /// A harness's adapter. Every method takes the agent's manifest, so a harness can vary by its own
 /// settings (an ACP agent's profile, say).
 pub trait Adapter: Send + Sync {
@@ -112,6 +149,12 @@ pub trait Adapter: Send + Sync {
         _login_meta: &Value,
     ) -> Result<WrappedPlan, String> {
         Err(format!("agent.remote.drive: the {} harness has no driven remote mode", self.harness()))
+    }
+
+    /// The driven session's control channel (#363), for [`Mode::Driven`] and [`Mode::DrivenRemote`].
+    /// None (the default): wicket only writes turns, and nothing can be interrupted.
+    fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
+        None
     }
 
     /// What a [`Mode::DrivenRemote`] session's output line says of its remote session: Ok(its
@@ -356,23 +399,19 @@ impl Adapter for ClaudeCode {
         login_meta: &Value,
     ) -> Result<WrappedPlan, String> {
         let r = m.agent.as_ref().and_then(|a| a.remote.as_ref()).ok_or("agent.remote.drive needs agent.remote")?;
+        // `default` asks before acting: a driven Claude Code asks wicket (its stdin host), not the
+        // app, and wicket raises each prompt as an approval (#363).
         let mode = r.permission_mode();
-        if mode.is_default() {
-            // `claude -p` asks its stdin host, not the app, before an action that needs approval:
-            // wicket answers no such prompt, so the action would only be refused.
-            return Err(
-                "agent.remote.permission_mode \"default\" with drive: true: a driven Claude Code asks wicket, not the Claude app, \
-                        before acting, and wicket answers no such prompt; leave the mode out (bypassPermissions, as in any driven box, \
-                        with wicket's proxies deciding what the box can reach) or choose acceptEdits, auto, dontAsk or plan"
-                    .into(),
-            );
-        }
         let mode = self.remote_permission_mode(mode)?.unwrap_or(RemotePermissionMode::BypassPermissions.as_str());
         crate::claude_code_driven_remote_plan(m, run, session, first, login_meta, mode).map_err(|e| e.0)
     }
 
     fn driven_remote_status(&self, line: &str) -> Option<Result<String, String>> {
         crate::driven_remote_status(line)
+    }
+
+    fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
+        Some(Box::new(claude::control::Control::default()))
     }
 
     fn remote_permission_mode(&self, mode: RemotePermissionMode) -> Result<Option<&'static str>, String> {

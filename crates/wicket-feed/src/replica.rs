@@ -28,6 +28,11 @@
 //!   at most the newer one's), so dropping it loses nothing, and refusing it would report an honest
 //!   interleaving as a replay. A replayed statement gets the same treatment: it can never take
 //!   effect, which is what replay protection is for. Counted in [`Stats::superseded`].
+//! - **A delta already held** (#300, #324): each run commits its own deltas and sends them over its
+//!   own connection, but another run's catch-up may carry them first. A delta at an epoch the node
+//!   holds whose hash is the head it recorded at that epoch (the ring of [`crate::HEADS_KEPT`]) is
+//!   that delta again: superseded, like a statement, not refused. Any other delta at a held epoch
+//!   is a `replay`.
 //!
 //! # Effective deadlines (clock-skew guard)
 //!
@@ -146,7 +151,8 @@ pub enum Escalation<'a> {
 pub struct Stats {
     pub accepted: BTreeMap<&'static str, u64>,
     pub refused: BTreeMap<&'static str, u64>,
-    /// Statements that verified but were signed before the newest one held: not applied (#300).
+    /// Statements that verified but were signed before the newest one held, and deltas held
+    /// already (another publisher's catch-up carried them first): not applied (#300).
     pub superseded: u64,
     pub last_refusal: Option<String>,
 }
@@ -594,6 +600,14 @@ impl<P: Policy> Replica<P> {
         let (d, cert): (Delta<P>, _) = self.verify_live(jws, TYP_DELTA, now)?;
         if d.version != cert.version {
             return Err(Refusal::WrongVersion { want: cert.version, got: d.version });
+        }
+        // A delta the node already holds, by its chain head at that epoch, that came again over
+        // another publisher's connection (#300, #324): one run's catch-up carried another run's
+        // delta before that run's own copy arrived. It is that delta, so it takes effect once and
+        // isn't refused as a replay; a different delta at a held epoch still is (or is a fork).
+        let held = self.state.as_ref().filter(|st| d.feed == self.node && d.version == st.version && d.epoch <= st.epoch);
+        if held.is_some() && self.heads.get(&d.epoch) == Some(&sha(jws)) {
+            return Ok(Plan::Superseded);
         }
         let head = self.check_delta(&d, jws)?;
         Ok(Plan::Delta { d, jws: jws.into(), head })

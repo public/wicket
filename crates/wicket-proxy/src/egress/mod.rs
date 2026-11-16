@@ -102,7 +102,7 @@ pub struct Upstream {
 
 impl Upstream {
     pub(crate) fn lookup(&self) -> crate::dial::Lookup {
-        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()) }
+        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()), own: None }
     }
 }
 

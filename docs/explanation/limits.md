@@ -204,6 +204,25 @@ not a permanent decision.
   [#103](https://github.com/public/wicket/pull/103)). A link to a box on a remote node passes through the
   control host, and each connection into the target box costs a `docker exec` there.
 
+- **No size cap on a box's volumes** ([#377](https://github.com/public/wicket/issues/377)). A volume is
+  a host directory bind-mounted into the box, and neither Docker nor gVisor caps a bind mount's
+  size. Docker's `--storage-opt size` caps only a container's own writable layer, and only on
+  overlay2 over XFS with project quotas (or devicemapper). A volume driver's `size` option is
+  either memory (tmpfs) or needs a loopback filesystem per volume, made as root. So a box can fill
+  its node's disk through a volume. What bounds the damage: the node's reserve (its own state can
+  still be written, and its feed recovers once space frees), admission (no new box starts below
+  the disk floor), the health alert at 85%, and per-run caches deleted once collected.
+- **Admission reckons with what is free when a box starts.** A box's limit is checked against the
+  memory available then, less what the running boxes may still take. Memory used outside the boxes
+  afterwards (another process on the node, the page cache that isn't reclaimable) can still bring the
+  OOM killer. Pids aren't checked against the machine: each box has its own `pids` limit.
+- **Health needs a connection.** A node reports its health only on its control connections, so a
+  node with no run connected reports nothing, and the console can't tell a full disk on a silent
+  node from no news. A report older than 10 min raises no disk or feed alert.
+- **An uncollected workspace stays.** A remote node keeps the workspace of a run whose work was
+  never collected (no fetch, outbox, push or bundle) until an operator forces its deletion. Such
+  workspaces use the node's disk until then: the alert at 85% is what tells you.
+
 ## Hibernated agents
 
 - **Bundles are sealed, not signed.** Each object is encrypted and authenticated under the

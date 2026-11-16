@@ -10,6 +10,7 @@
 // shows one notification saying so; the console then offers a signed re-registration.
 const TAG = "wicket-pending";
 const RESUB_TAG = "wicket-resubscribe";
+const HEALTH_TAG = "wicket-health";
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 self.addEventListener("install", () => self.skipWaiting());
@@ -20,10 +21,12 @@ self.addEventListener("push", e => {
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = {}; }
   const body = typeof d.body === "string" && d.body ? d.body.slice(0, 300) : "A request is waiting for you.";
   const id = typeof d.id === "string" && ID.test(d.id) ? d.id : "";
+  // Node health alerts (#377) have their own tag, so they and the pending one don't replace each other.
+  const health = d.kind === "health";
   // One notification at a time (the tag), replaced by the next and announced again (renotify).
   e.waitUntil(self.registration.showNotification("wicket", {
-    body, tag: TAG, renotify: true, requireInteraction: false,
-    icon: "/static/icon-192.png", badge: "/static/icon-192.png", data: { id },
+    body, tag: health ? HEALTH_TAG : TAG, renotify: true, requireInteraction: health,
+    icon: "/static/icon-192.png", badge: "/static/icon-192.png", data: health ? { health: true } : { id },
   }));
 });
 
@@ -46,7 +49,8 @@ self.addEventListener("notificationclick", e => {
   e.notification.close();
   const resub = !!(e.notification.data && e.notification.data.resubscribe === true);
   const id = (e.notification.data && ID.test(e.notification.data.id || "")) ? e.notification.data.id : "";
-  const url = new URL(resub ? "/#notifications" : "/#pending" + (id ? "/" + id : ""), self.location.origin).href;
+  const health = !!(e.notification.data && e.notification.data.health === true);
+  const url = new URL(resub ? "/#notifications" : health ? "/#health" : "/#pending" + (id ? "/" + id : ""), self.location.origin).href;
   e.waitUntil((async () => {
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     for (const c of wins) {

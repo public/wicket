@@ -230,9 +230,9 @@ pub fn never_reachable(host: &str) -> Option<String> {
 
 /// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
 /// its parent's zone, a link beyond the default policy, a capacity lease, and accepting a wicket
-/// build (`request_update`, #162); and the quota grants wicket records when it carves a run's
+/// build (`request_update`, #162), a driven harness's prompt before a tool call (#363); and the quota grants wicket records when it carves a run's
 /// budget, children and bytes (#256), which no request makes.
-pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE", "QUOTA"];
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE", "QUOTA", "TOOL"];
 
 /// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
 pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
@@ -293,6 +293,7 @@ impl CompiledZone {
     /// forbid rule can't silently allow.
     pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
         spec.check_wildcards()?;
+        spec.llm.as_ref().map_or(Ok(()), crate::manifest::LlmSpec::check_models)?;
         let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
         // Forbid globs ignore ASCII case (see `ForbidRule::paths`). A glob that doesn't compile is
         // reported as written.
@@ -422,7 +423,9 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113))
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                // Cloud metadata outside those ranges (#366): Azure's WireServer.
+                || o == [168, 63, 129, 16])
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
@@ -482,6 +485,7 @@ zone:
         let op = |m: &str, h: &str| Op::egress(&t, &r, "z", m, h, "/");
         assert!(op("spawn", "api.example.com").is_reserved());
         assert!(op("update", "api.example.com").is_reserved());
+        assert!(op("TOOL", "wicket.internal").refused_for_agents().is_some());
         assert!(op("GET", "wicket.internal").is_reserved());
         assert!(op("GET", "api.example.com").refused_for_agents().is_none());
         assert!(op("PROPFIND", "api.example.com").refused_for_agents().is_some());
