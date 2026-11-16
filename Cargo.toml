@@ -50,7 +50,9 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.11"
 hex = "0.4"
-ulid = "1"
+# Without its `std` feature, which brings rand 0.9 (a second rand, #219): ids come from
+# `wicket_core::new_ulid`, with the OS's randomness.
+ulid = { version = "1", default-features = false }
 globset = "0.4"
 url = "2"
 clap = { version = "4", features = ["derive"] }

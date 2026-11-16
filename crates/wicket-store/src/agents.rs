@@ -36,7 +36,7 @@ pub const HELD: &[&str] = &["active", "hibernating", "waking"];
 
 /// A new agent id: `agt_` and 26 lowercase ULID characters.
 pub fn new_agent_id() -> String {
-    format!("agt_{}", ulid::Ulid::new().to_string().to_lowercase())
+    format!("agt_{}", wicket_core::new_ulid().to_string().to_lowercase())
 }
 
 /// Whether `id` is an agent id wicket made.

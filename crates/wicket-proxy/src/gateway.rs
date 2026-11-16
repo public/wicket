@@ -725,7 +725,7 @@ impl Gateway {
         if me.claims.exp <= now {
             return ("not decided: this agent's identity has expired and was not refreshed".into(), true);
         }
-        let jti = format!("d-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let jti = format!("d-{}", wicket_core::new_ulid().to_string().to_lowercase());
         let payload = match decision {
             "renew" => json!({
                 "jti": jti, "iat": now, "kind": crate::DECISION_KIND,

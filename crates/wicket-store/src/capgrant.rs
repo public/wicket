@@ -275,7 +275,7 @@ impl Ledger {
         if let Err(why) = covers(&g.terms, &used, ask) {
             return Ok(Err(why));
         }
-        let use_id = format!("cu-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let use_id = format!("cu-{}", wicket_core::new_ulid().to_string().to_lowercase());
         tx.execute(
             "INSERT INTO capacity_uses (id, grant_id, request_id, node, plan, region, hourly, worst, created_at, status, instance, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'approved', NULL, NULL)",

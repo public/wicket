@@ -3643,7 +3643,6 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
- "rand 0.9.5",
  "web-time",
 ]
 
@@ -3978,7 +3977,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "ulid",
  "url",
  "wicket-agent",
  "wicket-auth",
@@ -4000,6 +3998,7 @@ name = "wicket-core"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "getrandom 0.4.3",
  "globset",
  "hex",
  "humantime",
@@ -4055,6 +4054,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "getrandom 0.4.3",
  "hex",
  "http",
  "http-body-util",
@@ -4128,7 +4128,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "ulid",
  "webpki-roots",
  "wicket-authz",
  "wicket-core",
@@ -4187,7 +4186,6 @@ dependencies = [
  "sha2",
  "tar",
  "thiserror",
- "ulid",
  "wicket-core",
  "zstd",
 ]

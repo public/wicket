@@ -415,7 +415,7 @@ mod tests {
     }
 
     fn tmp() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("wicket-registry-test-{}-{}", std::process::id(), ulid::Ulid::new()));
+        let d = std::env::temp_dir().join(format!("wicket-registry-test-{}-{}", std::process::id(), wicket_core::new_ulid()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

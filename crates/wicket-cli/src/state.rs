@@ -61,7 +61,7 @@ fn lineages(st: &crate::s3::S3Store) -> Result<Vec<Lineage>> {
 
 /// Starts a new lineage for this host: recorded here and appended to the store's list.
 fn new_lineage(st: &crate::s3::S3Store, mut list: Vec<Lineage>) -> Result<String> {
-    let id = ulid::Ulid::new().to_string().to_lowercase();
+    let id = wicket_core::new_ulid().to_string().to_lowercase();
     list.push(Lineage { id: id.clone(), since: wicket_feed::now_ms() });
     st.put_overwrite(LINEAGES, serde_json::to_vec(&list)?)?;
     std::fs::write(lineage_file(), &id)?;

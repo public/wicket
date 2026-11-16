@@ -335,7 +335,7 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         let why = format!("the org policy ({}) doesn't let zone {} hear from zone {my_zone}", o.version, to_zone.name);
         return refused_here(node, run, to, &why);
     }
-    let id = format!("m-node-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let id = format!("m-node-{}", wicket_core::new_ulid().to_string().to_lowercase());
     node.edge.post(LocalMessage {
         id: id.clone(),
         to: to_run.clone(),
@@ -359,7 +359,7 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
 /// A message refused on this node while cut off (#252): on its audit log, with a receipt for the
 /// sender that says why.
 fn refused_here(node: &Node, run: &str, to: &str, why: &str) -> (String, bool) {
-    let id = format!("m-node-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let id = format!("m-node-{}", wicket_core::new_ulid().to_string().to_lowercase());
     node.audit_note(run, "node.message_refused", json!({ "id": id, "to": to, "why": why }));
     let receipt = json!({ "message_id": id, "to": to, "state": "refused", "why": why, "verified_by": format!("node {}", node.name) });
     (format!("refused: {id} was not delivered: {why}\nreceipt: {receipt}"), true)
