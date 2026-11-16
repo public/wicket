@@ -55,10 +55,13 @@ fn replay_protection_survives_a_reboot() {
     let replay = Frame::new(FrameKind::Fresh, sign(&cp.feed_key, TYP_FRESH, &replay));
     assert_eq!(r.accept(&replay, T0 + 20).unwrap_err().kind(), "replay");
     r.accept(&later, T0 + 20).expect("a later statement is fine");
-    // The deltas already held are replays, too.
+    // A delta already held, again, never takes effect twice: it is the one held at its epoch, so
+    // superseded (#300), across the reboot too.
     let log = std::fs::read_to_string(cp.p.log_path()).unwrap();
     let first = Frame::new(FrameKind::Delta, log.lines().next().unwrap().into());
-    assert_eq!(r.accept(&first, T0 + 21).unwrap_err().kind(), "replay");
+    let held = r.state().unwrap().head.clone();
+    r.accept(&first, T0 + 21).expect("superseded");
+    assert_eq!((r.state().unwrap().head.clone(), r.stats.superseded), (held, 1));
 }
 
 #[test]
@@ -162,7 +165,8 @@ fn publisher_log_survives_restarts_and_torn_writes() {
     let mut r = cp.replica();
     let frames = cp.p.catch_up(&Hello { node: NODE.into(), ..Default::default() }, T0 + 3).unwrap();
     feed(&mut r, frames, T0 + 3);
-    assert_eq!(r.accept(&d, T0 + 3).unwrap_err().kind(), "replay", "already in the snapshot");
+    r.accept(&d, T0 + 3).expect("already in the snapshot: superseded");
+    assert_eq!((r.state().unwrap().epoch, r.stats.superseded), (3, 1));
     assert!(r.state().unwrap().grants.contains_key("b"));
     // A log that isn't a chain is refused.
     let log = std::fs::read_to_string(cp.p.log_path()).unwrap();

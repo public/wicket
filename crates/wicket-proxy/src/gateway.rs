@@ -13,7 +13,10 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// The waits are on tokio's clock, as their sleeps are: the same as the OS's in production, and
+// the simulated one in the deterministic simulation (#324).
+use tokio::time::Instant;
 
 /// The most uses one `decide` approval may grant: an agent's grants are always bounded (#50).
 pub const MAX_DECIDE_USES: u32 = 100;
@@ -121,6 +124,14 @@ impl Gateway {
             Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
         };
         body(StatusCode::OK, Some(reply))
+    }
+
+    /// The deterministic simulation's seam (#324): a `tools/call` without HTTP, as a relayed call
+    /// from a box's node reaches it. The `sim` feature only adds this.
+    #[cfg(feature = "sim")]
+    pub async fn sim_call(&self, name: &str, args: Value) -> (String, bool) {
+        let r = self.call(&json!({ "name": name, "arguments": args })).await;
+        (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
     }
 
     async fn call(&self, params: &Value) -> Value {

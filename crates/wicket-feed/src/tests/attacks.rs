@@ -68,10 +68,22 @@ fn a01_tampered_delta() {
     refused(&mut r, Frame::new(FrameKind::Delta, tamper(&d.jws, &p)), T0 + 20, "bad_signature");
 }
 
+/// A delta the node holds, sent again (#300, #324: honestly, another run's catch-up carried it
+/// first; or by an attacker): it never takes effect again. It is the very delta held at its epoch,
+/// so it is superseded rather than refused; a different delta at a held epoch is a `replay`
+/// (`a17`'s restored control plane).
 #[test]
 fn a02_replayed_old_delta() {
     let (_cp, mut r, deltas) = at_epoch_3();
-    refused(&mut r, deltas[0].clone(), T0 + 20, "replay");
+    let (epoch, head) = (r.state().unwrap().epoch, r.state().unwrap().head.clone());
+    for d in &deltas {
+        r.accept(d, T0 + 20).expect("a held delta again is superseded");
+    }
+    let st = r.state().unwrap();
+    assert_eq!((st.epoch, &st.head), (epoch, &head), "nothing applied twice");
+    assert_eq!(r.stats.superseded, 2);
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    assert_eq!(r.mode(T0 + 20), Mode::Fresh);
 }
 
 #[test]

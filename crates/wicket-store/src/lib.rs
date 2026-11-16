@@ -93,7 +93,9 @@ pub enum StoreError {
 /// `grants.args_sha256` (the decided-on arguments' hash), `grants.effect_sha256` (the approved
 /// descriptor's), and the indexes a run's recent egress (`audit_run`) and its pending requests
 /// (`requests_run`) are read by.
-pub const SCHEMA_VERSION: u32 = 10;
+/// Version 11 (expand) adds `runs.uncollected`: the node keeping a run's files that a fetch didn't
+/// bring back (#300, #324), which holds the node.
+pub const SCHEMA_VERSION: u32 = 11;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -269,7 +271,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, agent TEXT NOT NULL,
   status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, detail TEXT, owner TEXT, lease TEXT, node TEXT, policy TEXT,
-  authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER
+  authority_until INTEGER, authority_cap INTEGER, activity TEXT, activity_at INTEGER, uncollected TEXT
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
@@ -503,6 +505,8 @@ impl Ledger {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq); CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status)",
         )?;
+        // Ledgers created before a run's uncollected files held its node (#300, #324).
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 

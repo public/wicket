@@ -502,6 +502,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
     let node_name = node.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| crate::localnode::NAME.to_string());
+    if node.is_some() {
+        crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?;
+    }
     // This host's own node shares its filesystem. That is only transport: it lays the box out in the
     // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
     // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
@@ -2140,6 +2143,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Err(e) => {
                 // Loudly (#300): the box's work isn't here. Its node keeps it (not forgotten).
                 let msg = format!("fetching the box's files from node {node_name} failed: {e:#} (the node keeps them)");
+                // The run holds its node until they are collected: the reconciler doesn't release
+                // it with them (#324).
+                let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
                 println!("[wicket] {msg}");
                 eprintln!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(
