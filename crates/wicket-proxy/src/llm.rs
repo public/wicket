@@ -512,7 +512,7 @@ impl Llm {
         let spec = self.ctx.zone.llm.as_ref().ok_or_else(|| anyhow::anyhow!("this zone has no model route"))?;
         let (parts, body) = req.into_parts();
         let body = Limited::new(body, MAX_REQUEST_BODY).collect().await.map_err(|e| anyhow::anyhow!("request body: {e}"))?.to_bytes();
-        let Filtered { body, model, note, reserved } = match self.filter(Some(spec), &parts, body) {
+        let Filtered { body, model, mut note, reserved } = match self.filter(Some(spec), &parts, body) {
             Ok(f) => f,
             Err(r) => return Ok(*r),
         };
@@ -528,7 +528,7 @@ impl Llm {
                 return Ok(problem(503, "credential", "Model credential unavailable on this node", &format!("{e:#}"), None));
             }
         }
-        let up = self.send_upstream(spec, &parts, body).await.map(|r| {
+        let up = self.send_once_more_if_relogged(spec, &parts, body, model.as_deref(), &mut note).await.map(|r| {
             let (status, headers) = (r.status().as_u16(), r.headers().clone());
             let stream = r.bytes_stream().map(|c| c.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).boxed();
             (status, headers, stream)
@@ -551,11 +551,68 @@ impl Llm {
         Ok(out.body(body)?)
     }
 
+    /// Sends a call upstream with the model secret's current value; if the upstream refuses that
+    /// value (401: a login refreshed by its owner while the call was out revokes the old access
+    /// token, #360), reads the secret again from its source and, only if the value changed, sends
+    /// the call once more with the new one. The retry is audited; an unchanged value is never sent
+    /// again, so a real revocation still surfaces as the 401. Nothing of the first response has
+    /// reached the box when this decides (its body is only streamed by [`Llm::account`], after),
+    /// and the request body is the one this proxy holds, so the box sees one call either way.
+    async fn send_once_more_if_relogged(
+        &self,
+        spec: &wicket_core::manifest::LlmSpec,
+        parts: &http::request::Parts,
+        body: Bytes,
+        model: Option<&str>,
+        note: &mut String,
+    ) -> Result<reqwest::Response> {
+        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
+        let token = self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await?;
+        let first = self.send_upstream(spec, parts, body.clone(), &token).await?;
+        if first.status() != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let fresh = match self.ctx.vault.refetch(&spec.secret).await {
+            Ok(()) => self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await,
+            Err(e) => Err(e),
+        };
+        let fresh = match fresh {
+            Ok(f) if f != token => f,
+            Ok(_) => {
+                note.push_str(&format!(
+                    "; upstream refused the credential (401); secret {:?} read again is unchanged: not retried",
+                    spec.secret
+                ));
+                return Ok(first);
+            }
+            Err(e) => {
+                note.push_str(&format!(
+                    "; upstream refused the credential (401); secret {:?} could not be read again ({e:#}): not retried",
+                    spec.secret
+                ));
+                return Ok(first);
+            }
+        };
+        drop(first);
+        self.event(
+            model.map(String::from),
+            401,
+            Usage::default(),
+            &format!(
+                "upstream refused the credential (401); secret {:?} has changed since it was read: retrying once with its new value",
+                spec.secret
+            ),
+        );
+        note.push_str(&format!("; retried once after a 401 with the new value of secret {:?}", spec.secret));
+        self.send_upstream(spec, parts, body, &fresh).await
+    }
+
     async fn send_upstream(
         &self,
         spec: &wicket_core::manifest::LlmSpec,
         parts: &http::request::Parts,
         body: Bytes,
+        token: &str,
     ) -> Result<reqwest::Response> {
         let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
         let url = format!("{}{}", spec.upstream.trim_end_matches('/'), pq);
@@ -569,12 +626,11 @@ impl Llm {
             }
         }
         // The real credential, attached as the provider's profile says (the one slot it uses).
-        // Only to an upstream the secret is bound to, whatever the zone's `upstream` says.
-        let up_host = reqwest::Url::parse(&spec.upstream)?.host_str().map(String::from).unwrap_or_default();
-        let token = self.ctx.vault.get_for_patiently(&spec.secret, &up_host, SECRET_PATIENCE).await?;
+        // Only to an upstream the secret is bound to ([`Llm::send_once_more_if_relogged`] read it
+        // for this host), whatever the zone's `upstream` says.
         let profile =
             crate::provider::profile(&spec.provider).ok_or_else(|| anyhow::anyhow!("no provider profile for {:?}", spec.provider))?;
-        rb = (profile.attach)(rb, &token).header("accept-encoding", "identity");
+        rb = (profile.attach)(rb, token).header("accept-encoding", "identity");
         Ok(rb.body(body).send().await?)
     }
 

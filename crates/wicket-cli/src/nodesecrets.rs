@@ -414,24 +414,36 @@ impl wicket_proxy::vault::SecretSource for RunSecrets {
     }
 
     fn fetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let lock = {
-                let mut m = self.cache.inflight.lock().expect("inflight");
-                m.entry((self.run.clone(), name.to_string())).or_default().clone()
-            };
-            let _one = lock.lock().await;
-            if self.has(name) {
-                return Ok(());
+        Box::pin(self.fetch_from_control_host(name, false))
+    }
+
+    /// The upstream refused the value held (#360): ask the control host for the current one, even
+    /// though it is held (it may not have said yet that the secret changed).
+    fn refetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(self.fetch_from_control_host(name, true))
+    }
+}
+
+impl RunSecrets {
+    /// Fetches `name` for this run, one fetch at a time per run and name: if it isn't held, or
+    /// always with `again`.
+    async fn fetch_from_control_host(&self, name: &str, again: bool) -> Result<()> {
+        let lock = {
+            let mut m = self.cache.inflight.lock().expect("inflight");
+            m.entry((self.run.clone(), name.to_string())).or_default().clone()
+        };
+        let _one = lock.lock().await;
+        if !again && self.has(name) {
+            return Ok(());
+        }
+        match (self.fetch)(self.run.clone(), name.to_string()).await {
+            Ok(f) if f.name == name => {
+                self.cache.put(&self.run, &f);
+                Ok(())
             }
-            match (self.fetch)(self.run.clone(), name.to_string()).await {
-                Ok(f) if f.name == name => {
-                    self.cache.put(&self.run, &f);
-                    Ok(())
-                }
-                Ok(_) => bail!("the control host sent another secret"),
-                Err(e) => bail!("{e}"),
-            }
-        })
+            Ok(_) => bail!("the control host sent another secret"),
+            Err(e) => bail!("{e}"),
+        }
     }
 }
 
