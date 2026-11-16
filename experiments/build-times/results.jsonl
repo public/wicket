@@ -7,3 +7,17 @@
 {"label":"after-j1","step":"touch-cli","secs":43.58,"peak_mib":1978,"commit":"f7dc5f1","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1","step":"test-build","secs":4.14,"peak_mib":103,"commit":"f7dc5f1","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1","step":"test-run-failed","secs":387.65,"peak_mib":811,"commit":"f7dc5f1","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-clean","secs":194.78,"peak_mib":2458,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-test-cold","secs":32.77,"peak_mib":2827,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-core","secs":9.78,"peak_mib":1979,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-core","secs":8.65,"peak_mib":1963,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-core","secs":8.58,"peak_mib":1973,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-cli","secs":5.63,"peak_mib":1959,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-cli","secs":5.58,"peak_mib":1961,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-touch-cli","secs":5.56,"peak_mib":1953,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-clippy","secs":4.6,"peak_mib":1478,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-clippy","secs":4.4,"peak_mib":1475,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-clippy","secs":4.38,"peak_mib":1473,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-test","secs":6.85,"peak_mib":2169,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-test","secs":6.82,"peak_mib":2184,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"base-j2","step":"cli-test","secs":7.21,"peak_mib":2171,"commit":"8275c33","jobs":"2","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}

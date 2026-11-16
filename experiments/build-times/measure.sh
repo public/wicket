@@ -13,6 +13,15 @@
 #   test-run     cargo test --workspace (built already: the tests' own time)
 #   sizes        target dir size, test binary count and sizes
 #   release      cargo build --release -p wicket-cli, from an empty target dir (its own)
+#   cli-clean    cargo build -p wicket-cli (debug), from an empty target dir, with --timings
+#   cli-test-cold  cargo test -p wicket-cli --no-run, after cli-clean (what the test build adds)
+#   cli-touch-core cargo build -p wicket-cli after a one-line change in wicket-core
+#   cli-touch-cli  the same after a one-line change in wicket-cli
+#   cli-clippy   cargo clippy -p wicket-cli --all-targets after a one-line change in wicket-cli
+#   cli-test     cargo test -p wicket-cli --no-run after a one-line change in wicket-cli
+#
+# The cli-touch-*, cli-clippy and cli-test steps run REPEAT times (default 3), each recorded; their
+# first run is primed (built once untimed), so each timed run starts warm.
 #
 # The environment decides how it builds: CARGO_BUILD_JOBS, RUSTC_WRAPPER (unset it for a cold
 # compile), CARGO_INCREMENTAL, RUSTFLAGS. They are recorded with each line. Wall time and peak
@@ -43,7 +52,10 @@ timed() { # step command...: runs it, records wall time and peak memory
   local step=$1; shift
   local tf; tf=$(mktemp)
   local st=0
-  "${TIME:-/usr/bin/time}" -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || st=$?
+  local timer=("${TIME:-/usr/bin/time}")
+  # No GNU time (a box): the same two numbers from peaktime.py.
+  [ -x "${timer[0]}" ] || timer=(python3 -I "$out/peaktime.py")
+  "${timer[@]}" -f '%e %M' -o "$tf" "$@" >"$out/.last.log" 2>&1 || st=$?
   # A failed build stops the run; failed tests are recorded as such (test-run-failed).
   if [ "$st" != 0 ] && [ "$step" != test-run ]; then
     tail -20 "$out/.last.log"
@@ -61,6 +73,17 @@ touch_and_build() { # step file
   git checkout -- "$2"
   # Back to the committed source, so the next step starts from it.
   cargo build --workspace --all-targets --locked >/dev/null 2>&1
+}
+
+touch_cli() { # step file command...: a one-line change in file, then command, timed; reverted
+  local step=$1 file=$2; shift 2
+  "$@" >/dev/null 2>&1 || true
+  for _ in $(seq "${REPEAT:-3}"); do
+    printf '\n// measure.sh: a one-line change\n' >>"$file"
+    timed "$step" "$@" || { git checkout -- "$file"; return 1; }
+    git checkout -- "$file"
+    "$@" >/dev/null 2>&1
+  done
 }
 
 for s in "${steps[@]}"; do
@@ -91,6 +114,16 @@ for s in "${steps[@]}"; do
       cp "$CARGO_TARGET_DIR-release"/cargo-timings/cargo-timing.html "$out/timings-$label-release.html"
       rm -rf "$CARGO_TARGET_DIR-release"
       ;;
+    cli-clean)
+      rm -rf "$CARGO_TARGET_DIR"
+      timed cli-clean cargo build -p wicket-cli --locked --timings
+      cp "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html "$out/timings-$label-cli-clean.html"
+      ;;
+    cli-test-cold) timed cli-test-cold cargo test -p wicket-cli --locked --no-run ;;
+    cli-touch-core) touch_cli cli-touch-core crates/wicket-core/src/lib.rs cargo build -p wicket-cli --locked ;;
+    cli-touch-cli) touch_cli cli-touch-cli crates/wicket-cli/src/main.rs cargo build -p wicket-cli --locked ;;
+    cli-clippy) touch_cli cli-clippy crates/wicket-cli/src/main.rs cargo clippy -p wicket-cli --all-targets --locked ;;
+    cli-test) touch_cli cli-test crates/wicket-cli/src/main.rs cargo test -p wicket-cli --locked --no-run ;;
     *) echo "unknown step $s" >&2; exit 2 ;;
   esac
 done
