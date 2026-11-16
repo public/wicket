@@ -1410,7 +1410,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             }
         }
         if wicket_core::timing::enabled() {
-            print!("[wicket] timings (ms from this supervisor's start; node.start.* on node {node_name}'s clock, from when the start was sent):\n{}", wicket_core::timing::table(&timings.spans()));
+            say!(
+                "[wicket] timings (ms from this supervisor's start; node.start.* on node {node_name}'s clock, from when the start was sent):\n{}",
+                wicket_core::timing::table(&timings.spans()).trim_end()
+            );
         }
         (BoxProc(nb.exit), Stopper(nb.ctl), si, so, Box::new(nb.stderr) as Reader)
     };
