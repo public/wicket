@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and test times (#219): one labelled set of measurements of this checkout, appended as JSON
-# lines to experiments/build-times/results.jsonl, with each clean build's `cargo --timings` report
-# kept as timings-<label>-<step>.html.
+# lines to experiments/build-times/results.jsonl, with each clean build's `cargo --timings` units
+# kept as timings-<label>-<step>.json (units.py: each unit's seconds, the longest first).
 #
 #   experiments/build-times/measure.sh LABEL [STEP...]
 #
@@ -92,7 +92,7 @@ for s in "${steps[@]}"; do
     clean)
       rm -rf "$CARGO_TARGET_DIR"
       timed clean cargo build --workspace --all-targets --locked --timings
-      cp "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html "$out/timings-$label-clean.html"
+      python3 -I "$out/units.py" "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html >"$out/timings-$label-clean.json"
       ;;
     touch-core) touch_and_build touch-core crates/wicket-core/src/lib.rs ;;
     touch-cli) touch_and_build touch-cli crates/wicket-cli/src/main.rs ;;
@@ -112,13 +112,13 @@ for s in "${steps[@]}"; do
     release)
       rm -rf "$CARGO_TARGET_DIR-release"
       CARGO_TARGET_DIR=$CARGO_TARGET_DIR-release timed release cargo build --release --locked -p wicket-cli --timings
-      cp "$CARGO_TARGET_DIR-release"/cargo-timings/cargo-timing.html "$out/timings-$label-release.html"
+      python3 -I "$out/units.py" "$CARGO_TARGET_DIR-release"/cargo-timings/cargo-timing.html >"$out/timings-$label-release.json"
       rm -rf "$CARGO_TARGET_DIR-release"
       ;;
     cli-clean)
       rm -rf "$CARGO_TARGET_DIR"
       timed cli-clean cargo build -p wicket-cli --locked --timings
-      cp "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html "$out/timings-$label-cli-clean.html"
+      python3 -I "$out/units.py" "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html >"$out/timings-$label-cli-clean.json"
       ;;
     cli-clippy-clean)
       rm -rf "$CARGO_TARGET_DIR"

@@ -68,7 +68,9 @@ previous build, so incremental state would only take space there.
 ## Scripts
 
 - `loop.sh LABEL [proxy|cli|core…]`: the loop above, for the environment it runs in.
-- `measure.sh LABEL [STEP…]`: clean, incremental, test and release builds, with `cargo --timings`.
+- `measure.sh LABEL [STEP…]`: clean, incremental, test and release builds, with `cargo --timings`
+  (summarized by `units.py`), and wicket-cli's own steps (`cli-*`); `peaktime.py` stands in for GNU
+  time where there is none.
 
 ## Second round: fewer test binaries, one crypto generation
 
@@ -147,7 +149,7 @@ The `base-j2` rows are three clean builds of the base at `-j2`, for scale: 194.8
 192.5 s. Incremental steps were run three times each (medians below); clean builds once each,
 since one run takes six minutes and the box warned about memory every time. Clean builds at `-j1` are
 nearly serial, so their wall time is close to the sum of the units in `cargo --timings`
-(timings-*-j1c-cli-clean.html). That sum is the more reliable measure: 353.1 s vs. 327.6 s.
+(timings-*-j1c-cli-clean.json, from `units.py`). That sum is the more reliable measure: 353.1 s vs. 327.6 s.
 
 | step (wicket-cli, debug) | before | after |
 |---|---|---|
