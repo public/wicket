@@ -12,8 +12,14 @@
 #
 # Suites: docs (check-public, Markdown links, terms),
 # policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
-# install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on
-# PRs: node-e2e, acceptance-nodes (acceptance --nodes local), update.
+# install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
+# (acceptance --nodes local), update. And one per fuzz target (#323, ci/fuzz.sh): fuzz-egress,
+# fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git.
+#
+# In a crate, a rule naming only fuzz targets (crates `-`) adds them without narrowing anything: the
+# file still selects what the other rules (or none) say. An unmapped crate file selects every
+# end-to-end suite but only the fuzz targets tagged on it; a file selecting everything selects every
+# target too.
 
 # ---- the selection itself, the build and the toolchain: everything ----
 ci/affected.py                     | all | all
@@ -90,7 +96,7 @@ crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodecreate.rs| -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
 crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
 crates/wicket-placement/**         | -   | acceptance-nodes
@@ -127,6 +133,58 @@ ci/node-e2e/**                     | -   | node-e2e
 ci/update.sh                       | -   | update
 ci/update/**                       | -   | update
 ci/policy-diff.sh                  | -   | policy
+
+# ---- fuzz targets (#323): the harnesses and their inputs ----
+# fuzz/ is its own workspace (not a crate here): a change to it selects targets, never the crates
+# (its Cargo.toml and Cargo.lock select everything, by the rules at the top).
+fuzz/src/lib.rs                    | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+fuzz/tests/**                      | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+fuzz/examples/**                   | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+fuzz/.gitignore                    | -   | -
+ci/fuzz.sh                         | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+fuzz/src/util.rs                   | -   | fuzz-egress fuzz-gateway
+fuzz/src/egress.rs                 | -   | fuzz-egress fuzz-gateway
+fuzz/src/node_chan.rs              | -   | fuzz-chan
+fuzz/*/egress.rs                   | -   | fuzz-egress
+fuzz/*/gateway.rs                  | -   | fuzz-gateway
+fuzz/*/chan.rs                     | -   | fuzz-chan
+fuzz/*/feed.rs                     | -   | fuzz-feed
+fuzz/*/token.rs                    | -   | fuzz-token
+fuzz/*/manifest.rs                 | -   | fuzz-manifest
+fuzz/*/store.rs                    | -   | fuzz-store
+fuzz/*/git.rs                      | -   | fuzz-git
+fuzz/corpus/egress/**              | -   | fuzz-egress
+fuzz/corpus/gateway/**             | -   | fuzz-gateway
+fuzz/corpus/chan/**                | -   | fuzz-chan
+fuzz/corpus/feed/**                | -   | fuzz-feed
+fuzz/corpus/token/**               | -   | fuzz-token
+fuzz/corpus/manifest/**            | -   | fuzz-manifest
+fuzz/corpus/store/**               | -   | fuzz-store
+fuzz/corpus/git/**                 | -   | fuzz-git
+fuzz/regressions/egress/**         | -   | fuzz-egress
+fuzz/regressions/gateway/**        | -   | fuzz-gateway
+fuzz/regressions/chan/**           | -   | fuzz-chan
+fuzz/regressions/feed/**           | -   | fuzz-feed
+fuzz/regressions/token/**          | -   | fuzz-token
+fuzz/regressions/manifest/**       | -   | fuzz-manifest
+fuzz/regressions/store/**          | -   | fuzz-store
+fuzz/regressions/git/**            | -   | fuzz-git
+
+# ---- fuzz targets: the code each one fuzzes (tags; see the top) ----
+# Every target depends on wicket-core.
+crates/wicket-core/src/**          | -   | fuzz-egress fuzz-gateway fuzz-chan fuzz-feed fuzz-token fuzz-manifest fuzz-store fuzz-git
+# The chan target compiles the CLI's channel modules, which carry proxy, feed and identity types.
+crates/wicket-proxy/src/**         | -   | fuzz-egress fuzz-gateway fuzz-chan
+crates/wicket-cli/src/chan.rs      | -   | fuzz-chan
+crates/wicket-cli/src/nodesecrets.rs | - | fuzz-chan
+crates/wicket-cli/src/oci.rs       | -   | fuzz-chan
+crates/wicket-cli/src/registry.rs  | -   | fuzz-chan
+crates/wicket-feed/src/**          | -   | fuzz-feed fuzz-chan
+crates/wicket-authz/src/**         | -   | fuzz-feed fuzz-token fuzz-manifest fuzz-chan
+crates/wicket-agent/src/**         | -   | fuzz-manifest
+crates/wicket-policy/src/**        | -   | fuzz-manifest
+crates/wicket-store/src/**         | -   | fuzz-store fuzz-egress fuzz-gateway fuzz-chan
+crates/wicket-identity/src/**      | -   | fuzz-chan
 # #322: the Lean spec (its oracle test in wicket-authz reads it) and the test itself. wicket-core,
 # grant.rs and the toolchain files aren't listed, so they select every suite, this one included.
 verification/lean/**               | wicket-authz | lean

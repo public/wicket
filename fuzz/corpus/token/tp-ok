@@ -1,0 +1,1 @@
+Tapproved("g", "h", "GET", "/") <- time($t), $t <= 2030-01-01T00:00:00Z, box("b0/b1/b2"), epoch(3), uses_left("g", $n), $n > 0;

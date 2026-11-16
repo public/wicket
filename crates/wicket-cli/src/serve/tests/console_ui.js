@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "placed", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -322,6 +322,37 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.ok(ids["confirm-what"].textContent.includes("running runs using it: run_a"));
   ids["confirm-cancel"].listeners.click(); await flush();
   console.log("console secrets: ok");
+
+  // The Capacity card (#256): each live grant with what it covers, uses and leaves; Renew is a
+  // signed action, Revoke only the session; the form issues one through a signed action.
+  const grant = { id: "g-cap1", principal: "spiffe://x/t/t0/op/unix/" + HOSTILE, decided_by: "passkey:laptop", expires_at: 5000, created_at: 1,
+    terms: { plans: ["vc2-1c-2gb"], regions: ["lhr"], hourly_usd: "$0.0500", daily_usd: "$1.0000", nodes: 2 },
+    used: { nodes: 1, hourly_usd: "$0.0140", daily_usd: "$0.0200" }, left: { nodes: 1, hourly_usd: "$0.0360", daily_usd: "$0.9800" } };
+  state = { ...base, pending: [], capacity: [grant] };
+  await run("refresh()"); await flush();
+  const capRow = ids.capacity.children[0];
+  assert.ok(capRow.textContent.includes("g-cap1") && capRow.textContent.includes("left 1 node(s)") && capRow.textContent.includes("vc2-1c-2gb in lhr"), capRow.textContent);
+  assert.strictEqual(ids.capacity.all(n => n.tagName === "img").length, 0, "a principal stays text");
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_renew", grant: "g-cap1", principal: grant.principal, terms: grant.terms, ttl_secs: 28800 };
+  capRow.all(n => n.tagName === "button" && n.textContent === "Renew")[0].click(); await flush();
+  assert.deepStrictEqual([began().pop().body.action, began().slice(-1)[0].body.id, began().slice(-1)[0].body.ttl_secs], ["capacity_renew", "g-cap1", 28800]);
+  assert.ok(ids["confirm-what"].textContent.startsWith("Renew capacity grant g-cap1"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  await capRow.all(n => n.tagName === "button" && n.textContent === "Revoke")[0].click(); await flush();
+  assert.deepStrictEqual(calls.filter(c => c.path === "/api/capacity/revoke").map(c => c.body), [{ id: "g-cap1" }]);
+  const inputs = ids["capacity-form"].all(n => n.tagName === "input");
+  assert.strictEqual(inputs.length, 7);
+  ["unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", "2", "4"].forEach((v, i) => { inputs[i].value = v; });
+  await advance(1000);
+  nextAction = { v: 1, action: "capacity_grant", principal: "spiffe://x/t/t0/op/unix/alex", terms: grant.terms, ttl_secs: 14400 };
+  ids["capacity-form"].all(n => n.tagName === "button")[0].click(); await flush();
+  const g = began().pop().body;
+  assert.deepStrictEqual([g.action, g.principal, g.plans, g.regions, g.max_hourly_usd, g.max_daily_usd, g.nodes, g.ttl_secs],
+    ["capacity_grant", "unix/alex", "vc2-1c-2gb", "lhr", "0.05", "1", 2, 14400]);
+  assert.ok(ids["confirm-what"].textContent.startsWith("Grant spiffe://x/t/t0/op/unix/alex 2 node(s) at once"), ids["confirm-what"].textContent);
+  ids["confirm-cancel"].listeners.click(); await flush();
+  console.log("console capacity: ok");
 
   // The service worker: a replaced subscription is subscribed again with the same key, any open
   // console is told, and one notification says so; tapping it opens the console's notifications.

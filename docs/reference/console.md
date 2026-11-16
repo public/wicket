@@ -53,9 +53,39 @@ exactly its parameters, checked again when applied, audited with the passkey tha
 - **store or replace a secret, change its hosts, or delete it** (`set_secret`, `secret_hosts`,
   `delete_secret`): see [secrets](#secrets). The passkey signs a salted sha256 of a value, never
   the value.
+- **issue and renew a capacity grant** (`capacity_grant`, `capacity_renew`): see
+  [capacity grants](#capacity-grants). Revoking one needs only the session.
 
 Open it as `http://localhost:8787` (WebAuthn needs a secure context). `wicket approve` on the host remains a
 break-glass path and is audited as such.
+
+## Capacity grants
+
+A capacity grant lets a principal lease nodes with `wicket node create` without asking each time
+([#256](https://github.com/public/wicket/issues/256)). The Capacity card issues one to a principal:
+an operator as `unix/<user>` or `passkey/<name>`, or any identity as `spiffe://…`. The grant names:
+- the plans and regions it covers;
+- the most its nodes may cost per hour together, and the most the nodes it approves in any day may
+  cost (their worst cases);
+- how many of its nodes may exist at once;
+- its lifetime, at most 24 hours.
+
+The passkey signs all of it. The grant is one grant record (`QUOTA wicket.internal /quota/capacity`,
+its daily money as its amount, `wicket grant list` lists it) and a `decision` audit record.
+
+`wicket node create` files its spend as a request, `CAPACITY wicket.internal /capacity/node/<name>`,
+from the operator who runs it. If one of that operator's live grants covers the node, the request
+is approved at once through the same decide function as every approval. The decision is audited
+against the grant (`capacity_grant`, the ask, and what its uses took before). Otherwise the
+request waits in **Waiting for you**, with a notification on your devices, for up to `create
+--wait` (default 15 minutes).
+
+Each row of the card shows what the grant covers, what its nodes use and leave, and when it ends.
+**Renew** is a signed decision that gives it a new end, from now (the form's hours, at most 24).
+**Revoke** ends it at once: nothing more is approved under it, and the nodes made under it keep
+their own leases. The money envelope (`create --max-hourly`, `--max-total`) is still checked before
+anything is created. An operator whose authority in [`operators.yaml`](configuration.md#operatorsyaml)
+doesn't include `capacity` may not issue or renew one.
 
 ## Sessions
 

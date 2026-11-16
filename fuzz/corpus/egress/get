@@ -1,0 +1,4 @@
+GET /repos/acme/app/issues?state=open HTTP/1.1
+host: fuzz.example
+accept: */*
+

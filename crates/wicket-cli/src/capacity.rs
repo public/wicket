@@ -231,7 +231,7 @@ impl SpendApprover for LeaseApprover {
         match self.0.lock().expect("approver").clone() {
             Some((name, max)) if name == r.node_name && r.worst_case <= max => Approval::Approved,
             Some((name, max)) if name == r.node_name => {
-                Approval::Denied(format!("its worst case {} is over the {} a human approved", r.worst_case, max))
+                Approval::Denied(format!("its worst case {} is over the {} an operator approved", r.worst_case, max))
             }
             _ => Approval::Denied("no approved lease for this node".into()),
         }
@@ -327,7 +327,7 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
                              "hourly_cap_usd_micros": hourly.0, "reserved_usd_micros": worst.0, "duration_secs": a.duration_secs }),
     )?;
     Ok(CapacityState::Waiting(format!(
-        "requested: lease {id} ({what}; {money}), waiting for a human (request {rid}). Call request_capacity with lease {id} to wait until its node is ready."
+        "requested: lease {id} ({what}; {money}), waiting for an operator (request {rid}). Call request_capacity with lease {id} to wait until its node is ready."
     )))
 }
 
@@ -336,7 +336,7 @@ pub fn status(l: &Ledger, run: &RunId, id: &str) -> Result<CapacityState> {
     let lease = l.lease(id)?.filter(|x| x.run == run.0).with_context(|| format!("no lease {id} held by this run"))?;
     let rid = lease.request_id.clone().unwrap_or_default();
     Ok(match lease.status.as_str() {
-        "pending" => CapacityState::Waiting(format!("lease {id} is waiting for a human (request {rid})")),
+        "pending" => CapacityState::Waiting(format!("lease {id} is waiting for an operator (request {rid})")),
         "approved" => CapacityState::Waiting(format!("lease {id} is approved; its node is being set up")),
         "active" => CapacityState::Settled(format!(
             "ready: lease {id} is node {} until {}. Start boxes there with spawn and placement {{\"lease\": \"{id}\"}}. They stop when the lease ends.",

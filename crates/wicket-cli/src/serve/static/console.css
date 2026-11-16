@@ -99,3 +99,6 @@ textarea.yaml { font:13px/1.45 var(--mono); min-height:260px; }
 #secret-edit .warn { color:var(--warn); font-size:14px; margin-top:8px; }
 #secret-edit label { display:block; font-size:13px; color:var(--soft); margin-top:12px; }
 input.text { font-size:16px; } /* 16px: iOS doesn't zoom into the field. */
+.cap { display:block; }
+label.field { display:block; margin-top:8px; }
+label.field input { width:100%; font:14px var(--sans); padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:var(--tint); color:var(--ink); }
