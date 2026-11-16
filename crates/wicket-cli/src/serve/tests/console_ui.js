@@ -281,11 +281,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   const gh = { name: "gh", kind: "value", reference: null, hosts: ["api.github.com"], set_at: 1700000000,
     used_by: [{ root: "manifests", manifest: "d.yaml", zone: "docs", use: "inject", host: "api.github.com", header: "authorization", format: "Bearer {secret}", optional: false }],
     zones: ["docs"], runs: [{ run: "run_a", zone: "docs" }] };
-  const login = { name: "login", kind: "reference", reference: { file: "/home/o/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
+  const login = { name: "login", kind: "reference", reference: { file: "/home/you/.claude/.credentials.json", pointer: "/a/token" }, hosts: [], set_at: 1700000000, used_by: [], zones: [], runs: [] };
   state = { ...base, pending: [], secrets: { secrets: [gh, login], missing: [{ name: "HOSTILE<b>", zones: ["z"], used_by: [] }], link_cli_only: "references are made on the host: wicket secret link NAME --file PATH" } };
   await run("refresh()"); await flush();
   const sx = ids.secrets.textContent;
-  for (const want of ["gh", "sent only to api.github.com", "header authorization", "format Bearer {secret}", "running now: run_a", "reference", "/home/o/.claude/.credentials.json#/a/token", "not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
+  for (const want of ["gh", "sent only to api.github.com", "header authorization", "format Bearer {secret}", "running now: run_a", "reference", "/home/you/.claude/.credentials.json#/a/token", "not set", "wicket secret link"]) assert.ok(sx.includes(want), want + " in " + sx);
   const sbtn = label => ids.secrets.all(n => n.tagName === "button" && n.textContent.startsWith(label));
   assert.strictEqual(sbtn("Replace value").length, 1, "a reference's value isn't set here");
   assert.strictEqual(sbtn("Hosts").length, 2, "a reference's hosts can be changed");
