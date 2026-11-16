@@ -524,7 +524,7 @@ impl Node {
     /// Sends this node's health on every connection that takes it (#377).
     fn report_health(&self) {
         let h = self.health();
-        for l in self.links.lock().expect("links").values().filter(|l| l.proto >= chan::NODE_HEALTH) {
+        for l in self.links.lock().expect("links").values() {
             let _ = l.out.send(Frame::Msg(Msg::Health { health: h.clone() }));
         }
     }
