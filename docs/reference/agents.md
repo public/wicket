@@ -21,7 +21,7 @@ an EdDSA-signed document whose key is held by wicket, never by the box.
 - `max_children: N` in the agent spec allows `spawn`: an agent or a program in its own box and identity, in a
   zone the agent writes. That zone must be a subset of the agent's own: reach, credentials, model budget (carved
   out), resources, time, isolation, images and `max_children` (a child's own count against the parent's). Otherwise `spawn` lists what exceeds it, and with `escalate` puts
-  exactly that zone to an operator. `spawn_agent` is the shorthand for the agent's own zone narrowed by host. Set
+  exactly that zone to an operator. Without a zone, the child gets the agent's own. Set
   `in_box_subagents: false` to make wicket children the only kind of subagent.
 - A run's model budget and box slots are quota grants (#256, `wicket grant list`): a root run's are recorded
   from its zone when it starts, made by whoever started it; a child's are what its parent carved for it, recorded
@@ -85,7 +85,7 @@ their state, generation and bundle size.
   zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
   background build, a dev server) has its other processes stopped after the zone's `limits.exit_grace` (30 s
   by default), named in `wicket agents`, then hibernates, because a rebuild restores files, not processes.
-- **Wake.** `wicket wake <agent> ["…"]`, `wicket session <run or agent> ["…"]`, or a message from another agent
+- **Wake.** `wicket session <run or agent> ["…"]` (a prompt, if given, is its first turn), or a message from another agent
   rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
   `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,
   and by what. A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly

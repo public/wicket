@@ -5,7 +5,7 @@
 //!   RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p wicket-core --test loom_budget --release
 //!
 //! (ci/kani.sh runs it after the Kani harnesses). The threads are what share a run's counter: its
-//! node's `Spent` reports (merged as they arrive, `noderun`), the slice leased to the node
+//! node's `Spent` reports (merged as they arrive, `noderun`), the slice sent to the node
 //! (`slice_due`), its model calls (admitted, and reserving output) and its spawns' carve-outs.
 #![cfg(loom)]
 
@@ -23,12 +23,12 @@ fn counter(requests: u64, output_tokens: u64) -> Arc<Counter> {
     Arc::new(c)
 }
 
-/// A node's report merged while a slice is leased: the count ends at the report (merging never
+/// A node's report merged while a slice is being made: the count ends at the report (merging never
 /// lowers it: Kani's `merging_spent_only_raises_the_counts` covers stale and reordered reports),
-/// and the slice never leases more than the budget. Before #325 `next_slice` read `requests` twice;
-/// a report merged in between leased 8 + 3 = 11 of 10.
+/// and the slice never holds more than the budget. Before #325 `next_slice` read `requests` twice;
+/// a report merged in between sent 8 + 3 = 11 of 10.
 #[test]
-fn a_merged_report_and_a_lease_stay_within_the_budget() {
+fn a_merged_report_and_a_slice_stay_within_the_budget() {
     loom::model(|| {
         let c = counter(6, 40);
         let merge = {
