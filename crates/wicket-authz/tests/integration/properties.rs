@@ -156,7 +156,7 @@ fn a_node_can_narrow() {
 }
 
 #[test]
-fn expiry_and_leases() {
+fn expiry_and_grant_lifetimes() {
     let f = fixture();
     let k = &f.keys;
     let l = load_ok(&f.tok, k);
@@ -166,7 +166,7 @@ fn expiry_and_leases() {
     assert_eq!(decide_compiled(&l, &at(0, leaf_exp)), Decision::Allow, "A at the leaf's expiry");
     assert!(is_forbidden(&decide_compiled(&l, &at(0, leaf_exp + 1))), "A after it");
     assert!(is_grant(&decide_compiled(&l, &at(2, g.not_after + 1))), "C after the grant's expiry");
-    assert_eq!(decide_compiled(&l, &at(0, g.not_after + 1)), Decision::Allow, "an expired lease doesn't end the chain");
+    assert_eq!(decide_compiled(&l, &at(0, g.not_after + 1)), Decision::Allow, "an expired grant doesn't end the chain");
     assert_eq!(decide_compiled(&l, &at(2, g.not_after)), Decision::Allow, "C at the grant's expiry");
     let mut r = req(2);
     r.uses_left = vec![("g-7f3a".into(), 0)];
@@ -297,13 +297,13 @@ fn revocation_by_subtree() {
     for t in [&c1, &c2, &p3] {
         assert!(matches!(try_load(t, &b2), Err(AuthzError::Revoked(2))), "b2's subtree");
     }
-    // A grant block has its own id: revoking it ends the lease, not the zone.
+    // A grant block has its own id: revoking it ends the grant, not the zone.
     let g = grant(&c1, &keys.approver, &leaf_grant(4)).unwrap();
     let ig = revocation_ids(&g);
     assert_eq!(ig.len(), 6);
-    let lease: HashSet<Vec<u8>> = [ig[5].clone()].into();
-    assert!(matches!(try_load(&g, &lease), Err(AuthzError::Revoked(5))));
-    assert!(try_load(&c1, &lease).is_ok());
+    let grant_block: HashSet<Vec<u8>> = [ig[5].clone()].into();
+    assert!(matches!(try_load(&g, &grant_block), Err(AuthzError::Revoked(5))));
+    assert!(try_load(&c1, &grant_block).is_ok());
     assert_eq!(load_ok(&g, &keys).revocation_ids(), &ig[..]);
 }
 

@@ -433,7 +433,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // checked when a run starts or an agent wakes. A supervisor re-attaching to a running box doesn't
     // start anything.
     if record.is_none() {
-        crate::settings::check_run(&m, &crate::settings::load()?)?;
+        wicket_agent::acp::check_installation(&m).map_err(anyhow::Error::msg)?;
     }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
@@ -847,7 +847,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         _ => true,
     };
 
-    // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
+    // spawn: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     timings.since("policy.org", lap);
     // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as
@@ -1425,7 +1425,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         if wake.is_some() {
             println!("  agent {} woken: generation {}, session {} resumed", f.agent, f.generation, session.id);
         } else {
-            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket wake {}", f.agent, session.id, run, f.agent);
+            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket session {}", f.agent, session.id, run, f.agent);
         }
     }
     // Its quota grants are its limits (#256): kept live while it runs, at most a day ahead each
@@ -2269,7 +2269,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     let ms = t0.elapsed().as_millis();
                     println!(
-                        "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket wake {}",
+                        "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket session {}",
                         f.agent,
                         st.trees.len(),
                         crate::hibernate::human(st.raw_bytes()),

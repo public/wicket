@@ -11,11 +11,11 @@
 #   wicket run examples/demo.yaml              # the agents
 task: |
   You are the lead agent in a demonstration of wicket, the system that sandboxes you. Use the wicket
-  MCP tools (load them with ToolSearch: whoami, spawn_agent, await_message, await_grant).
+  MCP tools (load them with ToolSearch: whoami, spawn, await_message, await_grant).
   1. Call wicket whoami and note your identity and who you act for.
   2. Read https://api.github.com/repos/octocat/Hello-World with curl and note its description and
      default branch.
-  3. Call wicket spawn_agent with name "fetcher" and this task: "Fetch https://example.com/ with curl
+  3. Call wicket spawn with name "fetcher" and this task: "Fetch https://example.com/ with curl
      and note its <title>. If you get a 403 pending-approval response, call the wicket await_grant tool
      with its request_id (timeout_seconds 600) and then retry once. Then send your parent a message
      with wicket send_message (to: "parent"), body {"title": ..., "http_status": ...}."

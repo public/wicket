@@ -217,8 +217,6 @@ pub struct SpawnRequest {
     pub max_children: u32,
     /// If the zone isn't a subset of the parent's, put exactly this zone up for approval instead of refusing.
     pub escalate: bool,
-    /// spawn_agent's shorthand: the parent's zone, narrowed to these hosts.
-    pub reach_hosts: Option<Vec<String>>,
     /// Where to run it: `{"lease": "l-…"}` (a capacity lease this run holds) or `{"node": "<name>"}`.
     /// Default: where the parent runs.
     pub placement: Option<serde_json::Value>,

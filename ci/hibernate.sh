@@ -131,6 +131,8 @@ fi
 gen1=$(agent_field "$A" generation)
 check "A's first run spent 3 requests" '[ "$(agent_field "$A" used.requests)" = 3 ]'
 
+# `wicket wake` is the internal entry point of every wake (#249: an operator wakes an agent with
+# `wicket session`, an agent with a message); these flows drive it directly, in the foreground.
 echo "== agent A: wicket wake"
 timeout 240 "$WICKET" wake "$A" "Run it again, please." ${IMAGE:+} >"$work/a2.log" 2>&1 || true
 grep -E '^\[wicket\]|woken' "$work/a2.log" || true

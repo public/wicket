@@ -11,7 +11,6 @@ humantime strings (`90s`, `10m`, `1h`).
 - [`wicket run`](#wicket-run)
 - [`wicket session`](#wicket-session)
 - [`wicket hibernate`](#wicket-hibernate)
-- [`wicket wake`](#wicket-wake)
 - [`wicket top`](#wicket-top)
 - [`wicket agents`](#wicket-agents)
 - [`wicket wrap`](#wicket-wrap)
@@ -113,7 +112,6 @@ Commands:
   run        Run a task manifest: one workload (an agent, or a program) in one zone
   session    Open a running agent's session in this terminal, as its operator: what it says and does, live. An ACP agent's whole session shows, as on the console's session page; a Claude Code agent's messages, tool calls and turn ends. Each line typed is a prompt, the agent's next turn; `/stop` cancels an ACP agent's running turn; Ctrl-C or the end of input leaves, and the agent goes on. With TEXT, sends it as one prompt and exits when that turn ends. A long-lived agent can be named by its id or any of its runs; a hibernated one is woken
   hibernate  Hibernate a long-lived agent (by run or agent id) at its next quiet point: its turn has ended and nothing but the agent runs in its box. What else runs is stopped after the zone's limits.exit_grace
-  wake       Wake a hibernated agent: rebuild its box, restore its state and resume its harness session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
   top        A live view of what wicket is doing across its nodes (read-only): nodes (connected, boxes, what their boxes are given), runs (node, agent, status, uptime, model usage), pending requests and active leases. Redrawn every 2 s; q or Ctrl-C quits. On a node, `wicket node top`
   agents     Long-lived agents: state, generation, current run and bundle size
   wrap       Run an agent command line that another program launches, inside a wicket box: the harness's wrapped mode (e.g. its Remote Control sessions' process wrapper). Its stdin and stdout stay connected to the launcher, its credentials become placeholders swapped at the proxy, and wicket logs to a file
@@ -198,21 +196,6 @@ Arguments:
 Options:
       --wait <WAIT>  How long to wait for the outcome (seconds) [default: 120]
   -h, --help         Print help
-```
-
-## `wicket wake`
-
-```text
-Wake a hibernated agent: rebuild its box, restore its state and resume its harness session. Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's message to it
-
-Usage: wicket wake <AGENT> [TEXT]...
-
-Arguments:
-  <AGENT>    
-  [TEXT]...  
-
-Options:
-  -h, --help  Print help
 ```
 
 ## `wicket top`

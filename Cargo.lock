@@ -4004,6 +4004,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "wicket-core",
 ]
 

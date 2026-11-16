@@ -58,7 +58,7 @@ At the host's shell, `wicket session <run>` shows the same session in the termin
 you type is a prompt; `wicket session <run> "…"` sends one prompt and returns when its turn ends.
 
 Prompts, hibernation (the `hibernate` tool or `wicket hibernate`), `finish` and
-`wicket wake` work as for any agent. A
+waking (`wicket session`, or a message) work as for any agent. A
 woken agent continues its own ACP session.
 
 ## Claude Code through its ACP adapter

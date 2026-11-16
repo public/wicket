@@ -359,6 +359,7 @@ agent_field() { w agents --json | jq -r --arg n "$agent" ".[] | select(.id == \$
 check "the agent hibernated after its turn" '[ -n "$agent" ] && grep -q "hibernated in" "$work/hib1.log" && [ "$(agent_field state)" = hibernated ]'
 check "  and its box is gone" '[ -z "$(box_of "${our_runs[-1]}")" ]'
 gen1=$(agent_field generation)
+# The internal wake (#249; an operator's is `wicket session`), in the foreground for its log.
 wt 300 wake "$agent" "Again, please." >"$work/hib2.log" 2>&1 || true
 our_runs+=("$(run_id_of "$work/hib2.log")")
 hres=$(result_of "$work/hib2.log")

@@ -9,7 +9,7 @@ Every tool answers with one text block; a refusal or failure sets `isError`.
 
 **On a node** (protocol 5, #164), the box's node decides from its token, connected or not:
 `whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, and `spawn`
-and `spawn_agent` within the box's zone placed on that node (the child starts on the node, its token
+within the box's zone placed on that node (the child starts on the node, its token
 attenuated there, and the control host takes it over when it can be reached). While the control host is
 unreachable, the node also delivers `send_message` and `await_message` between boxes on that node, and
 push delivery of messages (see [Push delivery](#push-delivery)); a link between them, once made, is
@@ -30,7 +30,6 @@ node still asks the control host, and why: [design §9.2.1](../explanation/desig
 | [`await_message`](#await_message) | Wait for the next message | |
 | [`principals`](#principals) | Who this box may talk to, with each one's kind and state | |
 | [`receipts`](#receipts) | What became of the messages this box sent | |
-| [`spawn_agent`](#spawn_agent) | Start a child agent in a narrowed copy of this zone | `max_children` |
 | [`spawn`](#spawn) | Start an agent or program in a zone the caller writes | `max_children` |
 | [`continue_child`](#continue_child) | Give a child agent the caller delegated to another brief, its context intact | |
 | [`delegations`](#delegations) | The caller's delegations: each child's state and its latest report's receipt | |
@@ -259,19 +258,6 @@ What became of the messages this principal sent (#252), in any of its runs. Each
 
 A receipt is readable only by its sender.
 
-## `spawn_agent`
-
-Starts a child agent in its own box with its own identity, in the caller's own zone, optionally
-narrowed to some of its hosts. Returns the child's run id and its principal, which `send_message`
-addresses it by, and a [handle](#delegation): its task is a delegation, whose report comes back as a
-message. Refused when `max_children` is 0 or spent.
-
-| argument | type | |
-|---|---|---|
-| `name` | string, `^[a-z][a-z0-9-]{0,31}$`, required | the child's agent name |
-| `task` | string, required | |
-| `reach_hosts` | list of strings | only these hosts from the caller's own reach |
-
 ## `spawn`
 
 Starts a new box, an agent (with a task) or a program (a command, such as a long-running service),
@@ -299,7 +285,9 @@ Returns the new run id, and for an agent a [handle](#delegation).
 | `escalate` | boolean | false | put a zone beyond the caller's to an operator |
 | `placement` | `{"lease": "l-…"}` or `{"node": "<name>"}` | where the caller runs | an active lease from `request_capacity`, or the node the caller runs on |
 
-What `zone` leaves out: no reach and no credentials; the caller's limits, isolation,
+Without `zone`, the child gets the caller's own zone, its reach, credentials and forbid rules
+included, for the time the caller has left (to narrow it, describe a zone). What a `zone` given
+leaves out: no reach and no credentials; the caller's limits, isolation,
 `unlisted_hosts` and `wildcards`; for an agent, half the model budget the caller has left, and the
 caller's `escalation`. A program may not ask for more (`escalation.request: false`) unless `zone`
 says `escalation: { request: true }`, which the caller's zone must allow too. The spawned zone is named
@@ -307,7 +295,7 @@ says `escalation: { request: true }`, which the caller's zone must allow too. Th
 
 ## Delegation
 
-An agent `spawn` (or `spawn_agent`) starts is a delegation (#252): its task is its first brief.
+An agent `spawn` starts is a delegation (#252): its task is its first brief.
 `spawn` ends its answer with the child's handle, one line of JSON:
 
 ```text

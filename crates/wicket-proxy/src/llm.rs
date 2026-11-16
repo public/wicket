@@ -36,7 +36,7 @@ pub struct Llm {
     /// What this run has counted, carved out for its children, and spent in earlier activations
     /// (#70, #152, #256): shared by its calls, its spawns' carve-outs and its node's reports.
     pub count: Counter,
-    /// On a node (#152): the slice of the budget the control host has leased it, as caps on this
+    /// On a node (#152): the slice of the budget the control host has sent it, as caps on this
     /// activation's own counters. None: no slice (the zone's budget alone bounds it).
     slice: std::sync::Mutex<Option<Slice>>,
     /// The model budget this proxy enforces (#256): on the control host, the amounts of the run's
@@ -151,7 +151,7 @@ impl Llm {
         self.count.merge_spent(s);
     }
 
-    /// The budget slice leased to this node (#152).
+    /// The budget slice sent to this node (#152).
     pub fn set_slice(&self, s: Option<Slice>) {
         *self.slice.lock().expect("slice") = s;
     }
@@ -160,7 +160,7 @@ impl Llm {
         *self.slice.lock().expect("slice")
     }
 
-    /// The slice this activation may be leased next (#152): what it has counted plus `fraction` of
+    /// The slice this activation's node may be sent next (#152): what it has counted plus `fraction` of
     /// the zone's budget, never past what is left of it.
     pub fn next_slice(&self, fraction: f64) -> Option<Slice> {
         Some(self.count.next_slice(self.quota()?, fraction))
@@ -299,7 +299,7 @@ impl Llm {
                     429,
                     "budget",
                     "Model budget slice exhausted on this node",
-                    "this node has spent the slice of the model budget it was leased; the control host leases more when it can be reached. Retry later",
+                    "this node has spent the slice of the model budget it was sent; the control host sends more when it can be reached. Retry later",
                     None,
                 ));
             }
