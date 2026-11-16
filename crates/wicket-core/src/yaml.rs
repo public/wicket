@@ -14,7 +14,7 @@
 //!
 //! Untyped YAML (`serde_json::Value`) is read the same way; there is no YAML value type of its own.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// The most bytes of YAML read at once.
 pub const MAX_INPUT: usize = 4 << 20;
@@ -66,6 +66,16 @@ pub fn to_string<T: Serialize>(v: &T) -> Result<String, Error> {
     serde_saphyr::to_string(v).map_err(|e| Error::Write(e.to_string()))
 }
 
+/// For a defaulted list or map field: an empty YAML key (`reach:` with nothing after it, or only
+/// commented-out entries) is the field's default, as serde_yaml read it, not an error.
+pub fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +103,8 @@ mod tests {
         let v: serde_json::Value = from_str("name: z\nreach: [{host: a.example, paths: [\"/x\"]}]\n").unwrap();
         assert_eq!(v["reach"][0]["host"], "a.example");
         assert_eq!(from_str::<serde_json::Value>(&to_string(&v).unwrap()).unwrap(), v);
+        // An empty list key is the empty list (serde_yaml's reading, kept).
+        let z: crate::ZoneSpec = from_str("name: z\nreach:\nforbid:\n  # none yet\n").unwrap();
+        assert!(z.reach.is_empty() && z.forbid.is_empty());
     }
 }

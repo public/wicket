@@ -115,7 +115,7 @@ pub struct AgentSpec {
     pub in_box_subagents: bool,
     /// Extra environment for the agent: non-secret configuration only. Variables
     /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub env: std::collections::BTreeMap<String, String>,
     /// Settings for the agent's own adapter (for claude-code: written to its settings.json), limited
     /// to keys that can't change what the agent can reach or run (ADAPTER_SETTINGS_ALLOWED).
@@ -280,7 +280,7 @@ pub struct ZoneSpec {
     #[serde(default)]
     pub isolation: Isolation,
     /// What the zone may reach over HTTP(S). Anything else becomes a pending escalation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub reach: Vec<ReachRule>,
     /// What a host that no reach rule names looks like from inside: `escalate` (default) treats a
     /// request to it as a pending request a human can approve; `hide` makes it look like it doesn't
@@ -295,10 +295,10 @@ pub struct ZoneSpec {
     pub wildcards: WildcardSpec,
     /// Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked
     /// before `reach`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub forbid: Vec<ForbidRule>,
     /// Credentials injected by the egress proxy into exactly one header slot per host.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub inject: Vec<InjectRule>,
     /// The model route; required for agents, absent for programs.
     #[serde(default)]
@@ -307,14 +307,14 @@ pub struct ZoneSpec {
     /// state a workload keeps (a cache, a dataset, model weights, a database). Per tenant and zone,
     /// and shared by the zone's runs, so whatever one run leaves there the next one reads (and
     /// inherits its labels, design §12).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub volumes: Vec<VolumeSpec>,
     /// Images boxes in this zone may start other boxes from (besides their own), with `spawn`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub images: Vec<String>,
     /// Zones whose agents may send messages to agents in this zone (besides parent and children).
     /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
@@ -450,7 +450,7 @@ pub struct ForbidRule {
     /// (GitHub's owner and repository names, for one) fold case, so `/repos/ACME/prod` must not dodge
     /// a forbid on `/repos/acme/prod/**`. Reach globs stay case-sensitive (narrower is safer there).
     /// Default: everything on the host.
-    #[serde(default = "default_paths")]
+    #[serde(default = "default_paths", deserialize_with = "crate::yaml::null_as_default")]
     pub paths: Vec<String>,
 }
 
@@ -521,10 +521,10 @@ pub enum Persist {
 pub struct ReachRule {
     /// Exact host, or `*.example.com`.
     pub host: String,
-    #[serde(default = "default_methods")]
+    #[serde(default = "default_methods", deserialize_with = "crate::yaml::null_as_default")]
     pub methods: Vec<String>,
     /// Path globs: `*` matches within one segment, `**` across segments.
-    #[serde(default = "default_paths")]
+    #[serde(default = "default_paths", deserialize_with = "crate::yaml::null_as_default")]
     pub paths: Vec<String>,
     /// Allow requests that the dangerous-pattern list rates R3+ without a grant. Default false.
     #[serde(default)]
