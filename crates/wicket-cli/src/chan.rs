@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn a_node_forwards_no_egress_from_protocol_11() {
         assert_eq!(NO_FORWARDED_EGRESS, 11);
-        assert!(negotiate(PROTOCOL, 10).unwrap() < NO_FORWARDED_EGRESS);
+        assert!(negotiate(NO_FORWARDED_EGRESS, 10).unwrap() < NO_FORWARDED_EGRESS);
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values; a control host
