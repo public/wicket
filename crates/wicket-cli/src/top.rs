@@ -1063,7 +1063,14 @@ mod tests {
 
     #[test]
     fn the_control_frame_reads_on_an_80_column_console() {
-        let cap = crate::chan::NodeCapacity { vcpus: 4.0, memory_mib: 8192, used_vcpus: 1.5, used_memory_mib: 2560, boxes: 2 };
+        let cap = crate::chan::NodeCapacity {
+            vcpus: 4.0,
+            memory_mib: 8192,
+            used_vcpus: 1.5,
+            used_memory_mib: 2560,
+            boxes: 2,
+            ..Default::default()
+        };
         let f = ControlFrame {
             now_ms: NOW,
             nodes: vec![
@@ -1165,7 +1172,14 @@ mod tests {
         l.run_ended(&wicket_core::RunId("run_01jccccccccccccccccccccccc".into()), "done", "").unwrap();
         let a = dir.join("run_01jcaaaaaaaaaaaaaaaaaaaaaa");
         std::fs::create_dir_all(a.join("ctl")).unwrap();
-        let cap = crate::chan::NodeCapacity { vcpus: 2.0, memory_mib: 4096, used_vcpus: 1.0, used_memory_mib: 1024, boxes: 1 };
+        let cap = crate::chan::NodeCapacity {
+            vcpus: 2.0,
+            memory_mib: 4096,
+            used_vcpus: 1.0,
+            used_memory_mib: 1024,
+            boxes: 1,
+            ..Default::default()
+        };
         let spent = Spent { requests: 5, input_tokens: 100, output_tokens: 20, ..Default::default() };
         LinkRecord { node: "local".into(), connected: true, since_ms: NOW - 5000, spent, capacity: Some(cap), updated_ms: NOW }.save(&a);
         let b = dir.join("run_01jcbbbbbbbbbbbbbbbbbbbbbb");

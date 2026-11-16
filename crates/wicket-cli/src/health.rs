@@ -198,6 +198,69 @@ pub fn summary(h: &NodeHealth, now_ms: i64) -> String {
     s
 }
 
+/// What a node keeps back from boxes' memory (#377): at least this much, MiB...
+pub const MEMORY_MARGIN_MIB: u64 = 256;
+/// ...and at least this share of the machine's memory, percent.
+pub const MEMORY_MARGIN_PCT: u64 = 5;
+/// The free disk below which a node starts no box (#377): at least this much...
+pub const DISK_FLOOR_BYTES: u64 = 1 << 30;
+/// ...and at least this share of the disk, percent.
+pub const DISK_FLOOR_PCT: u64 = 5;
+/// Free inodes below this share of them refuse a box too, percent.
+pub const FILES_FLOOR_PCT: u64 = 1;
+
+/// The memory a node keeps back from boxes, MiB.
+pub fn memory_margin_mib(total_mib: u64) -> u64 {
+    MEMORY_MARGIN_MIB.max(total_mib * MEMORY_MARGIN_PCT / 100)
+}
+
+/// The free disk below which a node starts no box.
+pub fn disk_floor(d: &Disk) -> u64 {
+    DISK_FLOOR_BYTES.max(d.total_bytes / 100 * DISK_FLOOR_PCT)
+}
+
+/// The memory a new box may be given now (MiB): what the kernel says is available, less what the
+/// boxes already running may still take up to their limits (`unused_mib`, their limits less their
+/// use), less the margin. Limits are never overcommitted against what is actually free.
+pub fn room_mib(m: &Memory, unused_mib: u64) -> u64 {
+    m.available_mib.saturating_sub(unused_mib + memory_margin_mib(m.total_mib))
+}
+
+/// Why this node starts no box at all now, if it doesn't: its disk (or inodes) below the floor.
+pub fn refuses(d: &Disk) -> Option<String> {
+    if d.total_bytes == 0 {
+        return None; // not known: not refused for it
+    }
+    let floor = disk_floor(d);
+    if d.free_bytes() < floor {
+        return Some(format!("disk: {} free for boxes, below the node's floor of {}", gib(d.free_bytes()), gib(floor)));
+    }
+    if d.files_total > 0 && d.files_avail < d.files_total / 100 * FILES_FLOOR_PCT {
+        return Some(format!("disk: {} inodes free of {}, below {FILES_FLOOR_PCT}%", d.files_avail, d.files_total));
+    }
+    None
+}
+
+/// What a box refused for room starts its refusal with: placement reads it (another node is tried).
+pub const NO_ROOM: &str = "no room on this node for the box";
+
+/// Admission (#377): whether a box with a `want_mib` memory limit may start, given the room
+/// ([`room_mib`]) and the disk. The refusal names the reason.
+pub fn admit(want_mib: u64, room_mib: u64, m: &Memory, d: &Disk) -> Result<(), String> {
+    if let Some(why) = refuses(d) {
+        return Err(format!("{NO_ROOM}: {why}"));
+    }
+    if m.total_mib > 0 && want_mib > room_mib {
+        return Err(format!(
+            "{NO_ROOM}: memory: its limit is {want_mib} MiB, and {room_mib} MiB can be given ({} MiB available, {} MiB committed to running boxes' limits, {} MiB kept back)",
+            m.available_mib,
+            m.committed_mib,
+            memory_margin_mib(m.total_mib)
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +320,31 @@ mod tests {
     fn this_hosts_disk_is_read() {
         let d = disk(&std::env::temp_dir().join("no-such-dir-wicket"));
         assert!(d.total_bytes > 0 && d.avail_bytes <= d.total_bytes);
+    }
+
+    #[test]
+    fn a_box_is_admitted_only_into_memory_actually_free() {
+        let m = Memory { total_mib: 8192, available_mib: 4096, committed_mib: 3072 };
+        let d = healthy(0).disk;
+        // 4096 available, 1024 still claimable by running boxes, 409 kept back: 2663 for a new box.
+        let room = room_mib(&m, 1024);
+        assert_eq!(room, 4096 - 1024 - 409);
+        assert!(admit(2048, room, &m, &d).is_ok());
+        let e = admit(3072, room, &m, &d).unwrap_err();
+        assert!(e.starts_with(NO_ROOM) && e.contains("memory: its limit is 3072 MiB, and 2663 MiB can be given"), "{e}");
+    }
+
+    #[test]
+    fn a_box_is_refused_below_the_disk_floor() {
+        let m = Memory { total_mib: 8192, available_mib: 8000, committed_mib: 0 };
+        let mut d = Disk { total_bytes: 100 << 30, avail_bytes: 4 << 30, files_total: 1000, files_avail: 500, reserve_bytes: 0 };
+        let e = admit(512, room_mib(&m, 0), &m, &d).unwrap_err();
+        assert!(e.contains("disk: 4.0 GiB free for boxes, below the node's floor of 5.0 GiB"), "{e}");
+        d.avail_bytes = 50 << 30;
+        assert!(admit(512, room_mib(&m, 0), &m, &d).is_ok());
+        d.files_avail = 5;
+        assert!(admit(512, room_mib(&m, 0), &m, &d).unwrap_err().contains("inodes"));
+        // A disk wicket can't read refuses nothing for it.
+        assert!(refuses(&Disk::default()).is_none());
     }
 }

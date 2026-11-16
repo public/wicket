@@ -255,6 +255,9 @@ struct Node {
     /// Boxes killed for memory, and failures to persist the node's own state (#377), for its health.
     ooms: Arc<crate::health::Counter>,
     persists: Arc<crate::health::Counter>,
+    /// Boxes admitted and still starting (#377), by run: their memory limits (MiB), counted as
+    /// committed until the box is up or its start fails.
+    admitting: Mutex<HashMap<String, u64>>,
 }
 
 impl Node {
@@ -372,7 +375,43 @@ impl Node {
             c.used_memory_mib += b.memory_mib;
             c.boxes += 1;
         }
+        let (m, d, unused) = self.room_with(&self.admitting.lock().expect("admitting"));
+        c.room_mib = Some(crate::health::room_mib(&m, unused));
+        c.full = crate::health::refuses(&d).is_some();
         c
+    }
+
+    /// What admission reckons with (#377): the machine's memory (with the limits committed, those of
+    /// boxes still starting among them), the data directory's disk, and what the boxes may still
+    /// take up to their limits (MiB: each one's limit less what it uses now, as last sampled; its
+    /// whole limit if not sampled yet). `admitting` is the boxes starting.
+    fn room_with(&self, admitting: &HashMap<String, u64>) -> (crate::health::Memory, crate::health::Disk, u64) {
+        let (total_mib, available_mib) = crate::health::memory();
+        let starting: u64 = admitting.values().sum();
+        let (committed, unused) = {
+            let mem = self.mem.lock().expect("mem");
+            let boxes = self.boxes.lock().expect("boxes");
+            let running = boxes.iter().filter(|(_, b)| b.exited.is_none());
+            running.fold((starting, starting), |(c, u), (run, b)| {
+                (c + b.memory_mib, u + b.memory_mib.saturating_sub(mem.get(run).map_or(0, |e| e.1.current >> 20)))
+            })
+        };
+        (crate::health::Memory { total_mib, available_mib, committed_mib: committed }, crate::health::disk(&self.paths.root), unused)
+    }
+
+    /// Admits a box with a `want_mib` memory limit for `run`, or says why not (#377). Admitted, it
+    /// counts as committed until [`Self::admitted`]; two starts are admitted one after the other.
+    fn admit(&self, run: &str, want_mib: u64) -> Result<()> {
+        let mut admitting = self.admitting.lock().expect("admitting");
+        let (m, d, unused) = self.room_with(&admitting);
+        let room = crate::health::room_mib(&m, unused);
+        crate::health::admit(want_mib, room, &m, &d).map_err(|why| anyhow::anyhow!("node {}: {why}", self.name))?;
+        admitting.insert(run.to_string(), want_mib);
+        Ok(())
+    }
+
+    fn admitted(&self, run: &str) {
+        self.admitting.lock().expect("admitting").remove(run);
     }
 
     /// This node's health (#377): its data directory's disk, memory, feed, and what went wrong.
@@ -759,6 +798,7 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         seen: Default::default(),
         ooms: Default::default(),
         persists: Default::default(),
+        admitting: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -1073,6 +1113,7 @@ async fn start_box(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: Arc<Ti
         node.seen.starting(&run, &bs.zone, wicket_feed::now_ms());
     }
     let r = start_box_steps(node, owner, bs, t).await;
+    node.admitted(&run);
     node.seen.started(&run);
     r
 }
@@ -1114,6 +1155,13 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
             .await?
             .with_context(|| format!("image {} not found on node {} (run: wicket image there)", bs.image, node.name))?,
     };
+    // Admission (#377): the box's memory limit against what is actually free, and the disk floor.
+    // Refused, nothing of it is made; the refusal names why, and placement tries another node.
+    if let Err(e) = node.admit(&bs.run, bs.memory.parse::<u64>().unwrap_or(0) >> 20) {
+        eprintln!("[node] {}: refused: {e:#}", bs.run);
+        node.audit_note(&bs.run, "box.refused", serde_json::json!({ "why": format!("{e:#}") }));
+        return Err(e);
+    }
     if !bs.binds.is_empty() && !node.paths.shares_host() {
         bail!("this node doesn't share the control host's filesystem: it can't mount the control host's directories");
     }
@@ -2428,6 +2476,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             seen: Default::default(),
             ooms: Default::default(),
             persists: Default::default(),
+            admitting: Default::default(),
         })
     }
 
@@ -2600,6 +2649,41 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             Frame::Data { stream: b.streams[1], offset: at, bytes: bytes.to_vec() }
         };
         node.send_run("run_a", f);
+    }
+
+    /// #377: a node's health names its data directory's disk, its memory, its feed, and the boxes
+    /// killed for memory and failed writes it has seen; its status carries the same.
+    #[tokio::test]
+    async fn the_health_counts_what_went_wrong() {
+        let inst = Install::new("nodesrv-health");
+        let node = test_node(&inst);
+        let h = node.health();
+        assert!(h.disk.total_bytes > 0 && h.memory.total_mib > 0, "{h:?}");
+        assert_eq!((h.oom_kills, h.persist_failures, h.feed_mode.as_str()), (0, 0, "closed"));
+        node.ooms.note(5, "run_a: killed: out of memory");
+        node.persists.note(6, "feed: could not persist: No space left on device");
+        node.persists.note(7, "spend journal: No space left on device");
+        let h = node.status().health.expect("health in the status");
+        assert_eq!((h.oom_kills, h.persist_failures), (1, 2));
+        assert_eq!(h.last_persist_failure.map(|e| e.at_ms), Some(7));
+    }
+
+    /// #377: a box is admitted only into memory that is actually free, counting what the boxes
+    /// starting already took; refused, it says why.
+    #[tokio::test]
+    async fn admission_refuses_a_box_that_does_not_fit() {
+        let inst = Install::new("nodesrv-admit");
+        let node = test_node(&inst);
+        let e = node.admit("run_big", 1 << 40).unwrap_err().to_string();
+        assert!(e.contains(crate::health::NO_ROOM) && e.contains("memory: its limit is"), "{e}");
+        assert!(node.admitting.lock().unwrap().is_empty(), "a refused box takes nothing");
+        let room = node.capacity().room_mib.expect("room");
+        node.admit("run_a", room / 2).unwrap();
+        let after = node.capacity().room_mib.expect("room");
+        assert!(after + room / 2 <= room + 64, "the starting box counts as committed: {room} then {after}");
+        assert!(node.admit("run_b", room / 2 + 128).is_err(), "the second doesn't fit beside the first");
+        node.admitted("run_a");
+        assert!(node.admitting.lock().unwrap().is_empty());
     }
 
     /// `wicket node top`'s status: the node's identity, connections, boxes (with their state, agent,

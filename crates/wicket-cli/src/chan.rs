@@ -337,6 +337,13 @@ pub struct NodeCapacity {
     pub used_vcpus: f32,
     pub used_memory_mib: u64,
     pub boxes: u32,
+    /// The memory limit a new box may have now (#377), as the node's admission reckons it from
+    /// what is actually free; None from a node before it.
+    #[serde(default)]
+    pub room_mib: Option<u64>,
+    /// Whether the node starts no box at all now (its disk below the floor, #377).
+    #[serde(default)]
+    pub full: bool,
 }
 
 /// How far a box's stdio has got, as the node reports it on reconnect.
@@ -969,7 +976,14 @@ mod tests {
                     stderr_start: 0,
                     authority_until: 1,
                 }],
-                capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
+                capacity: Some(NodeCapacity {
+                    vcpus: 2.0,
+                    memory_mib: 2048,
+                    used_vcpus: 1.0,
+                    used_memory_mib: 512,
+                    boxes: 1,
+                    ..Default::default()
+                }),
             }),
             Frame::Msg(Msg::ImageHave { id: 3, digest: format!("sha256:{}", "a".repeat(64)) }),
             Frame::Msg(Msg::PutImage {
