@@ -55,6 +55,8 @@ pub enum StoreError {
     Writer(String),
     #[error("not requested: {0}")]
     Refused(String),
+    #[error("request {0} is not the effect that was shown (shown {1}, now {2}): it changed since; look at it again and decide that")]
+    EffectChanged(String, String, String),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
 }
@@ -81,7 +83,8 @@ pub enum StoreError {
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
 /// Version 8 (expand) binds approvals to their effect (#369): `requests.args_sha256` and
 /// `grants.args_sha256` (the decided-on arguments' hash), `grants.effect_sha256` (the approved
-/// descriptor's), and the `audit_run` index a run's recent egress is read by.
+/// descriptor's), and the indexes a run's recent egress (`audit_run`) and its pending requests
+/// (`requests_run`) are read by.
 pub const SCHEMA_VERSION: u32 = 8;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
@@ -265,6 +268,7 @@ CREATE TABLE IF NOT EXISTS requests (
   attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0, args_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
+CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status);
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
@@ -460,7 +464,9 @@ impl Ledger {
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN args_sha256 TEXT", []);
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN args_sha256 TEXT", []);
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN effect_sha256 TEXT", []);
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq)")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq); CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status)",
+        )?;
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -534,7 +540,13 @@ impl Ledger {
     /// Records a pending request for `op`, or returns the existing one. `who` is the attribution of
     /// this ask; when a *different* asker hits an existing request, it is added, so the human sees
     /// everyone a grant would serve.
-    pub(crate) fn pending_for_unheld(&self, op: &Op, reason: &str, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
+    pub(crate) fn pending_for_unheld(
+        &self,
+        op: &Op,
+        args: Option<&str>,
+        reason: &str,
+        who: Option<&serde_json::Value>,
+    ) -> Result<(String, bool)> {
         let digest = op.digest();
         if let Some((id, attr)) = self
             .conn
@@ -565,9 +577,9 @@ impl Ledger {
         let id = new_request_id();
         let attr = serde_json::Value::from(who.cloned().into_iter().collect::<Vec<_>>()).to_string();
         self.conn.execute(
-            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
-            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr],
+            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution, args_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
+            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr, args],
         )?;
         Ok((id, true))
     }
@@ -937,6 +949,13 @@ impl Ledger {
         if let Some(why) = op.refused_for_agents() {
             return Err(StoreError::Refused(why));
         }
+        // An exact ask that a pending prefix ask from the run covers waits on that ask (#369).
+        if !prefix {
+            if let Some(pending) = self.held_by(op, None)? {
+                self.merge_attribution(&pending, who)?;
+                return Ok((pending, false));
+            }
+        }
         let digest = format!("{}{}", op.digest(), if prefix { ":prefix" } else { "" });
         if let Some(id) = self
             .conn
@@ -1015,15 +1034,22 @@ impl Ledger {
     /// run of it) can use it, and it ends with the run (#127). [`Ledger::approve_zone_wide`] is the
     /// wider scope, when the human picks it.
     pub fn approve(&mut self, id: &str, a: &Approval) -> Result<String> {
-        self.approve_scoped(id, a, false)
+        Ok(self.approve_scoped(id, a, false, None)?.0)
+    }
+
+    /// As [`Ledger::approve`] (or [`Ledger::approve_zone_wide`]), only if the request's effect
+    /// descriptor with these terms is `shown` (#369), checked in the transaction that makes the
+    /// grant ([`StoreError::EffectChanged`] otherwise). Returns the grant and the descriptor's hash.
+    pub fn approve_shown(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
+        self.approve_scoped(id, a, zone_wide, shown)
     }
 
     /// As [`Ledger::approve`], usable by any run in the request's zone until it expires.
     pub fn approve_zone_wide(&mut self, id: &str, a: &Approval) -> Result<String> {
-        self.approve_scoped(id, a, true)
+        Ok(self.approve_scoped(id, a, true, None)?.0)
     }
 
-    fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool) -> Result<String> {
+    fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let req = tx
             .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
@@ -1031,6 +1057,12 @@ impl Ledger {
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))?;
         if req.status != "pending" {
             return Err(StoreError::NotPending(id.into(), req.status));
+        }
+        // The effect this grant is for (#369), from the row as it is in this transaction.
+        let terms = DecisionTerms { uses: a.uses, ttl_secs: a.ttl.as_secs(), prefix: a.path_prefix.clone(), zone_wide };
+        let effect_sha256 = descriptor(&req, Some(&terms)).sha256();
+        if let Some(shown) = shown.filter(|s| *s != effect_sha256) {
+            return Err(StoreError::EffectChanged(id.into(), shown.into(), effect_sha256));
         }
         let (path, prefix) = granted_scope(&req, a.path_prefix.as_deref());
         let prefix = prefix as i64;
@@ -1043,8 +1075,8 @@ impl Ledger {
         let gid = new_grant_id();
         let t = now();
         tx.execute(
-            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, args_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, args_sha256, effect_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 gid,
                 req.tenant,
@@ -1060,12 +1092,13 @@ impl Ledger {
                 t,
                 max_risk,
                 (!zone_wide).then_some(&req.run),
-                req.args_sha256
+                req.args_sha256,
+                effect_sha256
             ],
         )?;
         tx.execute("UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1", params![id, t, a.decided_by])?;
         tx.commit()?;
-        Ok(gid)
+        Ok((gid, effect_sha256))
     }
 
     pub fn deny(&self, id: &str, by: &str) -> Result<()> {

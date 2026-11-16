@@ -9,8 +9,8 @@
 //!   used only for exactly its target and the arguments it was decided on
 //!   ([`Ledger::use_effect_grant`]): never through a prefix, and an action whose arguments changed
 //!   after the approval is refused and audited (`effect.refused`).
-//! - **Exactly once.** An action presented again after its grant's last use finds it spent
-//!   ([`EffectUse::Spent`]), instead of filing a new request.
+//! - **Exactly once.** A grant's use is taken in the transaction that finds it, so an action
+//!   presented again after its last use runs only with a new decision: it is asked for again.
 
 use crate::{now, Ledger, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -44,10 +44,9 @@ pub enum EffectUse {
     Granted(String),
     /// A request from this run for this target is pending: the action waits for its decision.
     Held { pending: String },
-    /// A live grant for this target was decided on other arguments: refused, and audited.
+    /// A live grant this run asked for, for this target, was decided on other arguments: refused,
+    /// and audited.
     ArgsChanged { grant: String },
-    /// The grant for exactly this was used up: the action already ran.
-    Spent { grant: String },
     /// No grant: ask.
     None,
 }
@@ -116,18 +115,51 @@ impl Ledger {
     /// the one already pending; or, while a related request from the same run is pending, files
     /// nothing ([`Filed::Held`]). Related: the same target asked with other arguments, or (for an
     /// egress request) a pending prefix ask from the run that covers it.
+    ///
+    /// The check and the insert are one transaction, and the arguments are in the insert, so no
+    /// decision lands between them and no two asks for one target both file a request.
     pub fn file_request(&self, op: &Op, args: Option<&str>, reason: &str, who: Option<&serde_json::Value>) -> Result<Filed> {
-        if let Some(pending) = self.held_by(op, args)? {
-            return Ok(Filed::Held { pending });
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let filed = match self.held_by(op, args)? {
+            // The held asker is shown on the request it waits on.
+            Some(pending) => {
+                self.merge_attribution(&pending, who)?;
+                Filed::Held { pending }
+            }
+            None => match self.pending_for_unheld(op, args, reason, who)? {
+                (id, true) => Filed::New(id),
+                (id, false) => Filed::Existing(id),
+            },
+        };
+        tx.commit()?;
+        Ok(filed)
+    }
+
+    /// Adds `who` to request `id`'s attribution, if it isn't there (at most 8 askers).
+    pub(crate) fn merge_attribution(&self, id: &str, who: Option<&serde_json::Value>) -> Result<()> {
+        let Some(w) = who else { return Ok(()) };
+        let attr: String = self.conn.query_row("SELECT attribution FROM requests WHERE id = ?1", params![id], |r| r.get(0))?;
+        let mut list: Vec<serde_json::Value> = serde_json::from_str(&attr).unwrap_or_default();
+        if !list.iter().any(|x| crate::same_askers(x, w)) && list.len() < 8 {
+            list.push(w.clone());
+            self.conn
+                .execute("UPDATE requests SET attribution = ?2 WHERE id = ?1", params![id, serde_json::Value::from(list).to_string()])?;
         }
-        let (id, fresh) = self.pending_for_unheld(op, reason, who)?;
-        if !fresh {
-            return Ok(Filed::Existing(id));
-        }
-        if args.is_some() {
-            self.conn.execute("UPDATE requests SET args_sha256 = ?2 WHERE id = ?1", params![id, args])?;
-        }
-        Ok(Filed::New(id))
+        Ok(())
+    }
+
+    /// The request that denied exactly this ask (`op` with arguments hashed `args`) in the last
+    /// ten minutes, if one did: a denial of one set of arguments doesn't refuse another.
+    pub fn denied_recently_with(&self, op: &Op, args: Option<&str>) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM requests WHERE tenant = ?1 AND zone = ?2 AND digest = ?3 AND run = ?4 AND status = 'denied'
+                   AND decided_at > ?5 AND COALESCE(args_sha256, '') = COALESCE(?6, '') ORDER BY decided_at DESC LIMIT 1",
+                params![op.tenant.0, op.zone, op.digest(), op.run.0, now() - 600, args],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Returns the id of the pending request for `op` (without arguments), creating it if needed:
@@ -141,12 +173,13 @@ impl Ledger {
     }
 
     /// The pending request from `op`'s run that an ask for `op` with `args` must wait on, if any.
-    fn held_by(&self, op: &Op, args: Option<&str>) -> Result<Option<String>> {
+    /// A request filed before arguments were recorded (no `args_sha256`) holds nothing.
+    pub(crate) fn held_by(&self, op: &Op, args: Option<&str>) -> Result<Option<String>> {
         let same_target = self
             .conn
             .query_row(
                 "SELECT id FROM requests WHERE tenant = ?1 AND zone = ?2 AND run = ?3 AND method = ?4 AND host = ?5
-                   AND path = ?6 AND status = 'pending' AND scope_prefix = 0 AND COALESCE(args_sha256, '') <> COALESCE(?7, '')
+                   AND path = ?6 AND status = 'pending' AND scope_prefix = 0 AND args_sha256 IS NOT NULL AND args_sha256 IS NOT ?7
                  ORDER BY created_at, id LIMIT 1",
                 params![op.tenant.0, op.zone, op.run.0, op.method, op.host, op.path, args],
                 |r| r.get::<_, String>(0),
@@ -190,35 +223,37 @@ impl Ledger {
             tx.commit()?;
             return Ok(EffectUse::Held { pending });
         }
-        let rows: Vec<(String, Option<i64>, Option<String>)> = {
+        let rows: Vec<(String, Option<i64>, Option<String>, Option<String>)> = {
             let mut st = tx.prepare(
-                "SELECT id, uses_left, args_sha256 FROM grants
+                "SELECT id, uses_left, args_sha256, run FROM grants
                  WHERE tenant = ?1 AND zone = ?2 AND method = ?3 AND host = ?4 AND path = ?5 AND prefix = 0
                    AND revoked = 0 AND expires_at > ?6 AND amount IS NULL AND node IS NULL
                    AND (run IS NULL OR run = ?7) AND COALESCE(max_risk, 0) >= ?8
+                   AND (uses_left IS NULL OR uses_left > 0)
                  ORDER BY created_at, id",
             )?;
             let rows = st.query_map(params![op.tenant.0, op.zone, op.method, op.host, op.path, now(), op.run.0, op.risk.rank()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        let usable = |u: &Option<i64>| u.is_none_or(|n| n > 0);
-        let found = if let Some((gid, uses, _)) = rows.iter().find(|(_, u, a)| usable(u) && a.as_deref() == args) {
+        // Exactly these arguments: one use. Otherwise a grant this run asked for, decided on other
+        // arguments, refuses the action: they changed after the approval. A zone-wide grant decided
+        // for another run's arguments, or one made before arguments were recorded, isn't this
+        // action's: it asks for its own.
+        let found = if let Some((gid, uses, _, _)) = rows.iter().find(|(_, _, a, _)| a.as_deref() == args) {
             if uses.is_some() {
                 tx.execute("UPDATE grants SET uses_left = uses_left - 1 WHERE id = ?1", params![gid])?;
             }
             EffectUse::Granted(gid.clone())
-        } else if let Some((gid, _, _)) = rows.iter().find(|(_, u, _)| usable(u)) {
+        } else if let Some((gid, _, _, _)) = rows.iter().find(|(_, _, a, run)| a.is_some() && run.as_deref() == Some(op.run.0.as_str())) {
             EffectUse::ArgsChanged { grant: gid.clone() }
-        } else if let Some((gid, _, _)) = rows.iter().find(|(_, _, a)| a.as_deref() == args) {
-            EffectUse::Spent { grant: gid.clone() }
         } else {
             EffectUse::None
         };
         tx.commit()?;
         if let EffectUse::ArgsChanged { grant } = &found {
-            let approved: Option<String> = rows.iter().find(|(g, _, _)| g == grant).and_then(|(_, _, a)| a.clone());
+            let approved: Option<String> = rows.iter().find(|(g, _, _, _)| g == grant).and_then(|(_, _, a, _)| a.clone());
             self.audit(
                 &TenantId(op.tenant.0.clone()),
                 Some(&RunId(op.run.0.clone())),
@@ -231,12 +266,6 @@ impl Ledger {
             )?;
         }
         Ok(found)
-    }
-
-    /// Records the hash of the effect descriptor grant `gid` was approved as (#369).
-    pub fn bind_grant_effect(&self, gid: &str, effect_sha256: &str) -> Result<()> {
-        self.conn.execute("UPDATE grants SET effect_sha256 = ?2 WHERE id = ?1", params![gid, effect_sha256])?;
-        Ok(())
     }
 
     /// The effect descriptor hash and argument hash grant `gid` was approved with.
@@ -318,7 +347,8 @@ mod tests {
         assert_eq!(l.use_effect_grant(&op("run_b", "SPAWN", "/zones/child/worker"), Some("aaaa")).unwrap(), EffectUse::None);
 
         let gid = l.approve(&rid, &once("op")).unwrap();
-        assert_eq!(l.grant_effect(&gid).unwrap(), Some((None, Some("aaaa".into()))));
+        let (effect, args) = l.grant_effect(&gid).unwrap().unwrap();
+        assert_eq!((effect.map(|e| e.len()), args.as_deref()), (Some(64), Some("aaaa")), "every grant records its effect");
         // Changed arguments: refused, nothing used, and on the record.
         assert_eq!(l.use_effect_grant(&o, Some("bbbb")).unwrap(), EffectUse::ArgsChanged { grant: gid.clone() });
         let rec = l.audit_latest("run_a", "effect.refused").unwrap().expect("audited");
@@ -326,7 +356,8 @@ mod tests {
         assert_eq!((body["approved_args_sha256"].as_str(), body["presented_args_sha256"].as_str()), (Some("aaaa"), Some("bbbb")));
         // Exactly the arguments: once. Again: spent.
         assert_eq!(l.use_effect_grant(&o, Some("aaaa")).unwrap(), EffectUse::Granted(gid.clone()));
-        assert_eq!(l.use_effect_grant(&o, Some("aaaa")).unwrap(), EffectUse::Spent { grant: gid.clone() });
+        // Used once: presented again, it runs only with a new decision; other arguments may ask too.
+        assert_eq!(l.use_effect_grant(&o, Some("aaaa")).unwrap(), EffectUse::None);
         assert_eq!(l.use_effect_grant(&o, Some("bbbb")).unwrap(), EffectUse::None, "a spent grant holds nothing back");
     }
 
@@ -348,6 +379,56 @@ mod tests {
         assert_eq!(l.use_effect_grant(&o2, Some("aaaa")).unwrap(), EffectUse::Held { pending: r3.id().into() });
         l.deny(r3.id(), "op").unwrap();
         assert_eq!(l.use_effect_grant(&o2, Some("aaaa")).unwrap(), EffectUse::Granted(g2));
+    }
+
+    /// Review of #369: a zone-wide grant another run's arguments were decided on, or a grant from
+    /// before arguments were recorded, isn't refused as tampering: the run asks for its own. A
+    /// denial is of exactly its arguments. And an approval is made only on the effect shown,
+    /// checked in its own transaction.
+    #[test]
+    fn other_runs_and_legacy_grants_dont_refuse_and_denials_are_per_arguments() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let o = |run: &str| op(run, "SPAWN", "/zones/child/worker");
+        let rid = l.file_request(&o("run_b"), Some("aaaa"), "spawn", None).unwrap().id().to_string();
+        l.approve_zone_wide(&rid, &once("op")).unwrap();
+        assert_eq!(l.use_effect_grant(&o("run_a"), Some("bbbb")).unwrap(), EffectUse::None, "run_b's arguments, not run_a's");
+        // A legacy grant (no arguments recorded) for run_a's target doesn't refuse run_a either.
+        let legacy = l.pending_for_unheld(&o("run_a"), None, "old", None).unwrap().0;
+        l.approve(&legacy, &once("op")).unwrap();
+        assert_eq!(l.use_effect_grant(&o("run_a"), Some("bbbb")).unwrap(), EffectUse::None);
+        // Denied with one set of arguments: another set may still ask.
+        let d = l.file_request(&o("run_c"), Some("aaaa"), "spawn", None).unwrap().id().to_string();
+        l.deny(&d, "op").unwrap();
+        assert_eq!(l.denied_recently_with(&o("run_c"), Some("aaaa")).unwrap(), Some(d));
+        assert_eq!(l.denied_recently_with(&o("run_c"), Some("cccc")).unwrap(), None);
+        // The shown effect, checked where the grant is made.
+        let r = l.file_request(&o("run_d"), Some("aaaa"), "spawn", None).unwrap().id().to_string();
+        let shown = crate::descriptor(
+            &l.request(&r).unwrap(),
+            Some(&DecisionTerms { uses: Some(2), ttl_secs: 600, prefix: None, zone_wide: false }),
+        )
+        .sha256();
+        assert!(
+            matches!(l.approve_shown(&r, &once("op"), false, Some(&shown)), Err(crate::StoreError::EffectChanged(..))),
+            "one use isn't two"
+        );
+        assert_eq!(l.request(&r).unwrap().status, "pending");
+        let (gid, sha) = l.approve_shown(&r, &Approval { uses: Some(2), ..once("op") }, false, Some(&shown)).unwrap();
+        assert_eq!((sha, l.grant_effect(&gid).unwrap()), (shown.clone(), Some((Some(shown), Some("aaaa".into())))));
+    }
+
+    /// A held ask is shown on the request it waits on.
+    #[test]
+    fn a_held_asker_joins_the_request_it_waits_on() {
+        let l = Ledger::open_in_memory().unwrap();
+        let ask = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "files.example", "/docs");
+        let (pid, _) = l.ask(&ask, "the docs", true, None).unwrap();
+        let get = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "files.example", "/docs/a");
+        let who = serde_json::json!({ "requesters": [{ "agent": "reader" }] });
+        assert_eq!(l.pending_for(&get, "", Some(&who)).unwrap(), (pid.clone(), false));
+        assert_eq!(crate::requesters(&l.request(&pid).unwrap().attribution[0]), vec!["reader".to_string()]);
+        // request_access for an exact path under it waits on it too.
+        assert_eq!(l.ask(&get, "one file", false, None).unwrap(), (pid, false));
     }
 
     /// An egress request a pending prefix ask from its run covers waits on that ask.
