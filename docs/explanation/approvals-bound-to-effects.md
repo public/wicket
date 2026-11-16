@@ -35,13 +35,16 @@ Its canonical JSON has sorted keys and no whitespace, and its sha256 is what is 
   only if the request is still that descriptor.
 - **The console** signs the descriptor and its hash (`effect`, `effect_sha256`) with the passkey,
   in the same JSON as the rest of the decision.
-- **An agent's `decide`** signs the hash into its decision envelope; the gateway lists the requests
-  it may decide with each one's hash.
+- **An agent's `decide`** names the request's effect as `pending_requests` listed it (`effect`),
+  and the gateway refuses the call if the request changed since; it then signs the hash of the
+  effect it grants into the decision envelope.
 
 [`grant::decide`](one-decision-path.md) rebuilds the descriptor from the ledger when the decision is
-recorded. If it differs from the one that was shown or signed (another asker joined the request,
-its risk was rewritten, other terms were picked), the decision is refused and audited as
-`decision.refused`. Otherwise the grant is made with the descriptor's hash (`grants.effect_sha256`)
+recorded, and the ledger again in the transaction that makes the grant (`Ledger::approve_shown`).
+If it differs from the one that was shown or signed (another asker joined the request, its risk
+was rewritten, other terms were picked), the decision is refused and audited as
+`decision.refused`. The reason text isn't part of the effect: for wicket's own kinds it is written
+from the arguments, which are. Otherwise the grant is made with the descriptor's hash (`grants.effect_sha256`)
 and the arguments' hash (`grants.args_sha256`), and the decision record carries both.
 
 What the arguments are, per kind:
@@ -56,11 +59,15 @@ What the arguments are, per kind:
 A grant for a reserved kind is used (`Ledger::use_effect_grant`) only:
 
 - for exactly its target, never through a prefix grant;
-- with exactly the arguments it was decided on. A call whose arguments changed after the approval
-  is refused, and the refusal is audited as `effect.refused`, with both hashes;
+- with exactly the arguments it was decided on. A call from the run that asked, whose arguments
+  changed after the approval, is refused, and the refusal is audited as `effect.refused`, with both
+  hashes. Another run's zone-wide grant on other arguments, or a grant made before arguments were
+  recorded, just isn't this call's: it asks for its own;
 - while it is live, checked when the action runs, not when it was decided;
-- as many times as its uses allow. A call presented again after its last use finds it spent: a
-  spawn says the child was already started, and nothing is asked again.
+- as many times as its uses allow, each use taken in the transaction that finds it. A call
+  presented again after its last use doesn't run again: it asks for a new decision.
+
+A denial refuses exactly the arguments it was made on for ten minutes; other arguments may ask.
 
 The reconciler provisions an approved capacity lease only while its grant is live and the lease is
 still what was approved; otherwise it closes the lease as denied and audits `effect.refused`.
@@ -83,8 +90,9 @@ While a request from a run is pending:
 
 - an ask for the same target with other arguments files nothing; the caller is told to wait for
   the pending request (`Filed::Held`);
-- an egress request a pending prefix ask from the run covers gets that ask's id, not a request of
-  its own, so it is decided by the same decision;
+- an egress request, or an exact `request_access` ask, that a pending prefix ask from the run
+  covers gets that ask's id, not a request of its own, so it is decided by the same decision;
+- a held asker is added to the request it waits on, so the decider sees everyone it would serve;
 - an action for that target waits, even under a grant made earlier (`EffectUse::Held`). The spawn
   and link tools answer "waiting: request … is not decided yet".
 

@@ -78,7 +78,7 @@ Tick ==
     /\ now' = now + 1
     /\ UNCHANGED <<reqs, grants, spent, hist>>
 
-\* Principal p asks for effect e with arguments a (`Ledger::request_or_existing`). With Hold a
+\* Principal p asks for effect e with arguments a (`Ledger::file_request`). With Hold a
 \* second ask for an effect already pending for p files nothing: it waits on the pending one.
 Ask(i, p, e, a) ==
     /\ reqs[i].st = "none"

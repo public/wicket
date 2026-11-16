@@ -4,8 +4,9 @@
 //! The CLI (`wicket approve`), the console and an agent's `decide` all show a decider the request's
 //! descriptor with the terms they picked, and [`crate::grant::decide`] makes the grant only if the
 //! descriptor it builds from the ledger's row then is the one the decider was shown
-//! ([`SHOWN_EFFECT`]): a request that changed in between (its reason, its risk, its arguments) is
-//! refused, not granted as something nobody saw.
+//! ([`SHOWN_EFFECT`]): a request that changed in between (who asked, its risk, its arguments) is
+//! refused, not granted as something nobody saw. The reason text is not part of the effect: for
+//! wicket's own request kinds it is written from the arguments, which are.
 
 use crate::grant::Terms;
 use anyhow::Result;

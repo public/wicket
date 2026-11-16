@@ -194,8 +194,14 @@ the model on a `\* model: ApprovalEffect` line (`GrantsOnNodes`'s variants name 
 | `Ask` | `wicket-store/src/effect.rs` `Ledger::file_request` (`held_by`: `Filed::Held`); `pending_for` for egress, spawn, link, capacity and update asks |
 | `Approve` | `wicket-cli/src/grant.rs` `decide` (the shown descriptor, `effect::SHOWN_EFFECT`) → `approve` → `Ledger::approve` (`args_sha256` copied to the grant) and `bind_grant_effect` |
 | `Deny` | `wicket-cli/src/grant.rs` `decide` → `deny` |
-| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-cli/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress |
+| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-cli/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress, where the hold is at `Ask`: an egress op is asked for only when no grant covers it, so no request for its exact effect is pending while a grant for it is used |
 | `Via` | the identity a request is filed under: the asking run's (`Op::run`), never a relaying parent's; `Effect::run` and `requested_by` in the descriptor |
 
 Bounds: two request ids, one effect, two argument values, `Lifetime = 1`, `MaxTime = 2`
 (`ApprovalEffect.cfg`).
+
+Each invariant is the safety property its switch's guard is there for, so the model checks that
+the guards together keep every property in every interleaving of asks, decisions, replays, ticks
+and hops, and that dropping any one guard breaks its property. Not modelled: zone-wide grants,
+prefix asks, and the ledger's transactions themselves (each action is one atomic step, as
+`file_request`, `approve_shown` and `use_effect_grant` are one transaction each).
