@@ -17,19 +17,19 @@ per request today, and the order in which that moves to the node.
 ## Where the control host decides per request today
 
 Every box runs on a node (#146): an enrolled one, or the host's own built-in node (`localnode.rs`,
-`node.json`'s `shares_host`). `wicket run` (`run.rs`) also starts the run's own proxies on
-`<run>/ctl/*.sock`. The node reaches them through `Node::open_tunnel` (`nodesrv.rs`), using the socket itself
+`node.json`'s `shares_host`). `wicket run` (`run.rs`) also starts the run's own gateway on
+`<run>/ctl/gateway.sock`. The node reaches it through `Node::open_tunnel` (`nodesrv.rs`), using the socket itself
 on the built-in node or a `TunnelOpen` over the run's channel elsewhere (`noderun.rs` accepts the
-targets `egress` and `gateway`).
+target `gateway`; `egress` went with slice 3, `llm` with slice 1).
 
 | where | what it decides | still needed because |
 |---|---|---|
-| `run.rs` → `Egress::new` on `ctl/egress.sock`, deciding through `decide::Central` (compiled zone + ledger: `consume_grant`, `denied_recently`, `pending_for`) | every request to a host the node forwards instead of terminating (`decide::route_sealed`) | hosts outside the node CA's name constraints, or a node with no CA or an expired one; the swapped hosts of a box a control host at protocol 9 started. Since slice 2 credential swaps (remote and wrapped sessions, #169/#112) are made on the node |
-| the same egress's model gate (`Egress::set_model_gate`) | budget and filter for model calls made through egress (wrapped sessions) | it sits on the forwarded path above |
+| `run.rs` → `Egress::new` on `ctl/egress.sock`, deciding through `decide::Central` (compiled zone + ledger: `consume_grant`, `denied_recently`, `pending_for`) | every request to a host the node forwarded instead of terminating | **removed in slice 3**: a host the node CA can't cover is spliced (if the box's token allows it wholesale) or refused on the node (`decide::route`, `Route::Uncovered`) |
+| the same egress's model gate (`Egress::set_model_gate`) | budget and filter for model calls made through egress (wrapped sessions) | **removed in slice 3**, with the forwarded path; since slice 2 the node's egress takes its own model proxy as its gate |
 | `run.rs` → `Gateway::new` on `ctl/gateway.sock` (`wicket-proxy/src/gateway.rs`) | every gateway tool the node relays: `decide`, `expose`/`connect`/`link`/`unlink`/`links`, `finish`, `hibernate`; `send_message`, `request_capacity`, `request_update` while connected; spawns the node doesn't start itself; the control-host side of `await_grant`/`pending_requests`; `tools/list` and `initialize` | these tools need the ledger, the other boxes' records or the placement backend, and the node relays them as raw JSON-RPC |
 | `run.rs` → `Llm::new` on `ctl/llm.sock` | nothing: since #152 the node's model proxy holds the credential (fetched with `SecretFetch`) and calls the model itself; `Llm::relayed`'s relay runs only when the vault isn't sourced, which never happens on a node | **removed in slice 1** |
 | `noderun::ask` / `check_node_ask` / `check_node_op` | raises a pending request for a node's ask, after checking the op belongs to the run's own tenant, run and zone | this is issuance, not a decision: it stays (a peer message only asks) |
-| `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks; since slice 2 also those on swapped hosts | the ledger is still where a grant is recorded *and* consumed for the forwarded egress path above |
+| `noderun::sync_grants` | turns ledger grants into Biscuit grant blocks (`LiveGrant`) on the feed, and renewals into re-minted blocks | publication, not a decision: since slice 3 it only publishes (every egress grant, whatever its host), and the ledger only records issuance. `Ledger::consume_grant` refuses an egress op; it still consumes wicket's own SPAWN and LINK grants for the control-host gateway (slice 4) |
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
@@ -56,15 +56,28 @@ node's own `Llm`.
    on swapped hosts to the node, so their uses are counted there, from the feed. The node's
    egress takes its own model proxy as its model gate (`Egress::set_model_gate`), so a wrapped
    session's model calls, whose login is now swapped on the node, keep their budget and filter.
-3. **Slice 3: no forwarded egress.** A node whose CA can't cover a host refuses it (or splices it
-   when its token allows the host wholesale) instead of forwarding it. The local node's CA is
-   unconstrained already. `Central` and the `egress` tunnel target go, and the ledger stops
-   consuming grants: it records issuance and `sync_grants` only publishes.
+3. **Slice 3 (done): no forwarded egress.** A node whose CA can't cover a host (outside its name
+   constraints, or no live CA) refuses it, or splices it when the box's token allows the host
+   wholesale, instead of forwarding it (`decide::route` → `Route::Uncovered`; `Egress::refuse_uncovered`).
+   The local node's CA is unconstrained already. `Central`, `forward_connect`, the `Relay` trait's
+   tunnel and the `egress` tunnel target go, and so do `ctl/egress.sock` and `BoxStart::swap_hosts`.
+   Plain `http://` needs no certificate, so the node decides it whatever its CA covers. The ledger
+   stops consuming egress grants (`Ledger::consume_grant` refuses an egress op;
+   `Ledger::grant_covering` looks one up without using it): it records issuance, and `sync_grants`
+   only publishes, every egress grant included. A grant the node can't honour as approved (a risk
+   bound a query could exceed, #119, or one its token can't load) is never published, so the box's
+   request is asked again; one past `MAX_GRANTS` waits for room. Protocol 11
+   (`chan::NO_FORWARDED_EGRESS`): a box that a node before 11 would forward a known host of (a reach,
+   inject or swap host outside that node's CA, or any host without a live CA, `noderun::forwarded_host`)
+   goes only to a node at 11 or later (`refuse_older_node`). Egress lines: a refused uncovered host
+   is a `forbidden` line (`not served on this node (<why>)`), where it was a `forwarded` one; the
+   control host's own `grant …; used by …` details (and their `WARNING: approved for …`) are gone
+   with Central. Audit records are unchanged.
 4. **Slice 4: one gateway, on the node.** `tools/list`, `initialize` and every tool are answered by
    `nodegw.rs`. Tools that need the control host (link tools, `decide`, `finish`/`hibernate`,
    capacity, update, messages to boxes on other nodes) go as typed channel messages that ask
    (`Msg::Ask`'s pattern), not as relayed JSON-RPC. `wicket-proxy/src/gateway.rs`'s tool bodies
-   and spawn's `--parent-run` re-exec path go. This is protocol 11, behind #241's jumps.
+   and spawn's `--parent-run` re-exec path go. This is protocol 12, behind #241's jumps.
 5. **Slice 5: `run.rs` starts no proxies.** With nothing left on `ctl/*.sock`, the run supervisor
    keeps the vault, the ledger, approvals and the feed. The control host is forward-only: it relays
    secrets and asks, and decides nothing per request.

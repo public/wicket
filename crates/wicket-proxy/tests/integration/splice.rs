@@ -3,6 +3,7 @@
 //! wholesale is spliced (the box sees the origin's own certificate); any other host is intercepted
 //! (the box sees a leaf from the run's CA).
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::{Central, NodeDecider};
+use wicket_proxy::decide::NodeDecider;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{Event, RunCtx};
 
@@ -92,6 +93,11 @@ impl World {
     /// The proxy as the control host runs it, or (with a node decider) as a node does: the node's
     /// feed decides, there is no activation fence, and interception uses the node's own CA.
     async fn with(node: Option<Arc<NodeDecider>>) -> World {
+        World::with_router(node, None).await
+    }
+
+    /// As [`World::with`], with a node's router: which hosts its CA covers.
+    async fn with_router(node: Option<Arc<NodeDecider>>, router: Option<Arc<dyn wicket_proxy::egress::Router>>) -> World {
         let dir = tmpdir();
         let origin_ca = RunCa::generate("origin").unwrap();
         let resolve = origins(&origin_ca, &["open.test", "checked.test", "fenced.test", "registry.test"]).await;
@@ -139,8 +145,8 @@ impl World {
         // Not pinned: checked like a real DNS answer (#116), and refused.
         up.dns.insert("private.test".into(), vec!["127.0.0.1".parse().unwrap()]);
         let egress = match node {
-            None => Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_splice").unwrap()), Arc::new(Central), None, up),
-            Some(d) => Egress::with_upstream(ctx, Arc::new(RunCa::generate("node").unwrap()), d, None, up),
+            None => Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_splice").unwrap()), Arc::new(ZoneDecider), None, up),
+            Some(d) => Egress::with_upstream(ctx, Arc::new(RunCa::generate("node").unwrap()), d, router, up),
         }
         .unwrap();
         let sock = dir.join("egress.sock");
@@ -572,6 +578,35 @@ async fn a_node_splices_only_top_level_boxes_and_only_wholesale_hosts() {
     for d in [child_dir, top_dir, org_dir, base_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// A node's CA that covers none of the test's hosts.
+struct NoneCovered;
+
+impl wicket_proxy::egress::Router for NoneCovered {
+    fn route(&self, _host: &str) -> wicket_proxy::decide::Route {
+        wicket_proxy::decide::Route::Uncovered("outside the node CA's name constraints".into())
+    }
+}
+
+/// #257, slice 3: a host the node's CA can't cover is never forwarded to the control host. One the
+/// box's token allows wholesale is spliced (nothing is terminated, so no leaf is needed); any other
+/// is refused at CONNECT, saying why, and logged as a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_splices_or_refuses_what_its_ca_cannot_cover() {
+    let (d, _, feed_dir) = node_feed(&zone(), "run_splice");
+    let w = World::with_router(Some(d), Some(Arc::new(NoneCovered))).await;
+    let (status, s) = w.connect("open.test").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "allowed wholesale: spliced {status}");
+    drop(s);
+    let (status, _) = w.connect("checked.test").await;
+    assert!(status.starts_with("HTTP/1.1 403") && status.contains("not served on this node"), "{status}");
+    assert!(status.contains("outside the node CA's name constraints") && status.contains("renew-ca"), "{status}");
+    settle().await;
+    let ev = w.events();
+    assert!(ev.iter().any(|(h, o, d)| h == "checked.test" && o == "forbidden" && d.contains("not served on this node")), "{ev:?}");
+    assert!(!ev.iter().any(|(_, o, _)| o == "forwarded"), "{ev:?}");
+    let _ = std::fs::remove_dir_all(feed_dir);
 }
 
 /// TLS over `s` (any certificate), one raw request, and the response as text.

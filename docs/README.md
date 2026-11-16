@@ -67,6 +67,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Concepts](explanation/concepts.md): zones, boxes, nodes, grants, identities, authority as tokens,
   deciding at the edge, the signed feed, links, leases, hibernation, audit
 - [Security model](explanation/security-model.md) and [what wicket doesn't protect](explanation/limits.md)
+- [Approvals bound to their effect](explanation/approvals-bound-to-effects.md): what an approval signs, its blast radius, and holding until decided
 - [Why gVisor](explanation/why-gvisor.md)
 - [Performance of the network path](explanation/performance.md)
 - [How updates work](explanation/updates.md)

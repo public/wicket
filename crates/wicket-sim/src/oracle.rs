@@ -9,6 +9,9 @@
 //!   the grant never allows by it. A fresh node does so for at most one statement TTL (plus clock
 //!   skew) after the revocation: a fresh node holds every epoch a live statement names. A forbidden
 //!   op, or one no grant covers, is never allowed.
+//! - **No forwarded egress** (#257's slice 3). A host the node's CA can't cover is never decided by
+//!   a grant: it is allowed only spliced, when the zone allows it wholesale, and refused otherwise,
+//!   whatever grant was published for it.
 //! - **Model spend within the run's budget**, across slices, crashes and reconnections. This is
 //!   what the stand-in upstream billed (requests, output tokens), not what any proxy counted.
 
@@ -60,6 +63,9 @@ pub struct Stats {
     pub connections: u64,
     pub feed_refusals: u64,
     pub grant_actions: u64,
+    /// Requests to hosts the node's CA can't cover: spliced, refused.
+    pub spliced: u64,
+    pub uncovered_refused: u64,
 }
 
 pub struct Oracle {
@@ -163,6 +169,25 @@ impl Oracle {
             Decision::Forbidden(_) => self.stats.forbidden += 1,
             Decision::Refused { .. } => self.stats.refused += 1,
         }
+    }
+
+    /// The node's CA can't cover `host`: it spliced the request (by reach rule `spliced`) or refused
+    /// it, before anything was decided (#257's slice 3).
+    pub fn uncovered(&mut self, t: i64, run: &str, host: &str, path: &str, spliced: Option<usize>) {
+        self.note(t, format!("uncovered {run} {host}{path} -> {}", spliced.map_or("refused".to_string(), |r| format!("spliced {r}"))));
+        match spliced {
+            Some(_) if host != crate::SPLICED_HOST => {
+                self.violate(t, format!("{run}: {host}{path} is outside the node's CA and not allowed wholesale, but was spliced"));
+            }
+            Some(_) => self.stats.spliced += 1,
+            None => self.stats.uncovered_refused += 1,
+        }
+    }
+
+    /// The node decided (and allowed) a request to a host its CA can't cover, as if it had
+    /// terminated it: only with `Options::refuse_uncovered` off.
+    pub fn decided_uncovered(&mut self, t: i64, run: &str, host: &str, path: &str, d: &Decision) {
+        self.violate(t, format!("{run}: {host}{path} is outside the node's CA, and was decided and allowed ({})", short(d)));
     }
 
     #[allow(clippy::too_many_arguments)]

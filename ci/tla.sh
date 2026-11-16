@@ -37,6 +37,12 @@ expect_fail() {
     fail_token_boundary | fail_node_skew) echo 'NoAllowPastLifetime' ;;
     fail_no_journal | fail_merged_counters | fail_slice_unreserved | fail_edge_carve | fail_no_first_slice) echo 'SpendWithinBudget' ;;
     fail_today) echo 'NoAllowPastLifetime|SpendWithinBudget' ;;
+    # #369's model (ApprovalEffect.tla): each switch off breaks the invariant it protects.
+    fail_effect_no_hold) echo 'HoldUntilDecided' ;;
+    fail_effect_replay) echo 'ExactlyOnceOnReplay' ;;
+    fail_effect_check_at_decision) echo 'NoActionAfterExpiry' ;;
+    fail_effect_relay_as_self) echo 'IdentityKeptAcrossHops' ;;
+    fail_effect_unbound_args) echo 'ArgumentsBound' ;;
     *) echo "" ;;
   esac
 }
@@ -47,9 +53,20 @@ if [ $# -gt 0 ]; then cfgs=("$@"); else mapfile -t cfgs < <(ls verification/tla/
 status=0
 for cfg in "${cfgs[@]}"; do
   dir=$(dirname "$cfg") name=$(basename "$cfg" .cfg)
-  # A model's own .cfg is named after it; the variants check the one model in their directory.
-  spec=$(ls "$dir"/*.tla | head -n 1)
-  [ -f "$dir/$name.tla" ] && spec=$dir/$name.tla
+  # A model's own .cfg is named after it; a variant names its model on a `\* model: <Name>` line
+  # (needed where a directory holds more than one model; with one, it checks that one).
+  model=$(sed -n 's/^\\\* model: *\([A-Za-z0-9_]*\) *$/\1/p' "$cfg" | head -n 1)
+  if [ -f "$dir/$name.tla" ]; then
+    spec=$dir/$name.tla
+  elif [ -n "$model" ] && [ -f "$dir/$model.tla" ]; then
+    spec=$dir/$model.tla
+  elif [ "$(ls "$dir"/*.tla | wc -l)" -eq 1 ]; then
+    spec=$(ls "$dir"/*.tla)
+  else
+    echo "FAIL  $name: names no model (a \`\\* model: <Name>\` line) and $dir holds several"
+    status=1
+    continue
+  fi
   log=$work/$name.log
   start=$(date +%s)
   set +e

@@ -21,6 +21,7 @@ Safety (invariants):
 | `NoAllowAfterRevocation` | no allow with a grant whose revocation the decider has: the ledger for Central, the replica for the node |
 | `SpendWithinBudget` | what the provider billed for the box, plus every child's carve-out (each assumed spent in full), stays within the run's budget, across slices, crashes and reconnections |
 | `PeerNeverGrants` | every grant in the ledger was decided by a human, and every grant the node holds came from the publisher's feed |
+| `LedgerNeverDecides` | from #257's slice 3 the ledger records grants and never decides a request by one (`CentralAllow` never fires): one decision path, the node's |
 
 Liveness, under weak fairness for the plumbing only: the node restarts and reconnects, the feed
 is delivered, spend is written and reported, a call in flight lands, a child is adopted, and an
@@ -67,7 +68,7 @@ is not modelled here.
 | value | what decides | model actions |
 |---|---|---|
 | `"today"` | slices 1 and 2 done. Central decides forwarded hosts from the ledger, the control host's egress model gate makes model calls, and the gateway on the control host spawns | `CentralAllow`, `ChCall`, `ChSpawn`, and every node action |
-| `"slice3"` | no forwarded egress (Central and the model gate gone); the gateway still spawns on the control host | `ChSpawn`, and the node's |
+| `"slice3"` | no forwarded egress (done, #257 slice 3): Central and the model gate gone; `Hand` publishes every grant, `FwdGrants` (on hosts the node's CA can't cover) included, and `NodeAllow` never uses one, since such a host is spliced or refused; the gateway still spawns on the control host | `ChSpawn`, and the node's |
 | `"end"` | slices 4–5: only the node decides, and spawns | the node's only |
 
 Each #257 slice PR should update this table and the switch, and keep every `pass_*.cfg` passing.
@@ -109,12 +110,12 @@ After #257's slice 3, `SeparateCounters` and the control host's own calls are mo
 | `PeerAsk` | `noderun.rs` `ask`, `check_node_ask` (a node's `Msg::Ask`); `nodegw.rs` `request_access` and the queue while cut off; the gateway's `request_access` |
 | `PeerForge` | `wicket-feed/src/replica.rs` `Replica::accept` → `plan`, `verify`: only frames the publisher signed are applied |
 | `Approve` | `wicket-cli/src/grant.rs` `decide` → `approve`; `wicket-store` `Ledger::approve` |
-| `Hand` | `noderun.rs` `sync_grants` (`route_sealed` = Terminate) → `wicket-store/src/node.rs` `hand_grant_to_node`, `live_grant`, `Publisher::commit` (`Change::PutZone`) |
+| `Hand` | `noderun.rs` `sync_grants` (today: `route_sealed` = Terminate; since slice 3 every egress grant) → `wicket-store/src/node.rs` `hand_grant_to_node`, `live_grant`, `Publisher::commit` (`Change::PutZone`) |
 | `Renew` | `grant.rs` `renew`; `node.rs` `renew_grant`; `noderun.rs` `renew_live`, `sync_grants` |
 | `Revoke` | `node.rs` `revoke_grant`; `noderun.rs` `sync_grants` (`Change::Revoke`) |
 | `Deliver` | `nodesrv/conn.rs` (feed frames from the channel) → `Replica::accept`; it resumes from the node's epoch on reconnect (`Replica::hello`) |
-| `NodeAllow` | `wicket-proxy/src/decide.rs` `NodeDecider` → `wicket-feed/src/token.rs` `Replica::<BoxAuthority>::decide` (`request`: whole seconds) |
-| `CentralAllow` | `decide.rs` `Central` → `wicket-store/src/lib.rs` `Ledger::consume_grant`, `live_grant` (`expires_at > now`, `node IS NULL`) |
+| `NodeAllow` | `wicket-proxy/src/decide.rs` `route` (only a host the node's CA covers; else `egress/connect.rs` splices or `refuse_uncovered`), then `NodeDecider` → `wicket-feed/src/token.rs` `Replica::<BoxAuthority>::decide` (`request`: whole seconds) |
+| `CentralAllow` | today only (removed in slice 3): `decide.rs` `Central` → `wicket-store/src/lib.rs` `Ledger::consume_grant`, which since slice 3 refuses an egress op |
 | `NodeAdmit` | `wicket-proxy/src/llm.rs` `Llm::admit` (slice, then zone), `filter`, `reserve_output`; with #333, `Llm::journal` |
 | `NodeUpstream` | `llm.rs` `Llm::handle`: the call sent upstream |
 | `NodePersist` | `nodesrv.rs` `serve_box`'s spend task (`SPEND_FILE`; with #333, `write_spend`) |
@@ -154,10 +155,54 @@ a 1 GiB heap:
 | cfg | half | states (distinct) | time |
 |---|---|---|---|
 | `GrantsOnNodes.cfg` | both, end state: 1 grant, 4 ticks, budget 2, 1 spawn, 2 faults | 101,762 | 26 s |
-| `pass_grants_end`, `pass_grants_today` | grants: 2 grants (one forwarded), 5 ticks at 2 per second, 1 renewal, 2 faults | 424,704 | 90 s each |
+| `pass_grants_end`, `pass_grants_slice3`, `pass_grants_today` | grants: 2 grants (one on a host the node's CA can't cover), 5 ticks at 2 per second, 1 renewal, 2 faults | 424,704 (today) | 90 s each |
 | `pass_budget_end`, `_slice3`, `_today` | budget: budget 4, step 2, 2 spawns of 1, 3 faults | 5,591 to 14,803 | under 10 s |
 | `fail_*` | as their half | (stops at the violation) | under 10 s |
 
 The halves share only the node's up/connected state and its faults, so checking them apart
 loses no interleaving that matters to either property, and keeps the state space in the
 hundreds of thousands. The whole model at the halves' bounds had over 10M states.
+
+# ApprovalEffect: approvals bound to their effect
+
+[#369](https://github.com/public/wicket/issues/369), on top of model 1. A parent principal and the
+child it spawned (one delegation hop) ask for one effect, each request with arguments. A human, or
+an agent with grant rights, decides each request on its effect descriptor: who asks, the effect,
+the grant's terms, and the hash of the arguments. An action runs under a grant: the egress proxy
+sends the request, or wicket spawns, links, leases or updates. The box may present an action
+again (a retry, a replay), change its arguments after the approval, or hold it until its grant is
+near its end. `ci/tla.sh` runs `ApprovalEffect.cfg` and its `fail_effect_*` variants, which name
+the model on a `\* model: ApprovalEffect` line (`GrantsOnNodes`'s variants name theirs).
+
+| property | meaning |
+|---|---|
+| `HoldUntilDecided` | no action runs for a principal's effect while a request for that effect, from a sibling branch or the same one, waits for a decision |
+| `ExactlyOnceOnReplay` | an approved action runs once, however often it is presented again |
+| `NoActionAfterExpiry` | no action runs at or after its grant's end, however long it waited |
+| `IdentityKeptAcrossHops` | a request keeps its originator's identity across the delegation hop, and an action runs only under a grant to its originator |
+| `ArgumentsBound` | an action runs only with the arguments its grant was decided on |
+
+| switch (decided value) | the bug it stands for | fails |
+|---|---|---|
+| `Hold = TRUE` | a related request is filed and decided apart from the pending one, or a granted action runs while another request for its effect is pending (2607.14166) | `fail_effect_no_hold`: `HoldUntilDecided` |
+| `ConsumeOnce = TRUE` | the grant's use isn't recorded with the action, so a replay runs it again | `fail_effect_replay`: `ExactlyOnceOnReplay` |
+| `CheckAtRun = TRUE` | the grant's lifetime is checked when it is decided, not when the action runs | `fail_effect_check_at_decision`: `NoActionAfterExpiry` |
+| `KeepIdentity = TRUE` | the parent relays its child's request as its own, so the child acts under the parent's grants | `fail_effect_relay_as_self`: `IdentityKeptAcrossHops` |
+| `BindArgs = TRUE` | a grant matches only the target, so changed arguments run under it (2610.21063) | `fail_effect_unbound_args`: `ArgumentsBound` |
+
+| action | code (file, function) |
+|---|---|
+| `Ask` | `wicket-store/src/effect.rs` `Ledger::file_request` (`held_by`: `Filed::Held`); `pending_for` for egress, spawn, link, capacity and update asks |
+| `Approve` | `wicket-cli/src/grant.rs` `decide` (the shown descriptor, `effect::SHOWN_EFFECT`) → `approve` → `Ledger::approve` (`args_sha256` copied to the grant) and `bind_grant_effect` |
+| `Deny` | `wicket-cli/src/grant.rs` `decide` → `deny` |
+| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-cli/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress, where the hold is at `Ask`: an egress op is asked for only when no grant covers it, so no request for its exact effect is pending while a grant for it is used |
+| `Via` | the identity a request is filed under: the asking run's (`Op::run`), never a relaying parent's; `Effect::run` and `requested_by` in the descriptor |
+
+Bounds: two request ids, one effect, two argument values, `Lifetime = 1`, `MaxTime = 2`
+(`ApprovalEffect.cfg`).
+
+Each invariant is the safety property its switch's guard is there for, so the model checks that
+the guards together keep every property in every interleaving of asks, decisions, replays, ticks
+and hops, and that dropping any one guard breaks its property. Not modelled: zone-wide grants,
+prefix asks, and the ledger's transactions themselves (each action is one atomic step, as
+`file_request`, `approve_shown` and `use_effect_grant` are one transaction each).
