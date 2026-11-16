@@ -15,6 +15,7 @@
 #   release      cargo build --release -p wicket-cli, from an empty target dir (its own)
 #   cli-clean    cargo build -p wicket-cli (debug), from an empty target dir, with --timings
 #   cli-test-cold  cargo test -p wicket-cli --no-run, after cli-clean (what the test build adds)
+#   cli-clippy-clean cargo clippy -p wicket-cli --all-targets, from an empty target dir
 #   cli-touch-core cargo build -p wicket-cli after a one-line change in wicket-core
 #   cli-touch-cli  the same after a one-line change in wicket-cli
 #   cli-clippy   cargo clippy -p wicket-cli --all-targets after a one-line change in wicket-cli
@@ -118,6 +119,10 @@ for s in "${steps[@]}"; do
       rm -rf "$CARGO_TARGET_DIR"
       timed cli-clean cargo build -p wicket-cli --locked --timings
       cp "$CARGO_TARGET_DIR"/cargo-timings/cargo-timing.html "$out/timings-$label-cli-clean.html"
+      ;;
+    cli-clippy-clean)
+      rm -rf "$CARGO_TARGET_DIR"
+      timed cli-clippy-clean cargo clippy -p wicket-cli --all-targets --locked
       ;;
     cli-test-cold) timed cli-test-cold cargo test -p wicket-cli --locked --no-run ;;
     cli-touch-core) touch_cli cli-touch-core crates/wicket-core/src/lib.rs cargo build -p wicket-cli --locked ;;
