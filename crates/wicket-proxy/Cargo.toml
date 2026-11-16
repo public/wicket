@@ -51,8 +51,7 @@ wicket-authz.workspace = true
 
 [features]
 # The deterministic simulation's seam (#324): `Llm::sim_begin` and `Llm::sim_settle`, the model
-# proxy's own accounting without HTTP, and `Gateway::sim_call`, a gateway tool call without HTTP.
-# Only `wicket-sim` turns it on.
+# proxy's own accounting without HTTP. Only `wicket-sim` turns it on.
 sim = []
 
 [dev-dependencies]

@@ -128,6 +128,8 @@ pub(super) async fn connection(node: Arc<Node>, stream: UnixStream, gen: u64) ->
             }
         }
     };
+    // The control host's tools asked over it get no answer now: their callers learn it at once.
+    node.calls.lock().expect("calls").retain(|_, (g, _)| *g != gen);
     let gone = {
         let mut links = node.links.lock().expect("links");
         let gone = links.remove(&gen);
@@ -348,6 +350,11 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                     } else if b.dir.starts_with(node.paths.runs()) {
                         super::volumes::drop_caches(&b.dir);
                     }
+                }
+            }
+            Msg::Called { id, text, is_error } => {
+                if let Some((_, tx)) = node.calls.lock().expect("calls").remove(&id) {
+                    let _ = tx.send((text, is_error));
                 }
             }
             m @ Msg::Asked { .. } => {
