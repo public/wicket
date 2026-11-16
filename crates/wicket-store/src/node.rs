@@ -134,6 +134,39 @@ impl Ledger {
     }
 
     /// Node `node` reports its feed at `epoch`: grants published up to it have reached it.
+    /// Records `node`'s latest health report (#377): JSON, as the node sent it, received at `at_ms`.
+    pub fn set_node_health(&self, node: &str, at_ms: i64, health: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_health (node, at_ms, health) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node) DO UPDATE SET at_ms = excluded.at_ms, health = excluded.health",
+            params![node, at_ms, health],
+        )?;
+        Ok(())
+    }
+
+    /// Every node's latest health report: (node, received at ms, JSON), by node.
+    pub fn node_health(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.conn.prepare("SELECT node, at_ms, health FROM node_health ORDER BY node")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records that `run`'s work was collected, and how (#377): `fetched` (its files came back to
+    /// the control host), `outbox` (its result was taken), `pushed` (a git push it made was
+    /// allowed), `bundled` (its state was pushed as it hibernated). The first time each way counts.
+    pub fn record_collected(&self, run: &str, how: &str) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO run_collected (run, how, at) VALUES (?1, ?2, ?3)", params![run, how, crate::now()])?;
+        Ok(())
+    }
+
+    /// How (and when, Unix s) `run`'s work was collected; empty: it hasn't been, and a cleanup
+    /// doesn't delete its workspace unless forced.
+    pub fn collected(&self, run: &str) -> Result<Vec<(String, i64)>> {
+        let mut st = self.conn.prepare("SELECT how, at FROM run_collected WHERE run = ?1 ORDER BY at, how")?;
+        let rows = st.query_map([run], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn node_feed_at(&self, node: &str, epoch: i64) -> Result<()> {
         self.conn.execute("UPDATE grants SET node_epoch = NULL WHERE node = ?1 AND node_epoch <= ?2", params![node, epoch])?;
         Ok(())
@@ -488,5 +521,34 @@ mod tests {
         fresh.audit(&t, None, "op", &serde_json::json!({})).unwrap();
         ctl.append_node_audit("n1", &t, &fresh.audit_records_after(0, 10).unwrap()).unwrap();
         assert_eq!(ctl.verify_node_audit().unwrap()[0].restarts, 1);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use crate::Ledger;
+
+    /// #377: the latest report per node is kept, replacing the one before.
+    #[test]
+    fn a_nodes_latest_health_replaces_the_last() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.set_node_health("n2", 1, "{\"a\":1}").unwrap();
+        l.set_node_health("n1", 2, "{}").unwrap();
+        l.set_node_health("n2", 3, "{\"a\":2}").unwrap();
+        assert_eq!(l.node_health().unwrap(), [("n1".to_string(), 2, "{}".to_string()), ("n2".to_string(), 3, "{\"a\":2}".to_string())]);
+    }
+
+    /// #377: a run's work is collected once each way, and a run never collected has nothing.
+    #[test]
+    fn a_runs_collection_is_recorded_once_each_way() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert!(l.collected("run_a").unwrap().is_empty());
+        l.record_collected("run_a", "outbox").unwrap();
+        l.record_collected("run_a", "outbox").unwrap();
+        l.record_collected("run_a", "fetched").unwrap();
+        let hows: Vec<String> = l.collected("run_a").unwrap().into_iter().map(|(h, _)| h).collect();
+        assert_eq!(hows.len(), 2);
+        assert!(hows.contains(&"outbox".to_string()) && hows.contains(&"fetched".to_string()));
+        assert!(l.collected("run_b").unwrap().is_empty());
     }
 }

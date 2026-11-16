@@ -262,6 +262,52 @@ wicket node revoke n1
 - **For now.** Gateway tools beyond #164's are still decided on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
+## Health, admission and disk ([#377](https://github.com/public/wicket/issues/377))
+
+- **Health.** Every 30 s, on each control connection that speaks protocol 12 or later, a node reports its
+  health (`Msg::Health`). The report covers the disk and inodes of its data directory, its memory
+  (total, available, and the limits committed to running boxes), its feed's mode and freshness, the
+  boxes killed for memory since `serve` started, and its failures to persist its own state (feed
+  frames, spend journal). The control host keeps each node's latest in the ledger (`node_health`).
+  `wicket top` shows a DISK column and the alerts below the node table. `wicket node top` and the
+  node's status socket show the same report. The console shows it under Nodes.
+- **Alerts.** The console pushes to every registered device when a node's disk or inodes pass 85%
+  used, its feed has been stale for more than 5 min, a box was killed for memory, or it couldn't persist
+  its state. The control host's own disk past 85% alerts too. Each condition is pushed once when it
+  appears, and again only after it has cleared, under its own notification tag (`wicket-health`).
+  A device registered without details is told how many alerts there are, not what they say. A report
+  older than 10 min raises no disk or feed alert, and nothing is reported by a node with no
+  control connection.
+- **Admission.** A node refuses to start a box it can't fit, and says why. The box's memory limit
+  must fit in what the kernel says is available (MemAvailable), less what the running and starting
+  boxes may still take up to their limits (each one's limit less its last sampled use), less a
+  margin of 5% of memory, at least 256 MiB. Limits are never overcommitted against what is actually
+  free. The disk must have at least 5% (at least 1 GiB) free, and 1% of its inodes. The refusal
+  (`no room on this node for the box: …`) is audited as `box.refused` on the node, and `wicket run`
+  reports it. A node's `Welcome` carries the room it has now (`room_mib`) and whether it starts
+  no box at all (`full`). Placing a waking agent uses both, and refuses the wake when no node has
+  room, rather than overcommitting one.
+- **Reserve.** A node holds a disk reserve, `reserve` in its directory: preallocated space box
+  volumes can't use, 2% of the disk (at least 256 MiB, at most 2 GiB), or `WICKET_NODE_RESERVE_MIB`
+  (0 for none). When a feed frame can't be persisted, the node releases the reserve and tries the
+  frame again. If it still can't, the feed is stalled. Every 5 s the node checks whether the feed's
+  directory can be written again; once it can, it asks each control connection for what it missed (a
+  catch-up), audited as `feed.recovered`. No restart is needed. The node takes the reserve back once
+  the disk has room for it above the floor. Health counts the reserve as free.
+- **Volumes.** A volume the zone doesn't `keep` is the run's own cache, under `runs/<run>/cache/<name>`.
+  It is deleted when the control host forgets the run (its work collected), on every node including
+  this host's own. If the run's work is never collected, an hourly sweep deletes the cache once its
+  retention after the run's end has passed (default 7 days). A kept volume lives under
+  `volumes/<tenant>/<zone>/<name>` and is deleted by the sweep once it has gone unused for its
+  `retention`, if it has one, and only while no running box has it. Each sweep deletion is
+  audited as `volume.expired`. The sweep never deletes a workspace.
+- **Collection.** The ledger records when a run's work was collected (`run_collected`): its files
+  fetched back to the control host, its outbox taken, a git push it made allowed, or its state
+  bundled as it hibernated. A remote node's workspace for a run with nothing collected isn't
+  forgotten at the run's end. Instead the refusal is printed and audited as `run.cleanup_refused`,
+  and the node keeps the files until `wicket node forget <run> --force` (audited as
+  `run.cleanup_forced`). The node audits the deletion as `run.files_deleted`.
+
 ## Images on nodes
 
 A box on a node starts from an image its node has. A box whose image is pinned by digest (#192,

@@ -477,6 +477,31 @@ pub struct VolumeSpec {
     /// What happens to it when an agent hibernates (#70).
     #[serde(default)]
     pub persist: Persist,
+    /// Kept on the node across runs, shared by the zone's runs (#377). Not kept (the default), it
+    /// is the run's own cache: empty when the run starts, and deleted once its work is collected,
+    /// or [`Self::retention`] after the run ends if it never is.
+    #[serde(default)]
+    pub keep: bool,
+    /// For a kept volume, how long it may go unused before the node deletes it (none: never); for
+    /// a run's cache, how long after the run ends it is kept if the run's work isn't collected
+    /// (default [`CACHE_RETENTION`]). A duration: `12h`, `7d`.
+    #[serde(default)]
+    pub retention: Option<String>,
+}
+
+/// How long after its run ends a run's cache volume is kept if the run's work is never collected.
+pub const CACHE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+impl VolumeSpec {
+    /// [`Self::retention`] as a duration: a kept volume's (None: kept forever), or a cache's (its
+    /// default if unset).
+    pub fn retention(&self) -> Result<Option<std::time::Duration>, ManifestError> {
+        match &self.retention {
+            Some(r) => humantime::parse_duration(r).map(Some).map_err(|_| ManifestError::Duration(r.clone())),
+            None if self.keep => Ok(None),
+            None => Ok(Some(CACHE_RETENTION)),
+        }
+    }
 }
 
 /// A volume's class when an agent hibernates.
@@ -904,6 +929,13 @@ impl Manifest {
                     v.name, v.path
                 )));
             }
+            v.retention()?;
+            if v.keep && v.persist == Persist::Durable {
+                return Err(ManifestError::Invalid(format!(
+                    "volume {:?}: a durable volume is the agent's own and goes with its state; `keep` is for volumes the node keeps",
+                    v.name
+                )));
+            }
         }
         self.zone.limits.check()?;
         Ok(())
@@ -1172,6 +1204,17 @@ zone:
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /workspace/x }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/../etc }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: a, path: /volumes/a }, { name: a, path: /volumes/b }")).is_err());
+        // #377: a volume is the run's cache unless it is kept; each has a retention.
+        let v = |y: &str| Manifest::from_yaml(&vol(y)).map(|m| m.zone.volumes[0].clone());
+        let cache = v("{ name: data, path: /volumes/data }").unwrap();
+        assert!(!cache.keep);
+        assert_eq!(cache.retention().unwrap(), Some(CACHE_RETENTION));
+        let kept = v("{ name: data, path: /volumes/data, keep: true }").unwrap();
+        assert_eq!(kept.retention().unwrap(), None, "kept forever");
+        let kept = v("{ name: data, path: /volumes/data, keep: true, retention: 30d }").unwrap();
+        assert_eq!(kept.retention().unwrap(), Some(std::time::Duration::from_secs(30 * 86400)));
+        assert!(v("{ name: data, path: /volumes/data, retention: soon }").is_err());
+        assert!(v("{ name: data, path: /volumes/data, keep: true, persist: durable }").is_err());
     }
 
     #[test]
