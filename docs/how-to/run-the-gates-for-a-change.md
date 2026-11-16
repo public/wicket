@@ -68,7 +68,10 @@ wicket.
 
 - **A pull request** runs what its change selects. The `select` job prints the selection in its
   summary.
-- **The `full-ci` label** on a pull request runs everything. Adding the label starts a run.
+- **The `full-ci` label** on a pull request runs everything. Adding the label starts a run. The
+  `select` job reads the pull request's labels from the API when it runs, not from the event that
+  started it, so a label added just after a push counts whichever of the two runs survives (#246). If
+  the labels can't be read, it runs everything.
 - **Every push to `main`, and a nightly run,** run the full set, as the signed build does
   (`build.yml`), which never uses a selection.
 - **Node and update suites** (`node-e2e`, `acceptance --nodes local`, `update`) run nightly in
