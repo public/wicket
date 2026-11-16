@@ -37,9 +37,12 @@
 
 pub mod boxes;
 pub mod control;
+pub mod messages;
 pub mod node;
 pub mod oracle;
+pub mod placement;
 pub mod rng;
+pub mod trace;
 pub mod wire;
 
 use oracle::Oracle;
@@ -522,4 +525,27 @@ enum Action {
     Crash(&'static str),
     Bounce(&'static str),
     Latency(u64),
+}
+
+/// Runs `scenario` (one of [`trace::SCENARIOS`]) for `seed`: the first slice's feed and budget
+/// scenario ([`run_with`]), [`placement`] or [`messages`].
+pub fn run_scenario(scenario: &str, seed: u64, dir: &Path, keep_trace: bool) -> trace::Report {
+    match scenario {
+        "feed" => {
+            let r = run_with(seed, dir, Options { keep_trace, ..Options::default() });
+            trace::Report {
+                scenario: "feed",
+                seed,
+                plan: r.plan.to_string(),
+                violations: r.violations,
+                known: vec![],
+                hash: r.hash,
+                stats: format!("{:?}, billed {:?}", r.stats, r.billed),
+                trace: r.trace,
+            }
+        }
+        "placement" => placement::run(seed, dir, placement::Options { keep_trace, ..placement::Options::default() }),
+        "messages" => messages::run(seed, dir, messages::Options { keep_trace, ..messages::Options::default() }),
+        other => panic!("no scenario {other:?}: one of {:?}", trace::SCENARIOS),
+    }
 }
