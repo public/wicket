@@ -110,6 +110,9 @@ pub fn requesters(v: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A live grant for a target: its id, uses left, arguments' hash and run.
+type GrantFound = (String, Option<i64>, Option<String>, Option<String>);
+
 impl Ledger {
     /// Records a pending request for `op` asked with arguments hashed `args` (#369), or returns
     /// the one already pending; or, while a related request from the same run is pending, files
@@ -223,7 +226,7 @@ impl Ledger {
             tx.commit()?;
             return Ok(EffectUse::Held { pending });
         }
-        let rows: Vec<(String, Option<i64>, Option<String>, Option<String>)> = {
+        let rows: Vec<GrantFound> = {
             let mut st = tx.prepare(
                 "SELECT id, uses_left, args_sha256, run FROM grants
                  WHERE tenant = ?1 AND zone = ?2 AND method = ?3 AND host = ?4 AND path = ?5 AND prefix = 0
