@@ -568,6 +568,18 @@ mod tests {
         assert_eq!(op.risk, RiskClass::R2WriteReversible);
     }
 
+    /// Each cloud API or metadata host is R4 on its own, even for a read.
+    #[test]
+    fn each_cloud_metadata_host_is_r4() {
+        let (t, run) = (TenantId::single(), RunId("run_x".into()));
+        for host in ["s3.amazonaws.com", "metadata.google.internal", "169.254.169.254"] {
+            let op = Op::egress(&t, &run, "z", "GET", host, "/latest/meta-data");
+            assert_eq!(op.risk, RiskClass::R4ExecOrPrivilege, "{host}");
+            assert!(op.effects.iter().any(|e| e.starts_with("cloud:")), "{host}");
+        }
+        assert_eq!(Op::egress(&t, &run, "z", "GET", "example.com", "/").risk, RiskClass::R1ReadScoped);
+    }
+
     fn zone() -> ZoneSpec {
         Manifest::from_yaml(
             r#"
