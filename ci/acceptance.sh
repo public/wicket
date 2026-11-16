@@ -536,7 +536,9 @@ our_runs+=("$esc_run")
 esc_out() { data "runs/$esc_run/workspace/out/escape.log" 2>/dev/null; }
 esc_out | sed 's/^/   /'
 # The run's allowed egress, from the audit: the control host's own records and its nodes' (whose
-# body is the node's record, as a string).
+# body is the node's record, as a string). A wicket DNS answer (method DNS: a name resolved to
+# wicket's synthetic range, for HTTP/3; the no-proxy attempt's lookup of example.com makes one) is
+# printed as `DNS <host>`: an answer, not a request, which nothing leaves the box by.
 esc_allowed() {
   w audit --tail 20000 | python3 -I -c '
 import json, sys
@@ -551,13 +553,15 @@ for line in sys.stdin:
             b = json.loads(b["body"]) if b.get("kind") == "op" else {}
     except (ValueError, KeyError, TypeError):
         continue
-    if b.get("kind") == "egress" and b.get("outcome") in ("allow", "spliced"):
+    if b.get("kind") == "egress" and b.get("method") == "DNS" and b.get("outcome") == "allow":
+        print("DNS", b.get("host"))
+    elif b.get("kind") == "egress" and b.get("outcome") in ("allow", "spliced"):
         print(b.get("method"), b.get("host"), b.get("path"))
 ' "${1:-$esc_run}"
 }
 check "a box trying to get out: every attempt refused, none ESCAPED" '[ "$(esc_out | grep -c " blocked ")" -ge 25 ] && ! esc_out | grep -q " ESCAPED "'
 check "  and the canary on the host's addresses saw no request" '[ ! -s "$work/canary.log" ]'
-check "  and its audit allowed nothing but GET example.com/" '! esc_allowed | grep -vxq "GET example.com /"'
+check "  and its audit allowed nothing but GET example.com/ (and resolved no other name)" '! esc_allowed | grep -vxqE "GET example.com /|DNS example.com"'
 
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then

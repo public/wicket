@@ -201,7 +201,7 @@ escape_flow() {
   sed 's/^/   /' <<<"$out"
   check "  on $NODE too: every attempt refused, none ESCAPED" '[ "$(grep -c " blocked " <<<"$out")" -ge 25 ] && ! grep -q " ESCAPED " <<<"$out"'
   check "  and the canary saw no request" '[ ! -s "$work/canary.log" ]'
-  check "  and the audit its node shipped allowed nothing but GET example.com/" '! esc_allowed "$r" | grep -vxq "GET example.com /"'
+  check "  and the audit its node shipped allowed nothing but GET example.com/ (and resolved no other name)" '! esc_allowed "$r" | grep -vxqE "GET example.com /|DNS example.com"'
 }
 
 
