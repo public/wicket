@@ -163,6 +163,15 @@ wicket node revoke n1
   than half of it is left, and lowered at once when what is left shrinks (a spawn's carve-out). Offline, a
   node spends what is left of its slice and nothing more; a slice is kept on the node's disk
   (`slices/`), so a restart doesn't hand an offline node a fresh one.
+- **Egress slices** (#368, protocol 12, the `EgressSlice` message), per run whose zone has
+  `limits.egress`: the totals of requests and bytes the run's box may send through the node's egress
+  proxy before it is sent more, leased from the principal's window (a long-lived agent's over all its
+  activations, kept in the ledger's `egress_windows`): a quarter of what the window has left by default
+  (`WICKET_NODE_EGRESS_SLICE` on the control host, a fraction), the first one in the box's start, renewed
+  while connected once less than half of it is left. The node refuses (429) what doesn't fit, journals its
+  count before each request goes (`node-egress.json`) and reports it with its model spend. Offline, it
+  spends its slice and nothing more; with no slice, a capped box sends nothing. A box whose zone caps
+  egress starts only on a node talking protocol 12, and nothing of it is spliced.
 - **Lifetimes** (#153). Everything a node holds that carries authority ends on its own:
 
   | what | lasts | set by |
@@ -171,6 +180,7 @@ wicket node revoke n1
   | a grant | its TTL, at most 24 h | `wicket approve --ttl` (default 10 min) |
   | a run's use of a secret its node fetched | the box's authority, or the upstream token's own expiry if earlier | the zone; the upstream |
   | a budget slice | until spent, renewed while connected | `WICKET_NODE_BUDGET_SLICE` on the control host (fraction, default 0.25) |
+  | an egress slice | until spent, renewed while connected | `WICKET_NODE_EGRESS_SLICE` on the control host (fraction, default 0.25) |
   | an agent identity | 10 min, re-issued every 5 by the run's supervisor | `WICKET_IDENTITY_TTL` |
   | the node's certificate and node CA | 24 h, renewed over the channel at half-life, or by `renew-ca` | `enrol --cert-ttl`, `--ca-ttl` |
   | the node feed key's certificate | 7 days, renewed when a run starts with less than a day left | (fixed) |

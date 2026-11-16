@@ -75,9 +75,9 @@ impl EgressCounter {
 
     fn why(&self, what: &str) -> String {
         let w = self.caps.window_secs;
-        let window = if w % 3600 == 0 {
+        let window = if w.is_multiple_of(3600) {
             format!("{}h", w / 3600)
-        } else if w % 60 == 0 {
+        } else if w.is_multiple_of(60) {
             format!("{}m", w / 60)
         } else {
             format!("{w}s")
