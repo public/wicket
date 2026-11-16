@@ -13,6 +13,7 @@
 const TAG = "wicket-pending";
 const RUN_TAG = "wicket-runs";
 const RESUB_TAG = "wicket-resubscribe";
+const HEALTH_TAG = "wicket-health";
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 self.addEventListener("install", () => self.skipWaiting());
@@ -26,10 +27,12 @@ self.addEventListener("push", e => {
   const body = typeof d.body === "string" && d.body ? d.body.slice(0, 300) : fallback;
   const id = typeof d.id === "string" && ID.test(d.id) ? d.id : "";
   const run = runs && typeof d.run === "string" && ID.test(d.run) ? d.run : "";
-  // One notification of each kind at a time (the tag), replaced by the next and announced again.
+  // Node health alerts (#377) and runs (#364) have their own tags, so they and the pending one don't
+  // replace each other. One notification of each kind at a time, replaced by the next and announced again.
+  const health = d.kind === "health";
   e.waitUntil(self.registration.showNotification("wicket", {
-    body, tag: runs ? RUN_TAG : TAG, renotify: true, requireInteraction: false,
-    icon: "/static/icon-192.png", badge: "/static/icon-192.png", data: runs ? { run } : { id },
+    body, tag: health ? HEALTH_TAG : runs ? RUN_TAG : TAG, renotify: true, requireInteraction: health,
+    icon: "/static/icon-192.png", badge: "/static/icon-192.png", data: health ? { health: true } : runs ? { run } : { id },
   }));
 });
 
@@ -53,7 +56,8 @@ self.addEventListener("notificationclick", e => {
   const resub = !!(e.notification.data && e.notification.data.resubscribe === true);
   const id = (e.notification.data && ID.test(e.notification.data.id || "")) ? e.notification.data.id : "";
   const run = (e.notification.data && ID.test(e.notification.data.run || "")) ? e.notification.data.run : "";
-  const where = resub ? "/#notifications" : run ? "/#runs/" + run : "/#pending" + (id ? "/" + id : "");
+  const health = !!(e.notification.data && e.notification.data.health === true);
+  const where = resub ? "/#notifications" : health ? "/#health" : run ? "/#runs/" + run : "/#pending" + (id ? "/" + id : "");
   const url = new URL(where, self.location.origin).href;
   e.waitUntil((async () => {
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });

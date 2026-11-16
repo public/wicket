@@ -19,6 +19,9 @@ pub(crate) mod util;
 #[path = "../../crates/wicket-cli/src/chan.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod chan;
+#[path = "../../crates/wicket-cli/src/health.rs"]
+#[allow(dead_code, unused_imports)]
+mod health;
 #[path = "../../crates/wicket-cli/src/nodesecrets.rs"]
 #[allow(dead_code, unused_imports)]
 mod nodesecrets;

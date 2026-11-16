@@ -1701,9 +1701,11 @@ fn spawn_notifier(state: Arc<State>) {
     }
     tokio::spawn(async move {
         let mut n = push::Notifier::default();
+        let mut h = push::HealthNotifier::default();
         loop {
             tokio::time::sleep(NOTIFY_EVERY).await;
             notify_once(&state, &mut n, wicket_store::now()).await;
+            notify_health(&state, &mut h, wicket_feed::now_ms()).await;
         }
     });
 }
@@ -1740,6 +1742,43 @@ async fn notify_once(state: &State, n: &mut push::Notifier, now: i64) -> Vec<(St
         }
     }
     results
+}
+
+/// Every node's latest health report and the alerts it raises, and the control host's own disk
+/// (#377): what the console shows and what [`notify_health`] pushes.
+fn health_view(state: &State, now_ms: i64) -> Result<(Value, Vec<crate::health::Alert>)> {
+    let l = state.ledger()?;
+    let mut alerts = Vec::new();
+    let mut nodes = Vec::new();
+    for (node, received_ms, j) in l.node_health()? {
+        let Ok(h) = serde_json::from_str::<crate::health::NodeHealth>(&j) else { continue };
+        let mine = crate::health::alerts(&node, &h, now_ms);
+        nodes.push(json!({
+            "node": node, "received_ms": received_ms, "summary": crate::health::summary(&h, now_ms),
+            "disk_pct": h.disk.used_pct().round(), "alerts": mine.iter().map(|a| a.text.clone()).collect::<Vec<_>>(),
+        }));
+        alerts.extend(mine);
+    }
+    let disk = crate::health::disk(&state.data);
+    alerts.extend(crate::health::disk_alerts("control", "the control host", &disk));
+    Ok((
+        json!({ "nodes": nodes, "control_disk_pct": disk.used_pct().round(), "alerts": alerts.iter().map(|a| a.text.clone()).collect::<Vec<_>>() }),
+        alerts,
+    ))
+}
+
+/// Pushes node health alerts as they appear (#377), to devices of passkeys still enrolled.
+async fn notify_health(state: &State, h: &mut push::HealthNotifier, now_ms: i64) -> Vec<(String, u16)> {
+    let Some(p) = &state.push else { return Vec::new() };
+    let (alerts, creds) = match (health_view(state, now_ms), creds(state)) {
+        (Ok((_, a)), Ok(c)) => (a, c),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("health notifier: reading the ledger: {e:#}");
+            return Vec::new();
+        }
+    };
+    let subs: Vec<push::Subscription> = p.store.all().into_iter().filter(|s| creds.iter().any(|c| c.id == s.operator)).collect();
+    p.deliver(h.tick(&alerts, &subs), wicket_store::now()).await
 }
 
 fn dashboard(state: &State) -> Result<Value> {
@@ -1791,6 +1830,7 @@ fn dashboard(state: &State) -> Result<Value> {
         "secrets": secrets::view(state),
         "passkeys": l.operator_credentials(t)?,
         "placed": placed_view(&l, wicket_store::now())?,
+        "health": health_view(state, wicket_feed::now_ms())?.0,
         "capacity": capacity::view(&l, &t.0)?,
         "audit": audit,
     }))

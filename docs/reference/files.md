@@ -95,8 +95,9 @@ the user `serve` runs as:
 | `audit.db` | Its own hash-chained audit log, shipped to the control host on every connect. |
 | `asks.json` | Requests raised while the control host was unreachable, queued. |
 | `slices/` | Budget slices, so a restart doesn't hand an offline node a fresh one. |
-| `runs/<run>/` | Each box's directory: `node-box.json` (its record, for adoption), `node-spend.json` (its model spend), its sockets and workspace. |
-| `volumes/` | Zone volumes of the `node` class. |
+| `runs/<run>/` | Each box's directory: `node-box.json` (its record, for adoption), `node-spend.json` (its model spend), its sockets and workspace, and `cache/` (its volumes not kept, with `.life.json`, #377). |
+| `volumes/` | Zone volumes the zone keeps (`keep: true`), each with `.<name>.life.json` (its retention and last use, #377). |
+| `reserve` | The disk reserve: preallocated space for the node's own state, released when it can't write (#377). |
 | `ctl/ctl.sock` | `serve`'s control socket (directory 0700), which `wicket node attach` joins an ssh session to. |
 | `ctl/status.sock` | `serve`'s status, read-only: one JSON document per connection, what `wicket node top` shows (names, deadlines, states and counts; no secrets). |
 | `serve.pid`, `serve.lock` | The running `serve`. This host's own node also keeps `serve.log`. |

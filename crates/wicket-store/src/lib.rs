@@ -95,7 +95,11 @@ pub enum StoreError {
 /// (`requests_run`) are read by.
 /// Version 11 (expand) adds `runs.uncollected`: the node keeping a run's files that a fetch didn't
 /// bring back (#300, #324), which holds the node.
-pub const SCHEMA_VERSION: u32 = 11;
+/// Version 12 (expand) adds the `node_health` table: each node's latest health report, for
+/// `wicket top`, the console and its alerts (#377). Version 13 (expand) adds the `run_collected`
+/// table: when and how a run's work was collected, which a cleanup checks before it deletes the
+/// run's workspace (#377).
+pub const SCHEMA_VERSION: u32 = 13;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 // A build can open the ledgers it writes (#325: `version::the_schema_floor_only_rises` assumes it).
@@ -369,6 +373,8 @@ CREATE TABLE IF NOT EXISTS placed_nodes (
   created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT,
   hourly INTEGER
 );
+CREATE TABLE IF NOT EXISTS node_health (node TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, health TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS run_collected (run TEXT NOT NULL, how TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (run, how));
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
