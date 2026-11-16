@@ -202,3 +202,12 @@ fn a_host_is_allowed_wholesale_only_without_any_condition_on_it() {
     );
     assert!(o.allows_host_wholesale("b.test") && !o.allows_host_wholesale("e.test"));
 }
+
+/// Whether block 0 carries an org layer is what stops a node splicing a whole host (#51, #326).
+#[test]
+fn a_loaded_token_says_whether_it_has_an_org_layer() {
+    let (k, t, _) = chain(None);
+    assert!(!load_ok(&t, &k).has_org_layer());
+    let (k, t, _) = chain(Some(org(None, vec![host("x.example")])));
+    assert!(load_ok(&t, &k).has_org_layer());
+}

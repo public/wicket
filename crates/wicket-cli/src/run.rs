@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{ca::RunCa, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 
@@ -391,7 +391,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         m.task = t;
     }
     // The effective manifest (after any --task) is what the identity's digest covers.
-    let text = serde_yaml::to_string(&m)?;
+    let text = wicket_core::yaml::to_string(&m)?;
     timings.since("manifest", timings.origin());
     let lap = std::time::Instant::now();
     let workspace_dir = match workspace_dir {
@@ -506,9 +506,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         true => crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?,
         false => None,
     };
-    // This host's own node shares its filesystem. That is only transport: it lays the box out in the
-    // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
-    // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
+    // This host's own node shares its filesystem. That is only transport, and nothing else branches
+    // on it (#257 slice 5): it lays the box out in the run's own directory (so the run's trees needn't
+    // be sent to it, nor fetched back), and can mount a directory of this host's in the box (in place,
+    // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
     let run = match run_id {
@@ -659,25 +660,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
 
-    // Enforcement points, on unix sockets that only this box gets.
-    // Its key is kept in `ctl/` (never mounted in the box), for a supervisor that re-attaches.
+    // No CA of the run's (#257 slice 5): the control host terminates no TLS, so a box trusts only
+    // what its node's CA mints (the installation root, which its node puts in the box).
     timings.since("ledger", lap);
-    let lap = std::time::Instant::now();
-    let ca = match &record {
-        Some(_) => Arc::new(RunCa::load(
-            &std::fs::read_to_string(dir.join("ctl/run-ca.pem")).context("the run CA's certificate")?,
-            &std::fs::read_to_string(dir.join("ctl/run-ca.key")).context("the run CA's key")?,
-        )?),
-        None => {
-            let ca = RunCa::generate(&run.0)?;
-            std::fs::create_dir_all(dir.join("ctl"))?;
-            std::fs::write(dir.join("ctl/run-ca.pem"), ca.cert_pem())?;
-            write_secret(&dir.join("ctl/run-ca.key"), &ca.key_pem())?;
-            Arc::new(ca)
-        }
-    };
-    std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
-    timings.since("ca", lap);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
     let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
@@ -1049,20 +1034,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // Taken over from its node (#164): its time counts from when it started there.
         (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
-    let gs = dir.join("ctl/gateway.sock");
-    // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
-    wicket_proxy::sockpath::resolve(&gs).with_context(|| format!("the run proxy socket {}", gs.display()))?;
+    // The control host's half of the box's gateway (#257 slice 4b): the tools its node doesn't
+    // answer itself, which the node asks over the run's channel (`Msg::Call`). Nothing listens on a
+    // socket of the run's: the model, egress and gateway proxies are the node's.
     let gateway = Gateway::new(ctx.clone());
-    // The run's own gateway, which its node reaches for the MCP tools it doesn't decide yet: `ctl/`,
-    // not the box's `sock/`, which is the node's. The model and egress proxies are the node's alone
-    // (#257: no egress is forwarded here since slice 3, so nothing listens on `ctl/egress.sock`).
-    // It is bound and listening before it is served, so it is ready here, with no wait for its
-    // socket to appear (#287), and one that can't be bound fails the run, naming it.
-    let waited = std::time::Instant::now();
-    let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
-    let gl = listen(&gs)?;
-    timings.since("proxies.sockets", waited);
-    let g_task = tokio::spawn(gateway.serve_on(gl));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 
@@ -1246,7 +1221,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             timeout_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
                 + if long_lived { 120 } else { 0 },
             escalate,
-            ca_pem: ca.cert_pem(),
+            // Nothing more than the root (#257 slice 5); a node at 13 still reads the field.
+            ca_pem: String::new(),
             workspace_tar: String::new(),
             state_files: state_files.clone(),
             state_dirs: state_dirs.clone(),
@@ -1287,7 +1263,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 // keys are added when it is minted, `noderun::start`).
                 spawn: match &m.agent {
                     Some(a) if a.max_children > 0 => Some(crate::chan::EdgeSpawn {
-                        manifest: serde_yaml::to_string(&m)?,
+                        manifest: wicket_core::yaml::to_string(&m)?,
                         base: String::new(),
                         grant_keys: vec![],
                         time_left_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs(),
@@ -1340,6 +1316,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             vault: ctx.vault.clone(),
             swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
+            gateway: gateway.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
         })
@@ -2322,7 +2299,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("    {}", wicket_agent::clip(l, 300));
         }
     }
-    g_task.abort();
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its
     // boxes sent it with the exit.)
@@ -2611,14 +2587,6 @@ pub fn spawn_attach(run: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes a file only this user can read.
-fn write_secret(p: &Path, body: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
-    std::io::Write::write_all(&mut f, body.as_bytes())?;
-    Ok(())
-}
-
 /// Whether `id` has the shape of a request id (`r-` and lowercase letters or digits).
 fn is_request_id(id: &str) -> bool {
     id.strip_prefix("r-").is_some_and(|r| (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
@@ -2776,7 +2744,7 @@ mod tests {
             wicket_agent::load(&AGENT.replace("img:rust\n", &format!("{}\n", crate::image::DEFAULT)).replace("[img:rust]", "[]")).unwrap();
         assert_eq!(box_image(None, &dflt).unwrap(), crate::image::effective(crate::image::DEFAULT));
         // It round-trips through the effective manifest (what the identity's digest covers).
-        let again = wicket_agent::load(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        let again = wicket_agent::load(&wicket_core::yaml::to_string(&m).unwrap()).unwrap();
         assert_eq!(again.agent.unwrap().image.as_deref(), Some("img:rust"));
     }
 

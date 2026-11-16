@@ -126,7 +126,7 @@ pub struct Ceiling {
     pub inject: Vec<Inject>,
     pub spawn: SpawnLimits,
     pub llm: LlmBudget,
-    /// Zones whose boxes may message this one.
+    /// Who may message this box: zone names or principal ids (#250), as its zone's `accept_from`.
     pub accept_from: Vec<String>,
     /// Keys whose grants this link's reach and risk checks accept: the approval service, plus (for
     /// spawn links) the parent box's grantor key. Never the box's own key.

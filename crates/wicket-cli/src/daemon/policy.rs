@@ -195,9 +195,9 @@ pub fn internal_args(cmd: &Cmd) -> Option<&'static str> {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Grantees {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub users: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub groups: Vec<String>,
 }
 
@@ -228,7 +228,7 @@ impl Policy {
         if s.trim().is_empty() {
             return Ok(Policy::default());
         }
-        Ok(serde_yaml::from_str(s)?)
+        Ok(wicket_core::yaml::from_str(s)?)
     }
 
     /// The policy at `path`, or the default when there is none.

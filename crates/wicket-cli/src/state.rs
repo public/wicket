@@ -138,7 +138,7 @@ fn litestream_config(s: &StateStore, l: &LedgerStream, db: &Path, lineage: &str,
         cfg["dbs"][0]["replica"]["access-key-id"] = k.access_key_id.clone().into();
         cfg["dbs"][0]["replica"]["secret-access-key"] = k.secret_access_key.clone().into();
     }
-    Ok(serde_yaml::to_string(&cfg)?)
+    Ok(wicket_core::yaml::to_string(&cfg)?)
 }
 
 /// A Litestream command (`replicate` or `restore …`), with its config written beside the ledger,

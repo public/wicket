@@ -25,7 +25,6 @@ wicket-authz.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 hex.workspace = true
-serde_yaml.workspace = true
 libc = "0.2"
 anyhow.workspace = true
 clap.workspace = true

@@ -64,7 +64,7 @@ fn written(raw: &Value, path: &str) -> bool {
 
 /// A manifest's every field with its effective value, marking those it didn't write (defaults).
 fn fields(m: &Manifest, text: &str) -> Vec<Value> {
-    let raw: Value = serde_yaml::from_str::<serde_yaml::Value>(text).ok().and_then(|y| serde_json::to_value(y).ok()).unwrap_or(Value::Null);
+    let raw: Value = wicket_core::yaml::from_str::<serde_json::Value>(text).ok().unwrap_or(Value::Null);
     let mut all = vec![];
     leaves(&serde_json::to_value(m).unwrap_or(Value::Null), "", &mut all);
     all.into_iter().map(|(path, value)| json!({ "path": path, "value": value, "default": !written(&raw, &path) })).collect()

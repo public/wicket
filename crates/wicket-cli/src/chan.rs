@@ -19,9 +19,9 @@
 //!
 //! **Streams.** A box's stdio streams are numbered by the control host when it starts the box
 //! ([`BoxStart::streams`]); their data frames carry the byte offset of their first byte, so after a
-//! reconnect the receiver can say where to resume and duplicates are dropped. Tunnels (a forwarded
-//! CONNECT, or a connection to the run's LLM or MCP gateway socket on the control host) are numbered
-//! by the node with the top bit set, and die with the connection.
+//! reconnect the receiver can say where to resume and duplicates are dropped. Tunnels (a link's
+//! connection to a box on the other side) are numbered by the node with the top bit set, and die
+//! with the connection.
 //!
 //! [`read_frame`] never panics on any input: a bad frame is an error and the connection is dropped.
 //!
@@ -45,16 +45,52 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 11 or 12, so only the versions from 11 on have a check here; the checks for features of earlier
-/// versions (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
-/// forwarded egress) went once no peer could talk below them.
-pub const PROTOCOL: u32 = 12;
-/// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
-pub const NODE_HEALTH: u32 = 12;
-/// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its MCP
-/// gateway, for the tools the node relays. Not the model proxy nor the egress proxy: those are the
-/// node's alone (#257).
-pub const TUNNEL_TARGETS: [&str; 1] = ["gateway"];
+/// 12 or 13, so only the versions above 12 have a check here; the checks for features of 12 and
+/// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
+/// forwarded egress, node health) went once every peer had them.
+pub const PROTOCOL: u32 = 13;
+/// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
+pub const ONE_GATEWAY: u32 = 13;
+
+/// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
+/// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
+/// every other tool itself (`nodegw`), and sends only these, by name, as [`Msg::Call`]; any other
+/// name never leaves the node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlTool {
+    AwaitGrant,
+    PendingRequests,
+    SendMessage,
+    AwaitMessage,
+    Principals,
+    Receipts,
+    Spawn,
+    ContinueChild,
+    Delegations,
+    Decide,
+    Expose,
+    Connect,
+    Link,
+    Unlink,
+    Links,
+    RequestCapacity,
+    RequestUpdate,
+    Finish,
+    Hibernate,
+}
+
+impl ControlTool {
+    /// The tool's name in MCP (`tools/call`'s `name`).
+    pub fn name(self) -> String {
+        serde_json::to_value(self).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+    }
+
+    /// The control host's tool of this name, if it is one.
+    pub fn of(name: &str) -> Option<ControlTool> {
+        serde_json::from_value(serde_json::Value::String(name.into())).ok()
+    }
+}
 /// How far apart two peers' versions may be.
 pub const PROTOCOL_SKEW: u32 = 1;
 
@@ -72,7 +108,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    assert!(NODE_HEALTH <= PROTOCOL);
+    assert!(ONE_GATEWAY <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -117,8 +153,9 @@ pub struct BoxStart {
     pub timeout_secs: u64,
     /// The zone's `escalation.request` (false by default for a program, #255).
     pub escalate: bool,
-    /// The box's CA bundle: the installation root (node-minted leaves) and the run's own CA (hosts the
-    /// control host terminates).
+    /// More of the box's CA bundle, after the installation root (which signs its node CA's leaves).
+    /// Empty: the control host terminates no TLS, so it has no CA of the run's to add (#257 slice 5).
+    /// Still sent, for nodes at 13 that read it.
     pub ca_pem: String,
     /// The workspace, as a tar archive (base64).
     pub workspace_tar: String,
@@ -442,6 +479,21 @@ pub enum Msg {
         denied: Option<String>,
         error: Option<String>,
     },
+    /// Node → control host (#257 slice 4b): one of the control host's tools for `run`'s box, with
+    /// its arguments as the box gave them. Answered with [`Msg::Called`] once the tool is done (a
+    /// wait, `await_grant` or `await_message`, answers when it ends).
+    Call {
+        id: u64,
+        run: String,
+        tool: ControlTool,
+        args: serde_json::Value,
+    },
+    /// Answer to [`Msg::Call`]: the tool's text, and whether it is an error.
+    Called {
+        id: u64,
+        text: String,
+        is_error: bool,
+    },
     /// Ship audit records after this node seq.
     AuditFrom {
         seq: i64,
@@ -672,8 +724,9 @@ pub enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_request_ms: Option<i64>,
     },
-    /// Open a tunnel to the run's `target` socket on the control host: `egress` or `gateway`. (`llm`
-    /// is refused: a node's model proxy calls the model itself, since protocol 3, #152, #257.)
+    /// Open a tunnel for `run`: a link socket (`link:<sock>`) of a box on the other side. No socket
+    /// of the control host's own is a target any more (#257: `llm`, `egress` and, from protocol 13,
+    /// `gateway` are gone).
     TunnelOpen {
         stream: u64,
         run: String,
@@ -689,8 +742,7 @@ pub enum Msg {
     Audit {
         records: Vec<wicket_store::AuditRecord>,
     },
-    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection that
-    /// speaks [`NODE_HEALTH`].
+    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection.
     Health {
         health: crate::health::NodeHealth,
     },
@@ -914,12 +966,23 @@ impl Tunnels {
 mod tests {
     use super::*;
 
-    /// #257: a box's model and egress proxies are its node's only; a node can't reach the control
-    /// host's (slice 1 removed `llm`, slice 3 `egress`).
+    /// #257 slice 4b: the control host's tools are a closed set, sent by their MCP names, and a call
+    /// and its answer are typed messages (protocol 13).
     #[test]
-    fn a_node_tunnels_to_the_runs_gateway_only() {
-        assert_eq!(TUNNEL_TARGETS, ["gateway"]);
-        assert!(!TUNNEL_TARGETS.contains(&"llm") && !TUNNEL_TARGETS.contains(&"egress"));
+    fn the_control_hosts_tools_are_typed_calls_from_protocol_13() {
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
+        assert!(negotiate(PROTOCOL, 12).unwrap() < ONE_GATEWAY);
+        assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
+        assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
+        for local in ["whoami", "request_access", "spawn_agent", "anything", ""] {
+            assert_eq!(ControlTool::of(local), None, "{local}: answered on the node, never sent");
+        }
+        let m = Msg::Call { id: 3, run: "r".into(), tool: ControlTool::Links, args: serde_json::json!({}) };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v, serde_json::json!({ "m": "call", "id": 3, "run": "r", "tool": "links", "args": {} }));
+        assert!(matches!(serde_json::from_value(v).unwrap(), Msg::Call { tool: ControlTool::Links, .. }));
+        let bad = serde_json::json!({ "m": "call", "id": 3, "run": "r", "tool": "whoami", "args": {} });
+        assert!(serde_json::from_value::<Msg>(bad).is_err(), "a tool outside the set isn't a call");
     }
 
     fn samples() -> Vec<Frame> {
@@ -1141,27 +1204,28 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features before protocol 11: a peer below it can't connect,
-    /// so every connection talks 11 or 12 (#253). A check for a version under 11 would be dead.
+    /// Why this build has no checks for features of protocol 12 or before (node health, #377, the
+    /// last): a peer below 12 can't connect, so every connection talks 12 or 13 (#253, #257 slice
+    /// 4b), and a check for a version at or under 12 would always pass.
     #[test]
-    fn no_connection_talks_below_protocol_11() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW), (12, 1));
+    fn no_connection_talks_below_protocol_12() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW), (13, 1));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((11..=12).contains(&at) && (11..=13).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(11..=13).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((12..=13).contains(&at) && (12..=14).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(12..=14).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 12 or 13 talking to a control host at 12 from the other side.
-        assert_eq!(negotiate(13, PROTOCOL), Ok(12));
-        assert!(negotiate(PROTOCOL, 10).is_err() && negotiate(10, PROTOCOL).is_err());
+        // And a node at 13 or 14 talking to a control host at 13 from the other side.
+        assert_eq!(negotiate(14, PROTOCOL), Ok(13));
+        assert!(negotiate(PROTOCOL, 11).is_err() && negotiate(11, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
     /// without them reads as having none.
     #[test]
     fn a_start_carries_its_swaps_by_name() {
-        assert_eq!((PROTOCOL, NODE_HEALTH), (12, 12));
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),

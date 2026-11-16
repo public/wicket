@@ -69,13 +69,11 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `agent.stderr.log` | The agent's stderr, the newest `limits.output` kept. |
 | `console.log` | The output of a run the console started. |
 | `ctl/run.json` | The run's record: what another supervisor needs to take it over. |
-| `ctl/run-ca.key`, `ctl/run-ca.pem` | The run's CA, which the run's egress proxy terminates TLS with. |
 | `ctl/progress.json` | Model spend and output offsets, saved as the run goes (every 3 s). |
 | `ctl/authority.json` | When the box's authority ends, and whether its node confirmed the box stopped. |
 | `ctl/holdings.json` | The secrets released to the run's node and its budget slice. |
 | `ctl/link.json` | Whether the run's supervisor is connected to its node (and since when), the node's size at the last connect, and the model spend the node last reported: what `wicket top` shows. |
 | `ctl/attach.log` | The log of a supervisor that adopted the run (`wicket attach`). |
-| `ctl/gateway.sock` | The run's own gateway, which its node reaches for the gateway tools it relays. The model and egress proxies run only on the node (#257); nothing listens on `ctl/egress.sock` since slice 3. |
 | `sock/` | The box's sockets: egress, model, gateway, QUIC, links, `stdin.sock`. |
 | `tmp/`, `state/` | A long-lived agent's `/tmp` and `/wicket/state` (`$HOME` and Claude Code's config). |
 | `children/` | Logs of the children it started. |

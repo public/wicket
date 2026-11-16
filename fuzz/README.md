@@ -8,7 +8,7 @@ These [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets fuzz those p
 | Target | What it fuzzes | The oracle, besides panics and hangs |
 |---|---|---|
 | `egress` | the egress proxy, end to end: a box's connection (CONNECT, plain HTTP, or the inside of a TLS tunnel) to local origins | what is decided is what goes upstream: no request reaches an origin without a decision of the same method, host and path |
-| `gateway` | the MCP gateway's JSON-RPC, through its HTTP/1.1 server | a request with an `id` gets one reply with that `id` |
+| `gateway` | the control host's gateway tools as a box's node asks them (`Gateway::call_tool`, #257), and MCP's handshake | every call answers; only the control host's own tools are asked of it; `initialize` carries a version and the instructions |
 | `chan` | the control/node channel's frames, both directions, and version negotiation | a frame that decodes re-encodes to one that decodes to itself |
 | `feed` | the node's feed replica: raw frames, and payloads signed with the feed's keys | an unsigned frame never changes the replica's state |
 | `token` | Biscuit box tokens, with blocks a holder appends (or raw bytes), loaded, verified and decided | a token decides every probe the same in the compiled evaluator and the generic engine (or the engine refuses) |

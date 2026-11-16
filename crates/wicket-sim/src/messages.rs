@@ -3,15 +3,16 @@
 //!
 //! **What is real and what stands in.**
 //! - Real, on the control host: the run's MCP gateway ([`wicket_proxy::gateway::Gateway`], through
-//!   the `sim` feature's `Gateway::sim_call`): `send_message` (`RunCtx::send`: addressing by
-//!   principal, `accept_from`, refusals with their receipts, holding, waking a hibernated agent),
+//!   `Gateway::call_tool`, which a box's node asks with a typed `Msg::Call`): `send_message`
+//!   (`RunCtx::send`: addressing by principal, `accept_from`, refusals with their receipts,
+//!   holding, waking a hibernated agent),
 //!   `await_message` (the signed envelope checked, `Ledger::take_message`) and `receipts`; the ledger
 //!   ([`wicket_store::Ledger`] on the control host's disk: identities, held messages moved to a
 //!   principal's new run by `put_identity`, an agent's wake by `claim_wake`); and identities signed
 //!   by [`wicket_identity::Issuer`].
 //! - Stand-ins:
 //!   - the node follows `wicket-cli/src/nodegw.rs`: connected, a box's `send_message` and
-//!     `await_message` are relayed to its run's gateway on the control host (`relay_tool`); cut off,
+//!     `await_message` are asked of its run's gateway on the control host (`call_control`); cut off,
 //!     a message to another box on the node is decided and delivered there (`send_local`, with its
 //!     receipt, refused if the recipient's `accept_from` doesn't list the sender), kept in the
 //!     node's inbox on its disk (`EdgeQueue`), and `await_message` takes from that inbox first. The
@@ -656,7 +657,7 @@ async fn serve_node(env: Rc<Env>, s: turmoil::net::TcpStream) {
             let live = env.ledger().lock().expect("ledger").run_status(&run).ok().flatten().as_deref() == Some("running");
             let g = env.gateways.borrow().get(&run).cloned();
             let (text, is_error) = match g.filter(|_| live) {
-                Some(g) => g.sim_call(&name, args).await,
+                Some(g) => g.call_tool(&name, args).await,
                 None => (format!("run {run} has ended"), true),
             };
             let _ = tx.send(Chan::Answer { id, text, is_error });

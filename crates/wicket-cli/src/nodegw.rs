@@ -321,11 +321,11 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         "child"
     } else if my_path.rsplit_once('/').is_some_and(|(p, _)| p == to_path) {
         "parent"
-    } else if to_zone.accept_from.contains(&my_zone)
-        || node
-            .edge_start(run)
-            .is_some_and(|e| e.who.get("id").and_then(|v| v.as_str()).is_some_and(|me| to_zone.accept_from.iter().any(|a| a == me)))
-    {
+    } else if wicket_core::manifest::accepts(
+        &to_zone.accept_from,
+        &my_zone,
+        node.edge_start(run).and_then(|e| e.who.get("id").and_then(|v| v.as_str()).map(String::from)).as_deref(),
+    ) {
         "peer"
     } else {
         let why = format!("zone {} does not accept messages from zone {my_zone} (its accept_from does not list it)", to_zone.name);
@@ -995,18 +995,11 @@ pub(super) fn replay(node: &Arc<Node>, run: &str) {
     }
 }
 
-/// Calls tool `name` on the run's gateway on the control host: its text and whether it is an error.
+/// Calls tool `name`, one of the control host's (`chan::ControlTool`), for the run's box: its text
+/// and whether it is an error (#257 slice 4b: a typed call, not a relayed request).
 pub(super) async fn relay_tool(node: &Arc<Node>, run: &str, name: &str, args: &Value) -> std::io::Result<(String, bool)> {
-    let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
-    let resp = super::relay_rpc(node, run, None, bytes::Bytes::from(rpc.to_string())).await?;
-    let body = http_body_util::BodyExt::collect(resp.into_body()).await.map_err(std::io::Error::other)?.to_bytes();
-    let v: Value = serde_json::from_slice(&body).map_err(std::io::Error::other)?;
-    let r = &v["result"];
-    let text = r["content"][0]["text"].as_str().map(String::from);
-    match text {
-        Some(t) => Ok((t, r["isError"].as_bool().unwrap_or(false))),
-        None => Err(std::io::Error::other(v["error"]["message"].as_str().unwrap_or("no answer").to_string())),
-    }
+    let tool = crate::chan::ControlTool::of(name).ok_or_else(|| std::io::Error::other(format!("{name} is not the control host's tool")))?;
+    node.call_control(run, tool, args).await
 }
 
 /// The control host's record of a tool decided here, for its console.

@@ -110,6 +110,30 @@ jobs:
           # Every commit reachable from the one under test (not other branches, which have their own runs).
           ./gitleaks git --redact --no-banner --log-opts="HEAD" --config .gitleaks.toml .
 
+  # Supply chain (#326): cargo deny (deny.toml) on every pull request, push and nightly run:
+  # RustSec advisories (vulnerable, unsound or yanked crates), licences, banned crates and sources.
+  # Nightly too, so an advisory published against an unchanged lockfile is seen. Duplicate
+  # versions are reported, not failed (#219).
+  deny:
+    name: Supply chain (cargo deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Caches ~/.cargo/bin, so cargo-deny is built once per version.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: cargo-deny
+          cache-targets: false
+      - name: cargo-deny (from crates.io, its locked dependencies checksum-verified)
+        run: cargo deny --version 2>/dev/null | grep -q " $CARGO_DENY_VERSION" || cargo install --locked "cargo-deny@$CARGO_DENY_VERSION"
+      - name: cargo deny check
+        run: cargo deny --locked check
+
   rust:
     name: Format, clippy and tests
     needs: select

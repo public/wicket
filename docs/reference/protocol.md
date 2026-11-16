@@ -89,11 +89,13 @@ exchanged, for the logs and for the health gate.
 | 10 | Credential swaps on the node (#257): `BoxStart.swaps`, each fetched with `SecretFetch` on first use and swapped by the node's own egress proxy, which then decides the swapped hosts from the feed. A box with swaps went only to a node talking 10. |
 | 11 | No forwarded egress (#257): a node terminates what its CA covers and decides it, splices a host its CA can't cover if the box's token allows it wholesale, and refuses it otherwise. The control host no longer serves the `egress` tunnel target, and `BoxStart.swap_hosts` is gone. |
 | 12 | Node health (#377): a node reports its disk, inodes, memory, feed freshness and failures as `Health`, sent only on connections talking 12. |
+| 13 | One gateway, on the node (#257 slice 4b): the tools a box's node doesn't answer itself reach the control host as `Call` (one of `ControlTool`, the control host's tools by name, with the box's arguments), answered with `Called`, instead of JSON-RPC relayed through a `gateway` tunnel (gone, with the run's `ctl/gateway.sock`). A box starts only on a node talking 13. |
 
-wicket speaks version 12, so it talks only to peers at 11 and 12. What the rows above say happens
+wicket speaks version 13, so it talks only to peers at 12 and 13. What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
-9, 10 or 11, an image not sent to a node before 7) is history: no connection can negotiate below 11,
-and the code for it is gone. Each version from 11 on that a build still talks to keeps its check.
+9, 10 or 11, an image not sent to a node before 7) is history: no connection can negotiate below 12,
+and the code for it is gone. Every connection has 12's health reports, so they have no check
+either; each version above 12 that a build still talks to keeps its check.
 
 ## Ledger schema
 

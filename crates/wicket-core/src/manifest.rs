@@ -9,7 +9,7 @@ use std::time::Duration;
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] crate::yaml::Error),
     #[error("invalid path glob {glob:?}: {err}")]
     Glob { glob: String, err: String },
     #[error("invalid duration {0:?}")]
@@ -115,7 +115,7 @@ pub struct AgentSpec {
     pub in_box_subagents: bool,
     /// Extra environment for the agent: non-secret configuration only. Variables
     /// wicket controls (proxies, CA, model routes, credentials) can't be set here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub env: std::collections::BTreeMap<String, String>,
     /// Settings for the agent's own adapter (for claude-code: written to its settings.json), limited
     /// to keys that can't change what the agent can reach or run (ADAPTER_SETTINGS_ALLOWED).
@@ -280,7 +280,7 @@ pub struct ZoneSpec {
     #[serde(default)]
     pub isolation: Isolation,
     /// What the zone may reach over HTTP(S). Anything else becomes a pending escalation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub reach: Vec<ReachRule>,
     /// What a host that no reach rule names looks like from inside: `escalate` (default) treats a
     /// request to it as a pending request a human can approve; `hide` makes it look like it doesn't
@@ -295,10 +295,10 @@ pub struct ZoneSpec {
     pub wildcards: WildcardSpec,
     /// Hosts or paths refused outright, whatever the method: no pending request, no grant. Checked
     /// before `reach`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub forbid: Vec<ForbidRule>,
     /// Credentials injected by the egress proxy into exactly one header slot per host.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub inject: Vec<InjectRule>,
     /// The model route; required for agents, absent for programs.
     #[serde(default)]
@@ -307,14 +307,16 @@ pub struct ZoneSpec {
     /// state a workload keeps (a cache, a dataset, model weights, a database). Per tenant and zone,
     /// and shared by the zone's runs, so whatever one run leaves there the next one reads (and
     /// inherits its labels, design §12).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub volumes: Vec<VolumeSpec>,
     /// Images boxes in this zone may start other boxes from (besides their own), with `spawn`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub images: Vec<String>,
-    /// Zones whose agents may send messages to agents in this zone (besides parent and children).
-    /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
-    #[serde(default)]
+    /// Who may send messages to agents in this zone (besides parent and children): each entry a
+    /// zone's name (every agent in it) or one principal's id (#250, `spiffe://…/a/<agent>`, or an
+    /// operator's `…/op/<via>/<name>`). Empty = nobody else. Senders are identified by wicket, never
+    /// by their own claim; [`accepts`] is the one test.
+    #[serde(default, deserialize_with = "crate::yaml::null_as_default")]
     pub accept_from: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
@@ -450,7 +452,7 @@ pub struct ForbidRule {
     /// (GitHub's owner and repository names, for one) fold case, so `/repos/ACME/prod` must not dodge
     /// a forbid on `/repos/acme/prod/**`. Reach globs stay case-sensitive (narrower is safer there).
     /// Default: everything on the host.
-    #[serde(default = "default_paths")]
+    #[serde(default = "default_paths", deserialize_with = "crate::yaml::null_as_default")]
     pub paths: Vec<String>,
 }
 
@@ -521,10 +523,10 @@ pub enum Persist {
 pub struct ReachRule {
     /// Exact host, or `*.example.com`.
     pub host: String,
-    #[serde(default = "default_methods")]
+    #[serde(default = "default_methods", deserialize_with = "crate::yaml::null_as_default")]
     pub methods: Vec<String>,
     /// Path globs: `*` matches within one segment, `**` across segments.
-    #[serde(default = "default_paths")]
+    #[serde(default = "default_paths", deserialize_with = "crate::yaml::null_as_default")]
     pub paths: Vec<String>,
     /// Allow requests that the dangerous-pattern list rates R3+ without a grant. Default false.
     #[serde(default)]
@@ -641,6 +643,12 @@ impl LlmSpec {
         }
         Ok(())
     }
+}
+
+/// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
+/// sender's principal id, when the caller knows it.
+pub fn accepts(accept_from: &[String], zone: &str, principal: Option<&str>) -> bool {
+    accept_from.iter().any(|a| a == zone || principal.is_some_and(|p| a == p))
 }
 
 /// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
@@ -826,7 +834,7 @@ impl Manifest {
     /// `escalation.request: true` (#255). The model route's defaults are the harness adapter's: load
     /// an agent's manifest through `wicket_agent::load` to fill them.
     pub fn from_yaml(s: &str) -> Result<Self, ManifestError> {
-        let mut m: Manifest = serde_yaml::from_str(s)?;
+        let mut m: Manifest = crate::yaml::from_str(s)?;
         if m.program.is_some() {
             #[derive(Deserialize)]
             struct Probe {
@@ -842,7 +850,7 @@ impl Manifest {
                 #[serde(default)]
                 request: Option<bool>,
             }
-            let said = serde_yaml::from_str::<Probe>(s)?.zone.escalation.and_then(|e| e.request);
+            let said = crate::yaml::from_str::<Probe>(s)?.zone.escalation.and_then(|e| e.request);
             m.zone.escalation.request = said.unwrap_or(false);
         }
         m.validate()?;
@@ -1122,6 +1130,53 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).
+    #[test]
+    fn accept_from_names_a_zone_or_a_principal() {
+        let list = vec!["ops".to_string(), "spiffe://w.test/t/t0/z/audit/a/auditor".to_string()];
+        assert!(accepts(&list, "ops", None), "every agent of a listed zone");
+        assert!(accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/auditor")), "one listed principal");
+        assert!(!accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/other")), "not its zone-mates");
+        assert!(!accepts(&list, "audit", None), "a principal entry needs the sender's id");
+        assert!(!accepts(&[], "ops", Some("x")));
+    }
+
+    /// #326: a class's ranges are folded as ranges and its other letters one by one; a `-` at the
+    /// end of a class is a literal, never the start of a range past it.
+    #[test]
+    fn folded_classes_keep_their_ranges_and_their_letters() {
+        let m = |g: &str| compile_glob(&fold_case_glob(g)).unwrap();
+        let ends_in_dash = m("/[a-]");
+        for p in ["/a", "/A", "/-"] {
+            assert!(ends_in_dash.is_match(p), "/[a-] matches {p}");
+        }
+        assert!(!ends_in_dash.is_match("/b"));
+        let letters = m("/[axz]");
+        assert!(letters.is_match("/X") && letters.is_match("/z"));
+        assert!(!letters.is_match("/M") && !letters.is_match("/m"), "three letters, not the range a-z");
+        let mixed = m("/[xa-c-]");
+        for p in ["/X", "/B", "/-"] {
+            assert!(mixed.is_match(p), "/[xa-c-] matches {p}");
+        }
+        assert!(!mixed.is_match("/d"));
+    }
+
+    /// #326: a zone names a host by a reach rule or an inject rule, exactly or by wildcard; a host
+    /// named exactly isn't reached through a wildcard.
+    #[test]
+    fn a_zone_names_its_hosts_by_reach_or_inject() {
+        let z: ZoneSpec = crate::yaml::from_str(
+            "name: z\nreach: [{ host: \"*.example.com\" }, { host: api.example.com }]\ninject: [{ host: up.other.org, header: X, secret: s }]\n",
+        )
+        .unwrap();
+        assert!(z.names_host("api.example.com") && z.names_host("x.example.com"), "by reach");
+        assert!(z.names_host("up.other.org"), "by inject alone");
+        assert!(!z.names_host("other.org") && !z.names_host("example.org"));
+        assert_eq!(z.wildcard_for("x.example.com"), Some("*.example.com"));
+        assert_eq!(z.wildcard_for("api.example.com"), None, "named exactly");
+        assert_eq!(z.wildcard_for("other.org"), None);
+    }
+
     /// A folded glob matches a path exactly when the glob matches it in some ASCII case (the Lean
     /// spec's `ciEq`, which it states for globs without classes), and a folded negated class matches
     /// only what it excludes in neither case (the closure of the class is negated, so a forbid rule
@@ -1203,14 +1258,14 @@ mod tests {
     /// field (the feed carries zones to nodes that refuse unknown fields).
     #[test]
     fn escalation_defaults_on_and_is_written_only_when_restricted() {
-        let z: ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        let z: ZoneSpec = crate::yaml::from_str("name: z\n").unwrap();
         assert_eq!(z.escalation, Escalation { request: true, grant: true });
         assert!(!serde_json::to_string(&z).unwrap().contains("escalation"));
-        let r: ZoneSpec = serde_yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
+        let r: ZoneSpec = crate::yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
         assert_eq!(r.escalation, Escalation { request: false, grant: true });
         let back: ZoneSpec = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.escalation, r.escalation);
-        assert!(serde_yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
+        assert!(crate::yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
     }
 
     /// #293: the harness's grace to exit defaults to 30 s, is written only when set otherwise (nodes
@@ -1302,11 +1357,11 @@ zone:
     fn programs_have_no_model_and_may_not_ask_by_default() {
         let m = Manifest::from_yaml("task: t\nprogram: {name: p, command: [bash, run.sh]}\nzone: {name: z}").unwrap();
         assert!(!m.zone.escalation.request && m.zone.escalation.grant);
-        let back = Manifest::from_yaml(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        let back = Manifest::from_yaml(&crate::yaml::to_string(&m).unwrap()).unwrap();
         assert!(!back.zone.escalation.request, "the default survives a round trip");
         let asks = Manifest::from_yaml("task: t\nprogram: {name: p, command: [x]}\nzone: {name: z, escalation: {request: true}}").unwrap();
         assert!(asks.zone.escalation.request);
-        let back = Manifest::from_yaml(&serde_yaml::to_string(&asks).unwrap()).unwrap();
+        let back = Manifest::from_yaml(&crate::yaml::to_string(&asks).unwrap()).unwrap();
         assert!(back.zone.escalation.request, "so does a program's request: true");
         let back = Manifest::from_yaml(&serde_json::to_string(&asks).unwrap()).unwrap();
         assert!(back.zone.escalation.request, "in JSON too");
@@ -1381,7 +1436,7 @@ zone:
         assert!(y(", harness: nope").unwrap_err().to_string().contains("unknown variant"));
         // `kind` is spawn's word for a workload (agent or program), not a manifest field.
         assert!(y(", kind: claude-code").unwrap_err().to_string().contains("unknown field `kind`"));
-        let plain = serde_yaml::to_string(&y("").unwrap()).unwrap();
+        let plain = crate::yaml::to_string(&y("").unwrap()).unwrap();
         assert!(plain.contains("harness: claude-code"), "{plain}");
     }
 
@@ -1416,15 +1471,15 @@ zone:
         assert!(y(", remote: { name: x, permission_mode: BypassPermissions }").is_err(), "spelled as the CLI takes it");
         // An unset mode isn't written out, so a remote manifest's digest is unchanged; a set one is,
         // `default` included (a driven session's default differs).
-        let rc = serde_yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
         assert!(!rc.contains("permission_mode") && !rc.contains("drive"), "{rc}");
-        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
         assert!(rc.contains("permission_mode: default"), "{rc}");
-        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
         assert!(rc.contains("permission_mode: plan"), "{rc}");
         // Other manifests serialize as before (their identity digests don't change).
         let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
-        assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));
+        assert!(!crate::yaml::to_string(&plain).unwrap().contains("remote"));
     }
 
     #[test]
@@ -1441,6 +1496,6 @@ zone:
         let r = y("task: t\n", ", drive: true, permission_mode: acceptEdits").unwrap().agent.unwrap().remote.unwrap();
         assert_eq!(r.permission_mode(), RemotePermissionMode::AcceptEdits);
         assert_eq!(y("", "").unwrap().agent.unwrap().remote.unwrap().permission_mode(), RemotePermissionMode::Default);
-        assert!(serde_yaml::to_string(&m).unwrap().contains("drive: true"));
+        assert!(crate::yaml::to_string(&m).unwrap().contains("drive: true"));
     }
 }
