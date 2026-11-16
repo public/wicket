@@ -230,7 +230,7 @@ mod tests {
         // The same lifetime (an hour) and constraints, recorded active; the old one revoked early.
         assert_eq!(ca_of(&i.ledger).serial, serial2);
         assert!((3590..=3600).contains(&(row.not_after - wicket_store::now())), "{row:?}");
-        assert_eq!(ca.permitted, ["api.example.com", ".example.org"], "the constraints it had");
+        assert_eq!(ca.permitted, [".example.org", "api.example.com"], "the constraints it had");
         assert_eq!(row.hosts, ca.permitted);
         let l = i.ledger.lock().unwrap();
         assert_eq!(l.revoked_node_cas(t).unwrap().iter().map(|c| c.serial.clone()).collect::<Vec<_>>(), std::slice::from_ref(&c.serial));

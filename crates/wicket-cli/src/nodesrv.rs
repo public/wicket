@@ -2571,7 +2571,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             clock: node_clock(),
             replica: Arc::new(Mutex::new(Replica::new_with("n1", root, ReplicaConfig::default(), wicket_authz::PublicKey([5; 32])))),
             audit: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())),
-            root_pem: String::new(),
+            // The installation root, if the test enrolled the node with one.
+            root_pem: std::fs::read_to_string(i.dir.join("root.pem")).unwrap_or_default(),
             docker: Docker::from_env(),
             idents: Default::default(),
             links: Mutex::new(HashMap::new()),
@@ -3841,5 +3842,137 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert_eq!(audit.iter().filter(|r| r.2 == "node.secret_fetched").count(), 2, "{audit:?}");
         assert!(!format!("{audit:?}").contains(LOGIN) && !format!("{audit:?}").contains(VALUE));
+    }
+
+    /// A node enrolled under `root` with a CA for `hosts` lasting `ttl` (recorded as issued now),
+    /// and the node made from it.
+    fn ca_node(inst: &Install, root: &wicket_proxy::ca::InstallationCa, ttl: time::Duration) -> (Arc<Node>, wicket_proxy::ca::NodeCaCert) {
+        std::fs::write(inst.dir.join("root.pem"), root.cert_pem()).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+        let cert = root.issue_node_ca(&csr, "n1", &["api.example.com".into()], ttl).unwrap();
+        std::fs::write(inst.dir.join("ca.pem"), &cert.pem).unwrap();
+        std::fs::write(inst.dir.join("ca.key"), key.serialize_pem()).unwrap();
+        let row = wicket_store::NodeCaRow {
+            serial: cert.serial.clone(),
+            node: "n1".into(),
+            issued_at: wicket_store::now(),
+            not_after: cert.not_after,
+            hosts: cert.permitted.clone(),
+            status: "active".into(),
+        };
+        inst.ledger.lock().unwrap().renew_node_ca(&row).unwrap();
+        (test_node(inst), cert)
+    }
+
+    /// A box's TLS connection to `host` through `minter`, verified against the installation root as
+    /// a box verifies it. Returns the CA that issued the leaf (DER).
+    fn box_connects(minter: &dyn Minter, root: &wicket_proxy::ca::InstallationCa, host: &str) -> Result<Vec<u8>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.cert_der())?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cc = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut c = rustls::ClientConnection::new(Arc::new(cc), host.to_string().try_into()?)?;
+        let mut s = rustls::ServerConnection::new(minter.server_config(host)?)?;
+        while c.is_handshaking() || s.is_handshaking() {
+            let mut buf = vec![];
+            c.write_tls(&mut buf)?;
+            s.read_tls(&mut &buf[..])?;
+            s.process_new_packets()?;
+            buf.clear();
+            s.write_tls(&mut buf)?;
+            c.read_tls(&mut &buf[..])?;
+            c.process_new_packets()?;
+        }
+        Ok(c.peer_certificates().context("no chain")?[1].to_vec())
+    }
+
+    async fn ca_answer(c: &mut UnixStream) -> Msg {
+        loop {
+            match next_msg(c).await {
+                Frame::Msg(m @ (Msg::CaCsr { .. } | Msg::NodeCaInstalled { .. })) => return m,
+                _ => continue,
+            }
+        }
+    }
+
+    /// #416's test: a connected node's CA, minutes long, is renewed over the channel at half its
+    /// life, before it expires; a box already running is served by the new CA from its next
+    /// connection, and the ledger and audit say so, the replaced CA revoked.
+    #[tokio::test]
+    async fn a_connected_nodes_ca_is_renewed_before_it_expires_under_a_running_box() {
+        const RUN: &str = "run_kkkkkkkkkkkkkkkkkkkkkkkkkk";
+        let inst = Install::new("ca-renewal");
+        let root = wicket_proxy::ca::InstallationCa::generate().unwrap();
+        let (node, first) = ca_node(&inst, &root, time::Duration::minutes(6));
+        let issued = crate::nodeca::active(&inst.ledger.lock().unwrap(), "n1").unwrap().issued_at;
+        // A running box: its egress proxy's minter and router, as `serve_box` made them.
+        let live = node.ca();
+        let router = NodeRouter { ca: live.clone(), clock: node.clock.clone() };
+        assert_eq!(box_connects(&*live, &root, "api.example.com").unwrap(), first.der);
+        // Its run's connection, and the control host's side of the renewal (`noderun` drives the
+        // same calls on its once-a-second tick).
+        let mut c = connect_run(&node, 2, &inst, RUN).await;
+        let mut r = crate::nodeca::CaRenewal::default();
+        assert!(r.tick(&inst.ledger, "n1", chan::PROTOCOL, issued + 179).is_none(), "not yet half its life");
+        let ask = r.tick(&inst.ledger, "n1", chan::PROTOCOL, issued + 180).expect("due at half its life");
+        c.write_all(&Frame::Msg(ask).encode()).await.unwrap();
+        let Msg::CaCsr { csr, error } = ca_answer(&mut c).await else { panic!("no request") };
+        // Asked again meanwhile (another run's connection): refused, the first goes on.
+        let (mut other, _) = handshake(&node, 3, chan::PROTOCOL, &inst, &inst.issuer).await;
+        other.write_all(&Frame::Msg(Msg::CaRenew {}).encode()).await.unwrap();
+        assert!(matches!(ca_answer(&mut other).await, Msg::CaCsr { csr: None, error: Some(e) } if e.contains("under way")));
+        let cert = r.on_csr(&inst.ledger, Some(&root), "n1", csr, error, issued + 181).expect("signed");
+        c.write_all(&Frame::Msg(cert).encode()).await.unwrap();
+        let Msg::NodeCaInstalled { serial, error } = ca_answer(&mut c).await else { panic!("no answer") };
+        assert_eq!(error, None);
+        let row = r.on_installed(&inst.ledger, "n1", &serial, error, wicket_store::now()).expect("recorded");
+        assert!(row.not_after > first.not_after && wicket_store::now() < first.not_after, "renewed before the first one's end");
+        // The running box's next connection: served, and by the new CA, with the same constraints.
+        let new = live.get().unwrap();
+        assert_eq!((new.not_after, new.permitted.clone()), (row.not_after, first.permitted.clone()));
+        assert_eq!(box_connects(&*live, &root, "api.example.com").unwrap(), new.cert_der());
+        assert_eq!(router.route("api.example.com"), Route::Terminate);
+        assert!(box_connects(&*live, &root, "elsewhere.example.net").is_err(), "outside the constraints, as before");
+        // On disk for the next `serve`; in the ledger and the audit log; the old CA revoked.
+        assert_eq!(node.ca().get().unwrap().cert_der(), new.cert_der());
+        assert_eq!(ca_not_after(&std::fs::read(inst.dir.join("ca.pem")).unwrap()), Some(row.not_after));
+        let l = inst.ledger.lock().unwrap();
+        assert_eq!(
+            l.revoked_node_cas(wicket_store::now()).unwrap().iter().map(|c| c.serial.clone()).collect::<Vec<_>>(),
+            [first.serial.clone()]
+        );
+        let audit = l.audit_of_kind("node.ca_renewed").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&audit.last().unwrap().body).unwrap();
+        assert_eq!((body["ca_serial"].as_str(), body["ca_not_after"].as_i64()), (Some(serial.as_str()), Some(row.not_after)));
+        assert_eq!(body["revoked"], serde_json::json!([first.serial]));
+        drop(l);
+        // Its health shows the new end, and nothing to alert on.
+        let h = node.health();
+        assert_eq!(h.ca_not_after, Some(row.not_after));
+        assert!(crate::health::alerts("n1", &h, (node.clock)()).is_empty());
+    }
+
+    /// #416: an expired node CA is a health alert, and a box whose hosts need it isn't started.
+    #[tokio::test]
+    async fn an_expired_node_ca_alerts_and_refuses_the_boxes_that_need_it() {
+        const RUN: &str = "run_xxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let inst = Install::new("ca-expired");
+        let root = wicket_proxy::ca::InstallationCa::generate().unwrap();
+        let (node, _) = ca_node(&inst, &root, time::Duration::seconds(-1));
+        let h = node.health();
+        let alerts = crate::health::alerts("n1", &h, (node.clock)());
+        assert_eq!(alerts.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["n1/ca-expired"]);
+        assert!(node.status().ca_until.is_some_and(|u| u * 1000 < (node.clock)()));
+        fed_box(&node, &inst, RUN, "name: z\nreach:\n  - { host: api.example.com }\n");
+        node.boxes.lock().unwrap().remove(RUN);
+        let mut bs = fake_record(RUN).start;
+        (bs.run, bs.tenant, bs.zone) = (RUN.into(), "t0".into(), "z".into());
+        let e = start_box(&node, None, bs.clone(), Arc::new(Timings::new())).await.unwrap_err().to_string();
+        assert!(e.contains("node n1's CA expired") && e.contains("wicket node renew-ca n1"), "{e}");
+        assert!(!node.boxes.lock().unwrap().contains_key(RUN), "nothing of it made");
     }
 }
