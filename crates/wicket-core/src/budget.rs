@@ -1,5 +1,5 @@
 //! A run's model budget (#152, #256): what its model proxy has counted, what it has carved out for
-//! its children, and the slices of it a node is leased, kept in one [`Counter`] that the proxy's
+//! its children, and the slices of it sent to its node, kept in one [`Counter`] that the proxy's
 //! calls, a spawn's carve-out and the node's `Spent` reports share across threads.
 //!
 //! The counter's atomics are std's, or loom's under `cfg(loom)` (#325:
@@ -56,7 +56,7 @@ pub struct Slice {
 }
 
 impl Slice {
-    /// The slice to lease a node next (#152), given the one it holds (`cur`, None before the first),
+    /// The slice to send a node next (#152), given the one it holds (`cur`, None before the first),
     /// the control host's [`Counter::next_slice`], what it has counted (`spent`, and `input_total`
     /// with cached tokens): `cur` until less than half a slice of it is left, else `next`; and
     /// `next` at once if it is lower than `cur` (what is left of the budget shrank, a spawn's
@@ -106,7 +106,7 @@ impl Spent {
 
 /// What a [`Counter`] holds at one moment, each counter read once: every figure derived from one
 /// `Counts` agrees with the others (#325: [`Counter::next_slice`] read `requests` twice, and a
-/// `Spent` merged in between leased a node more than was left).
+/// `Spent` merged in between sent a node more than was left).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub requests: u64,
@@ -159,7 +159,7 @@ impl Counts {
         Some(q.input_tokens?.saturating_sub(self.input_committed()))
     }
 
-    /// The slice to lease next: what this activation has counted plus `part` of each limit, never
+    /// The slice to send next: what this activation has counted plus `part` of each limit, never
     /// past what is left. `part(max)` is the share of `max` a slice adds (any value: Kani checks
     /// every one).
     pub fn slice(&self, q: ModelQuota, part: impl Fn(u64) -> u64) -> Slice {
@@ -302,7 +302,7 @@ impl Counter {
         self.output_tokens.fetch_max(s.output_tokens, SeqCst);
     }
 
-    /// The slice this activation may be leased next (#152): what it has counted plus `fraction` of
+    /// The slice this activation's node may be sent next (#152): what it has counted plus `fraction` of
     /// the budget, never past what is left of it. From one [`Counts`].
     pub fn next_slice(&self, q: ModelQuota, fraction: f64) -> Slice {
         self.counts().slice(q, |max| part(max, fraction))

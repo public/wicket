@@ -256,7 +256,7 @@ impl Ledger {
         Ok(match agent {
             Some(a) if a.restorable && ["hibernated", "hibernating", "waking"].contains(&a.state.as_str()) => (
                 format!("{to} is {}: wicket wakes it to read the message", a.state),
-                "wicket itself, by waking it (its operator can also: `wicket wake`)".into(),
+                "wicket itself, by waking it (its operator can also: `wicket session`)".into(),
             ),
             _ => (
                 format!("{to} has no live run"),

@@ -1146,7 +1146,7 @@ mod tests {
                 "op",
                 json!({ "kind": "llm", "model": null, "status": 429, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "requests": 9, "outcome": "budget: request cap reached" }),
             ),
-            rec("op", json!({ "kind": "tool", "name": "spawn_agent", "detail": "x" })),
+            rec("op", json!({ "kind": "tool", "name": "spawn", "detail": "x" })),
             rec(
                 "decision",
                 json!({ "decision": "approve", "request": "req_1", "grant": "gr_1", "by": "alex", "method": "POST", "host": "api.github.com", "path": "/repos/a/b/issues" }),
@@ -1192,7 +1192,7 @@ mod tests {
         let capped = attrs(&logs[3]);
         assert_eq!(capped["error.type"]["stringValue"], "429");
         assert!(!capped.contains_key("gen_ai.request.model") && !capped.contains_key("gen_ai.provider.name"));
-        assert_eq!(attrs(&logs[4])["gen_ai.tool.name"]["stringValue"], "spawn_agent");
+        assert_eq!(attrs(&logs[4])["gen_ai.tool.name"]["stringValue"], "spawn");
         let d = attrs(&logs[5]);
         assert_eq!(
             (d["wicket.decision"]["stringValue"].as_str(), d["wicket.decision.by"]["stringValue"].as_str()),

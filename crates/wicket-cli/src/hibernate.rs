@@ -13,7 +13,8 @@
 //!   placeholders, the bundle restored and verified, and Claude Code resumed with `--resume` on the
 //!   agent's own session, at the same workspace path (Claude Code keys sessions by directory). Its
 //!   first turn says it was woken, by what, and carries the operator's message if there is one.
-//!   Sources: `wicket wake`, opening its session (`wicket session`), a message from another agent.
+//!   Sources: opening its session (`wicket session`, or a prompt in the console), and a message
+//!   from another agent; each starts the internal `wicket wake` ([`trigger_wake`]).
 //! - **Incremental** (#365). State goes into the content-addressed store as a bundle tree
 //!   (`wicket_store::bundle`, version 2): the control host's local store (`<data dir>/store`)
 //!   writes only files that changed since an earlier hibernation, and with `bundles: s3` the state
@@ -540,7 +541,8 @@ fn wake_text(by: &str, said: &[(String, String)], messages: i64) -> String {
     t
 }
 
-/// `wicket wake <agent>`: claims the agent and runs its next activation in the foreground.
+/// `wicket wake <agent>` (internal, #249): claims the agent and runs its next activation in the
+/// foreground. What [`trigger_wake`] starts, and wicket's own tests run.
 pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result<()> {
     let (agent, generation, run, first, last_node) = {
         let mut l = Ledger::open(&ledger_path())?;

@@ -614,7 +614,7 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
         // Server-side search would bypass the egress proxy (the LLM proxy strips it too).
         "--disallowedTools".into(),
         // In-box subagents can't be told apart by identity; when the manifest says so, the only way
-        // to start a subagent is wicket's spawn_agent (its own sandbox and identity).
+        // to start a subagent is wicket's spawn (its own sandbox and identity).
         if m.agent.as_ref().map(|a| a.in_box_subagents).unwrap_or(true) { "WebSearch".into() } else { "WebSearch,Agent,Task".into() },
         "--append-system-prompt".into(),
         format!("{BOX_NOTICE}\n{LIFETIME_NOTICE}"),

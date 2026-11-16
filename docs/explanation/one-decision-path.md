@@ -33,7 +33,7 @@ target `gateway`; `egress` went with slice 3, `llm` with slice 1).
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
-`request_access`, `await_grant`, `pending_requests`, `spawn`/`spawn_agent`, `send_message` and
+`request_access`, `await_grant`, `pending_requests`, `spawn`, `send_message` and
 `await_message` while cut off, `request_capacity`/`request_update` queued while cut off) and the
 node's own `Llm`.
 
@@ -41,7 +41,7 @@ node's own `Llm`.
 
 1. **Slice 1 (done, #317): the model proxy runs only on the node.** `run.rs` stops listening on
    `ctl/llm.sock`. Its `Llm` stays as the run's budget counter (the node's `Spent` reports are
-   merged into it, slices are leased from it, and the egress model gate uses it). `Llm::relayed`,
+   merged into it, slices are sent from it, and the egress model gate uses it). `Llm::relayed`,
    `LlmRelay` and the `llm` tunnel target go. No protocol bump: every node within
    `PROTOCOL_SKEW` of protocol 8 is at protocol 3 or later (#152), so it fetches the credential and
    never opens that tunnel.
@@ -76,7 +76,8 @@ node's own `Llm`.
    `nodegw.rs`. Tools that need the control host (link tools, `decide`, `finish`/`hibernate`,
    capacity, update, messages to boxes on other nodes) go as typed channel messages that ask
    (`Msg::Ask`'s pattern), not as relayed JSON-RPC. `wicket-proxy/src/gateway.rs`'s tool bodies
-   and spawn's `--parent-run` re-exec path go. This is protocol 12, behind #241's jumps.
+   and spawn's `--parent-run` re-exec path go. This is protocol 13 (12 is node health's, #377),
+   behind #241's jumps.
 5. **Slice 5: `run.rs` starts no proxies.** With nothing left on `ctl/*.sock`, the run supervisor
    keeps the vault, the ledger, approvals and the feed. The control host is forward-only: it relays
    secrets and asks, and decides nothing per request.

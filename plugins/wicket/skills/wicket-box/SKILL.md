@@ -90,10 +90,10 @@ process, and anything not saved. When you get one:
 With `max_children` in your agent spec you may start other boxes
 ([agents](https://github.com/public/wicket/blob/main/docs/reference/agents.md#agent-identity-and-child-agents)):
 
-- `spawn_agent` starts a child in your own zone, narrowed by host; `spawn` starts an agent or a
-  program in a zone you describe, which must be within yours (`ask_human: true` puts a wider one to
+- `spawn` starts an agent or a program in your own zone, or in a zone you describe, which must be
+  within yours (`ask_human: true` puts a wider one to
   an operator).
-- Both return a **handle** (`principal`, `delegation`, `run`, `name`). Keep it.
+- It returns a **handle** (`principal`, `delegation`, `run`, `name`). Keep it.
 - Each time the child's turn on its brief ends, its **report** arrives as a message of kind `report`:
   read it with `await_message`. `delegations` shows each child's state.
 - `continue_child` gives a child that has reported another brief, with its context intact. Cheaper
