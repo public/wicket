@@ -46,7 +46,7 @@ fn check(host: &str, addrs: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
     if let Some(bad) = addrs.iter().find(|a| !wicket_core::is_public_ip(&a.ip())) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{host} resolves to the non-public address {}, which is never reachable from a sandbox", bad.ip()),
+            format!("{host} resolves to the non-public address {}, which is never reachable from a box", bad.ip()),
         ));
     }
     Ok(addrs)

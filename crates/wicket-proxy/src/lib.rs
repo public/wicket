@@ -215,8 +215,8 @@ pub struct SpawnRequest {
     /// time it has left, isolation, unlisted_hosts) or to nothing (reach, inject, volumes).
     pub zone: Option<serde_json::Value>,
     pub max_children: u32,
-    /// If the zone isn't a subset of the parent's, put exactly this zone to a human instead of refusing.
-    pub ask_human: bool,
+    /// If the zone isn't a subset of the parent's, put exactly this zone up for approval instead of refusing.
+    pub escalate: bool,
     /// spawn_agent's shorthand: the parent's zone, narrowed to these hosts.
     pub reach_hosts: Option<Vec<String>>,
     /// Where to run it: `{"lease": "l-…"}` (a capacity lease this run holds) or `{"node": "<name>"}`.
@@ -617,7 +617,7 @@ pub(crate) fn problem(status: u16, kind: &str, title: &str, detail: &str, reques
     if let Some(id) = request_id {
         body["request_id"] = id.into();
         body["retry_after"] = 30.into();
-        body["hint"] = format!("Call the wicket MCP tool await_grant with request_id {id} to wait for a human's decision, then retry this same request once. Nothing else will reach this destination from the sandbox.").into();
+        body["hint"] = format!("Call the wicket MCP tool await_grant with request_id {id} to wait for the decision, then retry this same request once. Nothing else will reach this destination from the box.").into();
     }
     let mut b = http::Response::builder().status(status).header("content-type", "application/problem+json").header("x-wicket", kind);
     if let Some(id) = request_id {
@@ -649,13 +649,13 @@ pub(crate) const UNAVAILABLE_RETRY_AFTER: u64 = 5;
 pub(crate) fn unavailable(detail: &str) -> http::Response<BoxBody> {
     let mut body = serde_json::json!({
         "type": "https://wicket.dev/e/unavailable",
-        "title": "Blocked by wicket sandbox: control plane unreachable",
+        "title": "Blocked by wicket box: control host unreachable",
         "status": 503,
         "detail": detail,
         "retry_after": UNAVAILABLE_RETRY_AFTER,
     });
     body["hint"] = "This is temporary: retry this same request in a few seconds.".into();
-    let mut resp = problem(503, "unavailable", "Blocked by wicket sandbox: control plane unreachable", detail, None);
+    let mut resp = problem(503, "unavailable", "Blocked by wicket box: control host unreachable", detail, None);
     *resp.body_mut() = full(serde_json::to_vec_pretty(&body).unwrap_or_default());
     resp.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from(UNAVAILABLE_RETRY_AFTER));
     resp
@@ -663,9 +663,9 @@ pub(crate) fn unavailable(detail: &str) -> http::Response<BoxBody> {
 
 /// What every refusal reminds the agent of: where it is, and that there is no other way out.
 /// What an agent whose zone may not ask (`escalation.request: false`, #50) is told when it asks.
-pub const NEVER_ASKS: &str = "this zone may not ask for anything outside its reach (escalation.request: false), so this will never be allowed from this sandbox; tell the user";
+pub const NEVER_ASKS: &str = "this zone may not ask for anything outside its reach (escalation.request: false), so this will never be allowed from this box; tell the user";
 
-pub(crate) const SANDBOX_FACT: &str = "You are in a wicket sandbox (a gVisor container with no network of its own); wicket's proxy is its only route out, so no other tool, host, mirror or cache will reach this either.";
+pub(crate) const BOX_FACT: &str = "You are in a wicket box (a gVisor container with no network of its own); wicket's proxy is its only route out, so no other tool, host, mirror or cache will reach this either.";
 
 /// Request headers the egress proxy forwards from a box to any upstream (#130, design §9.0): content
 /// negotiation, caching and conditional requests, the body's own description, and git's protocol
@@ -739,7 +739,7 @@ mod fence_tests {
                 manifest: "m",
                 image: "i",
                 workspace: None,
-                lease_until: 0,
+                claim_until: 0,
             })
             .unwrap();
         assert!(ledger.commit_agent_push(&agent, 1, 0, 1, "h", 1).unwrap());

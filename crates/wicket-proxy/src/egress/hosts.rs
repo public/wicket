@@ -20,9 +20,9 @@ impl Egress {
                     detail: why.clone(),
                 });
                 let note = self.strike(&format!("host {host}"));
-                Some(problem(403, "forbidden", "Blocked by wicket sandbox: never allowed", &format!(
-                    "{why}. This will never be allowed from this sandbox, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
-                    crate::SANDBOX_FACT
+                Some(problem(403, "forbidden", "Blocked by wicket box: never allowed", &format!(
+                    "{why}. This will never be allowed from this box, and no approval can change that. {} Do not retry it; tell the user it is blocked.{note}",
+                    crate::BOX_FACT
                 ), None))
             }
             wicket_core::HostVerdict::Hidden => {
@@ -35,9 +35,9 @@ impl Egress {
                     detail: "not a host this zone can see".into(),
                 });
                 let note = self.strike(&format!("host {host}"));
-                Some(problem(502, "unknown-host", "wicket sandbox: unknown host", &format!(
-                    "{host} does not exist as far as this sandbox is concerned: it can only see the hosts its zone names. {} Do not retry it.{note}",
-                    crate::SANDBOX_FACT
+                Some(problem(502, "unknown-host", "wicket box: unknown host", &format!(
+                    "{host} does not exist as far as this box is concerned: it can only see the host names its zone names. {} Do not retry it.{note}",
+                    crate::BOX_FACT
                 ), None))
             }
         }
@@ -66,10 +66,10 @@ impl Egress {
         Some(problem(
             502,
             "unknown-host",
-            "wicket sandbox: unknown host",
+            "wicket box: unknown host",
             &format!(
                 "{host} does not exist: there is no domain {domain}. Check the name for a typo. {} Do not retry it.{note}",
-                crate::SANDBOX_FACT
+                crate::BOX_FACT
             ),
             None,
         ))
@@ -156,7 +156,7 @@ impl Egress {
             note.push_str(&format!(" This exact request has now been blocked {same} times: stop retrying it."));
         }
         if total >= 10 {
-            note.push_str(&format!(" This run has hit the sandbox's limits {total} times. Stop exploring alternatives: tell the user what you need, or call request_access once with a reason."));
+            note.push_str(&format!(" This run has hit the box's limits {total} times. Stop exploring alternatives: tell the user what you need, or call request_access once with a reason."));
         }
         note
     }
@@ -170,6 +170,6 @@ impl Egress {
             outcome: "forbidden".into(),
             detail: why.into(),
         });
-        problem(403, "forbidden", "Blocked by wicket sandbox: malformed request", &format!("{why}. {}", crate::SANDBOX_FACT), None)
+        problem(403, "forbidden", "Blocked by wicket box: malformed request", &format!("{why}. {}", crate::BOX_FACT), None)
     }
 }

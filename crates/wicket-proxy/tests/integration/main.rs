@@ -3,6 +3,7 @@
 #[path = "../support/zone_decider.rs"]
 mod zone_decider;
 
+mod canary;
 mod git_push;
 mod h3;
 mod remote_session;

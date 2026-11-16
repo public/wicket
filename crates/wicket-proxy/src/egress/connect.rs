@@ -99,10 +99,10 @@ impl Egress {
         problem(
             403,
             "forbidden",
-            "Blocked by wicket sandbox: host not served on this node",
+            "Blocked by wicket box: host not served on this node",
             &format!(
                 "{host} can't be reached from this box's node ({why}), and wicket doesn't forward it anywhere else. Retrying won't help; continue without it and tell the user, who can have the node's CA cover it (`wicket node renew-ca <node> --hosts ...`). {}",
-                crate::SANDBOX_FACT
+                crate::BOX_FACT
             ),
             None,
         )

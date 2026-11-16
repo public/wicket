@@ -594,7 +594,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         if let Some(f) = &fence {
             match l.agent(&f.agent)? {
                 Some(a) if a.generation == f.generation => {
-                    l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::LEASE_SECS)?;
+                    l.renew_agent_claim(&f.agent, f.generation, wicket_store::now() + crate::hibernate::CLAIM_SECS)?;
                 }
                 _ => bail!("agent {} has moved past generation {}: this activation was superseded", f.agent, f.generation),
             }
@@ -625,7 +625,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 manifest: &text,
                 image,
                 workspace: workspace_dir.as_deref().and_then(|w| w.to_str()),
-                lease_until: wicket_store::now() + crate::hibernate::LEASE_SECS,
+                claim_until: wicket_store::now() + crate::hibernate::CLAIM_SECS,
             })?;
             fence = Some(wicket_proxy::Fence { agent: id, generation: 1 });
         }
@@ -1816,7 +1816,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if let Ok(l) = ledger.lock() {
                         let _ = l.record_agent_usage(&f.agent, f.generation, &usage());
                     }
-                    let ok = ledger.lock().ok().and_then(|l| l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::LEASE_SECS).ok());
+                    let ok = ledger.lock().ok().and_then(|l| l.renew_agent_claim(&f.agent, f.generation, wicket_store::now() + crate::hibernate::CLAIM_SECS).ok());
                     if ok == Some(false) {
                         println!("[wicket] agent {} was woken elsewhere (this is generation {}); stopping this box", f.agent, f.generation);
                         superseded = true;
@@ -2165,7 +2165,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             let row = {
                 let l = ledger.lock().expect("ledger");
                 // No heartbeat runs while the state is pushed: hold the claim for long enough.
-                l.renew_agent_lease(&f.agent, f.generation, wicket_store::now() + crate::hibernate::BUSY_LEASE_SECS)?;
+                l.renew_agent_claim(&f.agent, f.generation, wicket_store::now() + crate::hibernate::BUSY_CLAIM_SECS)?;
                 l.agent(&f.agent)?.context("the agent row")?
             };
             let mut trees = crate::hibernate::trees(&m, &f.agent, &dir, workspace_dir.as_deref());

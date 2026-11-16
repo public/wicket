@@ -29,12 +29,12 @@ use wicket_store::{AgentRow, Ledger};
 
 /// How long a holder's claim on an agent lasts without renewal (seconds). The supervisor renews it
 /// every few seconds; a waker may take over an agent whose holder let it lapse.
-pub const LEASE_SECS: i64 = 30;
+pub const CLAIM_SECS: i64 = 30;
 
 /// The claim held across the steps no heartbeat covers (a waker restoring and starting the box, a
 /// supervisor pushing the state): long enough for a big bundle, after which a crashed holder's agent
 /// can be woken again.
-pub const BUSY_LEASE_SECS: i64 = 900;
+pub const BUSY_CLAIM_SECS: i64 = 900;
 
 /// The object store agent state goes to, sealed under `state.key`: the installation's S3-compatible
 /// store if `state-store.yaml` puts bundles there (#154), or a directory under wicket's data dir.
@@ -528,7 +528,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
             bail!("agent {} can't be woken: {why}", a.id);
         }
         let run = RunId::new();
-        let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_LEASE_SECS)? else {
+        let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_CLAIM_SECS)? else {
             let a = l.agent(&a.id)?.unwrap_or(a);
             println!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
             std::process::exit(2);
@@ -857,6 +857,12 @@ mod outbox_tests {
         symlink(d.join("vdir"), st.join("launcher")).unwrap();
         write_owned(&st, "claude/.credentials.json", b"placeholder").unwrap();
         write_owned(&st, "launcher/file0", b"prompt").unwrap();
+        // A link deeper in a harness's config (its skills directory, say), as its node writes them.
+        std::fs::create_dir_all(d.join("sdir")).unwrap();
+        symlink(d.join("sdir"), st.join("claude/skills")).unwrap();
+        write_owned(&st, wicket_agent::claude::BOX_SKILL_FILE, wicket_agent::BOX_SKILL.as_bytes()).unwrap();
+        assert!(std::fs::read_dir(d.join("sdir")).unwrap().next().is_none());
+        assert_eq!(std::fs::read(st.join(wicket_agent::claude::BOX_SKILL_FILE)).unwrap(), wicket_agent::BOX_SKILL.as_bytes());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(std::fs::read_dir(d.join("vdir")).unwrap().next().is_none());
         assert_eq!(std::fs::read(st.join("claude/.credentials.json")).unwrap(), b"placeholder");
@@ -960,7 +966,7 @@ mod tests {
             head: Some("h".into()),
             head_seq: 1,
             bundle_bytes: 1,
-            lease_until: None,
+            claim_until: None,
             restorable: true,
             want: None,
             note: None,

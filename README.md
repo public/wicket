@@ -33,6 +33,18 @@ sudo wicket approve r-xxxxxxxx            # ...which you approve here, or in the
 [Install on a host](docs/how-to/install-on-a-host.md) has every step, including checking the
 download and enrolling a passkey for the console.
 
+## Claude Code skills
+
+wicket's skills for operating it, writing manifests and coordinating boxes are a Claude Code plugin
+in this repository ([use wicket's skills](docs/how-to/use-wickets-skills.md)):
+
+```text
+/plugin install wicket --marketplace public/wicket
+```
+
+(or `/plugin marketplace add public/wicket`, then `/plugin install wicket@wicket`). Agents in a box
+have the one they need, `wicket-box`, without installing anything.
+
 ## Documentation
 
 - **[Tutorials](docs/README.md#tutorials)**: [your first box](docs/tutorials/first-box.md), and

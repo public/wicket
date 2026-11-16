@@ -51,7 +51,7 @@ send itself:
 
 | request | from | class |
 |---|---|---|
-| `SPAWN wicket.internal/zones/<zone>/<digest>` | `spawn` with `ask_human`, for a zone beyond the parent's | R4 |
+| `SPAWN wicket.internal/zones/<zone>/<digest>` | `spawn` with `escalate`, for a zone beyond the parent's | R4 |
 | `LINK wicket.internal/links/<from run>/<to run>/<port>` | `connect` or `link` beyond the default policy | R2 |
 | `CAPACITY wicket.internal/capacity/<lease>` | `request_capacity` | R2 |
 | `UPDATE wicket.internal/self/<sha256>` | `request_update` | R4 |

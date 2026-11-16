@@ -223,7 +223,7 @@ async fn a_push_asks_once_and_both_requests_pass_on_one_approval() {
     let w = World::new().await;
     let (st, body) = w.discover(REPO).await;
     assert_eq!(st, 403, "{body}");
-    assert!(body.contains("needs human approval") || body.contains("await_grant"), "{body}");
+    assert!(body.contains("needs approval") || body.contains("await_grant"), "{body}");
     let p = w.pending();
     assert_eq!(p.len(), 1);
     let rid = p[0].id.clone();

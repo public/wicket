@@ -461,8 +461,8 @@ impl H3 {
             return problem(
                 421,
                 "misdirected",
-                "Blocked by wicket sandbox: wrong host for this connection",
-                &format!("This HTTP/3 connection serves {host} only; connect to {asked} separately. {}", crate::SANDBOX_FACT),
+                "Blocked by wicket box: wrong host for this connection",
+                &format!("This HTTP/3 connection serves {host} only; connect to {asked} separately. {}", crate::BOX_FACT),
                 None,
             );
         }

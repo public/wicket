@@ -2,7 +2,7 @@
 
 What happens when boxes run on other machines: enrolment, `wicket node serve`, placement and leases.
 [Concepts](../explanation/concepts.md) explains the feed and leases. To set a node up, see [add a
-remote node](../how-to/add-a-remote-node.md) and [place nodes on Vultr](../how-to/place-nodes-on-vultr.md).
+remote node](../how-to/add-a-remote-node.md) and [create nodes on Vultr](../how-to/create-nodes-on-vultr.md).
 
 ## Enrolment
 
@@ -232,7 +232,7 @@ wicket node revoke n1
   `unlisted_hosts: escalate`; or every host once the node CA has expired, or without one) is never terminated
   and, since protocol 11 (#257's slice 3), never forwarded to the control host either: the node splices it
   through if the box's token allows the host wholesale, and otherwise refuses the CONNECT with a 403 that says
-  so (`Blocked by wicket sandbox: host not served on this node`, logged as a `forbidden` egress line,
+  so (`Blocked by wicket box: host not served on this node`, logged as a `forbidden` egress line,
   `not served on this node (<why>)`). To serve such a host, widen the node's CA (`wicket node renew-ca <node>
   --hosts …`). Plain `http://` needs no certificate, so the node decides it like any request. Grants are all
   published to the node, which alone counts their uses; the ledger records them. A box that a node before
@@ -308,27 +308,31 @@ from the control host first (#191):
   on its node. Tagged images are not sent: a tag is resolved where the box starts. `wicket self update`
   still loads its own agent image onto nodes by tag.
 
-## Provisioning nodes (`wicket place`)
+## Creating nodes (`wicket node create`)
 
 `crates/wicket-placement` is the placement interface (#37): request capacity (CPU, memory, isolation tier,
 region and plan hints, a price limit, an idempotency key) and get a node back; list, get and release owned
-nodes. Backends are the operator's own machines (static hosts) and Vultr. `wicket place` drives the Vultr one:
+nodes. Backends are the operator's own machines (static hosts) and Vultr. `wicket node create`, `release` and
+`plans` drive the Vultr one; `wicket node enrol` is for machines you already have:
 
 ```sh
 wicket secret set vultr-api-key                     # read from the terminal; only ever sent as the API's bearer token
-wicket place plans --region lhr                     # plans and their hourly price
-wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
+wicket node plans --region lhr                     # plans and their hourly price
+wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
   --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id of a key in the Vultr account> --ssh-key <its private key> \
   --hosts 'api.example.com'
-wicket place list                                   # owned nodes, lease end and next paid hour
-wicket place release <instance-id>                  # destroy now and revoke the enrolment
+wicket node list                                   # every node, a leased one with its lease end, provider and cost
+wicket node list --provider                        # and the provider's owned instances, next paid hour
+wicket node release n2                             # destroy now (by name or instance id), revoke the enrolment
 ```
 
 - **Money.** `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
-  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused, and
-  everything inside it still waits for `yes` on the terminal, with the plan, rate and worst case shown. Vultr
+  every owned node's cost through its lease plus the new node's worst case. Anything beyond it is refused.
+  Inside it, the node is a `CAPACITY wicket.internal /capacity/node/<name>` request from the operator who runs
+  `create`: approved at once by a live [capacity grant](console.md#capacity-grants) of theirs that covers it
+  (plans, regions, hourly and daily money, nodes at once), otherwise pending for an operator for up to `--wait`. Vultr
   bills per started hour, each line rounded up to the cent, with a 672 h monthly cap, so a node's lease ends at
-  minute 50 of its last hour and `list` shows when the next paid hour starts.
+  minute 50 of its last hour and `list --provider` shows when the next paid hour starts.
 - **Ownership.** Instances are tagged `wicket-owner-<installation>` (`--owner`, default the trust domain).
   Nothing without that tag, or with `wicket-protected`, is listed or destroyed. A retried `create` with the same
   `--idempotency-key` finds the first instance by its tag instead of making a second one.

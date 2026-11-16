@@ -7,7 +7,7 @@ type: Changed
   the node CA's name constraints, for example one approved later under
   `unlisted_hosts: escalate`. There is also every host on a node with no live CA. The node splices
   such a host through when the box's token allows it wholesale, and refuses it otherwise with a
-  403: `Blocked by wicket sandbox: host not served on this node`. Before, the node tunnelled such
+  403: `Blocked by wicket box: host not served on this node`. Before, the node tunnelled such
   hosts to the run's egress proxy on the control host. To serve one, widen the node's CA with
   `wicket node renew-ca <node> --hosts …`. Plain `http://` needs no certificate, so the node now
   decides it whatever its CA covers.
