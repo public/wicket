@@ -58,7 +58,8 @@ pub(super) fn put(node: &Arc<Node>, gen: u64, stream: u64, digest: String, name:
             return refuse(format!("{n:?} is not a name pinned to {digest}"));
         }
     }
-    let dir = spool(&node.paths.root).join(format!("in-{:x}-{}", stream & !(TUNNEL_BIT | chan::CONTROL_TUNNEL_BIT), ulid::Ulid::new()));
+    let dir =
+        spool(&node.paths.root).join(format!("in-{:x}-{}", stream & !(TUNNEL_BIT | chan::CONTROL_TUNNEL_BIT), wicket_core::new_ulid()));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return refuse(format!("making {}: {e}", dir.display()));
     }
@@ -131,7 +132,7 @@ async fn receive(
 pub(super) fn pull(node: &Arc<Node>, gen: u64, id: u64, run: String, digest: String, name: Option<String>, from: crate::registry::Source) {
     let n = node.clone();
     tokio::spawn(async move {
-        let dir = spool(&n.paths.root).join(format!("pull-{id:x}-{}", ulid::Ulid::new()));
+        let dir = spool(&n.paths.root).join(format!("pull-{id:x}-{}", wicket_core::new_ulid()));
         let r = pull_into(&n, gen, &run, &digest, name.as_deref(), &from, &dir).await;
         let _ = std::fs::remove_dir_all(&dir);
         let mut body =
@@ -429,9 +430,9 @@ sys.exit(2)
             std::env::var("WICKET_DOCKER").unwrap_or_else(|_| "docker".into()).split_whitespace().map(String::from).collect();
         let ctx = inst.dir.join("ctx");
         std::fs::create_dir_all(&ctx).unwrap();
-        std::fs::write(ctx.join("f"), ulid::Ulid::new().to_string()).unwrap();
+        std::fs::write(ctx.join("f"), wicket_core::new_ulid().to_string()).unwrap();
         std::fs::write(ctx.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
-        let tag = format!("wicket-test/delivered:{}", ulid::Ulid::new().to_string().to_lowercase());
+        let tag = format!("wicket-test/delivered:{}", wicket_core::new_ulid().to_string().to_lowercase());
         let docker = Docker::from_env();
         docker.build_image(&tag, &ctx, &[]).await.unwrap();
         let id = docker.image_identity(&tag).await.unwrap().unwrap().id;

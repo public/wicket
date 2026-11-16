@@ -292,7 +292,7 @@ impl H3 {
     /// a throwaway self-signed certificate, never presented.
     fn placeholder(&self) -> Result<quinn::ServerConfig> {
         let ck = rcgen::generate_simple_self_signed(vec!["placeholder.invalid".to_string()])?;
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()));
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()

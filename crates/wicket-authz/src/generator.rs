@@ -394,7 +394,16 @@ pub fn request_facts(r: &Request) -> Vec<Fact> {
         Action::Llm { used_requests, used_output_tokens } => {
             f.push(fact("llm_used", &[Term::Integer(*used_requests), Term::Integer(*used_output_tokens)]))
         }
-        Action::Msg { from } => f.push(fact("msg_from", &[s(from)])),
+        // One fact for the zone and one for the id, each only in its own form, so a list's zone
+        // entries match the zone and its principal entries the id: `accepts`, exactly (#411).
+        Action::Msg { from, sender } => {
+            if !wicket_core::manifest::is_principal_entry(from) {
+                f.push(fact("msg_from", &[s(from)]));
+            }
+            if let Some(id) = sender.as_deref().filter(|id| wicket_core::manifest::is_principal_entry(id)) {
+                f.push(fact("msg_from", &[s(id)]));
+            }
+        }
     }
     for (g, n) in &r.uses_left {
         f.push(fact("uses_left", &[s(g), Term::Integer(*n)]));

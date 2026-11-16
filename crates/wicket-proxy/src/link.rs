@@ -665,7 +665,7 @@ mod tests {
 
     impl World {
         fn new() -> World {
-            let root = std::env::temp_dir().join(format!("wicket-link-test-{}", ulid::Ulid::new()));
+            let root = std::env::temp_dir().join(format!("wicket-link-test-{}", wicket_core::new_ulid()));
             World { issuer: Issuer::generate("test.local"), ledger: Arc::new(Mutex::new(Ledger::open_in_memory().unwrap())), root }
         }
 

@@ -154,7 +154,7 @@ impl S3Store {
 
     fn scratch_file(&self) -> io::Result<std::fs::File> {
         std::fs::create_dir_all(&self.scratch)?;
-        let p = self.scratch.join(format!(".s3-{}-{}", std::process::id(), ulid::Ulid::new()));
+        let p = self.scratch.join(format!(".s3-{}-{}", std::process::id(), wicket_core::new_ulid()));
         let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p)?;
         let _ = std::fs::remove_file(&p);
         Ok(f)
@@ -189,7 +189,7 @@ impl S3Store {
 
     /// Checks the store can be reached and written: puts, reads back and deletes a probe object.
     pub fn probe(&self) -> Result<()> {
-        let key = format!("probe/{}", ulid::Ulid::new().to_string().to_lowercase());
+        let key = format!("probe/{}", wicket_core::new_ulid().to_string().to_lowercase());
         self.put_if_absent(&key, &mut &b"wicket"[..])?;
         let mut back = String::new();
         self.get(&key)?.context("the probe object isn't there after writing it")?.read_to_string(&mut back)?;

@@ -47,7 +47,7 @@ impl std::fmt::Debug for HostKeyPair {
 /// A fresh ed25519 host key, from `ssh-keygen`, in a 0700 temporary directory removed afterwards.
 pub async fn generate_host_key(comment: &str) -> anyhow::Result<HostKeyPair> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = std::env::temp_dir().join(format!("wicket-hostkey-{}", ulid::Ulid::new()));
+    let dir = std::env::temp_dir().join(format!("wicket-hostkey-{}", crate::new_ulid()));
     std::fs::DirBuilder::new().mode(0o700).create(&dir).context("temporary directory for the host key")?;
     let path = dir.join("key");
     let out = tokio::process::Command::new("ssh-keygen")
@@ -279,7 +279,7 @@ impl Probe for SshProbe {
 /// early with [`Unreachable`] if nothing ever answers on the ssh port (see [`wait_ready`]).
 pub async fn wait_ssh_ready(target: &str, host_key_line: &str, identity: Option<&Path>, wait: &ReadyWait) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = std::env::temp_dir().join(format!("wicket-probe-{}", ulid::Ulid::new()));
+    let dir = std::env::temp_dir().join(format!("wicket-probe-{}", crate::new_ulid()));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let kh = dir.join("known_hosts");
     let r: anyhow::Result<()> = async {

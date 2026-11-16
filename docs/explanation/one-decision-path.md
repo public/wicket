@@ -110,9 +110,13 @@ node's own `Llm`.
      module the handshake, but the deterministic simulation (`wicket-sim`, which depends on
      `wicket-proxy`, not on the `wicket` binary crate) calls them through `Gateway::call_tool`, so
      they move only with a library the simulation can use.
-5. **Slice 5: `run.rs` starts no proxies.** (Its gateway socket went with 4b.) With nothing left on `ctl/*.sock`, the run supervisor
-   keeps the vault, the ledger, approvals and the feed. The control host is forward-only: it relays
-   secrets and asks, and decides nothing per request.
+5. **Slice 5 (done): `run.rs` starts no proxies.** (Its gateway socket went with 4b.) With nothing
+   left on `ctl/*.sock`, the run supervisor keeps the vault, the ledger, approvals and the feed. The
+   control host is forward-only: it relays secrets and asks, and decides nothing per request. Its
+   own node's `shares_host` is transport only (where a box's files are laid out, what may be
+   mounted, which boxes are its to reap); no branch on it decides. The run's own CA went too: the
+   control host terminates no TLS, so a box trusts the installation root alone (`BoxStart.ca_pem`
+   is sent empty, for nodes at 13 that read it).
 
 Each slice has to pass the node e2e flow (`ci/node-e2e.sh`, also run by `ci/acceptance.sh --nodes local`) and the acceptance
 suite unchanged.

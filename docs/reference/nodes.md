@@ -227,7 +227,7 @@ wicket node revoke n1
   remaining lifetime of what was revoked. A tampered, replayed or rolled-back
   feed frame is refused.
 - **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
-  the node CA's leaves) and the run's own CA. An `inject` rule's host and a credential swap's host are
+  the node CA's leaves) and nothing else: the control host terminates no TLS, so a run has no CA of its own. An `inject` rule's host and a credential swap's host are
   terminated on the node, which injects or swaps the credential itself, its secret fetched on first use
   (#152, #257). A host the node CA can't cover (outside its name constraints, e.g. one approved later under
   `unlisted_hosts: escalate`; or every host once the node CA has expired, or without one) is never terminated
@@ -431,7 +431,7 @@ a pass at once; everything else (lease ends, approvals on the console) waits for
 - **A restart of the control host** is a pass away from normal: kill every wicket process on it, start
   again, and one `wicket reconcile` restarts this host's own node (whose `serve` adopts its boxes) and takes
   every run over, on every node. What a supervisor needs for that is in the run's `ctl/` directory: the run's
-  record (`run.json`), its run CA's key, its model spend and output offsets as it goes (`progress.json`); its
+  record (`run.json`), its model spend and output offsets as it goes (`progress.json`); its
   identity is re-issued and its box's token re-minted with the grants already on the node.
   `ci/acceptance.sh` checks it, on this host's node and (`--nodes local`) another.
 - **Leases** end when their run has ended or their end has passed; denied or withdrawn asks give their

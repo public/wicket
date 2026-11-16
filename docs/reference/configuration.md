@@ -117,5 +117,5 @@ None of these is for production.
 
 The agent's environment points every client at wicket: `HTTPS_PROXY` and `HTTP_PROXY` at
 `http://wicket.internal:3128`, `ANTHROPIC_BASE_URL` at `http://wicket.internal:8080`, a placeholder
-`CLAUDE_CODE_OAUTH_TOKEN`, and the run CA in `SSL_CERT_FILE` and its relatives. A manifest can't set
+`CLAUDE_CODE_OAUTH_TOKEN`, and the box's CA bundle (the installation root) in `SSL_CERT_FILE` and its relatives. A manifest can't set
 any of these: see [`agent.env`](manifest.md#agent). The box is described in [the box](box.md).

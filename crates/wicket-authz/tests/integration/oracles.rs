@@ -386,7 +386,10 @@ fn random_request(rng: &mut Rng, leaf: usize) -> Request {
             timeout_s: 600 * (1 + rng.below(40)) as i64,
         },
         1 => Action::Llm { used_requests: rng.below(3500) as i64, used_output_tokens: rng.below(4_500_000) as i64 },
-        2 => Action::Msg { from: rng.pick(&["ops", "other", ""]).to_string() },
+        2 => Action::Msg {
+            from: rng.pick(&["ops", "other", ""]).to_string(),
+            sender: [None, Some("spiffe://w.test/t/t0/z/ops/a/auditor"), Some("ops")][rng.below(3)].map(String::from),
+        },
         _ => Action::Http {
             host: rng.pick(&hosts).to_string(),
             method: rng.pick(&METHODS).to_string(),

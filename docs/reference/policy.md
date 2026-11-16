@@ -21,8 +21,8 @@ A request is allowed when:
   - the egress proxy, for hosts the node forwards (credentialed ones) and local boxes;
   - injections, before a credential goes in;
   - `spawn`, before a child starts;
-  - message delivery, at the receiving box: a message from a zone it doesn't accept is dropped, and
-    the agent told.
+  - message delivery, at the receiving box: a message from a zone or principal it doesn't accept is
+    dropped, and the agent told.
 
 The two layers are separate Cedar policy sets, evaluated separately. Merged into one set, an org
 permit would OR with the zone's permits and widen every zone. A grant lifts the zone layer only: the
@@ -38,7 +38,7 @@ condition errors, and for a forbid that would fail open.
 |---|---|---|---|
 | `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` | `Box` | `Url`: `host`, `path`, `path_matches`, `path_matches_any_case` | `risk` (0–4) |
 | `spawn` | `Box` | `Image` | `isolation`, `memory`, `cpus_milli`, `pids`, `timeout_s` |
-| `message` | `Box` | `Zone` (the sender's) | |
+| `message` | `Box` | `Zone` (the sender's) | `sender` (its principal id, `spiffe://…`; `""` if unknown) |
 | `inject` | `Box` | `Secret` | `host`, `header` |
 
 - A `Box` has `zone`, `tenant`, `principal` (`<type>:<id>` of who it acts for) and `depth` (spawn
@@ -60,6 +60,12 @@ Zone::"…"`) are decided when the token is minted, and gone from the token. Con
   `context.memory`/`cpus_milli`/`pids`/`timeout_s <= n`.
 - **Names:** images, sending zones and secrets, by `resource ==` or `resource in [...]`. An `inject`
   permit names its secret, `context.host` and `context.header` exactly.
+- **Senders:** a `message` permit names the sender's zone (`resource in [Zone::"ops"]`) or its
+  principal id (`context.sender == "spiffe://…"`, or `["spiffe://…", …].contains(context.sender)`),
+  not both in one conjunction. A zone's `accept_from` reads the same way: a zone entry matches the
+  sender's zone, a principal entry (one with `://`) its id, so a zone's policy says
+  `permit(principal, action == Action::"message", resource) when { resource in [Zone::"ops"] ||
+  ["spiffe://…/a/auditor"].contains(context.sender) };`.
 
 `&&`, `||`, `!` and `unless` combine them. Anything else is a compile error that names the construct:
 - a negated path or image;
@@ -67,6 +73,7 @@ Zone::"…"`) are decided when the token is minted, and gone from the token. Con
 - `has`, `if`, extension functions;
 - templates;
 - a forbid on `spawn`, `message` or `inject` (write a narrower permit);
+- a negated `context.sender`, a sender that isn't a principal's id, or a `Zone` named like one;
 - naming a `Box`.
 
 Permits become a check's alternatives (a first-party Biscuit block can't hold rules), and forbids
