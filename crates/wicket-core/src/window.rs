@@ -3,8 +3,11 @@
 //! activations, else the run), never per session, so a box can't reset them by starting again.
 //!
 //! - **The spec** is `zone.limits.egress: { window, requests, bytes }` ([`EgressSpec`]).
-//! - **History** is a [`Ring`] of [`BUCKETS`] fixed buckets over the window: a sum over the last
-//!   window that forgets one bucket at a time, in bounded space. The control host keeps it (in the
+//! - **History** is a [`Ring`] of fixed buckets, [`BUCKETS`] to a window: a sum over the last
+//!   window that forgets one bucket at a time, in bounded space. A bucket is forgotten only once
+//!   all of it is older than the window (so a ring holds up to `BUCKETS + 1`): whatever is counted
+//!   stays counted for at least a whole window, so no true sliding window ever holds more than
+//!   the cap; the price is that room comes back up to one bucket late. The control host keeps it (in the
 //!   ledger, by principal) and is its only writer.
 //! - **Leases.** A node is leased an [`EgressSlice`]: totals this activation's own counter
 //!   ([`EgressUse`], cumulative) may reach before it is sent more. The node refuses past it, so a
@@ -121,9 +124,16 @@ impl Ring {
         now.div_euclid(self.bucket_secs.max(1) as i64)
     }
 
+    /// The oldest bucket still counted at `now`: bucket `i` holds `[i*b, (i+1)*b)`, and stays until
+    /// its end is a whole window old, so a count made at `e` is still in [`Ring::total`] until at
+    /// least `e + window`.
+    fn oldest(&self, now: i64) -> i64 {
+        self.index(now) - BUCKETS as i64
+    }
+
     /// Forgets buckets that have left the window ending at `now`.
     fn prune(&mut self, now: i64) {
-        let oldest = self.index(now) - BUCKETS as i64 + 1;
+        let oldest = self.oldest(now);
         self.buckets.retain(|(i, _)| *i >= oldest);
     }
 
@@ -145,7 +155,7 @@ impl Ring {
 
     /// What the window ending at `now` holds.
     pub fn total(&self, now: i64) -> EgressUse {
-        let oldest = self.index(now) - BUCKETS as i64 + 1;
+        let oldest = self.oldest(now);
         self.buckets.iter().filter(|(i, _)| *i >= oldest).fold(EgressUse::default(), |a, (_, b)| EgressUse {
             requests: a.requests.saturating_add(b.requests),
             bytes: a.bytes.saturating_add(b.bytes),
@@ -280,18 +290,21 @@ mod tests {
         assert_eq!(r.buckets.len(), 1, "one bucket a minute");
         r.add(t0 + 1800, EgressUse { requests: 5, bytes: 0 });
         assert_eq!(r.total(t0 + 1800).requests, 16);
-        // An hour after the first bucket, it has left the window; the later one hasn't.
-        assert_eq!(r.total(t0 + 3600).requests, 5);
-        assert_eq!(r.total(t0 + 1800 + 3600).requests, 0);
-        // A day of a request a second: never more than BUCKETS buckets.
+        // A whole window after the first bucket ends, it has left; the later one hasn't. Never
+        // before: counted at t0, it is still counted at t0 + 1h.
+        assert_eq!(r.total(t0 + 3600).requests, 16);
+        assert_eq!(r.total(t0 + 3660).requests, 5);
+        assert_eq!(r.total(t0 + 1800 + 3660).requests, 0);
+        // A day of a request a second: never more than BUCKETS + 1 buckets, and the window holds
+        // the last hour and up to one bucket more.
         for s in 0..86_400 {
             r.add(t0 + s, EgressUse { requests: 1, bytes: 1 });
         }
-        assert!(r.buckets.len() as u64 <= BUCKETS);
-        assert_eq!(r.total(t0 + 86_399).requests, 3600);
+        assert!(r.buckets.len() as u64 <= BUCKETS + 1);
+        assert_eq!(r.total(t0 + 86_399).requests, 3660);
         // A clock that goes back counts in the newest bucket, never in a forgotten one.
         r.add(t0, EgressUse { requests: 7, bytes: 0 });
-        assert_eq!(r.total(t0 + 86_399).requests, 3607);
+        assert_eq!(r.total(t0 + 86_399).requests, 3667);
     }
 
     #[test]
@@ -322,11 +335,44 @@ mod tests {
         let mut one = Ring::new(&caps);
         one.add(now, EgressUse { requests: 99, bytes: 0 });
         assert_eq!(EgressSlice::next(&caps, &one, now, EgressUse::default(), SLICE_FRACTION).requests, Some(1));
-        // An hour later the window has room again.
-        assert_eq!(
-            EgressSlice::next(&caps, &full, now + 3600, EgressUse { requests: 100, bytes: 1000 }, SLICE_FRACTION).requests,
-            Some(125)
-        );
+        // A window (and a bucket) later the window has room again; not a moment sooner.
+        let all = EgressUse { requests: 100, bytes: 1000 };
+        assert_eq!(EgressSlice::next(&caps, &full, now + 3600, all, SLICE_FRACTION).requests, Some(100));
+        assert_eq!(EgressSlice::next(&caps, &full, now + 3660, all, SLICE_FRACTION).requests, Some(125));
+    }
+
+    /// The property the caps promise: no true sliding window of the window's length ever holds
+    /// more than the cap. A writer that adds only what [`Ring::total`] leaves room for, at random
+    /// times, never puts more than the cap into any hour.
+    #[test]
+    fn no_true_sliding_window_holds_more_than_the_cap() {
+        let caps = spec("1h", Some(50), None).caps().unwrap();
+        let mut r = Ring::new(&caps);
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut events: Vec<i64> = vec![];
+        let mut t = 10_000_000i64;
+        for _ in 0..20_000 {
+            t += (next() % 180) as i64;
+            let room = 50 - r.total(t).requests;
+            let n = if room == 0 { 0 } else { next() % (room + 1) };
+            r.add(t, EgressUse { requests: n, bytes: 0 });
+            events.extend(std::iter::repeat_n(t, n as usize));
+        }
+        // Every hour that starts at an event.
+        let mut j = 0;
+        for i in 0..events.len() {
+            while j < events.len() && events[j] < events[i] + 3600 {
+                j += 1;
+            }
+            assert!(j - i <= 50, "{} requests in the hour from {}", j - i, events[i]);
+        }
+        assert!(events.len() > 1000, "the writer did write");
     }
 
     #[test]

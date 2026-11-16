@@ -134,7 +134,7 @@ mod tests {
         // Another principal's window is its own.
         let other = Window::open(ledger, key(None, "run_c"), "run_c", caps(), now).unwrap();
         assert_eq!(other.total(now).requests, 0);
-        // An hour on, the window has room again.
-        assert_eq!(woken.next_slice(now + 11 + 3600).requests, Some(70 + 25));
+        // A window (and a bucket) on, the window has room again.
+        assert_eq!(woken.next_slice(now + 11 + 3700).requests, Some(70 + 25));
     }
 }
