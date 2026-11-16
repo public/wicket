@@ -404,6 +404,9 @@ pub struct Start {
     /// the model proxy's `prior` counters, so the node's first report is the base its later ones
     /// count from (#152).
     pub spent_counted: bool,
+    /// The control host's half of the box's gateway (#257 slice 4b): it answers the node's
+    /// [`Msg::Call`]s.
+    pub gateway: Arc<wicket_proxy::gateway::Gateway>,
     /// Takes over children the node starts for the box (#164): None, it may start none.
     pub adopt: Option<Adopter>,
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
@@ -442,6 +445,8 @@ struct Shared {
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
+    /// Answers the node's [`Msg::Call`]s for the box's gateway (#257).
+    gateway: Arc<wicket_proxy::gateway::Gateway>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for
     /// them ([`fetch_secret`]).
     swaps: Vec<wicket_proxy::CredentialSwap>,
@@ -601,6 +606,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         llm: s.llm.clone(),
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
+        gateway: s.gateway.clone(),
         swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
@@ -649,15 +655,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
         trees.end();
         let start = s.start;
-        // A node before #257's slice 3 would forward the hosts its CA can't cover to this host, which
-        // no longer serves them.
-        let forwarded = {
-            let l = shared.ledger.lock().expect("ledger");
-            let now = wicket_store::now();
-            let ca = l.node_cas(&name).ok().and_then(|cs| cs.into_iter().find(|c| c.status == "active" && c.not_after > now));
-            forwarded_host(&shared.zone, &shared.swaps, ca.as_ref().map(|c| (&c.hosts[..], c.not_after)), now)
-        };
-        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst), &start, shared.llm.is_some(), forwarded.as_deref())?;
+        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst))?;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
@@ -1284,21 +1282,22 @@ async fn on_frame(
                     l.merge_spent(spent.since(base));
                 }
             }
+            // A tool of the box's gateway its node doesn't answer itself (#257 slice 4b): answered
+            // by the run's own gateway here, on a task of its own (a wait may last minutes).
+            Msg::Call { id, run, tool, args } => {
+                let (gw, out) = (sh.gateway.clone(), out.clone());
+                let mine = run == sh.run.0;
+                tokio::spawn(async move {
+                    let (text, is_error) = match mine {
+                        true => gw.call_tool(&tool.name(), args).await,
+                        false => (format!("no gateway for run {run} here"), true),
+                    };
+                    let _ = out.send(Frame::Msg(Msg::Called { id, text, is_error }));
+                });
+            }
             Msg::TunnelOpen { stream, run, target } => {
-                let ok_target = chan::TUNNEL_TARGETS.contains(&target.as_str());
-                let conn = match (run == sh.run.0, ok_target) {
-                    (true, true) => {
-                        tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
-                    }
-                    _ => Err(format!("no tunnel to {target} for run {run}")),
-                };
-                match conn {
-                    Ok(c) => {
-                        send(Frame::Msg(Msg::TunnelOpened { stream, error: None }));
-                        sh.ctl.calls.tunnels.attach(stream, c, out.clone());
-                    }
-                    Err(e) => send(Frame::Msg(Msg::TunnelOpened { stream, error: Some(e) })),
-                }
+                // No socket of the control host's is a tunnel target any more (#257).
+                send(Frame::Msg(Msg::TunnelOpened { stream, error: Some(format!("no tunnel to {target} for run {run}")) }));
             }
             Msg::Audit { records } => {
                 let n = records.len();
@@ -1610,62 +1609,14 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
 }
 
-/// A host of the box that a node before protocol 11 would forward to the control host instead of
-/// terminating (#257): one its zone reaches, injects into or swaps a credential for, outside the
-/// node CA's name constraints; or every host, without a live CA. None: such a node forwards
-/// nothing the box is known to use (a host approved later under `unlisted_hosts: escalate` may
-/// still be, and is refused there).
-pub(crate) fn forwarded_host(
-    zone: &wicket_core::ZoneSpec,
-    swaps: &[wicket_proxy::CredentialSwap],
-    ca: Option<(&[String], i64)>,
-    now_secs: i64,
-) -> Option<String> {
-    let hosts = zone.reach.iter().map(|r| &r.host).chain(zone.inject.iter().map(|r| &r.host)).chain(swaps.iter().map(|s| &s.host));
-    for h in hosts {
-        // A wildcard is covered if a name under it is.
-        let probe = h.strip_prefix("*.").map(|b| format!("wicket-probe.{b}")).unwrap_or_else(|| h.clone());
-        if let wicket_proxy::decide::Route::Uncovered(why) = wicket_proxy::decide::route(&probe, ca, now_secs) {
-            return Some(format!("{h} ({why})"));
-        }
-    }
-    None
-}
-
-/// Why a box can't start on node `name` talking `proto`: it needs something an older node wouldn't
-/// do, and so would run unbounded or unchecked there (or fail closed, as a swap would).
-/// `forwarded` is a host of the box such a node would forward ([`forwarded_host`]).
-pub(crate) fn refuse_older_node(name: &str, proto: u32, start: &BoxStart, budget: bool, forwarded: Option<&str>) -> Result<()> {
-    // A node before #257's slice 3 would forward a host its CA can't cover to the control host,
-    // which decides no request now: the box goes only where such a host is spliced or refused, and
-    // the refusal says why.
-    if let Some(host) = forwarded.filter(|_| proto < crate::chan::NO_FORWARDED_EGRESS) {
+/// Why a box can't start on node `name` talking `proto` (#257 slice 4b): before protocol 13 the node
+/// would relay the box's gateway tools through a tunnel this host no longer serves. Every older
+/// feature floor (pins, budget slices, swaps, no forwarded egress) is below it.
+pub(crate) fn refuse_older_node(name: &str, proto: u32) -> Result<()> {
+    if proto < crate::chan::ONE_GATEWAY {
         bail!(
-            "node {name} talks protocol {proto}, and would forward {host} to the control host, which decides no egress from protocol {}: update the node (`wicket node install {name}`)",
-            crate::chan::NO_FORWARDED_EGRESS
-        );
-    }
-    // A node before #256 would take no budget slice: a box with a model budget goes only where its
-    // node is bounded by one.
-    if budget && proto < crate::chan::BUDGET_SLICE {
-        bail!(
-            "node {name} talks protocol {proto}, and this box has a model budget, whose slice needs {}: update the node (`wicket node install {name}`)",
-            crate::chan::BUDGET_SLICE
-        );
-    }
-    // A node before #257 would neither make a swap nor forward its host: a box with swaps goes only
-    // where they are made.
-    if !start.swaps.is_empty() && proto < crate::chan::CREDENTIAL_SWAPS {
-        bail!(
-            "node {name} talks protocol {proto}, and this box has credential swaps, which its node makes from protocol {}: update the node (`wicket node install {name}`)",
-            crate::chan::CREDENTIAL_SWAPS
-        );
-    }
-    // A node before #192 wouldn't check a pin: a pinned box goes only where it is checked.
-    if start.image_pin.is_some() && proto < crate::chan::IMAGE_PINS {
-        bail!(
-            "node {name} talks protocol {proto}, and this box's image is pinned by digest, which needs {}: update the node (`wicket node install {name}`)",
-            crate::chan::IMAGE_PINS
+            "node {name} talks protocol {proto}, and this host answers a box's gateway tools only as typed calls, from protocol {}: update the node (`wicket node install {name}`)",
+            crate::chan::ONE_GATEWAY
         );
     }
     Ok(())

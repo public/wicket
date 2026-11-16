@@ -1,17 +1,12 @@
-//! A minimal MCP gateway (design §9.2, PoC cut): JSON-RPC over streamable HTTP on a unix socket,
-//! serving wicket's own tools. `await_grant` lets a blocked agent wait for the human's decision
-//! instead of sleeping and retrying; `pending_requests` shows what this run is waiting on.
+//! The control host's half of a box's MCP gateway (design §9.2, #257): the tools that need the
+//! ledger, the other boxes' records, the placement backend or the run's own supervisor. The box's
+//! node serves the gateway itself (MCP's handshake, `tools/list`, and the tools it decides from the
+//! box's token) and asks these with a typed call (`Msg::Call`, [`Gateway::call_tool`]).
+//! `await_grant` lets a blocked agent wait for the human's decision instead of sleeping and
+//! retrying; `pending_requests` shows what this run is waiting on.
 
-use crate::{BoxBody, Event, RunCtx};
-use anyhow::Result;
-use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use crate::{Event, RunCtx};
 use serde_json::{json, Value};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 // The waits are on tokio's clock, as their sleeps are: the same as the OS's in production, and
@@ -32,97 +27,18 @@ pub struct Gateway {
     ctx: RunCtx,
 }
 
-fn body(status: StatusCode, v: Option<Value>) -> Response<BoxBody> {
-    let mut b = Response::builder().status(status);
-    let bytes = match v {
-        Some(v) => {
-            b = b.header("content-type", "application/json");
-            Bytes::from(v.to_string())
-        }
-        None => Bytes::new(),
-    };
-    b.body(Full::new(bytes).map_err(|never| match never {}).boxed()).expect("response")
-}
-
 impl Gateway {
     pub fn new(ctx: RunCtx) -> Arc<Gateway> {
         Arc::new(Gateway { ctx })
     }
 
-    pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
-        let listener = crate::sockpath::listen(socket)?;
-        self.serve_on(listener).await
-    }
-
-    /// As [`Self::serve`], on a socket already listening ([`crate::sockpath::listen`]): its
-    /// caller knows it is ready the moment it is bound, with no wait for it to appear (#287).
-    pub async fn serve_on(self: Arc<Self>, listener: tokio::net::UnixListener) -> Result<()> {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(self.clone().serve_io(stream, hyper::server::conn::http1::Builder::new()));
-        }
-    }
-
-    /// Serves one connection from the box on any byte stream, with `http1`'s settings, until it
-    /// ends: what [`Self::serve_on`] does with each connection it accepts. Public for the fuzz
-    /// targets (#323), which feed it raw bytes.
-    #[doc(hidden)]
-    pub async fn serve_io<S>(self: Arc<Self>, io: S, http1: hyper::server::conn::http1::Builder)
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let svc = service_fn(move |req| {
-            let me = self.clone();
-            async move { Ok::<_, hyper::Error>(me.handle(req).await) }
-        });
-        let _ = http1.serve_connection(TokioIo::new(io), svc).await;
-    }
-
-    async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<BoxBody> {
-        if req.method() != Method::POST {
-            // No server-initiated stream in the PoC.
-            return body(StatusCode::METHOD_NOT_ALLOWED, None);
-        }
+    /// One of the control host's tools for this run's box (#257 slice 4b): what a box's node asks
+    /// with `Msg::Call` when it doesn't answer the tool itself, and what the deterministic
+    /// simulation (#324) calls. A superseded activation (#70) gets nothing done.
+    pub async fn call_tool(&self, name: &str, args: Value) -> (String, bool) {
         if let Some(why) = self.ctx.superseded() {
-            return body(StatusCode::CONFLICT, Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32000, "message": why } })));
+            return (why, true);
         }
-        let raw = match Limited::new(req.into_body(), 1024 * 1024).collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => return body(StatusCode::PAYLOAD_TOO_LARGE, None),
-        };
-        let Ok(msg) = serde_json::from_slice::<Value>(&raw) else {
-            return body(
-                StatusCode::OK,
-                Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } })),
-            );
-        };
-        if msg.is_array() {
-            return body(
-                StatusCode::OK,
-                Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "batches are not accepted" } })),
-            );
-        }
-        let Some(id) = msg.get("id").cloned() else {
-            return body(StatusCode::ACCEPTED, None); // a notification
-        };
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        let result = match (handshake(method, &params), method) {
-            (Some(r), _) => Ok(r),
-            (None, "tools/call") => Ok(self.call(&params).await),
-            (None, _) => Err((-32601, format!("method {method} not found"))),
-        };
-        let reply = match result {
-            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
-        };
-        body(StatusCode::OK, Some(reply))
-    }
-
-    /// The deterministic simulation's seam (#324): a `tools/call` without HTTP, as a relayed call
-    /// from a box's node reaches it. The `sim` feature only adds this.
-    #[cfg(feature = "sim")]
-    pub async fn sim_call(&self, name: &str, args: Value) -> (String, bool) {
         let r = self.call(&json!({ "name": name, "arguments": args })).await;
         (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
     }

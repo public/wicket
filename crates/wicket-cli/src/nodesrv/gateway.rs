@@ -1,13 +1,14 @@
-//! The box's MCP gateway on its node (#151): MCP's own methods answered here (#257, the same
-//! answer the control host's gateway gives), the tools this node decides answered from the box's
-//! token (#164), and the rest relayed to the run's own gateway. Split out of `nodesrv.rs` (#220).
+//! The box's MCP gateway, on its node only (#151, #257): MCP's own methods answered here, the
+//! tools this node decides answered from the box's token (#164), and the control host's tools
+//! (`chan::ControlTool`) asked of it with a typed call (`Msg::Call`). Split out of `nodesrv.rs`
+//! (#220).
 
 use super::*;
 
 /// One MCP gateway call from a box. A tool this node decides (#164) is answered here from the
-/// box's token, connected or not ([`gw`]); every other call is relayed to the run's gateway on the
-/// control host, whole (the answers are small), so a call cut short by the control host going
-/// away gets a clear, retryable tool error instead of a broken response.
+/// box's token, connected or not ([`gw`]); one of the control host's is asked of it as a call and
+/// answered when it is done, so a call cut short by the control host going away gets a clear,
+/// retryable tool error.
 ///
 /// With push delivery on for the box's harness (#252, [`chan::EdgeStart::push`]), a `GET` opens the
 /// session's stream, which carries incoming messages as notifications ([`gw::push`]), and
@@ -81,8 +82,10 @@ async fn gateway_rpc(
     push: Option<&wicket_agent::harness::MessagePush>,
 ) -> hyper::Response<GwBody> {
     use http_body_util::BodyExt;
-    let (parts, body) = req.into_parts();
-    let body = match http_body_util::Limited::new(body, 1 << 20).collect().await {
+    let error = |id: serde_json::Value, code: i64, message: &str| {
+        gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
+    };
+    let body = match http_body_util::Limited::new(req.into_body(), 1 << 20).collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
             return gw_reply(
@@ -91,56 +94,59 @@ async fn gateway_rpc(
             )
         }
     };
-    let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    if rpc.get("method").and_then(|m| m.as_str()) == Some("tools/call") && rpc.get("id").is_some() && node.edge_start(run).is_some() {
-        let name = rpc["params"]["name"].as_str().unwrap_or("").to_string();
-        let args = rpc["params"].get("arguments").cloned().unwrap_or(serde_json::json!({}));
-        if let Some((text, is_error)) = gw::tool(node, run, &name, &args).await {
-            gw::record(node, run, &name, &text);
-            return gw_reply(
-                200,
-                serde_json::json!({ "jsonrpc": "2.0", "id": rpc["id"], "result": {
-                    "content": [{ "type": "text", "text": text }], "isError": is_error,
-                } }),
-            );
-        }
+    let Ok(rpc) = serde_json::from_slice::<serde_json::Value>(&body) else { return error(serde_json::Value::Null, -32700, "parse error") };
+    if !rpc.is_object() {
+        return error(serde_json::Value::Null, -32600, "batches are not accepted");
     }
-    // MCP's own methods and notifications are the node's to answer (#257), as they were the
-    // control host's: the same answer (`wicket_proxy::gateway::handshake`), with no round trip, and
-    // whether or not the control host can be reached.
     let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    if rpc.is_object() && rpc.get("id").is_none_or(|i| i.is_null()) && !method.is_empty() {
+    // A notification: nothing to answer.
+    if rpc.get("id").is_none_or(|i| i.is_null()) {
         return gw_reply(202, serde_json::Value::Null);
     }
+    let id = rpc["id"].clone();
+    // MCP's own methods are the node's to answer (#257), the same answer wherever the gateway runs.
     if let Some(result) = wicket_proxy::gateway::handshake(method, &rpc["params"]) {
-        let resp = gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": rpc["id"], "result": result }));
+        let resp = gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
         return match push {
             Some(p) if method == "initialize" => with_push(resp, p, rpc["params"]["protocolVersion"].as_str()),
             _ => resp,
         };
     }
-    relay_or_offline(node, run, &parts, &body, &rpc).await
+    if method != "tools/call" {
+        return error(id, -32601, &format!("method {method} not found"));
+    }
+    let name = rpc["params"]["name"].as_str().unwrap_or("").to_string();
+    let args = rpc["params"].get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    // The tools this node decides (#164), else the control host's (#257 slice 4b), asked as a call.
+    let answer = match gw::tool(node, run, &name, &args).await {
+        Some(a) => {
+            gw::record(node, run, &name, &a.0);
+            a
+        }
+        None => match chan::ControlTool::of(&name) {
+            Some(tool) => call_or_offline(node, run, tool, &args).await,
+            None => (format!("unknown tool {name}"), true),
+        },
+    };
+    gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+        "content": [{ "type": "text", "text": answer.0 }], "isError": answer.1,
+    } }))
 }
 
-async fn relay_or_offline(
-    node: &Arc<Node>,
-    run: &str,
-    parts: &http::request::Parts,
-    body: &bytes::Bytes,
-    rpc: &serde_json::Value,
-) -> hyper::Response<GwBody> {
+/// One of the control host's tools, asked of it; while it can't be reached, a clear refusal.
+async fn call_or_offline(node: &Arc<Node>, run: &str, tool: chan::ControlTool, args: &serde_json::Value) -> (String, bool) {
     let mut tries = 0;
     loop {
-        match relay_rpc(node, run, Some(parts), body.clone()).await {
-            Ok(r) => return r,
-            // A child this node started (#164) is relayed to once its control host has taken it
-            // over and supervises it: a call before that waits for it (while its parent's control
+        match node.call_control(run, tool, args).await {
+            Ok(a) => return a,
+            // A child this node started (#164) is answered once its control host has taken it over
+            // and supervises it: a call before that waits for it (while its parent's control
             // connection is up, so its supervisor is on the way), for up to a minute.
             Err(_) if tries < 60 && started_here(node, run) && parent_connected(node, run) => {
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            Err(e) => return gateway_offline(rpc, &e.to_string()),
+            Err(e) => return offline(&e.to_string()),
         }
     }
 }
@@ -156,49 +162,12 @@ pub(super) fn parent_connected(node: &Node, run: &str) -> bool {
     path.and_then(|p| p.rsplit('/').nth(1).map(String::from)).is_some_and(|parent| node.owner(&parent).is_some())
 }
 
-/// Relays one JSON-RPC request to the run's gateway on the control host, and reads its answer.
-pub(super) async fn relay_rpc(
-    node: &Arc<Node>,
-    run: &str,
-    parts: Option<&http::request::Parts>,
-    body: bytes::Bytes,
-) -> std::io::Result<hyper::Response<GwBody>> {
-    use http_body_util::BodyExt;
-    let io = node.open_tunnel(run, "gateway").await?;
-    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.map_err(std::io::Error::other)?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let mut rb = match parts {
-        Some(p) => {
-            let mut rb = hyper::Request::builder().method(p.method.clone()).uri(p.uri.clone());
-            for (k, v) in p.headers.iter() {
-                rb = rb.header(k, v);
-            }
-            rb
-        }
-        None => hyper::Request::builder().method("POST").uri("/mcp").header("content-type", "application/json"),
-    };
-    if parts.is_none() {
-        rb = rb.header("accept", "application/json");
-    }
-    let resp = send.send_request(rb.body(GwBody::new(body)).map_err(std::io::Error::other)?).await.map_err(std::io::Error::other)?;
-    let (rp, rb) = resp.into_parts();
-    let bytes = rb.collect().await.map_err(std::io::Error::other)?.to_bytes();
-    Ok(hyper::Response::from_parts(rp, GwBody::new(bytes)))
-}
-
-/// What a tool the node relays answers while the control host can't be reached: a clear refusal
-/// (it needs the control plane). MCP's handshake never gets here: the node answers it itself.
-pub(super) fn gateway_offline(rpc: &serde_json::Value, why: &str) -> hyper::Response<GwBody> {
-    let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let result = serde_json::json!({
-        "content": [{ "type": "text", "text": format!(
-            "the control host is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
-        ) }],
-        "isError": true,
-    });
-    gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+/// What one of the control host's tools answers while it can't be reached: a clear refusal.
+fn offline(why: &str) -> (String, bool) {
+    (
+        format!("the control host is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."),
+        true,
+    )
 }
 
 pub(super) fn gw_reply(status: u16, v: serde_json::Value) -> hyper::Response<GwBody> {

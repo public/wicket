@@ -815,20 +815,9 @@ mod fence_tests {
     #[tokio::test]
     async fn the_gateway_refuses_a_stale_generation() {
         let gw = gateway::Gateway::new(stale_ctx());
-        let d = dir("gateway");
-        let sock = d.join("gateway.sock");
-        let server = tokio::spawn({
-            let sock = sock.clone();
-            async move { gw.serve(&sock).await }
-        });
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#;
-        let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: wicket.internal\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let r = raw(&sock, &req).await;
-        assert!(r.starts_with("HTTP/1.1 409") && r.contains("stale"), "{r}");
-        server.abort();
-        let _ = std::fs::remove_dir_all(&d);
+        for tool in ["links", "await_grant", "send_message"] {
+            let (text, is_error) = gw.call_tool(tool, serde_json::json!({})).await;
+            assert!(is_error && text.contains("stale"), "{tool}: {text}");
+        }
     }
 }
