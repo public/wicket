@@ -8,10 +8,12 @@ wicket's MCP gateway is the agent's only MCP server. Claude Code reaches it at
 Every tool answers with one text block; a refusal or failure sets `isError`.
 
 **On a node** (protocol 5, #164), the box's node decides from its token, connected or not:
-`whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, `spawn` and
-`spawn_agent` within the box's zone (the child starts on the node, its token attenuated there, and
-the control host takes it over when it can be reached), and `send_message`, `await_message` and
-`link` between boxes on that node, and push delivery of messages (see [Push delivery](#push-delivery)). While the control host is unreachable, what needs an operator
+`whoami`, `request_access` (which spends no grant), `await_grant` and `pending_requests`, and `spawn`
+and `spawn_agent` within the box's zone placed on that node (the child starts on the node, its token
+attenuated there, and the control host takes it over when it can be reached). While the control host is
+unreachable, the node also delivers `send_message` and `await_message` between boxes on that node, and
+push delivery of messages (see [Push delivery](#push-delivery)); a link between them, once made, is
+carried by the node, but `link` itself is decided by the control host. While the control host is unreachable, what needs an operator
 (`request_access` beyond the token, `request_capacity`, `request_update`, a spawn beyond the zone) is
 queued on the node under a node-local id `q-…`; `await_grant` with that id follows it once it is
 raised. Every other call is relayed to the control host, and fails clearly while it is away. What a
