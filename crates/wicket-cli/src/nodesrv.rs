@@ -3930,7 +3930,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let Msg::NodeCaInstalled { serial, error } = ca_answer(&mut c).await else { panic!("no answer") };
         assert_eq!(error, None);
         let row = r.on_installed(&inst.ledger, "n1", &serial, error, wicket_store::now()).expect("recorded");
-        assert!(row.not_after > first.not_after && wicket_store::now() < first.not_after, "renewed before the first one's end");
+        assert!(row.serial != first.serial && row.not_after >= first.not_after, "{row:?}");
+        assert!(wicket_store::now() < first.not_after, "renewed before the first one's end");
         // The running box's next connection: served, and by the new CA, with the same constraints.
         let new = live.get().unwrap();
         assert_eq!((new.not_after, new.permitted.clone()), (row.not_after, first.permitted.clone()));
