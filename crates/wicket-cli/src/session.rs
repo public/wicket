@@ -13,8 +13,8 @@
 //! running the command (the unix user wicketd names, as for `wicket approve`); the run's supervisor
 //! hands it to the agent as its next turn. Audited as `session.prompt` with `via: terminal`. `/stop`
 //! cancels the running turn, as the console's Stop does (a stream-json Claude Code's is interrupted,
-//! #363); for a stream-json run, `/mode MODE` changes its permission mode while it runs. With TEXT, the command sends that
-//! one prompt, shows its turn and exits when it ends (`--no-wait`: at once).
+//! #363); for a stream-json run, `/mode MODE` changes its permission mode while it runs. With TEXT,
+//! the command sends that one prompt, shows its turn and exits when it ends (`--no-wait`: at once).
 //!
 //! **No passkey.** The console's socket needs a fresh passkey assertion because a browser is
 //! remote; this command runs as the local operator through wicketd, who can already read the run's
