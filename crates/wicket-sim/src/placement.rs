@@ -498,7 +498,7 @@ impl Provider for Cloud {
     }
 }
 
-/// The human at `place create`'s spend prompt (`place::TerminalApprover`), answering as planned.
+/// The decision on `wicket node create`'s CAPACITY request (`nodecreate::CapacityApprover`), as planned.
 struct PlanApprover(bool);
 
 impl SpendApprover for PlanApprover {

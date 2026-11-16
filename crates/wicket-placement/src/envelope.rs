@@ -78,8 +78,9 @@ pub enum Approval {
     Denied(String),
 }
 
-/// The human in the loop for anything with a money effect. The CLI asks on the terminal; the console
-/// will show a card. Called only for requests already inside the envelope.
+/// Who decides anything with a money effect: `wicket node create`'s CAPACITY request, decided by
+/// the operator's standing capacity grants or, beyond them, by an operator (#256). Called only for
+/// requests already inside the envelope.
 pub trait SpendApprover: Send + Sync {
     fn approve(&self, req: &SpendRequest) -> impl Future<Output = Approval> + Send;
 }

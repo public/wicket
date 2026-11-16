@@ -949,9 +949,8 @@ From weakest to strongest boundary between a workload and its host:
 | microVM / VM | **Firecracker**, Cloud Hypervisor, QEMU, libkrun; Apple Virtualization.framework; Hyper-V | the workload's own kernel behind hardware virtualization | hardware virtualization (KVM on Linux) |
 | confidential VM | SEV-SNP, TDX | also protects the guest from the host; not part of wicket's threat model | specific CPUs and clouds |
 
-**Kata Containers** isn't a separate tier. It's a container runtime that runs each container or pod in a
-microVM using one of those hypervisors, so Kubernetes and Docker treat VMs as containers (a Kubernetes
-RuntimeClass). It's the natural VM tier for the Kubernetes backend (#45).
+**Kata Containers** isn't a separate tier: it runs each container in a microVM using one of those
+hypervisors, so it would be the VM tier of a Kubernetes backend, which is deferred (#45, §22).
 
 **Why not Firecracker for everything:**
 - **It needs KVM.** Most cheap cloud VMs (this Vultr VPS, Hetzner Cloud) don't expose it. Only bare metal or
@@ -996,7 +995,6 @@ Full mediation is the default, but some zones need raw speed. `zone.network` tak
 |---|---|---|
 | gVisor, runc | `--network none`, unix sockets (built) | a veth pair with host-side nftables, NAT and wicket's resolver. gVisor can't run nftables inside, and doesn't need to |
 | Firecracker, Cloud Hypervisor | no network device; vsock to wicket's endpoints | virtio-net on a host TAP with host nftables and NAT; Firecracker's bandwidth limits |
-| Kata | vsock forwarding for wicket's endpoints (to verify) | Kubernetes network policy (e.g. Cilium DNS-aware rules) plus steering |
 | Virtualization.framework | no network device; vsock | a file-handle network device with wicket as the NAT in user space (controlled, slower), or Apple's NAT with `pf` rules |
 | Seatbelt | the profile allows only wicket's forwarders | general outbound, with steering only by proxy environment variables, which programs can ignore. The weakest |
 
@@ -2093,8 +2091,7 @@ isolation as an agent.*
 A **program is an agent without a model** (#255): the manifest's `program` (a command, or a source tree
 named by its digest) instead of an `agent`, in the same box, zone, proxies, identity and audit. There's
 no model route. It can't reason about a pending request, so by default it may not ask
-(`program.on_pending: fail`; `escalation.request: false` once #256 lands). `spawn` starts one like an
-agent.
+(`escalation.request: false`, #255). `spawn` starts one like an agent.
 
 **Approving a program is a grant on its digest** (#258): a source tree in the content-addressed store
 is named by its sha256, and "may this digest run" is one check over grants, as for any other artifact.

@@ -77,7 +77,8 @@ node's own `Llm`.
    `nodegw.rs`. Tools that need the control host (link tools, `decide`, `finish`/`hibernate`,
    capacity, update, messages to boxes on other nodes) go as typed channel messages that ask
    (`Msg::Ask`'s pattern), not as relayed JSON-RPC. `wicket-proxy/src/gateway.rs`'s tool bodies
-   and spawn's `--parent-run` re-exec path go. This is protocol 12, behind #241's jumps.
+   and spawn's `--parent-run` re-exec path go. This is protocol 13 (12 is node health's, #377),
+   behind #241's jumps.
 5. **Slice 5: `run.rs` starts no proxies.** With nothing left on `ctl/*.sock`, the run supervisor
    keeps the vault, the ledger, approvals and the feed. The control host is forward-only: it relays
    secrets and asks, and decides nothing per request.
