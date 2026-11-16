@@ -12,7 +12,8 @@
 //! **Prompts.** Each line typed is a prompt, queued as an operator message from the operator
 //! running the command (the unix user wicketd names, as for `wicket approve`); the run's supervisor
 //! hands it to the agent as its next turn. Audited as `session.prompt` with `via: terminal`. `/stop`
-//! cancels an ACP agent's running turn, as the console's Stop does. With TEXT, the command sends that
+//! cancels the running turn, as the console's Stop does (a stream-json Claude Code's is interrupted,
+//! #363); for a stream-json run, `/mode MODE` changes its permission mode while it runs. With TEXT, the command sends that
 //! one prompt, shows its turn and exits when it ends (`--no-wait`: at once).
 //!
 //! **No passkey.** The console's socket needs a fresh passkey assertion because a browser is
@@ -323,6 +324,35 @@ impl Session {
     }
 
     /// Queues a prompt for a run that isn't ACP's, audited as the endpoint's are.
+    /// `/stop` for a stream-json run (#363): its supervisor interrupts the running turn.
+    fn cancel(&self) -> Result<()> {
+        let l = self.ledger()?;
+        running(&l, &self.run)?;
+        let id = l.request_turn_cancel(&self.run, &self.op.label)?;
+        self.audit(
+            "session.cancel",
+            json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "cancel": id }),
+        );
+        Ok(())
+    }
+
+    /// `/mode MODE` for a stream-json run (#363): its supervisor changes the session's permission
+    /// mode while it runs. The mode as the manifest spells it.
+    fn set_mode(&self, mode: &str) -> Result<&'static str> {
+        let Some(m) = crate::control::parse_mode(mode) else {
+            let all: Vec<&str> = wicket_core::RemotePermissionMode::ALL.iter().map(|m| m.as_str()).collect();
+            bail!("/mode takes one of {}", all.join(", "));
+        };
+        let l = self.ledger()?;
+        running(&l, &self.run)?;
+        let id = l.request_mode_change(&self.run, m.as_str(), &self.op.label)?;
+        self.audit(
+            "session.mode",
+            json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal", "mode": m.as_str(), "change": id }),
+        );
+        Ok(m.as_str())
+    }
+
     fn queue(&self, text: &str) -> Result<i64> {
         if text.chars().count() > crate::serve::MAX_TEXT {
             bail!("the prompt is too long (at most {} characters)", crate::serve::MAX_TEXT);
@@ -349,7 +379,7 @@ impl Session {
             return self.follow_turn(&mut scr, pos, id, busy).await;
         }
         self.audit("session.attached", json!({ "run": self.run, "by": self.op.label, "principal": self.op.id, "via": "terminal" }));
-        show(&format!("session {} (type a prompt and Enter; Ctrl-C leaves)\n", self.run));
+        show(&format!("session {} (type a prompt and Enter; /stop interrupts the running turn; /mode MODE changes its permission mode; Ctrl-C leaves)\n", self.run));
         let mut pos = 0;
         let mut input = typed();
         let mut prompts = 0u64;
@@ -360,7 +390,14 @@ impl Session {
                 l = input.recv() => match l {
                     None => break "the input ended",
                     Some(l) if l.trim().is_empty() => {}
-                    Some(l) if l.trim() == "/stop" => show(&scr.line("[wicket] /stop cancels an ACP agent's turn; this agent speaks stream-json")),
+                    Some(l) if l.trim() == "/stop" => show(&scr.line(&match self.cancel() {
+                        Ok(()) => "[wicket] asked the agent to stop its running turn".to_string(),
+                        Err(e) => format!("[wicket] not sent: {e}"),
+                    })),
+                    Some(l) if l.trim() == "/mode" || l.trim().starts_with("/mode ") => show(&scr.line(&match self.set_mode(l.trim()["/mode".len()..].trim()) {
+                        Ok(mode) => format!("[wicket] asked the agent to change its permission mode to {mode}"),
+                        Err(e) => format!("[wicket] not sent: {e}"),
+                    })),
                     Some(l) => match self.queue(&l) {
                         Ok(_) => prompts += 1,
                         Err(e) => show(&scr.line(&format!("[wicket] not sent: {e}"))),
