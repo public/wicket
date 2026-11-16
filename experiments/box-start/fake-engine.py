@@ -10,7 +10,8 @@ are its command's last argument (what `sh -c 'echo …'` would print), so measur
     WICKET_DOCKER="docker -H unix:///path/to/docker.sock" experiments/box-start/measure.sh -n 20 --isolation runc
 
 Only what a box start asks is answered: _ping, image inspect, create, start, inspect, logs, wait,
-kill, delete, and the image events (held open, none sent). Anything else is a 404.
+kill, delete, the container list (empty), and the image events (held open, none sent). Anything
+else is a 404.
 """
 import datetime
 import json
@@ -69,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p[0] != "containers":
             return self.reply(404, {"message": "not here"})
+        if p[1] == "json":
+            return self.reply(200, [])  # a node's serve adopting earlier boxes: none
         if p[1] == "create" and method == "POST":
             name = q.get("name", ["box"])[0]
             spec = self.body()
