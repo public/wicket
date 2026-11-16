@@ -84,7 +84,7 @@ pub fn config_path() -> PathBuf {
 pub fn load() -> Result<CiConfig> {
     let p = config_path();
     let text = std::fs::read_to_string(&p).with_context(|| format!("{} (see docs/how-to/update-from-ci.md)", p.display()))?;
-    let c: CiConfig = serde_yaml::from_str(&text).with_context(|| p.display().to_string())?;
+    let c: CiConfig = wicket_core::yaml::from_str(&text).with_context(|| p.display().to_string())?;
     let ok = |s: &str| !s.is_empty() && s.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_.".contains(ch));
     match c.repo.split_once('/') {
         Some((o, n)) if ok(o) && ok(n) => {}
@@ -315,7 +315,7 @@ impl Drop for Remove {
 #[derive(Default, Serialize, Deserialize)]
 struct FollowState {
     /// Builds whose update failed here (its gate, or a refusal): not tried again.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     failed: Vec<String>,
     /// Why the last run didn't update, if it didn't: audited when it changes, not every run.
     #[serde(default)]

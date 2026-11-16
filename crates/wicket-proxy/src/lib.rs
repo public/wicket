@@ -480,7 +480,7 @@ impl RunCtx {
             || me.claims.parent_run.as_deref().is_some_and(|p| l.identity(p).ok().flatten().is_some_and(|i| i.spiffe_id == principal))
         {
             "parent"
-        } else if rec.accept_from.iter().any(|a| a == &self.zone.name || a == &me.claims.sub) {
+        } else if wicket_core::manifest::accepts(&rec.accept_from, &self.zone.name, Some(&me.claims.sub)) {
             "peer"
         } else if replies {
             "reply"

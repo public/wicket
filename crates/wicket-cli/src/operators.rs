@@ -45,10 +45,10 @@ pub struct Scope {
     /// The request kinds it may decide: `http`, `spawn`, `link`, `capacity`, `update`, `tool` (a
     /// driven agent's prompt before a tool call, #363), and `authority` (renewing a running box's
     /// authority). Empty: none.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub kinds: Vec<String>,
     /// The hosts (`*.example.com` patterns) of the http requests it may decide. Empty: any.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     pub hosts: Vec<String>,
     /// The highest risk it may decide, `R0` to `R4`. None: any.
     #[serde(default)]
@@ -100,7 +100,7 @@ fn risk_rank(r: &str) -> Option<i64> {
 struct File {
     #[serde(default)]
     default: Option<RawAuthority>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
     operators: BTreeMap<String, RawAuthority>,
 }
 
@@ -122,7 +122,7 @@ impl Policy {
         if s.trim().is_empty() {
             return Ok(Policy::default());
         }
-        let f: File = serde_yaml::from_str(s)?;
+        let f: File = wicket_core::yaml::from_str(s)?;
         let default = f.default.map(Authority::try_from).transpose()?.unwrap_or(Authority::Anything);
         let mut operators = BTreeMap::new();
         for (k, v) in f.operators {

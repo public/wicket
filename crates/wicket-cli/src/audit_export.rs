@@ -128,10 +128,10 @@ pub enum SinkKind {
     /// records are POSTed to `<endpoint>/v1/logs`.
     Otlp {
         endpoint: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
         headers: BTreeMap<String, String>,
         /// Extra resource attributes (`service.name` is `wicket`).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "wicket_core::yaml::null_as_default")]
         resource: BTreeMap<String, String>,
     },
     /// Objects in the installation's state store (`state-store.yaml`, #154): one JSON-lines object
@@ -163,7 +163,7 @@ pub fn stored_objects(sink: &str) -> Result<Vec<Value>> {
 
 impl SinksConfig {
     pub fn parse(text: &str) -> Result<SinksConfig> {
-        let c: SinksConfig = serde_yaml::from_str(text)?;
+        let c: SinksConfig = wicket_core::yaml::from_str(text)?;
         let mut seen = std::collections::BTreeSet::new();
         for s in &c.sinks {
             if s.name.is_empty() || !seen.insert(s.name.clone()) {
