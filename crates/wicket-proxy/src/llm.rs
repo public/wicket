@@ -1949,4 +1949,150 @@ mod tests {
         let json = br#"{"usage": {"cache_read_input_tokens": 7, "input_tokens": 3, "cache_creation_input_tokens": 0, "output_tokens": 2}}"#;
         assert_eq!(usage(json), Usage { input: 3, cache_read: 7, cache_creation: 0, output: 2 });
     }
+
+    /// A fake model upstream that accepts only the bearer `good` and answers anything else 401
+    /// (`token revoked`), calling `on_reject` first: the login's owner refreshing it while the call
+    /// is out (#360). Records each request's bearer.
+    async fn relogin_upstream(
+        good: &'static str,
+        on_reject: impl Fn() + Send + Sync + 'static,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut req = Vec::new();
+                let mut buf = vec![0u8; 8192];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                let bearer = text.lines().find_map(|l| l.strip_prefix("authorization: bearer ")).unwrap_or("").trim().to_string();
+                seen2.lock().unwrap().push(bearer.clone());
+                let resp: &[u8] = if bearer == good {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                } else {
+                    on_reject();
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 75\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"revoked\"}}"
+                };
+                let _ = c.write_all(resp).await;
+            }
+        });
+        (port, seen)
+    }
+
+    /// The `llm` op records written so far.
+    async fn llm_ops(llm: &super::Llm, want: usize) -> Vec<String> {
+        let mut ops = vec![];
+        for _ in 0..300 {
+            let recs = llm.ctx.ledger.lock().unwrap().audit_of_kind("op").unwrap();
+            ops = recs.into_iter().map(|r| r.body).filter(|b| b.contains("\"kind\":\"llm\"")).collect();
+            if ops.len() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ops
+    }
+
+    /// A model call that races a login refresh (#360): the upstream refuses the old access token
+    /// the call went out with, the secret's file already holds the new one, so the call is sent once
+    /// more with it, and both the retry and the call's end are audited. The box sees one call, and
+    /// the budget counts one request.
+    #[tokio::test]
+    async fn a_call_that_races_a_login_refresh_is_retried_once_with_the_new_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-relogin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("creds.json");
+        let write = |p: &std::path::Path, t: &str| {
+            std::fs::write(p, format!(r#"{{"o":{{"accessToken":"{t}"}}}}"#)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(&creds, "tok-old");
+        let c2 = creds.clone();
+        let (port, seen) = relogin_upstream("tok-new", move || write(&c2, "tok-new")).await;
+        let vault = crate::vault::Vault::new(dir.join("vault"));
+        vault.link("model", creds.to_str().unwrap(), Some("/o/accessToken"), None, None).unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let mut c =
+            ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}"));
+        c.vault = vault;
+        let llm = super::Llm::new(c).unwrap();
+        let (status, body) = post(llm.clone(), "relogin").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(*seen.lock().unwrap(), ["tok-old", "tok-new"], "one retry, with the new token");
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one call for the budget");
+        let ops = llm_ops(&llm, 2).await;
+        assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("retrying once with its new value")), "{ops:?}");
+        assert!(ops.iter().any(|o| o.contains("\"status\":200") && o.contains("retried once after a 401")), "{ops:?}");
+        assert!(ops.iter().all(|o| !o.contains("tok-")), "no token in the audit: {ops:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 401 when the secret hasn't changed (#360): a real revocation, passed through to the box,
+    /// and the same value is never sent again.
+    #[tokio::test]
+    async fn a_401_with_an_unchanged_secret_passes_through() {
+        let (port, seen) = relogin_upstream("tok-never", || {}).await;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-revoked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok-revoked").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let mut c =
+            ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}"));
+        c.vault = vault;
+        let llm = super::Llm::new(c).unwrap();
+        let (status, body) = post(llm.clone(), "revoked").await;
+        assert_eq!(status, 401, "{body}");
+        assert!(body.contains("authentication_error"), "the upstream's answer: {body}");
+        assert_eq!(*seen.lock().unwrap(), ["tok-revoked"], "not retried");
+        let ops = llm_ops(&llm, 1).await;
+        assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("read again is unchanged: not retried")), "{ops:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node's copy of the login (#152, #360): after a 401 the node asks its source again even
+    /// though it holds a copy (the control host may not have said yet that it changed), and the
+    /// call is retried with what comes back.
+    #[tokio::test]
+    async fn a_node_asks_its_source_again_after_a_401() {
+        struct Source {
+            value: std::sync::Mutex<String>,
+            refetches: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::vault::SecretSource for Source {
+            fn get(&self, _: &str) -> anyhow::Result<String> {
+                Ok(self.value.lock().unwrap().clone())
+            }
+            fn hosts(&self, _: &str) -> Vec<String> {
+                vec!["127.0.0.1".into()]
+            }
+            fn has(&self, _: &str) -> bool {
+                true
+            }
+            fn refetch<'a>(&'a self, _: &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+                self.refetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.value.lock().unwrap() = "tok-new".into();
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let (port, seen) = relogin_upstream("tok-new", || {}).await;
+        let source = std::sync::Arc::new(Source { value: std::sync::Mutex::new("tok-old".into()), refetches: Default::default() });
+        let mut c =
+            ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &format!("{{secret: model, upstream: 'http://127.0.0.1:{port}'}}"));
+        c.vault = crate::vault::Vault::from_source(source.clone());
+        let (status, body) = post(super::Llm::new(c).unwrap(), "node-relogin").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(*seen.lock().unwrap(), ["tok-old", "tok-new"]);
+        assert_eq!(source.refetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
