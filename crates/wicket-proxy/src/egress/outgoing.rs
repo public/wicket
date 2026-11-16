@@ -89,6 +89,23 @@ impl Egress {
     /// unencoded, and every form of the credential in it is masked as it streams (#362).
     pub(super) fn clean(&self, resp: Response<BoxBody>, host: &str, method: &Method, injected: &[String]) -> Response<BoxBody> {
         let (mut parts, body) = resp.into_parts();
+        // wicket never asks an upstream to switch protocols (upgrade headers aren't forwarded), and
+        // relays no connection it can't read (#361): a 101 would leave the box's connection
+        // half-switched, with nothing deciding what passes over it.
+        if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+            self.anomaly(
+                host,
+                "response.upgrade",
+                &format!("{host} answered 101 Switching Protocols to a request that asked for no upgrade"),
+            );
+            return problem(
+                502,
+                "upstream",
+                "Upstream error",
+                &format!("refused: {host} switched protocols, and wicket relays only HTTP requests it decides. {}", crate::BOX_FACT),
+                None,
+            );
+        }
         let scan = canary::Scanner::secrets(injected);
         if !injected.is_empty() {
             if let Some(enc) = encoded(&parts.headers).filter(|_| *method != Method::HEAD && !matches!(parts.status.as_u16(), 204 | 304)) {

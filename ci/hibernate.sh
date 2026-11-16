@@ -201,13 +201,14 @@ wait "$busy_pid" 2>/dev/null || true
 check "B's run ended hibernated, and its box is gone" 'grep -q "^\[wicket\] run run_[a-z0-9]*: hibernated" "$work/b.log" && [ -z "$($DOCKER ps -q --filter name=^hib-run-)" ]'
 
 check "the model never saw the placeholder" '! grep -q "PLACEHOLDER" "$work/mock.log"'
+# Bundles are trees in the content-addressed store (#365, store/), and older ones blobs (objects/).
 sealed_only() {
   local f n=0
   while IFS= read -r f; do
-    case "$f" in "$WICKET_HOME/objects/sealed/"*) ;; *) return 1 ;; esac
+    case "$f" in "$WICKET_HOME/objects/sealed/"* | "$WICKET_HOME/store/sealed/"*) ;; *) return 1 ;; esac
     [ "$(head -c 4 "$f")" = WKS1 ] || return 1
     n=$((n + 1))
-  done < <(find "$WICKET_HOME/objects" -type f ! -name '.tmp-*')
+  done < <(find "$WICKET_HOME/objects" "$WICKET_HOME/store" -type f ! -name '.tmp-*' 2>/dev/null)
   [ "$n" -gt 0 ]
 }
 check "the agents' state is sealed at rest (every object encrypted)" sealed_only

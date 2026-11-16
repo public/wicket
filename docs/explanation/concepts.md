@@ -224,10 +224,23 @@ On a served node, each box's authority is a **Biscuit token**:
   box).
 
 A Biscuit block can only add checks, so a token can only narrow. Revoking a block's id revokes every
-token that contains it. The library also builds spawn blocks, which narrow a parent's token for its
-children so that revoking a parent's block revokes the whole subtree. In 0.0.1 that is tested at library
-level only: a child run on a node gets its own block 0 from its zone, which `spawn` has already checked
-is a subset of its parent's. wicket checks tokens with a vendored, patched `biscuit-auth` (see
+token that contains it.
+
+A child's token is built one of two ways, depending on who decides its spawn:
+
+- **On the parent's node** (#164): a spawn within the parent's authority, placed on the same node, is
+  decided there from the parent's token. The child's token is the parent's base token plus a
+  **spawn block** with the child's ceiling (`Replica::derive_child`), so it is never wider or longer-lived
+  than the parent's, and revoking any of the parent's blocks revokes it too. The node reports the child;
+  the control host checks it again (`subset::check`, the org policy, slots) and adopts it as a run of its
+  own, from then on with its own block 0.
+- **On the control host**: everything else (a placement elsewhere, a zone beyond the parent's that an
+  operator approves, a parent whose authority was renewed, an org policy that decides differently a
+  level down, an ACP agent's children). The control host runs `subset::check` and mints the child a
+  fresh **block 0** from its zone, as for any run. Revoking the parent's block doesn't by itself revoke
+  that child; revoking the parent's run does.
+
+wicket checks tokens with a vendored, patched `biscuit-auth` (see
 [limits](limits.md#authority-and-the-biscuit-fork)). It runs a structural check before loading, and uses a step budget instead of a wall-clock
 limit, so a decision doesn't depend on load.
 
@@ -301,9 +314,10 @@ harness session, and a **generation** number. Each run is one activation of it.
   it on a turn boundary (#249): the agent's harness decides, and the run ends when it exits, at its
   timeout, or when its authority ends. The agent ends its harness session with wicket's `finish` tool.
 - **Active → Hibernated:** when the agent asks (`hibernate` tool) or on `wicket hibernate`, at the end
-  of its turn, if the box is at a quiet point (nothing else running). The box stops, and its whole writable state is bundled into
+  of its turn. Anything else still running in the box (a build, a dev server) gets the zone's
+  `limits.exit_grace` to end, then is stopped (#293). The box stops, and its whole writable state is bundled into
   wicket's object store: the workspace, `$HOME` and the agent's config, `/tmp`, and `persist: durable`
-  volumes.
+  volumes. Files only: no process or memory survives hibernation.
 - **Wake:** `wicket wake`, opening its session (`wicket session`, or a prompt in the console), or a message from another agent rebuilds the box with a new
   identity, restores the state, and resumes the harness session at the same path.
 
@@ -327,6 +341,7 @@ what is left, and a spent agent isn't woken.
 ## Designed, not built
 
 These are in [design.md](design.md) but not built: provider adapters and adapter-generated MCP tools,
-platform (multi-tenant) mode, other harnesses (Codex, pi), microVM isolation, memory promotion and
-garbage collection. Labels and handles, service zones, crews, mandates, Kubernetes placement, other
+platform (multi-tenant) mode, other harnesses (Codex, pi), microVM isolation, memory restore on wake
+(gVisor checkpoint, [#365](https://github.com/public/wicket/issues/365)), warm boxes, memory promotion
+and garbage collection. Labels and handles, service zones, crews, mandates, Kubernetes placement, other
 clouds and the LLM manifest proposer are [deferred](design.md#22-deferred).
