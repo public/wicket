@@ -1876,7 +1876,7 @@ mod tests {
         let (status, body) = post(llm.clone(), "relogin").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(*seen.lock().unwrap(), ["tok-old", "tok-new"], "one retry, with the new token");
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one call for the budget");
+        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one call for the budget");
         let ops = llm_ops(&llm, 2).await;
         assert!(ops.iter().any(|o| o.contains("\"status\":401") && o.contains("retrying once with its new value")), "{ops:?}");
         assert!(ops.iter().any(|o| o.contains("\"status\":200") && o.contains("retried once after a 401")), "{ops:?}");
