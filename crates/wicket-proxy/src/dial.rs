@@ -146,10 +146,10 @@ mod tests {
     async fn the_nodes_own_addresses_are_refused() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let fixed = HashMap::from([
-            ("node.example".to_string(), vec![ip("8.8.8.8"), ip("203.0.114.9")]),
-            ("public.example".to_string(), vec![ip("8.8.4.4")]),
+            ("node.example".to_string(), vec![ip("8.8.8.8"), ip("1.1.1.1")]),
+            ("public.example".to_string(), vec![ip("8.8.8.8")]),
         ]);
-        let l = Lookup { fixed: Arc::new(fixed), own: Some(Arc::new(vec![ip("203.0.114.9"), ip("2001:4860::9")])) };
+        let l = Lookup { fixed: Arc::new(fixed), own: Some(Arc::new(vec![ip("1.1.1.1"), ip("2001:4860::9")])) };
         let e = resolve_public(&l, "node.example", 443).await.unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         assert!(e.to_string().contains("an address of this node itself"), "{e}");
@@ -164,6 +164,6 @@ mod tests {
         for a in ["168.63.129.16", "169.254.169.254", "fd00:ec2::254", "100.100.100.200", "192.0.0.192"] {
             assert!(!wicket_core::is_public_ip(&a.parse().unwrap()), "{a}");
         }
-        assert!(wicket_core::is_public_ip(&"168.63.129.17".parse().unwrap()));
+        assert!(wicket_core::is_public_ip(&"1.1.1.1".parse().unwrap()), "a public address stays public");
     }
 }
