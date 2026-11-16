@@ -2,6 +2,7 @@
 //! adapter ([`crate::harness`]), or as the installation's defaults.
 
 pub mod control;
+pub mod view;
 
 /// The agent image's repository, built from `images/claude-code`, and the tag a box gets when
 /// nothing names another.

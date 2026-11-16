@@ -112,6 +112,24 @@ pub enum ControlEvent {
     Answered { what: String, result: Result<(), String> },
 }
 
+/// A harness's stream, as ACP (#364): what the console's session view shows of a run whose harness
+/// doesn't speak ACP itself. Fed both sides of the raw conversation as they were kept, it returns
+/// the JSON-RPC messages an ACP agent and wicket's ACP client would have exchanged. No I/O.
+pub trait SessionView: Send {
+    /// One line of the harness's stdout: what an ACP agent would have written.
+    fn agent(&mut self, line: &str) -> Vec<Value>;
+    /// One message wicket wrote to the harness's stdin: what wicket's ACP client would have written.
+    fn wicket(&mut self, msg: &Value) -> Vec<Value>;
+}
+
+/// The session view for a run whose `acp-client.jsonl` names `format` ([`Adapter::session_view`]).
+pub fn session_view(format: &str) -> Option<Box<dyn SessionView>> {
+    match format {
+        claude::view::FORMAT => Some(Box::new(claude::view::View::default())),
+        _ => None,
+    }
+}
+
 /// A harness's adapter. Every method takes the agent's manifest, so a harness can vary by its own
 /// settings (an ACP agent's profile, say).
 pub trait Adapter: Send + Sync {
@@ -154,6 +172,12 @@ pub trait Adapter: Send + Sync {
     /// The driven session's control channel (#363), for [`Mode::Driven`] and [`Mode::DrivenRemote`].
     /// None (the default): wicket only writes turns, and nothing can be interrupted.
     fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
+        None
+    }
+
+    /// The [`session_view`] format a run of this harness keeps its conversation for, if it doesn't
+    /// speak ACP itself (an ACP agent's is shown as it is).
+    fn session_view(&self, _m: &Manifest) -> Option<&'static str> {
         None
     }
 
@@ -412,6 +436,10 @@ impl Adapter for ClaudeCode {
 
     fn controller(&self, _m: &Manifest) -> Option<Box<dyn Controller>> {
         Some(Box::new(claude::control::Control::default()))
+    }
+
+    fn session_view(&self, _m: &Manifest) -> Option<&'static str> {
+        Some(claude::view::FORMAT)
     }
 
     fn remote_permission_mode(&self, mode: RemotePermissionMode) -> Result<Option<&'static str>, String> {
