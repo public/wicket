@@ -711,6 +711,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #361: what would upgrade, re-route or re-frame a request at the next hop never goes upstream:
+    /// WebSocket and h2c upgrades, hop-by-hop headers, proxy headers, and the box's own Host (the
+    /// upstream's is wicket's, from the URL).
+    #[tokio::test]
+    async fn upgrade_hop_by_hop_and_proxy_headers_never_go_upstream() {
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "hops");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+        let mut b = http::Request::post("/x").header("accept", "*/*");
+        for (k, v) in [
+            ("host", "evil.test"),
+            ("connection", "Upgrade, HTTP2-Settings, keep-alive"),
+            ("upgrade", "websocket, h2c"),
+            ("http2-settings", "AAMAAABkAARAAAAAAAIAAAAA"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-protocol", "chat"),
+            ("keep-alive", "timeout=5"),
+            ("te", "trailers"),
+            ("trailer", "x-smuggled"),
+            ("proxy-authorization", "Basic eDp5"),
+            ("proxy-connection", "keep-alive"),
+            ("x-forwarded-proto", "http"),
+            ("x-real-ip", "127.0.0.1"),
+            ("via", "1.1 evil"),
+            ("expect", "100-continue"),
+        ] {
+            b = b.header(k, v);
+        }
+        let out = e
+            .prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), "api.github.com", "https", "/x", true)
+            .await
+            .unwrap();
+        let names: Vec<&str> = out.headers.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["accept"], "{names:?}");
+        assert_eq!(out.url, "https://api.github.com/x");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #361: a body over the limits is refused before anything goes upstream: one read whole (an
+    /// HTTP/3 request's, which may be re-sent over HTTP/2) past [`super::MAX_REQUEST_BODY`], and a
+    /// streamed one that declares more than [`super::MAX_STREAMED_BODY`], refused without reading it.
+    #[tokio::test]
+    async fn oversized_bodies_are_refused_before_they_go_upstream() {
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "big");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+        // Over HTTP/3, in pieces and with no length, as a QUIC stream delivers it.
+        let piece = bytes::Bytes::from(vec![b'a'; 1 << 20]);
+        let n = super::MAX_REQUEST_BODY / piece.len() + 1;
+        let frames =
+            futures_util::stream::iter((0..n).map(move |_| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(piece.clone()))));
+        let req = http::Request::post("/upload").body(http_body_util::StreamBody::new(frames)).unwrap();
+        let err = e.forward(req, "api.github.com", "https", "/upload", super::Via::H3).await.err().expect("refused");
+        assert!(format!("{err:#}").contains("length limit exceeded"), "{err:#}");
+        // Streamed, declaring more than the limit: refused on the declaration alone.
+        let declared = (super::MAX_STREAMED_BODY + 1).to_string();
+        let req =
+            http::Request::post("/upload").header("content-length", declared).body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+        let err = e.prepare(req, "api.github.com", "https", "/upload", true).await.err().expect("refused");
+        assert!(format!("{err:#}").contains("request body (the limit is"), "{err:#}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// #112: a wrapped session's model calls, which come through the egress proxy, get the model
     /// proxy's budget and body checks there: never forwarded once the budget is spent, nor as a
     /// batch or an encoded body.

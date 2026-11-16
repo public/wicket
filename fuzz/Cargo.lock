@@ -3428,6 +3428,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "ulid",
+ "url",
  "wicket-agent",
  "wicket-authz",
  "wicket-core",

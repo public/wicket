@@ -3,6 +3,7 @@
 //! corpora and every past finding (`regressions/<target>/`) through the same functions on stable.
 #![allow(clippy::new_without_default)]
 
+pub mod canon;
 pub mod egress;
 pub mod feed;
 pub mod gateway;
