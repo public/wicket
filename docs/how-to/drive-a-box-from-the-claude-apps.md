@@ -129,10 +129,14 @@ How it works, and what differs from a Remote Control session:
   `api.anthropic.com` with a claude.ai login: so the model calls go there through the egress proxy
   (with `zone.llm`'s budget and accounting), not to wicket's model proxy with an inference token.
 - **Permission mode.** `agent.remote.permission_mode` defaults to `bypassPermissions`, as in any
-  driven box. In `claude -p`, an action that needs approval is asked of its stdin host (wicket), not
-  the app, and wicket answers no such prompt, so `default` is refused; `acceptEdits`, `auto`,
-  `dontAsk` and `plan` are passed to `--permission-mode`. wicket's proxies decide what the box can
-  reach whatever the mode.
+  driven box; any mode is passed to `--permission-mode`. In `claude -p`, an action that needs
+  approval is asked of its stdin host (wicket), not the app (#363). wicket refuses at once a write to
+  a control file (`.claude`, `.git/hooks`, CI workflows and the like), a mode change and a question;
+  anything else becomes a request, `TOOL wicket.internal /tools/<tool>/<digest>`, decided like any
+  other (`wicket approve`, `wicket deny`, the console), while the session waits. A prefix approval
+  (`--prefix /tools/Bash/`) lets one tool run for the grant's life. `wicket session RUN` takes
+  `/mode MODE` to change the mode while the session runs, and `/stop` to interrupt its turn.
+  wicket's proxies decide what the box can reach whatever the mode.
 - **Hibernation.** It hibernates and wakes as a driven agent: a wake resumes the same conversation
   and turns Remote Control on again, which registers a new session in the app (with a new address,
   printed and recorded as before).

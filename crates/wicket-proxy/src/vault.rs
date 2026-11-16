@@ -42,6 +42,13 @@ pub trait SecretSource: Send + Sync {
     fn fetch<'a>(&'a self, _name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
+    /// Reads `name` again from where it comes from, even if held: the upstream refused the value
+    /// held (#360), so a node asks its control host for the current one. By default, as [`fetch`].
+    ///
+    /// [`fetch`]: SecretSource::fetch
+    fn refetch<'a>(&'a self, name: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        self.fetch(name)
+    }
 }
 
 impl Vault {
@@ -55,6 +62,16 @@ impl Vault {
         match &self.source {
             Some(s) if !s.has(name) => s.fetch(name).await,
             _ => Ok(()),
+        }
+    }
+
+    /// Re-reads `name` from its source after an upstream refused the value read (#360): a node's
+    /// cache asks the control host for the current value. A directory vault reads its files (and a
+    /// link's file) at every use, so it has nothing to do.
+    pub async fn refetch(&self, name: &str) -> Result<()> {
+        match &self.source {
+            Some(s) => s.refetch(name).await,
+            None => Ok(()),
         }
     }
 
