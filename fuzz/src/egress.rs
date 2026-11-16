@@ -100,9 +100,9 @@ async fn origins(log: Arc<Mutex<Vec<Seen>>>) -> (SocketAddr, SocketAddr, String)
     let ca_key = rcgen::KeyPair::generate().expect("key");
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca = ca_params.self_signed(&ca_key).expect("CA");
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("CA");
     let leaf_key = rcgen::KeyPair::generate().expect("key");
-    let leaf = rcgen::CertificateParams::new(vec![TLS_HOST.to_string()]).expect("params").signed_by(&leaf_key, &ca, &ca_key).expect("leaf");
+    let leaf = rcgen::CertificateParams::new(vec![TLS_HOST.to_string()]).expect("params").signed_by(&leaf_key, &ca).expect("leaf");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

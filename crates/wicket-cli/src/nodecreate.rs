@@ -849,7 +849,7 @@ mod tests {
     }
 
     fn ledger_path(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("wicket-place-{tag}-{}", ulid::Ulid::new()));
+        let d = std::env::temp_dir().join(format!("wicket-place-{tag}-{}", wicket_core::new_ulid()));
         std::fs::create_dir_all(&d).unwrap();
         d.join("ledger.db")
     }

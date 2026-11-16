@@ -375,7 +375,7 @@ mod tests {
         pub struct Dir(pub std::path::PathBuf);
         impl Dir {
             pub fn new() -> Dir {
-                let p = std::env::temp_dir().join(format!("wicket-oci-test-{}-{}", std::process::id(), ulid::Ulid::new()));
+                let p = std::env::temp_dir().join(format!("wicket-oci-test-{}-{}", std::process::id(), wicket_core::new_ulid()));
                 std::fs::create_dir_all(&p).unwrap();
                 Dir(p)
             }

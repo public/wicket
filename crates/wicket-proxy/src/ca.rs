@@ -3,8 +3,8 @@
 
 use anyhow::{bail, Context, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree, IsCa, KeyPair,
-    KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints, PublicKeyData,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -14,8 +14,11 @@ use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
 pub struct RunCa {
-    cert: Certificate,
-    key: KeyPair,
+    /// What signs leaves: the certificate's subject and key identifier, and its key.
+    issuer: Issuer<'static, KeyPair>,
+    /// The certificate as issued (what the box trusts), and its PEM.
+    der: CertificateDer<'static>,
+    pem: String,
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
 
@@ -33,25 +36,27 @@ impl RunCa {
         params.not_after = now + Duration::days(2);
         let key = KeyPair::generate()?;
         let cert = params.self_signed(&key)?;
-        Ok(RunCa { cert, key, leaves: Mutex::new(HashMap::new()) })
+        let (der, pem) = (cert.der().clone(), cert.pem());
+        Ok(RunCa { issuer: Issuer::new(params, key), der, pem, leaves: Mutex::new(HashMap::new()) })
     }
 
     pub fn cert_pem(&self) -> String {
-        self.cert.pem()
+        self.pem.clone()
     }
 
     /// The CA's private key (PEM), for a supervisor that re-attaches to the run (#151): kept beside
     /// the run's other control-host files, never where the box can read it.
     pub fn key_pem(&self) -> String {
-        self.key.serialize_pem()
+        self.issuer.key().serialize_pem()
     }
 
     /// The run CA again from its certificate and key: leaves it signs verify against the certificate
     /// the box already trusts.
     pub fn load(cert_pem: &str, key_pem: &str) -> Result<RunCa> {
         let key = KeyPair::from_pem(key_pem).context("run CA key")?;
-        let cert = CertificateParams::from_ca_cert_pem(cert_pem).context("run CA certificate")?.self_signed(&key)?;
-        Ok(RunCa { cert, key, leaves: Mutex::new(HashMap::new()) })
+        let der = pem_der(cert_pem).context("run CA certificate")?;
+        let issuer = Issuer::from_ca_cert_der(&der, key).context("run CA certificate")?;
+        Ok(RunCa { issuer, der, pem: cert_pem.to_string(), leaves: Mutex::new(HashMap::new()) })
     }
 
     /// A TLS server config presenting a leaf certificate for `host`, signed by this CA (cached).
@@ -59,8 +64,7 @@ impl RunCa {
         if let Some(c) = self.leaves.lock().expect("lock").get(host) {
             return Ok(c.clone());
         }
-        let der = CertificateDer::from(self.cert.der().to_vec());
-        let cfg = leaf_config(host, &self.cert, &self.key, &der, OffsetDateTime::now_utc() + Duration::days(1))?;
+        let cfg = leaf_config(host, &self.issuer, &self.der, OffsetDateTime::now_utc() + Duration::days(1))?;
         self.leaves.lock().expect("lock").insert(host.to_string(), cfg.clone());
         Ok(cfg)
     }
@@ -80,8 +84,7 @@ impl Minter for RunCa {
 /// A leaf for `host` signed by `issuer`; the chain presented is [leaf, issuer as issued (`issuer_der`)].
 fn leaf_config(
     host: &str,
-    issuer: &Certificate,
-    issuer_key: &KeyPair,
+    issuer: &Issuer<'_, KeyPair>,
     issuer_der: &CertificateDer<'static>,
     not_after: OffsetDateTime,
 ) -> Result<Arc<ServerConfig>> {
@@ -93,7 +96,7 @@ fn leaf_config(
     params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
     params.not_after = not_after;
     let leaf_key = KeyPair::generate()?;
-    let leaf = params.signed_by(&leaf_key, issuer, issuer_key)?;
+    let leaf = params.signed_by(&leaf_key, issuer)?;
     let chain = vec![CertificateDer::from(leaf.der().to_vec()), issuer_der.clone()];
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -113,11 +116,10 @@ fn leaf_config(
 /// else to the control host. Leaves are presented with the node CA after them, so a box that trusts
 /// the installation root verifies them.
 pub struct NodeCa {
-    /// The node CA as an rcgen issuer: rebuilt from the certificate's parameters and the node's key.
-    issuer: Certificate,
+    /// The node CA as an rcgen issuer: the certificate's subject and key identifier, and the node's key.
+    issuer: Issuer<'static, KeyPair>,
     /// The certificate as issued (what the box's verifier sees).
     der: CertificateDer<'static>,
-    key: KeyPair,
     pub not_after: i64,
     /// Permitted DNS subtrees, from the certificate's name constraints.
     pub permitted: Vec<String>,
@@ -138,7 +140,7 @@ impl NodeCa {
     fn load_with(cert_pem: &str, key_pem: &str, any: bool) -> Result<NodeCa> {
         use x509_parser::extensions::{GeneralName, ParsedExtension};
         let key = KeyPair::from_pem(key_pem).context("node CA key")?;
-        if key.public_key_der() != spki_of(cert_pem)? {
+        if key.subject_public_key_info() != spki_of(cert_pem)? {
             bail!("the node CA certificate is not for the node CA key");
         }
         let (_, p) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).map_err(|e| anyhow::anyhow!("node CA PEM: {e}"))?;
@@ -161,8 +163,9 @@ impl NodeCa {
             bail!("the node CA has no DNS name constraints: refusing to use it");
         }
         let not_after = cert.validity().not_after.timestamp();
-        let issuer = CertificateParams::from_ca_cert_pem(cert_pem).context("node CA certificate")?.self_signed(&key)?;
-        Ok(NodeCa { issuer, der: CertificateDer::from(der), key, not_after, permitted, leaves: Mutex::new(HashMap::new()) })
+        let der = CertificateDer::from(der);
+        let issuer = Issuer::from_ca_cert_der(&der, key).context("node CA certificate")?;
+        Ok(NodeCa { issuer, der, not_after, permitted, leaves: Mutex::new(HashMap::new()) })
     }
 
     /// Whether the CA may mint for `host` at `now` (Unix seconds).
@@ -183,7 +186,7 @@ impl Minter for NodeCa {
         // A leaf never outlives its CA; cached leaves are dropped with the process (the CA is renewed
         // daily, and `node serve` reloads it).
         let not_after = (OffsetDateTime::now_utc() + Duration::days(1)).min(OffsetDateTime::from_unix_timestamp(self.not_after)?);
-        let cfg = leaf_config(host, &self.issuer, &self.key, &self.der, not_after)?;
+        let cfg = leaf_config(host, &self.issuer, &self.der, not_after)?;
         self.leaves.lock().expect("lock").insert(host.to_string(), cfg.clone());
         Ok(cfg)
     }
@@ -198,9 +201,11 @@ impl Minter for NodeCa {
 /// - Local runs use a per-run [`RunCa`]. Boxes on enrolled nodes trust this root (for leaves their
 ///   node's [`NodeCa`] mints) and their run's own [`RunCa`] (for hosts the control host terminates).
 pub struct InstallationCa {
-    cert: Certificate,
+    /// What signs node intermediates: the root's subject and key identifier, and its key.
+    issuer: Issuer<'static, KeyPair>,
+    /// The root as issued, and its PEM (the file on disk).
+    der: CertificateDer<'static>,
     pem: String,
-    key: KeyPair,
 }
 
 /// A node intermediate CA certificate as issued, with what the ledger records about it.
@@ -235,8 +240,8 @@ impl InstallationCa {
         params.not_after = now + Duration::days(3650);
         let key = KeyPair::generate()?;
         let cert = params.self_signed(&key)?;
-        let pem = cert.pem();
-        Ok(InstallationCa { cert, pem, key })
+        let (der, pem) = (cert.der().clone(), cert.pem());
+        Ok(InstallationCa { issuer: Issuer::new(params, key), der, pem })
     }
 
     /// Loads the installation CA from `key_path` (PEM, 0600) and its certificate from
@@ -249,14 +254,14 @@ impl InstallationCa {
             Ok(key_pem) => {
                 let key = KeyPair::from_pem(&key_pem).context("installation CA key")?;
                 let pem = std::fs::read_to_string(&cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
-                // rcgen signs as an issuer from its parameters (subject, key identifier) and key; the
-                // re-signed copy is only that handle, the file on disk stays the certificate.
-                let params = CertificateParams::from_ca_cert_pem(&pem).context("installation CA certificate")?;
-                let cert = params.self_signed(&key)?;
-                if key.public_key_der() != spki_of(&pem)? {
+                if key.subject_public_key_info() != spki_of(&pem)? {
                     bail!("{} does not belong to the key in {}", cert_path.display(), key_path.display());
                 }
-                Ok(InstallationCa { cert, pem, key })
+                // rcgen signs as an issuer from the certificate's subject and key identifier, and the
+                // key; the file on disk stays the certificate.
+                let der = pem_der(&pem).context("installation CA certificate")?;
+                let issuer = Issuer::from_ca_cert_der(&der, key).context("installation CA certificate")?;
+                Ok(InstallationCa { issuer, der, pem })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(d) = key_path.parent() {
@@ -264,7 +269,7 @@ impl InstallationCa {
                 }
                 let ca = InstallationCa::generate()?;
                 let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(key_path)?;
-                f.write_all(ca.key.serialize_pem().as_bytes())?;
+                f.write_all(ca.issuer.key().serialize_pem().as_bytes())?;
                 std::fs::write(&cert_path, &ca.pem)?;
                 Ok(ca)
             }
@@ -277,7 +282,7 @@ impl InstallationCa {
     }
 
     pub fn cert_der(&self) -> CertificateDer<'static> {
-        CertificateDer::from(self.cert.der().to_vec())
+        self.der.clone()
     }
 
     /// Issues a node's intermediate CA from its certificate signing request.
@@ -319,9 +324,15 @@ impl InstallationCa {
         params.not_before = now - Duration::minutes(5);
         params.not_after = now + ttl;
         let (nb, na) = (params.not_before.unix_timestamp(), params.not_after.unix_timestamp());
-        let cert = params.signed_by(&csr.public_key, &self.cert, &self.key)?;
+        let cert = params.signed_by(&csr.public_key, &self.issuer)?;
         Ok(NodeCaCert { pem: cert.pem(), der: cert.der().to_vec(), serial: hex::encode(serial), not_before: nb, not_after: na, permitted })
     }
+}
+
+/// The certificate in `pem`, as DER.
+fn pem_der(pem: &str) -> Result<CertificateDer<'static>> {
+    let (_, p) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).map_err(|e| anyhow::anyhow!("certificate PEM: {e}"))?;
+    Ok(CertificateDer::from(p.contents))
 }
 
 /// The SubjectPublicKeyInfo (DER) of the certificate in `pem`.
@@ -397,11 +408,11 @@ mod tests {
 
     /// A leaf for `san` (a host name or an IP literal) minted by the node CA, as a stolen node CA could.
     fn leaf(node_key: &KeyPair, node: &NodeCaCert, san: &str) -> CertificateDer<'static> {
-        let issuer = CertificateParams::from_ca_cert_der(&CertificateDer::from(node.der.clone())).unwrap().self_signed(node_key).unwrap();
+        let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(node.der.clone()), node_key).unwrap();
         let mut p = CertificateParams::new(vec![san.to_string()]).unwrap();
         p.distinguished_name.push(DnType::CommonName, san);
         let k = KeyPair::generate().unwrap();
-        CertificateDer::from(p.signed_by(&k, &issuer, node_key).unwrap().der().to_vec())
+        CertificateDer::from(p.signed_by(&k, &issuer).unwrap().der().to_vec())
     }
 
     /// What a box's TLS client does: verify the chain against wicket's root only.

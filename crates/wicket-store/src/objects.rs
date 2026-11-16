@@ -132,7 +132,7 @@ impl ObjectStore for DirStore {
         }
         let dir = dest.parent().expect("a key has a parent");
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), ulid::Ulid::new()));
+        let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), wicket_core::new_ulid()));
         let res = (|| {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             io::copy(data, &mut f)?;

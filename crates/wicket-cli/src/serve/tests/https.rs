@@ -264,7 +264,7 @@ struct MockCa {
     state: Arc<Mutex<CaState>>,
     domain: String,
     target: SocketAddr,
-    issuer: Arc<(rcgen::Certificate, rcgen::KeyPair)>,
+    issuer: Arc<rcgen::CertifiedIssuer<'static, rcgen::KeyPair>>,
 }
 
 fn b64(v: &Value, k: &str) -> Vec<u8> {
@@ -351,9 +351,9 @@ impl MockCa {
             "/finalize/1" => {
                 let csr = b64(&payload, "csr");
                 let params = rcgen::CertificateSigningRequestParams::from_der(&csr.into()).unwrap();
-                let cert = params.signed_by(&self.issuer.0, &self.issuer.1).unwrap();
+                let cert = params.signed_by(&self.issuer).unwrap();
                 let mut s = self.state.lock().unwrap();
-                s.chain = Some(format!("{}{}", cert.pem(), self.issuer.0.pem()));
+                s.chain = Some(format!("{}{}", cert.pem(), self.issuer.pem()));
                 (StatusCode::OK, headers, order(&s).to_string())
             }
             "/cert/1" => {
@@ -384,13 +384,12 @@ impl HttpClient for MockCa {
     }
 }
 
-fn issuer() -> Arc<(rcgen::Certificate, rcgen::KeyPair)> {
+fn issuer() -> Arc<rcgen::CertifiedIssuer<'static, rcgen::KeyPair>> {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     p.distinguished_name.push(rcgen::DnType::CommonName, "mock ACME CA");
-    let cert = p.self_signed(&key).unwrap();
-    Arc::new((cert, key))
+    Arc::new(rcgen::CertifiedIssuer::self_signed(p, key).unwrap())
 }
 
 #[tokio::test]
