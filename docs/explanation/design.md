@@ -75,7 +75,7 @@ Things the brief assumed or left open, and what we now know (2026-11-08):
 | Two enforcement surfaces (MCP gateway, egress proxy) | **Three.** The model API is its own surface: an **LLM proxy** (via `ANTHROPIC_BASE_URL`) holds the model key, is the best liveness sensor, and is a taint ingress (Claude's WebSearch runs server-side and is invisible to the egress proxy). [01 §4.5–4.6] |
 | microVMs for speed and lightness | This box (Vultr VC2) has **no KVM**. v1 Linux tiers are a native process jail and gVisor (which also gives checkpoint/restore for parking). Firecracker comes later on bare metal. [02 §1, §10] |
 | Typed escalation à la RFC 9396 | Kept. MCP's own spec now says single-use must be enforced server-side, so use counts and approvals live in a **ledger**, not in tokens. [03 §2.6] |
-| Macaroon/Biscuit attenuation | Adopted: zone ceilings, grants and leases are Biscuit tokens, checked on the node by a vendored, patched `biscuit-auth` (§2.1). The syntactic subset check (`wicket_core::subset`) is kept only to refuse over-wide asks and explain them; it decides nothing (§4.1). [03 §7.2] |
+| Macaroon/Biscuit attenuation | Adopted: zone ceilings, grants and leases are Biscuit tokens, checked on the node by a vendored, patched `biscuit-auth` (§2.1). The syntactic subset check (`wicket_core::subset`) refuses over-wide asks and explains them. For a spawn its node decides, the child's token is the parent's plus a spawn block, so the token narrows it whatever the check said; for a spawn the control host decides, the child gets a fresh block 0 from its own zone, and the check is what keeps it within the parent's (§4.1, §9.2.1). [03 §7.2] |
 | Claude-style Remote Control and wicket's own UI side by side (owner, 2026-11-08) | Remote Control needs a claude.ai subscription login and Anthropic's own base URL, and its control protocol runs through Anthropic's session service (`--sdk-url`, Anthropic hosts only). So it can't share wicket's default launch. It becomes an opt-in `vendor_rc` zone mode: the RC bridge stays on the host, and its sessions are jailed via `CLAUDE_CODE_PROCESS_WRAPPER`. An observe-only tap at the egress proxy feeds wicket's console, and RC answers are never wicket grants. [09] |
 | Claude Code is the only inner agent that matters | **Codex app-server and pi are T1 too**: native control protocols with host-answered approvals, steering and typed output. pi has no permission layer by design ("the sandbox is your job"). Codex has its own Remote Control. [11] |
 | Hash-pin tool descriptions; label per agent | Tool descriptions poisoned from the start defeat pinning, and the highest-success real attacks tamper with *values inside* allowed calls (MCPTox, MSB). So descriptions are taint, sink arguments need provenance on every R2+ `Op`, and handles can be passed as arguments. [05, 06] |
@@ -551,7 +551,9 @@ agent's own; a human with that much access can approve an extension). Built:
 - **`spawn` starts an agent (task) or a program (command, possibly a long-running service)** in a zone the
   caller writes. `spawn_agent` is a narrowing of `spawn` (#255).
 - **`wicket_core::subset` proves the zone is within the caller's,** conservatively; anything it can't prove
-  is a violation, and every violation is listed. It checks:
+  is a violation, and every violation is listed. On the control host a spawn that passes gets a fresh
+  block 0 from the child's zone; on the parent's node a spawn within its authority gets the parent's
+  token plus a spawn block instead (§9.2.1). It checks:
   - reach: host, method and path, each covered by a parent rule;
   - credential injections: only the parent's own;
   - model budget: at most what's left, and then carved out of the parent's;
@@ -819,7 +821,7 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
 | Order | Backend | Notes |
 |---|---|---|
 | 1 | **`process`** (Linux) | `wicket-jail`: user/mount/pid/ipc/uts/net namespaces, per-box UID, overlay rootfs, cgroup v2 limits and freeze. **Network: Codex's listener-fd handoff.** The jail binds `127.0.0.1:0` inside an interface-less netns and passes the listening fd to wicketd by `SCM_RIGHTS`. That listener *is* the box's identity: no socket file, no in-box forwarder, and seccomp denies every new `AF_UNIX`/`AF_VSOCK`/`AF_NETLINK`/`AF_PACKET` socket and `io_uring`. **The mount view is locked:** mounts are built fd-relatively; then all caps and the bounding set are dropped, `max_user_namespaces=1` is set, and the agent runs in a nested userns. srt's namespace-escape seccomp rules are a second layer (`clone3`→ENOSYS). Landlock must report `FullyEnforced`. [07 a.2-1,2] |
-| 2 | **`gvisor`** | `runsc --platform=systrap --network=none --host-uds=open` with a bind-mounted UDS and an in-box forwarder: gVisor sockets aren't host fds, so the fd handoff doesn't apply. Needs no KVM. **Checkpoint/restore for parking.** The default floor on VPSes. |
+| 2 | **`gvisor`** | `runsc --platform=systrap --network=none --host-uds=open` with a bind-mounted UDS and an in-box forwarder: gVisor sockets aren't host fds, so the fd handoff doesn't apply. Needs no KVM. **Checkpoint/restore for parking** (designed, not built: #365). The default floor on VPSes. |
 | 3 | **`seatbelt`** (macOS) | Generated SBPL from Codex's base policy. Developer machines. |
 | 4 | **`firecracker`** | KVM hosts. Official jailer, vsock-only networking (`<uds>_<port>`), ext4 workdir image + `wicket-guest` PID-1 shim, diff snapshots with UFFD restore, VMGenID. libkrun has no snapshot on Linux, so it parks by freeze only. |
 | 5 | **`e2b`** | **E2B Cloud/BYOC only:** bring-your-own-proxy and MITM exist only there, while the open-source runtime ships a no-op egress hook. Its direct DNS is a **bidirectional C2 channel**, not a small leak, so the zone view shows it as such and valuable zones can't use it. |
@@ -864,7 +866,9 @@ stays so up to any push or merge, because code is delayed execution. Its *summar
 (files touched, test result) crosses gates as typed fields. After an approved file escalation, a later
 `Instance::grant_fd` can inject the opened file via `SECCOMP_IOCTL_NOTIF_ADDFD` without a restart (nono).
 
-**Parking** follows sandstorm's tier ladder [07 a.2-7]:
+**Parking** follows sandstorm's tier ladder [07 a.2-7]. Built: an idle long-lived box is paused
+(`docker pause`, the freezer), and hibernation rebuilds from files (§13.2). Steps 3 and 4, the checkpoint
+and a detached upper layer, aren't built (#365):
 1. Snapshots drop open connections on every substrate. So first the gateway answers *pending* and the
    agent goes quiet (watched via the LLM proxy; Codex replays pending approvals on reconnect).
 2. Freeze: `cgroup.freeze`, confirmed via `cgroup.events`, about 10 ms.
@@ -1266,7 +1270,10 @@ What a node still sends the control host, and why:
 | `Spent`, `Event`, `Audit`, `Started`, `Exited`, `FeedStatus` | records, after the fact |
 
 ### 9.3 LLM proxy (`wicket-llm`)
-- Holds the model credential (the owner's Claude subscription token, never an API key) and routes per zone (model allowlist, token and cost budget).
+- Holds the model credential (the owner's Claude subscription token, never an API key) and routes per
+  zone, with a budget of requests and tokens (`max_requests`, `max_output_tokens`, `max_input_tokens`).
+  It has no money budget: the only money limits are placement's envelope and capacity grants (§8.5). A
+  per-zone model allowlist is #366.
 - Wire APIs: Anthropic Messages, OpenAI Responses, Google, Chat (§6). `codex responses-api-proxy` is
   differential prior art.
 - **Rewrites server-side tool definitions** to the zone's reach, and taints sessions on server-side tool
@@ -1559,15 +1566,16 @@ the design; what is built is the agent row described in §13.5.
   boundary or an idle timer. The agent ends its session with the gateway's `finish` tool, which takes
   effect at the end of its turn.
 - **Hibernation is asked for**, by the agent (`hibernate`) or an operator (`wicket hibernate`). It
-  happens at a quiet point. If something else still runs in the box, the agent goes on running, with
-  the reason recorded.
+  happens at the end of a turn. If something else still runs in the box (a build, a dev server), it gets
+  the zone's `limits.exit_grace` to end, then is stopped and named (#293): a hibernated agent keeps its
+  files, never its processes or memory.
 - **A message wakes a hibernated agent**, so there is no separate wake source to configure. A schedule
   or an event is a message from the principal that set it up (#250).
 - **Lifetimes are one renewable authority grant plus a hard timeout** (#56). A box nobody renews stops
   when its authority ends.
 - **Wake = rebuild**: a fresh box from the base image, the bundle restored, and the agent's own session
   resume (Claude `--resume`). Every wake re-binds identity and bumps the generation (§13.5). Restoring a
-  memory snapshot instead (gVisor checkpoint, #71) is an optimisation.
+  memory snapshot instead (gVisor checkpoint, #71, #365) is designed, not built.
 
 ### 13.3 Authority across a long life
 
@@ -1645,11 +1653,11 @@ gate exists for. A skill is an instruction to every future activation, so it is 
 - The zone's model budget and `limits.timeout` are the agent's over all its activations. Spend is
   recorded on the agent row, and a wake starts from what is left. A spent agent is never woken, so peer
   messages can't buy it a fresh budget.
-- Hibernation by rebuild happens only at a quiet point, checked against the box's process list. Otherwise the
-  agent goes on running, with the reason recorded.
+- Hibernation by rebuild stops what else runs in the box after `limits.exit_grace`, checked against the
+  box's process list, and names it (#293).
 - Not built:
   - per-agent data keys and a signed `StateManifest` (sealing today uses the installation's one state key);
-  - the gVisor checkpoint (H2);
+  - the gVisor checkpoint (H2, #365): a wake restores files, not processes or memory;
   - garbage collection;
   - hibernation for node and wrapped boxes.
 
@@ -1938,7 +1946,11 @@ would amend the agent's in-box policy are never forwarded, and `ChannelCaps` gai
   checkpoints; OTel `gen_ai.*` export [08].
 - **Reference-monitor invariants are tested** (Anderson: complete mediation, tamper-proof, verifiable):
   each is a conformance check, and `wicket-core` is developed verification-guided, with differential random
-  testing against a reference model, as Cedar's team did [06].
+  testing against a reference model, as Cedar's team did [06]. What is proved (Lean, `verification/lean`,
+  #322): `subset::check`, `reach_within`, `grant::within_authority`, `operators::may_decide`,
+  `CompiledZone::evaluate`, and the glob, host and path matchers. The Biscuit evaluator that decides on
+  nodes isn't proved: it is tested differentially (against wicket-core's evaluation, and the fork's
+  compiled evaluator against its own generic engine and unpatched `AuthorizerBuilder` path).
 - v1 is CLI text plus Graphviz/Mermaid export, with a TUI later. The brief's three-engineer test (zone view
   vs raw policy, five blast-radius questions) decides whether the abstraction is right.
 
