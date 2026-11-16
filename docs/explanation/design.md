@@ -561,7 +561,7 @@ agent's own; a human with that much access can approve an extension). Built:
   - `accept_from` and child slots.
 - **Inherited without asking:** the parent's `forbid` rules, `unlisted_hosts: hide`, and defaults no wider
   than the parent's.
-- **With `ask_human`, a wider zone becomes a pending request** bound to the request as the agent stated it.
+- **With `escalate`, a wider zone becomes a pending request** bound to the request as the agent stated it.
   A human approves, and the agent's identical retry starts exactly that zone. It's audited as
   `spawn.beyond_parent`.
 - **Every box gets an identity,** programs included, chained to its creator and the human. Programs report
@@ -782,9 +782,9 @@ Claude Code ships near-daily, so this suite is how adapters stay honest. [01 §4
 
 ---
 
-## 7. Sandboxes
+## 7. Boxes
 
-Detail and trait sketch: [02 §11].
+The backends a box is made with. Detail and trait sketch: [02 §11].
 
 ```rust
 #[async_trait]
@@ -814,7 +814,7 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
   and for every third-party MCP server.
 - `process` is for development, M1, and low-value zones.
 - On production hosts the vault and `wicketd` never share a kernel with process-tier boxes.
-- A sandbox crash is logged as a security event.
+- A box's runtime crashing (a gVisor sandbox, a VMM) is logged as a security event.
 
 | Order | Backend | Notes |
 |---|---|---|
@@ -834,7 +834,7 @@ escape misconfigured containers (SandboxEscapeBench [05]). So:
   don't do this. Never enable libkrun TSI `HIJACK_UNIX`.
 - On Ubuntu, ship an **AppArmor profile granting `userns` to `wicket-jail`** instead of flipping the
   sysctl.
-- **Lessons for `wicket-jail` from a layer-by-layer sandbox write-up** (muhammadraza.me, 2026-11-11, with
+- **Lessons for `wicket-jail` from a layer-by-layer write-up on sandboxing** (muhammadraza.me, 2026-11-11, with
   its attack matrix; see #215):
   - **`umount2(MNT_DETACH)` of the old root after `pivot_root` is load-bearing.** Without it, a path like
     `/..//home/<user>/secret` still reaches the host while the plain path returns ENOENT. A test of only the
@@ -886,17 +886,17 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
 
 **Techniques, in the order they're built:**
 1. **Shared read-only base layers.** One rootfs or image per agent version and MCP server version, cached
-   on the node and mounted read-only. Per-sandbox state is a thin overlay or copy-on-write upper layer.
+   on the node and mounted read-only. Per-box state is a thin overlay or copy-on-write upper layer.
    Lazy image pulling (stargz, SOCI or nydus) for big images on cluster nodes.
-2. **Warm pools, claim-then-bind.** Pristine sandboxes are pre-created with nothing identifying in them.
+2. **Warm pools, claim-then-bind.** Pristine boxes are pre-created with nothing identifying in them.
    On claim, wicket binds the identity: listener fd / socket, per-zone CA, placeholders and
-   mounts. So a pooled sandbox can't carry one task's identity or state into another. [07]
+   mounts. So a pooled box can't carry one task's identity or state into another. [07]
 3. **Snapshot clones.** Boot an MCP server, or an agent up to "ready", once; snapshot it; restore clones
    from that snapshot. Firecracker restores in milliseconds with copy-on-write memory shared across clones,
    and gVisor checkpoint/restore plays the same role without KVM. After restore, reseed RNGs and rotate
    anything identity-bearing. One snapshot is never restored into two different trust contexts without
    reseeding.
-4. **Right-sized enforcement.** The proxies and gateway are per node, not per sandbox, so a sandbox adds a
+4. **Right-sized enforcement.** The proxies and gateway are per node, not per box, so a box adds a
    listener and some ledger rows, not a process. Codemode (Wasm or V8 isolates) serves tool-only zones in
    microseconds to milliseconds.
 5. **Direct launch on the hot path.** A node starts boxes itself, through Docker's Engine API with
@@ -918,7 +918,7 @@ floor**. Isolation is a hard filter; cost and latency are the score, never the o
 
 | Workload | Ready time | Overhead per instance (beyond the workload itself) | Mechanism |
 |---|---|---|---|
-| Agent sandbox | ≤ 300 ms box-ready from the warm pool, ≤ 1 s cold, plus the agent's own start | ≤ 40 MiB | process jail or gVisor, direct launch |
+| Agent box | ≤ 300 ms box-ready from the warm pool, ≤ 1 s cold, plus the agent's own start | ≤ 40 MiB | process jail or gVisor, direct launch |
 | Per-task MCP server | ≤ 250 ms to `tools/list`-ready from a pristine snapshot or unbound warm instance, ≤ 2 s cold | ≤ 30 MiB | gVisor/Firecracker snapshot clone, direct launch |
 | Shared, vetted MCP service | long-lived | pod overhead acceptable | gVisor pod |
 | Codemode call | ≤ 5 ms | ≤ 5 MB | wasmtime pooling allocator, in the gateway |
@@ -1316,13 +1316,13 @@ negotiated them. Connections are never held open while a human decides.
 **Agents must not spin at the edge** (owner, 2026-11-09: the goal is that agents don't spin endlessly
 when they hit isolation limits, and instead ask for more reach when they need it).
 - **Every refusal says which case it is in the status line**, because many tools show nothing else:
-  `Blocked by wicket sandbox: never allowed`, `… needs human approval (r-…)`, `… denied by a human`, or,
-  in hiding zones, `unknown host`. The body says the sandbox has no other route, and what to do.
+  `Blocked by wicket box: never allowed`, `… needs approval (r-…)`, `… denied`, or,
+  in hiding zones, `unknown host`. The body says the box has no other route, and what to do.
 - **Repeats are counted.** From the third block of the same request, the refusal says to stop. After every
   ten blocks in a run, the operator sees "agent may be stuck".
 - **`request_access`** lets the agent ask ahead, once, for a URL or a path prefix, with a reason shown to the
   human as the agent's own claim. It then waits with `await_grant`.
-- **Every agent gets the same sandbox notice:** batch runs and wrapped sessions alike.
+- **Every agent gets the same box notice:** batch runs and wrapped sessions alike.
 
 In a live check, an agent blocked on two hosts waited with `await_grant` and retried each once after
 approval. It didn't probe.

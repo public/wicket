@@ -83,7 +83,7 @@ wicket secret list                                          # names and hosts, n
   `wicket node token --name n1`, `wicket node enrol wicket@host --token … --host-key SHA256:… --hosts
   'api.example.com'`, `wicket node install n1`, then build the agent image there with `wicket image`.
 - **Have wicket create one** on a cloud, inside a money envelope, by hand or for agents that ask
-  with `request_capacity` (leases): [place nodes on Vultr](https://github.com/public/wicket/blob/main/docs/how-to/place-nodes-on-vultr.md).
+  with `request_capacity` (leases), with `wicket node create`: [create nodes on Vultr](https://github.com/public/wicket/blob/main/docs/how-to/create-nodes-on-vultr.md).
   `wicket lease list` and `wicket lease release l-…` manage leases.
 - **Watch**: `wicket top` on the control host; `wicket node top` on the node as its `wicket` user.
 - **Look after**: `wicket node list`, `wicket node renew-ca n1` (a node that was away until its

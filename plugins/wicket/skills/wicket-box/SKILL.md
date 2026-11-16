@@ -1,6 +1,6 @@
 ---
 name: wicket-box
-description: Use when you are an agent running inside a wicket box (your MCP server is wicket, your requests go through wicket.internal, or a request failed with "Blocked by wicket sandbox"). Covers asking for reach, what 403 and 503 answers mean, memory warnings, finish versus hibernate, messages and delegation, where results go, and habits that keep a box from losing work.
+description: Use when you are an agent running inside a wicket box (your MCP server is wicket, your requests go through wicket.internal, or a request failed with "Blocked by wicket box"). Covers asking for reach, what 403 and 503 answers mean, memory warnings, finish versus hibernate, messages and delegation, where results go, and habits that keep a box from losing work.
 ---
 
 # Working inside a wicket box

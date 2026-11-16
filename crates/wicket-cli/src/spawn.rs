@@ -102,7 +102,7 @@ fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
     }
     let hard = subset::unapprovable(&cm.zone, &p.zone);
     if !hard.is_empty() {
-        return Err(format!("it can't be started, with or without a human: {}", hard.join("; ")));
+        return Err(format!("it can't be started, with or without approval: {}", hard.join("; ")));
     }
     if let Some(org) = &c.org {
         let sp = wicket_authz::Ceiling::from_zone(&cm.zone, "child", 0, vec![]).map_err(|e| e.to_string())?.spawn;
@@ -414,7 +414,7 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
     // route or credential is never approvable (#118).
     let hard = subset::unapprovable(&cm.zone, &p.zone);
     if !hard.is_empty() {
-        return Err(format!("this zone can't be started, with or without a human:\n- {}", hard.join("\n- ")));
+        return Err(format!("this zone can't be started, with or without approval:\n- {}", hard.join("\n- ")));
     }
     let bounds = subset::Bounds {
         zone: &p.zone,
@@ -487,20 +487,20 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                     violations.join("\n- ")
                 ));
             }
-            None if !req.ask_human => {
+            None if !req.escalate => {
                 return Err(format!(
-                    "this zone is not within yours:\n- {}\nNarrow it, or call spawn again with ask_human: true to ask a human to approve exactly this zone.",
+                    "this zone is not within yours:\n- {}\nNarrow it, or call spawn again with escalate: true to ask for exactly this zone to be approved.",
                     violations.join("\n- ")
                 ));
             }
             None => {
                 if let Ok(Some(rid)) = l.denied_recently(&op) {
-                    return Err(format!("a human denied exactly this zone ({rid}) a few minutes ago; don't ask again"));
+                    return Err(format!("exactly this zone ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = card(&req.kind, name, &image, &cm, &violations);
                 let (rid, _) = l.pending_for(&op, &reason, None).map_err(|e| e.to_string())?;
                 return Ok(format!(
-                    "needs human approval: request {rid} (this zone exceeds yours: {}). Call await_grant with {rid}; once granted, call spawn again with exactly the same arguments.",
+                    "needs approval: request {rid} (this zone exceeds yours: {}). Call await_grant with {rid}; once granted, call spawn again with exactly the same arguments.",
                     violations.join("; ")
                 ));
             }
@@ -568,7 +568,7 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
         "started {} {name} as run {}{at}: its own box and identity, zone {zone_name}{principal}{}{budget}. {}{handle}",
         req.kind,
         child,
-        if beyond { " (approved by a human beyond your own zone)" } else { ", within your own" },
+        if beyond { " (approved beyond your own zone)" } else { ", within your own" },
         if is_agent {
             "When its turn on the task ends, its report comes to you as a message (kind report, with a receipt; use await_message); continue_child gives it another brief, its context intact. Its final run_finished comes when its run ends."
         } else {
@@ -1002,7 +1002,7 @@ mod tests {
             image: None,
             zone: Some(json!({ "reach": [{ "host": "api.example.com", "methods": ["GET"] }] })),
             max_children: 0,
-            ask_human: false,
+            escalate: false,
             reach_hosts: None,
             placement: None,
         }
@@ -1164,7 +1164,7 @@ mod tests {
         for (esc, needle) in [(json!({ "grant": true, "request": false }), "escalation.grant"), (json!({}), "escalation.request")] {
             let mut req = program("wider");
             req.zone.as_mut().unwrap()["escalation"] = esc;
-            req.ask_human = true;
+            req.escalate = true;
             let e = spawn(&p.ctx, req).unwrap_err();
             assert!(e.contains(needle) && e.contains("escalation.request: false"), "{e}");
         }
@@ -1203,7 +1203,7 @@ mod tests {
             task: Some("work".into()),
             command: vec![],
             zone: Some(z),
-            ask_human: true,
+            escalate: true,
             ..program("x")
         };
         for (z, needle) in [
@@ -1215,7 +1215,7 @@ mod tests {
             ),
         ] {
             let e = spawn(&p.ctx, agent(z)).unwrap_err();
-            assert!(e.contains("can't be started, with or without a human") && e.contains(needle), "{e}");
+            assert!(e.contains("can't be started, with or without approval") && e.contains(needle), "{e}");
         }
         assert!(p.ctx.ledger.lock().unwrap().pending(&wicket_core::TenantId::single()).unwrap().is_empty());
         // The parent's own route, with an extra host and a hostile path: a card.
@@ -1224,7 +1224,7 @@ mod tests {
             "reach": [{ "host": "api.example.com", "methods": ["GET"] }, { "host": "other.example.org", "paths": ["/a\u{1b}]0;t\u{7}\u{202e}/**"] }],
             "inject": [{ "host": "api.example.com", "header": "Authorization", "format": "Bearer {secret}", "secret": "ex-token" }],
         });
-        assert!(spawn(&p.ctx, agent(wide)).unwrap().starts_with("needs human approval: request r-"));
+        assert!(spawn(&p.ctx, agent(wide)).unwrap().starts_with("needs approval: request r-"));
         let l = p.ctx.ledger.lock().unwrap();
         let r = l.pending(&wicket_core::TenantId::single()).unwrap().pop().unwrap();
         assert_eq!((r.method.as_str(), r.host.as_str(), r.risk.as_str()), ("SPAWN", "wicket.internal", "R4ExecOrPrivilege"));

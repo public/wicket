@@ -24,7 +24,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Write a zone for a project](how-to/write-a-zone-for-a-project.md)
 - [Store and link secrets](how-to/store-and-link-secrets.md)
 - [Add a remote node](how-to/add-a-remote-node.md)
-- [Place nodes on Vultr](how-to/place-nodes-on-vultr.md), and leases for agents
+- [Create nodes on Vultr](how-to/create-nodes-on-vultr.md), and leases for agents
 - [Hibernate and wake an agent](how-to/hibernate-and-wake-an-agent.md)
 - [Drive a box from the Claude apps](how-to/drive-a-box-from-the-claude-apps.md)
 - [Run a program instead of an agent](how-to/run-a-program.md)

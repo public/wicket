@@ -69,6 +69,14 @@ function describe(a) {
   if (a.action === "push_subscribe") return (a.replaces ? "Re-register " : "Send notifications to ") + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")" +
     (a.details ? " \u00b7 showing the agent and what it asks for" : " \u00b7 showing only how many requests wait");
   if (a.action === "push_details") return "Show the agent and what it asks for in notifications on " + s(a.label) + " (" + s(a.service) + ", device " + s(a.device) + ")";
+  if (a.action === "capacity_grant" || a.action === "capacity_renew") {
+    const t = a.terms || {};
+    const what = (t.nodes || 0) + " node(s) at once of " + (t.plans || []).map(s).join(", ") + " in " + (t.regions || []).map(s).join(", ") +
+      ", at most " + s(t.hourly_usd) + "/h and " + s(t.daily_usd) + " a day";
+    const hours = Math.round((a.ttl_secs || 0) / 360) / 10;
+    return (a.action === "capacity_grant" ? "Grant " + s(a.principal) + " " + what + ", for " + hours + " h"
+      : "Renew capacity grant " + s(a.grant) + " (" + s(a.principal) + ": " + what + ") for " + hours + " h from now");
+  }
   if (a.action === "start_run") return "Start " + s(a.root + "/" + a.manifest) + " as " + s(a.principal && a.principal.id) + (a.image ? " \u00b7 image " + s(a.image) : "") + (a.task ? " with task \u201c" + s(a.task).slice(0, 60) + "\u201d" : "");
   return s(a.action);
 }
@@ -239,15 +247,67 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
-// A node from `wicket place create` (#294): past its lease it is released by the reconciler, unless
+// A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
   const d = el("div", "row");
   d.append(el("span", "mono", strip(p.name + " " + p.id)));
   if (!p.past_lease) d.append(el("span", "", "lease until " + when(p.lease_until)));
-  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket place release " + strip(p.id) + ")"));
+  else if (p.held_by) d.append(el("span", "blocked", "PAST ITS LEASE (" + when(p.lease_until) + "): still held by run " + strip(p.held_by) + ", billing until released (wicket node release " + strip(p.id) + ")"));
   else d.append(el("span", "pend", "past its lease (" + when(p.lease_until) + "): released at the reconciler's next pass"));
   return d;
+}
+
+// Standing capacity grants (#256): a principal's `wicket node create` within one is approved at once
+// and audited against it; beyond every one, it waits here as a request. Issuing and renewing a grant
+// widen what may be spent, so each is signed with the passkey; revoking one only narrows, so it needs
+// only the session.
+function capacityRow(g) {
+  const t = g.terms || {}, u = g.used || {}, left = g.left || {};
+  const d = el("div", "row cap");
+  const head = el("div");
+  head.append(el("span", "mono", strip(g.id) + " "), el("span", "", strip(g.principal)));
+  const what = el("div", "meta", (t.plans || []).map(strip).join(", ") + " in " + (t.regions || []).map(strip).join(", ") +
+    " · " + t.nodes + " node(s) at once, " + strip(t.hourly_usd) + "/h, " + strip(t.daily_usd) + " a day");
+  const use = el("div", "meta", "used " + u.nodes + " node(s), " + strip(u.hourly_usd) + "/h, " + strip(u.daily_usd) + " today · left " +
+    left.nodes + " node(s), " + strip(left.hourly_usd) + "/h, " + strip(left.daily_usd) + " · until " + when(g.expires_at) + " · by " + strip(g.decided_by));
+  const b = el("div", "buttons");
+  const renew = el("button", "approve", "Renew");
+  renew.onclick = () => signed({ action: "capacity_renew", id: g.id, ttl_secs: capacityTtl() });
+  const revoke = el("button", "deny", "Revoke");
+  revoke.onclick = async () => { try { toast((await post("/api/capacity/revoke", { id: g.id })).ok); } catch (e) { toast(e.message); } refresh(); };
+  b.append(renew, revoke);
+  d.append(head, what, use, b);
+  return d;
+}
+// The form's inputs, by name; built once, so what the operator types survives the poll.
+const capInputs = {};
+// The lifetime the form asks for (hours, at most 24): also what Renew renews for.
+function capacityTtl() {
+  const h = Number((capInputs.hours && capInputs.hours.value) || 8);
+  return Math.round(Math.min(24, Math.max(0.1, h)) * 3600);
+}
+function renderCapacityForm() {
+  const box = document.getElementById("capacity-form");
+  if (!box || box.dataset.built) return;
+  box.dataset.built = "1";
+  const field = (name, label, placeholder, type) => {
+    const l = el("label", "field"); const i = el("input"); i.placeholder = placeholder; if (type) i.type = type;
+    capInputs[name] = i; l.append(el("span", "meta", label), i); return l;
+  };
+  const go = el("button", "approve", "Grant (sign with passkey)");
+  go.onclick = () => {
+    const v = k => capInputs[k].value;
+    signed({ action: "capacity_grant", principal: v("principal"), plans: v("plans"), regions: v("regions"),
+      max_hourly_usd: v("hourly"), max_daily_usd: v("daily"), nodes: Number(v("nodes") || 0), ttl_secs: capacityTtl() });
+  };
+  const b = el("div", "buttons"); b.append(go);
+  box.append(el("div", "note", "Issue a capacity grant: what a principal may lease with `wicket node create` without asking each time."),
+    field("principal", "To", "unix/alex, passkey/laptop or spiffe://…"),
+    field("plans", "Plans", "vc2-1c-2gb, vc2-2c-4gb"), field("regions", "Regions", "lhr"),
+    field("hourly", "Most per hour, all its nodes ($)", "0.05"), field("daily", "Most a day ($)", "1.00"),
+    field("nodes", "Nodes at once", "2", "number"), field("hours", "Hours (at most 24)", "8", "number"), b);
+  capInputs.hours.value = "8";
 }
 
 // A running agent can have its identity revoked, signed. An ACP agent's session opens on its own
@@ -718,6 +778,8 @@ async function refresh() {
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
+    renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
+    renderCapacityForm();
     renderStart(s);
     renderManifests(s);
     renderRows("decided", s.decided, x => { const d = el("div", "row"); d.append(el("span", "mono", strip(x.id + " " + x.method + " " + x.host + x.path)), el("span", x.status === "granted" ? "ok" : "blocked", x.status)); return d; }, "No decisions yet.");

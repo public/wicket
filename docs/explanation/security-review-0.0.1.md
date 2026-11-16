@@ -157,8 +157,8 @@ Identity, nodes and the feed:
 
 Lifecycle and money:
 - **The worst-case cost understates long lifetimes.** It caps the whole lifetime at 672 hours, not 672 per month, and
-  `wicket place create --lifetime` has no upper bound. Operator-only: agent requests are capped at 24 h.
-- **The reconciler destroys nodes made with `wicket place create`.** They carry the owner tag but no lease.
+  `wicket node create --lifetime` has no upper bound. Operator-only: agent requests are capped at 24 h.
+- **The reconciler destroys nodes made with `wicket node create`.** They carry the owner tag but no lease.
 - **Money control depends on `wicket reconcile --every` running.** Without it, a lease's node keeps billing past its end.
 - **The ledger and data directory are created under the umask** (typically 0644 and 0755), not 0600 and 0700.
 
