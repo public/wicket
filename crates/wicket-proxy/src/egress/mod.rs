@@ -764,7 +764,9 @@ mod tests {
         let frames =
             futures_util::stream::iter((0..n).map(move |_| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(piece.clone()))));
         let req = http::Request::post("/upload").body(http_body_util::StreamBody::new(frames)).unwrap();
-        let err = e.forward(req, "api.github.com", "https", "/upload", super::Via::H3).await.err().expect("refused");
+        let Err(err) = e.forward(req, "api.github.com", "https", "/upload", super::Via::H3).await else {
+            panic!("an oversized HTTP/3 body went")
+        };
         assert!(format!("{err:#}").contains("length limit exceeded"), "{err:#}");
         // Streamed, declaring more than the limit: refused on the declaration alone.
         let declared = (super::MAX_STREAMED_BODY + 1).to_string();
