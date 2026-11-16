@@ -3943,7 +3943,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let l = inst.ledger.lock().unwrap();
         assert_eq!(
             l.revoked_node_cas(wicket_store::now()).unwrap().iter().map(|c| c.serial.clone()).collect::<Vec<_>>(),
-            [first.serial.clone()]
+            std::slice::from_ref(&first.serial)
         );
         let audit = l.audit_of_kind("node.ca_renewed").unwrap();
         let body: serde_json::Value = serde_json::from_str(&audit.last().unwrap().body).unwrap();
