@@ -621,12 +621,18 @@ pub struct Candidate {
 
 /// Best fit: of the nodes with room for `want` (vCPUs, MiB), the one left with the least memory free
 /// once it is placed (then the fewest vCPUs free; then `last`, where the agent ran before; then the
-/// name). With room nowhere, the node with the most memory free, and false.
+/// name). With room nowhere, the node with the most memory free, and false. A node's memory free is
+/// what its limits leave, and no more than its admission says a box may have now (#377); a node
+/// that starts no box (its disk below the floor) has no room.
 pub fn pick(cands: &[Candidate], want: (f32, u64), last: Option<&str>) -> Option<(String, bool)> {
-    let free = |c: &Candidate| (c.cap.vcpus - c.cap.used_vcpus, c.cap.memory_mib as i64 - c.cap.used_memory_mib as i64);
+    let free = |c: &Candidate| {
+        let by_limits = c.cap.memory_mib as i64 - c.cap.used_memory_mib as i64;
+        let mem = c.cap.room_mib.map_or(by_limits, |r| by_limits.min(r as i64));
+        (c.cap.vcpus - c.cap.used_vcpus, if c.cap.full { -1 } else { mem })
+    };
     let fits = |c: &&Candidate| {
         let (cpu, mem) = free(c);
-        cpu + 1e-3 >= want.0 && mem >= want.1 as i64
+        cpu + 1e-3 >= want.0 && mem >= want.1 as i64 && !c.cap.full
     };
     let key = |c: &Candidate| {
         let (cpu, mem) = free(c);
@@ -678,12 +684,22 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
             println!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
             Ok(Some(n))
         }
-        Some((n, false)) => {
-            println!(
-                "[wicket] no available node has room for agent {} ({} vCPU, {} MiB free needed): placing it on {n}, the least loaded",
-                agent.id, want.0, want.1
-            );
-            Ok(Some(n))
+        // No silent overcommit (#377): each node would refuse the box itself.
+        Some((_, false)) => {
+            let seen: Vec<String> = cands
+                .iter()
+                .map(|c| match (c.cap.full, c.cap.room_mib) {
+                    (true, _) => format!("{} (its disk is below the floor)", c.name),
+                    (false, Some(r)) => format!("{} ({:.1} vCPU, {r} MiB free)", c.name, c.cap.vcpus - c.cap.used_vcpus),
+                    (false, None) => format!(
+                        "{} ({:.1} vCPU, {} MiB free by limits)",
+                        c.name,
+                        c.cap.vcpus - c.cap.used_vcpus,
+                        c.cap.memory_mib.saturating_sub(c.cap.used_memory_mib)
+                    ),
+                })
+                .collect();
+            bail!("no available node has room for agent {} ({} vCPU, {} MiB needed): {}", agent.id, want.0, want.1, seen.join(", "))
         }
         None => Ok(None),
     }
@@ -877,7 +893,14 @@ mod tests {
     fn cand(name: &str, vcpus: f32, mem: u64, used_cpu: f32, used_mem: u64) -> Candidate {
         Candidate {
             name: name.into(),
-            cap: crate::chan::NodeCapacity { vcpus, memory_mib: mem, used_vcpus: used_cpu, used_memory_mib: used_mem, boxes: 0 },
+            cap: crate::chan::NodeCapacity {
+                vcpus,
+                memory_mib: mem,
+                used_vcpus: used_cpu,
+                used_memory_mib: used_mem,
+                boxes: 0,
+                ..Default::default()
+            },
         }
     }
 
@@ -893,6 +916,16 @@ mod tests {
         assert_eq!(pick(&twins, (1.0, 512), Some("b")), Some(("b".into(), true)), "it breaks a tie");
         assert_eq!(pick(&nodes, (8.0, 65536), None), Some(("local".into(), false)), "no room: the least loaded");
         assert_eq!(pick(&[], (1.0, 1), None), None);
+        // #377: a node's admission room caps its free memory, and a full node has none.
+        let mut tight = nodes.clone();
+        for c in tight.iter_mut().filter(|c| c.name == "local") {
+            c.cap.room_mib = Some(512);
+        }
+        assert_ne!(pick(&tight, (1.0, 1024), None).map(|p| p.0), Some("local".into()));
+        for c in tight.iter_mut() {
+            c.cap.full = true;
+        }
+        assert_eq!(pick(&tight, (0.1, 1), None).map(|p| p.1), Some(false), "no node starts a box: no fit");
     }
 
     use super::*;

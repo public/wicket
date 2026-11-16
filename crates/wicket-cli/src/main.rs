@@ -18,6 +18,7 @@ mod effect;
 mod enrol;
 mod exitcause;
 mod grant;
+mod health;
 mod hibernate;
 mod image;
 mod images_policy;

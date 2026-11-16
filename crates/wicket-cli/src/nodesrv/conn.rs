@@ -160,7 +160,16 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
     match f {
         Frame::Feed(bytes) => {
             let now = (node.clock)();
-            let r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
+            let mut r = node.replica.lock().expect("replica").accept_bytes(&bytes, now);
+            // Not persisted for want of space (#377): the node's reserve is released and the frame
+            // tried again; still failing, it is asked for again once the disk can be written.
+            if let Err(e) = r.clone() {
+                if e.kind() == "storage" {
+                    if let Some(again) = node.feed_storage_failed(&bytes, &e) {
+                        r = again;
+                    }
+                }
+            }
             if let Err(e) = &r {
                 eprintln!("[node] feed frame refused: {} ({e})", e.kind());
                 let _ = node.audit.lock().expect("audit").audit(
@@ -333,9 +342,13 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 node.seen.forget(&run);
                 if let Some(b) = b {
                     b.tasks.iter().for_each(|t| t.abort());
-                    // The control host's own node shares the run's directory with the run: that stays.
+                    // The control host's own node shares the run's directory with the run: that stays,
+                    // but for the run's caches (#377).
                     if !node.paths.shares_host() && b.dir.starts_with(node.paths.runs()) {
                         let _ = std::fs::remove_dir_all(&b.dir);
+                        node.audit_note(&run, "run.files_deleted", serde_json::json!({ "dir": b.dir.display().to_string() }));
+                    } else if b.dir.starts_with(node.paths.runs()) {
+                        super::volumes::drop_caches(&b.dir);
                     }
                 }
             }
