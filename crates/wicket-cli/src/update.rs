@@ -581,12 +581,7 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
     // A CI build (#190): only a CI signature whose claims are what was asked for. No other
     // signature, and no human approval of its sha256, stands in for it.
     if let Some(e) = ci {
-        let checked = std::fs::read(&sig_path)
-            .with_context(|| format!("no signature ({})", sig_path.display()))
-            .and_then(|b| Ok(serde_json::from_slice::<Signature>(&b)?))
-            .and_then(|s| verify_ci_sig(&s, &sha, &trusted_keys()?))
-            .and_then(|(key, c)| check_claims(&c, e, wicket_store::now()).map(|_| (key, c)));
-        return match checked {
+        return match ci_signed(&sha, &sig_path, e) {
             Ok((key, c)) => Ok(Accepted { copy, sha256: sha, source: ci_source(&key, &c) }),
             Err(e) => Err(refuse(format!("the CI build isn't signed as asked: {e:#}"))),
         };
@@ -625,9 +620,16 @@ fn accept(ledger: &Mutex<Ledger>, artifact: &Path, sig: Option<&Path>, stage: &P
 /// checks, before an update verifies it again from its private copy): the signing key's id and
 /// the claims.
 pub fn verify_ci_files(archive: &Path, sig: &Path, e: &CiExpect) -> Result<(String, CiClaims)> {
-    let sha = sha256_file(archive)?;
-    let s: Signature = serde_json::from_slice(&std::fs::read(sig)?)?;
-    let (key, c) = verify_ci_sig(&s, &sha, &trusted_keys()?)?;
+    ci_signed(&sha256_file(archive)?, sig, e)
+}
+
+/// Whether the signature at `sig` is CI's, by a trusted key, on an artifact with sha256 `sha`, with
+/// the claims `e` asks for: the signing key's id and the claims. The one CI check, for an update
+/// ([`accept`]) and for `self follow`'s checks before it ([`verify_ci_files`]).
+fn ci_signed(sha: &str, sig: &Path, e: &CiExpect) -> Result<(String, CiClaims)> {
+    let bytes = std::fs::read(sig).with_context(|| format!("no signature ({})", sig.display()))?;
+    let s: Signature = serde_json::from_slice(&bytes)?;
+    let (key, c) = verify_ci_sig(&s, sha, &trusted_keys()?)?;
     check_claims(&c, e, wicket_store::now())?;
     Ok((key, c))
 }
