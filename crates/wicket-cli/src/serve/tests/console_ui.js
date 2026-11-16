@@ -25,7 +25,7 @@ class Node {
 class Text { constructor(t) { this._t = t; this.parent = null; } get textContent() { return this._t; } }
 
 const ids = {};
-for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
+for (const id of ["msg", "auth", "console", "tenant", "pending", "runs", "runform", "runform-title", "runform-text", "runform-go", "runform-cancel", "start", "decided", "audit", "operator", "confirm", "confirm-title", "confirm-what", "confirm-blast", "confirm-state", "confirm-go", "confirm-cancel", "detail", "detail-title", "detail-body", "detail-close", "policy", "manifests", "mfedit", "mfedit-title", "mfedit-body", "mfedit-close", "push", "health", "placed", "capacity", "capacity-form", "secrets", "secret-edit", "secret-edit-title", "secret-edit-body", "secret-edit-go", "secret-edit-cancel"]) ids[id] = new Node("div");
 ids.confirm.hidden = true;
 let now = 100000;
 let timers = [];
@@ -133,7 +133,9 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
 
   // Once settled, a tap asks the server for the action and opens the confirmation; no passkey yet.
   await advance(1000);
-  nextAction = { v: 1, action: "decide", request: "q-a", run: "run_a", method: "POST", host: "api.example.com", path: "/harmless", risk: "R1ReadScoped", prefix: false, decision: "approve", uses: 1, ttl_secs: 600, agent: "spiffe://x", requested_by: [] };
+  nextAction = { v: 1, action: "decide", request: "q-a", run: "run_a", method: "POST", host: "api.example.com", path: "/harmless", risk: "R1ReadScoped", prefix: false, decision: "approve", uses: 1, ttl_secs: 600, agent: "spiffe://x", requested_by: [],
+    effect_sha256: "0123456789abcdef".repeat(4),
+    blast: { widens: ["every path under /h/ on api.example.com, not only /harmless"], examples: ["POST api.example.com/h/any-file"], zone_rules: [], covered: 3, recent: 7 } };
   button(aCard, "Approve once").click(); await flush();
   assert.strictEqual(began().length, 1);
   assert.strictEqual(began()[0].body.id, "q-a");
@@ -141,6 +143,12 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
   assert.strictEqual(ceremonies, 0, "the click alone starts no passkey ceremony");
   const what = ids["confirm-what"].textContent;
   assert.ok(what.includes("/harmless") && what.includes("q-a") && what.startsWith("Approve once"), what);
+  // #369: the effect it signs, and what else it would allow, are shown before the passkey.
+  assert.ok(what.includes("effect 0123456789abcdef"), what);
+  const blast = ids["confirm-blast"];
+  assert.strictEqual(blast.hidden, false);
+  assert.ok(blast.textContent.includes("every path under /h/") && blast.textContent.includes("POST api.example.com/h/any-file") &&
+    blast.textContent.includes("covered 3 of this run\u2019s last 7"), blast.textContent);
   // Its sign button isn't live at once (a second tap aimed at the card mustn't land on it).
   assert.strictEqual(ids["confirm-go"].disabled, true);
   ids["confirm-go"].click(); await flush();
@@ -168,10 +176,11 @@ const began = () => calls.filter(c => c.path === "/api/action/begin");
 
   // Cancel closes it without a ceremony.
   await advance(1000);
-  nextAction = { ...nextAction, request: "q-b", decision: "deny", uses: null, ttl_secs: null };
+  nextAction = { ...nextAction, request: "q-b", decision: "deny", uses: null, ttl_secs: null, blast: null };
   button(cardsIn()[1], "Deny").click(); await flush();
   assert.strictEqual(ids.confirm.hidden, false);
   assert.ok(ids["confirm-what"].textContent.startsWith("Deny"), ids["confirm-what"].textContent);
+  assert.strictEqual(ids["confirm-blast"].hidden, true, "a denial widens nothing");
   ids["confirm-cancel"].listeners.click(); await flush();
   assert.strictEqual(ids.confirm.hidden, true);
   assert.strictEqual(ceremonies, 1);

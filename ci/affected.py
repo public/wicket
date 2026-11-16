@@ -278,7 +278,7 @@ def self_test():
          lambda c: c != ALL and len(c) >= 10 and {"wicket-core", "wicket-cli", "wicket-proxy"} <= c and "wicket-fwd" not in c, ALL)
     case("a crate's own tests", ["crates/wicket-sandbox/tests/x.rs"], {"wicket-sandbox", "wicket-cli"}, set())
     case("policy code", ["crates/wicket-policy/tests/cedar.rs"], {"wicket-policy", "wicket-policy-diff", "wicket-cli"}, {"policy"})
-    case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli"}, {"hibernate", "restore"})
+    case("hibernation", ["crates/wicket-cli/src/hibernate.rs"], {"wicket-cli", "wicket-sim"}, {"hibernate", "restore"})
     case("updates", ["crates/wicket-cli/src/update.rs"], {"wicket-cli"}, {"update"})
     # Every end-to-end suite, and the fuzz target that reads its frames (#323).
     case("the node protocol", ["crates/wicket-cli/src/chan.rs"], {"wicket-cli"}, set(E2E) | {"fuzz-chan"})
@@ -322,6 +322,8 @@ def self_test():
     # #324: the simulation's stand-ins follow the node's run loop, so its seeds run on a change to it.
     case("the node's run loop", ["crates/wicket-cli/src/nodesrv.rs"], {"wicket-cli", "wicket-sim"},
          {"node-e2e", "acceptance-nodes", "tla"})
+    case("the reconciler", ["crates/wicket-cli/src/reconcile.rs"], {"wicket-cli", "wicket-sim"}, {"node-e2e", "acceptance-nodes", "acceptance"})
+    case("the node's gateway", ["crates/wicket-cli/src/nodegw.rs"], {"wicket-cli", "wicket-sim"}, {"node-e2e", "acceptance-nodes", "tla"})
     # A rule naming one path (no wildcard) names one that exists: a rename mustn't leave it behind.
     for pat, _, _ in rules:
         if "/" in pat and not any(ch in pat for ch in "*?[") and not (ROOT / pat).exists():

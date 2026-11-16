@@ -13,6 +13,7 @@ mod cli_reference;
 mod cmd;
 mod daemon;
 mod doctor;
+mod effect;
 mod enrol;
 mod exitcause;
 mod grant;

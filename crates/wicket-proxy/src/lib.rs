@@ -248,10 +248,7 @@ pub fn attribution_line(v: &serde_json::Value) -> String {
 
 /// The agents an attribution object names.
 pub fn attributed_agents(v: &serde_json::Value) -> Vec<String> {
-    v.get("requesters")
-        .and_then(|r| r.as_array())
-        .map(|rs| rs.iter().filter_map(|r| r.get("agent").and_then(|a| a.as_str()).map(String::from)).collect())
-        .unwrap_or_default()
+    wicket_store::requesters(v)
 }
 
 /// Live events for the operator's console and the audit log.

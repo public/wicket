@@ -12,6 +12,9 @@ wicket-authz.workspace = true
 wicket-feed.workspace = true
 wicket-store.workspace = true
 wicket-proxy = { workspace = true, features = ["sim"] }
+wicket-placement.workspace = true
+wicket-identity.workspace = true
+anyhow.workspace = true
 turmoil = "0.7"
 tokio.workspace = true
 serde.workspace = true
