@@ -157,8 +157,9 @@ pub fn check(l: &Ledger, data: &Path, grace_secs: i64, now: i64) -> Result<Summa
                 e.1 += ev["output_tokens"].as_i64().unwrap_or(0);
             }
             // A wicket DNS answer (method DNS, h3.rs): the name resolved to wicket's synthetic range,
-            // which only wicket's relay answers on. Nothing left the box; the name must still be one
-            // the run may reach.
+            // which only wicket's relay answers on, and nothing left the box. wicket answers a name
+            // the zone keeps open (reached, or unlisted in a zone that escalates), never one it
+            // forbids or hides: that is what is checked.
             Some("egress") if ev["method"] == "DNS" && ev["outcome"] == "allow" => {
                 s.dns_answers += 1;
                 let host = ev["host"].as_str().unwrap_or("");
@@ -168,13 +169,16 @@ pub fn check(l: &Ledger, data: &Path, grace_secs: i64, now: i64) -> Result<Summa
                     wicket_core::CompiledZone::new(spec.clone()).ok().map(|c| (spec, c))
                 });
                 if let Some((spec, _)) = zone {
-                    let reached = spec.reach.iter().any(|q| wicket_core::manifest::host_matches(&q.host, host));
+                    let open = wicket_core::host_verdict(spec, host) == wicket_core::HostVerdict::Open;
                     let granted = || l.grants_for_run(&r.run).is_ok_and(|gs| gs.iter().any(|g| g.host.eq_ignore_ascii_case(host)));
-                    if !reached && !granted() {
+                    if !open && !granted() {
                         findings.push(Finding {
                             invariant: "egress",
                             run: r.run.clone(),
-                            what: format!("wicket DNS resolved {host} at {}, a host the run's zone doesn't reach and no grant names", r.ts),
+                            what: format!(
+                                "wicket DNS resolved {host} at {}, a host the run's zone forbids or hides and no grant names",
+                                r.ts
+                            ),
                         });
                     }
                 }
@@ -480,12 +484,25 @@ mod tests {
             "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: example.com, methods: [GET], paths: [\"/\"] }]\n",
         )
         .unwrap();
+        // An unlisted host in a zone that escalates is open: wicket answers it (nothing leaves).
         let l = ledger();
         dns(&l, "example.com");
         dns(&l, "exfil.example.org");
+        assert_eq!(findings(&l, &d), Vec::<String>::new(), "an escalating zone keeps unlisted hosts open");
+        // A zone that hides unlisted hosts, or forbids one, gets no answer for it: one would break.
+        std::fs::write(
+            d.join(format!("runs/run_parent/children/{RUN}.yaml")),
+            "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  unlisted_hosts: hide\n  reach: [{ host: example.com, methods: [GET], paths: [\"/\"] }]\n  forbid: [{ host: bad.example.com }]\n",
+        )
+        .unwrap();
+        let l = ledger();
+        dns(&l, "example.com");
+        dns(&l, "exfil.example.org");
+        dns(&l, "bad.example.com");
         let f = findings(&l, &d);
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert!(f[0].contains("resolved exfil.example.org") && f[0].contains("doesn't reach"), "{f:?}");
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.iter().all(|f| f.contains("forbids or hides")), "{f:?}");
+        assert!(f[0].contains("resolved exfil.example.org") && f[1].contains("resolved bad.example.com"), "{f:?}");
         let _ = std::fs::remove_dir_all(d);
     }
 
