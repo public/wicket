@@ -11,6 +11,7 @@ mod chan;
 mod ci_update;
 mod cli_reference;
 mod cmd;
+mod control;
 mod daemon;
 mod doctor;
 mod enrol;

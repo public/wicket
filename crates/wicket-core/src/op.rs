@@ -230,9 +230,9 @@ pub fn never_reachable(host: &str) -> Option<String> {
 
 /// Methods wicket uses for its own approvals, on host [`crate::link::DOMAIN`]: starting a box beyond
 /// its parent's zone, a link beyond the default policy, a capacity lease, and accepting a wicket
-/// build (`request_update`, #162); and the quota grants wicket records when it carves a run's
+/// build (`request_update`, #162), a driven harness's prompt before a tool call (#363); and the quota grants wicket records when it carves a run's
 /// budget, children and bytes (#256), which no request makes.
-pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE", "QUOTA"];
+pub const RESERVED_METHODS: &[&str] = &["SPAWN", "LINK", "CAPACITY", "UPDATE", "QUOTA", "TOOL"];
 
 /// The HTTP methods an agent may ask a human for (request_access) or a node may raise a request for.
 pub const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
@@ -455,6 +455,7 @@ zone:
         let op = |m: &str, h: &str| Op::egress(&t, &r, "z", m, h, "/");
         assert!(op("spawn", "api.example.com").is_reserved());
         assert!(op("update", "api.example.com").is_reserved());
+        assert!(op("TOOL", "wicket.internal").refused_for_agents().is_some());
         assert!(op("GET", "wicket.internal").is_reserved());
         assert!(op("GET", "api.example.com").refused_for_agents().is_none());
         assert!(op("PROPFIND", "api.example.com").refused_for_agents().is_some());

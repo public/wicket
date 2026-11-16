@@ -42,8 +42,9 @@ pub enum Authority {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
-    /// The request kinds it may decide: `http`, `spawn`, `link`, `capacity`, `update`, and
-    /// `authority` (renewing a running box's authority). Empty: none.
+    /// The request kinds it may decide: `http`, `spawn`, `link`, `capacity`, `update`, `tool` (a
+    /// driven agent's prompt before a tool call, #363), and `authority` (renewing a running box's
+    /// authority). Empty: none.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// The hosts (`*.example.com` patterns) of the http requests it may decide. Empty: any.
@@ -54,7 +55,7 @@ pub struct Scope {
     pub max_risk: Option<String>,
 }
 
-const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "authority"];
+const KINDS: &[&str] = &["http", "spawn", "link", "capacity", "update", "tool", "authority"];
 
 #[derive(Deserialize)]
 #[serde(untagged)]
