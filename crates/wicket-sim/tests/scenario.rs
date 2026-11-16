@@ -182,3 +182,33 @@ fn a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants() {
     let ok = wicket_sim::run(1, &dir().join("uncovered-ok"));
     assert!(ok.ok() && ok.stats.spliced > 0 && ok.stats.uncovered_refused > 0, "both ways exercised: {:?}", ok.stats);
 }
+
+/// #368: a zone that caps egress, through node and control-host crashes, partitions and skew: the
+/// node sends upstream only within the slices leased from each run's window, so no true window of
+/// the zone's length ever holds more than the cap, and the cap is reached (requests are refused).
+#[test]
+fn egress_caps_hold_through_faults() {
+    let mut capped = 0;
+    for seed in 0..8 {
+        let r = wicket_sim::run_with(seed, &dir().join("egress-caps"), Options { egress_caps: true, ..Options::default() });
+        assert!(r.ok(), "seed {seed}: {r}");
+        assert!(r.stats.egress_sent > 0, "seed {seed}: nothing was sent: {:?}", r.stats);
+        capped += r.stats.egress_capped;
+    }
+    assert!(capped > 0, "no seed reached the cap: the test proves nothing");
+}
+
+/// #368: a node that counts and reports but doesn't hold its boxes to their slices sends past the
+/// cap, and the oracle finds it.
+#[test]
+fn without_held_slices_a_node_overruns_its_egress_cap() {
+    let found = (0..8).any(|seed| {
+        let r = wicket_sim::run_with(
+            seed,
+            &dir().join("egress-unheld"),
+            Options { egress_caps: true, egress_slices: false, ..Options::default() },
+        );
+        r.violations.iter().any(|v| v.contains("egress requests sent within"))
+    });
+    assert!(found, "no seed overran the cap without slices held");
+}

@@ -40,12 +40,17 @@ pub struct Disk {
     pub spend: BTreeMap<String, Spent>,
     /// `slices/` per run.
     pub slices: BTreeMap<String, Slice>,
+    /// `node-egress.json` per run, and its egress slice (`slices/<run>.egress.json`, #368).
+    pub egress: BTreeMap<String, wicket_core::window::EgressUse>,
+    pub egress_slices: BTreeMap<String, wicket_core::window::EgressSlice>,
 }
 
 struct Node {
     env: Rc<Env>,
     replica: RefCell<Replica<BoxAuthority>>,
     llms: BTreeMap<String, Arc<Llm>>,
+    /// Each run's egress counter, when the zone caps egress (#368).
+    egress: BTreeMap<String, Arc<wicket_proxy::egress::caps::EgressCounter>>,
 }
 
 impl Node {
@@ -83,7 +88,25 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
         }
         llms.insert(run.to_string(), l);
     }
-    let node = Rc::new(Node { env: env.clone(), replica: RefCell::new(replica), llms });
+    // As `nodesrv::serve_box`: the count from its journal, the slice as last sent.
+    let mut egress = BTreeMap::new();
+    if let Some(caps) = env.zone.limits.egress_caps() {
+        for run in RUNS {
+            let c = wicket_proxy::egress::caps::EgressCounter::new(caps);
+            let disk = env.node_disk.lock().expect("node disk");
+            if let Some(u) = disk.egress.get(run) {
+                c.merge_used(*u);
+            }
+            c.set_slice(disk.egress_slices.get(run).copied());
+            drop(disk);
+            let (d, r) = (env.node_disk.clone(), run.to_string());
+            c.set_journal(move |u| {
+                d.lock().expect("node disk").egress.insert(r.clone(), u);
+            });
+            egress.insert(run.to_string(), c);
+        }
+    }
+    let node = Rc::new(Node { env: env.clone(), replica: RefCell::new(replica), llms, egress });
     {
         let n = &node;
         let now = n.now();
@@ -165,11 +188,20 @@ async fn link(node: &Rc<Node>, s: turmoil::net::TcpStream) {
                         }
                     }
                     wire::KIND_MSG => {
-                        if let Ok(Ctl::BudgetSlice { run, slice }) = wire::parse::<Ctl>(&body) {
-                            if let Some(l) = node.llms.get(&run) {
-                                env.node_disk.lock().expect("node disk").slices.insert(run.clone(), slice);
-                                l.set_slice(Some(slice));
+                        match wire::parse::<Ctl>(&body) {
+                            Ok(Ctl::BudgetSlice { run, slice }) => {
+                                if let Some(l) = node.llms.get(&run) {
+                                    env.node_disk.lock().expect("node disk").slices.insert(run.clone(), slice);
+                                    l.set_slice(Some(slice));
+                                }
                             }
+                            Ok(Ctl::EgressSlice { run, slice }) => {
+                                if let Some(c) = node.egress.get(&run) {
+                                    env.node_disk.lock().expect("node disk").egress_slices.insert(run.clone(), slice);
+                                    c.set_slice(Some(slice));
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     _ => return,
@@ -181,7 +213,8 @@ async fn link(node: &Rc<Node>, s: turmoil::net::TcpStream) {
                     return;
                 }
                 for (run, l) in &node.llms {
-                    if wire::write_json(&mut wr, &Ctl::Spent { run: run.clone(), spent: l.spent() }).await.is_err() {
+                    let egress = node.egress.get(run).map(|c| c.used());
+                    if wire::write_json(&mut wr, &Ctl::Spent { run: run.clone(), spent: l.spent(), egress }).await.is_err() {
                         return;
                     }
                 }
@@ -219,7 +252,8 @@ async fn serve_box(node: Rc<Node>, s: turmoil::net::TcpStream) {
                 let not_after = (EPOCH_MS + 86_400_000) / 1000;
                 let route = wicket_proxy::decide::route(&host, Some((&ca[..], not_after)), now / 1000);
                 if let (wicket_proxy::decide::Route::Uncovered(why), true) = (&route, env.options.refuse_uncovered) {
-                    let spliced = node.replica.borrow().splice(&tenant, &run, &host, now);
+                    // A zone that caps egress splices nothing (`Egress::splice_rule`, #368).
+                    let spliced = if node.egress.is_empty() { node.replica.borrow().splice(&tenant, &run, &host, now) } else { None };
                     env.oracle.borrow_mut().uncovered(true_now(), &run, &host, &path, spliced);
                     let resp = BoxResp::Egress { allowed: spliced.is_some(), why: format!("{why}: spliced {spliced:?}") };
                     if wire::write_json(&mut wr, &resp).await.is_err() {
@@ -242,7 +276,27 @@ async fn serve_box(node: Rc<Node>, s: turmoil::net::TcpStream) {
                 if let (wicket_proxy::decide::Route::Uncovered(_), true) = (&route, d.is_allow()) {
                     env.oracle.borrow_mut().decided_uncovered(true_now(), &run, &host, &path, &d);
                 }
-                BoxResp::Egress { allowed: d.is_allow(), why: format!("{d:?}") }
+                // An allowed request goes upstream only within the run's egress slice (#368).
+                let mut allowed = d.is_allow();
+                match (allowed, node.egress.get(&run)) {
+                    (true, Some(c)) if env.options.egress_slices => match c.admit(None) {
+                        Ok(()) => env.oracle.borrow_mut().egress_sent(true_now(), &run),
+                        Err(why) => {
+                            env.oracle.borrow_mut().egress_capped(true_now(), &run, &why.0);
+                            allowed = false;
+                        }
+                    },
+                    // Without slices held: counted and reported all the same, never refused.
+                    (true, Some(c)) => {
+                        let u = c.used();
+                        c.merge_used(wicket_core::window::EgressUse { requests: u.requests + 1, bytes: u.bytes });
+                        c.journal();
+                        env.oracle.borrow_mut().egress_sent(true_now(), &run);
+                    }
+                    (true, None) => env.oracle.borrow_mut().egress_sent(true_now(), &run),
+                    (false, _) => {}
+                }
+                BoxResp::Egress { allowed, why: format!("{d:?}") }
             }
             Ok(BoxReq::Model { max_tokens }) => model_call(&node, &run, max_tokens).await,
             _ => return,

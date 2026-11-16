@@ -320,6 +320,21 @@ pub struct Env {
     pub upstream: Rc<RefCell<Rng>>,
 }
 
+/// Requests per [`EGRESS_WINDOW_S`] a capped zone may send (`Options::egress_caps`, #368).
+pub const EGRESS_CAP: u64 = 12;
+/// The capped zone's egress window: the shortest there is, so the run's minute slides it.
+pub const EGRESS_WINDOW_S: u64 = 60;
+
+/// The run's zone, with egress caps if `caps` ([`EGRESS_CAP`] per [`EGRESS_WINDOW_S`]).
+pub fn zone_with(caps: bool) -> ZoneSpec {
+    let mut z = zone();
+    if caps {
+        z.limits.egress =
+            Some(wicket_core::window::EgressSpec { window: format!("{EGRESS_WINDOW_S}s"), requests: Some(EGRESS_CAP), bytes: None });
+    }
+    z
+}
+
 /// The run's zone: reads on acme's repos by reach, the comment paths by grant, a forbidden host,
 /// a host allowed wholesale, and a model route with [`QUOTA`].
 pub fn zone() -> ZoneSpec {
@@ -390,11 +405,27 @@ pub struct Options {
     /// decides such a host from the feed as if it could terminate it, and the oracle finds the
     /// published grant on [`UNCOVERED_HOST`] allowing (`tests/scenario.rs`).
     pub refuse_uncovered: bool,
+    /// The zone caps egress (#368): [`EGRESS_CAP`] requests per [`EGRESS_WINDOW_S`], counted on the
+    /// node against the slices the control host leases from each run's window, and the oracle
+    /// checks no true window ever holds more. Off by default: a capped zone splices nothing, which
+    /// the default scenario's uncovered host needs.
+    pub egress_caps: bool,
+    /// The node holds a box to its egress slice (`EgressCounter::admit`, #368). Off (with
+    /// `egress_caps`): it counts and reports but never refuses, and the oracle finds the overrun
+    /// (`tests/scenario.rs`).
+    pub egress_slices: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { keep_trace: false, spend_journal: true, grant_end_fix: true, refuse_uncovered: true }
+        Options {
+            keep_trace: false,
+            spend_journal: true,
+            grant_end_fix: true,
+            refuse_uncovered: true,
+            egress_caps: false,
+            egress_slices: true,
+        }
     }
 }
 
@@ -420,7 +451,7 @@ pub fn run_with(seed: u64, dir: &Path, options: Options) -> Report {
         wicket_feed::TYP_KEY,
         &wicket_feed::KeyCert::new(&feed_key.verifying_key(), 1, EPOCH_MS + 86_400_000, 30_000),
     );
-    let zone = zone();
+    let zone = zone_with(options.egress_caps);
     let mut issuers = BTreeMap::new();
     for run in RUNS {
         let i =
@@ -439,7 +470,13 @@ pub fn run_with(seed: u64, dir: &Path, options: Options) -> Report {
         approver,
         zone,
         issuers,
-        oracle: Rc::new(RefCell::new(Oracle::new(QUOTA, TTL_MS, MAX_SKEW_MS, keep_trace))),
+        oracle: Rc::new(RefCell::new({
+            let mut o = Oracle::new(QUOTA, TTL_MS, MAX_SKEW_MS, keep_trace);
+            if options.egress_caps {
+                o.cap_egress(EGRESS_CAP, EGRESS_WINDOW_S as i64 * 1000);
+            }
+            o
+        })),
         control_disk: Rc::new(RefCell::new(control::Disk::default())),
         node_disk: Default::default(),
         options,

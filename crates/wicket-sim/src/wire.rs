@@ -26,8 +26,16 @@ pub enum Ctl {
     Hello { hello: wicket_feed::Hello },
     /// Control host → node: a run's budget slice (`Msg::BudgetSlice`).
     BudgetSlice { run: String, slice: Slice },
-    /// Node → control host: what a run's model proxy has counted (`Msg::Spent`).
-    Spent { run: String, spent: Spent },
+    /// Node → control host: what a run's model proxy has counted (`Msg::Spent`), and its egress
+    /// count when its zone caps egress (#368).
+    Spent {
+        run: String,
+        spent: Spent,
+        #[serde(default)]
+        egress: Option<wicket_core::window::EgressUse>,
+    },
+    /// Control host → node: a run's egress slice (`Msg::EgressSlice`, #368).
+    EgressSlice { run: String, slice: wicket_core::window::EgressSlice },
 }
 
 /// A box's request to its node.

@@ -26,6 +26,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use wicket_core::window::{EgressSlice, EgressUse, Ring};
 use wicket_core::{Op, RunId, TenantId};
 use wicket_feed::{BoxAuthority, Change, Frame, LiveGrant, Publisher, PublisherConfig, RevokeKind};
 use wicket_proxy::llm::{Llm, Slice, Spent};
@@ -41,6 +42,8 @@ pub struct Disk {
     pub revoked: BTreeSet<String>,
     /// Each run's counted spend (requests, input tokens, output tokens), as the ledger records it.
     pub used: BTreeMap<String, (u64, u64, u64)>,
+    /// Each run's egress window and what its node last reported (`egress_windows`, #368).
+    pub egress: BTreeMap<String, (Ring, EgressUse)>,
 }
 
 /// What to tell the oracle once the change's epoch is known.
@@ -87,6 +90,9 @@ pub async fn run(env: Rc<Env>) -> turmoil::Result {
             None => None,
         };
         runs.insert(run.to_string(), Run { llm, spent_base });
+        if let Some(caps) = env.zone.limits.egress_caps() {
+            env.control_disk.borrow_mut().egress.entry(run.to_string()).or_insert_with(|| (Ring::new(&caps), EgressUse::default()));
+        }
     }
     let st = Rc::new(RefCell::new(State { publisher, deltas: vec![], runs }));
     if !env.control_disk.borrow().started {
@@ -246,6 +252,7 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
         }
     }
     let mut slices: BTreeMap<String, Slice> = BTreeMap::new();
+    let mut egress_slices: BTreeMap<String, EgressSlice> = BTreeMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_rx = tokio::time::Instant::now();
     loop {
@@ -258,8 +265,11 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
                 let Some((kind, body)) = f else { return };
                 last_rx = tokio::time::Instant::now();
                 if kind == wire::KIND_MSG {
-                    if let Ok(Ctl::Spent { run, spent }) = wire::parse::<Ctl>(&body) {
+                    if let Ok(Ctl::Spent { run, spent, egress }) = wire::parse::<Ctl>(&body) {
                         spent_in(&env, &mut st.borrow_mut(), &run, spent);
+                        if let Some(u) = egress {
+                            egress_in(&env, &run, u);
+                        }
                     }
                 }
             }
@@ -287,6 +297,14 @@ async fn serve(env: Rc<Env>, st: Rc<RefCell<State>>, s: turmoil::net::TcpStream)
                             out.push((wire::KIND_MSG, serde_json::to_vec(&m).expect("serialises")));
                         }
                     }
+                    for run in s.runs.keys() {
+                        if let Some(sl) = egress_due(&env, run, egress_slices.get(run).copied()) {
+                            egress_slices.insert(run.clone(), sl);
+                            env.oracle.borrow_mut().note(now, format!("egress slice {run} {sl:?}"));
+                            let m = Ctl::EgressSlice { run: run.clone(), slice: sl };
+                            out.push((wire::KIND_MSG, serde_json::to_vec(&m).expect("serialises")));
+                        }
+                    }
                 }
                 for (k, b) in out {
                     if wire::write_frame(&mut wr, k, &b).await.is_err() {
@@ -303,6 +321,29 @@ fn slice_due(l: &Llm, cur: Option<Slice>) -> Option<Slice> {
     let next = l.next_slice(crate::SLICE_FRACTION)?;
     let slice = Slice::renewed(cur, next, l.spent(), l.input_total());
     (cur != Some(slice)).then_some(slice)
+}
+
+/// `noderun::egress_due` (#368): the egress slice to send, from the run's window, if it differs
+/// from the one this connection sent.
+fn egress_due(env: &Env, run: &str, cur: Option<EgressSlice>) -> Option<EgressSlice> {
+    let caps = env.zone.limits.egress_caps()?;
+    let disk = env.control_disk.borrow();
+    let (ring, seen) = disk.egress.get(run)?;
+    let next = EgressSlice::next(&caps, ring, true_now() / 1000, *seen, wicket_core::window::SLICE_FRACTION);
+    let slice = EgressSlice::renewed(cur, next, *seen);
+    (cur != Some(slice)).then_some(slice)
+}
+
+/// The egress count in `Msg::Spent` (`egress_window::Window::report`): what is new goes into the
+/// run's window, at the control host's time.
+fn egress_in(env: &Env, run: &str, used: EgressUse) {
+    let mut disk = env.control_disk.borrow_mut();
+    let Some((ring, seen)) = disk.egress.get_mut(run) else { return };
+    let delta = used.since(*seen);
+    if delta != EgressUse::default() {
+        ring.add(true_now() / 1000, delta);
+        *seen = EgressUse { requests: seen.requests.max(used.requests), bytes: seen.bytes.max(used.bytes) };
+    }
 }
 
 /// `Msg::Spent`'s handler: the node is the counter of record; the ledger keeps the run's total.

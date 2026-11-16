@@ -66,6 +66,9 @@ pub struct Stats {
     /// Requests to hosts the node's CA can't cover: spliced, refused.
     pub spliced: u64,
     pub uncovered_refused: u64,
+    /// Egress requests sent upstream, and refused at the zone's egress cap (#368).
+    pub egress_sent: u64,
+    pub egress_capped: u64,
 }
 
 pub struct Oracle {
@@ -79,6 +82,10 @@ pub struct Oracle {
     trace: Vec<String>,
     hash: u64,
     keep_trace: bool,
+    /// The zone's egress cap and window (ms), and each run's requests sent upstream (true times).
+    egress_cap: Option<(u64, i64)>,
+    egress: BTreeMap<String, Vec<i64>>,
+    egress_over: std::collections::BTreeSet<String>,
 }
 
 impl Oracle {
@@ -94,6 +101,9 @@ impl Oracle {
             trace: vec![],
             hash: 0xcbf2_9ce4_8422_2325,
             keep_trace,
+            egress_cap: None,
+            egress: BTreeMap::new(),
+            egress_over: Default::default(),
         }
     }
 
@@ -218,6 +228,31 @@ impl Oracle {
                 }
             }
         }
+    }
+
+    /// The zone caps egress at `cap` requests per `window_ms` (#368).
+    pub fn cap_egress(&mut self, cap: u64, window_ms: i64) {
+        self.egress_cap = Some((cap, window_ms));
+    }
+
+    /// A box's egress request went upstream at true time `t`: no window of the zone's length,
+    /// ending now, may hold more than the cap (reported once per run).
+    pub fn egress_sent(&mut self, t: i64, run: &str) {
+        self.stats.egress_sent += 1;
+        let Some((cap, window)) = self.egress_cap else { return };
+        let sent = self.egress.entry(run.into()).or_default();
+        sent.push(t);
+        let n = sent.iter().filter(|s| **s > t - window).count() as u64;
+        self.note(t, format!("egress {run}: {n} sent in the last {window} ms"));
+        if n > cap && self.egress_over.insert(run.to_string()) {
+            self.violate(t, format!("{run}: {n} egress requests sent within {window} ms, cap {cap}"));
+        }
+    }
+
+    /// A box's egress request was refused at the zone's cap.
+    pub fn egress_capped(&mut self, t: i64, run: &str, why: &str) {
+        self.stats.egress_capped += 1;
+        self.note(t, format!("egress {run} capped: {why}"));
     }
 
     /// The stand-in upstream served (and billed) one model call.
