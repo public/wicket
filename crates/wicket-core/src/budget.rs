@@ -369,6 +369,170 @@ impl Counter {
     }
 }
 
+/// Exact values, so a changed operator or boundary fails here, in the crate's own fast suite: the
+/// Kani harnesses and the loom test (which `cargo test` doesn't run) prove the properties, and
+/// mutation testing (#326) found nothing else in `cargo test -p wicket-core` that would notice.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const Q: ModelQuota = ModelQuota { requests: 10, output_tokens: 1000, input_tokens: Some(5000) };
+
+    fn counter(c: Counts) -> Counter {
+        let k = Counter::default();
+        k.requests.store(c.requests, SeqCst);
+        k.input_tokens.store(c.input_total, SeqCst);
+        k.output_tokens.store(c.output_tokens, SeqCst);
+        k.reserved_requests.store(c.reserved_requests, SeqCst);
+        k.reserved_output_tokens.store(c.reserved_output_tokens, SeqCst);
+        k.reserved_input_tokens.store(c.reserved_input_tokens, SeqCst);
+        k.prior_requests.store(c.prior_requests, SeqCst);
+        k.prior_input_tokens.store(c.prior_input_tokens, SeqCst);
+        k.prior_output_tokens.store(c.prior_output_tokens, SeqCst);
+        k.inflight_output_tokens.store(c.inflight_output_tokens, SeqCst);
+        k
+    }
+
+    const C: Counts = Counts {
+        requests: 1,
+        input_total: 100,
+        output_tokens: 10,
+        reserved_requests: 2,
+        reserved_output_tokens: 20,
+        reserved_input_tokens: 200,
+        prior_requests: 3,
+        prior_input_tokens: 300,
+        prior_output_tokens: 30,
+        inflight_output_tokens: 40,
+    };
+
+    #[test]
+    fn a_zones_quota_is_its_llm_limits() {
+        let l: crate::manifest::LlmSpec =
+            serde_yaml::from_str("{ max_requests: 7, max_output_tokens: 70, max_input_tokens: 700 }").unwrap();
+        assert_eq!(ModelQuota::of_zone(&l), ModelQuota { requests: 7, output_tokens: 70, input_tokens: Some(700) });
+    }
+
+    #[test]
+    fn committed_and_remaining_add_every_part_once() {
+        assert_eq!(C.requests_committed(), 6);
+        assert_eq!(C.output_committed(), 100);
+        assert_eq!(C.input_committed(), 600);
+        assert_eq!(C.remaining(Q), (4, 900));
+        assert_eq!(C.remaining_input(Q), Some(4400));
+        assert_eq!(C.remaining_input(ModelQuota { input_tokens: None, ..Q }), None);
+        // Past the budget: nothing left, never wrapped.
+        let over = Counts { requests: 20, output_tokens: 2000, input_total: 9000, ..Counts::default() };
+        assert_eq!((over.remaining(Q), over.remaining_input(Q)), ((0, 0), Some(0)));
+        // A sum that would pass u64::MAX is all of any budget.
+        let huge = Counts { requests: u64::MAX, reserved_requests: 1, ..Counts::default() };
+        assert_eq!(huge.requests_committed(), u64::MAX);
+    }
+
+    #[test]
+    fn a_slice_adds_a_part_of_each_limit_within_what_is_left() {
+        let s = C.slice(Q, |max| max / 10);
+        assert_eq!(s, Slice { requests: 1 + 1, output_tokens: 10 + 100, input_tokens: Some(100 + 500) });
+        // The part is capped by what is left.
+        let s = C.slice(Q, |max| max);
+        assert_eq!(s, Slice { requests: 1 + 4, output_tokens: 10 + 900, input_tokens: Some(100 + 4400) });
+        assert_eq!(C.slice(ModelQuota { input_tokens: None, ..Q }, |m| m).input_tokens, None);
+        assert_eq!((part(10, 0.25), part(1000, 0.25), part(0, 0.25), part(3, 0.5)), (3, 250, 1, 2));
+    }
+
+    #[test]
+    fn a_slice_is_renewed_when_less_than_half_of_it_is_left_or_the_next_is_lower() {
+        let s = |r, o, i| Slice { requests: r, output_tokens: o, input_tokens: i };
+        let spent = |r, o| Spent { requests: r, output_tokens: o, ..Spent::default() };
+        let next = s(12, 1200, Some(12_000));
+        assert_eq!(Slice::renewed(None, next, Spent::default(), 0), next, "the first");
+        let cur = s(10, 1000, Some(10_000));
+        // Renewed once twice what is left of `cur` is less than what `next` would leave:
+        // (10 - u) * 2 < 12 - u from u = 9; likewise 801 output and 8001 input tokens.
+        assert_eq!(Slice::renewed(Some(cur), next, spent(8, 800), 8000), cur);
+        assert_eq!(Slice::renewed(Some(cur), next, spent(9, 0), 0), next);
+        assert_eq!(Slice::renewed(Some(cur), next, spent(0, 801), 0), next);
+        assert_eq!(Slice::renewed(Some(cur), next, spent(0, 0), 8001), next, "input tokens too");
+        // A lower next is taken at once, limit by limit.
+        assert_eq!(Slice::renewed(Some(cur), s(9, 1200, Some(12_000)), spent(0, 0), 0), s(9, 1200, Some(12_000)));
+        assert_eq!(Slice::renewed(Some(cur), s(12, 999, Some(12_000)), spent(0, 0), 0), s(12, 999, Some(12_000)));
+        assert_eq!(Slice::renewed(Some(cur), s(12, 1200, Some(9999)), spent(0, 0), 0), s(12, 1200, Some(9999)));
+        assert_eq!(Slice::renewed(Some(cur), cur, spent(0, 0), 0), cur, "the same is kept");
+        let uncapped = s(10, 1000, None);
+        assert_eq!(Slice::renewed(Some(uncapped), s(12, 1200, None), spent(0, 0), 1 << 40), uncapped);
+    }
+
+    #[test]
+    fn spent_since_is_per_field_and_saturates() {
+        let a = Spent { requests: 5, input_tokens: 50, cache_read_tokens: 6, cache_creation_tokens: 7, output_tokens: 8 };
+        let b = Spent { requests: 2, input_tokens: 60, cache_read_tokens: 1, cache_creation_tokens: 2, output_tokens: 3 };
+        assert_eq!(a.since(b), Spent { requests: 3, input_tokens: 0, cache_read_tokens: 5, cache_creation_tokens: 5, output_tokens: 5 });
+    }
+
+    #[test]
+    fn a_counter_reads_what_it_holds() {
+        let k = counter(C);
+        assert_eq!(k.counts(), C);
+        k.cache_read_tokens.store(5, SeqCst);
+        k.cache_creation_tokens.store(7, SeqCst);
+        assert_eq!(k.input_total(), 112);
+        assert_eq!(k.spent(), Spent { requests: 1, input_tokens: 100, cache_read_tokens: 5, cache_creation_tokens: 7, output_tokens: 10 });
+        assert_eq!(k.spent_charged().output_tokens, 50, "in flight charged in full");
+        assert!(format!("{k:?}").starts_with("Counter(Counts { requests: 1"));
+        k.merge_spent(Spent { requests: 9, input_tokens: 1, cache_read_tokens: 6, cache_creation_tokens: 1, output_tokens: 11 });
+        assert_eq!(k.spent(), Spent { requests: 9, input_tokens: 100, cache_read_tokens: 6, cache_creation_tokens: 7, output_tokens: 11 });
+        // 9 + 2 + 3 committed of 10: nothing more to lease; 11 output tokens + 500 of what is left.
+        assert_eq!(k.next_slice(Q, 0.5), Slice { requests: 9, output_tokens: 11 + 500, input_tokens: Some(113 + 2500) });
+    }
+
+    #[test]
+    fn requests_and_reservations_count_and_stop_at_the_budget() {
+        let k = Counter::default();
+        assert_eq!(k.admit_request(), 1);
+        k.prior_requests.store(4, SeqCst);
+        assert_eq!(k.admit_request(), 6);
+        assert_eq!(k.requests.load(SeqCst), 2);
+        assert_eq!(k.reserve_output(100, 30), Some(30));
+        assert_eq!(k.reserve_output(100, 90), Some(70), "lowered to what is left");
+        assert_eq!(k.reserve_output(100, 1), None, "nothing left");
+        assert_eq!(k.inflight_output_tokens.load(SeqCst), 100);
+        k.settle(30, 1, 2, 3, 12);
+        assert_eq!(k.inflight_output_tokens.load(SeqCst), 70);
+        assert_eq!(k.spent(), Spent { requests: 2, input_tokens: 1, cache_read_tokens: 2, cache_creation_tokens: 3, output_tokens: 12 });
+        assert_eq!(k.reserve_output(100, 50), Some(18));
+        k.settle(1000, 0, 0, 0, 0);
+        assert_eq!(k.inflight_output_tokens.load(SeqCst), 0, "a release saturates at 0");
+    }
+
+    #[test]
+    fn a_carve_out_fits_exactly_or_names_the_limit_and_takes_nothing() {
+        let k = counter(Counts { inflight_output_tokens: 0, ..C });
+        // Left: 4 requests, 940 output tokens, 4400 input tokens.
+        let child = |r, o, i| ModelQuota { requests: r, output_tokens: o, input_tokens: i };
+        assert_eq!(k.carve(Q, child(5, 1, Some(1))), Err(Short::Requests));
+        assert_eq!(k.carve(Q, child(1, 941, Some(1))), Err(Short::OutputTokens));
+        assert_eq!(k.carve(Q, child(1, 1, Some(4401))), Err(Short::InputTokens));
+        assert_eq!(k.counts(), Counts { inflight_output_tokens: 0, ..C }, "a refusal takes nothing");
+        assert_eq!(k.carve(Q, child(4, 940, Some(4400))), Ok(()), "exactly what is left fits");
+        let c = k.counts();
+        assert_eq!((c.reserved_requests, c.reserved_output_tokens, c.reserved_input_tokens), (6, 960, 4600));
+        assert_eq!(k.carve(Q, child(0, 0, None)), Ok(()));
+        assert_eq!(k.carve(Q, child(1, 0, None)), Err(Short::Requests));
+        // Uncapped input: anything fits there.
+        assert_eq!(counter(Counts::default()).carve(ModelQuota { input_tokens: None, ..Q }, child(1, 1, Some(u64::MAX))), Ok(()));
+        k.uncarve(child(4, 940, Some(4400)));
+        let c = k.counts();
+        assert_eq!((c.reserved_requests, c.reserved_output_tokens, c.reserved_input_tokens), (2, 20, 200));
+        k.uncarve(child(100, 100, None));
+        assert_eq!(k.counts().reserved_requests, 0, "saturates at 0");
+        assert_eq!(k.counts().reserved_input_tokens, 200, "None gives back no input");
+        assert_eq!(
+            (Short::Requests.to_string(), Short::OutputTokens.to_string(), Short::InputTokens.to_string()),
+            ("model requests".to_string(), "output tokens".to_string(), "input tokens".to_string())
+        );
+    }
+}
+
 #[cfg(kani)]
 #[path = "proofs/budget.rs"]
 mod proofs;

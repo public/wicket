@@ -227,6 +227,20 @@ fn escape_fault(b: &[u8]) -> Option<Fault> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #326: the length cap is inclusive, and each byte the matcher can't see as written (a
+    /// backslash, a control character, DEL) is refused on its own.
+    #[test]
+    fn the_length_cap_is_inclusive_and_each_bad_byte_is_refused() {
+        let at = format!("/{}", "a".repeat(MAX_PATH - 1));
+        assert!(canonical_path(&at).is_ok());
+        assert!(matches!(canonical_path(&format!("{at}a")), Err(CanonError::TooLong(_))));
+        assert!(canonical_path(&format!("{at}?q=1")).is_ok(), "the query isn't counted");
+        for bad in ["/a\\b", "/a\u{1}b", "/a\u{1f}b", "/a\u{7f}b"] {
+            assert!(canonical_path(bad).is_err(), "{bad:?}");
+        }
+        assert!(canonical_path("/a b").is_err() && canonical_path("/a~b").is_ok());
+    }
     use super::*;
 
     /// #325 rewrote `check_plain` and `check_escapes` on bytes for Kani: they decide, and report,

@@ -35,8 +35,9 @@ box's token and the grants published to it, splice-through included) exactly as 
 audit records are shipped as `node.audit` like any node's. Its CA is the one difference in kind: a 24-hour
 intermediate with no DNS name constraint (`*`; IP addresses still excluded), since it serves whatever its
 boxes reach, while a remote node's is constrained to `--hosts`. What a node doesn't decide itself (the
-MCP gateway's relayed tools) goes to the run's own gateway (`<run dir>/ctl/gateway.sock`) over the
-node's channel. No egress goes there: since #257's slice 3 the node decides every request itself.
+control host's gateway tools: links, `decide`, `finish` and `hibernate`, operator-held requests,
+messages, capacity and update requests, spawns it doesn't start) is asked of the run's supervisor as a
+typed call over the node's channel (`Msg::Call`, protocol 13, #257). No egress goes there: since #257's slice 3 the node decides every request itself.
 
 Sharing the filesystem is used only as transport:
 

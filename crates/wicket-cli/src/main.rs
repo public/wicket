@@ -23,6 +23,7 @@ mod health;
 mod hibernate;
 mod image;
 mod images_policy;
+mod invariants;
 mod links;
 mod localnode;
 mod mock;
@@ -395,6 +396,15 @@ enum Cmd {
         /// The agent image to check [default: the default harness's agent image].
         #[arg(long)]
         image: Option<String>,
+        /// Instead, check this installation's ledger for #321's invariants (#326): every allowed
+        /// egress request had a reach rule or a live grant, no run's model spend passed its budget,
+        /// and no node ran past its lease. Read only; exits non-zero on any violation.
+        #[arg(long)]
+        invariants: bool,
+        /// With --invariants: how long past a lease's end a run or the lease may still have ended
+        /// (the reconciler's cadence), in seconds.
+        #[arg(long, default_value_t = 600, requires = "invariants")]
+        lease_grace: i64,
     },
     /// Nodes (#16, #37), machines that run boxes: leased from a provider (create, release, plans) or
     /// your own (one-time join tokens, enrolment with a pinned ssh host key, a node key and a

@@ -75,7 +75,6 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `ctl/holdings.json` | The secrets released to the run's node and its budget slice. |
 | `ctl/link.json` | Whether the run's supervisor is connected to its node (and since when), the node's size at the last connect, and the model spend the node last reported: what `wicket top` shows. |
 | `ctl/attach.log` | The log of a supervisor that adopted the run (`wicket attach`). |
-| `ctl/gateway.sock` | The run's own gateway, which its node reaches for the gateway tools it relays. The model and egress proxies run only on the node (#257); nothing listens on `ctl/egress.sock` since slice 3. |
 | `sock/` | The box's sockets: egress, model, gateway, QUIC, links, `stdin.sock`. |
 | `tmp/`, `state/` | A long-lived agent's `/tmp` and `/wicket/state` (`$HOME` and Claude Code's config). |
 | `children/` | Logs of the children it started. |
