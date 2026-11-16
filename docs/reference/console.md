@@ -95,9 +95,13 @@ doesn't include `capacity` may not issue or renew one.
 
 ## Sessions
 
-A running ACP agent's session, live, on its own page (#327): `/session?run=<run>`, opened from the
-run's *session* link in **Runs** (shown for running ACP runs, whose supervisor keeps
-`acp-client.jsonl`). How-to: [work with a running agent in the console](../how-to/work-with-a-running-agent-in-the-console.md).
+A running agent's session, live, on its own page (#327): `/session?run=<run>`, opened from the
+run's *session* link in **Runs** (shown for running runs whose supervisor keeps `acp-client.jsonl`:
+ACP agents, and Claude Code runs started since #364). A Claude Code run speaks stream-json, not ACP:
+wicket keeps its raw stream and translates it to ACP when the page reads it (the Claude adapter's
+session view, `claude-stream-json`), so the page shows the same messages, thoughts, tool calls
+with their input and results, plans (from `TodoWrite`), prompts, permission outcomes and turn
+ends. Its thinking appears only as Claude Code reports it, and partial messages aren't shown. How-to: [work with a running agent in the console](../how-to/work-with-a-running-agent-in-the-console.md).
 
 **What the page shows,** as it streams:
 - the agent's messages and thoughts (thoughts folded), as plain text: no markdown or HTML is
@@ -339,6 +343,15 @@ approvals](../how-to/get-notified-of-approvals.md) sets it up.
   also gets that request's agent and method, host and path (`lead asks GET api.example.com/x`,
   cleaned of control and bidi characters and cut to 200 characters). Reasons, attributions and
   identities are never sent. Push services see only ciphertext, its size and when it was sent.
+- **Runs** (#364). A device is also told when an agent's turn ends (its run goes from busy to idle:
+  it waits for you) and when a run ends: finished, or ended otherwise with the first word of its
+  status (`timeout`, `lost`, `failed`, …). Not for a hibernation, or a run another activation
+  superseded. These carry `Topic: wicket-runs`, `Urgency: normal`, and their own notification (tag
+  `wicket-runs`), so they never replace a request's; they are coalesced per device as requests are.
+  The payload says what happened and the run's id; a device with details on also gets the agent's
+  name. Nothing the agent said is ever sent. **While you have that run's session open** in the
+  console, your devices get none about it; when wicket can't tell, they get them (it fails open).
+  Tapping one opens `/#runs/<run>`.
 - **Tapping a notification** focuses the console if it is open and marks that request's card, or
   opens `/#pending/<id>`. Approving still needs a sign-in and a passkey signature, as always.
 - **A replaced subscription.** A browser may replace a device's subscription (Chrome and Firefox

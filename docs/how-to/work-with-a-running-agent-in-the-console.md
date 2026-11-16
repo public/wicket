@@ -17,7 +17,7 @@ You need:
 ## 1. Open the session
 
 1. Sign in to the console.
-2. In **Runs**, follow the run's **session** link. Only running ACP runs have one.
+2. In **Runs**, follow the run's **session** link. Running ACP runs and Claude Code runs (started since #364) have one.
 3. Tap **Open session**. The confirmation at the top of the screen says what your passkey signs:
    *Open run_…'s session as spiffe://…/op/passkey/<name> · agent …*. Check the run, then tap **Sign
    with passkey** and use your passkey.
