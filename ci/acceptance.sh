@@ -42,6 +42,9 @@
 #     runs, and their next turns reach the model and the gateway; then each node's `serve` alone is
 #     killed and restarted, and the same boxes take one more turn each;
 #   - a box over its memory limit is killed by the kernel, and its run says so (#185);
+#   - a box that tries every way out of its reach is refused each time, a canary on the host sees
+#     nothing, and its audit allows only what its zone does (#326);
+#   - `wicket doctor --invariants` over the whole ledger (#326);
 #   - `wicket audit --verify`, and audit export to a JSON-lines sink checked with `--against` (a
 #     tampered copy of the export is refused).
 #
@@ -496,6 +499,66 @@ grep -E "box ended|run $oom_run" "$work/oom.log" | sed 's/^/   /' || true
 check "a box over its memory limit ends saying so: out of memory, with its limit" 'grep -q "out of memory (limit 128 MiB" "$work/oom.log" && grep -q "failed (exit status: 137; killed: out of memory" "$work/oom.log"'
 check "  and the audit's run.end and the node's record carry the cause" 'w audit --tail 400 | grep run.end | grep "$oom_run" | grep -q "out of memory" && w audit --tail 400 | grep "$oom_run" | grep -q "box.exit_cause"'
 
+# ---- 3d. a box trying to get out of its reach (#326) ----
+# escape.sh tries every way out it can (other hosts, methods and paths, the host's own addresses,
+# cloud metadata, a CONNECT tunnel, raw sockets, DNS, the forwarder's other ports, the model and
+# gateway endpoints, its read-only files, a user namespace). Each attempt must be refused; a canary
+# HTTP server on the host (on all its addresses) must see nothing; and the run's audit must allow only
+# what its zone does, GET example.com/.
+log "a box trying to get out of its reach"
+canary_port=$(free_port)
+host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+: >"$work/canary.log"
+python3 -I - "$canary_port" "$work/canary.log" <<'PY' &
+import http.server, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class Canary(http.server.BaseHTTPRequestHandler):
+    def hit(self):
+        with open(log, "a") as f:
+            f.write(f"{self.client_address[0]} {self.command} {self.path}\n")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"canary")
+    do_GET = do_POST = do_PUT = do_CONNECT = do_HEAD = hit
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer(("0.0.0.0", port), Canary).serve_forever()
+PY
+pids+=("$!")
+wait_for 10 "(exec 3<>/dev/tcp/127.0.0.1/$canary_port) 2>/dev/null" || true
+# The check's own probe isn't a box's: start the log empty.
+: >"$work/canary.log"
+esc_ws=$(workdir escape)
+sed -i "s/HOST_IP/${host_ip:-127.0.0.1}/g; s/CANARY_PORT/$canary_port/g" "$esc_ws/escape.sh"
+HOME=$HOMEW "$W" run "$(manifest escape)" --workdir "$esc_ws" --image "$IMAGE_TAG" >"$work/escape.log" 2>&1 || true
+esc_run=$(run_id_of "$work/escape.log")
+our_runs+=("$esc_run")
+esc_out() { data "runs/$esc_run/workspace/out/escape.log" 2>/dev/null; }
+esc_out | sed 's/^/   /'
+# The run's allowed egress, from the audit: the control host's own records and its nodes' (whose
+# body is the node's record, as a string).
+esc_allowed() {
+  w audit --tail 20000 | python3 -I -c '
+import json, sys
+run = sys.argv[1]
+for line in sys.stdin:
+    f = line.split(None, 4)
+    if len(f) < 5 or f[3] != run:
+        continue
+    try:
+        b = json.loads(f[4])
+        if f[2] == "node.audit":
+            b = json.loads(b["body"]) if b.get("kind") == "op" else {}
+    except (ValueError, KeyError, TypeError):
+        continue
+    if b.get("kind") == "egress" and b.get("outcome") in ("allow", "spliced"):
+        print(b.get("method"), b.get("host"), b.get("path"))
+' "$esc_run"
+}
+check "a box trying to get out: every attempt refused, none ESCAPED" '[ "$(esc_out | grep -c " blocked ")" -ge 25 ] && ! esc_out | grep -q " ESCAPED "'
+check "  and the canary on the host's addresses saw no request" '[ ! -s "$work/canary.log" ]'
+check "  and its audit allowed nothing but GET example.com/" '! esc_allowed | grep -vxq "GET example.com /"'
+
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
   multihost
@@ -633,6 +696,10 @@ fi
 # ---- 6. audit ----
 log "audit"
 check "wicket audit --verify" 'w audit --verify >"$work/verify.log" 2>&1'
+# #326: #321's invariants over everything this test did: allowed egress had a rule or a grant, no
+# run passed its model budget, no node outlived its lease.
+check "wicket doctor --invariants holds over the whole ledger" 'w doctor --invariants >"$work/invariants.log" 2>&1 || { cat "$work/invariants.log"; false; }'
+sed 's/^/   /' "$work/invariants.log" 2>/dev/null || true
 if [ -n "${sink:-}" ]; then
   w audit export --once --checkpoint >"$work/export.log" 2>&1 || cat "$work/export.log"
   [ "$mode" = dev ] || sudo -n cat "$work/sink/audit.jsonl" >"$sink"
