@@ -469,4 +469,42 @@ mod tests {
         assert_eq!(f, ["budget: 3 model calls went through, budget 2", "budget: 110 output tokens, budget 100"]);
         let _ = std::fs::remove_dir_all(d);
     }
+    #[test]
+    fn no_run_outlasts_its_lease() {
+        let mut l = ledger();
+        let d = tmp("lease");
+        let now = wicket_store::now();
+        let lease = wicket_store::LeaseRow {
+            id: "l-inv".into(),
+            tenant: "default".into(),
+            run: RUN.into(),
+            request_id: None,
+            provider: "static".into(),
+            spec: json!({}),
+            hourly_cap: 0,
+            reserved: 0,
+            duration_secs: 3600,
+            created_at: now - 9000,
+            not_after: Some(now - 5000),
+            status: "active".into(),
+            node_id: None,
+            node_name: None,
+            ssh_target: None,
+            host_key: None,
+            billed: None,
+            ended_at: None,
+            detail: None,
+        };
+        let budget = wicket_store::LeaseBudget { max_hourly: i64::MAX, max_total: i64::MAX };
+        l.create_lease(&lease, budget).unwrap().unwrap();
+        // As the reconciler does: active once its node is up, with the end its billing sets.
+        assert!(l.lease_transition("l-inv", &["pending"], "active", "test").unwrap());
+        assert!(l.set_lease_not_after("l-inv", now - 5000).unwrap());
+        l.set_run_lease(RUN, "l-inv").unwrap();
+        let f = check(&l, &d, 600, now).unwrap().findings;
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].what.contains("ran on lease l-inv until") && f[0].what.contains("5000s past its end"), "{f:?}");
+        assert!(check(&l, &d, 6000, now).unwrap().findings.is_empty(), "within the grace");
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
