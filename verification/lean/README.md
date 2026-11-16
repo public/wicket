@@ -13,6 +13,24 @@ definitions as an oracle that wicket-core's decisions are checked against.
 | `Wicket/Canon.lean` | `canon::canonical_path` | `upstream_eq`: an upstream that percent-decodes and resolves dot segments, in either order, names the canonical path's segments; `decode_eq_unreserved`: no escape spells an unreserved character; `reach_no_escape`, `forbid_no_escape`: a canonical path can't get out from under a rule `Q/**` |
 | `Wicket/Grant.lean` | `grant::within_authority`, `check_terms`, `agent_terms`, `outlasts`, `operators::may_decide` | `agent_grant_within`: every use an agent's grant permits is one the agent's own zone allows by reach, by a strict descendant, before the agent's authority ends, for one or more uses; `grant_within_ancestor`: and within every zone the agent's is within; `agent_renewal_within`; `operator_within` (#320) |
 
+## What it doesn't cover
+
+The proofs are about the Rust functions in the table, restated in Lean, and the oracle checks that
+wicket-core decides as the spec does on its fixtures and generated cases. They don't cover:
+
+- **The Biscuit evaluator** that decides requests on nodes (the vendored, patched `biscuit-auth`,
+  its compiled evaluator and the structural check). It is tested, not proved:
+  `crates/wicket-authz/tests/integration/oracles.rs` checks token decisions against wicket-core's
+  `CompiledZone::evaluate` (single blocks and random chains), and the compiled evaluator against the
+  fork's generic engine and its unpatched `AuthorizerBuilder` path. Nothing compares it with the
+  upstream crate itself.
+- **The Cedar compiler** (org and zone policies to token checks): differentially tested against
+  Cedar's own evaluation, not proved.
+- **Which path builds a child's token.** `check_within` is about `subset::check`; a spawn its node
+  decides is also narrowed by the spawn block appended to its parent's token, which the proofs don't
+  model.
+- Everything else: the proxies, parsing, the ledger, the feed's signatures and the node's replica.
+
 ## What the spec takes as given
 
 - **Pure inputs.** An op's risk (`classify`) and whether its host is never reachable

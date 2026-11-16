@@ -477,6 +477,31 @@ pub struct VolumeSpec {
     /// What happens to it when an agent hibernates (#70).
     #[serde(default)]
     pub persist: Persist,
+    /// Kept on the node across runs, shared by the zone's runs (#377). Not kept (the default), it
+    /// is the run's own cache: empty when the run starts, and deleted once its work is collected,
+    /// or [`Self::retention`] after the run ends if it never is.
+    #[serde(default)]
+    pub keep: bool,
+    /// For a kept volume, how long it may go unused before the node deletes it (none: never); for
+    /// a run's cache, how long after the run ends it is kept if the run's work isn't collected
+    /// (default [`CACHE_RETENTION`]). A duration: `12h`, `7d`.
+    #[serde(default)]
+    pub retention: Option<String>,
+}
+
+/// How long after its run ends a run's cache volume is kept if the run's work is never collected.
+pub const CACHE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+impl VolumeSpec {
+    /// [`Self::retention`] as a duration: a kept volume's (None: kept forever), or a cache's (its
+    /// default if unset).
+    pub fn retention(&self) -> Result<Option<std::time::Duration>, ManifestError> {
+        match &self.retention {
+            Some(r) => humantime::parse_duration(r).map(Some).map_err(|_| ManifestError::Duration(r.clone())),
+            None if self.keep => Ok(None),
+            None => Ok(Some(CACHE_RETENTION)),
+        }
+    }
 }
 
 /// A volume's class when an agent hibernates.
@@ -557,6 +582,11 @@ pub struct LlmSpec {
     /// Allow server-side tools (web search/fetch). They bypass the egress proxy, so default false.
     #[serde(default)]
     pub allow_server_tools: bool,
+    /// The models a box may call (#366): each an exact name (`claude-opus-4-5`) or a prefix ending
+    /// in `*` (`claude-sonnet-*`). The model proxy refuses a call naming any other, or none. Left
+    /// out: any model the credential reaches. A zone a box starts may only narrow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
 }
 
 /// A harness's default model route: what its adapter fills into a zone's `llm` where the manifest
@@ -586,6 +616,39 @@ impl LlmSpec {
             .into_iter()
             .find(|(_, v)| v.trim().is_empty())
             .map(|(k, _)| k)
+    }
+}
+
+impl LlmSpec {
+    /// Whether the zone lets a box call `model` ([`LlmSpec::models`]).
+    pub fn allows_model(&self, model: &str) -> bool {
+        self.models.as_ref().is_none_or(|ms| ms.iter().any(|m| model_covers(m, model)))
+    }
+
+    /// Whether every entry of `models` is a model name or a prefix ending in its only `*`.
+    pub fn check_models(&self) -> Result<(), ManifestError> {
+        for m in self.models.iter().flatten() {
+            let name = m.strip_suffix('*').unwrap_or(m);
+            let ok = !m.is_empty()
+                && m.len() <= 128
+                && !name.contains('*')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@/".contains(c));
+            if !ok {
+                return Err(ManifestError::Invalid(format!(
+                    "zone.llm.models: {m:?} is neither a model name nor a prefix ending in '*' (letters, digits, '-', '_', '.', ':', '@', '/')"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
+/// name, or a pattern of its own, for which it covers every name `other` covers.
+pub fn model_covers(pattern: &str, other: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => other.starts_with(prefix),
+        None => pattern == other,
     }
 }
 
@@ -790,6 +853,7 @@ impl Manifest {
         self.zone.limits.authority()?;
         self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
+        self.zone.llm.as_ref().map_or(Ok(()), LlmSpec::check_models)?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
         let own = self.agent.as_ref().and_then(|a| a.image.as_deref()).map(|i| ("agent.image", i));
@@ -823,6 +887,14 @@ impl Manifest {
                 }
                 // Whether the agent's harness takes a model route (`zone.llm`), its default route, and
                 // which ACP profiles exist are its adapter's: `wicket_agent::load` checks them.
+                if let (Some(m), Some(l)) = (&a.model, &self.zone.llm) {
+                    if !l.allows_model(m) {
+                        return Err(ManifestError::Invalid(format!(
+                            "agent.model {m:?} is not in zone.llm.models ({}): every call it made would be refused",
+                            l.models.as_deref().unwrap_or_default().join(", ")
+                        )));
+                    }
+                }
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
@@ -902,6 +974,13 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!(
                     "volume {:?} at {:?}: names are [a-z0-9-]+ and unique; paths live under /volumes/",
                     v.name, v.path
+                )));
+            }
+            v.retention()?;
+            if v.keep && v.persist == Persist::Durable {
+                return Err(ManifestError::Invalid(format!(
+                    "volume {:?}: a durable volume is the agent's own and goes with its state; `keep` is for volumes the node keeps",
+                    v.name
                 )));
             }
         }
@@ -1172,6 +1251,17 @@ zone:
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /workspace/x }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: data, path: /volumes/../etc }")).is_err());
         assert!(Manifest::from_yaml(&vol("{ name: a, path: /volumes/a }, { name: a, path: /volumes/b }")).is_err());
+        // #377: a volume is the run's cache unless it is kept; each has a retention.
+        let v = |y: &str| Manifest::from_yaml(&vol(y)).map(|m| m.zone.volumes[0].clone());
+        let cache = v("{ name: data, path: /volumes/data }").unwrap();
+        assert!(!cache.keep);
+        assert_eq!(cache.retention().unwrap(), Some(CACHE_RETENTION));
+        let kept = v("{ name: data, path: /volumes/data, keep: true }").unwrap();
+        assert_eq!(kept.retention().unwrap(), None, "kept forever");
+        let kept = v("{ name: data, path: /volumes/data, keep: true, retention: 30d }").unwrap();
+        assert_eq!(kept.retention().unwrap(), Some(std::time::Duration::from_secs(30 * 86400)));
+        assert!(v("{ name: data, path: /volumes/data, retention: soon }").is_err());
+        assert!(v("{ name: data, path: /volumes/data, keep: true, persist: durable }").is_err());
     }
 
     #[test]

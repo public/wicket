@@ -72,7 +72,9 @@ exec "$REAL_FWD" "${args[@]}""#,
     script(
         &bin.join("prog"),
         r#"readlink /proc/$$/fd/* > "$ROOT/prog.fds" || :
-printf 'args %s\ncert %s\n' "$*" "$SSL_CERT_FILE" > "$ROOT/prog.out""#,
+printf 'args %s\ncert %s\n' "$*" "$SSL_CERT_FILE" > "$ROOT/prog.out"
+printf '%s\n' "$PIP_CERT" "$AWS_CA_BUNDLE" "$CARGO_HTTP_CAINFO" "$DENO_CERT" "$CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE" "$NIX_SSL_CERT_FILE" \
+  "$JAVA_TOOL_OPTIONS" > "$ROOT/prog.env""#,
     );
     root
 }
@@ -136,6 +138,11 @@ fn starts_the_program_once_the_forwarder_listens_and_records_each_step() {
     assert_eq!(std::fs::read_to_string(root.join("ca-bundle.pem")).unwrap(), "ROOTS\nRUN CA\n");
     let prog = std::fs::read_to_string(root.join("prog.out")).unwrap();
     assert_eq!(prog, "args a b c\ncert /tmp/ca-bundle.pem\n");
+    // #366: the tools with CA variables of their own, and a JVM's proxy.
+    let env = std::fs::read_to_string(root.join("prog.env")).unwrap();
+    let lines: Vec<&str> = env.lines().collect();
+    assert_eq!(lines[..6], ["/tmp/ca-bundle.pem"; 6], "{env}");
+    assert_eq!(lines[6], "-Dhttp.proxyHost=wicket.internal -Dhttp.proxyPort=3128 -Dhttps.proxyHost=wicket.internal -Dhttps.proxyPort=3128");
     let pipes = std::fs::read_to_string(root.join("fwd.pipes")).unwrap();
     let fds = std::fs::read_to_string(root.join("prog.fds")).unwrap();
     assert_eq!(pipes.lines().filter(|p| p.starts_with("pipe:")).count(), 2, "{pipes}");

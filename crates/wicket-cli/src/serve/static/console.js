@@ -275,6 +275,15 @@ function line(op) {
   return el("div", "", op.kind);
 }
 
+// A node's latest health report (#377): disk, memory, what went wrong, and what is alerted.
+function healthRow(n) {
+  const d = el("div", "row");
+  d.append(el("span", "mono", strip(n.node)));
+  d.append(el("span", (n.alerts || []).length ? "blocked" : "", strip(n.summary) + " · reported " + whenMs(n.received_ms)));
+  for (const a of n.alerts || []) d.append(el("div", "blocked", "! " + strip(a)));
+  return d;
+}
+
 // A node from `wicket node create` (#294): past its lease it is released by the reconciler, unless
 // a run still holds it, which is a warning until renewals exist (#56).
 function placedRow(p) {
@@ -724,7 +733,7 @@ function grantsView(g) {
   for (const h of g.hosts) out.push(kvRow(h.mode, h.host + (h.mode === "spliced" ? " (every method and path; not inspected)" : " (" + h.why + ")"), h.mode === "spliced" ? "pend" : "mono"));
   for (const f of g.forbid) out.push(kvRow("forbid", f.host + " " + (f.paths || ["everything"]).join(" "), "blocked"));
   for (const i of g.inject) out.push(kvRow("inject", "secret " + i.secret + " → " + i.host + " " + i.header + (i.secret_set ? "" : " · NOT SET in the vault") + (i.bound_to_host ? "" : " · not bound to this host") + (i.optional ? " · optional" : ""), i.secret_set && i.bound_to_host ? "mono" : "pend"));
-  if (g.llm) out.push(kvRow("model", g.llm.provider + " via " + g.llm.upstream + " · secret " + g.llm.secret + (g.llm.secret_set ? "" : " (NOT SET)") + " · " + g.llm.max_requests + " requests, " + g.llm.max_output_tokens + " output tokens" + (g.llm.max_input_tokens != null ? ", " + g.llm.max_input_tokens + " input tokens" : "")));
+  if (g.llm) out.push(kvRow("model", g.llm.provider + " via " + g.llm.upstream + " · secret " + g.llm.secret + (g.llm.secret_set ? "" : " (NOT SET)") + " · " + g.llm.max_requests + " requests, " + g.llm.max_output_tokens + " output tokens" + (g.llm.max_input_tokens != null ? ", " + g.llm.max_input_tokens + " input tokens" : "") + (g.llm.models ? " · models: " + (g.llm.models.length ? g.llm.models.join(", ") : "none") : "")));
   for (const v of g.volumes) out.push(kvRow("volume", JSON.stringify(v)));
   out.push(kvRow("limits", JSON.stringify(g.limits)));
   const o = g.org_policy;
@@ -946,6 +955,8 @@ async function refresh() {
     document.getElementById("tenant").textContent = "tenant " + s.tenant;
     renderPending(s);
     renderRows("runs", s.runs, x => renderRun(s, x), "No runs yet.");
+    renderRows("health", ((s.health || {}).nodes) || [], healthRow, "No node has reported its health yet.");
+    if (s.health && s.health.control_disk_pct > 85) document.getElementById("health").prepend(el("div", "blocked", "! the control host's disk is " + s.health.control_disk_pct + "% full"));
     renderRows("placed", s.placed || [], placedRow, "No placed nodes.");
     renderRows("capacity", s.capacity || [], capacityRow, "No capacity grants: every `wicket node create` waits for a decision.");
     renderCapacityForm();

@@ -638,13 +638,18 @@ fn card(kind: &str, name: &str, image: &str, cm: &Manifest, violations: &[String
     };
     let model = match &z.llm {
         Some(l) => format!(
-            "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens, {} input tokens{}",
+            "model route {} via {} with secret {} (this zone's own), {} requests, {} output tokens, {} input tokens, {}{}",
             clip(&l.provider, 40),
             clip(&l.upstream, 200),
             clip(&l.secret, 80),
             l.max_requests,
             l.max_output_tokens,
             l.max_input_tokens.map(|i| i.to_string()).unwrap_or_else(|| "uncapped".into()),
+            match &l.models {
+                None => "any model".to_string(),
+                Some(ms) if ms.is_empty() => "no models".to_string(),
+                Some(ms) => format!("models {}", clip(&ms.join(", "), 200)),
+            },
             if l.allow_server_tools { ", server-side tools allowed" } else { "" }
         ),
         None => "no model route".into(),

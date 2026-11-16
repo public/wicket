@@ -115,10 +115,21 @@ not a permanent decision.
   CI), not proven. A policy change reaches running boxes only when `wicket policy apply` revokes them
   (or at their token's end, with `--keep-runs`). SymCC treats path globs as opaque, so a changed glob
   reads as "may widen".
-- **Spawn chains aren't used on nodes yet.** A child run on a node gets its own block 0 from its zone
-  (checked as a subset by `spawn`), not a spawn block appended to its parent's token. So revoking a
-  parent's block on a node doesn't by itself revoke a child there; the run revocation does
-  ([#102](https://github.com/public/wicket/pull/102)).
+- **Two kinds of child token.** A spawn its node decides (#164: on the parent's node, within its
+  authority) appends a spawn block to the parent's token, so revoking any of the parent's blocks revokes
+  the child too. A spawn the control host decides (placed elsewhere, approved beyond the parent's zone,
+  or after the parent's authority was renewed) gets a fresh block 0 after `subset::check`, as does a
+  node-started child once the control host adopts it. Revoking a parent's block doesn't by itself revoke
+  those; revoking the parent's run does ([concepts](concepts.md#authority-biscuit-tokens-and-the-feed)).
+- **What is proved, and what is tested.** The Lean spec (`verification/lean`, #322) proves properties of
+  the Rust it restates: `subset::check` and `reach_within`, `grant::within_authority` and
+  `operators::may_decide`, `CompiledZone::evaluate`, the glob, host and path matchers and
+  `canonical_path`; an oracle test checks wicket-core's decisions against it. It doesn't cover the
+  Biscuit evaluator that decides on nodes, the Cedar compiler, the proxies' parsing or anything else.
+  The evaluator is tested, not proved: token decisions against `CompiledZone::evaluate`, and the fork's
+  compiled evaluator against the fork's own generic engine and its unpatched `AuthorizerBuilder` path
+  (oracles 1–3 in `crates/wicket-authz/tests/integration/oracles.rs`). Nothing compares it with the
+  upstream crate itself. Kani harnesses (#325) check some of the same Rust functions on bounded inputs.
 - **At most 10 live grants per box on a node,** and a used-up grant holds its slot until it expires.
   A path-prefix grant is honoured on a node for the asked path only
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102)).
@@ -195,14 +206,37 @@ not a permanent decision.
 - **The join token is visible in `ps`** and shell history when passed as `--token`. It is single-use
   and short-lived ([#85](https://github.com/public/wicket/pull/85)).
 - **What doesn't work on remote nodes yet:** wrapped sessions (`wicket wrap` runs on the control host's
-  own node), a host outside the node CA's name constraints that the box's token doesn't allow wholesale
-  (refused since #257's slice 3; widen the node's CA with `wicket node renew-ca`), and tool decisions on
-  the node: the
-  gateway runs on the node (#151) but relays every call to the control host, which decides the tools;
-  while it is away only MCP's own handshake answers. Egress events from a disconnected period reach the audit log, not the live console
+  own node), and a host outside the node CA's name constraints that the box's token doesn't allow wholesale
+  (refused since #257's slice 3; widen the node's CA with `wicket node renew-ca`).
+- **A node decides only some tools.** Since #164 the node answers `whoami`, `request_access`,
+  `await_grant`, `pending_requests` and spawns within the box's authority (placed on that node) from
+  the box's token, connected or not. While the control host is away it also delivers `send_message` and
+  `await_message` between its own boxes, and queues `request_capacity`, `request_update` and what
+  needs an operator. Every other tool (`link`, `expose`, `connect`, messages while connected, …) is
+  relayed to the control host, and fails clearly while it is away ([MCP tools](../reference/mcp-tools.md), [nodes](../reference/nodes.md)).
+  Egress events from a disconnected period reach the audit log, not the live console
   ([#88](https://github.com/public/wicket/pull/88), [#102](https://github.com/public/wicket/pull/102),
   [#103](https://github.com/public/wicket/pull/103)). A link to a box on a remote node passes through the
   control host, and each connection into the target box costs a `docker exec` there.
+
+- **No size cap on a box's volumes** ([#377](https://github.com/public/wicket/issues/377)). A volume is
+  a host directory bind-mounted into the box, and neither Docker nor gVisor caps a bind mount's
+  size. Docker's `--storage-opt size` caps only a container's own writable layer, and only on
+  overlay2 over XFS with project quotas (or devicemapper). A volume driver's `size` option is
+  either memory (tmpfs) or needs a loopback filesystem per volume, made as root. So a box can fill
+  its node's disk through a volume. What bounds the damage: the node's reserve (its own state can
+  still be written, and its feed recovers once space frees), admission (no new box starts below
+  the disk floor), the health alert at 85%, and per-run caches deleted once collected.
+- **Admission reckons with what is free when a box starts.** A box's limit is checked against the
+  memory available then, less what the running boxes may still take. Memory used outside the boxes
+  afterwards (another process on the node, the page cache that isn't reclaimable) can still bring the
+  OOM killer. Pids aren't checked against the machine: each box has its own `pids` limit.
+- **Health needs a connection.** A node reports its health only on its control connections, so a
+  node with no run connected reports nothing, and the console can't tell a full disk on a silent
+  node from no news. A report older than 10 min raises no disk or feed alert.
+- **An uncollected workspace stays.** A remote node keeps the workspace of a run whose work was
+  never collected (no fetch, outbox, push or bundle) until an operator forces its deletion. Such
+  workspaces use the node's disk until then: the alert at 85% is what tells you.
 
 ## Hibernated agents
 
@@ -214,8 +248,12 @@ not a permanent decision.
   the node's channel (ssh), and on the node it is plain files in the run's directory while the box
   runs, as any box's workspace is, removed once fetched. The store is a directory in the data directory; S3 and other remote stores
   aren't supported ([#106](https://github.com/public/wicket/pull/106)).
-- **A rebuild restores files, not processes.** A box running anything besides the agent stays paused
-  instead of hibernating.
+- **Hibernation keeps files, not processes.** A bundle holds the box's writable files (workspace,
+  state, `/tmp`, durable volumes); a wake rebuilds the box from them and resumes the agent's session.
+  Nothing in memory survives: anything besides the agent still running at hibernation (a build, a dev
+  server) gets the zone's `limits.exit_grace` to end, is then stopped and named in `wicket agents`
+  (#293), and isn't restarted on wake. Restoring a memory snapshot (gVisor checkpoint) is designed but
+  not built ([#365](https://github.com/public/wicket/issues/365)).
 - **Wrapped agents (`wicket wrap`) and boxes on nodes don't hibernate.**
 - **There's no garbage collection** of agents or their bundles yet (design §13.6).
 
@@ -227,6 +265,11 @@ not a permanent decision.
 - **`wicket approve` on the host is break-glass.** It is audited as such, but it bypasses the passkey.
 
 ## Money
+
+- **Model budgets count requests and tokens, not money.** A zone's `llm` budget is `max_requests`,
+  `max_output_tokens` and `max_input_tokens`; nothing converts them to a price or caps a run's spend in
+  currency. The only money limits are placement's: the envelope in `placement.yaml` and the capacity
+  grants for nodes ([`placement.yaml`](../reference/configuration.md#placementyaml)).
 
 - **Charges aren't reconciled against the provider.** Leases record what they billed by wicket's own
   arithmetic. Nothing compares that with Vultr's invoices yet (design §8.5,
@@ -246,7 +289,8 @@ Measured numbers for the network path, and how they were measured, are in
 - **A new connection over a link takes 140–200 ms,** because each one runs `docker exec`
   ([#103](https://github.com/public/wicket/pull/103)).
 - **Waking takes seconds.** A wake rebuilds the box and resumes the session; the gVisor checkpoint fast
-  path isn't built ([#90](https://github.com/public/wicket/pull/90)).
+  path isn't built ([#90](https://github.com/public/wicket/pull/90),
+  [#365](https://github.com/public/wicket/issues/365)).
 
 ## Built, not yet run live
 

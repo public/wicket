@@ -102,7 +102,7 @@ pub struct Upstream {
 
 impl Upstream {
     pub(crate) fn lookup(&self) -> crate::dial::Lookup {
-        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()) }
+        crate::dial::Lookup { fixed: Arc::new(self.dns.clone()), own: None }
     }
 }
 
@@ -324,7 +324,22 @@ impl Egress {
         if let Some(why) = self.ctx.superseded() {
             return self.refuse(&host, &method, "/", &why);
         }
-        // Authority pinning: a Host header that disagrees with the tunnel target is an attack.
+        // Authority pinning: a Host header that disagrees with the tunnel target is an attack, and
+        // so is a second one (RFC 9112 §3.2: a server answers 400), which a server behind could read
+        // instead of the first.
+        if req.headers().get_all(http::header::HOST).iter().count() > 1 {
+            return self.refuse(&host, &method, "/", "more than one Host header");
+        }
+        // An absolute-form URL names its own authority (RFC 9112 §3.2.2: it wins over Host): inside
+        // a tunnel it must be the tunnel's target, on its port, or the request names another host
+        // than the one decided (#361).
+        if let Some(a) = req.uri().authority().filter(|_| via != Via::H3) {
+            let named = a.host().trim_end_matches('.').to_ascii_lowercase();
+            let default = if scheme == "https" { 443 } else { 80 };
+            if named != host || a.port_u16().is_some_and(|p| p != default) || req.uri().scheme_str().is_some_and(|s| s != scheme) {
+                return self.refuse(&host, &method, "/", &format!("the request's URL names {a}, not the tunnel target {host}"));
+            }
+        }
         if let Some(h) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()) {
             let h = h.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
             if !h.is_empty() && h != host {
@@ -693,6 +708,72 @@ mod tests {
         // A GET body that arrives without framing headers (HTTP/3) is caught when it is read.
         let get = http::Request::get("/x").body(http_body_util::Full::new(bytes::Bytes::from_static(b"x"))).unwrap();
         assert!(e.prepare(get, "api.github.com", "https", "/x", true).await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #361: what would upgrade, re-route or re-frame a request at the next hop never goes upstream:
+    /// WebSocket and h2c upgrades, hop-by-hop headers, proxy headers, and the box's own Host (the
+    /// upstream's is wicket's, from the URL).
+    #[tokio::test]
+    async fn upgrade_hop_by_hop_and_proxy_headers_never_go_upstream() {
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "hops");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+        let mut b = http::Request::post("/x").header("accept", "*/*");
+        for (k, v) in [
+            ("host", "evil.test"),
+            ("connection", "Upgrade, HTTP2-Settings, keep-alive"),
+            ("upgrade", "websocket, h2c"),
+            ("http2-settings", "AAMAAABkAARAAAAAAAIAAAAA"),
+            ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-protocol", "chat"),
+            ("keep-alive", "timeout=5"),
+            ("te", "trailers"),
+            ("trailer", "x-smuggled"),
+            ("proxy-authorization", "Basic eDp5"),
+            ("proxy-connection", "keep-alive"),
+            ("x-forwarded-proto", "http"),
+            ("x-real-ip", "127.0.0.1"),
+            ("via", "1.1 evil"),
+            ("expect", "100-continue"),
+        ] {
+            b = b.header(k, v);
+        }
+        let out = e
+            .prepare(b.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap(), "api.github.com", "https", "/x", true)
+            .await
+            .unwrap();
+        let names: Vec<&str> = out.headers.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["accept"], "{names:?}");
+        assert_eq!(out.url, "https://api.github.com/x");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #361: a body over the limits is refused before anything goes upstream: one read whole (an
+    /// HTTP/3 request's, which may be re-sent over HTTP/2) past [`super::MAX_REQUEST_BODY`], and a
+    /// streamed one that declares more than [`super::MAX_STREAMED_BODY`], refused without reading it.
+    #[tokio::test]
+    async fn oversized_bodies_are_refused_before_they_go_upstream() {
+        let (c, dir) = ctx("reach: [{host: api.github.com, methods: [GET, POST]}]", vec![], "big");
+        let ca = std::sync::Arc::new(crate::ca::RunCa::generate("run_x").unwrap());
+        let e = super::Egress::with(c, ca, std::sync::Arc::new(crate::zone_decider::ZoneDecider), None).unwrap();
+        // Over HTTP/3, in pieces and with no length, as a QUIC stream delivers it.
+        let piece = bytes::Bytes::from(vec![b'a'; 1 << 20]);
+        let n = super::MAX_REQUEST_BODY / piece.len() + 1;
+        let frames =
+            futures_util::stream::iter((0..n).map(move |_| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(piece.clone()))));
+        let req = http::Request::post("/upload").body(http_body_util::StreamBody::new(frames)).unwrap();
+        let Err(err) = e.forward(req, "api.github.com", "https", "/upload", super::Via::H3).await else {
+            panic!("an oversized HTTP/3 body went")
+        };
+        assert!(format!("{err:#}").contains("length limit exceeded"), "{err:#}");
+        // Streamed, declaring more than the limit: refused on the declaration alone.
+        let declared = (super::MAX_STREAMED_BODY + 1).to_string();
+        let req =
+            http::Request::post("/upload").header("content-length", declared).body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+        let err = e.prepare(req, "api.github.com", "https", "/upload", true).await.err().expect("refused");
+        assert!(format!("{err:#}").contains("request body (the limit is"), "{err:#}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

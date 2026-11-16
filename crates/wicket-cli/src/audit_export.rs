@@ -213,8 +213,118 @@ pub fn checkpoint_json(issuer: &wicket_identity::Issuer, seq: i64, head: &str, t
     })
 }
 
+/// What an exported object is as an OpenTelemetry event (#368): its event name, severity, and the
+/// standard attributes its record carries, beside wicket's own. The hash chain is the object
+/// itself (the log record's body), unchanged; these only make it readable by a collector without
+/// knowing wicket's bodies.
+///
+/// - an egress decision (`op` of kind `egress`) is `wicket.egress.decision`, with HTTP semantic
+///   conventions (`http.request.method`, `server.address`, `url.path`), the outcome, the risk class
+///   and the reason; a refusal is `WARN`, with `error.type` its outcome;
+/// - a model call (`op` of kind `llm`) is `gen_ai.client.inference.operation.details`, with the
+///   GenAI conventions (`gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`,
+///   `gen_ai.usage.input_tokens` and `.output_tokens`) and `http.response.status_code`;
+/// - a tool call (`op` of kind `tool`) is `wicket.tool.call`, with `gen_ai.operation.name`
+///   `execute_tool` and `gen_ai.tool.name`;
+/// - a human's or an agent's decision on a request (`decision`) is `wicket.approval.decision`;
+/// - anything else is `wicket.audit.<kind>`, and a checkpoint `wicket.audit.checkpoint`.
+pub fn otlp_event(it: &Value) -> (String, u8, Vec<Value>) {
+    let s = |v: &str| json!({ "stringValue": v });
+    let int = |v: u64| json!({ "intValue": v.to_string() });
+    let attr = |k: &str, v: Value| json!({ "key": k, "value": v });
+    let body = &it["body"];
+    let text = |f: &str| body[f].as_str().filter(|v| !v.is_empty());
+    let mut a = Vec::new();
+    if it["type"] == "wicket.audit.checkpoint" {
+        return ("wicket.audit.checkpoint".into(), 9, a);
+    }
+    let kind = it["kind"].as_str().unwrap_or("");
+    let op = if kind == "op" { body["kind"].as_str().unwrap_or("") } else { "" };
+    let (name, mut sev) = match (kind, op) {
+        ("op", "egress") => {
+            for (k, f) in [("http.request.method", "method"), ("server.address", "host"), ("url.path", "path")] {
+                if let Some(v) = text(f) {
+                    a.push(attr(k, s(v)));
+                }
+            }
+            ("wicket.egress.decision".to_string(), 9)
+        }
+        ("op", "llm") => {
+            a.push(attr("gen_ai.operation.name", s("chat")));
+            if let Some(p) = text("provider") {
+                a.push(attr("gen_ai.provider.name", s(p)));
+            }
+            if let Some(m) = text("model") {
+                a.push(attr("gen_ai.request.model", s(m)));
+            }
+            let (input, cached, output) = (
+                body["input_tokens"].as_u64().unwrap_or(0),
+                body["cached_tokens"].as_u64().unwrap_or(0),
+                body["output_tokens"].as_u64().unwrap_or(0),
+            );
+            // GenAI's input tokens are the whole prompt's, cached ones included.
+            a.push(attr("gen_ai.usage.input_tokens", int(input + cached)));
+            a.push(attr("gen_ai.usage.output_tokens", int(output)));
+            a.push(attr("wicket.llm.cached_tokens", int(cached)));
+            if let Some(st) = body["status"].as_u64().filter(|s| *s > 0) {
+                a.push(attr("http.response.status_code", int(st)));
+            }
+            ("gen_ai.client.inference.operation.details".to_string(), 9)
+        }
+        ("op", "tool") => {
+            a.push(attr("gen_ai.operation.name", s("execute_tool")));
+            if let Some(n) = text("name") {
+                a.push(attr("gen_ai.tool.name", s(n)));
+            }
+            ("wicket.tool.call".to_string(), 9)
+        }
+        ("decision", _) => {
+            for (k, f) in [
+                ("wicket.decision", "decision"),
+                ("wicket.request.id", "request"),
+                ("wicket.grant.id", "grant"),
+                ("wicket.decision.by", "by"),
+                ("http.request.method", "method"),
+                ("server.address", "host"),
+                ("url.path", "path"),
+            ] {
+                if let Some(v) = text(f) {
+                    a.push(attr(k, s(v)));
+                }
+            }
+            ("wicket.approval.decision".to_string(), 9)
+        }
+        ("op", other) if !other.is_empty() => (format!("wicket.audit.op.{other}"), 9),
+        _ => (format!("wicket.audit.{}", if kind.is_empty() { "record" } else { kind }), 9),
+    };
+    if kind == "op" {
+        if let Some(o) = text("outcome") {
+            a.push(attr("wicket.decision.outcome", s(&wicket_core::text::clip(o, 256))));
+        }
+        // A refusal of the box's request is a warning, its type the outcome; a model call's (whose
+        // outcome is a note) is its HTTP status.
+        let failed = match op {
+            "llm" => body["status"].as_u64().filter(|st| *st >= 400).map(|st| st.to_string()),
+            "egress" => text("outcome").filter(|o| !matches!(*o, "allow" | "spliced")).map(String::from),
+            _ => None,
+        };
+        if let Some(t) = failed {
+            a.push(attr("error.type", s(&t)));
+            sev = 13;
+        }
+        if let Some(r) = text("risk").filter(|r| *r != "-") {
+            a.push(attr("wicket.decision.risk", s(r)));
+        }
+        if let Some(d) = text("detail") {
+            a.push(attr("wicket.decision.reason", s(&wicket_core::text::clip(d, 1024))));
+        }
+    }
+    (name, sev, a)
+}
+
 /// OTLP/HTTP JSON for a batch of exported objects (records or checkpoints): one log record each,
-/// whose body is the object's JSON line.
+/// whose body is the object's JSON line, with its event name and standard attributes
+/// ([`otlp_event`]).
 pub fn otlp_body(items: &[Value], resource: &BTreeMap<String, String>) -> Value {
     let s = |v: &str| json!({ "stringValue": v });
     let observed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0).to_string();
@@ -239,11 +349,14 @@ pub fn otlp_body(items: &[Value], resource: &BTreeMap<String, String>) -> Value 
                     attrs.push(json!({ "key": k, "value": s(v) }));
                 }
             }
+            let (event, sev, extra) = otlp_event(it);
+            attrs.extend(extra);
             json!({
                 "timeUnixNano": (it["ts"].as_i64().unwrap_or(0) as i128 * 1_000_000_000).to_string(),
                 "observedTimeUnixNano": observed,
-                "severityNumber": 9,
-                "severityText": "INFO",
+                "severityNumber": sev,
+                "severityText": if sev >= 13 { "WARN" } else { "INFO" },
+                "eventName": event,
                 "body": s(&it.to_string()),
                 "attributes": attrs,
             })
@@ -1005,6 +1118,90 @@ mod tests {
         assert_eq!((a.records, a.checkpoints), (100, 1));
         drop(x);
         drop(l);
+    }
+
+    /// #368: each record is an OpenTelemetry event with standard attributes beside wicket's own:
+    /// HTTP conventions for an egress decision, GenAI conventions for a model call, and the record
+    /// itself (the chain) still the body.
+    #[test]
+    fn records_carry_event_names_and_standard_attributes() {
+        let rec = |kind: &str, body: Value| json!({ "type": "wicket.audit.record", "seq": 7, "ts": 1, "tenant": "t", "run": "run_a", "kind": kind, "body": body, "prev": "p", "hash": "h" });
+        let attrs = |v: &Value| -> BTreeMap<String, Value> {
+            v["attributes"].as_array().unwrap().iter().map(|a| (a["key"].as_str().unwrap().to_string(), a["value"].clone())).collect()
+        };
+        let items = vec![
+            rec(
+                "op",
+                json!({ "kind": "egress", "method": "POST", "host": "api.github.com", "path": "/repos/a/b/issues", "risk": "R3ExternalOrIrreversible", "outcome": "pending", "detail": "req_1 (new): outside reach" }),
+            ),
+            rec(
+                "op",
+                json!({ "kind": "egress", "method": "GET", "host": "crates.io", "path": "/api/v1/crates", "risk": "R1ReadScoped", "outcome": "allow", "detail": "reach rule 0" }),
+            ),
+            rec(
+                "op",
+                json!({ "kind": "llm", "provider": "anthropic", "model": "claude-sonnet-5-5", "status": 200, "input_tokens": 10, "cached_tokens": 90, "output_tokens": 5, "requests": 1, "outcome": "ok" }),
+            ),
+            rec(
+                "op",
+                json!({ "kind": "llm", "model": null, "status": 429, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "requests": 9, "outcome": "budget: request cap reached" }),
+            ),
+            rec("op", json!({ "kind": "tool", "name": "spawn_agent", "detail": "x" })),
+            rec(
+                "decision",
+                json!({ "decision": "approve", "request": "req_1", "grant": "gr_1", "by": "alex", "method": "POST", "host": "api.github.com", "path": "/repos/a/b/issues" }),
+            ),
+            rec("agent.hibernate", json!({ "agent": "agt_x" })),
+            json!({ "type": "wicket.audit.checkpoint", "seq": 7, "head": "h", "ts": 1 }),
+        ];
+        let body = otlp_body(&items, &BTreeMap::new());
+        let logs = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array().unwrap().clone();
+        let names: Vec<&str> = logs.iter().map(|l| l["eventName"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "wicket.egress.decision",
+                "wicket.egress.decision",
+                "gen_ai.client.inference.operation.details",
+                "gen_ai.client.inference.operation.details",
+                "wicket.tool.call",
+                "wicket.approval.decision",
+                "wicket.audit.agent.hibernate",
+                "wicket.audit.checkpoint"
+            ]
+        );
+        let pending = attrs(&logs[0]);
+        assert_eq!(pending["http.request.method"]["stringValue"], "POST");
+        assert_eq!(pending["server.address"]["stringValue"], "api.github.com");
+        assert_eq!(pending["url.path"]["stringValue"], "/repos/a/b/issues");
+        assert_eq!(pending["wicket.decision.outcome"]["stringValue"], "pending");
+        assert_eq!(pending["error.type"]["stringValue"], "pending");
+        assert_eq!(pending["wicket.decision.risk"]["stringValue"], "R3ExternalOrIrreversible");
+        assert_eq!((logs[0]["severityNumber"].as_u64(), logs[0]["severityText"].as_str()), (Some(13), Some("WARN")));
+        let allowed = attrs(&logs[1]);
+        assert!(!allowed.contains_key("error.type"));
+        assert_eq!(logs[1]["severityText"], "INFO");
+        let llm = attrs(&logs[2]);
+        assert_eq!(llm["gen_ai.operation.name"]["stringValue"], "chat");
+        assert_eq!(llm["gen_ai.provider.name"]["stringValue"], "anthropic");
+        assert_eq!(llm["gen_ai.request.model"]["stringValue"], "claude-sonnet-5-5");
+        assert_eq!(llm["gen_ai.usage.input_tokens"]["intValue"], "100", "the whole prompt, cached tokens included");
+        assert_eq!(llm["gen_ai.usage.output_tokens"]["intValue"], "5");
+        assert_eq!(llm["http.response.status_code"]["intValue"], "200");
+        assert!(!llm.contains_key("error.type"));
+        let capped = attrs(&logs[3]);
+        assert_eq!(capped["error.type"]["stringValue"], "429");
+        assert!(!capped.contains_key("gen_ai.request.model") && !capped.contains_key("gen_ai.provider.name"));
+        assert_eq!(attrs(&logs[4])["gen_ai.tool.name"]["stringValue"], "spawn_agent");
+        let d = attrs(&logs[5]);
+        assert_eq!(
+            (d["wicket.decision"]["stringValue"].as_str(), d["wicket.decision.by"]["stringValue"].as_str()),
+            (Some("approve"), Some("alex"))
+        );
+        // The chain is untouched: every body is the exported object's JSON line.
+        for (l, it) in logs.iter().zip(&items) {
+            assert_eq!(serde_json::from_str::<Value>(l["body"]["stringValue"].as_str().unwrap()).unwrap(), *it);
+        }
     }
 
     #[test]

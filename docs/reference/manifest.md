@@ -74,7 +74,7 @@ says which it has (a mode it hasn't is refused, saying so):
 | field | type | default | meaning |
 |---|---|---|---|
 | `name` | string | required | The session's name in the vendor's apps: 1–64 letters, digits, spaces, `-`, `_` or `.`. |
-| `permission_mode` | string | `default`; `bypassPermissions` with `drive` | How far the harness acts without asking: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks in the app before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. With `drive`, `default` is refused: a driven Claude Code asks wicket, not the app, and wicket answers no such prompt. |
+| `permission_mode` | string | `default`; `bypassPermissions` with `drive` | How far the harness acts without asking: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk` or `plan`, as `claude remote-control --permission-mode` takes them. `default` asks in the app before each action, as a session on the owner's machine would, so an unattended box waits on prompts nobody answers; `bypassPermissions` lets it work unattended. Any other value is refused. A harness adapter that has no permission modes refuses any but `default`. With `drive`, a driven Claude Code asks wicket, not the app: what wicket's rule allows is raised as a `TOOL` request for a human to decide (#363). |
 | `drive` | boolean | `false` | wicket drives the session (#285): it starts the harness as in the driven mode and gives it the task, prompts and messages as turns, and the session is also registered in the vendor's apps. Needs a `task`. Claude Code's `claude -p` takes no Remote Control flag; wicket turns Remote Control on over its stdin (a `remote_control` control request) before the first turn. |
 
 Whatever the permission mode, wicket's proxies decide what the box can reach: the mode only says
@@ -199,6 +199,11 @@ upstream's host when it is stored with no binding of its own.
 | `max_output_tokens` | integer | `400000` | The most output tokens over the agent's life. Each call reserves its `max_tokens` up front. |
 | `max_input_tokens` | integer | none | The most input tokens, cache reads and writes included. None: no input cap. |
 | `allow_server_tools` | boolean | `false` | Forward server-side tools (web search and fetch), URL sources, the MCP connector and containers. They make the provider reach hosts the zone never allowed, so they are refused by default. |
+| `models` | list of strings | none (any model) | The models a box may call: exact names (`claude-opus-4-5`) or prefixes ending in `*` (`claude-sonnet-*`). The model proxy refuses, with a 403, a call naming another model or none. `agent.model` must be in the list. A zone a box starts may only narrow it: with a list here, a child must have one, each entry within one of these (a prefix only within a prefix). |
+
+With `models`, list every model the harness calls on its own too. Claude Code, for one, uses a small
+model (Haiku) for background work such as titles and summaries, and those calls are refused if it
+isn't listed (#366).
 
 ### `volumes`
 
@@ -207,9 +212,12 @@ upstream's host when it is stored with no binding of its own.
 | `name` | string | required | `[a-z0-9-]+`, unique within the zone. |
 | `path` | string | required | Where it is mounted, read-write: an absolute path under `/volumes/`, with no `..`. |
 | `persist` | `durable`, `node` or `cache` | `node` | What happens when an agent hibernates. `durable`: the agent's own, bundled with its state and restored on wake. `node`: shared by the zone on the node that runs it, kept there, not bundled. `cache`: never bundled, and may be empty after a wake on another node. |
+| `keep` | boolean | `false` | Kept on the node across runs ([#377](https://github.com/public/wicket/issues/377)). Not kept, the volume is the run's own cache: empty when the run starts, deleted once the run's work is collected, or `retention` after the run ends if it never is. Not for a `durable` volume (that one is the agent's, and goes with its state). |
+| `retention` | duration | kept: none; a cache: `7d` | A kept volume: how long it may go unused before its node deletes it (none: never). A run's cache: how long after the run ends it is kept if the run's work isn't collected. |
 
-Volumes are per tenant and zone, and shared by the zone's runs: what one run leaves there the next
-one reads.
+A kept volume is per tenant and zone, and shared by the zone's runs: what one run leaves there the
+next one reads. Any other volume is its run's alone. A control host from before #377 marks no
+volume either way, and its nodes keep every volume, as before.
 
 ### `limits`
 

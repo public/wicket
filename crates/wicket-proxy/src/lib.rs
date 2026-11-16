@@ -266,6 +266,9 @@ pub enum Event {
     /// One model call. `input_tokens` is the uncached input; `cached_tokens` the cache reads and
     /// cache writes on top of it (all three count toward `max_input_tokens`).
     Llm {
+        /// The zone's model provider (`zone.llm.provider`, #368: `gen_ai.provider.name` in OTLP).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         model: Option<String>,
         status: u16,
         input_tokens: u64,

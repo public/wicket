@@ -82,8 +82,16 @@ read -r -t 30 -u "$FWD_OUT" said || said=
 [ "$said" = ready ] || fail "wicket-fwd didn't start listening (see its error above)"
 mark fwd
 
-export SSL_CERT_FILE=/tmp/ca-bundle.pem CURL_CA_BUNDLE=/tmp/ca-bundle.pem GIT_SSL_CAINFO=/tmp/ca-bundle.pem \
-       REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem
+# The run's CA, for every tool that reads its own variable for it (pip, the AWS CLI and SDKs,
+# cargo, deno, gcloud, nix), not only SSL_CERT_FILE (#366).
+CA=/tmp/ca-bundle.pem
+export SSL_CERT_FILE=$CA CURL_CA_BUNDLE=$CA GIT_SSL_CAINFO=$CA REQUESTS_CA_BUNDLE=$CA NODE_EXTRA_CA_CERTS=/wicket/ca/ca.pem \
+       PIP_CERT=$CA AWS_CA_BUNDLE=$CA CARGO_HTTP_CAINFO=$CA DENO_CERT=$CA CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE=$CA \
+       NIX_SSL_CERT_FILE=$CA
+# A JVM ignores HTTPS_PROXY: its own properties point it at the egress proxy, after whatever the
+# manifest's env put there. (Its trust store isn't PEM: a JVM tool still needs the CA imported.)
+J="-Dhttp.proxyHost=wicket.internal -Dhttp.proxyPort=3128 -Dhttps.proxyHost=wicket.internal -Dhttps.proxyPort=3128"
+export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }$J"
 
 # The start's steps, for the forwarder to write as the agent's user; on disk before the program
 # starts (best effort). Bash makes these descriptors close-on-exec, so the program inherits neither
