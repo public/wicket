@@ -321,11 +321,11 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         "child"
     } else if my_path.rsplit_once('/').is_some_and(|(p, _)| p == to_path) {
         "parent"
-    } else if to_zone.accept_from.contains(&my_zone)
-        || node
-            .edge_start(run)
-            .is_some_and(|e| e.who.get("id").and_then(|v| v.as_str()).is_some_and(|me| to_zone.accept_from.iter().any(|a| a == me)))
-    {
+    } else if wicket_core::manifest::accepts(
+        &to_zone.accept_from,
+        &my_zone,
+        node.edge_start(run).and_then(|e| e.who.get("id").and_then(|v| v.as_str()).map(String::from)).as_deref(),
+    ) {
         "peer"
     } else {
         let why = format!("zone {} does not accept messages from zone {my_zone} (its accept_from does not list it)", to_zone.name);

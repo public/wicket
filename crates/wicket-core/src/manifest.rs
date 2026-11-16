@@ -312,8 +312,10 @@ pub struct ZoneSpec {
     /// Images boxes in this zone may start other boxes from (besides their own), with `spawn`.
     #[serde(default)]
     pub images: Vec<String>,
-    /// Zones whose agents may send messages to agents in this zone (besides parent and children).
-    /// Empty = nobody else. Senders are identified by wicket, never by their own claim.
+    /// Who may send messages to agents in this zone (besides parent and children): each entry a
+    /// zone's name (every agent in it) or one principal's id (#250, `spiffe://…/a/<agent>`, or an
+    /// operator's `…/op/<via>/<name>`). Empty = nobody else. Senders are identified by wicket, never
+    /// by their own claim; [`accepts`] is the one test.
     #[serde(default)]
     pub accept_from: Vec<String>,
     #[serde(default)]
@@ -641,6 +643,12 @@ impl LlmSpec {
         }
         Ok(())
     }
+}
+
+/// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
+/// sender's principal id, when the caller knows it.
+pub fn accepts(accept_from: &[String], zone: &str, principal: Option<&str>) -> bool {
+    accept_from.iter().any(|a| a == zone || principal.is_some_and(|p| a == p))
 }
 
 /// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
@@ -1121,6 +1129,17 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #250: accept_from names zones (every agent in one) or principals (one agent, or an operator).
+    #[test]
+    fn accept_from_names_a_zone_or_a_principal() {
+        let list = vec!["ops".to_string(), "spiffe://w.test/t/t0/z/audit/a/auditor".to_string()];
+        assert!(accepts(&list, "ops", None), "every agent of a listed zone");
+        assert!(accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/auditor")), "one listed principal");
+        assert!(!accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/other")), "not its zone-mates");
+        assert!(!accepts(&list, "audit", None), "a principal entry needs the sender's id");
+        assert!(!accepts(&[], "ops", Some("x")));
+    }
 
     /// A folded glob matches a path exactly when the glob matches it in some ASCII case (the Lean
     /// spec's `ciEq`, which it states for globs without classes), and a folded negated class matches
