@@ -562,7 +562,9 @@ for line in sys.stdin:
 }
 check "a box trying to get out: every attempt refused, none ESCAPED" '[ "$(esc_out | grep -c " blocked ")" -ge 25 ] && ! esc_out | grep -q " ESCAPED "'
 check "  and the canary on the host's addresses saw no request" '[ ! -s "$work/canary.log" ]'
-check "  and its audit allowed nothing but GET example.com/ (and resolved no other name)" '! esc_allowed | grep -vxqE "GET example.com /|DNS example.com"'
+# What else the audit allowed, printed so a failure names it.
+esc_unexpected() { esc_allowed "$@" | grep -vxE "GET example.com /|DNS example.com" | sort | uniq -c | sed 's/^/     allowed: /'; }
+check "  and its audit allowed nothing but GET example.com/ (and resolved no other name)" '[ -z "$(esc_unexpected)" ] || { esc_unexpected; false; }'
 
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
