@@ -566,10 +566,16 @@ function openPending(id) {
   if (box && box.scrollIntoView) box.scrollIntoView();
   for (const [k, c] of cards) c.node.className = "card req" + (k === openId ? " opened" : "");
 }
+// Opened from a run's notification (#364): scroll to the runs list.
+function openRuns() {
+  const box = document.getElementById("runs");
+  if (box && box.scrollIntoView) box.scrollIntoView();
+}
 function fromHash() {
   const h = (typeof location !== "undefined" && location.hash) || "";
   const m = /^#pending(?:\/([A-Za-z0-9_-]{1,64}))?$/.exec(h);
   if (m) openPending(m[1]);
+  if (/^#runs(?:\/[A-Za-z0-9_-]{1,64})?$/.test(h)) openRuns();
   if (h === "#notifications") openNotifications();
 }
 
@@ -979,6 +985,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("detail-close").addEventListener("click", () => { document.getElementById("detail").hidden = true; });
   if (typeof navigator !== "undefined" && navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", e => {
     if (e.data && typeof e.data.open === "string") openPending(e.data.open);
+    if (e.data && typeof e.data.openRun === "string") openRuns();
     if (e.data && e.data.resubscribe === true) openNotifications();
   });
   if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("hashchange", fromHash);

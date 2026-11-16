@@ -271,6 +271,18 @@ impl Ledger {
     /// What `run` is doing, as its supervisor and gateway report it (#252): `busy` (a turn is
     /// running), `idle` (between turns) or `waiting` (in a wait: `await_message`, `await_grant`).
     /// None clears it.
+    /// `tenant`'s runs that are running, or ended at or after `since` (Unix seconds), with their
+    /// status and activity: what the console's notifier watches for a turn's or a run's end (#364).
+    pub fn run_states(&self, tenant: &crate::TenantId, since: i64) -> Result<Vec<crate::RunState>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, agent, status, activity FROM runs WHERE tenant = ?1 AND (status = 'running' OR ended_at >= ?2) ORDER BY started_at, id",
+        )?;
+        let rows = st.query_map(params![tenant.0, since], |r| {
+            Ok(crate::RunState { id: r.get(0)?, agent: r.get(1)?, status: r.get(2)?, activity: r.get(3)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_run_activity(&self, run: &str, activity: Option<&str>) -> Result<()> {
         self.conn.execute("UPDATE runs SET activity = ?2, activity_at = ?3 WHERE id = ?1", params![run, activity, now()])?;
         Ok(())

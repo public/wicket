@@ -259,6 +259,15 @@ pub struct RunRow {
     pub ended_at: Option<i64>,
 }
 
+/// A run's status and activity (`busy`, `idle`, `waiting`, or none), for watching them change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunState {
+    pub id: String,
+    pub agent: String,
+    pub status: String,
+    pub activity: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Approval {
     /// None = unlimited uses until expiry.

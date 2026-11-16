@@ -105,6 +105,8 @@ pub const MAX_SOCKETS: usize = 32;
 pub struct Sockets {
     total: usize,
     by_session: HashMap<String, usize>,
+    /// Open sockets by (passkey credential, run): who watches which run's session now (#364).
+    watching: HashMap<(String, String), usize>,
 }
 
 impl Sockets {
@@ -119,6 +121,11 @@ impl Sockets {
         None
     }
 
+    /// Whether the operator with passkey `cred` has `run`'s session open now.
+    pub fn watching(&self, cred: &str, run: &str) -> bool {
+        self.watching.get(&(cred.to_string(), run.to_string())).is_some_and(|n| *n > 0)
+    }
+
     /// How many are open, in all and for `console_session`.
     #[cfg(test)]
     pub fn open(&self, console_session: &str) -> (usize, usize) {
@@ -131,6 +138,8 @@ impl Sockets {
 pub struct Slot {
     sockets: std::sync::Arc<std::sync::Mutex<Sockets>>,
     console_session: String,
+    /// The (passkey credential, run) this socket watches, once its ticket is checked.
+    watch: Option<(String, String)>,
 }
 
 impl Slot {
@@ -142,7 +151,19 @@ impl Slot {
         }
         s.total += 1;
         *s.by_session.entry(console_session.to_string()).or_default() += 1;
-        Ok(Slot { sockets: sockets.clone(), console_session: console_session.to_string() })
+        Ok(Slot { sockets: sockets.clone(), console_session: console_session.to_string(), watch: None })
+    }
+
+    /// Records that this socket is the operator with passkey `cred` watching `run`, until it drops.
+    pub fn watch(&mut self, cred: &str, run: &str) {
+        let key = (cred.to_string(), run.to_string());
+        let mut s = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = self.watch.replace(key.clone()) {
+            if let Some(n) = s.watching.get_mut(&old) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        *s.watching.entry(key).or_default() += 1;
     }
 }
 
@@ -154,6 +175,14 @@ impl Drop for Slot {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 s.by_session.remove(&self.console_session);
+            }
+        }
+        if let Some(w) = self.watch.take() {
+            if let Some(n) = s.watching.get_mut(&w) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    s.watching.remove(&w);
+                }
             }
         }
     }
@@ -269,7 +298,7 @@ pub(super) fn check_upgrade(
         return Err((S::FORBIDDEN, "open the session with your passkey first"));
     };
     // Over a cap, the ticket isn't spent: the operator can close a socket and use it within its TTL.
-    let slot = Slot::take(&state.sockets, &sess.0).map_err(|why| (S::TOO_MANY_REQUESTS, why))?;
+    let mut slot = Slot::take(&state.sockets, &sess.0).map_err(|why| (S::TOO_MANY_REQUESTS, why))?;
     // Single use, whatever happens next.
     let t = state.tickets.lock().expect("lock").remove(tk);
     let Some(t) = t.filter(|t| t.expires > Instant::now()) else { return Err((S::FORBIDDEN, "unknown, used or expired ticket")) };
@@ -281,6 +310,8 @@ pub(super) fn check_upgrade(
         return Err((S::CONFLICT, "the run is not running"));
     }
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    // The run's pushes don't go to this operator's devices while the socket is open (#364).
+    slot.watch(cred, run);
     Ok((t, accept, slot))
 }
 
@@ -410,6 +441,11 @@ pub struct Bridge {
     pub prompts: u64,
     /// When this socket last asked for a cancel.
     last_cancel: Option<Instant>,
+    /// For a harness that doesn't speak ACP (#364): its adapter's translation of both sides, named
+    /// by the log's `format` entry.
+    view: Option<Box<dyn wicket_agent::harness::SessionView>>,
+    /// The log names a format this console can't read: nothing of the conversation is shown.
+    unreadable: bool,
 }
 
 fn rpc_key(id: &Value) -> String {
@@ -449,6 +485,8 @@ impl Bridge {
             next_id: 0,
             prompts: 0,
             last_cancel: None,
+            view: None,
+            unreadable: false,
         }
     }
 
@@ -657,13 +695,24 @@ impl Bridge {
         out
     }
 
-    /// One line the agent wrote.
+    /// One line the agent wrote: an ACP message, or (through the run's view) what it amounts to.
     fn on_agent(&mut self, line: &str, out: &mut Vec<Value>) {
         if line.len() > MAX_LINE {
             out.push(self.notice(&format!("the agent sent a {} KiB message, too large to show here", line.len() >> 10)));
             return;
         }
-        let Ok(mut v) = serde_json::from_str::<Value>(line) else { return };
+        let msgs = match self.view.as_mut() {
+            Some(view) => view.agent(line),
+            None if self.unreadable => vec![],
+            None => serde_json::from_str::<Value>(line).into_iter().collect(),
+        };
+        for v in msgs {
+            self.on_agent_msg(v, out);
+        }
+    }
+
+    /// One ACP message from the agent.
+    fn on_agent_msg(&mut self, mut v: Value, out: &mut Vec<Value>) {
         let method = v.get("method").and_then(|m| m.as_str()).map(String::from);
         let id = v.get("id").cloned().filter(|i| !i.is_null());
         match (method.as_deref(), id) {
@@ -708,11 +757,36 @@ impl Bridge {
 
     /// One entry of what wicket said to the agent.
     fn on_wicket(&mut self, e: &Value, out: &mut Vec<Value>) {
+        if let Some(f) = e.get("format").and_then(|f| f.as_str()) {
+            self.view = wicket_agent::harness::session_view(f);
+            self.unreadable = self.view.is_none();
+            if self.unreadable {
+                out.push(
+                    self.notice(&format!(
+                        "this run's session is kept as {}, which this console can't show",
+                        wicket_core::text::clip(f, 60)
+                    )),
+                );
+            }
+            return;
+        }
         if let Some(q) = e.get("queued") {
             self.queued.push_back(Queued { by: q["by"].as_str().unwrap_or("wicket").to_string(), op: q["op"].as_i64() });
             return;
         }
         let Some(msg) = e.get("msg") else { return };
+        let msgs = match self.view.as_mut() {
+            Some(view) => view.wicket(msg),
+            None if self.unreadable => vec![],
+            None => vec![msg.clone()],
+        };
+        for m in &msgs {
+            self.on_wicket_msg(m, out);
+        }
+    }
+
+    /// One ACP message from wicket's client to the agent.
+    fn on_wicket_msg(&mut self, msg: &Value, out: &mut Vec<Value>) {
         let id = msg.get("id").cloned().filter(|i| !i.is_null());
         match (msg.get("method").and_then(|m| m.as_str()), id) {
             (Some("session/prompt"), Some(id)) => {

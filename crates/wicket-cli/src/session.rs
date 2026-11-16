@@ -83,7 +83,8 @@ pub async fn open(o: Opts) -> Result<()> {
     }
     let dir = crate::data_dir().join("runs").join(&run);
     let s = Session { run, dir, tenant, op, deadline: o.timeout.map(|t| Instant::now() + t) };
-    if s.dir.join(crate::transcript::ACP_LOG).is_file() {
+    // An ACP agent's log has no format; a stream-json harness's log (#364) is read as stream-json here.
+    if matches!(crate::transcript::log_format(&s.dir), Some(None)) {
         s.acp(o.text, o.wait).await
     } else {
         s.stream_json(o.text, o.wait).await
