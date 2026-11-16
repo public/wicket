@@ -33,7 +33,7 @@ run's is a tunnel target any more (`llm` went with slice 1, `egress` with slice 
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
-`request_access`, `await_grant`, `pending_requests`, `spawn`/`spawn_agent`, `send_message` and
+`request_access`, `await_grant`, `pending_requests`, `spawn`, `send_message` and
 `await_message` while cut off, `request_capacity`/`request_update` queued while cut off) and the
 node's own `Llm`.
 
@@ -41,7 +41,7 @@ node's own `Llm`.
 
 1. **Slice 1 (done, #317): the model proxy runs only on the node.** `run.rs` stops listening on
    `ctl/llm.sock`. Its `Llm` stays as the run's budget counter (the node's `Spent` reports are
-   merged into it, slices are leased from it, and the egress model gate uses it). `Llm::relayed`,
+   merged into it, slices are sent from it, and the egress model gate uses it). `Llm::relayed`,
    `LlmRelay` and the `llm` tunnel target go. No protocol bump: every node within
    `PROTOCOL_SKEW` of protocol 8 is at protocol 3 or later (#152), so it fetches the credential and
    never opens that tunnel.
@@ -51,8 +51,8 @@ node's own `Llm`.
    node keeps the start in its box record. The node fetches swapped secrets with `SecretFetch`, as
    it does injected ones (#152). `nodesecrets::release_run` releases them for the swap's hosts
    only. `route_sealed` forwards only hosts the node's CA can't cover, plus the `swap_hosts` of a
-   box a control host at protocol 9 started. Protocol 10 (`chan::CREDENTIAL_SWAPS`; #316 took 9 for
-   `BUDGET_SLICE`): a box with swaps goes only to a node at 10 or later. `sync_grants` hands grants
+   box a control host at protocol 9 started. Protocol 10 (#316 took 9 for the budget slice): a box
+   with swaps went only to a node at 10 or later, a check gone since no peer talks below 11. `sync_grants` hands grants
    on swapped hosts to the node, so their uses are counted there, from the feed. The node's
    egress takes its own model proxy as its model gate (`Egress::set_model_gate`), so a wrapped
    session's model calls, whose login is now swapped on the node, keep their budget and filter.
@@ -66,10 +66,9 @@ node's own `Llm`.
    `Ledger::grant_covering` looks one up without using it): it records issuance, and `sync_grants`
    only publishes, every egress grant included. A grant the node can't honour as approved (a risk
    bound a query could exceed, #119, or one its token can't load) is never published, so the box's
-   request is asked again; one past `MAX_GRANTS` waits for room. Protocol 11
-   (`chan::NO_FORWARDED_EGRESS`): a box that a node before 11 would forward a known host of (a reach,
-   inject or swap host outside that node's CA, or any host without a live CA, `noderun::forwarded_host`)
-   goes only to a node at 11 or later (`refuse_older_node`). Egress lines: a refused uncovered host
+   request is asked again; one past `MAX_GRANTS` waits for room. Protocol 11:
+   a box that a node before 11 would have forwarded a known host of went only to a node at 11 or
+   later; with protocol 12 no peer talks below 11, and that check is gone. Egress lines: a refused uncovered host
    is a `forbidden` line (`not served on this node (<why>)`), where it was a `forwarded` one; the
    control host's own `grant …; used by …` details (and their `WARNING: approved for …`) are gone
    with Central. Audit records are unchanged.
@@ -77,7 +76,8 @@ node's own `Llm`.
    `nodegw.rs`. Tools that need the control host (link tools, `decide`, `finish`/`hibernate`,
    capacity, update, messages to boxes on other nodes) go as typed channel messages that ask
    (`Msg::Ask`'s pattern), not as relayed JSON-RPC. `wicket-proxy/src/gateway.rs`'s tool bodies
-   and spawn's `--parent-run` re-exec path go. This is protocol 13 (12 is node health, #377).
+   and spawn's `--parent-run` re-exec path go. This is protocol 13 (12 is node health's, #377),
+   behind #241's jumps.
    - **4a (done): what was already the node's.** The node answers MCP's own methods (`initialize`,
      `ping`, `tools/list`, notifications) itself, with the one implementation
      (`wicket_proxy::gateway::handshake`), connected or not: they are never relayed. The control

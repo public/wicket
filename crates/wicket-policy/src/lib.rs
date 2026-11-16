@@ -12,7 +12,7 @@
 //! Nodes evaluate Biscuit only; no Cedar engine runs at the edge. A spawn needs no conversion: the
 //! parent attenuates its token on the node, and block 0's checks carry over.
 //!
-//! Budgets, use counts and output limits aren't policy: they stay leased counters.
+//! Budgets, use counts and output limits aren't policy: they stay counters (quota grants and the slices sent to nodes).
 
 pub mod compile;
 pub mod schema;

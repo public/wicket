@@ -433,7 +433,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // checked when a run starts or an agent wakes. A supervisor re-attaching to a running box doesn't
     // start anything.
     if record.is_none() {
-        crate::settings::check_run(&m, &crate::settings::load()?)?;
+        wicket_agent::acp::check_installation(&m).map_err(anyhow::Error::msg)?;
     }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
@@ -502,9 +502,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         bail!("{} is not an enrolled node: enrol it (wicket node enrol) and install wicket there (wicket node install); boxes run only through a node's `wicket node serve`", n.target);
     }
     let node_name = node.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| crate::localnode::NAME.to_string());
-    if node.is_some() {
-        crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?;
-    }
+    let start_by = match node.is_some() {
+        true => crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?,
+        false => None,
+    };
     // This host's own node shares its filesystem. That is only transport: it lays the box out in the
     // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
     // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
@@ -846,11 +847,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         _ => true,
     };
 
-    // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
+    // spawn: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     timings.since("policy.org", lap);
     // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as
     // its own first, made by who started it; a child's its parent recorded before starting it.
+    let lap = std::time::Instant::now();
     let limits = {
         let start = match (&record, &parent_run) {
             (Some(_), _) => crate::quotas::Start::Reattached,
@@ -859,6 +861,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         };
         crate::quotas::at_start(&ledger.lock().expect("ledger"), &m, &run, start)?
     };
+    timings.since("quotas", lap);
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
@@ -1245,6 +1248,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             long_lived: box_tmp,
             name: Some(spec.name.clone()),
             llm_prior: llm.spent_total(),
+            start_by,
             output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             // Swapped on the node (#257): their names and placeholders only, the credentials
@@ -1412,7 +1416,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         if wake.is_some() {
             println!("  agent {} woken: generation {}, session {} resumed", f.agent, f.generation, session.id);
         } else {
-            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket wake {}", f.agent, session.id, run, f.agent);
+            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket session {}", f.agent, session.id, run, f.agent);
         }
     }
     // Its quota grants are its limits (#256): kept live while it runs, at most a day ahead each
@@ -2256,7 +2260,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     let ms = t0.elapsed().as_millis();
                     println!(
-                        "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket wake {}",
+                        "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket session {}",
                         f.agent,
                         st.trees.len(),
                         crate::hibernate::human(st.raw_bytes()),

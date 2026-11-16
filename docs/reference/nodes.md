@@ -127,8 +127,8 @@ wicket node revoke n1
   its authority expires**, whether or not it can reach the control host: the workload's grants decide, not
   the node (this replaces #151's run lease and `WICKET_NODE_LEASE_EXPIRY`). What the node reports for each
   box says when its authority ends (`authority_until`). **The wake fence:** while a box's authority is live
-  on a node this host can't hear from, nothing replaces it. Its agent isn't woken anywhere (`wicket wake`
-  says from when it can be: the authority's end plus 30 s of clock skew) unless the node has confirmed the
+  on a node this host can't hear from, nothing replaces it. Its agent isn't woken anywhere (the wake's log,
+  which `wicket session` names, says from when it can be: the authority's end plus 30 s of clock skew) unless the node has confirmed the
   box stopped (its exit, or it says it has no box for the run), and `wicket reconcile` reports the run as
   unreachable, "still authorized there until …", rather than lost, whatever the node's status. Two copies
   of an agent never act at once with separate budget slices and writes. The authority and the node's

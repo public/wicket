@@ -564,11 +564,13 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         publisher.epoch()
     };
     published.end();
+    let recording = t.span("authority.record");
     let token_root = (token_issuer.block_ids()[0].clone(), until_s.saturating_mul(1000));
     // What fences a wake of the agent elsewhere while this box may still run (#153).
     record_authority(&s.dir, &name, token_root.1 + 1000).context("recording the box's authority")?;
     // Records the node ships are filed under this run only once the ledger says it runs there (#120).
     s.ledger.lock().expect("ledger").set_run_node(&s.run.0, &name).context("recording the run's node")?;
+    recording.end();
     let ctl = Arc::new(NodeCtl {
         node: name.clone(),
         run: s.run.0.clone(),
@@ -659,14 +661,12 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
-            if ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_DELIVERY {
-                let pull = shared.pull.as_ref().filter(|_| ctl.proto.load(Ordering::SeqCst) >= crate::chan::IMAGE_PULL);
-                shared.pulling.store(pull.is_some(), Ordering::SeqCst);
-                let _delivering = t.span("image.deliver");
-                let got = deliver_image(&ctl.calls, &name, &ctl.run, &start.image, pin, pull).await;
-                shared.pulling.store(false, Ordering::SeqCst);
-                got.with_context(|| format!("getting image {pin} to node {name}"))?;
-            }
+            let pull = shared.pull.as_ref();
+            shared.pulling.store(pull.is_some(), Ordering::SeqCst);
+            let _delivering = t.span("image.deliver");
+            let got = deliver_image(&ctl.calls, &name, &ctl.run, &start.image, pin, pull).await;
+            shared.pulling.store(false, Ordering::SeqCst);
+            got.with_context(|| format!("getting image {pin} to node {name}"))?;
         }
         let sent = std::time::Instant::now();
         if !ctl.send(Frame::Msg(Msg::Start(Box::new(start)))) {
@@ -933,7 +933,6 @@ async fn session(
             p.link.save(&sh.dir);
             p.proto = proto;
             sh.ctl.proto.store(proto, Ordering::SeqCst);
-            sh.ctl.calls.set_proto(proto);
             (feed, runs)
         }
         _ => unreachable!("nodeauth::control returns a welcome"),
@@ -1589,11 +1588,6 @@ fn slice_fraction() -> f64 {
 /// connection: renewed once less than half a slice is left, and lowered at once if what is
 /// left of the budget shrinks below it (a spawn's carve-out).
 fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
-    // A node before #256 knows the slice by its old name: it gets none (and no box with a model
-    // budget starts there, `start_box`).
-    if p.proto < crate::chan::BUDGET_SLICE {
-        return None;
-    }
     let l = sh.llm.as_ref()?;
     let next = l.next_slice(slice_fraction())?;
     let slice = wicket_proxy::llm::Slice::renewed(p.slice, next, l.spent(), l.input_total());

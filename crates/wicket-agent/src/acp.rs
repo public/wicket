@@ -93,6 +93,43 @@ pub struct ClaudeAdapterSettings {
     pub allow_subscription_backed_claude_adapter: bool,
 }
 
+/// The installation settings file (`wicket.yaml`): `/etc/wicket/wicket.yaml` (root's, like the
+/// daemon's policy), or `$WICKET_CONFIG` (development and tests). Its one section is this adapter's.
+pub const SETTINGS_PATH: &str = "/etc/wicket/wicket.yaml";
+
+/// Where the installation settings are read from.
+pub fn settings_path() -> std::path::PathBuf {
+    std::env::var_os("WICKET_CONFIG").map(std::path::PathBuf::from).unwrap_or_else(|| SETTINGS_PATH.into())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationSettings {
+    #[serde(default)]
+    acp: ClaudeAdapterSettings,
+}
+
+/// The adapter's installation settings from `p`. A missing or empty file means every default; a
+/// file that can't be read or parsed is an error (it stops the run), so a setting meant to allow
+/// something never silently allows it, nor the reverse.
+pub fn load_settings(p: &std::path::Path) -> Result<ClaudeAdapterSettings, String> {
+    match std::fs::read_to_string(p) {
+        Ok(s) if s.trim().is_empty() => Ok(ClaudeAdapterSettings::default()),
+        Ok(s) => serde_yaml::from_str::<InstallationSettings>(&s)
+            .map(|i| i.acp)
+            .map_err(|e| format!("the installation settings {}: {e}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaudeAdapterSettings::default()),
+        Err(e) => Err(format!("reading the installation settings {}: {e}", p.display())),
+    }
+}
+
+/// Refuses, at run start, a manifest that the installation's settings ([`settings_path`]) don't
+/// allow (#66): [`check_claude_adapter`] with the settings as the file has them now.
+pub fn check_installation(m: &wicket_core::Manifest) -> Result<(), String> {
+    let p = settings_path();
+    check_claude_adapter(m, &load_settings(&p)?, &p.display().to_string())
+}
+
 /// Refuses, at run start, a manifest that runs the Claude adapter in a way the installation's
 /// settings (read from `settings_path`) don't allow (#66). Every other agent passes.
 pub fn check_claude_adapter(m: &wicket_core::Manifest, s: &ClaudeAdapterSettings, settings_path: &str) -> Result<(), String> {
@@ -738,6 +775,49 @@ pub fn render(e: &SessionEvent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    fn settings_manifest(agent: &str, llm: bool) -> wicket_core::Manifest {
+        crate::load(&format!("task: t\nagent: {agent}\nzone: {{name: z{}}}", if llm { ", llm: {}" } else { "" })).unwrap()
+    }
+
+    #[test]
+    fn the_claude_adapter_on_a_subscription_is_refused_unless_the_installation_allows_it() {
+        let check = |m: &wicket_core::Manifest, yes: bool| {
+            check_claude_adapter(m, &ClaudeAdapterSettings { allow_subscription_backed_claude_adapter: yes }, SETTINGS_PATH)
+        };
+        let claude = settings_manifest("{name: a, harness: acp, acp: {command: [claude-agent-acp], profile: claude-agent-acp}}", true);
+        let e = check(&claude, false).unwrap_err();
+        assert!(e.contains("acp.allow_subscription_backed_claude_adapter: true") && e.contains("harness: claude-code"), "{e}");
+        // The owner's opt-in.
+        assert!(check(&claude, true).is_ok());
+        // The adapter by its command alone must use the profile (and so this check).
+        let bare =
+            settings_manifest("{name: a, harness: acp, acp: {command: [npx, '@agentclientprotocol/claude-agent-acp@0.104.1']}}", false);
+        assert!(check(&bare, true).unwrap_err().contains("profile: claude-agent-acp"));
+        // Nothing else is affected.
+        assert!(check(&settings_manifest("{name: a, harness: acp, acp: {command: [gemini, --experimental-acp]}}", false), false).is_ok());
+        assert!(check(&settings_manifest("{name: a}", true), false).is_ok());
+    }
+
+    #[test]
+    fn the_settings_file_defaults_to_no_and_a_bad_one_stops_the_run() {
+        let d = std::env::temp_dir().join(format!("wicket-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("wicket.yaml");
+        let read = |body: Option<&str>| {
+            let _ = std::fs::remove_file(&f);
+            if let Some(b) = body {
+                std::fs::write(&f, b).unwrap();
+            }
+            load_settings(&f)
+        };
+        assert!(!read(None).unwrap().allow_subscription_backed_claude_adapter);
+        assert!(!read(Some("")).unwrap().allow_subscription_backed_claude_adapter);
+        assert!(read(Some("acp:\n  allow_subscription_backed_claude_adapter: true\n")).unwrap().allow_subscription_backed_claude_adapter);
+        assert!(read(Some("acp:\n  allow_subscription_backed_claude_adaptor: true\n")).is_err(), "a misspelt key is an error, not a no");
+        assert!(read(Some("acp: yes\n")).is_err());
+        let _ = std::fs::remove_dir_all(d);
+    }
     use super::*;
 
     fn cfg() -> AcpConfig {

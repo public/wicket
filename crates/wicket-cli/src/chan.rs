@@ -43,61 +43,12 @@
 use serde::{Deserialize, Serialize};
 use wicket_proxy::llm::Slice;
 
-/// The control/node protocol version this build speaks.
-///
-/// - 1: versions (#162).
-/// - 2: box tokens may be minted by a certified authority issuing key, and carry its certificate
-///   (`BoxAuthority::issuer_cert`, #154).
-/// - 3: budget slices, secrets fetched by a node on first use, and its model spend (#152, #153):
-///   `Msg::Lease` (now [`Msg::BudgetSlice`]), [`Msg::SecretFetch`], [`Msg::SecretFetched`], [`Msg::SecretRevoke`] and
-///   [`Msg::Spent`]; the control host's per-run lease message is gone (a box's authority decides
-///   when it stops).
-/// - 4: block 0 may carry an org layer, compiled from the org policy in Cedar (#51).
-/// - 5: decisions at the edge (#164): a node answers the MCP gateway's tools itself from the box's
-///   token, spawns narrower children by attenuating it and reports them ([`Msg::Spawned`]), and
-///   asks for a path prefix ([`Msg::Ask`]'s `prefix`). A node does these only for runs whose
-///   control host talks [`EDGE_DECISIONS`] or later; with an older one it relays every tool call.
-/// - 6: images pinned by digest (#192): [`BoxStart::image_pin`], which the node checks against the
-///   image it starts (and then starts it by its id), and the digest it started in `Started` and
-///   `Spawned`. A pinned box goes only to nodes talking [`IMAGE_PINS`] or later.
-/// - 7: images delivered over the channel (#191): [`Msg::ImageHave`], and [`Msg::PutImage`] with its
-///   data frames, the node's [`Msg::Ack`]s of them and its [`Msg::ImagePut`]. Sent only on
-///   connections talking [`IMAGE_DELIVERY`] or later; an older node must have the image already.
-/// - 8: images pulled by the node from a registry, host-side (#191): [`Msg::PullImage`] and
-///   [`Msg::ImagePulled`], sent only on connections talking [`IMAGE_PULL`] or later.
-/// - 9: a run's budget slice is [`Msg::BudgetSlice`] (it was `Lease`, #256: "lease" names one
-///   thing, a grant of capacity). Unreleased, so no alias: a node talking 8 is sent no slice, and a
-///   box with a model budget doesn't start there ([`BUDGET_SLICE`]).
-/// - 10: credential swaps on the node (#257): [`BoxStart::swaps`], each fetched with
-///   [`Msg::SecretFetch`] on first use and swapped by the node's own egress proxy, which then
-///   decides the swapped hosts from the feed. A box with swaps goes only to nodes talking
-///   [`CREDENTIAL_SWAPS`] or later.
-/// - 11: no forwarded egress (#257): a node terminates what its CA covers and decides it, splices
-///   a host its CA can't cover if the box's token allows it wholesale, and refuses it otherwise.
-///   The control host no longer serves the `egress` tunnel target, and `BoxStart::swap_hosts`
-///   (the hosts a control host before 10 swapped itself) is gone. A box that a node before 11
-///   would forward a host of goes only to nodes talking [`NO_FORWARDED_EGRESS`] or later.
-/// - 12: node health (#377): a node reports its disk, inodes, memory, feed freshness and failures
-///   as [`Msg::Health`], sent only on connections talking [`NODE_HEALTH`] or later.
-/// - 13: one gateway, on the node (#257 slice 4b): the tools a box's node doesn't answer itself
-///   reach the control host as [`Msg::Call`] (one of [`ControlTool`]s), answered with
-///   [`Msg::Called`], instead of JSON-RPC relayed through a `gateway` tunnel (gone, with the
-///   control host's `ctl/gateway.sock`). A box goes only to nodes talking [`ONE_GATEWAY`] or later.
+/// The control/node protocol version this build speaks. What each version added is in
+/// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
+/// 12 or 13, so only the versions from 12 on have a check here; the checks for features of earlier
+/// versions (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
+/// forwarded egress) went once no peer could talk below them.
 pub const PROTOCOL: u32 = 13;
-/// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
-pub const EDGE_DECISIONS: u32 = 5;
-/// The first protocol version whose nodes check a box's image against its pin (#192).
-pub const IMAGE_PINS: u32 = 6;
-/// The first protocol version whose nodes take an image over the channel and verify it (#191).
-pub const IMAGE_DELIVERY: u32 = 7;
-/// The first protocol version whose nodes pull an image from a registry themselves (#191).
-pub const IMAGE_PULL: u32 = 8;
-/// The first protocol version whose nodes take a budget slice as [`Msg::BudgetSlice`] (#256).
-pub const BUDGET_SLICE: u32 = 9;
-/// The first protocol version whose nodes swap a box's credentials themselves (#257).
-pub const CREDENTIAL_SWAPS: u32 = 10;
-/// The first protocol version whose nodes forward no egress to the control host (#257).
-pub const NO_FORWARDED_EGRESS: u32 = 11;
 /// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
 pub const NODE_HEALTH: u32 = 12;
 /// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
@@ -117,7 +68,6 @@ pub enum ControlTool {
     Principals,
     Receipts,
     Spawn,
-    SpawnAgent,
     ContinueChild,
     Delegations,
     Decide,
@@ -160,22 +110,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    let floors = [
-        EDGE_DECISIONS,
-        IMAGE_PINS,
-        IMAGE_DELIVERY,
-        IMAGE_PULL,
-        BUDGET_SLICE,
-        CREDENTIAL_SWAPS,
-        NO_FORWARDED_EGRESS,
-        NODE_HEALTH,
-        ONE_GATEWAY,
-    ];
-    let mut i = 0;
-    while i < floors.len() {
-        assert!(floors[i] <= PROTOCOL);
-        i += 1;
-    }
+    assert!(NODE_HEALTH <= PROTOCOL && ONE_GATEWAY <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -261,6 +196,11 @@ pub struct BoxStart {
     /// input and output tokens. The node's model proxy starts from it (#151).
     #[serde(default)]
     pub llm_prior: (u64, u64, u64),
+    /// The latest the box may be started (Unix seconds): its placed node's lease end (#395). The
+    /// node refuses a start that reaches it then or later, so the control host's check at the run's
+    /// start (`nodecreate::refuse_past_lease`) and the start itself can't race. None: no lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_by: Option<i64>,
     /// What the box's output may take on the node's disk (#151; the zone's `limits.output`), and
     /// whether the box is stopped when its output passes it (else the oldest output goes).
     #[serde(default = "default_output_cap")]
@@ -270,16 +210,15 @@ pub struct BoxStart {
     /// The box's credential swaps, made by the node's egress proxy (#257): the box holds only each
     /// one's placeholder, and the node fetches the real credential on first use
     /// ([`Msg::SecretFetch`]), as it does injected secrets. Never a value: this is kept in the
-    /// node's box record. Sent only to nodes talking [`CREDENTIAL_SWAPS`].
+    /// node's box record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swaps: Vec<SwapStart>,
-    /// What the node needs to decide the box's gateway tools itself (#164). Sent only to nodes
-    /// talking [`EDGE_DECISIONS`]; without it the node relays every tool call.
+    /// What the node needs to decide the box's gateway tools itself (#164); without it the node
+    /// relays every tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<Box<EdgeStart>>,
     /// The digest (`sha256:…`) the box's image must be (#192): the node refuses to start it as any
-    /// other, and starts it by its id, so a retag can't swap it. Sent only to nodes talking
-    /// [`IMAGE_PINS`].
+    /// other, and starts it by its id, so a retag can't swap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pin: Option<String>,
     /// Measure the runtime's part of the start too (#287: `WICKET_TIMINGS=1`): one more `docker
@@ -599,8 +538,7 @@ pub enum Msg {
         sock: String,
         /// A link between two boxes on this node (#164): the node dials each connection into
         /// box `.0` at port `.1` itself, while both boxes' authority holds, instead of offering
-        /// it as a tunnel; the link outlives the control connection. Sent only on connections
-        /// talking [`EDGE_DECISIONS`].
+        /// it as a tunnel; the link outlives the control connection.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dial: Option<(String, u16)>,
     },
@@ -735,7 +673,7 @@ pub enum Msg {
     /// A child box this node started for `run`'s box while deciding its spawn (#164): what the
     /// control host needs to check it again and take it over (adopt it as a run of its own).
     /// Sent on `run`'s connection, at once or when it is back, until answered by
-    /// [`Msg::Adopted`]. Sent only on connections talking [`EDGE_DECISIONS`].
+    /// [`Msg::Adopted`].
     Spawned {
         run: String,
         child: String,
@@ -766,7 +704,7 @@ pub enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queued: Option<(String, i64)>,
         /// Every path under the op's directory, not the one path (`request_access`'s `scope:
-        /// prefix`, #164). Sent only on connections talking [`EDGE_DECISIONS`].
+        /// prefix`, #164).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         prefix: bool,
     },
@@ -1037,8 +975,8 @@ mod tests {
         assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
         assert!(negotiate(PROTOCOL, 12).unwrap() < ONE_GATEWAY);
         assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
-        assert_eq!(ControlTool::SpawnAgent.name(), "spawn_agent");
-        for local in ["whoami", "request_access", "anything", ""] {
+        assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
+        for local in ["whoami", "request_access", "spawn_agent", "anything", ""] {
             assert_eq!(ControlTool::of(local), None, "{local}: answered on the node, never sent");
         }
         let m = Msg::Call { id: 3, run: "r".into(), tool: ControlTool::Links, args: serde_json::json!({}) };
@@ -1266,25 +1204,30 @@ mod tests {
         assert!(matches!(back, Msg::BudgetSlice { slice: s, .. } if s == slice));
         let old = serde_json::json!({"m":"lease","run":"r","lease":{"slice":{"requests":3,"output_tokens":100}}});
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
-        assert_eq!(BUDGET_SLICE, 9);
-        assert!(negotiate(BUDGET_SLICE, 8).unwrap() < BUDGET_SLICE, "a node at 8 talks 8: no slice goes to it");
     }
 
-    /// #257, slice 3: a node at 11 forwards no egress; one at 10 talks 10 to a control host at 11,
-    /// below [`NO_FORWARDED_EGRESS`], and is gated per box (`noderun::refuse_older_node`).
+    /// Why this build has no checks for features before protocol 12: a peer below it can't connect,
+    /// so every connection talks 12 or 13 (#253, #257 slice 4b). A check for a version under 12
+    /// would be dead.
     #[test]
-    fn a_node_forwards_no_egress_from_protocol_11() {
-        assert_eq!(NO_FORWARDED_EGRESS, 11);
-        assert!(negotiate(NO_FORWARDED_EGRESS, 10).unwrap() < NO_FORWARDED_EGRESS);
+    fn no_connection_talks_below_protocol_12() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW), (13, 1));
+        for theirs in 1..=PROTOCOL + 3 {
+            match negotiate(PROTOCOL, theirs) {
+                Ok(at) => assert!((12..=13).contains(&at) && (12..=14).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(12..=14).contains(&theirs), "{theirs} refused"),
+            }
+        }
+        // And a node at 13 or 14 talking to a control host at 13 from the other side.
+        assert_eq!(negotiate(14, PROTOCOL), Ok(13));
+        assert!(negotiate(PROTOCOL, 11).is_err() && negotiate(11, PROTOCOL).is_err());
     }
 
-    /// #257: a box's swaps go in its start as names and placeholders, never values; a control host
-    /// before protocol 10 sends none (a node takes its start as having none), and a node at 9
-    /// talks 9 to a control host at 10, below [`CREDENTIAL_SWAPS`].
+    /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
+    /// without them reads as having none.
     #[test]
-    fn a_start_carries_its_swaps_by_name_from_protocol_10() {
-        assert_eq!((CREDENTIAL_SWAPS, NO_FORWARDED_EGRESS, NODE_HEALTH), (10, 11, 12));
-        assert!(negotiate(CREDENTIAL_SWAPS, 9).unwrap() < CREDENTIAL_SWAPS);
+    fn a_start_carries_its_swaps_by_name() {
+        assert_eq!((PROTOCOL, NODE_HEALTH, ONE_GATEWAY), (13, 12, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),

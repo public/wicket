@@ -302,7 +302,7 @@ fn grant_rule(r: &Rule, p: &Policy) -> Result<(), String> {
             _ => return Err(format!("grant rule predicate not allowed: {}/{}", b.name, b.terms.len())),
         }
     }
-    // Exactly `$t <= <date>` and `$n > <int>`: the lease's expiry and its uses.
+    // Exactly `$t <= <date>` and `$n > <int>`: the grant's expiry and its uses.
     let mut shapes: Vec<&str> = Vec::new();
     for e in &r.expressions {
         let shape = match e.ops.as_slice() {
