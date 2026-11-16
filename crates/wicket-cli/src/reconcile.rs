@@ -298,6 +298,21 @@ where
             match r.status.as_str() {
                 "pending" => {}
                 "granted" => {
+                    // Provisioned only as it was decided on, and while its approval lasts (#369).
+                    if let Some(why) = self.lease_unbound(&lease, &r)? {
+                        if !self.dry_run {
+                            self.ledger.lease_ended(&lease.id, "denied", &why, None)?;
+                            self.ledger.audit(
+                                &TenantId(lease.tenant.clone()),
+                                Some(&RunId(lease.run.clone())),
+                                "effect.refused",
+                                &serde_json::json!({ "lease": lease.id, "request": rid, "why": why }),
+                            )?;
+                        }
+                        self.leases_ended.insert(lease.id.clone());
+                        self.did("lease_closed", &lease.id, &why, Some(&lease.run));
+                        continue;
+                    }
                     if !self.dry_run {
                         self.ledger.lease_transition(&lease.id, &["pending"], "approved", &format!("request {rid} granted"))?;
                     }
@@ -314,6 +329,25 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Why a granted lease may not be provisioned, if it may not (#369): its approval has ended, or
+    /// the lease is no longer what was approved. A request filed before approvals were bound to
+    /// their effect carries no arguments, and is provisioned as before.
+    fn lease_unbound(&self, lease: &wicket_store::LeaseRow, r: &wicket_store::Request) -> Result<Option<String>> {
+        let Some(asked) = r.args_sha256.as_deref() else { return Ok(None) };
+        let Some(g) = self.ledger.grant_for_request(&r.id)? else {
+            return Ok(Some(format!("request {} has no live grant", r.id)));
+        };
+        if g.expires_at <= wicket_store::now() {
+            return Ok(Some(format!("its approval ({}) ended before it was provisioned", g.id)));
+        }
+        let granted = self.ledger.grant_effect(&g.id)?.and_then(|(_, a)| a);
+        let now = crate::capacity::lease_args(lease);
+        if granted.as_deref() != Some(asked) || now != asked {
+            return Ok(Some(format!("the lease is not what its approval ({}) was for: it changed after it was decided", g.id)));
+        }
+        Ok(None)
     }
 
     async fn lease_ends(&mut self) -> Result<()> {
@@ -1387,6 +1421,29 @@ mod tests {
         assert_eq!(*fake.creates.lock().unwrap(), 0);
         let x = l.lease(&lease).unwrap().unwrap();
         assert_eq!((x.status.as_str(), x.node_id.as_deref(), x.not_after), ("active", Some("i-made-before"), Some(NOW + 3000)));
+    }
+
+    /// #369: a lease is provisioned only while its approval lasts and as it was approved: one whose
+    /// grant ended first is closed, not provisioned, and that is on the record.
+    #[tokio::test]
+    async fn a_lease_whose_approval_ended_is_not_provisioned() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let lease = approved_lease(&mut l, &c, "run_a");
+        let rid = l.lease(&lease).unwrap().unwrap().request_id.unwrap();
+        let asked = l.request(&rid).unwrap().args_sha256.expect("the ask carries its arguments");
+        assert_eq!(asked, capacity::lease_args(&l.lease(&lease).unwrap().unwrap()));
+        let g = l.grant_for_request(&rid).unwrap().unwrap();
+        assert_eq!(l.grant_effect(&g.id).unwrap().and_then(|(_, a)| a), Some(asked));
+        l.revoke_grant(&g.id).unwrap();
+        let d = w.pass(&mut l, NOW, false).await;
+        assert_eq!(kinds(&d), vec!["lease_closed"], "{d:?}");
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "denied");
+        assert!(l.audit_tail(20).unwrap().iter().any(|r| r.2 == "effect.refused"));
     }
 
     #[tokio::test]

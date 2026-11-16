@@ -12,7 +12,9 @@ mod agents;
 mod capgrant;
 pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
+mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
+pub use effect::{descriptor, requesters, DecisionTerms, EffectUse, EgressSeen, Filed};
 pub mod bundle;
 pub mod cas;
 mod links;
@@ -55,6 +57,10 @@ pub enum StoreError {
     Writer(String),
     #[error("not requested: {0}")]
     Refused(String),
+    #[error("request {0} is not the effect that was shown (shown {1}, now {2}): it changed since; look at it again and decide that")]
+    EffectChanged(String, String, String),
+    #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
+    EgressGrant(String),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
 }
@@ -83,6 +89,10 @@ pub enum StoreError {
 /// hour, for `wicket node list` (#358).
 /// Version 9 (expand) adds standing capacity grants (#256): `grants.principal`, `grants.terms` and
 /// the `capacity_uses` table.
+/// Version 10 (expand) binds approvals to their effect (#369): `requests.args_sha256` and
+/// `grants.args_sha256` (the decided-on arguments' hash), `grants.effect_sha256` (the approved
+/// descriptor's), and the indexes a run's recent egress (`audit_run`) and its pending requests
+/// (`requests_run`) are read by.
 /// Version 11 (expand) adds `runs.uncollected`: the node keeping a run's files that a fetch didn't
 /// bring back (#300, #324), which holds the node.
 pub const SCHEMA_VERSION: u32 = 11;
@@ -164,6 +174,9 @@ pub struct Request {
     pub attribution: Vec<serde_json::Value>,
     /// The agent asked for every path under `path` (request_access with scope prefix), not one path.
     pub scope_prefix: bool,
+    /// The sha256 of the arguments it asks with, for the kinds whose effect depends on more than
+    /// the target (spawn, link, capacity, update: #369, [`wicket_core::effect::args_sha256`]).
+    pub args_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,14 +277,15 @@ CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, run TEXT NOT NULL, zone TEXT NOT NULL, digest TEXT NOT NULL,
   method TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, risk TEXT NOT NULL, reason TEXT NOT NULL,
   status TEXT NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
-  attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0
+  attribution TEXT NOT NULL DEFAULT '[]', scope_prefix INTEGER NOT NULL DEFAULT 0, args_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_pending ON requests (tenant, zone, digest, status);
+CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status);
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, principal TEXT, terms TEXT
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, principal TEXT, terms TEXT, args_sha256 TEXT, effect_sha256 TEXT
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -346,11 +360,27 @@ CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
   kind TEXT NOT NULL, body TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq);
 "#;
 
+/// The path and whether it is a prefix that approving `req` with the human's `path_prefix` grants:
+/// what [`Ledger::approve`] records, and what the effect descriptor a decision signs names (#369).
+/// Prefixes cover whole segments (#119): a prefix given by the human must cover the asked path, or
+/// (for a prefix ask) lie within the asked prefix.
+pub fn granted_scope(req: &Request, path_prefix: Option<&str>) -> (String, bool) {
+    match path_prefix {
+        Some(p) if wicket_core::prefix_covers(p, &req.path) => (wicket_core::prefix_dir(p), true),
+        Some(p) if req.scope_prefix && wicket_core::prefix_covers(&req.path, p) => (wicket_core::prefix_dir(p), true),
+        // A prefix ask is granted as asked unless the human narrows it.
+        _ if req.scope_prefix => (wicket_core::prefix_dir(&req.path), true),
+        _ => (req.path.clone(), false),
+    }
+}
+
 /// What a request needs of a grant: the one lookup every request kind's grant is found by
-/// ([`Ledger::consume_grant`] for access, SPAWN and LINK asks, [`Ledger::use_update_approval`] for
-/// UPDATE). `None` matches any tenant, zone or run.
+/// ([`Ledger::consume_grant`] for SPAWN and LINK asks, [`Ledger::use_update_approval`] for UPDATE,
+/// [`Ledger::grant_covering`] for what an egress grant covers). `None` matches any tenant, zone or
+/// run.
 struct GrantMatch<'a> {
     tenant: Option<&'a str>,
     zone: Option<&'a str>,
@@ -364,6 +394,24 @@ struct GrantMatch<'a> {
     exact: bool,
     /// Only a grant made for a request whose own method, host and path are these.
     answers_request: bool,
+}
+
+impl<'a> GrantMatch<'a> {
+    /// What `op` needs of a grant: its tenant, zone and run, a path or a prefix covering it, at
+    /// least its risk.
+    fn for_op(op: &'a Op) -> GrantMatch<'a> {
+        GrantMatch {
+            tenant: Some(&op.tenant.0),
+            zone: Some(&op.zone),
+            run: Some(&op.run.0),
+            method: &op.method,
+            host: &op.host,
+            path: &op.path,
+            min_risk: op.risk.rank(),
+            exact: false,
+            answers_request: false,
+        }
+    }
 }
 
 /// The oldest live grant matching `m` (exact paths before prefixes), with its uses left: not
@@ -450,6 +498,13 @@ impl Ledger {
         // Ledgers created before capacity grants (#256): the principal a grant is to, and its terms.
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN principal TEXT", []);
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN terms TEXT", []);
+        // Ledgers created before approvals were bound to their effect (#369).
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN args_sha256 TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN args_sha256 TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN effect_sha256 TEXT", []);
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS audit_run ON audit (run, seq); CREATE INDEX IF NOT EXISTS requests_run ON requests (run, status)",
+        )?;
         // Ledgers created before a run's uncollected files held its node (#300, #324).
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN uncollected TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
@@ -526,7 +581,13 @@ impl Ledger {
     /// Records a pending request for `op`, or returns the existing one. `who` is the attribution of
     /// this ask; when a *different* asker hits an existing request, it is added, so the human sees
     /// everyone a grant would serve.
-    pub fn pending_for(&self, op: &Op, reason: &str, who: Option<&serde_json::Value>) -> Result<(String, bool)> {
+    pub(crate) fn pending_for_unheld(
+        &self,
+        op: &Op,
+        args: Option<&str>,
+        reason: &str,
+        who: Option<&serde_json::Value>,
+    ) -> Result<(String, bool)> {
         let digest = op.digest();
         if let Some((id, attr)) = self
             .conn
@@ -557,9 +618,9 @@ impl Ledger {
         let id = new_request_id();
         let attr = serde_json::Value::from(who.cloned().into_iter().collect::<Vec<_>>()).to_string();
         self.conn.execute(
-            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
-            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr],
+            "INSERT INTO requests (id, tenant, run, zone, digest, method, host, path, risk, reason, status, created_at, attribution, args_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
+            params![id, op.tenant.0, op.run.0, op.zone, digest, op.method, op.host, op.path, format!("{:?}", op.risk), reason, now(), attr, args],
         )?;
         Ok((id, true))
     }
@@ -929,6 +990,13 @@ impl Ledger {
         if let Some(why) = op.refused_for_agents() {
             return Err(StoreError::Refused(why));
         }
+        // An exact ask that a pending prefix ask from the run covers waits on that ask (#369).
+        if !prefix {
+            if let Some(pending) = self.held_by(op, None)? {
+                self.merge_attribution(&pending, who)?;
+                return Ok((pending, false));
+            }
+        }
         let digest = format!("{}{}", op.digest(), if prefix { ":prefix" } else { "" });
         if let Some(id) = self
             .conn
@@ -965,7 +1033,7 @@ impl Ledger {
 
     pub fn request(&self, id: &str) -> Result<Request> {
         self.conn
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))
     }
@@ -984,7 +1052,7 @@ impl Ledger {
     /// Recently decided requests, newest first.
     pub fn decided(&self, tenant: &TenantId, limit: usize) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests
              WHERE tenant = ?1 AND status != 'pending' ORDER BY decided_at DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![tenant.0, limit as i64], row_to_request)?;
@@ -993,7 +1061,7 @@ impl Ledger {
 
     pub fn pending(&self, tenant: &TenantId) -> Result<Vec<Request>> {
         let mut st = self.conn.prepare(
-            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests
+            "SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests
              WHERE tenant = ?1 AND status = 'pending' ORDER BY created_at",
         )?;
         let rows = st.query_map(params![tenant.0], row_to_request)?;
@@ -1007,32 +1075,38 @@ impl Ledger {
     /// run of it) can use it, and it ends with the run (#127). [`Ledger::approve_zone_wide`] is the
     /// wider scope, when the human picks it.
     pub fn approve(&mut self, id: &str, a: &Approval) -> Result<String> {
-        self.approve_scoped(id, a, false)
+        Ok(self.approve_scoped(id, a, false, None)?.0)
+    }
+
+    /// As [`Ledger::approve`] (or [`Ledger::approve_zone_wide`]), only if the request's effect
+    /// descriptor with these terms is `shown` (#369), checked in the transaction that makes the
+    /// grant ([`StoreError::EffectChanged`] otherwise). Returns the grant and the descriptor's hash.
+    pub fn approve_shown(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
+        self.approve_scoped(id, a, zone_wide, shown)
     }
 
     /// As [`Ledger::approve`], usable by any run in the request's zone until it expires.
     pub fn approve_zone_wide(&mut self, id: &str, a: &Approval) -> Result<String> {
-        self.approve_scoped(id, a, true)
+        Ok(self.approve_scoped(id, a, true, None)?.0)
     }
 
-    fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool) -> Result<String> {
+    fn approve_scoped(&mut self, id: &str, a: &Approval, zone_wide: bool, shown: Option<&str>) -> Result<(String, String)> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let req = tx
-            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix FROM requests WHERE id = ?1", params![id], row_to_request)
+            .query_row("SELECT id, tenant, run, zone, method, host, path, risk, reason, status, created_at, attribution, scope_prefix, args_sha256 FROM requests WHERE id = ?1", params![id], row_to_request)
             .optional()?
             .ok_or_else(|| StoreError::NoSuchRequest(id.to_string()))?;
         if req.status != "pending" {
             return Err(StoreError::NotPending(id.into(), req.status));
         }
-        // Prefixes cover whole segments (#119): a prefix given by the human must cover the asked path,
-        // or (for a prefix ask) lie within the asked prefix.
-        let (path, prefix) = match &a.path_prefix {
-            Some(p) if wicket_core::prefix_covers(p, &req.path) => (wicket_core::prefix_dir(p), 1),
-            Some(p) if req.scope_prefix && wicket_core::prefix_covers(&req.path, p) => (wicket_core::prefix_dir(p), 1),
-            // A prefix ask is granted as asked unless the human narrows it.
-            _ if req.scope_prefix => (wicket_core::prefix_dir(&req.path), 1),
-            _ => (req.path.clone(), 0),
-        };
+        // The effect this grant is for (#369), from the row as it is in this transaction.
+        let terms = DecisionTerms { uses: a.uses, ttl_secs: a.ttl.as_secs(), prefix: a.path_prefix.clone(), zone_wide };
+        let effect_sha256 = descriptor(&req, Some(&terms)).sha256();
+        if let Some(shown) = shown.filter(|s| *s != effect_sha256) {
+            return Err(StoreError::EffectChanged(id.into(), shown.into(), effect_sha256));
+        }
+        let (path, prefix) = granted_scope(&req, a.path_prefix.as_deref());
+        let prefix = prefix as i64;
         // The grant covers nothing riskier than what the human was shown (#119): a prefix approved
         // for an R2 write doesn't also cover the R4 operations under it.
         let max_risk = wicket_core::RiskClass::from_name(&req.risk).map(|r| r.rank()).unwrap_or(0);
@@ -1042,8 +1116,8 @@ impl Ledger {
         let gid = new_grant_id();
         let t = now();
         tx.execute(
-            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO grants (id, tenant, zone, method, host, path, prefix, uses_left, expires_at, request_id, decided_by, created_at, max_risk, run, args_sha256, effect_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 gid,
                 req.tenant,
@@ -1058,12 +1132,14 @@ impl Ledger {
                 a.decided_by,
                 t,
                 max_risk,
-                (!zone_wide).then_some(&req.run)
+                (!zone_wide).then_some(&req.run),
+                req.args_sha256,
+                effect_sha256
             ],
         )?;
         tx.execute("UPDATE requests SET status = 'granted', decided_at = ?2, decided_by = ?3 WHERE id = ?1", params![id, t, a.decided_by])?;
         tx.commit()?;
-        Ok(gid)
+        Ok((gid, effect_sha256))
     }
 
     pub fn deny(&self, id: &str, by: &str) -> Result<()> {
@@ -1078,24 +1154,20 @@ impl Ledger {
         Ok(())
     }
 
-    /// Finds a live grant covering the op and consumes one use, atomically. Returns the grant id. A
-    /// grant bound to a run covers only that run's ops (#127).
+    /// Finds a live grant covering an op in wicket's own approval namespace (a SPAWN or LINK ask, a
+    /// capacity request) and consumes one use, atomically. Returns the grant id. A grant bound to a
+    /// run covers only that run's ops (#127).
+    ///
+    /// Never an egress op (one a box makes itself, [`Op::refused_for_agents`] is `None`): since
+    /// #257's slice 3 the ledger records an egress grant's issuance, renewals and revocation, and
+    /// the run's process publishes it to the box's node, which alone decides and counts its uses.
+    /// Such an op is refused with [`StoreError::EgressGrant`].
     pub fn consume_grant(&mut self, op: &Op) -> Result<Option<String>> {
+        if op.refused_for_agents().is_none() {
+            return Err(StoreError::EgressGrant(format!("{} {}{}", op.method, op.host, op.path)));
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found = live_grant(
-            &tx,
-            &GrantMatch {
-                tenant: Some(&op.tenant.0),
-                zone: Some(&op.zone),
-                run: Some(&op.run.0),
-                method: &op.method,
-                host: &op.host,
-                path: &op.path,
-                min_risk: op.risk.rank(),
-                exact: false,
-                answers_request: false,
-            },
-        )?;
+        let found = live_grant(&tx, &GrantMatch::for_op(op))?;
         let Some((gid, uses)) = found else {
             tx.commit()?;
             return Ok(None);
@@ -1105,6 +1177,16 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(Some(gid))
+    }
+
+    /// The live grant that covers `op`, by the lookup [`Ledger::consume_grant`] uses, without
+    /// using it: for what an issued grant covers (the console, tests). A grant already handed to a
+    /// node isn't found: its uses are counted there.
+    pub fn grant_covering(&self, op: &Op) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found = live_grant(&tx, &GrantMatch::for_op(op))?;
+        tx.commit()?;
+        Ok(found.map(|(gid, _)| gid))
     }
 
     /// An operator's approval of an agent's `request_update` for the artifact with this sha256
@@ -1463,6 +1545,7 @@ fn row_to_request(r: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
         created_at: r.get(10)?,
         attribution: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
         scope_prefix: r.get::<_, i64>(12)? != 0,
+        args_sha256: r.get(13)?,
     })
 }
 
@@ -2085,9 +2168,9 @@ mod tests {
         assert_eq!(l.pending_for(&op("run_a"), "again", None).unwrap(), (a.clone(), false));
         // a's grant is a's alone.
         l.approve(&a, &once).unwrap();
-        assert!(l.consume_grant(&op("run_b")).unwrap().is_none(), "another box in the zone used a's grant");
-        assert!(l.consume_grant(&op("run_later")).unwrap().is_none(), "a later run of the zone used a's grant");
-        assert!(l.consume_grant(&op("run_a")).unwrap().is_some());
+        assert!(l.grant_covering(&op("run_b")).unwrap().is_none(), "another box in the zone used a's grant");
+        assert!(l.grant_covering(&op("run_later")).unwrap().is_none(), "a later run of the zone used a's grant");
+        assert!(l.grant_covering(&op("run_a")).unwrap().is_some());
         // A denial of b's request doesn't stop a from asking.
         l.deny(&b, "owner").unwrap();
         assert!(l.denied_recently(&op("run_b")).unwrap().is_some());
@@ -2095,13 +2178,13 @@ mod tests {
         // A run-bound grant ends with its run.
         l.run_started(&t, &RunId("run_a".into()), "z", "a").unwrap();
         l.run_ended(&RunId("run_a".into()), "succeeded", "").unwrap();
-        assert!(l.consume_grant(&op("run_a")).unwrap().is_none(), "the grant outlived its run");
+        assert!(l.grant_covering(&op("run_a")).unwrap().is_none(), "the grant outlived its run");
         // Zone-wide, when the human picks it: any run in the zone, after the asker ends too.
         let (c, _) = l.pending_for(&op("run_c"), "c", None).unwrap();
         l.approve_zone_wide(&c, &once).unwrap();
         l.run_started(&t, &RunId("run_c".into()), "z", "c").unwrap();
         l.run_ended(&RunId("run_c".into()), "succeeded", "").unwrap();
-        assert!(l.consume_grant(&op("run_d")).unwrap().is_some());
+        assert!(l.grant_covering(&op("run_d")).unwrap().is_some());
     }
 
     #[test]
@@ -2113,7 +2196,7 @@ mod tests {
         assert_eq!(l.ask(&ask, "again", true, None).unwrap(), (id.clone(), false), "asking twice is one request");
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         let later = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "news.example.org", "/item");
-        assert!(l.consume_grant(&later).unwrap().is_some(), "every path under the prefix");
+        assert!(l.grant_covering(&later).unwrap().is_some(), "every path under the prefix");
     }
 
     #[test]
@@ -2289,11 +2372,19 @@ mod tests {
         let (id, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh);
         assert_eq!(l.pending_for(&o, "push", None).unwrap(), (id.clone(), false));
-        assert_eq!(l.consume_grant(&o).unwrap(), None);
+        assert_eq!(l.grant_covering(&o).unwrap(), None);
         l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        assert!(l.consume_grant(&o).unwrap().is_some());
-        assert_eq!(l.consume_grant(&o).unwrap(), None, "single use");
+        assert!(l.grant_covering(&o).unwrap().is_some());
+        assert!(l.grant_covering(&o).unwrap().is_some(), "looking a grant up doesn't use it");
+        // #257: an egress grant's uses are the node's to count, never the ledger's.
+        assert!(matches!(l.consume_grant(&o), Err(StoreError::EgressGrant(_))));
         assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
+        // wicket's own namespace (a spawn beyond its parent): consumed here, once.
+        let spawn = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "SPAWN", "wicket.internal", "/zones/z.x/0123");
+        let (sid, _) = l.pending_for(&spawn, "spawn", None).unwrap();
+        l.approve(&sid, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        assert!(l.consume_grant(&spawn).unwrap().is_some());
+        assert_eq!(l.consume_grant(&spawn).unwrap(), None, "single use");
     }
 
     /// #26: one approval of a push covers its requests for a short window, whatever uses the human
@@ -2316,7 +2407,7 @@ mod tests {
         assert_eq!(expires - created, wicket_core::git::PUSH_WINDOW_SECS as i64, "the window, not the hour asked for");
         // Discovery, a probe, the upload, a retry: all within the window.
         for _ in 0..4 {
-            assert_eq!(l.consume_grant(&o).unwrap().as_deref(), Some(gid.as_str()));
+            assert_eq!(l.grant_covering(&o).unwrap().as_deref(), Some(gid.as_str()));
         }
         // A shorter ttl than the window is kept.
         let (id2, _) = l.pending_for(&op("/o/s.git/git-receive-pack"), "push", None).unwrap();
@@ -2327,7 +2418,7 @@ mod tests {
         assert_eq!(e2, 60);
         // The window passes: nothing covers the push, and it is asked about again (a new request).
         l.conn.execute("UPDATE grants SET expires_at = ?2 WHERE id = ?1", params![gid, now() - 1]).unwrap();
-        assert_eq!(l.consume_grant(&o).unwrap(), None);
+        assert_eq!(l.grant_covering(&o).unwrap(), None);
         let (again, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh && again != id);
     }
@@ -2345,13 +2436,13 @@ mod tests {
         let (id, _) = l.ask(&o("PUT", "/repos/acme/app/contents"), "edit files", true, None).unwrap();
         assert_eq!(l.request(&id).unwrap().path, "/repos/acme/app/contents/", "kept ending in '/'");
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents/src/main.rs")).unwrap().is_some());
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents")).unwrap().is_some(), "the directory itself");
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents-x/a")).unwrap().is_none(), "a sibling");
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents/src/main.rs")).unwrap().is_some());
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents")).unwrap().is_some(), "the directory itself");
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents-x/a")).unwrap().is_none(), "a sibling");
         // Approved at R2: the R4 workflow edit under the same prefix isn't covered.
         let wf = o("PUT", "/repos/acme/app/contents/.github/workflows/ci.yml");
         assert_eq!(wf.risk, wicket_core::RiskClass::R4ExecOrPrivilege);
-        assert!(l.consume_grant(&wf).unwrap().is_none());
+        assert!(l.grant_covering(&wf).unwrap().is_none());
 
         // A raw-prefix grant from an older ledger: segment-bounded too, and without a risk bound it
         // covers nothing.
@@ -2359,10 +2450,10 @@ mod tests {
         let gid =
             l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         l.conn.execute("UPDATE grants SET path = '/repos/acme/api', max_risk = 1 WHERE id = ?1", params![gid]).unwrap();
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
         l.conn.execute("UPDATE grants SET max_risk = NULL WHERE id = ?1", params![gid]).unwrap();
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
 
         // An exact grant for a fetch's ref discovery doesn't cover the push's (same path, R4).
         let fetch = Op::egress_with_query(
@@ -2386,8 +2477,8 @@ mod tests {
             "service=git-receive-pack",
         );
         assert_eq!(push.digest(), fetch.digest());
-        assert!(l.consume_grant(&push).unwrap().is_none());
-        assert!(l.consume_grant(&fetch).unwrap().is_some());
+        assert!(l.grant_covering(&push).unwrap().is_none());
+        assert!(l.grant_covering(&fetch).unwrap().is_some());
     }
 
     #[test]
@@ -2398,8 +2489,8 @@ mod tests {
         // A prefix that is not a prefix of the asked path is ignored: the grant stays exact.
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(60), path_prefix: Some("/other".into()), decided_by: "a".into() })
             .unwrap();
-        assert!(l.consume_grant(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
-        assert!(l.consume_grant(&o).unwrap().is_some());
+        assert!(l.grant_covering(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
+        assert!(l.grant_covering(&o).unwrap().is_some());
     }
 
     #[test]

@@ -19,7 +19,8 @@ EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
     Grants,          \* grant ids the human may issue
-    FwdGrants,       \* of those, grants on hosts the node forwards (Route::Forward): decided by Central
+    FwdGrants,       \* of those, grants on hosts the node's CA can't cover: forwarded to Central
+                     \* today; since slice 3 published, and never used (spliced or refused)
     Lifetime,        \* a grant's lifetime, and a renewal's, in whole seconds
     MaxRenew,        \* renewals per grant
     TicksPerSec,     \* ticks per second (>= 2 to see the sub-second boundary)
@@ -84,13 +85,14 @@ VARIABLES
     released,    \* its final spend reported and its slice returned
     \* ---- history, for the safety properties ----
     pastLife,    \* some allow came at or past the grant's lifetime (the ledger's)
-    pastRevoke   \* some allow used a grant whose revocation the decider had
+    pastRevoke,  \* some allow used a grant whose revocation the decider had
+    ledgerUsed   \* the ledger decided a request by a grant (Central's consume_grant)
 
 grantVars == <<ledger, asks, decided, forged, feed, epoch, rep>>
 nodeVars == <<up, conn, faults>>
 budgetVars == <<billed, carved, chCount, chOwn, chNode, chReserved, chSlice, sliceSent,
                 nCount, nJournal, nSlice, nInflight, nCarved, unadopted, spawns, boxDone, released>>
-histVars == <<pastLife, pastRevoke>>
+histVars == <<pastLife, pastRevoke, ledgerUsed>>
 vars == <<now, grantVars, nodeVars, budgetVars, histVars>>
 
 -----------------------------------------------------------------------------
@@ -134,7 +136,7 @@ Init ==
     /\ nSlice = (IF SliceAtStart THEN Min(Budget, Part) ELSE NoSlice)
     /\ nCarved = 0 /\ unadopted = 0 /\ spawns = 0
     /\ boxDone = FALSE /\ released = FALSE
-    /\ pastLife = FALSE /\ pastRevoke = FALSE
+    /\ pastLife = FALSE /\ pastRevoke = FALSE /\ ledgerUsed = FALSE
 
 Tick ==
     /\ now < MaxTime
@@ -165,9 +167,10 @@ Approve(g) ==
     /\ ledger' = [ledger EXCEPT ![g].st = "live", ![g].exp = Sec(now) + Lifetime]
     /\ UNCHANGED <<now, asks, forged, feed, epoch, rep, nodeVars, budgetVars, histVars>>
 
-\* sync_grants hands a live, terminated grant to the node: ledger.node set, a PutZone on the feed.
+\* sync_grants hands a live grant to the node: ledger.node set, a PutZone on the feed. Today only a
+\* grant on a host the node terminates; since slice 3 it only publishes, every grant included.
 Hand(g) ==
-    /\ g \notin FwdGrants
+    /\ (Stacks = "today" => g \notin FwdGrants)
     /\ LedgerLive(g, now)
     /\ ~ledger[g].handed
     /\ ledger' = [ledger EXCEPT ![g].handed = TRUE]
@@ -208,17 +211,20 @@ Deliver ==
 
 (* Decisions. *)
 
-\* The node decides at the edge, fresh or offline, on its own clock (`Replica::decide`).
+\* The node decides at the edge, fresh or offline, on its own clock (`Replica::decide`). Never a
+\* host its CA can't cover (`decide::route`): today it forwards those; since slice 3 it splices one
+\* the box's token allows wholesale (which uses no grant) and refuses the rest.
 NodeAllow(g) ==
     /\ up
+    /\ g \notin FwdGrants
     /\ rep[g].has /\ ~rep[g].rev
     /\ TokenLive(rep[g].exp, NodeNow)
     /\ pastLife' = (pastLife \/ ~(now < ledger[g].exp * TicksPerSec))
     /\ pastRevoke' = (pastRevoke \/ RevDelivered(g))
-    /\ UNCHANGED <<now, grantVars, nodeVars, budgetVars>>
+    /\ UNCHANGED <<now, grantVars, nodeVars, budgetVars, ledgerUsed>>
 
 \* Today only: Central decides a forwarded request from the ledger (`consume_grant`), reached
-\* through the node's tunnel.
+\* through the node's tunnel. Gone with slice 3 (no forwarded egress).
 CentralAllow(g) ==
     /\ Stacks = "today"
     /\ up /\ conn
@@ -227,6 +233,7 @@ CentralAllow(g) ==
     /\ LedgerLive(g, now)
     /\ pastLife' = (pastLife \/ ~(now < ledger[g].exp * TicksPerSec))
     /\ pastRevoke' = (pastRevoke \/ ledger[g].st = "revoked")
+    /\ ledgerUsed' = TRUE
     /\ UNCHANGED <<now, grantVars, nodeVars, budgetVars>>
 
 -----------------------------------------------------------------------------
@@ -430,7 +437,11 @@ PeerNeverGrants ==
     /\ \A g \in Grants : ledger[g].st # "none" => g \in decided
     /\ \A g \in Grants : rep[g].has => ledger[g].handed
 
-Safety == NoAllowPastLifetime /\ NoAllowAfterRevocation /\ SpendWithinBudget /\ PeerNeverGrants
+\* One decision path (#257): from slice 3 the ledger records grants and never decides a request
+\* by one; only the node does, from its replica.
+LedgerNeverDecides == Stacks # "today" => ~ledgerUsed
+
+Safety == NoAllowPastLifetime /\ NoAllowAfterRevocation /\ SpendWithinBudget /\ PeerNeverGrants /\ LedgerNeverDecides
 
 \* A reconnecting node converges to the control host's grants.
 Converged ==

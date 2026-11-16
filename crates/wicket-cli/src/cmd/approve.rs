@@ -28,6 +28,14 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             // What is approved is what wicket recorded, shown before the grant exists: a hint printed
             // from a node's or an agent's text can name the wrong request (#121).
             print!("{}", show_request(&l, &req));
+            // The effect the grant will be for (#369), and what else it would allow if it widens.
+            let shown = crate::effect::descriptor(&req, Some(&t));
+            let shown_sha = shown.sha256();
+            println!("effect {shown_sha}: {}", wicket_core::text::clip(&shown.canonical(), 2000));
+            let zone = crate::effect::zone_of_run(&l, &data_dir(), &req.run);
+            if let Some(b) = crate::effect::blast_radius(&l, zone.as_ref(), &req, &t)? {
+                print!("{}", crate::effect::render(&b));
+            }
             if !yes && std::io::stdin().is_terminal() && !confirm(&format!("approve {id} as shown above?"))? {
                 bail!("not approved");
             }
@@ -36,7 +44,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 &grant::Granter::Human(crate::operators::Operator::cli(&TenantId::single().0)?),
                 &id,
                 &grant::Verdict::Approve(t),
-                serde_json::json!({}),
+                serde_json::json!({ crate::effect::SHOWN_EFFECT: shown_sha }),
             )?
             else {
                 unreachable!("an approval approves")

@@ -19,6 +19,14 @@ pub mod sockpath;
 mod splice;
 pub mod vault;
 
+// The tests' stand-in decision source, shared with the integration tests (which reach it by
+// `#[path]`), written against this crate's public items as `wicket_proxy::`.
+#[cfg(test)]
+extern crate self as wicket_proxy;
+#[cfg(test)]
+#[path = "../tests/support/zone_decider.rs"]
+pub(crate) mod zone_decider;
+
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -240,10 +248,7 @@ pub fn attribution_line(v: &serde_json::Value) -> String {
 
 /// The agents an attribution object names.
 pub fn attributed_agents(v: &serde_json::Value) -> Vec<String> {
-    v.get("requesters")
-        .and_then(|r| r.as_array())
-        .map(|rs| rs.iter().filter_map(|r| r.get("agent").and_then(|a| a.as_str()).map(String::from)).collect())
-        .unwrap_or_default()
+    wicket_store::requesters(v)
 }
 
 /// Live events for the operator's console and the audit log.
@@ -788,7 +793,7 @@ mod fence_tests {
     async fn the_egress_proxy_refuses_a_stale_generation() {
         let ctx = stale_ctx();
         let ca = Arc::new(ca::RunCa::generate("run_old").unwrap());
-        let egress = egress::Egress::new(ctx, ca).unwrap();
+        let egress = egress::Egress::with(ctx, ca, Arc::new(zone_decider::ZoneDecider), None).unwrap();
         let d = dir("egress");
         let sock = d.join("egress.sock");
         let server = tokio::spawn({

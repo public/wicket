@@ -8,6 +8,7 @@
 //! - The request's `content-length` goes upstream as sent; the response's comes back to the box.
 //! - Requests from several box connections share one pooled HTTP/2 upstream connection.
 
+use crate::zone_decider::ZoneDecider;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::collections::HashMap;
@@ -20,7 +21,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::Central;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::RunCtx;
 
@@ -162,7 +162,7 @@ impl World {
             lifecycle: None,
         };
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
-        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_stream").unwrap()), Arc::new(Central), None, up).unwrap();
+        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_stream").unwrap()), Arc::new(ZoneDecider), None, up).unwrap();
         let sock = dir.join("egress.sock");
         let s2 = sock.clone();
         tokio::spawn(async move { egress.serve(&s2).await });

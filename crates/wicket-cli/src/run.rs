@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{ca::RunCa, egress::Egress, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{ca::RunCa, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 
@@ -1010,16 +1010,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         lifecycle: m.program.is_none().then(|| want_tx.clone()),
     };
     let proxies_lap = std::time::Instant::now();
-    let egress = Egress::new(ctx.clone(), ca.clone())?;
     // The run's model budget and spend: its node's model proxy is the box's only one and the counter
     // of record (#152, #257), whose reports are merged in here and whose budget slices are sent from here.
     // Nothing listens for model calls on this side.
     // Its budget is its quota grants' amounts (#256), whatever its zone says.
     let llm = Llm::with_quota(ctx.clone(), limits.model)?;
     let _ = llm_slot.set(llm.clone());
-    // A wrapped session's model calls reach the model host through the egress proxy: they get the
-    // model proxy's budget, filter and accounting there (#112).
-    egress.set_model_gate(llm.clone());
     // A woken agent's budget continues from what its earlier activations spent (#70); a re-attached
     // long-lived agent's from what its agent row records (this activation's spend included, up to its
     // supervisor's last heartbeat), any other re-attached run's from what its supervisor last saved.
@@ -1050,23 +1046,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // Taken over from its node (#164): its time counts from when it started there.
         (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
-    let (es, gs) = (dir.join("ctl/egress.sock"), dir.join("ctl/gateway.sock"));
+    let gs = dir.join("ctl/gateway.sock");
     // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
-    for s in [&es, &gs] {
-        wicket_proxy::sockpath::resolve(s).with_context(|| format!("the run proxy socket {}", s.display()))?;
-    }
+    wicket_proxy::sockpath::resolve(&gs).with_context(|| format!("the run proxy socket {}", gs.display()))?;
     let gateway = Gateway::new(ctx.clone());
-    // The run's own proxies, which its node reaches for what it doesn't decide itself (hosts it
-    // forwards, the MCP gateway's tools it doesn't decide yet): `ctl/`, not the box's `sock/`, which
-    // is the node's. The model proxy is the node's alone (#257).
-    // Each is bound and listening before it is served, so it is ready here, with no wait for its
+    // The run's own gateway, which its node reaches for the MCP tools it doesn't decide yet: `ctl/`,
+    // not the box's `sock/`, which is the node's. The model and egress proxies are the node's alone
+    // (#257: no egress is forwarded here since slice 3, so nothing listens on `ctl/egress.sock`).
+    // It is bound and listening before it is served, so it is ready here, with no wait for its
     // socket to appear (#287), and one that can't be bound fails the run, naming it.
     let waited = std::time::Instant::now();
     let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
-    let (gl, el) = (listen(&gs)?, listen(&es)?);
+    let gl = listen(&gs)?;
     timings.since("proxies.sockets", waited);
     let g_task = tokio::spawn(gateway.serve_on(gl));
-    let e_task = tokio::spawn(egress.serve_on(el));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 
@@ -1262,7 +1255,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
             // Swapped on the node (#257): their names and placeholders only, the credentials
             // fetched by the node on first use.
-            swap_hosts: vec![],
             swaps: crate::chan::swap_starts(&ctx.swaps),
             durable: match long_lived {
                 true => m
@@ -2255,7 +2247,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("    {}", wicket_agent::clip(l, 300));
         }
     }
-    e_task.abort();
     g_task.abort();
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its

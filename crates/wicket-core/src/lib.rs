@@ -8,6 +8,7 @@
 pub mod authority;
 pub mod budget;
 pub mod canon;
+pub mod effect;
 pub mod git;
 pub mod image;
 pub mod link;
