@@ -725,7 +725,7 @@ mod tests {
             ("connection", "Upgrade, HTTP2-Settings, keep-alive"),
             ("upgrade", "websocket, h2c"),
             ("http2-settings", "AAMAAABkAARAAAAAAAIAAAAA"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
             ("sec-websocket-version", "13"),
             ("sec-websocket-protocol", "chat"),
             ("keep-alive", "timeout=5"),

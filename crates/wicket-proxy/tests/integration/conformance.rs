@@ -298,7 +298,7 @@ fn get(path: &str, host_line: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upgrades_are_never_passed_upstream_and_leave_no_raw_pipe() {
     let w = World::new().await;
-    let ws = "GET /upgrade HTTP/1.1\r\nHost: echo.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    let ws = "GET /upgrade HTTP/1.1\r\nHost: echo.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";
     let h2c = "GET /upgrade HTTP/1.1\r\nHost: echo.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n";
     // An upstream that refuses the upgrade: what follows must still be a request, not a pipe.
     let refused = "GET /refuse-upgrade HTTP/1.1\r\nHost: echo.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";

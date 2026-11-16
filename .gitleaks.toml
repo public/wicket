@@ -16,3 +16,7 @@ commits = ["dc0e969a96370e9ebb81ec46a33d69d589b46725", "67f2eebfe8e8df23c46b5a00
 description = "fuzz seed corpora: synthetic feed JWS"
 targetRules = ["jwt"]
 paths = ['''^fuzz/corpus/feed/''']
+
+[[allowlists]]
+description = "RFC 6455 §1.3's published sample Sec-WebSocket-Key ('the sample nonce'), a test vector, in two commits before the conformance tests (#361) used a zero key"
+commits = ["410127960e104b3caa475fb1d8654d56d86ee590", "65679d4b0bbe0cb67d96dd25ad0956dcfe792c56"]
