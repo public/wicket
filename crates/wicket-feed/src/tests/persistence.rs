@@ -262,3 +262,37 @@ fn reopening_compiles_only_the_entries_still_held() {
     assert!(viewed.zones.values().all(|z| z.compiled.is_ok()));
     assert_eq!(viewed.head, head);
 }
+
+/// #287: a delta rewrites the statements file only when it changes what the file holds. One that
+/// comes after the newest statement leaves it as it was (the same bytes, not rewritten); one that
+/// reaches a newer statement's epoch moves `vouched` and is written. Reopened, the node is fresh on
+/// the latest state either way.
+#[test]
+fn a_delta_rewrites_the_statements_only_when_they_change() {
+    let (mut cp, dir) = persisted();
+    let mut r = open(&cp, &dir).unwrap();
+    let path = dir.path().join("statements.json");
+    let stamp = |p: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.ino(), std::fs::read(p).unwrap())
+    };
+    let before = stamp(&path);
+    let d = cp.p.commit(vec![add(grant("g-after", &read(), T0 + 3_600_000))], T0 + 20).unwrap();
+    r.accept(&d, T0 + 20).unwrap();
+    assert_eq!(stamp(&path), before, "a delta after the newest statement changes nothing it holds");
+    assert_eq!(r.state().unwrap().epoch, 4);
+    let reopened = open(&cp, &dir).unwrap();
+    assert_eq!((reopened.state().unwrap().epoch, reopened.mode(T0 + 21)), (4, Mode::Fresh));
+    // A statement for an epoch the node doesn't hold yet, then the delta that reaches it: vouched
+    // moves, and the file is rewritten.
+    let d2 = cp.p.commit(vec![add(grant("g-next", &read(), T0 + 3_600_000))], T0 + 22).unwrap();
+    let s = cp.p.statement(T0 + 23);
+    let mut r = open(&cp, &dir).unwrap();
+    r.accept(&s, T0 + 23).unwrap();
+    let after_statement = stamp(&path);
+    r.accept(&d2, T0 + 24).unwrap();
+    assert_ne!(stamp(&path), after_statement, "the delta that reaches the statement's epoch is written");
+    let reopened = open(&cp, &dir).unwrap();
+    assert_eq!((reopened.state().unwrap().epoch, reopened.mode(T0 + 25)), (5, Mode::Fresh));
+}

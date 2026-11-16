@@ -103,3 +103,35 @@ fn a_delta_another_publishers_catch_up_carried_first_is_not_a_replay() {
     assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
     assert!(r.state().unwrap().grants.contains_key("g-a"));
 }
+
+/// Found by the placement simulation (seed 50002077): a node caught up from a snapshot newer than
+/// a statement another run signed earlier holds no history for that statement's epoch. Delivered
+/// late, the statement is superseded (it never takes effect), not refused as a rollback. A newer
+/// statement naming an epoch older than the history held is still a rollback.
+#[test]
+fn a_late_statement_older_than_the_nodes_history_is_superseded() {
+    let mut cp = Cp::new();
+    cp.p.commit(vec![Change::PutZone { zone: zone("z") }], T0 - 10).unwrap();
+    // Another run signs for the feed's first epoch, then two deltas are committed and signed for.
+    let early = cp.p.statement(T0);
+    let early_epoch = cp.p.epoch();
+    for i in 0..2 {
+        cp.p.commit(vec![add(grant(&format!("g-{i}"), &read(), T0 + 3_600_000))], T0 + 1 + i).unwrap();
+    }
+    // A node that first hears of the feed now: a snapshot at the latest epoch, and a newer statement.
+    let mut r = cp.replica();
+    let frames = cp.p.catch_up(&r.hello(), T0 + 10).unwrap();
+    feed(&mut r, frames, T0 + 10);
+    assert_eq!(r.mode(T0 + 10), Mode::Fresh);
+    let held = r.state().unwrap().epoch;
+    assert!(held > early_epoch);
+    let superseded = r.stats.superseded;
+    r.accept(&early, T0 + 11).expect("superseded, not a rollback");
+    assert_eq!((r.stats.superseded, r.state().unwrap().epoch, r.mode(T0 + 11)), (superseded + 1, held, Mode::Fresh));
+    assert!(r.stats.refused.is_empty(), "{:?}", r.stats.refused);
+    // Signed after the newest statement held, for that old epoch: still refused.
+    let mut f = Fresh { issued_at: r.last_statement().unwrap().issued_at + 1, ..r.last_statement().unwrap().clone() };
+    f.epoch = early_epoch;
+    let forged = Frame::new(FrameKind::Fresh, sign(&cp.feed_key, TYP_FRESH, &f));
+    assert_eq!(r.accept(&forged, T0 + 12).unwrap_err().kind(), "rollback");
+}
