@@ -48,7 +48,6 @@ mod run;
 mod s3;
 mod serve;
 mod session;
-mod settings;
 mod snapstore;
 mod spawn;
 mod state;

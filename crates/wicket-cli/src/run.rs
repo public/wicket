@@ -433,7 +433,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // checked when a run starts or an agent wakes. A supervisor re-attaching to a running box doesn't
     // start anything.
     if record.is_none() {
-        crate::settings::check_run(&m, &crate::settings::load()?)?;
+        wicket_agent::acp::check_installation(&m).map_err(anyhow::Error::msg)?;
     }
     // A program runs only the source it was approved as (its digest), copied into the box.
     let program_src = match &m.program {
