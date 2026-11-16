@@ -451,6 +451,123 @@ mod tests {
     use super::*;
     use crate::Manifest;
 
+    /// #326: every range `is_public_ip` refuses, by an address inside it and a public neighbour just
+    /// outside, so each clause alone decides some address (mutation testing found none of them
+    /// checked in this crate; wicket-proxy's dial tests only sample them).
+    #[test]
+    fn each_non_public_range_is_refused_and_its_neighbours_are_not() {
+        let non_public = [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "0.1.2.3",
+            "240.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "198.18.0.1",
+            "198.19.255.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "168.63.129.16",
+            "::1",
+            "::",
+            "ff02::1",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "febf::1",
+            "fec0::1",
+            "feff::1",
+            "::ffff:8.8.8.8",
+            "::8.8.8.8",
+            "64:ff9b::808:808",
+            "2002::1",
+            "2001::1",
+            "2001:1ff::1",
+            "2001:db8::1",
+            "100::1",
+        ];
+        let public = [
+            "8.8.8.8",
+            "223.255.255.254",
+            "100.63.255.255",
+            "100.128.0.1",
+            "99.64.0.1",
+            "198.17.0.1",
+            "198.20.0.1",
+            "197.18.0.1",
+            "192.0.1.1",
+            "192.0.3.1",
+            "192.1.0.1",
+            "193.0.0.1",
+            "192.88.98.1",
+            "192.89.99.1",
+            "191.88.99.1",
+            "198.51.99.1",
+            "198.52.100.1",
+            "197.51.100.1",
+            "203.0.112.1",
+            "203.1.113.1",
+            "202.0.113.1",
+            "168.63.129.17",
+            "168.63.128.16",
+            "168.62.129.16",
+            "167.63.129.16",
+            "2606:4700::1111",
+            "2001:200::1",
+            "2001:db9::1",
+            "2000:db8::1",
+            "2003::1",
+            "2001:4860::8888",
+            "65:ff9b::1",
+            "64:ff9a::1",
+            "100:0:0:1::1",
+            "101::1",
+            "fbff::1",
+            "fe00::1",
+            "::1:0:0",
+            "1::",
+        ];
+        for a in non_public {
+            assert!(!is_public_ip(&a.parse().unwrap()), "{a} is not public");
+        }
+        for a in public {
+            assert!(is_public_ip(&a.parse().unwrap()), "{a} is public");
+        }
+    }
+
+    #[test]
+    fn risk_classes_rank_and_round_trip_by_name() {
+        use RiskClass::*;
+        for (i, r) in [R0Read, R1ReadScoped, R2WriteReversible, R3ExternalOrIrreversible, R4ExecOrPrivilege].into_iter().enumerate() {
+            assert_eq!(r.rank(), i as i64);
+            assert_eq!(RiskClass::from_name(&format!("{r:?}")), Some(r));
+        }
+        assert_eq!(RiskClass::from_name("R5"), None);
+    }
+
+    /// Opening an issue or a pull request notifies people, whatever the path's other segments say.
+    #[test]
+    fn opening_an_issue_or_a_pull_request_is_r3() {
+        let t = TenantId::single();
+        let run = RunId("run_x".into());
+        for path in ["/repos/octocat/hello/issues", "/repos/octocat/hello/pulls"] {
+            let op = Op::egress(&t, &run, "z", "POST", "api.github.com", path);
+            assert_eq!(op.risk, RiskClass::R3ExternalOrIrreversible, "{path}");
+            assert!(op.effects.iter().any(|e| e.starts_with("gh.notify")), "{path}: {:?}", op.effects);
+        }
+        let op = Op::egress(&t, &run, "z", "POST", "api.github.com", "/repos/octocat/hello/issues/1/labels");
+        assert_eq!(op.risk, RiskClass::R2WriteReversible);
+    }
+
     fn zone() -> ZoneSpec {
         Manifest::from_yaml(
             r#"
