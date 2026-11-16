@@ -1097,6 +1097,22 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #326: a zone names a host by a reach rule or an inject rule, exactly or by wildcard; a host
+    /// named exactly isn't reached through a wildcard.
+    #[test]
+    fn a_zone_names_its_hosts_by_reach_or_inject() {
+        let z: ZoneSpec = serde_yaml::from_str(
+            "name: z\nreach: [{ host: \"*.example.com\" }, { host: api.example.com }]\ninject: [{ host: up.other.org, header: X, secret: s }]\n",
+        )
+        .unwrap();
+        assert!(z.names_host("api.example.com") && z.names_host("x.example.com"), "by reach");
+        assert!(z.names_host("up.other.org"), "by inject alone");
+        assert!(!z.names_host("other.org") && !z.names_host("example.org"));
+        assert_eq!(z.wildcard_for("x.example.com"), Some("*.example.com"));
+        assert_eq!(z.wildcard_for("api.example.com"), None, "named exactly");
+        assert_eq!(z.wildcard_for("other.org"), None);
+    }
     use super::*;
 
     /// #50: both rights default on, and a zone that doesn't restrict them serializes without the

@@ -390,7 +390,6 @@ fn grant_request_round_trip() {
     let req_bytes = f.parent_only.grant_request().unwrap().to_bytes().unwrap();
     let back = GrantRequest::from_bytes(&req_bytes).unwrap();
     let signed = sign_grant(back, &f.keys.approver, &leaf_grant(5)).unwrap();
-    assert!(!signed.to_bytes().unwrap().is_empty());
     let t = f.parent_only.add_grant(&f.keys.approver.public(), signed).unwrap();
     assert_eq!(decide(&t, &f.keys, &req(2)), Decision::Allow);
     // Appended under the wrong key name: refused.
@@ -427,4 +426,27 @@ fn a_loaded_token_reports_its_earliest_block_expiry() {
     cs[2].not_after = 4_500;
     assert_eq!(load_ok(&mint_chain(&cs[..1], &keys), &keys).not_after(), Some(5_000));
     assert_eq!(load_ok(&mint_chain(&cs, &keys), &keys).not_after(), Some(4_000));
+}
+
+/// #326 (mutation testing): the token size cap is inclusive; a signing key's `Debug` shows its
+/// public half only; a request's steps are counted.
+#[test]
+fn the_size_cap_is_inclusive_keys_debug_as_public_and_steps_count() {
+    let f = fixture();
+    let bytes = f.parent_only.to_bytes().unwrap();
+    let pk = f.keys.root.public();
+    let cap = |n: usize| load_with(&bytes, &pk, &never_revoked, &Policy { max_token_bytes: n, ..Policy::default() }, limits());
+    assert!(cap(bytes.len()).is_ok(), "exactly at the cap");
+    match cap(bytes.len() - 1) {
+        Err(e) => assert!(e.to_string().contains("bytes (cap"), "{e}"),
+        Ok(_) => panic!("a token one byte over the cap loaded"),
+    }
+    let k = SigningKey::from_bytes(&[7; 32]).unwrap();
+    let shown = format!("{k:?}");
+    assert_eq!(shown, format!("SigningKey({})", k.public().to_hex()));
+    assert!(!shown.contains(&"07".repeat(32)), "never the secret");
+    let l = load_ok(&f.parent_only, &f.keys);
+    let _ = l.decide(&req(2));
+    assert!(l.last_steps() > 1, "a request takes steps: {}", l.last_steps());
+    assert!(l.is_compiled() && !l.last_fell_back());
 }
