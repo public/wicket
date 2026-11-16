@@ -369,7 +369,7 @@ impl Ceiling {
     }
 }
 
-/// A grant: one exact request (host, method, path) a box may make while the lease is live and its
+/// A grant: one exact request (host, method, path) a box may make while the grant is live and its
 /// ledger entry has uses left. Signed as a third-party block by the approver's key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {

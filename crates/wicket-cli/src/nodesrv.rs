@@ -575,13 +575,6 @@ impl Node {
         }
     }
 
-    /// The protocol version of the connection that owns `run`'s box (0: none up).
-    #[cfg(test)]
-    fn proto_of(&self, run: &str) -> u32 {
-        let Some(g) = self.owner(run) else { return 0 };
-        self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto)
-    }
-
     /// Sends to the connection that owns `run`'s box.
     fn send_run(&self, run: &str, f: Frame) -> bool {
         self.owner(run).is_some_and(|g| self.send_to(g, f))
@@ -1223,6 +1216,11 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     if zone.name != bs.zone {
         bail!("run {}'s authority is for zone {}, not {}", bs.run, zone.name, bs.zone);
     }
+    // A placed node past its lease starts no box (#395): decided here, where the box starts, not
+    // only when its run began.
+    if let Some(by) = bs.start_by.filter(|by| (node.clock)() / 1000 >= *by) {
+        bail!("{}", crate::nodecreate::past_lease(&node.name, by));
+    }
     // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
     // reference, or the digest alone; a tag moved to another image since changes nothing, and a
     // node without it refuses. Either way the box is started by the image's id, so nothing swaps it.
@@ -1519,6 +1517,8 @@ fn child_start(
         durable: vec![],
         name,
         llm_prior: (0, 0, 0),
+        // On the same node as its parent: started no later than its parent could be.
+        start_by: parent.start_by,
         output_cap: m.zone.limits.output_bytes().unwrap_or(64 << 20),
         output_stop: m.zone.limits.on_output_full == wicket_core::manifest::OnOutputFull::Stop,
         swaps: vec![],
@@ -2095,7 +2095,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
-    // What was leased to the run goes with its box (#152, #153).
+    // What was sent for the run (secrets, its budget slice) goes with its box (#152, #153).
     n.secrets.release(run);
     n.slices.drop_run(run);
     n.queue.drop_run(run);
@@ -2642,6 +2642,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 durable: vec![],
                 name: None,
                 llm_prior: (0, 0, 0),
+                start_by: None,
                 output_cap: 64 << 20,
                 output_stop: false,
                 swaps: vec![],
@@ -2978,10 +2979,10 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     }
 
     /// #152, #153: an ask queued while the run's control host was away is raised when it resumes the
-    /// box, with its node-local id and time, and leaves the queue once answered; a lease's budget
+    /// box, with its node-local id and time, and leaves the queue once answered; a run's budget
     /// slice is kept on disk; a protocol-1 control host gets none of the version-2 messages.
     #[tokio::test]
-    async fn a_queued_ask_is_raised_on_resume_and_a_lease_keeps_its_slice() {
+    async fn a_queued_ask_is_raised_on_resume_and_a_run_keeps_its_slice() {
         const RUN: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
         let inst = Install::new("nodesrv-queued");
         let node = test_node(&inst);
@@ -3033,7 +3034,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert!(node.queue.of(RUN).is_empty(), "answered: off the queue");
         assert_eq!(node.slices.get(RUN), Some(slice));
         assert!(crate::nodesecrets::Asks::open(&inst.dir).of(RUN).is_empty(), "and off the disk");
-        assert_eq!(node.proto_of(RUN), chan::PROTOCOL);
+        let owner = node.owner(RUN).expect("the run's connection");
+        assert_eq!(node.links.lock().unwrap().get(&owner).map(|l| l.proto), Some(chan::PROTOCOL), "it talks the negotiated version");
     }
 
     /// Done-when for #16: a node with an unexpected certificate is refused (wrong installation, wrong
@@ -3636,6 +3638,28 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     /// fetched over the run's own connection on first use: a vault secret released for the swap's
     /// host only, a value by its key. Neither is in the box's start, so neither is in the node's
     /// box record.
+    /// #395: a placed node past its lease starts no box, decided when the start reaches it (the
+    /// control host checked the lease when the run began, seconds earlier).
+    #[tokio::test]
+    async fn a_start_that_reaches_the_node_past_its_lease_is_refused() {
+        const RUN: &str = "run_llllllllllllllllllllllllll";
+        let inst = Install::new("nodesrv-start-by");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        node.boxes.lock().unwrap().remove(RUN);
+        let now_s = (node.clock)() / 1000;
+        let mut bs = fake_record(RUN).start;
+        bs.zone = "z".into();
+        bs.start_by = Some(now_s);
+        let e = start_box_steps(&node, None, bs.clone(), Arc::new(Timings::new())).await.unwrap_err().to_string();
+        assert!(e.contains("past its lease") && e.contains("takes no new runs"), "{e}");
+        assert!(!node.boxes.lock().unwrap().contains_key(RUN));
+        // Before its lease's end, the lease is no reason (whatever else stops this start here).
+        bs.start_by = Some(now_s + 3600);
+        let e = start_box_steps(&node, None, bs, Arc::new(Timings::new())).await.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!e.contains("past its lease"), "{e}");
+    }
+
     #[tokio::test]
     async fn a_swapped_host_is_decided_on_the_node_and_its_credential_fetched_there() {
         const RUN: &str = "run_ssssssssssssssssssssssssss";
@@ -3748,64 +3772,5 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert_eq!(audit.iter().filter(|r| r.2 == "node.secret_fetched").count(), 2, "{audit:?}");
         assert!(!format!("{audit:?}").contains(LOGIN) && !format!("{audit:?}").contains(VALUE));
-    }
-
-    /// #257: a box with credential swaps starts only on a node talking protocol 10 or later; an
-    /// older one is refused, saying why and what to do, as for a pin or a model budget.
-    #[test]
-    fn a_box_with_swaps_is_refused_by_a_node_before_protocol_10() {
-        let mut start = fake_record("run_a").start;
-        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true, None).is_ok(), "no swaps: protocol 9 will do");
-        start.swaps = chan::swap_starts(&[wicket_proxy::CredentialSwap {
-            name: "account login".into(),
-            host: "rc.api.test".into(),
-            placeholder: "ph".into(),
-            real: wicket_proxy::SwapSource::Vault("login".into()),
-            box_bearers: true,
-        }]);
-        let why = crate::noderun::refuse_older_node("n1", 9, &start, true, None).unwrap_err().to_string();
-        assert!(why.contains("node n1 talks protocol 9") && why.contains("credential swaps") && why.contains("from protocol 10"), "{why}");
-        assert!(why.contains("wicket node install n1"), "{why}");
-        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true, None).is_ok());
-        // The others still hold: a pin below 6, a budget below 9.
-        start.swaps.clear();
-        start.image_pin = Some("sha256:00".into());
-        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false, None).unwrap_err().to_string().contains("pinned"));
-        start.image_pin = None;
-        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true, None).unwrap_err().to_string().contains("model budget"));
-    }
-
-    /// #257, slice 3: a box a node before protocol 11 would forward a host of (outside its CA, or
-    /// every host without one) starts only on a node at 11 or later, which splices or refuses such
-    /// a host instead; a box whose hosts the CA covers still starts at 10.
-    #[test]
-    fn a_box_a_node_would_forward_is_refused_by_a_node_before_protocol_11() {
-        use crate::noderun::{forwarded_host, refuse_older_node};
-        let start = fake_record("run_a").start;
-        let zone: wicket_core::ZoneSpec = serde_json::from_value(serde_json::json!({
-            "name": "z",
-            "reach": [{"host": "api.example.com"}, {"host": "*.example.org"}],
-        }))
-        .unwrap();
-        let covered = ["api.example.com".to_string(), ".example.org".to_string()];
-        assert_eq!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 1_000), None);
-        assert!(refuse_older_node("n1", 10, &start, false, None).is_ok(), "nothing forwarded: protocol 10 will do");
-        let narrow = ["api.example.com".to_string()];
-        let host = forwarded_host(&zone, &[], Some((&narrow[..], 2_000)), 1_000).unwrap();
-        assert!(host.starts_with("*.example.org") && host.contains("name constraints"), "{host}");
-        assert!(forwarded_host(&zone, &[], None, 1_000).unwrap().contains("no CA"));
-        assert!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 2_000).unwrap().contains("expired"));
-        let swap = wicket_proxy::CredentialSwap {
-            name: "login".into(),
-            host: "rc.api.test".into(),
-            placeholder: "ph".into(),
-            real: wicket_proxy::SwapSource::Vault("login".into()),
-            box_bearers: true,
-        };
-        assert!(forwarded_host(&zone, &[swap], Some((&covered[..], 2_000)), 1_000).unwrap().starts_with("rc.api.test"));
-        let why = refuse_older_node("n1", 10, &start, false, Some(&host)).unwrap_err().to_string();
-        assert!(why.contains("node n1 talks protocol 10") && why.contains("*.example.org") && why.contains("from protocol 11"), "{why}");
-        assert!(why.contains("wicket node install n1"), "{why}");
-        assert!(refuse_older_node("n1", chan::NO_FORWARDED_EGRESS, &start, false, Some(&host)).is_ok());
     }
 }

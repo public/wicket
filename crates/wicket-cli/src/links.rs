@@ -166,9 +166,6 @@ impl BoxOps for NodeBoxes {
                 return Ok(false);
             }
             let c = self.calls(run).await?;
-            if c.proto() < crate::chan::EDGE_DECISIONS {
-                return Ok(false);
-            }
             c.listen_direct(run, sock, to, port).await.map(|_| true).map_err(|e| format!("{e:#}"))
         })
     }

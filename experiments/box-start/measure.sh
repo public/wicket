@@ -54,8 +54,8 @@ for i in $(seq 0 "$n"); do
   rec="$data/runs/$run/ctl/run.json"
   [ -f "$rec" ] || { echo "run $run has no record at $rec" >&2; exit 1; }
   [ "$i" -eq 0 ] && { echo "warm-up $run: ${wall_ms} ms end to end"; continue; }
-  jq -c --arg run "$run" --arg label "$label" --argjson wall "$wall_ms" --arg host "$(hostname)" \
-    '{label: $label, host: $host, run: $run, wall_ms: $wall, spans: [.timings[] | {name, at_ms, ms}]}' "$rec" >>"$out"
+  jq -c --arg run "$run" --arg lbl "$label" --argjson wall "$wall_ms" --arg host "$(hostname)" \
+    '{"label": $lbl, "host": $host, "run": $run, "wall_ms": $wall, "spans": [.timings[] | {name, at_ms, ms}]}' "$rec" >>"$out"
   echo "run $i/$n $run: ${wall_ms} ms end to end"
 done
 

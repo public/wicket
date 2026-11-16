@@ -104,7 +104,7 @@ pub struct AgentSpec {
     /// other image must be listed in `zone.images`, as for `spawn`. `wicket run --image` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// How many child agents this agent may start with `spawn_agent`, each in its own box with
+    /// How many child boxes this agent may start with `spawn`, each with
     /// its own identity (design §3.2, §5.1). 0 = none.
     #[serde(default)]
     pub max_children: u32,
