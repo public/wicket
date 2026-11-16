@@ -1098,6 +1098,26 @@ pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// #326: a class's ranges are folded as ranges and its other letters one by one; a `-` at the
+    /// end of a class is a literal, never the start of a range past it.
+    #[test]
+    fn folded_classes_keep_their_ranges_and_their_letters() {
+        let m = |g: &str| compile_glob(&fold_case_glob(g)).unwrap();
+        let ends_in_dash = m("/[a-]");
+        for p in ["/a", "/A", "/-"] {
+            assert!(ends_in_dash.is_match(p), "/[a-] matches {p}");
+        }
+        assert!(!ends_in_dash.is_match("/b"));
+        let letters = m("/[axz]");
+        assert!(letters.is_match("/X") && letters.is_match("/z"));
+        assert!(!letters.is_match("/M") && !letters.is_match("/m"), "three letters, not the range a-z");
+        let mixed = m("/[xa-c-]");
+        for p in ["/X", "/B", "/-"] {
+            assert!(mixed.is_match(p), "/[xa-c-] matches {p}");
+        }
+        assert!(!mixed.is_match("/d"));
+    }
+
     /// #326: a zone names a host by a reach rule or an inject rule, exactly or by wildcard; a host
     /// named exactly isn't reached through a wildcard.
     #[test]
