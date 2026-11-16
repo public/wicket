@@ -829,7 +829,7 @@ mod tests {
     /// unlimited. Lifetimes are above 0 and at most MAX_TTL.
     #[test]
     fn a_grants_bounds_by_granter() {
-        let z: wicket_core::ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str("name: z\n").unwrap();
         let agent = Granter::Agent(AgentAuthority {
             tenant: TenantId::single(),
             run: RunId("run_p".into()),
