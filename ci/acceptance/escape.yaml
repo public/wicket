@@ -1,0 +1,17 @@
+# Acceptance (ci/acceptance.sh, #326): a box that tries to get out of its reach. Its zone reaches
+# only GET example.com/; escape.sh tries every other way out it can think of (other hosts, methods
+# and paths, the host's own addresses and loopback, cloud metadata, a CONNECT tunnel, raw sockets,
+# DNS, the forwarder's other ports, the model and gateway endpoints, its read-only files and a user
+# namespace), and writes one line per attempt to out/escape.log. The script outside checks that
+# each was refused, that a canary listening on the host saw nothing, that the audit allowed only
+# what the zone allows, and that `wicket doctor --invariants` holds.
+task: Try to get out of your reach.
+program:
+  name: escape
+  command: [bash, /workspace/escape.sh]
+zone:
+  name: acc-escape
+  isolation: gvisor
+  reach:
+    - { host: example.com, methods: [GET], paths: ["/"] }
+  limits: { memory: 256m, cpus: 1, timeout: 4m }

@@ -118,7 +118,7 @@ fn mints(org: &OrgPolicy, zone: &wicket_core::ZoneSpec, groups: BTreeSet<String>
 
 /// The zones the check mints for: every running run's (from its record), and a bare one.
 fn zones_to_check() -> Vec<(String, wicket_core::ZoneSpec)> {
-    let bare: wicket_core::ZoneSpec = serde_yaml::from_str("name: policy-check\n").expect("a bare zone");
+    let bare: wicket_core::ZoneSpec = wicket_core::yaml::from_str("name: policy-check\n").expect("a bare zone");
     let mut out = vec![("a zone with no rules".to_string(), bare)];
     if let Ok(l) = wicket_store::Ledger::open(&ledger_path()) {
         for (run, _, _) in l.running_policies().unwrap_or_default() {

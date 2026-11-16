@@ -86,7 +86,7 @@ pub fn path() -> PathBuf {
 
 impl StateStore {
     pub fn parse(text: &str) -> Result<StateStore> {
-        let s: StateStore = serde_yaml::from_str(text)?;
+        let s: StateStore = wicket_core::yaml::from_str(text)?;
         s.check()?;
         Ok(s)
     }

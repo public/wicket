@@ -189,7 +189,7 @@ impl Gateway {
         mine.push(self.ctx.run.0.clone());
         let parent = me.claims.parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|i| i.spiffe_id);
         let hears = |zone: &str, id: &str| {
-            self.ctx.zone.accept_from.iter().any(|a| a == zone || a == id)
+            wicket_core::manifest::accepts(&self.ctx.zone.accept_from, zone, Some(id))
                 && self.ctx.org.as_ref().is_none_or(|o| o.allows_message_from(zone))
         };
         let rows = match l.principals(&self.tenant()) {
@@ -206,7 +206,7 @@ impl Gateway {
                 "peer"
             };
             let family = relation != "peer";
-            let may_send = family || r.accept_from.iter().any(|a| a == &self.ctx.zone.name || a == &me.claims.sub);
+            let may_send = family || wicket_core::manifest::accepts(&r.accept_from, &self.ctx.zone.name, Some(&me.claims.sub));
             let may_receive = family || hears(&r.zone, &r.spiffe_id);
             if !may_send && !may_receive {
                 continue;

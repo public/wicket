@@ -137,6 +137,9 @@ crates/wicket-cli/src/cmd/zone.rs    | - | acceptance
 crates/*/src/proofs/**             | -   | kani
 crates/wicket-core/tests/loom_budget.rs | - | kani
 ci/kani.sh                         | -   | kani
+ci/mutants.sh                      | -   | -
+ci/mutants.accepted                | -   | -
+deny.toml                          | -   | -
 
 # ---- the end-to-end scripts themselves ----
 ci/smoke.sh                        | -   | smoke

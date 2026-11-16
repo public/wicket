@@ -899,6 +899,14 @@ impl Ledger {
     }
 
     /// A run's status ("running", "succeeded", …), if it exists.
+    /// When `run` started and (if it has) ended, Unix seconds.
+    pub fn run_times(&self, run: &str) -> Result<Option<(i64, Option<i64>)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT started_at, ended_at FROM runs WHERE id = ?1", params![run], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     pub fn run_status(&self, run: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row("SELECT status FROM runs WHERE id = ?1", params![run], |r| r.get(0)).optional()?)
     }

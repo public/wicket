@@ -3307,7 +3307,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let not_after = u64::try_from(now / 1000 + 3600).unwrap();
         let mut changes = vec![];
         for (run, zone) in boxes {
-            let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+            let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
             let issuer =
                 Issuer::root(&authz_root, "t0", &format!("run:{run}"), run, 0, &z, &[], not_after, vec![approver.public()]).unwrap();
             changes.push(Change::PutZone { zone: issuer.publish(&approver, &[]).unwrap() });
@@ -3323,7 +3323,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     }
 
     fn add_box(node: &Arc<Node>, inst: &Install, run: &str, zone: &str) {
-        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
         let mut rec = fake_record(run);
         rec.start.zone = z.name.clone();
         rec.start.edge = Some(Box::new(chan::EdgeStart {
@@ -3748,7 +3748,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         // Decided here: both swapped hosts are terminated by the node's own egress proxy, which
         // decides them from the box's token in the feed; a host outside the CA is uncovered (spliced
         // or refused, never forwarded, slice 3).
-        let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+        let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
         let router = NodeRouter { ca: node.ca(), clock: node.clock.clone() };
         assert_eq!(router.route("rc.api.test"), Route::Terminate);
         assert_eq!(router.route("wrap.api.test"), Route::Terminate);

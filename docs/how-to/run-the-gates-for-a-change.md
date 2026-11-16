@@ -76,6 +76,15 @@ wicket.
   (`build.yml`), which never uses a selection.
 - **Node and update suites** (`node-e2e`, `acceptance --nodes local`, `update`) run nightly in
   `acceptance.yml`, and in local gates when a change selects them. They don't run on pull requests.
+- **Supply chain**: `cargo deny --locked check` (`deny.toml`: RustSec advisories, licences, banned
+  crates and sources) runs on every pull request, every push and nightly, whatever the change selects
+  (#326). Run it locally with `cargo install --locked cargo-deny@0.20.2`.
+- **Mutation testing** of the decision code (`ci/mutants.sh`) runs weekly in `mutants.yml`, not on
+  pull requests: a mutant the tests don't catch fails it unless `ci/mutants.accepted` says why it is
+  equivalent. Results and how to run it: [verification/mutants](../../verification/mutants/README.md).
+- **Acceptance** (`ci/acceptance.sh`, on pull requests in the smoke job and nightly) includes a box
+  that tries every way out of its reach, and ends with `wicket doctor --invariants` over the ledger
+  it made (#326).
 
 If the `select` job fails, every job runs in full.
 
