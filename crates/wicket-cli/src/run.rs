@@ -846,7 +846,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         _ => true,
     };
 
-    // spawn_agent: a child is another `wicket run` process with its own sandbox, sockets, proxies and
+    // spawn: a child is another `wicket run` process with its own sandbox, sockets, proxies and
     // identity. Its reach can only narrow. It gets the task text and nothing else from the parent.
     timings.since("policy.org", lap);
     // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as

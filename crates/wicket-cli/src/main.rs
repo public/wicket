@@ -120,7 +120,7 @@ enum Cmd {
         /// Internal: the run id to use (set by a parent starting a child agent).
         #[arg(long, hide = true)]
         run_id: Option<String>,
-        /// Internal: the run that started this one (`spawn_agent`).
+        /// Internal: the run that started this one (`spawn`).
         #[arg(long, hide = true)]
         parent_run: Option<String>,
         /// Internal: the capacity lease this run is placed on (`spawn` with `placement: {lease}`).

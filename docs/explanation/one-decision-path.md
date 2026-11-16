@@ -33,7 +33,7 @@ target `gateway`; `egress` went with slice 3, `llm` with slice 1).
 | `nodesrv.rs` `shares_host` branches | transport only: where the box is laid out, the run's sockets reached directly, host directories mounted, the CA loaded unconstrained (`NodeCa::load_any`) | the built-in node shares the host's filesystem; none of these is a decision |
 
 The node side, for comparison: `NodeDecider` (egress, from the replica), `nodegw.rs` (`whoami`,
-`request_access`, `await_grant`, `pending_requests`, `spawn`/`spawn_agent`, `send_message` and
+`request_access`, `await_grant`, `pending_requests`, `spawn`, `send_message` and
 `await_message` while cut off, `request_capacity`/`request_update` queued while cut off) and the
 node's own `Llm`.
 

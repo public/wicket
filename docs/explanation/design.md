@@ -399,7 +399,7 @@ Bodies are the sender's data, shown to the recipient as such. (Typed gates that 
 further are deferred, §22.)
 
 **PoC status (2026-11-08).** Built: the issuer (`wicket identity issuer`), per-run identity documents
-(EdDSA JWS) with keys held by `wicket run`, `whoami`, `send_message`, `await_message`, `spawn_agent`
+(EdDSA JWS) with keys held by `wicket run`, `whoami`, `send_message`, `await_message`, `spawn`
 (a child `wicket run` with its own sandbox, sockets and identity, reach narrowed only), and signed
 `run_finished` reports. Also:
 - verified identities are shown with every pending request, and the console refuses approval when the
@@ -549,7 +549,7 @@ trusted as the parent.
 **Agents construct zones** (owner, 2026-11-09: as long as the new zone's permissions are a subset of the
 agent's own; a human with that much access can approve an extension). Built:
 - **`spawn` starts an agent (task) or a program (command, possibly a long-running service)** in a zone the
-  caller writes. `spawn_agent` is a narrowing of `spawn` (#255).
+  caller writes, or (without one) in the caller's own zone (#255).
 - **`wicket_core::subset` proves the zone is within the caller's,** conservatively; anything it can't prove
   is a violation, and every violation is listed. On the control host a spawn that passes gets a fresh
   block 0 from the child's zone; on the parent's node a spawn within its authority gets the parent's

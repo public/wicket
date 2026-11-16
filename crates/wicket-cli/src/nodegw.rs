@@ -250,7 +250,7 @@ pub(super) async fn tool(node: &Arc<Node>, run: &str, name: &str, args: &Value) 
         "await_grant" => Some(await_grant(node, run, args).await),
         "pending_requests" => Some(pending_requests(node, run).await),
         "request_capacity" | "request_update" if !connected(node, run) => Some(queue_call(node, run, name, args)),
-        "spawn" | "spawn_agent" => spawn(node, run, name, args).await,
+        "spawn" => spawn(node, run, name, args).await,
         "send_message" if !connected(node, run) => Some(send_local(node, run, args)),
         "await_message" => await_message(node, run, args).await,
         _ => None,
@@ -485,7 +485,7 @@ fn notification(p: &wicket_agent::harness::MessagePush, v: &Value) -> Value {
 /// decides differently a level down, a zone beyond the box's while it can be asked).
 async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<(String, bool)> {
     let sp = node.edge_start(run)?.spawn?;
-    let req = match wicket_proxy::gateway::spawn_request(tool, args) {
+    let req = match wicket_proxy::gateway::spawn_request(args) {
         Ok(r) => r,
         Err(e) => return Some((e, true)),
     };
