@@ -306,13 +306,12 @@ mod tests {
         assert_eq!(l.consume_grant(&op).unwrap(), None);
         // Nor is it handed to a node: it answers no request of the run's.
         assert!(l.grants_for_run(&run.0).unwrap().is_empty());
-        // An ordinary approval still decides its op through the same lookup.
+        // An ordinary approval is still found by the same lookup.
         let get = Op::egress(&t, &run, "z", "GET", "api.example.com", "/v1/x");
         let (rid, _) = l.pending_for(&get, "why", None).unwrap();
         let gid =
             l.approve(&rid, &Approval { uses: Some(1), ttl: Duration::from_secs(60), path_prefix: None, decided_by: "op".into() }).unwrap();
-        assert_eq!(l.consume_grant(&get).unwrap(), Some(gid));
-        assert_eq!(l.consume_grant(&get).unwrap(), None, "used up");
+        assert_eq!(l.grant_covering(&get).unwrap(), Some(gid));
     }
 
     #[test]

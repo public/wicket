@@ -55,6 +55,8 @@ pub enum StoreError {
     Writer(String),
     #[error("not requested: {0}")]
     Refused(String),
+    #[error("{0}: an egress grant is decided and counted on the box's node, never consumed by the ledger (#257)")]
+    EgressGrant(String),
     #[error("this ledger was migrated by a newer wicket (schema {version}), past a step this build (schema {SCHEMA_VERSION}) can't read: roll forward, or restore the snapshot taken before that update")]
     TooNew { version: u32, floor: u32 },
 }
@@ -347,8 +349,9 @@ CREATE TABLE IF NOT EXISTS audit (
 "#;
 
 /// What a request needs of a grant: the one lookup every request kind's grant is found by
-/// ([`Ledger::consume_grant`] for access, SPAWN and LINK asks, [`Ledger::use_update_approval`] for
-/// UPDATE). `None` matches any tenant, zone or run.
+/// ([`Ledger::consume_grant`] for SPAWN and LINK asks, [`Ledger::use_update_approval`] for UPDATE,
+/// [`Ledger::grant_covering`] for what an egress grant covers). `None` matches any tenant, zone or
+/// run.
 struct GrantMatch<'a> {
     tenant: Option<&'a str>,
     zone: Option<&'a str>,
@@ -362,6 +365,24 @@ struct GrantMatch<'a> {
     exact: bool,
     /// Only a grant made for a request whose own method, host and path are these.
     answers_request: bool,
+}
+
+impl<'a> GrantMatch<'a> {
+    /// What `op` needs of a grant: its tenant, zone and run, a path or a prefix covering it, at
+    /// least its risk.
+    fn for_op(op: &'a Op) -> GrantMatch<'a> {
+        GrantMatch {
+            tenant: Some(&op.tenant.0),
+            zone: Some(&op.zone),
+            run: Some(&op.run.0),
+            method: &op.method,
+            host: &op.host,
+            path: &op.path,
+            min_risk: op.risk.rank(),
+            exact: false,
+            answers_request: false,
+        }
+    }
 }
 
 /// The oldest live grant matching `m` (exact paths before prefixes), with its uses left: not
@@ -1074,24 +1095,20 @@ impl Ledger {
         Ok(())
     }
 
-    /// Finds a live grant covering the op and consumes one use, atomically. Returns the grant id. A
-    /// grant bound to a run covers only that run's ops (#127).
+    /// Finds a live grant covering an op in wicket's own approval namespace (a SPAWN or LINK ask, a
+    /// capacity request) and consumes one use, atomically. Returns the grant id. A grant bound to a
+    /// run covers only that run's ops (#127).
+    ///
+    /// Never an egress op (one a box makes itself, [`Op::refused_for_agents`] is `None`): since
+    /// #257's slice 3 the ledger records an egress grant's issuance, renewals and revocation, and
+    /// the run's process publishes it to the box's node, which alone decides and counts its uses.
+    /// Such an op is refused with [`StoreError::EgressGrant`].
     pub fn consume_grant(&mut self, op: &Op) -> Result<Option<String>> {
+        if op.refused_for_agents().is_none() {
+            return Err(StoreError::EgressGrant(format!("{} {}{}", op.method, op.host, op.path)));
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found = live_grant(
-            &tx,
-            &GrantMatch {
-                tenant: Some(&op.tenant.0),
-                zone: Some(&op.zone),
-                run: Some(&op.run.0),
-                method: &op.method,
-                host: &op.host,
-                path: &op.path,
-                min_risk: op.risk.rank(),
-                exact: false,
-                answers_request: false,
-            },
-        )?;
+        let found = live_grant(&tx, &GrantMatch::for_op(op))?;
         let Some((gid, uses)) = found else {
             tx.commit()?;
             return Ok(None);
@@ -1101,6 +1118,16 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(Some(gid))
+    }
+
+    /// The live grant that covers `op`, by the lookup [`Ledger::consume_grant`] uses, without
+    /// using it: for what an issued grant covers (the console, tests). A grant already handed to a
+    /// node isn't found: its uses are counted there.
+    pub fn grant_covering(&self, op: &Op) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found = live_grant(&tx, &GrantMatch::for_op(op))?;
+        tx.commit()?;
+        Ok(found.map(|(gid, _)| gid))
     }
 
     /// An operator's approval of an agent's `request_update` for the artifact with this sha256
@@ -2081,9 +2108,9 @@ mod tests {
         assert_eq!(l.pending_for(&op("run_a"), "again", None).unwrap(), (a.clone(), false));
         // a's grant is a's alone.
         l.approve(&a, &once).unwrap();
-        assert!(l.consume_grant(&op("run_b")).unwrap().is_none(), "another box in the zone used a's grant");
-        assert!(l.consume_grant(&op("run_later")).unwrap().is_none(), "a later run of the zone used a's grant");
-        assert!(l.consume_grant(&op("run_a")).unwrap().is_some());
+        assert!(l.grant_covering(&op("run_b")).unwrap().is_none(), "another box in the zone used a's grant");
+        assert!(l.grant_covering(&op("run_later")).unwrap().is_none(), "a later run of the zone used a's grant");
+        assert!(l.grant_covering(&op("run_a")).unwrap().is_some());
         // A denial of b's request doesn't stop a from asking.
         l.deny(&b, "owner").unwrap();
         assert!(l.denied_recently(&op("run_b")).unwrap().is_some());
@@ -2091,13 +2118,13 @@ mod tests {
         // A run-bound grant ends with its run.
         l.run_started(&t, &RunId("run_a".into()), "z", "a").unwrap();
         l.run_ended(&RunId("run_a".into()), "succeeded", "").unwrap();
-        assert!(l.consume_grant(&op("run_a")).unwrap().is_none(), "the grant outlived its run");
+        assert!(l.grant_covering(&op("run_a")).unwrap().is_none(), "the grant outlived its run");
         // Zone-wide, when the human picks it: any run in the zone, after the asker ends too.
         let (c, _) = l.pending_for(&op("run_c"), "c", None).unwrap();
         l.approve_zone_wide(&c, &once).unwrap();
         l.run_started(&t, &RunId("run_c".into()), "z", "c").unwrap();
         l.run_ended(&RunId("run_c".into()), "succeeded", "").unwrap();
-        assert!(l.consume_grant(&op("run_d")).unwrap().is_some());
+        assert!(l.grant_covering(&op("run_d")).unwrap().is_some());
     }
 
     #[test]
@@ -2109,7 +2136,7 @@ mod tests {
         assert_eq!(l.ask(&ask, "again", true, None).unwrap(), (id.clone(), false), "asking twice is one request");
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         let later = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "GET", "news.example.org", "/item");
-        assert!(l.consume_grant(&later).unwrap().is_some(), "every path under the prefix");
+        assert!(l.grant_covering(&later).unwrap().is_some(), "every path under the prefix");
     }
 
     #[test]
@@ -2285,11 +2312,19 @@ mod tests {
         let (id, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh);
         assert_eq!(l.pending_for(&o, "push", None).unwrap(), (id.clone(), false));
-        assert_eq!(l.consume_grant(&o).unwrap(), None);
+        assert_eq!(l.grant_covering(&o).unwrap(), None);
         l.approve(&id, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        assert!(l.consume_grant(&o).unwrap().is_some());
-        assert_eq!(l.consume_grant(&o).unwrap(), None, "single use");
+        assert!(l.grant_covering(&o).unwrap().is_some());
+        assert!(l.grant_covering(&o).unwrap().is_some(), "looking a grant up doesn't use it");
+        // #257: an egress grant's uses are the node's to count, never the ledger's.
+        assert!(matches!(l.consume_grant(&o), Err(StoreError::EgressGrant(_))));
         assert!(matches!(l.deny(&id, "owner"), Err(StoreError::NotPending(_, _))));
+        // wicket's own namespace (a spawn beyond its parent): consumed here, once.
+        let spawn = Op::egress(&TenantId::single(), &RunId("run_t".into()), "z", "SPAWN", "wicket.internal", "/zones/z.x/0123");
+        let (sid, _) = l.pending_for(&spawn, "spawn", None).unwrap();
+        l.approve(&sid, &Approval { uses: Some(1), ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
+        assert!(l.consume_grant(&spawn).unwrap().is_some());
+        assert_eq!(l.consume_grant(&spawn).unwrap(), None, "single use");
     }
 
     /// #26: one approval of a push covers its requests for a short window, whatever uses the human
@@ -2312,7 +2347,7 @@ mod tests {
         assert_eq!(expires - created, wicket_core::git::PUSH_WINDOW_SECS as i64, "the window, not the hour asked for");
         // Discovery, a probe, the upload, a retry: all within the window.
         for _ in 0..4 {
-            assert_eq!(l.consume_grant(&o).unwrap().as_deref(), Some(gid.as_str()));
+            assert_eq!(l.grant_covering(&o).unwrap().as_deref(), Some(gid.as_str()));
         }
         // A shorter ttl than the window is kept.
         let (id2, _) = l.pending_for(&op("/o/s.git/git-receive-pack"), "push", None).unwrap();
@@ -2323,7 +2358,7 @@ mod tests {
         assert_eq!(e2, 60);
         // The window passes: nothing covers the push, and it is asked about again (a new request).
         l.conn.execute("UPDATE grants SET expires_at = ?2 WHERE id = ?1", params![gid, now() - 1]).unwrap();
-        assert_eq!(l.consume_grant(&o).unwrap(), None);
+        assert_eq!(l.grant_covering(&o).unwrap(), None);
         let (again, fresh) = l.pending_for(&o, "push", None).unwrap();
         assert!(fresh && again != id);
     }
@@ -2341,13 +2376,13 @@ mod tests {
         let (id, _) = l.ask(&o("PUT", "/repos/acme/app/contents"), "edit files", true, None).unwrap();
         assert_eq!(l.request(&id).unwrap().path, "/repos/acme/app/contents/", "kept ending in '/'");
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents/src/main.rs")).unwrap().is_some());
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents")).unwrap().is_some(), "the directory itself");
-        assert!(l.consume_grant(&o("PUT", "/repos/acme/app/contents-x/a")).unwrap().is_none(), "a sibling");
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents/src/main.rs")).unwrap().is_some());
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents")).unwrap().is_some(), "the directory itself");
+        assert!(l.grant_covering(&o("PUT", "/repos/acme/app/contents-x/a")).unwrap().is_none(), "a sibling");
         // Approved at R2: the R4 workflow edit under the same prefix isn't covered.
         let wf = o("PUT", "/repos/acme/app/contents/.github/workflows/ci.yml");
         assert_eq!(wf.risk, wicket_core::RiskClass::R4ExecOrPrivilege);
-        assert!(l.consume_grant(&wf).unwrap().is_none());
+        assert!(l.grant_covering(&wf).unwrap().is_none());
 
         // A raw-prefix grant from an older ledger: segment-bounded too, and without a risk bound it
         // covers nothing.
@@ -2355,10 +2390,10 @@ mod tests {
         let gid =
             l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(600), path_prefix: None, decided_by: "owner".into() }).unwrap();
         l.conn.execute("UPDATE grants SET path = '/repos/acme/api', max_risk = 1 WHERE id = ?1", params![gid]).unwrap();
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api/issues")).unwrap().is_some());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api-secrets/x")).unwrap().is_none());
         l.conn.execute("UPDATE grants SET max_risk = NULL WHERE id = ?1", params![gid]).unwrap();
-        assert!(l.consume_grant(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
+        assert!(l.grant_covering(&o("GET", "/repos/acme/api/issues")).unwrap().is_none());
 
         // An exact grant for a fetch's ref discovery doesn't cover the push's (same path, R4).
         let fetch = Op::egress_with_query(
@@ -2382,8 +2417,8 @@ mod tests {
             "service=git-receive-pack",
         );
         assert_eq!(push.digest(), fetch.digest());
-        assert!(l.consume_grant(&push).unwrap().is_none());
-        assert!(l.consume_grant(&fetch).unwrap().is_some());
+        assert!(l.grant_covering(&push).unwrap().is_none());
+        assert!(l.grant_covering(&fetch).unwrap().is_some());
     }
 
     #[test]
@@ -2394,8 +2429,8 @@ mod tests {
         // A prefix that is not a prefix of the asked path is ignored: the grant stays exact.
         l.approve(&id, &Approval { uses: None, ttl: Duration::from_secs(60), path_prefix: Some("/other".into()), decided_by: "a".into() })
             .unwrap();
-        assert!(l.consume_grant(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
-        assert!(l.consume_grant(&o).unwrap().is_some());
+        assert!(l.grant_covering(&op("/o/r/contents/docs/b.md")).unwrap().is_none());
+        assert!(l.grant_covering(&o).unwrap().is_some());
     }
 
     #[test]

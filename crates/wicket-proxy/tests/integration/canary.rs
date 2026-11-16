@@ -9,6 +9,7 @@
 //! - a compressed reply from the credentialed host is refused, and the request asked for none;
 //! - a bearer on the host that isn't the placeholder is dropped, and audited.
 
+use crate::zone_decider::ZoneDecider;
 use base64::Engine;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -21,7 +22,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use wicket_core::{RunId, TenantId, ZoneSpec};
 use wicket_proxy::ca::RunCa;
-use wicket_proxy::decide::Central;
 use wicket_proxy::egress::{Egress, Upstream};
 use wicket_proxy::{CredentialSwap, RunCtx, SwapSource};
 
@@ -164,7 +164,7 @@ impl World {
             lifecycle: None,
         };
         let up = Upstream { resolve, roots_pem: Some(origin_ca.cert_pem()), ..Default::default() };
-        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_canary").unwrap()), Arc::new(Central), None, up).unwrap();
+        let egress = Egress::with_upstream(ctx, Arc::new(RunCa::generate("run_canary").unwrap()), Arc::new(ZoneDecider), None, up).unwrap();
         let sock = dir.join("egress.sock");
         let s2 = sock.clone();
         tokio::spawn(async move { egress.serve(&s2).await });
