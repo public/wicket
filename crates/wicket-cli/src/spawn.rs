@@ -82,7 +82,7 @@ pub fn adopter(c: Arc<SpawnCtx>) -> crate::noderun::Adopter {
 /// the org policy, the parent's slots), its slots and model budget reserved as `spawn` does, and
 /// recorded and supervised as a run of its own (`wicket run --adopt`), which publishes its token
 /// and takes over its box without starting another. The budget was checked on the node against
-/// what it was leased; here it is carved from the parent's. Idempotent: a resend is taken once.
+/// the slice it was sent; here it is carved from the parent's. Idempotent: a resend is taken once.
 fn adopt(c: &SpawnCtx, s: crate::noderun::Spawned) -> Result<(), String> {
     crate::run::check_run_id(&s.child).map_err(|e| e.to_string())?;
     let p = &c.parent;

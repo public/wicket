@@ -521,7 +521,7 @@ async fn spawn(node: &Arc<Node>, run: &str, tool: &str, args: &Value) -> Option<
     let now = wicket_feed::now_ms();
     let deadline = started_ms + i64::try_from(sp.time_left_secs).unwrap_or(i64::MAX / 2000) * 1000;
     let time_left = Duration::from_millis(u64::try_from(deadline - now).unwrap_or(0));
-    // What the box may still spend: its zone's budget left, within what this node was leased.
+    // What the box may still spend: its zone's budget left, within the slice this node was sent.
     let llm = node.llms.lock().expect("llms").get(run).cloned();
     let slice = llm.as_ref().and_then(|l| l.slice());
     let (llm_left, llm_input_left) = match &llm {
@@ -642,7 +642,7 @@ async fn start_child(
     let dir = node.paths.runs().join(&child.0);
     std::fs::create_dir_all(&dir)?;
     super::save_derived(&dir, &record)?;
-    // Its model budget, carved from what this node was leased for its parent: together they never
+    // Its model budget, carved from the slice this node was sent for its parent: together they never
     // spend more than that.
     let llm = node.llms.lock().expect("llms").get(run).cloned();
     if let (Some(cl), Some(pl)) = (&m.zone.llm, &llm) {

@@ -41,7 +41,7 @@ node's own `Llm`.
 
 1. **Slice 1 (done, #317): the model proxy runs only on the node.** `run.rs` stops listening on
    `ctl/llm.sock`. Its `Llm` stays as the run's budget counter (the node's `Spent` reports are
-   merged into it, slices are leased from it, and the egress model gate uses it). `Llm::relayed`,
+   merged into it, slices are sent from it, and the egress model gate uses it). `Llm::relayed`,
    `LlmRelay` and the `llm` tunnel target go. No protocol bump: every node within
    `PROTOCOL_SKEW` of protocol 8 is at protocol 3 or later (#152), so it fetches the credential and
    never opens that tunnel.

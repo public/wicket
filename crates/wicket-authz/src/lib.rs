@@ -7,7 +7,7 @@
 //!   checks ([`Token::attenuate`]). Biscuit requires every block's checks to pass, so a child can't
 //!   exceed its parent, whatever a block says.
 //! - **Grant blocks** (third-party, signed by the approval service or a parent box's grantor key): one
-//!   `approved(gid, host, method, path)` rule that holds while the lease is live and the ledger has
+//!   `approved(gid, host, method, path)` rule that holds while the grant is live and the ledger has
 //!   uses left ([`grant`], or [`Token::grant_request`] / [`sign_grant`] / [`Token::add_grant`]). A
 //!   ceiling's reach and risk checks accept it only from the keys that ceiling lists.
 //! - **Load once, decide many** ([`load`], [`Loaded::decide`]): signatures, revocation ids of every

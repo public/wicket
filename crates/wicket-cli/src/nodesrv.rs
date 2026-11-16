@@ -2098,7 +2098,7 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
-    // What was leased to the run goes with its box (#152, #153).
+    // What was sent for the run (secrets, its budget slice) goes with its box (#152, #153).
     n.secrets.release(run);
     n.slices.drop_run(run);
     n.queue.drop_run(run);
@@ -2984,10 +2984,10 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
     }
 
     /// #152, #153: an ask queued while the run's control host was away is raised when it resumes the
-    /// box, with its node-local id and time, and leaves the queue once answered; a lease's budget
+    /// box, with its node-local id and time, and leaves the queue once answered; a run's budget
     /// slice is kept on disk; a protocol-1 control host gets none of the version-2 messages.
     #[tokio::test]
-    async fn a_queued_ask_is_raised_on_resume_and_a_lease_keeps_its_slice() {
+    async fn a_queued_ask_is_raised_on_resume_and_a_run_keeps_its_slice() {
         const RUN: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
         let inst = Install::new("nodesrv-queued");
         let node = test_node(&inst);
