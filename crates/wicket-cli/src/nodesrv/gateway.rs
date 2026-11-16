@@ -1,5 +1,6 @@
-//! The box's MCP gateway on its node (#151): calls relayed to the run's own gateway, and MCP's
-//! handshake answered while the control host can't be reached. Split out of `nodesrv.rs` (#220).
+//! The box's MCP gateway on its node (#151): MCP's own methods answered here (#257, the same
+//! answer the control host's gateway gives), the tools this node decides answered from the box's
+//! token (#164), and the rest relayed to the run's own gateway. Split out of `nodesrv.rs` (#220).
 
 use super::*;
 
@@ -104,12 +105,21 @@ async fn gateway_rpc(
             );
         }
     }
-    let init = rpc.get("method").and_then(|m| m.as_str()) == Some("initialize");
-    let resp = relay_or_offline(node, run, &parts, &body, &rpc).await;
-    match push {
-        Some(p) if init => with_push(resp, p, rpc["params"]["protocolVersion"].as_str()),
-        _ => resp,
+    // MCP's own methods and notifications are the node's to answer (#257), as they were the
+    // control host's: the same answer (`wicket_proxy::gateway::handshake`), with no round trip, and
+    // whether or not the control host can be reached.
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if rpc.is_object() && rpc.get("id").is_none_or(|i| i.is_null()) && !method.is_empty() {
+        return gw_reply(202, serde_json::Value::Null);
     }
+    if let Some(result) = wicket_proxy::gateway::handshake(method, &rpc["params"]) {
+        let resp = gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": rpc["id"], "result": result }));
+        return match push {
+            Some(p) if method == "initialize" => with_push(resp, p, rpc["params"]["protocolVersion"].as_str()),
+            _ => resp,
+        };
+    }
+    relay_or_offline(node, run, &parts, &body, &rpc).await
 }
 
 async fn relay_or_offline(
@@ -178,26 +188,16 @@ pub(super) async fn relay_rpc(
     Ok(hyper::Response::from_parts(rp, GwBody::new(bytes)))
 }
 
-/// What the gateway answers while the control host can't be reached: MCP's own handshake, and a
-/// clear refusal for every tool (each needs the control plane).
+/// What a tool the node relays answers while the control host can't be reached: a clear refusal
+/// (it needs the control plane). MCP's handshake never gets here: the node answers it itself.
 pub(super) fn gateway_offline(rpc: &serde_json::Value, why: &str) -> hyper::Response<GwBody> {
     let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let result = match method {
-        "initialize" => serde_json::json!({
-            "protocolVersion": rpc["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26"),
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "wicket", "version": env!("CARGO_PKG_VERSION") },
-        }),
-        "ping" => serde_json::json!({}),
-        _ if id.is_null() => return gw_reply(202, serde_json::Value::Null),
-        _ => serde_json::json!({
-            "content": [{ "type": "text", "text": format!(
-                "the control host is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
-            ) }],
-            "isError": true,
-        }),
-    };
+    let result = serde_json::json!({
+        "content": [{ "type": "text", "text": format!(
+            "the control host is unreachable ({why}): this needs it. Retry this call in a minute; if it was a wait (await_grant, await_message), call it again."
+        ) }],
+        "isError": true,
+    });
     gw_reply(200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 

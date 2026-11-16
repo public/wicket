@@ -535,14 +535,10 @@ impl Node {
         found.first().map(|(r, _)| r.to_string())
     }
 
-    /// What this node decides `run`'s gateway tools from (#164): None, they are all relayed (a
-    /// control host before protocol 5 started it, or one of those is connected now).
+    /// What this node decides `run`'s gateway tools from (#164): its start's edge. (A control host
+    /// that started a box without one, before protocol 5, is past `PROTOCOL_SKEW`.)
     fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
-        let e = self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone())?;
-        match self.proto_of(run) {
-            p if (1..chan::EDGE_DECISIONS).contains(&p) => None,
-            _ => Some(*e),
-        }
+        self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone()).map(|e| *e)
     }
 
     /// The tenant `run`'s box runs for, and the zone its token holds.
@@ -580,6 +576,7 @@ impl Node {
     }
 
     /// The protocol version of the connection that owns `run`'s box (0: none up).
+    #[cfg(test)]
     fn proto_of(&self, run: &str) -> u32 {
         let Some(g) = self.owner(run) else { return 0 };
         self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto)
@@ -2320,9 +2317,6 @@ async fn serve_box(
     Ok(tasks)
 }
 
-/// How a tool call relayed to a control host before [`chan::EDGE_DECISIONS`] fails: it would decide
-/// it differently.
-pub const OLD_CONTROL: &str = "the control host speaks an older protocol";
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 
@@ -3318,6 +3312,110 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
         c.write_all(&Frame::Data { stream, offset: 0, bytes: resp.into_bytes() }.encode()).await.unwrap();
         (call["params"]["name"].as_str().unwrap_or("").to_string(), call["params"]["arguments"].clone())
+    }
+
+    /// #257 slice 4a: MCP's own methods are the node's to answer, the same answer the control
+    /// host's gateway gives (`wicket_proxy::gateway::handshake`), with no control host at all; a
+    /// notification is accepted; a tool the node relays gets a clear refusal while cut off.
+    #[tokio::test]
+    async fn the_node_answers_mcps_handshake_itself() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const RUN: &str = "run_hhhhhhhhhhhhhhhhhhhhhhhhhh";
+        let inst = Install::new("nodesrv-handshake");
+        let node = test_node(&inst);
+        fed_box(&node, &inst, RUN, "name: z\n");
+        let sock = inst.dir.join("gw.sock");
+        let l = wicket_proxy::sockpath::bind(&sock).unwrap();
+        let n = node.clone();
+        tokio::spawn(async move {
+            while let Ok((c, _)) = l.accept().await {
+                let n = n.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req| {
+                        let n = n.clone();
+                        async move { Ok::<_, hyper::Error>(gateway_call(&n, RUN, req).await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(c), svc).await;
+                });
+            }
+        });
+        let post = |body: serde_json::Value| {
+            let sock = sock.clone();
+            async move {
+                let b = body.to_string();
+                let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
+                let req = format!("POST /mcp HTTP/1.1\r\nHost: wicket.internal\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                c.write_all(req.as_bytes()).await.unwrap();
+                let mut out = String::new();
+                c.read_to_string(&mut out).await.unwrap();
+                let status: u16 = out[9..12].parse().unwrap();
+                let v = out.split("\r\n\r\n").nth(1).and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok()).unwrap_or_default();
+                (status, v)
+            }
+        };
+        let (st, v) =
+            post(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }))
+                .await;
+        assert_eq!(st, 200);
+        assert_eq!(
+            v["result"],
+            wicket_proxy::gateway::handshake("initialize", &serde_json::json!({ "protocolVersion": "2025-06-18" })).unwrap()
+        );
+        assert!(v["result"]["instructions"].as_str().unwrap().contains("await_grant"), "{v}");
+        let (st, v) = post(serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await;
+        let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(st == 200 && names.contains(&"whoami") && names.contains(&"link"), "{names:?}");
+        let (st, v) = post(serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" })).await;
+        assert_eq!((st, v["result"].clone()), (200, serde_json::json!({})));
+        let (st, _) = post(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+        assert_eq!(st, 202);
+        // A tool the node relays, with no control host: refused clearly, as before.
+        let (st, v) =
+            post(serde_json::json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "links", "arguments": {} } }))
+                .await;
+        assert!(st == 200 && v["result"]["isError"] == true, "{v}");
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("control host is unreachable"), "{v}");
+    }
+
+    /// The node's `request_access` holds what the control host's did (the control host's copy is
+    /// gone, #257): a push's discovery is asked for as the push, wicket's own methods (UPDATE, and
+    /// anything not HTTP) can't be asked for, and a zone that may not ask raises nothing.
+    #[tokio::test]
+    async fn the_nodes_request_access_asks_for_a_push_and_never_for_wickets_own() {
+        const RUN: &str = "run_pppppppppppppppppppppppppp";
+        const QUIET: &str = "run_qqqqqqqqqqqqqqqqqqqqqqqqqq";
+        let inst = Install::new("nodesrv-push-ask");
+        let node = test_node(&inst);
+        fed_boxes(
+            &node,
+            &inst,
+            &[
+                (RUN, "name: z\nreach: [{ host: github.com, methods: [GET, POST], paths: ['/acme/app.git/info/refs', '/acme/app.git/git-upload-pack'] }]\n"),
+                (QUIET, "name: q\nescalation: { request: false }\n"),
+            ],
+        );
+        let ask = |run: &'static str, url: String, method: &str| {
+            let (node, args) = (node.clone(), serde_json::json!({ "url": url, "method": method, "reason": "push my branch" }));
+            async move { gw::tool(&node, run, "request_access", &args).await.expect("decided on the node") }
+        };
+        let (t, _) = ask(RUN, "https://github.com/acme/app.git/info/refs?service=git-receive-pack".into(), "GET").await;
+        assert!(t.starts_with("queued: q-"), "{t}");
+        let q = node.queue.of(RUN);
+        assert_eq!(q.len(), 1);
+        assert_eq!((q[0].op.method.as_str(), q[0].op.path.as_str()), ("POST", "/acme/app.git/git-receive-pack"), "asked as the push");
+        let (t, _) = ask(RUN, "https://github.com/acme/app.git/info/refs?service=git-upload-pack".into(), "GET").await;
+        assert!(t.contains("already allowed"), "a fetch's discovery is itself: {t}");
+        let sha = "0f".repeat(32);
+        for (url, method) in
+            [(format!("https://wicket.internal/self/{sha}"), "UPDATE"), ("https://api.example.com/self".to_string(), "update")]
+        {
+            let (t, _) = ask(RUN, url.clone(), method).await;
+            assert!(t.starts_with("not requested"), "{method} {url}: {t}");
+        }
+        let (t, err) = ask(QUIET, "https://api.example.com/x".into(), "GET").await;
+        assert!(!err && t.contains("never be allowed") && t.contains("escalation.request: false"), "{t}");
+        assert_eq!(node.queue.of(RUN).len(), 1);
+        assert!(node.queue.of(QUIET).is_empty());
     }
 
     /// #164: with its control host unreachable, the node decides the box's gateway tools from its

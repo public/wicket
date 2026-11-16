@@ -648,11 +648,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
             ctl.calls.put_tree(&ctl.run, tree, src, &x).await.with_context(|| format!("sending the box's {tree} to node {name}"))?;
         }
         trees.end();
-        let mut start = s.start;
-        // A node before #164 relays every gateway tool: nothing to decide them from.
-        if ctl.proto.load(Ordering::SeqCst) < crate::chan::EDGE_DECISIONS {
-            start.edge = None;
-        }
+        let start = s.start;
         // A node before #257's slice 3 would forward the hosts its CA can't cover to this host, which
         // no longer serves them.
         let forwarded = {
