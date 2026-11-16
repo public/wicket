@@ -482,11 +482,6 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                     "refused: starting {name} was approved ({grant}) for other arguments, and these changed after the approval (this is recorded). Call spawn with exactly the arguments that were approved."
                 ));
             }
-            EffectUse::Spent { grant } => {
-                return Err(format!(
-                    "{name} was already started under its approval ({grant}), which allowed it once; it is not started again"
-                ));
-            }
             EffectUse::Granted(gid) => {
                 beyond = true;
                 let _ = l.audit(
@@ -510,8 +505,8 @@ fn spawn(c: &SpawnCtx, req: SpawnRequest) -> Result<String, String> {
                 ));
             }
             EffectUse::None => {
-                if let Ok(Some(rid)) = l.denied_recently(&op) {
-                    return Err(format!("starting {name} in this zone ({rid}) was denied a few minutes ago; don't ask again"));
+                if let Ok(Some(rid)) = l.denied_recently_with(&op, Some(&digest)) {
+                    return Err(format!("exactly this spawn ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = card(&req.kind, name, &image, &cm, &violations);
                 let rid = match l.file_request(&op, Some(&digest), &reason, None).map_err(|e| e.to_string())? {
@@ -1267,7 +1262,7 @@ mod tests {
 
     /// #369: a spawn beyond the parent is approved for exactly its arguments. While it is pending,
     /// the same child with other arguments waits on it; once granted, other arguments are refused
-    /// and audited; the approved ones start it once, and a replay doesn't start it again.
+    /// and audited; the approved ones start it once, and a replay asks again instead of starting it.
     #[test]
     fn a_spawn_approval_is_for_exactly_its_arguments_once() {
         let zone = "  llm: { secret: model-key }\n  reach:\n    - { host: api.example.com, methods: [GET] }\n  limits: { memory: 1g, cpus: 1, timeout: 1h }\n";
@@ -1318,8 +1313,9 @@ mod tests {
         drop(l);
         let started = spawn(&p.ctx, wide("build it")).unwrap();
         assert!(!started.starts_with("needs approval") && !started.starts_with("waiting"), "{started}");
-        let again = spawn(&p.ctx, wide("build it")).unwrap_err();
-        assert!(again.contains("already started under its approval"), "{again}");
+        // Its one use is taken: presented again, it doesn't start a second child, it asks again.
+        let again = spawn(&p.ctx, wide("build it")).unwrap();
+        assert!(again.starts_with("needs approval: request r-") && !again.contains(&rid), "{again}");
     }
 
     fn at(node: &str, lease: Option<&str>) -> Option<Placed> {

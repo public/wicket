@@ -326,11 +326,8 @@ async fn open(
                     "refused: this link was approved ({grant}) under another name, and the name changed after the approval (this is recorded). Make the call with the name that was approved."
                 ));
             }
-            EffectUse::Spent { grant } => {
-                return Err(format!("this link was already opened under its approval ({grant}), which allowed it once"));
-            }
             EffectUse::None => {
-                if let Ok(Some(rid)) = l.denied_recently(&op) {
+                if let Ok(Some(rid)) = l.denied_recently_with(&op, Some(&args)) {
                     return Err(format!("exactly this link ({rid}) was denied a few minutes ago; don't ask again"));
                 }
                 let reason = format!(
