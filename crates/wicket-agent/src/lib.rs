@@ -396,8 +396,8 @@ const DRIVEN_RC_NOTICE: &str = "- Your session is also a Remote Control session:
 /// without it.
 ///
 /// `permission_mode` is `agent.remote.permission_mode` as `--permission-mode` takes it. In `-p`,
-/// Claude Code asks its stdin host (wicket), not the app, before an action that needs approval, and
-/// wicket answers no such prompt, so `default` is refused by the adapter.
+/// Claude Code asks its stdin host (wicket), not the app, before an action that needs approval:
+/// wicket raises each such prompt as an approval ([`claude::control`], #363).
 pub fn claude_code_driven_remote_plan(
     m: &Manifest,
     run: &RunId,
@@ -607,6 +607,10 @@ pub fn claude_code_plan(m: &Manifest, run: &RunId, session: &AgentSession) -> La
         // Enforcement is outside the box, so the agent's own prompts would only stall it.
         "--permission-mode".into(),
         "bypassPermissions".into(),
+        // Where a mode that asks (a driven remote session's, or one set while it runs) asks: wicket,
+        // over the stream-json control protocol (`can_use_tool`, #363), not a terminal.
+        "--permission-prompt-tool".into(),
+        "stdio".into(),
         // Server-side search would bypass the egress proxy (the LLM proxy strips it too).
         "--disallowedTools".into(),
         // In-box subagents can't be told apart by identity; when the manifest says so, the only way
@@ -963,16 +967,17 @@ mod tests {
     }
 
     #[test]
-    fn a_driven_remote_session_takes_a_mode_that_needs_no_prompt_answered() {
+    fn a_driven_remote_session_takes_any_mode_and_asks_wicket_over_stdio() {
         let run = RunId("run_rd2".into());
         let a = harness::adapter(Harness::ClaudeCode);
-        for mode in ["acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"] {
+        // `default` too (#363): its prompts come to wicket, which raises them as approvals.
+        for mode in ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"] {
             let m = driven_remote_manifest(&format!(", permission_mode: {mode}"));
-            assert_eq!(permission_mode_of(&a.driven_remote_plan(&m, &run, &AgentSession::new(), "t", &Value::Null).unwrap()), mode);
+            let w = a.driven_remote_plan(&m, &run, &AgentSession::new(), "t", &Value::Null).unwrap();
+            assert_eq!(permission_mode_of(&w), mode);
+            assert!(w.plan.argv.windows(2).any(|p| p == ["--permission-prompt-tool", "stdio"]), "{mode}");
         }
-        let m = driven_remote_manifest(", permission_mode: default");
-        let e = a.driven_remote_plan(&m, &run, &AgentSession::new(), "t", &Value::Null).err().unwrap();
-        assert!(e.contains("asks wicket, not the Claude app") && e.contains("leave the mode out"), "{e}");
+        assert!(a.controller(&driven_remote_manifest("")).is_some(), "a driven Claude Code has a control channel");
     }
 
     #[test]

@@ -1529,6 +1529,24 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             acp = Some(c);
         }
     }
+    // A driven harness's control channel (#363): its running turn interrupted, its permission mode
+    // changed while it runs, and its prompts before a tool call raised as approvals.
+    let mut control = match (mode, &acp, harness) {
+        (Some(wicket_agent::harness::Mode::Driven | wicket_agent::harness::Mode::DrivenRemote(_)), None, Some(h)) => {
+            h.controller(&m).map(|c| {
+                crate::control::Supervised::new(
+                    c,
+                    crate::control::RunOf {
+                        tenant: m.tenant.clone(),
+                        run: run.clone(),
+                        zone: m.zone.name.clone(),
+                        may_ask: m.zone.escalation.request,
+                    },
+                )
+            })
+        }
+        _ => None,
+    };
     // Re-attached: between turns if the box's last output line was a turn's result.
     let mut turn_running = match &record {
         Some(_) if acp.is_some() => acp.as_ref().is_some_and(|c| c.busy()),
@@ -1720,6 +1738,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             let _ = write_json(&acp_state, &*c);
                         }
                     } else {
+                        // The harness's control lines (#363): its prompts, and its answers to wicket's requests.
+                        if let Some(c) = control.as_mut() {
+                            let out = ledger.lock().map(|mut lg| c.on_line(&mut lg, &l)).unwrap_or_default();
+                            control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                            write_lines(&mut stdin, &out.write).await;
+                        }
                         // A driven remote session's answer to wicket's Remote Control request: its
                         // address, recorded once as a remote session's is; or why there is none (the
                         // session carries on, driven only).
@@ -1891,7 +1915,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let cancels = ledger.lock().ok().and_then(|mut l| l.take_turn_cancels(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
                 if let Some(by) = cancels.last() {
                     use tokio::io::AsyncWriteExt;
-                    let out = acp.as_mut().map(|c| c.cancel()).unwrap_or_default();
+                    let out = match (acp.as_mut(), control.as_mut()) {
+                        (Some(c), _) => c.cancel(),
+                        // A driven harness's interrupt (#363): only while a turn runs, as ACP's.
+                        (None, Some(c)) if turn_running => c.interrupt(),
+                        _ => vec![],
+                    };
                     let sent = !out.is_empty();
                     if sent {
                         println!("[operator] {by}: cancel the running turn");
@@ -1909,8 +1938,37 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         }
                     }
                     if let Ok(l) = ledger.lock() {
-                        let why = if sent { "cancelled" } else if acp.is_some() { "no turn was running" } else { "not an ACP run: nothing to cancel" };
+                        let why = if sent {
+                            "cancelled"
+                        } else if acp.is_some() || control.is_some() {
+                            "no turn was running"
+                        } else {
+                            "this run's harness can't be interrupted"
+                        };
                         let _ = l.audit(&m.tenant, Some(&run), "run.turn_cancel", &serde_json::json!({ "by": by, "asked": cancels.len(), "outcome": why }));
+                    }
+                }
+                // Prompts whose approvals were decided (#363), and a live permission mode change.
+                if let Some(c) = control.as_mut() {
+                    let out = ledger.lock().map(|mut lg| c.poll(&mut lg)).unwrap_or_default();
+                    control_said(&out, &ledger, &m.tenant, &run, &mut acp_audits);
+                    write_lines(&mut stdin, &out.write).await;
+                }
+                let modes = ledger.lock().ok().and_then(|mut l| l.take_mode_changes(&run.0, CANCEL_FRESH_SECS).ok()).unwrap_or_default();
+                if let Some((want, by)) = modes.last() {
+                    let outcome = match (crate::control::parse_mode(want), control.as_mut()) {
+                        (Some(mode), Some(c)) => {
+                            println!("[operator] {by}: permission mode {mode}");
+                            let out = c.set_mode(mode);
+                            write_lines(&mut stdin, &out).await;
+                            "asked"
+                        }
+                        (None, _) => "not a permission mode",
+                        (_, None) => "this run's harness takes no live mode change",
+                    };
+                    if let Ok(l) = ledger.lock() {
+                        let body = serde_json::json!({ "by": by, "mode": wicket_agent::clip(want, 40), "asked": modes.len(), "outcome": outcome });
+                        let _ = l.audit(&m.tenant, Some(&run), "run.permission_mode", &body);
                     }
                 }
                 if let Some(f) = &fence {
@@ -2550,6 +2608,40 @@ const CANCEL_FRESH_SECS: i64 = 30;
 
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;
+
+/// Writes lines to the agent's stdin; a stdin that can't be written is dropped.
+async fn write_lines<W: tokio::io::AsyncWrite + Unpin>(stdin: &mut Option<W>, lines: &[String]) {
+    use tokio::io::AsyncWriteExt;
+    let Some(si) = stdin.as_mut().filter(|_| !lines.is_empty()) else { return };
+    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    if si.write_all(input.as_bytes()).await.is_err() {
+        *stdin = None;
+    }
+}
+
+/// Shows and audits what a driven harness's control channel did (#363); audits are capped per run
+/// with the ACP client's, so an agent can't flood the ledger with prompts.
+fn control_said(
+    out: &crate::control::Out,
+    ledger: &std::sync::Mutex<Ledger>,
+    tenant: &wicket_core::TenantId,
+    run: &RunId,
+    audits: &mut u32,
+) {
+    for s in &out.say {
+        println!("{s}");
+    }
+    for (kind, body) in &out.audit {
+        *audits += 1;
+        if *audits <= ACP_AUDIT_CAP {
+            if let Ok(l) = ledger.lock() {
+                let _ = l.audit(tenant, Some(run), kind, body);
+            }
+        } else if *audits == ACP_AUDIT_CAP + 1 {
+            println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+        }
+    }
+}
 
 /// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
 fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
