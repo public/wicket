@@ -423,7 +423,9 @@ pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113))
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                // Cloud metadata outside those ranges (#366): Azure's WireServer.
+                || o == [168, 63, 129, 16])
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
