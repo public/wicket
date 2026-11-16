@@ -78,6 +78,19 @@ node's own `Llm`.
    (`Msg::Ask`'s pattern), not as relayed JSON-RPC. `wicket-proxy/src/gateway.rs`'s tool bodies
    and spawn's `--parent-run` re-exec path go. This is protocol 13 (12 is node health's, #377),
    behind #241's jumps.
+   - **4a (done): what was already the node's.** The node answers MCP's own methods (`initialize`,
+     `ping`, `tools/list`, notifications) itself, with the one implementation
+     (`wicket_proxy::gateway::handshake`), connected or not: they are never relayed. The control
+     host's copies of `whoami` and `request_access`, which the node always answered, are gone,
+     and so are the branches for peers before protocol 5 (`EDGE_DECISIONS`), which
+     `PROTOCOL_SKEW` no longer lets connect. No protocol change.
+   - **4b (left): typed asks for the rest**, then the relay goes: the node still relays
+     `await_grant` and `pending_requests` for requests already put to an operator, `send_message`,
+     `await_message`, `request_capacity` and `request_update` while connected, the queued calls it
+     replays, spawns it doesn't start itself, and the control host's tools (links, `decide`,
+     `finish`/`hibernate`, `principals`, `receipts`, `delegations`, `continue_child`). Each becomes
+     a typed message at protocol 13, then `relay_rpc`, `relay_tool` and `gateway_offline` go, and
+     with the last spawn the `--parent-run` re-exec, `Spawner` and `Cmd::Run.parent_run`.
 5. **Slice 5: `run.rs` starts no proxies.** With nothing left on `ctl/*.sock`, the run supervisor
    keeps the vault, the ledger, approvals and the feed. The control host is forward-only: it relays
    secrets and asks, and decides nothing per request.
