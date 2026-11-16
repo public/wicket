@@ -209,8 +209,12 @@ Done for #258, an update, a program and an image are all accepted through `may_u
    files only, every file `0644` or `0755` by its executable bit, every directory `0755` and every
    time 0, so the same source has one digest in every checkout. Old `wicket-program-v1` pins are
    accepted with a warning while the source is unchanged, and `wicket zone pin` rewrites them.
-3. **Hibernation bundles as bundle trees**, through the local store; push to the state store by
-   negotiation; manifest version 2 alongside a reader for version 1 until no agent's head is version 1.
+3. **Hibernation bundles as bundle trees** (done, #365), through the local store; push to the state
+   store by negotiation; manifest version 2 alongside a reader for version 1 until no agent's head
+   is version 1. The ledger's head is the bundle tree's digest, and a write-once ref
+   `agents/<agent>/<seq>.<generation>` names it in the bundles' home store (the state store with
+   `bundles: s3`, else the local one). A tree with a name that isn't UTF-8 is still pushed as
+   version 1. Not yet: resuming on the same host before the upload ends, and packs.
 4. **Garbage collection** in the reconciler, and the local store's cache cap.
 5. **Named snapshots and forks** (#177) on bundle trees.
 6. **Transfer between nodes**: `has` and `get` on the node channel, reads falling through local, peer

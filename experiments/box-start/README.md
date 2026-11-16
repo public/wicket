@@ -115,4 +115,66 @@ So `node.start` − `node.start.total` is the channel (both ways) and the node's
 
 ## Results
 
-Not yet run: the numbers go here and in docs/explanation/performance.md (#287, step 1).
+### wicket's own part, against a stand-in Docker (2026-11-16)
+
+`fake-engine.py` is a Docker Engine API on a unix socket whose containers are created, started and
+exit at once, so a start costs Docker (and runsc) nothing. What `measure.sh` reports with it is
+wicket's own work, both hosts' parts, and its Engine API round trips. It needs no Docker:
+
+```sh
+python3 experiments/box-start/fake-engine.py /tmp/fake/docker.sock &
+WICKET_DOCKER="docker -H unix:///tmp/fake/docker.sock" WICKET=target/release/wicket \
+  experiments/box-start/measure.sh -n 20 --isolation runc
+```
+
+**The machine:** a wicket box (gVisor) on a shared VPS, release build, this host's own node, 20
+starts after a warm-up. Medians, in ms. fsync is slow here (3–8 ms per sync), and noisy: the spans
+that are writes to disk move most between runs, the others by under 1 ms. Raw spans:
+`logs/fake-engine-before.jsonl`, `logs/fake-engine-after.jsonl`.
+
+| span | before | after | what it is |
+|---|---:|---:|---|
+| `wicket run`, end to end (wall) | 163 | 153 | the process, start to exit |
+| `ledger` | 15.9 | 16.2 | opening the ledger, the run's rows and audit records (SQLite commits) |
+| `identity` | 9.7 | 9.7 | the agent identity, issued and put in the ledger |
+| `quotas` | (untimed) | 9.7 | the run's quota grants recorded (ledger commits); was a gap after `policy.org` |
+| `token.keys` + `token.policy` + `token.mint` | 8.2 | 8.7 | the feed opened, block 0 compiled, the token minted |
+| `feed.publish` | 3.5 | 3.7 | the token's delta fsynced into the control host's feed |
+| `authority.record` | (untimed) | 7.8 | the box's authority and node recorded (a file and a ledger commit); was a gap |
+| `node.ready` | **32.1** | **22.4** | the node's channel up and its feed fresh at the box's epoch |
+|   `node.handshake` | 7.3 | 7.4 | hello, authentication, welcome |
+|   (the feed's catch-up, applied on the node) | 24.5 | 14.6 | the frames the node persists before it says it is fresh (below) |
+| `node.start` | 6.2 | 6.2 | the node's whole start of the box; Docker's calls in it: |
+|   `node.start.docker.run` | 2.0 | 2.0 | create and start, two Engine API calls |
+|   `node.start.proxies` | 2.0 | 2.0 | the node's per-box proxies, their sockets bound |
+| **`started`** | **104.8** | **94.1** | when the supervisor learns the box runs |
+| `node.teardown` | 6.8 | 6.7 | the node's part after the box exits (inspect, rm, release) |
+| `teardown` | 15.1 | 14.8 | the control host's part after the exit (the audit flushed, the record saved) |
+
+**Where the node's wait went.** Each start's catch-up is four frames: the feed key's certificate
+(unchanged, not persisted: 0.04 ms), two deltas and a freshness statement. Each delta was appended and fsynced, and then `statements.json` was rewritten
+(an atomic replace: fsync the file, rename, fsync the directory), about 8 ms per delta. The rewrite
+wrote the same bytes: a delta leaves the newest statement alone, and moves `vouched` only when it
+reaches a newer statement's epoch. Now it is skipped when nothing in the file changed: about 3 ms per
+delta here, and `node.ready` 32 → 22 ms. The statement itself is still written (2 fsyncs): it carries
+the replay floor that must survive a restart.
+
+**What is left of wicket's own ~95 ms**, by kind:
+
+- SQLite commits on the control host, one per write (`ledger`, `identity`, `quotas`,
+  `authority.record`, and in `teardown`): these spans add up to about 58 ms here, mostly commits. They are the next cut: the start's writes
+  in one transaction (one commit), and the ledger's schema statements run once per process instead
+  of on every open.
+- fsyncs on the node's feed: ~15 ms (two delta appends, the statement).
+- the node's handshake, 7 ms (a fresh connection per run, with its authentication).
+- computation (CA, token compile and mint, proxies): about 10 ms.
+
+Docker's two calls took 2 ms against the stand-in. Through real dockerd, containerd and runsc they are
+what `docker.run.create`, `.runtime` and `.return` separate, and they need a host with Docker: the
+next section.
+
+### On a host with Docker
+
+Not run in this round: the box this was measured in has no Docker. Run `measure.sh` there, `-n 20`,
+with and without `--isolation runc`, and on an enrolled node (`--node`); `docker.run.runtime` is
+runsc's sandbox and gofer boot, the number #287's step 3 turns on.

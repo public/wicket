@@ -724,7 +724,15 @@ impl<P: Policy> Replica<P> {
                 }
                 self.apply_delta(&d, head);
                 self.recheck_local();
+                // The statements file is rewritten only if this delta changed what it holds: a
+                // delta leaves the newest statement and the floor alone, and moves `vouched` only
+                // when it reaches the newest statement's epoch. Rewriting the same bytes cost two
+                // fsyncs per delta for nothing (#287: most of a box start's wait on its node).
+                let before = self.vouched.as_ref().map(|v| (v.jws.clone(), v.received_at));
                 self.revouch();
+                if self.vouched.as_ref().map(|v| (v.jws.clone(), v.received_at)) == before {
+                    return Ok(());
+                }
                 self.persist_statements().map_err(io)
             }
             Plan::Fresh(s) => {

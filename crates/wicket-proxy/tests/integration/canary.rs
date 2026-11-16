@@ -7,7 +7,9 @@
 //!   before anything reaches the origin, audited as an anomaly, and counted as a strike;
 //! - another run's placeholder is refused the same way;
 //! - a compressed reply from the credentialed host is refused, and the request asked for none;
-//! - a bearer on the host that isn't the placeholder is dropped, and audited.
+//! - a bearer on the host that isn't the placeholder is dropped, and audited;
+//! - the credential reflected in response headers, or split across a streamed body's chunks, never
+//!   reaches the box either (#361).
 
 use crate::zone_decider::ZoneDecider;
 use base64::Engine;
@@ -55,22 +57,26 @@ type Seen = Arc<Mutex<String>>;
 
 /// The echoing origin: answers with what it was sent. `/forms` answers with the Authorization's
 /// token in base64 (inside a longer value, as Basic credentials hold one) and hex; `/gzip` claims a
-/// gzip-encoded body.
+/// gzip-encoded body; `/headers` reflects the token in response headers (a redirect, a cookie, a
+/// challenge); `/split` streams the echo in small chunks, with pauses, so the token straddles them
+/// (#361).
 async fn origin(ca: &RunCa, name: &str, seen: Seen) -> SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let mut cfg = (*ca.server_config(name).unwrap()).clone();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+    let name = name.to_string();
     tokio::spawn(async move {
         loop {
             let Ok((s, _)) = l.accept().await else { return };
-            let (acceptor, seen) = (acceptor.clone(), seen.clone());
+            let (acceptor, seen, name) = (acceptor.clone(), seen.clone(), name.clone());
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(s).await else { return };
                 let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
-                    let seen = seen.clone();
+                    let (seen, name) = (seen.clone(), name.clone());
                     async move {
+                        use futures_util::StreamExt;
                         use http_body_util::BodyExt;
                         let mut text = format!("{} {}\n", req.method(), req.uri());
                         for (k, v) in req.headers() {
@@ -89,6 +95,21 @@ async fn origin(ca: &RunCa, name: &str, seen: Seen) -> SocketAddr {
                         text.push_str(&String::from_utf8_lossy(&body));
                         seen.lock().unwrap().push_str(&format!("{text}\n----\n"));
                         let mut r = http::Response::builder().header("x-echo", "yes");
+                        if path == "/split" {
+                            let chunks: Vec<Bytes> = text.as_bytes().chunks(7).map(Bytes::copy_from_slice).collect();
+                            let stream = futures_util::stream::iter(chunks).then(|c| async move {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                                Ok::<_, hyper::Error>(hyper::body::Frame::data(c))
+                            });
+                            return Ok(r.body(BodyExt::boxed(http_body_util::StreamBody::new(stream))).unwrap());
+                        }
+                        if path == "/headers" {
+                            r = r
+                                .header("location", format!("https://{name}/next?token={token}"))
+                                .header("set-cookie", format!("s={token}; Secure"))
+                                .header("www-authenticate", format!("Bearer error=\"invalid_token\", token=\"{token}\""))
+                                .header("x-reflect", hex::encode(&token));
+                        }
                         let out = match path.as_str() {
                             "/forms" => {
                                 let b64 = base64::engine::general_purpose::STANDARD.encode(format!("git:{token}"));
@@ -100,7 +121,9 @@ async fn origin(ca: &RunCa, name: &str, seen: Seen) -> SocketAddr {
                             }
                             _ => text,
                         };
-                        Ok::<_, hyper::Error>(r.body(http_body_util::Full::new(Bytes::from(out))).unwrap())
+                        Ok::<_, hyper::Error>(
+                            r.body(BodyExt::boxed(http_body_util::Full::new(Bytes::from(out)).map_err(|e| match e {}))).unwrap(),
+                        )
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;
@@ -215,6 +238,9 @@ impl World {
             }
             None => {
                 let _ = tls.read_to_end(&mut body).await;
+                if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+                    body = dechunk(&body);
+                }
             }
         }
         (head, String::from_utf8_lossy(&body).into_owned())
@@ -246,6 +272,20 @@ async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> String {
     String::from_utf8(head).unwrap()
 }
 
+/// A chunked body's data, its framing removed (so a check sees what the box's client would).
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(i) = b.windows(2).position(|w| w == b"\r\n") {
+        let n = usize::from_str_radix(std::str::from_utf8(&b[..i]).unwrap().split(';').next().unwrap().trim(), 16).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&b[i + 2..i + 2 + n]);
+        b = &b[i + 2 + n + 2..];
+    }
+    out
+}
+
 fn bearer(token: &str) -> String {
     format!("Authorization: Bearer {token}\r\n")
 }
@@ -274,6 +314,29 @@ async fn an_echoed_credential_reaches_the_box_masked() {
     assert!(body.contains("\"raw\":\"****"), "{body}");
     let reflected = w.audits("anomaly");
     assert!(reflected.len() == 2 && reflected.iter().all(|a| a.contains("secret.reflected")), "{reflected:?}");
+}
+
+/// #361: the credential reflected where the body scan doesn't look (a redirect, a cookie, a
+/// challenge, a header of the origin's own, in hex), or split across a streamed body's chunks, still
+/// never reaches the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credential_reflected_in_headers_or_split_across_chunks_never_reaches_the_box() {
+    let w = World::new().await;
+    let (head, body) = w.call(HOST, "GET", "/headers", &bearer(PLACEHOLDER), "").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!leaks(&head) && !leaks(&body), "{head}{body}");
+    let lower = head.to_ascii_lowercase();
+    for h in ["location:", "set-cookie:", "www-authenticate:", "x-reflect:"] {
+        assert!(!lower.contains(h), "{h} should have been dropped: {head}");
+    }
+    assert!(lower.contains("x-echo: yes"), "the origin's other headers pass: {head}");
+    // Streamed in 7-byte chunks: the credential is spread over four or five of them.
+    let (head, body) = w.call(HOST, "GET", "/split", &bearer(PLACEHOLDER), "").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!leaks(&body), "{body}");
+    assert!(body.contains("authorization: Bearer ****"), "{body}");
+    // The origin did get it, every time: the guard is all that kept it out.
+    assert_eq!(w.seen(HOST).matches(&format!("authorization: Bearer {SECRET}")).count(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

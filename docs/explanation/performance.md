@@ -324,3 +324,76 @@ for arm in splice inspect; do wicket run workloads/$arm.yaml --workdir /tmp/ws; 
 
 The raw results are in `experiments/network-overhead/logs/splice-through/results.json` and
 `logs/node-proxy/results.json`.
+
+## Box starts (#287)
+
+How long a box takes to start, measured with the spans every run records
+([experiments/box-start](../../experiments/box-start/README.md) has the method, the spans, the raw
+logs and how to run it).
+
+**What has changed.**
+
+- **No CLI processes on a start.** The node talks to Docker's Engine API over its unix socket
+  (`wicket_sandbox::engine`, hyper, no new crate): create and start, inspect, logs, wait, kill and rm,
+  image inspect, and the image events, which keep the node's cache of image identities valid instead
+  of an `image inspect` per start. `WICKET_DOCKER` still names a Docker (`docker -H unix://…` for
+  another socket). The CLI remains for everything where there is no local socket to talk to
+  (`sudo -n docker`, ssh, a TCP host or a Docker context), and, off the start path, for `docker
+  exec` (a box's processes listed or stopped at hibernation), `docker info` in `wicket doctor`, and
+  image save, load and build. Listing wicket's boxes, when a node's `serve` starts and adopts earlier
+  ones, is the API's container list since 2026-11-16 (it was `docker ps`, which a node with the
+  socket and no CLI couldn't run, so it adopted nothing).
+- **A box's stdin and sockets are wicket's own**: the box's stdin comes over `sock/stdin.sock`
+  (no `docker attach`), and each proxy's socket listens before the box starts, so nothing waits on
+  them.
+- **The node's feed writes only what changed** (2026-11-16): a delta no longer rewrites
+  `statements.json` with the same bytes. That was two fsyncs per delta, most of the wait for the node
+  to be fresh at the box's epoch: `node.ready` 32 → 22 ms, and the start 105 → 94 ms, in the
+  measurement below.
+
+**wicket's own part** (against a stand-in Docker that starts containers at once, in a gVisor box on
+a shared VPS, release build, medians of 20): about 94 ms from `wicket run` to the box started, 153 ms
+end to end. Of it, roughly 58 ms is spans dominated by SQLite commits on the control host (one per
+write, 3–8 ms each on this disk), 15 ms fsyncs on the node's feed, 7 ms the node's handshake, and
+about 10 ms computation (CA, the token's policy compiled and minted, the proxies). Docker's two calls
+took 2 ms there.
+
+| | before | after |
+|---|---:|---:|
+| `wicket run` to the box started (`started`) | 104.8 ms | 94.1 ms |
+| the node fresh at the box's epoch (`node.ready`) | 32.1 ms | 22.4 ms |
+| `wicket run`, end to end | 163 ms | 153 ms |
+
+**Next, by the numbers:** the control host's start writes in one SQLite transaction, and the
+ledger's schema statements run once per process, not on every open.
+
+### Docker, runsc, or a restore (#287, step 3)
+
+What Docker and runsc add to a start has to be measured on a host with Docker (`measure.sh`, its
+`docker.run.create`, `.runtime` and `.return` spans); it wasn't in this round. What is known:
+
+| what | time | source |
+|---|---:|---|
+| wicket's own start of a box, Docker excluded | 94 ms | above |
+| Docker's create and start calls, the Engine API, no runtime | 2 ms | above |
+| `docker run` (gVisor) to Claude Code's first line | 3.54 s | [hibernate E4](../../experiments/hibernate/RESULTS.md) |
+| `runsc restore` of a checkpointed agent box | 0.13–0.16 s | hibernate E1 |
+| `runsc checkpoint` of it | 0.23 s (114 MB of pages, 20 MB zstd) | hibernate E1 |
+
+**The choice.** For an agent, the box's start isn't what the user waits for: Claude Code's own
+start in gVisor is (3.5 s to its first line, against ~0.1 s for wicket and whatever runsc's boot is).
+Driving runsc directly would remove dockerd, containerd and the shim from the boot, saving tens of
+milliseconds at most of a start that takes seconds, at the cost of wicket owning OCI bundles,
+cgroups, logs and cleanup. A restore from a checkpoint skips the harness's start entirely (0.15 s
+against 3.5 s), but it needs direct runsc too (Docker restores only into the same container), plus a
+restore hook, restore-once fencing and carrying the box's addresses across (#71, #177, #365's
+item 3). So:
+
+- **Keep Docker for cold starts.** Measure `docker.run.runtime` on a Docker host before changing
+  anything: if runsc's boot (sandbox and gofer) is under ~200 ms, Docker's chain on top of it is not
+  worth replacing.
+- **Restores are the step worth taking**, for wakes and warm boxes: they cut what dominates (the
+  harness's start), and they bring direct runsc with them, which also ends the docker group's
+  root-equivalence on a node (#261). That is #365's work.
+- **runsc's own settings** (directfs, the systrap platform, `--host-uds`) can't be weighed here
+  (no runsc); `measure.sh` against a node with `runtimeArgs` changed is how.

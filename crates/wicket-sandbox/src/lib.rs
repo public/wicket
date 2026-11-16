@@ -680,8 +680,8 @@ impl Docker {
     }
 
     /// Starts the box detached (`docker run -d`, kept after it exits so its exit code can be read):
-    /// its stdin, if interactive, stays open between attaches, so a supervisor that restarts can
-    /// attach again ([`Docker::attach_stdin`]) and read its output from the start ([`Docker::logs`]).
+    /// a supervisor that restarts reads its output from the start ([`Docker::logs`]). An interactive
+    /// box's stdin is the node's to relay (its `sock/stdin.sock`), never Docker's.
     pub async fn start_detached(&self, spec: &SandboxSpec, log_cap: u64) -> Result<()> {
         let _t = self.span("run");
         if let Some(e) = self.engine().await {
@@ -721,14 +721,6 @@ impl Docker {
             bail!("docker run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(())
-    }
-
-    /// Writes to a detached box's stdin (piped), for as long as the returned process lives; its own
-    /// output is discarded ([`Docker::logs`] reads the box's).
-    pub fn attach_stdin(&self, name: &str) -> Command {
-        let mut c = self.command_with(["attach".to_string(), "--sig-proxy=false".into(), name.into()]);
-        c.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
-        c
     }
 
     /// A box's stdout and stderr as Docker still has them (from its start, unless rotated; or since
@@ -840,8 +832,23 @@ impl Docker {
         Ok(self.container(name).await?.and_then(|v| start_times_of(&v)))
     }
 
+    /// wicket's containers through the Engine API (`GET /containers/json`, #287): those labelled
+    /// `wicket=1`, with `status` if given (`exited`), else the running ones.
+    async fn listed(e: &engine::Engine, status: Option<&str>) -> Result<Vec<BoxInfo>> {
+        let mut f = serde_json::json!({ "label": ["wicket=1"] });
+        if let Some(s) = status {
+            f["status"] = serde_json::json!([s]);
+        }
+        let all = if status.is_some() { "&all=1" } else { "" };
+        let v = e.get_json(&format!("/containers/json?filters={}{all}", engine::enc(&f.to_string(), false))).await.context("docker ps")?;
+        Ok(v.as_ref().and_then(|v| v.as_array()).map(|a| a.iter().filter_map(box_info_of).collect()).unwrap_or_default())
+    }
+
     /// wicket boxes that have exited and are still there (started detached): (name, run).
     pub async fn exited_boxes(&self) -> Result<Vec<(String, String)>> {
+        if let Some(e) = self.engine().await {
+            return Ok(Self::listed(e, Some("exited")).await?.into_iter().filter_map(|b| Some((b.name, b.run?))).collect());
+        }
         let out = self
             .command_with([
                 "ps".to_string(),
@@ -882,6 +889,9 @@ impl Docker {
 
     /// Every running wicket box (label `wicket=1`).
     pub async fn boxes(&self) -> Result<Vec<BoxInfo>> {
+        if let Some(e) = self.engine().await {
+            return Self::listed(e, None).await;
+        }
         let out = self
             .command_with([
                 "ps".to_string(),
@@ -1242,6 +1252,13 @@ async fn follow_events_api(e: &engine::Engine, since: u64, cache: &ImageCache) -
     Some(began.elapsed())
 }
 
+/// A box as the Engine API lists it (`Names` has a leading `/`; `Labels` a map).
+fn box_info_of(v: &serde_json::Value) -> Option<BoxInfo> {
+    let name = v["Names"].as_array()?.first()?.as_str()?.trim_start_matches('/').to_string();
+    let label = |k: &str| v["Labels"][k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    Some(BoxInfo { name, run: label("wicket.run"), owner: label("wicket.owner") })
+}
+
 /// Parses `docker ps` lines of `name<TAB>run<TAB>owner`.
 fn parse_boxes(out: &str) -> Vec<BoxInfo> {
     let some = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
@@ -1591,6 +1608,40 @@ mod tests {
             "State": { "Running": false, "Pid": 0, "ExitCode": 137, "OOMKilled": true, "Error": "",
                        "StartedAt": "2026-11-15T10:00:00.3Z", "FinishedAt": "2026-11-15T10:00:01.5Z" },
         })
+    }
+
+    /// #287: listing wicket's boxes (a node's `serve` adopting them) is the Engine API's container
+    /// list, not `docker ps`: running ones, and the exited ones still there, by their labels.
+    #[tokio::test]
+    async fn boxes_are_listed_through_the_engine_api() {
+        let fake = FakeEngine::start("list", |m, p, _| match (m, p) {
+            ("GET", p) if p.starts_with("/containers/json") && p.contains("all=1") => Reply::Json(
+                200,
+                serde_json::json!([{ "Names": ["/wicket-run-b"], "Labels": { "wicket": "1", "wicket.run": "run_b" } },
+                                   { "Names": ["/stray"], "Labels": { "wicket": "1" } }]),
+            ),
+            ("GET", p) if p.starts_with("/containers/json") => Reply::Json(
+                200,
+                serde_json::json!([{ "Names": ["/wicket-run-a"], "Labels": { "wicket": "1", "wicket.run": "run_a", "wicket.owner": "host:1" } }]),
+            ),
+            _ => Reply::Status(404),
+        });
+        let d = fake.docker();
+        let running = d.boxes().await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(
+            (running[0].name.as_str(), running[0].run.as_deref(), running[0].owner.as_deref()),
+            ("wicket-run-a", Some("run_a"), Some("host:1"))
+        );
+        assert_eq!(
+            d.exited_boxes().await.unwrap(),
+            [("wicket-run-b".to_string(), "run_b".to_string())],
+            "a box without its run is left out"
+        );
+        let asked = fake.seen();
+        assert!(asked.iter().all(|(m, p)| m == "GET" && p.contains("filters=")), "{asked:?}");
+        let exited = &asked[1].1;
+        assert!(exited.contains("all=1") && exited.contains("exited") && exited.contains("wicket%3D1"), "{exited}");
     }
 
     #[tokio::test]

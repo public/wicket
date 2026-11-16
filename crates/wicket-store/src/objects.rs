@@ -40,6 +40,57 @@ impl ObjectStore for Box<dyn ObjectStore> {
     }
 }
 
+/// A store that counts the bytes it writes (objects that were new, as the backend got them): what
+/// an incremental push cost.
+pub struct Counting<S> {
+    inner: S,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S: ObjectStore> Counting<S> {
+    /// The store, and the counter it adds to.
+    pub fn new(inner: S) -> (Counting<S>, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let written = std::sync::Arc::<std::sync::atomic::AtomicU64>::default();
+        (Counting { inner, written: written.clone() }, written)
+    }
+}
+
+struct CountRead<'a> {
+    inner: &'a mut dyn Read,
+    n: u64,
+}
+
+impl Read for CountRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n += k as u64;
+        Ok(k)
+    }
+}
+
+impl<S: ObjectStore> ObjectStore for Counting<S> {
+    fn put_if_absent(&self, key: &str, data: &mut dyn Read) -> io::Result<bool> {
+        let mut r = CountRead { inner: data, n: 0 };
+        let wrote = self.inner.put_if_absent(key, &mut r)?;
+        if wrote {
+            self.written.fetch_add(r.n, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(wrote)
+    }
+    fn get(&self, key: &str) -> io::Result<Option<Box<dyn Read + Send>>> {
+        self.inner.get(key)
+    }
+    fn has(&self, key: &str) -> io::Result<bool> {
+        self.inner.has(key)
+    }
+    fn delete(&self, key: &str) -> io::Result<()> {
+        self.inner.delete(key)
+    }
+    fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list_prefix(prefix)
+    }
+}
+
 /// Object keys: relative, `/`-separated, of `[a-z0-9_.-]` segments, no `.` or `..` segment.
 pub fn valid_key(key: &str) -> bool {
     !key.is_empty()
