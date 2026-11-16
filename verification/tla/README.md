@@ -162,3 +162,47 @@ a 1 GiB heap:
 The halves share only the node's up/connected state and its faults, so checking them apart
 loses no interleaving that matters to either property, and keeps the state space in the
 hundreds of thousands. The whole model at the halves' bounds had over 10M states.
+
+# ApprovalEffect: approvals bound to their effect
+
+[#369](https://github.com/public/wicket/issues/369), on top of model 1. A parent principal and the
+child it spawned (one delegation hop) ask for one effect, each request with arguments. A human, or
+an agent with grant rights, decides each request on its effect descriptor: who asks, the effect,
+the grant's terms, and the hash of the arguments. An action runs under a grant: the egress proxy
+sends the request, or wicket spawns, links, leases or updates. The box may present an action
+again (a retry, a replay), change its arguments after the approval, or hold it until its grant is
+near its end. `ci/tla.sh` runs `ApprovalEffect.cfg` and its `fail_effect_*` variants, which name
+the model on a `\* model: ApprovalEffect` line (`GrantsOnNodes`'s variants name theirs).
+
+| property | meaning |
+|---|---|
+| `HoldUntilDecided` | no action runs for a principal's effect while a request for that effect, from a sibling branch or the same one, waits for a decision |
+| `ExactlyOnceOnReplay` | an approved action runs once, however often it is presented again |
+| `NoActionAfterExpiry` | no action runs at or after its grant's end, however long it waited |
+| `IdentityKeptAcrossHops` | a request keeps its originator's identity across the delegation hop, and an action runs only under a grant to its originator |
+| `ArgumentsBound` | an action runs only with the arguments its grant was decided on |
+
+| switch (decided value) | the bug it stands for | fails |
+|---|---|---|
+| `Hold = TRUE` | a related request is filed and decided apart from the pending one, or a granted action runs while another request for its effect is pending (2607.14166) | `fail_effect_no_hold`: `HoldUntilDecided` |
+| `ConsumeOnce = TRUE` | the grant's use isn't recorded with the action, so a replay runs it again | `fail_effect_replay`: `ExactlyOnceOnReplay` |
+| `CheckAtRun = TRUE` | the grant's lifetime is checked when it is decided, not when the action runs | `fail_effect_check_at_decision`: `NoActionAfterExpiry` |
+| `KeepIdentity = TRUE` | the parent relays its child's request as its own, so the child acts under the parent's grants | `fail_effect_relay_as_self`: `IdentityKeptAcrossHops` |
+| `BindArgs = TRUE` | a grant matches only the target, so changed arguments run under it (2610.21063) | `fail_effect_unbound_args`: `ArgumentsBound` |
+
+| action | code (file, function) |
+|---|---|
+| `Ask` | `wicket-store/src/effect.rs` `Ledger::file_request` (`held_by`: `Filed::Held`); `pending_for` for egress, spawn, link, capacity and update asks |
+| `Approve` | `wicket-cli/src/grant.rs` `decide` (the shown descriptor, `effect::SHOWN_EFFECT`) → `approve` → `Ledger::approve` (`args_sha256` copied to the grant) and `bind_grant_effect` |
+| `Deny` | `wicket-cli/src/grant.rs` `decide` → `deny` |
+| `Run` | `wicket-store/src/effect.rs` `Ledger::use_effect_grant` (exact target, arguments, one use, `expires_at > now`, held while pending) from `wicket-cli/src/spawn.rs` `spawn` and `wicket-proxy/src/link.rs` `open`; `wicket-cli/src/reconcile.rs` `lease_unbound` for capacity; `Ledger::consume_grant` (in its transaction) for egress, where the hold is at `Ask`: an egress op is asked for only when no grant covers it, so no request for its exact effect is pending while a grant for it is used |
+| `Via` | the identity a request is filed under: the asking run's (`Op::run`), never a relaying parent's; `Effect::run` and `requested_by` in the descriptor |
+
+Bounds: two request ids, one effect, two argument values, `Lifetime = 1`, `MaxTime = 2`
+(`ApprovalEffect.cfg`).
+
+Each invariant is the safety property its switch's guard is there for, so the model checks that
+the guards together keep every property in every interleaving of asks, decisions, replays, ticks
+and hops, and that dropping any one guard breaks its property. Not modelled: zone-wide grants,
+prefix asks, and the ledger's transactions themselves (each action is one atomic step, as
+`file_request`, `approve_shown` and `use_effect_grant` are one transaction each).

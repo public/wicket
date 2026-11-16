@@ -203,6 +203,16 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
     if let Err(why) = bounds(by, v) {
         return Err(refused(l, by, id, v, why));
     }
+    // #369: the decision is made on the effect the decider was shown, or not at all; checked again
+    // in the transaction that makes the grant (`Ledger::approve_shown`).
+    let shown = extra.as_object_mut().and_then(|o| o.remove(crate::effect::SHOWN_EFFECT)).map(|s| s.as_str().unwrap_or("?").to_string());
+    if let (Verdict::Approve(t), Some(shown)) = (v, &shown) {
+        let now = crate::effect::descriptor(&l.request(id)?, Some(t)).sha256();
+        if *shown != now {
+            let why = wicket_store::StoreError::EffectChanged(id.into(), shown.clone(), now);
+            return Err(refused(l, by, id, v, why.into()));
+        }
+    }
     if let Granter::Capacity { grant, ask } = by {
         let used = match capacity_use(l, grant, ask, id, v) {
             Ok(x) => x,
@@ -210,7 +220,7 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
         };
         merge(&mut extra, used);
         let Verdict::Approve(t) = v else { unreachable!("checked by capacity_use") };
-        return approve(l, by, id, t, extra).inspect_err(|e| {
+        return approve(l, by, id, t, shown.as_deref(), extra).inspect_err(|e| {
             let _ = l.capacity_use_failed(id, &format!("the approval failed: {e:#}"));
         });
     }
@@ -241,7 +251,12 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
         merge(&mut extra, serde_json::json!({ "granter": "agent", "chain": chain }));
     }
     match v {
-        Verdict::Approve(t) => approve(l, by, id, t, extra),
+        Verdict::Approve(t) => match approve(l, by, id, t, shown.as_deref(), extra) {
+            Err(e) if matches!(e.downcast_ref::<wicket_store::StoreError>(), Some(wicket_store::StoreError::EffectChanged(..))) => {
+                Err(refused(l, by, id, v, e))
+            }
+            r => r,
+        },
         Verdict::Deny => deny(l, by, id, extra),
         Verdict::Renew(_) => unreachable!("renewed above"),
     }
@@ -591,13 +606,16 @@ pub fn check_terms(req: &Request, t: &Terms) -> Result<()> {
     Ok(())
 }
 
-fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json::Value) -> Result<Decided> {
+fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, shown: Option<&str>, extra: serde_json::Value) -> Result<Decided> {
     let req = l.request(id)?;
     check_terms(&req, t)?;
     let lease = capacity::lease_of_request(l, &req)?;
     let label = by.label();
+    // The effect this grant is for (#369): made only if it is the one shown, recorded on the grant
+    // and on the decision's record.
     let a = Approval { uses: t.uses, ttl: t.ttl, path_prefix: t.prefix.clone(), decided_by: label.clone() };
-    let gid = if t.zone_wide { l.approve_zone_wide(id, &a)? } else { l.approve(id, &a)? };
+    let (gid, effect_sha256) = l.approve_shown(id, &a, t.zone_wide, shown)?;
+    let effect = crate::effect::descriptor(&req, Some(t));
     // What the grant is made with: a push gets its window, whatever was picked (#26).
     let (uses, ttl_secs) = match t.prefix.is_some() || req.scope_prefix {
         true => (t.uses, t.ttl.as_secs()),
@@ -610,6 +628,7 @@ fn approve(l: &mut Ledger, by: &Granter, id: &str, t: &Terms, extra: serde_json:
         "agent_identity": crate::verified_identity(l, &req.run, None),
         "uses": uses, "ttl_secs": ttl_secs, "prefix": t.prefix, "scope_prefix": req.scope_prefix,
         "scope": if t.zone_wide { "zone" } else { "run" }, "run": req.run, "zone": req.zone, "lease": lease,
+        "effect": effect, "effect_sha256": effect_sha256,
     });
     merge(&mut record, extra);
     if let Err(e) = l.audit(&TenantId::single(), None, "decision", &record) {
@@ -705,7 +724,12 @@ impl wicket_proxy::Decisions for AgentDecisions {
         if let Some((r, ..)) = l.revoked_in_chain(&self.run.0).map_err(|e| e.to_string())? {
             return Err(format!("this agent's identity was revoked (revoked: {r})"));
         }
-        let extra = serde_json::json!({ "signed": signed, "granter_identity": claims.sub });
+        let mut extra = serde_json::json!({ "signed": signed, "granter_identity": claims.sub });
+        // The effect the signed decision was made on (#369), checked against the request now.
+        if let Verdict::Approve(_) = &verdict {
+            let e = p["effect_sha256"].as_str().ok_or("the approval names no effect (effect_sha256)")?;
+            extra[crate::effect::SHOWN_EFFECT] = e.into();
+        }
         match decide(&mut l, &Granter::Agent(self.authority()), id, &verdict, extra) {
             Ok(Decided::Approved { grant, uses, ttl, .. }) => Ok(format!(
                 "approved: {id} is granted as {grant} ({} use(s), for {}s). The asking run may retry its request now.",
@@ -811,6 +835,42 @@ mod tests {
 
     fn decisions(l: &Ledger) -> Vec<serde_json::Value> {
         l.audit_tail(50).unwrap().into_iter().filter(|r| r.2 == "decision").map(|r| serde_json::from_str(&r.4).unwrap()).collect()
+    }
+
+    /// #369: a decision is made on the effect the decider was shown: its descriptor is on the grant
+    /// and the record, other terms than the ones shown are refused, and so is a request that
+    /// changed after it was shown.
+    #[test]
+    fn an_approval_is_made_only_on_the_effect_shown() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let by = human("alice@cli");
+        let id = asked(&l, "/v1/x");
+        let shown = crate::effect::descriptor(&l.request(&id).unwrap(), Some(&terms(600))).sha256();
+        let other = Terms { uses: Some(5), ..terms(600) };
+        let e = decide(&mut l, &by, &id, &Verdict::Approve(other), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
+        assert!(format!("{e:#}").contains("not the effect that was shown"), "{e:#}");
+        assert_eq!(l.request(&id).unwrap().status, "pending");
+        assert!(refusals(&l).iter().any(|r| r["why"].as_str().unwrap_or("").contains("not the effect that was shown")));
+        // As shown: granted, with the descriptor bound to the grant and on the record.
+        let Decided::Approved { grant, .. } =
+            decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap()
+        else {
+            panic!("not approved")
+        };
+        assert_eq!(l.grant_effect(&grant).unwrap(), Some((Some(shown.clone()), None)));
+        let d = decisions(&l);
+        assert_eq!(d[0]["effect_sha256"].as_str(), Some(shown.as_str()));
+        assert_eq!((d[0]["effect"]["path"].as_str(), d[0]["effect"]["terms"]["uses"].as_u64()), (Some("/v1/x"), Some(1)));
+        assert!(d[0].get(crate::effect::SHOWN_EFFECT).is_none(), "the check's input isn't recorded as a field");
+
+        // Changed after it was shown: another asker joined it.
+        let id = asked(&l, "/v1/y");
+        let shown = crate::effect::descriptor(&l.request(&id).unwrap(), Some(&terms(600))).sha256();
+        let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", "/v1/y");
+        l.pending_for(&op, "blocked", Some(&serde_json::json!({ "requesters": [{ "agent": "planted" }] }))).unwrap();
+        let e =
+            decide(&mut l, &by, &id, &Verdict::Approve(terms(600)), serde_json::json!({ crate::effect::SHOWN_EFFECT: shown })).unwrap_err();
+        assert!(format!("{e:#}").contains("it changed since"), "{e:#}");
     }
 
     #[test]
@@ -975,10 +1035,17 @@ mod tests {
 
         /// What the gateway signs for `decide`.
         fn signed(&self, id: &str, decision: &str, uses: u64, ttl: u64) -> String {
-            let p = serde_json::json!({
+            let mut p = serde_json::json!({
                 "jti": "d-1", "iat": wicket_store::now(), "kind": wicket_proxy::DECISION_KIND, "run": "run_p",
                 "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
             });
+            // As the gateway signs an approval: with the effect it grants (#369).
+            if decision == "approve" {
+                if let Ok(req) = self.ledger.lock().unwrap().request(id) {
+                    let t = wicket_store::DecisionTerms { uses: u32::try_from(uses).ok(), ttl_secs: ttl, prefix: None, zone_wide: false };
+                    p["effect_sha256"] = wicket_store::descriptor(&req, Some(&t)).sha256().into();
+                }
+            }
             wicket_identity::sign_envelope(&self.key, &self.jws, &p)
         }
 
@@ -997,6 +1064,27 @@ mod tests {
     }
 
     use wicket_proxy::Decisions as _;
+
+    /// #369: an agent's approval names the effect it was made on; one that names none, or another,
+    /// is not made.
+    #[test]
+    fn an_agents_approval_must_name_the_effect_it_grants() {
+        let t = Tree::new();
+        let hook = t.hook(PARENT_ZONE);
+        let child = t.ask("run_c", "GET", "/v1/items");
+        let bare = serde_json::json!({
+            "jti": "d-9", "iat": wicket_store::now(), "kind": wicket_proxy::DECISION_KIND, "run": "run_p",
+            "request": child, "decision": "approve", "uses": 1, "ttl_secs": 60,
+        });
+        let e = hook.decide(&wicket_identity::sign_envelope(&t.key, &t.jws, &bare)).unwrap_err();
+        assert!(e.contains("names no effect"), "{e}");
+        let mut wrong = bare.clone();
+        wrong["effect_sha256"] = "00".repeat(32).into();
+        let e = hook.decide(&wicket_identity::sign_envelope(&t.key, &t.jws, &wrong)).unwrap_err();
+        assert!(e.contains("not the effect that was shown"), "{e}");
+        assert_eq!(t.status(&child), "pending");
+        assert!(hook.decide(&t.signed(&child, "approve", 1, 60)).unwrap().starts_with("approved:"));
+    }
 
     #[test]
     fn a_parent_approves_a_descendants_request_within_its_reach() {

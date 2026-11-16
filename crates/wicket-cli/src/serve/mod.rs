@@ -143,6 +143,9 @@ enum Action {
         prefix: Option<String>,
         /// Usable by any run in the request's zone (as `wicket approve --zone-wide`).
         zone_wide: bool,
+        /// The sha256 of the effect descriptor the passkey signed (#369): the decision is made
+        /// only if the request is still that effect.
+        effect_sha256: String,
     },
     Revoke {
         run: String,
@@ -1200,11 +1203,21 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 Some(_) => return Err(bad("prefix must be a path")),
             };
             let zone_wide = approve && body.get("zone_wide").and_then(|z| z.as_bool()).unwrap_or(false);
+            let t = grant::Terms { uses, ttl: Duration::from_secs(ttl_secs), prefix: prefix.clone(), zone_wide };
             if approve {
                 // Refused before the passkey is asked for, by the same rule `decide` applies.
-                let t = grant::Terms { uses, ttl: Duration::from_secs(ttl_secs), prefix: prefix.clone(), zone_wide };
                 grant::check_terms(&req, &t).map_err(|e| bad(&format!("{e:#}")))?;
             }
+            // The effect the decision is about (#369), and for an approval that widens, what else
+            // it would allow: both shown before the passkey is asked for, and signed with it.
+            let effect = crate::effect::descriptor(&req, approve.then_some(&t));
+            let effect_sha256 = effect.sha256();
+            let blast = if approve {
+                let zone = crate::effect::zone_of_run(&l, &state.data, &req.run);
+                crate::effect::blast_radius(&l, zone.as_ref(), &req, &t).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            } else {
+                None
+            };
             let identity = (state.identity)(&l, &req.run);
             if approve && !identity_approvable(&identity) {
                 return Err(err(
@@ -1228,8 +1241,9 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
                 "agent": identity.get("id"), "identity_sha256": identity.get("identity_sha256"),
                 "identity_verified": identity.get("verified"),
                 "requested_by": req.attribution.iter().flat_map(wicket_proxy::attributed_agents).collect::<Vec<_>>(),
+                "effect": effect, "effect_sha256": effect_sha256, "blast": blast,
             });
-            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide }, v))
+            Ok((Action::Decide { request: req.id, approve, uses, ttl_secs, prefix, zone_wide, effect_sha256 }, v))
         }
         // `say` and the console's follow-up box are gone (#198): prompts are sent in the session.
         Some("say") => Err(bad("say is gone: open the run's session and prompt there")),
@@ -1464,7 +1478,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
     let t = &state.tenant;
     let rid = |r: &str| RunId(r.to_string());
     match action {
-        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide } => {
+        Action::Decide { request, approve: true, uses, ttl_secs, prefix, zone_wide, effect_sha256 } => {
             // The agent may have been revoked since the operator was shown it.
             let req = l.request(request)?;
             if !identity_approvable(&(state.identity)(&l, &req.run)) {
@@ -1476,7 +1490,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
                 &grant::Granter::Human(crate::operators::Operator::console(&state.tenant.0, &oc.name)?),
                 request,
                 &grant::Verdict::Approve(t),
-                json!({ "action": "decide", "signed": signed }),
+                json!({ "action": "decide", "signed": signed, crate::effect::SHOWN_EFFECT: effect_sha256 }),
             )?
             else {
                 unreachable!("an approval approves")
@@ -2239,6 +2253,36 @@ mod tests {
             assert_eq!(crate::principal_from_env(Some(bad)), None, "{bad}");
         }
         assert_eq!(crate::principal_from_env(None), None);
+    }
+
+    /// #369: the passkey signs the request's effect descriptor, and the blast radius of an approval
+    /// that widens is shown first; a request that changed between begin and finish isn't approved.
+    #[test]
+    fn the_passkey_signs_the_effect_and_a_changed_request_is_refused() {
+        let mut t = setup("effect");
+        t.running("run_g", "lead");
+        let op = wicket_core::Op::egress(&TenantId::single(), &RunId("run_g".into()), "z", "GET", "a.example", "/x");
+        let (rid, _) = t.ledger().pending_for(&op, "x", None).unwrap();
+        let ask = json!({ "action": "decide", "id": rid, "decision": "approve", "uses": 5 });
+        let b = t.begin(ask.clone());
+        assert_eq!(b.status, StatusCode::OK, "{:?}", b.body);
+        let a = &b.body["action"];
+        let sha = a["effect_sha256"].as_str().unwrap().to_string();
+        assert_eq!((a["effect"]["path"].as_str(), a["effect"]["terms"]["uses"].as_u64(), sha.len()), (Some("/x"), Some(5), 64));
+        assert_eq!(a["blast"]["widens"], json!(["5 uses, not one"]), "{a}");
+        // Another asker joins the request before the passkey answers: it isn't what was signed.
+        t.ledger().pending_for(&op, "x", Some(&json!({ "requesters": [{ "agent": "other" }] }))).unwrap();
+        let signed = t.sign(b.body["publicKey"]["challenge"].as_str().unwrap());
+        assert_refused(&t.post("/api/action/finish", signed), StatusCode::CONFLICT, "not the effect that was shown");
+        assert_eq!(t.ledger().request(&rid).unwrap().status, "pending");
+        // Shown again, as it is now: approved, and the record carries what was signed.
+        let r = t.act(ask);
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        let d = t.audit_kinds().into_iter().rev().find(|(k, _)| k == "decision").unwrap().1;
+        let now = d["effect_sha256"].as_str().unwrap();
+        assert_ne!(now, sha);
+        assert!(d["signed"]["decision_json"].as_str().unwrap().contains(now), "{d}");
+        assert_eq!(d["effect"]["requested_by"], json!(["other"]));
     }
 
     #[test]
