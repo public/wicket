@@ -13,6 +13,8 @@ wicket-identity.workspace = true
 wicket-feed.workspace = true
 ulid.workspace = true
 base64 = "0.22"
+# The tripwire and reflection guard's exact-match scans (#362).
+memchr = "2"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
