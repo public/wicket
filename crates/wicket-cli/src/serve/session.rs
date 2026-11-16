@@ -413,6 +413,8 @@ pub struct Bridge {
     /// For a harness that doesn't speak ACP (#364): its adapter's translation of both sides, named
     /// by the log's `format` entry.
     view: Option<Box<dyn wicket_agent::harness::SessionView>>,
+    /// The log names a format this console can't read: nothing of the conversation is shown.
+    unreadable: bool,
 }
 
 fn rpc_key(id: &Value) -> String {
@@ -453,6 +455,7 @@ impl Bridge {
             prompts: 0,
             last_cancel: None,
             view: None,
+            unreadable: false,
         }
     }
 
@@ -669,6 +672,7 @@ impl Bridge {
         }
         let msgs = match self.view.as_mut() {
             Some(view) => view.agent(line),
+            None if self.unreadable => vec![],
             None => serde_json::from_str::<Value>(line).into_iter().collect(),
         };
         for v in msgs {
@@ -724,7 +728,8 @@ impl Bridge {
     fn on_wicket(&mut self, e: &Value, out: &mut Vec<Value>) {
         if let Some(f) = e.get("format").and_then(|f| f.as_str()) {
             self.view = wicket_agent::harness::session_view(f);
-            if self.view.is_none() {
+            self.unreadable = self.view.is_none();
+            if self.unreadable {
                 out.push(
                     self.notice(&format!(
                         "this run's session is kept as {}, which this console can't show",
@@ -741,6 +746,7 @@ impl Bridge {
         let Some(msg) = e.get("msg") else { return };
         let msgs = match self.view.as_mut() {
             Some(view) => view.wicket(msg),
+            None if self.unreadable => vec![],
             None => vec![msg.clone()],
         };
         for m in &msgs {
