@@ -94,7 +94,8 @@ exchanged, for the logs and for the health gate.
 wicket speaks version 13, so it talks only to peers at 12 and 13. What the rows above say happens
 with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
 9, 10 or 11, an image not sent to a node before 7) is history: no connection can negotiate below 12,
-and the code for it is gone. Each version from 12 on that a build still talks to keeps its check.
+and the code for it is gone. Every connection has 12's health reports, so they have no check
+either; each version above 12 that a build still talks to keeps its check.
 
 ## Ledger schema
 

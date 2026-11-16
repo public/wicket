@@ -69,7 +69,6 @@ All private keys are 0600 files. `wicket state kit` writes the ones that stay on
 | `agent.stderr.log` | The agent's stderr, the newest `limits.output` kept. |
 | `console.log` | The output of a run the console started. |
 | `ctl/run.json` | The run's record: what another supervisor needs to take it over. |
-| `ctl/run-ca.key`, `ctl/run-ca.pem` | The run's CA, which the run's egress proxy terminates TLS with. |
 | `ctl/progress.json` | Model spend and output offsets, saved as the run goes (every 3 s). |
 | `ctl/authority.json` | When the box's authority ends, and whether its node confirmed the box stopped. |
 | `ctl/holdings.json` | The secrets released to the run's node and its budget slice. |

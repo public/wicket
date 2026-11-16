@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wicket_core::{Manifest, RunId};
-use wicket_proxy::{ca::RunCa, gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
+use wicket_proxy::{gateway::Gateway, llm::Llm, vault::Vault, Event, RunCtx};
 use wicket_sandbox::SandboxSpec;
 use wicket_store::Ledger;
 
@@ -506,9 +506,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         true => crate::nodecreate::refuse_past_lease(&Ledger::open(&ledger_path())?, &node_name, wicket_store::now())?,
         false => None,
     };
-    // This host's own node shares its filesystem. That is only transport: it lays the box out in the
-    // run's own directory (so the run's trees needn't be sent to it), reaches the run's proxies by
-    // their sockets, and can mount a directory of this host's in the box (in place, or wrapped).
+    // This host's own node shares its filesystem. That is only transport, and nothing else branches
+    // on it (#257 slice 5): it lays the box out in the run's own directory (so the run's trees needn't
+    // be sent to it, nor fetched back), and can mount a directory of this host's in the box (in place,
+    // or wrapped). Its proxies are its own, as on any node.
     let shares_host = node.is_none();
 
     let run = match run_id {
@@ -659,25 +660,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
 
-    // Enforcement points, on unix sockets that only this box gets.
-    // Its key is kept in `ctl/` (never mounted in the box), for a supervisor that re-attaches.
+    // No CA of the run's (#257 slice 5): the control host terminates no TLS, so a box trusts only
+    // what its node's CA mints (the installation root, which its node puts in the box).
     timings.since("ledger", lap);
-    let lap = std::time::Instant::now();
-    let ca = match &record {
-        Some(_) => Arc::new(RunCa::load(
-            &std::fs::read_to_string(dir.join("ctl/run-ca.pem")).context("the run CA's certificate")?,
-            &std::fs::read_to_string(dir.join("ctl/run-ca.key")).context("the run CA's key")?,
-        )?),
-        None => {
-            let ca = RunCa::generate(&run.0)?;
-            std::fs::create_dir_all(dir.join("ctl"))?;
-            std::fs::write(dir.join("ctl/run-ca.pem"), ca.cert_pem())?;
-            write_secret(&dir.join("ctl/run-ca.key"), &ca.key_pem())?;
-            Arc::new(ca)
-        }
-    };
-    std::fs::write(dir.join("ca/ca.pem"), ca.cert_pem())?;
-    timings.since("ca", lap);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     // What the agent asks of its own lifetime (#249): to finish, or to hibernate.
     let (want_tx, mut want_rx) = tokio::sync::mpsc::unbounded_channel::<wicket_proxy::Want>();
@@ -1236,7 +1221,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             timeout_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs()
                 + if long_lived { 120 } else { 0 },
             escalate,
-            ca_pem: ca.cert_pem(),
+            // Nothing more than the root (#257 slice 5); a node at 13 still reads the field.
+            ca_pem: String::new(),
             workspace_tar: String::new(),
             state_files: state_files.clone(),
             state_dirs: state_dirs.clone(),
@@ -2598,14 +2584,6 @@ pub fn spawn_attach(run: &str) -> Result<()> {
         });
     }
     c.spawn().context("starting `wicket attach`")?;
-    Ok(())
-}
-
-/// Writes a file only this user can read.
-fn write_secret(p: &Path, body: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
-    std::io::Write::write_all(&mut f, body.as_bytes())?;
     Ok(())
 }
 

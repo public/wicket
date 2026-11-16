@@ -7,8 +7,8 @@ request. This page says how it works, how to make it fast, and how to turn its D
 
 - The box resolves names through wicket's DNS. Each host the zone can reach gets a synthetic address
   in 198.19.0.0/16; hidden and forbidden hosts get NXDOMAIN, so a lookup can't carry data out.
-- QUIC sent to a synthetic address is relayed to wicket over a unix socket. wicket terminates it with
-  the run's CA (or, on a node, the node CA) and decides each request as it would an HTTP/1.1 one.
+- QUIC sent to a synthetic address is relayed to wicket over a unix socket. The box's node terminates it
+  with its node CA and decides each request as it would an HTTP/1.1 one.
 - 0-RTT is refused. Request bodies over HTTP/3 are read whole, up to 64 MiB.
 - An HTTP/3 connection serves one host only: a request for another gets a 421 `misdirected`.
 - HTTP/3 is always terminated and inspected: splice-through applies to TCP only.
