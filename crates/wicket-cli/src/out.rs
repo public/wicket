@@ -1,7 +1,9 @@
 //! Where a run supervisor's own output goes. A run started by the operator prints to this
 //! process's stdout and stderr; a spawned child's supervisor runs in its parent's process (#257
 //! slice 4c), on a thread of its own, and prints to its log in the parent's `children/` instead.
-//! [`say!`] and [`say_err!`] are `println!` and `eprintln!` that follow that thread's log.
+//! [`say!`] and [`say_err!`] are `println!` and `eprintln!` that follow that thread's log, and
+//! never panic: a supervisor whose stdout is gone (a closed pipe, a full disk) carries on
+//! supervising its box, and loses only what it would have printed.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -21,8 +23,12 @@ pub fn line(err: bool, a: std::fmt::Arguments<'_>) {
         Some(f) => {
             let _ = writeln!(f, "{a}");
         }
-        None if err => eprintln!("{a}"),
-        None => println!("{a}"),
+        None if err => {
+            let _ = writeln!(std::io::stderr().lock(), "{a}");
+        }
+        None => {
+            let _ = writeln!(std::io::stdout().lock(), "{a}");
+        }
     })
 }
 
