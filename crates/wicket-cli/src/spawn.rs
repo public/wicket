@@ -113,30 +113,36 @@ pub type Supervise = fn(ChildOpts) -> std::io::Result<std::thread::JoinHandle<()
 pub fn supervise(o: ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name(format!("supervise {}", o.run_id)).spawn(move || {
         let ChildOpts { manifest, run_id, parent_run, image, node, ssh_key, lease, adopt, log, stop } = o;
+        let id = run_id.clone();
         crate::out::to(log);
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => return say!("[wicket] run {run_id}'s supervisor has no runtime: {e}"),
         };
-        let r = rt.block_on(crate::run::run(crate::run::RunOpts {
-            manifest: &manifest,
-            workdir: None,
-            workspace_dir: None,
-            task: None,
-            image: Some(&image),
-            node: node.as_deref(),
-            ssh_key: ssh_key.as_deref(),
-            run_id: Some(run_id),
-            parent_run: Some(parent_run),
-            lease,
-            wrap: None,
-            wake: None,
-            attach: false,
-            adopt,
-            stop: Some(stop),
+        // A panic ends this run's supervisor, not its parent's.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(crate::run::run(crate::run::RunOpts {
+                manifest: &manifest,
+                workdir: None,
+                workspace_dir: None,
+                task: None,
+                image: Some(&image),
+                node: node.as_deref(),
+                ssh_key: ssh_key.as_deref(),
+                run_id: Some(run_id),
+                parent_run: Some(parent_run),
+                lease,
+                wrap: None,
+                wake: None,
+                attach: false,
+                adopt,
+                stop: Some(stop),
+            }))
         }));
-        if let Err(e) = r {
-            say!("Error: {e:?}");
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => say!("Error: {e:?}"),
+            Err(_) => say!("[wicket] run {id}'s supervisor panicked"),
         }
     })
 }
