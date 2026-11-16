@@ -432,7 +432,7 @@ fn cedar_and_the_compiled_token_agree() {
     ]"#;
     let mut zones: Vec<ZoneSpec> = common::example_zones();
     zones.push(
-        serde_yaml::from_str(
+        wicket_core::yaml::from_str(
             "name: dev-api\nreach:\n  - { host: api.github.com, methods: [GET, PUT, POST], paths: ['/repos/acme/**'] }\n  - { host: '*.githubusercontent.com', methods: [GET] }\n  - { host: example.com, methods: [GET, DELETE], paths: ['/admin/**'], allow_dangerous: true }\nforbid:\n  - { host: api.github.com, paths: ['/admin/**'] }\ninject:\n  - { host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh-app-acme }\nimages: [img:rust]\naccept_from: [ops]\nlimits: { memory: 1g, cpus: 1, timeout: 1h }\n",
         )
         .unwrap(),

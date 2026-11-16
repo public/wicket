@@ -391,7 +391,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         m.task = t;
     }
     // The effective manifest (after any --task) is what the identity's digest covers.
-    let text = serde_yaml::to_string(&m)?;
+    let text = wicket_core::yaml::to_string(&m)?;
     timings.since("manifest", timings.origin());
     let lap = std::time::Instant::now();
     let workspace_dir = match workspace_dir {
@@ -1287,7 +1287,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 // keys are added when it is minted, `noderun::start`).
                 spawn: match &m.agent {
                     Some(a) if a.max_children > 0 => Some(crate::chan::EdgeSpawn {
-                        manifest: serde_yaml::to_string(&m)?,
+                        manifest: wicket_core::yaml::to_string(&m)?,
                         base: String::new(),
                         grant_keys: vec![],
                         time_left_secs: m.zone.limits.timeout()?.saturating_sub(std::time::Duration::from_secs(prior_secs)).as_secs(),
@@ -2776,7 +2776,7 @@ mod tests {
             wicket_agent::load(&AGENT.replace("img:rust\n", &format!("{}\n", crate::image::DEFAULT)).replace("[img:rust]", "[]")).unwrap();
         assert_eq!(box_image(None, &dflt).unwrap(), crate::image::effective(crate::image::DEFAULT));
         // It round-trips through the effective manifest (what the identity's digest covers).
-        let again = wicket_agent::load(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        let again = wicket_agent::load(&wicket_core::yaml::to_string(&m).unwrap()).unwrap();
         assert_eq!(again.agent.unwrap().image.as_deref(), Some("img:rust"));
     }
 

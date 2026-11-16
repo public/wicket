@@ -1961,7 +1961,7 @@ mod tests {
     fn a_renewed_grant_is_republished_with_its_new_end() {
         let tenant = TenantId::single();
         let run = RunId("run_r".into());
-        let zone: ZoneSpec = serde_yaml::from_str("name: z\nreach: []\n").unwrap();
+        let zone: ZoneSpec = wicket_core::yaml::from_str("name: z\nreach: []\n").unwrap();
         let key = wicket_authz::SigningKey::generate();
         let issuer = wicket_feed::Issuer::root(&key, &tenant.0, "run:run_r", &run.0, 0, &zone, &[], 2_000_000_000, vec![]).unwrap();
         let row = |id: &str, node: Option<&str>, expires_at: i64| wicket_store::GrantRow {

@@ -179,9 +179,10 @@ mod tests {
     fn a_narrow_approval_has_no_blast_radius_and_a_wide_one_shows_what_it_covers() {
         let (l, req) = setup();
         assert_eq!(blast_radius(&l, None, &req, &terms(Some(1), 600, None, false)).unwrap(), None);
-        let zone: ZoneSpec =
-            serde_yaml::from_str("name: z\nreach:\n  - host: files.example\n    paths: [/docs/public/**]\n  - host: other.example\n")
-                .unwrap();
+        let zone: ZoneSpec = wicket_core::yaml::from_str(
+            "name: z\nreach:\n  - host: files.example\n    paths: [/docs/public/**]\n  - host: other.example\n",
+        )
+        .unwrap();
         let b = blast_radius(&l, Some(&zone), &req, &terms(None, 7200, Some("/docs"), true)).unwrap().expect("it widens");
         assert_eq!(b.widens.len(), 4, "{b:?}");
         assert_eq!((b.covered, b.recent), (3, 5), "GET /docs/a, /docs/b and /docs/c/d, not /other or the POST");

@@ -28,7 +28,7 @@ fn fixture(tag: &str) -> Fixture {
     let authz_root = wicket_authz::SigningKey::from_bytes(&[9; 32]).unwrap();
     let approver = wicket_authz::SigningKey::from_bytes(&[10; 32]).unwrap();
     t.state.authz_root = Some(authz_root.public());
-    let zone: wicket_core::ZoneSpec = serde_yaml::from_str(&format!(
+    let zone: wicket_core::ZoneSpec = wicket_core::yaml::from_str(&format!(
         "name: {ZONE}\nreach: [{{ host: api.example.com, methods: [GET], paths: ['/v1/**'] }}]\nforbid: [{{ host: api.example.com, paths: ['/admin/**'] }}]\n"
     ))
     .unwrap();

@@ -122,7 +122,7 @@ impl Policy {
         if s.trim().is_empty() {
             return Ok(Policy::default());
         }
-        let f: File = serde_yaml::from_str(s)?;
+        let f: File = wicket_core::yaml::from_str(s)?;
         let default = f.default.map(Authority::try_from).transpose()?.unwrap_or(Authority::Anything);
         let mut operators = BTreeMap::new();
         for (k, v) in f.operators {

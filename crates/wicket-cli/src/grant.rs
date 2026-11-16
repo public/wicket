@@ -1016,7 +1016,7 @@ mod tests {
         }
 
         fn hook(&self, zone: &str) -> AgentDecisions {
-            let z: wicket_core::ZoneSpec = serde_yaml::from_str(zone).unwrap();
+            let z: wicket_core::ZoneSpec = wicket_core::yaml::from_str(zone).unwrap();
             AgentDecisions {
                 tenant: TenantId::single(),
                 run: RunId("run_p".into()),

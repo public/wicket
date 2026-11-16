@@ -9,7 +9,7 @@ use std::time::Duration;
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] crate::yaml::Error),
     #[error("invalid path glob {glob:?}: {err}")]
     Glob { glob: String, err: String },
     #[error("invalid duration {0:?}")]
@@ -826,7 +826,7 @@ impl Manifest {
     /// `escalation.request: true` (#255). The model route's defaults are the harness adapter's: load
     /// an agent's manifest through `wicket_agent::load` to fill them.
     pub fn from_yaml(s: &str) -> Result<Self, ManifestError> {
-        let mut m: Manifest = serde_yaml::from_str(s)?;
+        let mut m: Manifest = crate::yaml::from_str(s)?;
         if m.program.is_some() {
             #[derive(Deserialize)]
             struct Probe {
@@ -842,7 +842,7 @@ impl Manifest {
                 #[serde(default)]
                 request: Option<bool>,
             }
-            let said = serde_yaml::from_str::<Probe>(s)?.zone.escalation.and_then(|e| e.request);
+            let said = crate::yaml::from_str::<Probe>(s)?.zone.escalation.and_then(|e| e.request);
             m.zone.escalation.request = said.unwrap_or(false);
         }
         m.validate()?;
@@ -1203,14 +1203,14 @@ mod tests {
     /// field (the feed carries zones to nodes that refuse unknown fields).
     #[test]
     fn escalation_defaults_on_and_is_written_only_when_restricted() {
-        let z: ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        let z: ZoneSpec = crate::yaml::from_str("name: z\n").unwrap();
         assert_eq!(z.escalation, Escalation { request: true, grant: true });
         assert!(!serde_json::to_string(&z).unwrap().contains("escalation"));
-        let r: ZoneSpec = serde_yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
+        let r: ZoneSpec = crate::yaml::from_str("name: z\nescalation: { request: false }\n").unwrap();
         assert_eq!(r.escalation, Escalation { request: false, grant: true });
         let back: ZoneSpec = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.escalation, r.escalation);
-        assert!(serde_yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
+        assert!(crate::yaml::from_str::<ZoneSpec>("name: z\nescalation: { ask: false }\n").is_err(), "unknown fields refused");
     }
 
     /// #293: the harness's grace to exit defaults to 30 s, is written only when set otherwise (nodes
@@ -1302,11 +1302,11 @@ zone:
     fn programs_have_no_model_and_may_not_ask_by_default() {
         let m = Manifest::from_yaml("task: t\nprogram: {name: p, command: [bash, run.sh]}\nzone: {name: z}").unwrap();
         assert!(!m.zone.escalation.request && m.zone.escalation.grant);
-        let back = Manifest::from_yaml(&serde_yaml::to_string(&m).unwrap()).unwrap();
+        let back = Manifest::from_yaml(&crate::yaml::to_string(&m).unwrap()).unwrap();
         assert!(!back.zone.escalation.request, "the default survives a round trip");
         let asks = Manifest::from_yaml("task: t\nprogram: {name: p, command: [x]}\nzone: {name: z, escalation: {request: true}}").unwrap();
         assert!(asks.zone.escalation.request);
-        let back = Manifest::from_yaml(&serde_yaml::to_string(&asks).unwrap()).unwrap();
+        let back = Manifest::from_yaml(&crate::yaml::to_string(&asks).unwrap()).unwrap();
         assert!(back.zone.escalation.request, "so does a program's request: true");
         let back = Manifest::from_yaml(&serde_json::to_string(&asks).unwrap()).unwrap();
         assert!(back.zone.escalation.request, "in JSON too");
@@ -1381,7 +1381,7 @@ zone:
         assert!(y(", harness: nope").unwrap_err().to_string().contains("unknown variant"));
         // `kind` is spawn's word for a workload (agent or program), not a manifest field.
         assert!(y(", kind: claude-code").unwrap_err().to_string().contains("unknown field `kind`"));
-        let plain = serde_yaml::to_string(&y("").unwrap()).unwrap();
+        let plain = crate::yaml::to_string(&y("").unwrap()).unwrap();
         assert!(plain.contains("harness: claude-code"), "{plain}");
     }
 
@@ -1416,15 +1416,15 @@ zone:
         assert!(y(", remote: { name: x, permission_mode: BypassPermissions }").is_err(), "spelled as the CLI takes it");
         // An unset mode isn't written out, so a remote manifest's digest is unchanged; a set one is,
         // `default` included (a driven session's default differs).
-        let rc = serde_yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x }").unwrap()).unwrap();
         assert!(!rc.contains("permission_mode") && !rc.contains("drive"), "{rc}");
-        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x, permission_mode: default }").unwrap()).unwrap();
         assert!(rc.contains("permission_mode: default"), "{rc}");
-        let rc = serde_yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
+        let rc = crate::yaml::to_string(&y(", remote: { name: x, permission_mode: plan }").unwrap()).unwrap();
         assert!(rc.contains("permission_mode: plan"), "{rc}");
         // Other manifests serialize as before (their identity digests don't change).
         let plain = Manifest::from_yaml("task: t\nagent: { name: a }\nzone: { name: z, llm: {} }\n").unwrap();
-        assert!(!serde_yaml::to_string(&plain).unwrap().contains("remote"));
+        assert!(!crate::yaml::to_string(&plain).unwrap().contains("remote"));
     }
 
     #[test]
@@ -1441,6 +1441,6 @@ zone:
         let r = y("task: t\n", ", drive: true, permission_mode: acceptEdits").unwrap().agent.unwrap().remote.unwrap();
         assert_eq!(r.permission_mode(), RemotePermissionMode::AcceptEdits);
         assert_eq!(y("", "").unwrap().agent.unwrap().remote.unwrap().permission_mode(), RemotePermissionMode::Default);
-        assert!(serde_yaml::to_string(&m).unwrap().contains("drive: true"));
+        assert!(crate::yaml::to_string(&m).unwrap().contains("drive: true"));
     }
 }

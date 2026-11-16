@@ -163,7 +163,7 @@ pub fn stored_objects(sink: &str) -> Result<Vec<Value>> {
 
 impl SinksConfig {
     pub fn parse(text: &str) -> Result<SinksConfig> {
-        let c: SinksConfig = serde_yaml::from_str(text)?;
+        let c: SinksConfig = wicket_core::yaml::from_str(text)?;
         let mut seen = std::collections::BTreeSet::new();
         for s in &c.sinks {
             if s.name.is_empty() || !seen.insert(s.name.clone()) {

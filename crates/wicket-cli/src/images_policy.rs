@@ -80,7 +80,7 @@ pub fn path() -> std::path::PathBuf {
 
 pub fn load() -> Result<ImagesPolicy> {
     match std::fs::read_to_string(path()) {
-        Ok(t) => serde_yaml::from_str(&t).with_context(|| path().display().to_string()),
+        Ok(t) => wicket_core::yaml::from_str(&t).with_context(|| path().display().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ImagesPolicy::default()),
         Err(e) => Err(e).with_context(|| path().display().to_string()),
     }
@@ -138,12 +138,12 @@ mod tests {
         assert_eq!(registry_of(&format!("localhost/x@sha256:{}", "a".repeat(64))), Some(("localhost".into(), "x".into())));
         assert_eq!(registry_of(&format!("sha256:{}", "a".repeat(64))), None);
         let p: ImagesPolicy =
-            serde_yaml::from_str("registries:\n  - host: registry.example.com\n    secret: reg\n  - host: docker.io\n").unwrap();
+            wicket_core::yaml::from_str("registries:\n  - host: registry.example.com\n    secret: reg\n  - host: docker.io\n").unwrap();
         let (r, repo) = p.registry_for("registry.example.com/team/agent:1").unwrap();
         assert_eq!((r.host.as_str(), r.secret.as_deref(), repo.as_str()), ("registry.example.com", Some("reg"), "team/agent"));
         assert_eq!(p.registry_for("ubuntu:24.04").unwrap().0.host, "registry-1.docker.io");
         assert_eq!(p.registry_for("docker.io/library/ubuntu:24.04").unwrap().0.host, "registry-1.docker.io");
         assert!(p.registry_for("other.example.com/x:1").is_none());
-        assert!(serde_yaml::from_str::<ImagesPolicy>("registries: [{host: a, typo: 1}]").is_err());
+        assert!(wicket_core::yaml::from_str::<ImagesPolicy>("registries: [{host: a, typo: 1}]").is_err());
     }
 }

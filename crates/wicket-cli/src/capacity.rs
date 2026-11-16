@@ -134,7 +134,7 @@ impl PlacementConfig {
     }
 
     pub fn parse(s: &str) -> Result<PlacementConfig> {
-        let c: PlacementConfig = serde_yaml::from_str(s)?;
+        let c: PlacementConfig = wicket_core::yaml::from_str(s)?;
         c.budget()?;
         match c.backend {
             Backend::Static if c.static_hosts.is_empty() => bail!("backend static needs static_hosts"),

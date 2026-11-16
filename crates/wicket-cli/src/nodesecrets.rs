@@ -599,7 +599,7 @@ mod tests {
     }
 
     fn zone(y: &str) -> wicket_core::ZoneSpec {
-        serde_yaml::from_str(y).unwrap()
+        wicket_core::yaml::from_str(y).unwrap()
     }
 
     /// The control host's vault, and a fetcher that releases from it as the control host does,

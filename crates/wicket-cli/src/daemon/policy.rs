@@ -228,7 +228,7 @@ impl Policy {
         if s.trim().is_empty() {
             return Ok(Policy::default());
         }
-        Ok(serde_yaml::from_str(s)?)
+        Ok(wicket_core::yaml::from_str(s)?)
     }
 
     /// The policy at `path`, or the default when there is none.
