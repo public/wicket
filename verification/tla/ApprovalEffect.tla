@@ -56,6 +56,11 @@ None == [st |-> "none", origin |-> Parent, via |-> Parent, e |-> CHOOSE x \in Ef
 \* A request for principal p's effect e is waiting for a decision.
 PendingFor(p, e) == \E j \in Ids : reqs[j].st = "pending" /\ reqs[j].origin = p /\ reqs[j].e = e
 
+\* A request other than grant g's own, for the same originator and effect as request i, is pending:
+\* a sibling's (or the same branch's) decision that i's action must wait for.
+SiblingPending(i, g) ==
+    \E j \in Ids : (j # g) /\ (reqs[j].st = "pending") /\ (reqs[j].origin = reqs[i].origin) /\ (reqs[j].e = reqs[i].e)
+
 \* The identity the decider sees on a request p makes: its own (one record across the hop), or,
 \* without KeepIdentity, the hop's (the parent relays the child's request as itself).
 Via(p) == IF ~KeepIdentity /\ p = Child THEN Parent ELSE p
@@ -106,12 +111,9 @@ Run(i, g, a) ==
     /\ BindArgs => grants[g].a = a
     /\ ConsumeOnce => g \notin spent
     /\ CheckAtRun => now < grants[g].exp
-    /\ Hold => ~\E j \in Ids : j # g /\ reqs[j].st = "pending" /\ reqs[j].origin = reqs[i].origin
-                                 /\ reqs[j].e = reqs[i].e
+    /\ Hold => ~SiblingPending(i, g)
     /\ spent' = spent \cup {g}
-    /\ ranWhilePending' = (ranWhilePending \/
-          \E j \in Ids : j # g /\ reqs[j].st = "pending" /\ reqs[j].origin = reqs[i].origin
-                         /\ reqs[j].e = reqs[i].e)
+    /\ ranWhilePending' = (ranWhilePending \/ SiblingPending(i, g))
     /\ ranTwice' = (ranTwice \/ g \in spent)
     /\ ranPastExpiry' = (ranPastExpiry \/ now >= grants[g].exp)
     /\ ranAsOther' = (ranAsOther \/ grants[g].p # reqs[i].origin)
