@@ -86,8 +86,14 @@ exchanged, for the logs and for the health gate.
 | 7 | Images delivered over the channel (#191): `ImageHave` (does the node have this digest), and `PutImage`, an OCI image layout archive on a control-host stream whose data frames the node acknowledges (`Ack`) as it takes them, ended by `Close` and answered by `ImagePut` once the node has verified and imported it, or refused it. With an older node, the image must be there already. |
 | 8 | Images pulled by the node from an allowlisted registry, host-side (#191): `PullImage` (the digest, the registry and repository, the hosts the pull may reach and the name of the registry's secret, which the node fetches for the run) and `ImagePulled`. With a node talking 7, the image is sent instead. |
 | 9 | A run's budget slice is `BudgetSlice` (it was `Lease`, #256: "lease" names only a grant of capacity). No alias: a node talking 8 is sent no slice, and a box with a model budget doesn't start on it. |
+| 10 | Credential swaps on the node (#257): `BoxStart.swaps`, each fetched with `SecretFetch` on first use and swapped by the node's own egress proxy, which then decides the swapped hosts from the feed. A box with swaps went only to a node talking 10. |
+| 11 | No forwarded egress (#257): a node terminates what its CA covers and decides it, splices a host its CA can't cover if the box's token allows it wholesale, and refuses it otherwise. The control host no longer serves the `egress` tunnel target, and `BoxStart.swap_hosts` is gone. |
+| 12 | Node health (#377): a node reports its disk, inodes, memory, feed freshness and failures as `Health`, sent only on connections talking 12. |
 
-wicket speaks version 9.
+wicket speaks version 12, so it talks only to peers at 11 and 12. What the rows above say happens
+with an older peer (a node relaying every gateway tool before 5, a box refused by a node before 6,
+9, 10 or 11, an image not sent to a node before 7) is history: no connection can negotiate below 11,
+and the code for it is gone. Each version from 11 on that a build still talks to keeps its check.
 
 ## Ledger schema
 

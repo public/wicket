@@ -247,10 +247,8 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 }
                 // Children this node started for it (#164) that its control host hasn't taken
                 // over: before its exit is replayed, so it learns of them whatever happens.
-                if node.proto_of(&run) >= chan::EDGE_DECISIONS {
-                    for c in node.edge.unadopted(&run) {
-                        node.send_to(gen, Frame::Msg(c.msg()));
-                    }
+                for c in node.edge.unadopted(&run) {
+                    node.send_to(gen, Frame::Msg(c.msg()));
                 }
                 // Asks raised while it was away (#153), with their original time.
                 for q in node.queue.of(&run) {

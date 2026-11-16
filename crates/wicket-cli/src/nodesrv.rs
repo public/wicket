@@ -535,14 +535,11 @@ impl Node {
         found.first().map(|(r, _)| r.to_string())
     }
 
-    /// What this node decides `run`'s gateway tools from (#164): None, they are all relayed (a
-    /// control host before protocol 5 started it, or one of those is connected now).
+    /// What this node decides `run`'s gateway tools from (#164): None if its start carries nothing
+    /// to decide them from, and they are all relayed.
     fn edge_start(&self, run: &str) -> Option<chan::EdgeStart> {
         let e = self.boxes.lock().expect("boxes").get(run).and_then(|b| b.record.start.edge.clone())?;
-        match self.proto_of(run) {
-            p if (1..chan::EDGE_DECISIONS).contains(&p) => None,
-            _ => Some(*e),
-        }
+        Some(*e)
     }
 
     /// The tenant `run`'s box runs for, and the zone its token holds.
@@ -577,12 +574,6 @@ impl Node {
             Some(Msg::Asked { error: Some(e), .. }) => Err(e),
             _ => Err(NO_ANSWER.into()),
         }
-    }
-
-    /// The protocol version of the connection that owns `run`'s box (0: none up).
-    fn proto_of(&self, run: &str) -> u32 {
-        let Some(g) = self.owner(run) else { return 0 };
-        self.links.lock().expect("links").get(&g).map_or(0, |l| l.proto)
     }
 
     /// Sends to the connection that owns `run`'s box.
@@ -2320,9 +2311,6 @@ async fn serve_box(
     Ok(tasks)
 }
 
-/// How a tool call relayed to a control host before [`chan::EDGE_DECISIONS`] fails: it would decide
-/// it differently.
-pub const OLD_CONTROL: &str = "the control host speaks an older protocol";
 /// An ask the control host didn't answer (cut off mid-ask).
 const NO_ANSWER: &str = "the control host did not answer";
 
@@ -3650,64 +3638,5 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         let audit = node.audit.lock().unwrap().audit_tail(50).unwrap();
         assert_eq!(audit.iter().filter(|r| r.2 == "node.secret_fetched").count(), 2, "{audit:?}");
         assert!(!format!("{audit:?}").contains(LOGIN) && !format!("{audit:?}").contains(VALUE));
-    }
-
-    /// #257: a box with credential swaps starts only on a node talking protocol 10 or later; an
-    /// older one is refused, saying why and what to do, as for a pin or a model budget.
-    #[test]
-    fn a_box_with_swaps_is_refused_by_a_node_before_protocol_10() {
-        let mut start = fake_record("run_a").start;
-        assert!(crate::noderun::refuse_older_node("n1", 9, &start, true, None).is_ok(), "no swaps: protocol 9 will do");
-        start.swaps = chan::swap_starts(&[wicket_proxy::CredentialSwap {
-            name: "account login".into(),
-            host: "rc.api.test".into(),
-            placeholder: "ph".into(),
-            real: wicket_proxy::SwapSource::Vault("login".into()),
-            box_bearers: true,
-        }]);
-        let why = crate::noderun::refuse_older_node("n1", 9, &start, true, None).unwrap_err().to_string();
-        assert!(why.contains("node n1 talks protocol 9") && why.contains("credential swaps") && why.contains("from protocol 10"), "{why}");
-        assert!(why.contains("wicket node install n1"), "{why}");
-        assert!(crate::noderun::refuse_older_node("n1", chan::CREDENTIAL_SWAPS, &start, true, None).is_ok());
-        // The others still hold: a pin below 6, a budget below 9.
-        start.swaps.clear();
-        start.image_pin = Some("sha256:00".into());
-        assert!(crate::noderun::refuse_older_node("n1", 5, &start, false, None).unwrap_err().to_string().contains("pinned"));
-        start.image_pin = None;
-        assert!(crate::noderun::refuse_older_node("n1", 8, &start, true, None).unwrap_err().to_string().contains("model budget"));
-    }
-
-    /// #257, slice 3: a box a node before protocol 11 would forward a host of (outside its CA, or
-    /// every host without one) starts only on a node at 11 or later, which splices or refuses such
-    /// a host instead; a box whose hosts the CA covers still starts at 10.
-    #[test]
-    fn a_box_a_node_would_forward_is_refused_by_a_node_before_protocol_11() {
-        use crate::noderun::{forwarded_host, refuse_older_node};
-        let start = fake_record("run_a").start;
-        let zone: wicket_core::ZoneSpec = serde_json::from_value(serde_json::json!({
-            "name": "z",
-            "reach": [{"host": "api.example.com"}, {"host": "*.example.org"}],
-        }))
-        .unwrap();
-        let covered = ["api.example.com".to_string(), ".example.org".to_string()];
-        assert_eq!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 1_000), None);
-        assert!(refuse_older_node("n1", 10, &start, false, None).is_ok(), "nothing forwarded: protocol 10 will do");
-        let narrow = ["api.example.com".to_string()];
-        let host = forwarded_host(&zone, &[], Some((&narrow[..], 2_000)), 1_000).unwrap();
-        assert!(host.starts_with("*.example.org") && host.contains("name constraints"), "{host}");
-        assert!(forwarded_host(&zone, &[], None, 1_000).unwrap().contains("no CA"));
-        assert!(forwarded_host(&zone, &[], Some((&covered[..], 2_000)), 2_000).unwrap().contains("expired"));
-        let swap = wicket_proxy::CredentialSwap {
-            name: "login".into(),
-            host: "rc.api.test".into(),
-            placeholder: "ph".into(),
-            real: wicket_proxy::SwapSource::Vault("login".into()),
-            box_bearers: true,
-        };
-        assert!(forwarded_host(&zone, &[swap], Some((&covered[..], 2_000)), 1_000).unwrap().starts_with("rc.api.test"));
-        let why = refuse_older_node("n1", 10, &start, false, Some(&host)).unwrap_err().to_string();
-        assert!(why.contains("node n1 talks protocol 10") && why.contains("*.example.org") && why.contains("from protocol 11"), "{why}");
-        assert!(why.contains("wicket node install n1"), "{why}");
-        assert!(refuse_older_node("n1", chan::NO_FORWARDED_EGRESS, &start, false, Some(&host)).is_ok());
     }
 }
