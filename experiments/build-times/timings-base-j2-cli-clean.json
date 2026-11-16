@@ -1,0 +1,312 @@
+{
+ "units": 441,
+ "sum_secs": 362.4,
+ "longest": [
+  {
+   "crate": "cedar-policy-core",
+   "version": "4.14.1",
+   "kind": "lib",
+   "secs": 74.56
+  },
+  {
+   "crate": "cedar-policy",
+   "version": "4.14.1",
+   "kind": "lib",
+   "secs": 25.76
+  },
+  {
+   "crate": "wicket-cli",
+   "version": "0.0.1",
+   "kind": "wicket \"bin\"",
+   "secs": 23.96
+  },
+  {
+   "crate": "biscuit-auth",
+   "version": "6.0.0-fork.0",
+   "kind": "lib",
+   "secs": 21.69
+  },
+  {
+   "crate": "regex-automata",
+   "version": "0.4.18",
+   "kind": "lib",
+   "secs": 9.36
+  },
+  {
+   "crate": "regex-automata",
+   "version": "0.4.18",
+   "kind": "lib",
+   "secs": 9.29
+  },
+  {
+   "crate": "zstd-sys",
+   "version": "2.1.2+zstd.1.5.7",
+   "kind": "run-custom-build",
+   "secs": 7.58
+  },
+  {
+   "crate": "wicket-proxy",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 6.98
+  },
+  {
+   "crate": "lalrpop",
+   "version": "0.22.2",
+   "kind": "lib",
+   "secs": 5.03
+  },
+  {
+   "crate": "libsqlite3-sys",
+   "version": "0.30.1",
+   "kind": "run-custom-build",
+   "secs": 4.97
+  },
+  {
+   "crate": "regex-syntax",
+   "version": "0.8.11",
+   "kind": "lib",
+   "secs": 4.4
+  },
+  {
+   "crate": "biscuit-parser",
+   "version": "0.2.0-fork.0",
+   "kind": "lib",
+   "secs": 4.0
+  },
+  {
+   "crate": "wicket-store",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 3.6
+  },
+  {
+   "crate": "tokio",
+   "version": "1.54.1",
+   "kind": "lib",
+   "secs": 3.38
+  },
+  {
+   "crate": "syn",
+   "version": "3.0.9",
+   "kind": "lib",
+   "secs": 2.79
+  },
+  {
+   "crate": "rustls",
+   "version": "0.23.46",
+   "kind": "lib",
+   "secs": 2.72
+  },
+  {
+   "crate": "ring",
+   "version": "0.17.14",
+   "kind": "run-custom-build",
+   "secs": 2.65
+  },
+  {
+   "crate": "h2",
+   "version": "0.4.20",
+   "kind": "lib",
+   "secs": 2.64
+  },
+  {
+   "crate": "syn",
+   "version": "2.0.119",
+   "kind": "lib",
+   "secs": 2.62
+  },
+  {
+   "crate": "quinn-proto",
+   "version": "0.11.19",
+   "kind": "lib",
+   "secs": 2.5
+  },
+  {
+   "crate": "wicket-authz",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 2.35
+  },
+  {
+   "crate": "zerocopy",
+   "version": "0.8.63",
+   "kind": "lib",
+   "secs": 2.31
+  },
+  {
+   "crate": "cedar-policy-core",
+   "version": "4.14.1",
+   "kind": "run-custom-build",
+   "secs": 2.3
+  },
+  {
+   "crate": "wicket-core",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 2.27
+  },
+  {
+   "crate": "psl",
+   "version": "2.1.253",
+   "kind": "lib",
+   "secs": 2.19
+  },
+  {
+   "crate": "globset",
+   "version": "0.4.21",
+   "kind": "lib",
+   "secs": 2.09
+  },
+  {
+   "crate": "object",
+   "version": "0.39.1",
+   "kind": "lib",
+   "secs": 2.02
+  },
+  {
+   "crate": "reqwest",
+   "version": "0.12.28",
+   "kind": "lib",
+   "secs": 1.89
+  },
+  {
+   "crate": "wicket-sandbox",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 1.84
+  },
+  {
+   "crate": "clap_builder",
+   "version": "4.6.7",
+   "kind": "lib",
+   "secs": 1.68
+  },
+  {
+   "crate": "educe",
+   "version": "0.8.2",
+   "kind": "lib",
+   "secs": 1.67
+  },
+  {
+   "crate": "darling_core",
+   "version": "0.24.1",
+   "kind": "lib",
+   "secs": 1.64
+  },
+  {
+   "crate": "curve25519-dalek",
+   "version": "5.0.0",
+   "kind": "lib",
+   "secs": 1.64
+  },
+  {
+   "crate": "futures-util",
+   "version": "0.3.34",
+   "kind": "lib",
+   "secs": 1.63
+  },
+  {
+   "crate": "serde_derive",
+   "version": "1.0.229",
+   "kind": "lib",
+   "secs": 1.61
+  },
+  {
+   "crate": "nom",
+   "version": "8.0.0",
+   "kind": "lib",
+   "secs": 1.51
+  },
+  {
+   "crate": "wicket-placement",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 1.51
+  },
+  {
+   "crate": "crypto-bigint",
+   "version": "0.7.11",
+   "kind": "lib",
+   "secs": 1.5
+  },
+  {
+   "crate": "wicket-feed",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 1.37
+  },
+  {
+   "crate": "wicket-agent",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 1.35
+  },
+  {
+   "crate": "time",
+   "version": "0.3.55",
+   "kind": "lib",
+   "secs": 1.32
+  },
+  {
+   "crate": "wicket-policy",
+   "version": "0.0.1",
+   "kind": "lib",
+   "secs": 1.25
+  },
+  {
+   "crate": "serde_core",
+   "version": "1.0.229",
+   "kind": "lib",
+   "secs": 1.22
+  },
+  {
+   "crate": "ring",
+   "version": "0.17.14",
+   "kind": "lib",
+   "secs": 1.12
+  },
+  {
+   "crate": "tracing-subscriber",
+   "version": "0.3.23",
+   "kind": "lib",
+   "secs": 1.12
+  },
+  {
+   "crate": "x509-parser",
+   "version": "0.16.0",
+   "kind": "lib",
+   "secs": 1.06
+  },
+  {
+   "crate": "rustix",
+   "version": "1.1.6",
+   "kind": "lib",
+   "secs": 1.05
+  },
+  {
+   "crate": "serde_with",
+   "version": "3.24.0",
+   "kind": "lib",
+   "secs": 1.05
+  },
+  {
+   "crate": "cc",
+   "version": "1.11.1",
+   "kind": "lib",
+   "secs": 1.02
+  },
+  {
+   "crate": "zerocopy-derive",
+   "version": "0.8.63",
+   "kind": "lib",
+   "secs": 1.01
+  },
+  {
+   "crate": "clap_derive",
+   "version": "4.6.7",
+   "kind": "lib",
+   "secs": 1.0
+  }
+ ]
+}

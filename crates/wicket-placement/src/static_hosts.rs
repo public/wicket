@@ -166,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_allocations_are_seen_by_another_instance_and_freed_by_it() {
-        let dir = std::env::temp_dir().join(format!("wicket-static-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("wicket-static-{}", crate::new_ulid()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("static.json");
         let a = StaticHosts::persistent(vec![host()], path.clone());

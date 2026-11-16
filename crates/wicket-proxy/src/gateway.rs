@@ -185,7 +185,7 @@ impl Gateway {
         let parent = me.claims.parent_run.as_deref().and_then(|p| l.identity(p).ok().flatten()).map(|i| i.spiffe_id);
         let hears = |zone: &str, id: &str| {
             wicket_core::manifest::accepts(&self.ctx.zone.accept_from, zone, Some(id))
-                && self.ctx.org.as_ref().is_none_or(|o| o.allows_message_from(zone))
+                && self.ctx.org.as_ref().is_none_or(|o| o.allows_message_from(zone, Some(id)))
         };
         let rows = match l.principals(&self.tenant()) {
             Ok(r) => r,
@@ -283,7 +283,7 @@ impl Gateway {
                             Some(f) => l.agent_runs(&f.agent).unwrap_or_default().into_iter().map(|(r, _)| r).collect(),
                             None => vec![],
                         };
-                        let from_zone = l.identity(&m.from_run).ok().flatten().map(|i| i.zone);
+                        let from_zone = l.identity(&m.from_run).ok().flatten().map(|i| (i.zone, i.spiffe_id));
                         (m, revoked, earlier, from_zone)
                     })
                 })
@@ -291,7 +291,7 @@ impl Gateway {
             match m {
                 // The org policy decides which zones' boxes this one hears from (#51), parent and
                 // children included: refused, the message is dropped, and the agent told.
-                Ok(Some((m, _, _, Some(z)))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z)) => {
+                Ok(Some((m, _, _, Some((z, id))))) if self.ctx.org.as_ref().is_some_and(|o| !o.allows_message_from(&z, Some(&id))) => {
                     self.refused_on_delivery(&m, &cell.current().claims.sub, &format!("the org policy doesn't let you hear from zone {z}"));
                     return (
                         format!(
@@ -541,7 +541,7 @@ impl Gateway {
         if me.claims.exp <= now {
             return ("not decided: this agent's identity has expired and was not refreshed".into(), true);
         }
-        let jti = format!("d-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let jti = format!("d-{}", wicket_core::new_ulid().to_string().to_lowercase());
         let payload = match decision {
             "renew" => json!({
                 "jti": jti, "iat": now, "kind": crate::DECISION_KIND,

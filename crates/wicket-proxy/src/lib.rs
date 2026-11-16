@@ -473,7 +473,7 @@ impl RunCtx {
                 _ => return Err(format!("in_reply_to {m} is not a message {principal} sent you").into()),
             },
         };
-        let id = format!("m-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let id = format!("m-{}", wicket_core::new_ulid().to_string().to_lowercase());
         let relation = if rec.parent_run.as_deref() == Some(&self.run.0) {
             "child"
         } else if prefer.is_some()

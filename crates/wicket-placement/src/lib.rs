@@ -53,6 +53,15 @@
 //! box over ssh with the sockets forwarded); this crate decides and pays for *where*. The reconciler is
 //! a pure function ([`reconcile::reconcile`]) with no daemon; #38 runs it.
 
+/// A new ULID, as `wicket_core::new_ulid` makes one (this crate doesn't depend on wicket-core): the
+/// time now and 80 bits of the OS's randomness, without ulid's `std` feature and its rand (#219).
+pub(crate) fn new_ulid() -> ulid::Ulid {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let mut r = [0u8; 16];
+    getrandom::fill(&mut r).expect("the OS's randomness");
+    ulid::Ulid::from_parts(ms, u128::from_le_bytes(r))
+}
+
 pub mod billing;
 pub mod boot;
 pub mod envelope;

@@ -46,11 +46,13 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = { version = "0.13", features = ["x509-parser"] }
-rusqlite = { version = "0.43", features = ["bundled"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rusqlite = { version = "0.43", features = ["bundled", "cache"], default-features = false }
 sha2 = "0.11"
 hex = "0.4"
-ulid = "1"
+# Without its `std` feature, which brings rand 0.9 (a second rand, #219): ids come from
+# `wicket_core::new_ulid`, with the OS's randomness.
+ulid = { version = "1", default-features = false }
 globset = "0.4"
 url = "2"
 clap = { version = "4", features = ["derive"] }
@@ -112,8 +114,11 @@ opt-level = 2
 [profile.dev.package.globset]
 opt-level = 2
 # #51's differential test (wicket-policy's tests/cedar.rs) runs Cedar's parser, validator and
-# authorizer on thousands of generated policies and requests: unoptimized, minutes.
+# authorizer on thousands of generated policies and requests: unoptimized, minutes. Level 1, not 2:
+# at 2 the two crates are the longest part of a clean build of wicket-cli, on its critical path
+# (#219, experiments/build-times: build 82 s at 2, 58 s at 1, 18 s at 0; that test 55 s, 64 s and
+# 100 s).
 [profile.dev.package.cedar-policy]
-opt-level = 2
+opt-level = 1
 [profile.dev.package.cedar-policy-core]
-opt-level = 2
+opt-level = 1

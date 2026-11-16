@@ -151,7 +151,8 @@ pub struct OrgLayer {
     /// HTTP requests refused whatever any zone or grant says.
     pub forbid: Vec<HttpMatch>,
     pub spawn: Option<Vec<SpawnMatch>>,
-    /// Zones whose boxes may message boxes under this policy (one set: alternatives are unioned).
+    /// Who may message boxes under this policy, as an `accept_from`: zone names and principal ids
+    /// (one set: alternatives are unioned).
     pub msg_from: Option<Vec<String>>,
     /// Injections allowed (`host|header|secret`, as [`Inject::key`]).
     pub inject: Option<Vec<String>>,
@@ -209,9 +210,10 @@ impl OrgLayer {
         })
     }
 
-    /// Whether boxes under it may receive messages from boxes of `zone`.
-    pub fn allows_message_from(&self, zone: &str) -> bool {
-        self.msg_from.as_ref().is_none_or(|z| z.iter().any(|x| x == zone))
+    /// Whether boxes under it may receive messages from a box of `zone` whose principal id is
+    /// `sender` (when known): its list read as an `accept_from` ([`wicket_core::manifest::accepts`]).
+    pub fn allows_message_from(&self, zone: &str, sender: Option<&str>) -> bool {
+        self.msg_from.as_ref().is_none_or(|z| wicket_core::manifest::accepts(z, zone, sender))
     }
 
     /// Whether it allows every request to `host` whatever its method, path and risk: no forbid can
@@ -447,6 +449,9 @@ pub enum Action {
     Msg {
         /// The sender's zone.
         from: String,
+        /// The sender's principal id (`spiffe://…`), when the node knows it: what an `accept_from`
+        /// principal entry (#250) names.
+        sender: Option<String>,
     },
 }
 
