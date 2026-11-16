@@ -17,9 +17,9 @@
 //!   each reconnect the node is caught up (deltas or a snapshot, and a statement signed for the
 //!   occasion), stdout and stderr resume where they left off, unsent stdin is resent, and the node
 //!   ships the audit records it made meanwhile.
-//! - **Tunnels.** The node opens tunnels to this run's MCP gateway socket, and to its egress proxy
-//!   for hosts the node must not terminate; they are connected here. The model proxy runs only on
-//!   the node (#257).
+//! - **Calls.** The node asks this run's gateway for the tools it doesn't answer itself
+//!   (`Msg::Call`, #257 slice 4b), answered by the run's `Gateway` in this process. No socket of this
+//!   run's is a tunnel target: the model, egress and gateway proxies are the node's (#257).
 //! - **Asks.** A request the node can't allow is raised here as an ordinary pending request.
 //! - **Identity.** Every connection starts with the mutual authentication in `nodeauth.rs`; at half
 //!   its life the node's certificate is renewed over the channel, and a node revoked meanwhile (from
@@ -404,6 +404,9 @@ pub struct Start {
     /// the model proxy's `prior` counters, so the node's first report is the base its later ones
     /// count from (#152).
     pub spent_counted: bool,
+    /// The control host's half of the box's gateway (#257 slice 4b): it answers the node's
+    /// [`Msg::Call`]s.
+    pub gateway: Arc<wicket_proxy::gateway::Gateway>,
     /// Takes over children the node starts for the box (#164): None, it may start none.
     pub adopt: Option<Adopter>,
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
@@ -442,6 +445,8 @@ struct Shared {
     vault: wicket_proxy::vault::Vault,
     /// What the node had counted when this supervisor took over, if that was already counted.
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
+    /// Answers the node's [`Msg::Call`]s for the box's gateway (#257).
+    gateway: Arc<wicket_proxy::gateway::Gateway>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for
     /// them ([`fetch_secret`]).
     swaps: Vec<wicket_proxy::CredentialSwap>,
@@ -603,6 +608,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         llm: s.llm.clone(),
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
+        gateway: s.gateway.clone(),
         swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
@@ -651,6 +657,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         }
         trees.end();
         let start = s.start;
+        refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst))?;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
@@ -1274,21 +1281,22 @@ async fn on_frame(
                     l.merge_spent(spent.since(base));
                 }
             }
+            // A tool of the box's gateway its node doesn't answer itself (#257 slice 4b): answered
+            // by the run's own gateway here, on a task of its own (a wait may last minutes).
+            Msg::Call { id, run, tool, args } => {
+                let (gw, out) = (sh.gateway.clone(), out.clone());
+                let mine = run == sh.run.0;
+                tokio::spawn(async move {
+                    let (text, is_error) = match mine {
+                        true => gw.call_tool(&tool.name(), args).await,
+                        false => (format!("no gateway for run {run} here"), true),
+                    };
+                    let _ = out.send(Frame::Msg(Msg::Called { id, text, is_error }));
+                });
+            }
             Msg::TunnelOpen { stream, run, target } => {
-                let ok_target = chan::TUNNEL_TARGETS.contains(&target.as_str());
-                let conn = match (run == sh.run.0, ok_target) {
-                    (true, true) => {
-                        tokio::net::UnixStream::connect(sh.dir.join("ctl").join(format!("{target}.sock"))).await.map_err(|e| e.to_string())
-                    }
-                    _ => Err(format!("no tunnel to {target} for run {run}")),
-                };
-                match conn {
-                    Ok(c) => {
-                        send(Frame::Msg(Msg::TunnelOpened { stream, error: None }));
-                        sh.ctl.calls.tunnels.attach(stream, c, out.clone());
-                    }
-                    Err(e) => send(Frame::Msg(Msg::TunnelOpened { stream, error: Some(e) })),
-                }
+                // No socket of the control host's is a tunnel target any more (#257).
+                send(Frame::Msg(Msg::TunnelOpened { stream, error: Some(format!("no tunnel to {target} for run {run}")) }));
             }
             Msg::Audit { records } => {
                 let n = records.len();
@@ -1593,6 +1601,19 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
     p.slice = Some(slice);
     save_holdings(sh, p);
     Some(Frame::Msg(Msg::BudgetSlice { run: sh.run.0.clone(), slice }))
+}
+
+/// Why a box can't start on node `name` talking `proto` (#257 slice 4b): before protocol 13 the node
+/// would relay the box's gateway tools through a tunnel this host no longer serves. Every older
+/// feature floor (pins, budget slices, swaps, no forwarded egress) is below it.
+pub(crate) fn refuse_older_node(name: &str, proto: u32) -> Result<()> {
+    if proto < crate::chan::ONE_GATEWAY {
+        bail!(
+            "node {name} talks protocol {proto}, and this host answers a box's gateway tools only as typed calls, from protocol {}: update the node (`wicket node install {name}`)",
+            crate::chan::ONE_GATEWAY
+        );
+    }
+    Ok(())
 }
 
 /// Releases secret `name` to this run's node, on its first use there (#152): only if the run's zone

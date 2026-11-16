@@ -436,6 +436,126 @@ pub(crate) mod tests {
         Ask { zone: z, image: "img:b", max_children: 0 }
     }
 
+    /// #326 (mutation testing): each budget and limit bound is inclusive (exactly what is left is
+    /// within), one past it isn't, and each violation is reported on its own.
+    #[test]
+    fn every_bound_is_inclusive_and_named_alone() {
+        let p = zone("  limits: { memory: 2g, cpus: 2, timeout: 1h, output: 64m, on_output_full: stop }\n");
+        let lim = "  limits: { memory: 1g, cpus: 1, timeout: 10m, on_output_full: stop }\n";
+        let mut b = bounds(&p);
+        b.llm_input_remaining = Some(1000);
+        let errs = |child: &str| check(&ask(&zone(&format!("{child}{lim}"))), &b).err().unwrap_or_default();
+        assert_eq!(errs("  llm: { max_requests: 100, max_output_tokens: 50000, max_input_tokens: 1000 }\n"), Vec::<String>::new());
+        assert_eq!(
+            errs("  llm: { max_requests: 101, max_output_tokens: 50000, max_input_tokens: 1000 }\n"),
+            ["101 model requests: only 100 are left in this zone's budget"]
+        );
+        assert_eq!(
+            errs("  llm: { max_requests: 100, max_output_tokens: 50001, max_input_tokens: 1000 }\n"),
+            ["50001 output tokens: only 50000 are left in this zone's budget"]
+        );
+        assert_eq!(
+            errs("  llm: { max_requests: 1, max_output_tokens: 1, max_input_tokens: 1001 }\n"),
+            ["1001 input tokens: only 1000 are left in this zone's budget"]
+        );
+        assert_eq!(
+            errs("  llm: { max_requests: 1, max_output_tokens: 1 }\n"),
+            ["no input token cap: this zone caps input tokens, and has 1000 left"]
+        );
+        assert_eq!(
+            errs("  llm: { max_requests: 1, max_output_tokens: 1, max_input_tokens: 1, allow_server_tools: true }\n"),
+            ["server-side model tools: this zone doesn't allow them"]
+        );
+        // Output: from 1 byte up to the parent's, inclusive; a parent that stops a full box binds it.
+        let out = |limits: &str| {
+            let c = zone(&format!("  llm: {{ max_requests: 1, max_output_tokens: 1, max_input_tokens: 1 }}\n  limits: {{ memory: 1g, cpus: 1, timeout: 10m, {limits} }}\n"));
+            check(&ask(&c), &b).err().unwrap_or_default()
+        };
+        assert_eq!(out("output: 64m, on_output_full: stop"), Vec::<String>::new());
+        assert!(out("output: 65m, on_output_full: stop")[0].starts_with("output 65m"));
+        // A zero the manifest refuses is refused here too, if a zone carries one.
+        let mut z = zone(&format!("  llm: {{ max_requests: 1, max_output_tokens: 1, max_input_tokens: 1 }}\n{lim}"));
+        z.limits.output = "0".into();
+        assert!(check(&ask(&z), &b).unwrap_err()[0].starts_with("output 0"));
+        assert_eq!(
+            out("output: 1m, on_output_full: keep_newest"),
+            ["on_output_full: this zone stops a box whose output is full; a child can't keep going"]
+        );
+        // Under a parent that keeps the newest output, a child may stop or keep.
+        let q = zone("  limits: { memory: 2g, cpus: 2, timeout: 1h }\n");
+        let c = zone(
+            "  llm: { max_requests: 1, max_output_tokens: 1 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m, on_output_full: stop }\n",
+        );
+        assert_eq!(check(&ask(&c), &bounds(&q)), Ok(()));
+        // A parent that allows server tools lets a child have them.
+        let st = zone("  llm: { allow_server_tools: true }\n  limits: { memory: 2g, cpus: 2, timeout: 1h }\n");
+        let cst = zone(
+            "  llm: { max_requests: 1, max_output_tokens: 1, allow_server_tools: true }\n  limits: { memory: 1g, cpus: 1, timeout: 10m }\n",
+        );
+        assert_eq!(check(&ask(&cst), &bounds(&st)), Ok(()));
+    }
+
+    /// What no approval can give is named field by field: each of the route's three, and each of an
+    /// injection's four.
+    #[test]
+    fn unapprovable_names_each_differing_field() {
+        let p = zone("  inject: [{ host: api.github.com, header: Authorization, format: \"Bearer {secret}\", secret: gh }]\n");
+        assert_eq!(unapprovable(&p, &p), Vec::<String>::new(), "the parent's own");
+        for llm in ["{ provider: other }", "{ secret: other }", "{ upstream: 'https://x.example' }"] {
+            let c = zone(&format!("  llm: {llm}\n"));
+            let v = unapprovable(&c, &p);
+            assert_eq!(v.len(), 1, "{llm}: {v:?}");
+            assert!(v[0].starts_with("the model route must be this zone's own"), "{v:?}");
+        }
+        for inj in [
+            "{ host: x.github.com, header: Authorization, format: \"Bearer {secret}\", secret: gh }",
+            "{ host: api.github.com, header: X-Token, format: \"Bearer {secret}\", secret: gh }",
+            "{ host: api.github.com, header: Authorization, format: \"{secret}\", secret: gh }",
+            "{ host: api.github.com, header: Authorization, format: \"Bearer {secret}\", secret: other }",
+        ] {
+            let c = zone(&format!("  inject: [{inj}]\n"));
+            let v = unapprovable(&c, &p);
+            assert_eq!(v.len(), 1, "{inj}: {v:?}");
+            assert!(v[0].contains("only this zone's own credential injections"), "{v:?}");
+        }
+    }
+
+    /// The shortcuts `path_covered` takes before splitting: the same text, `/**`, and a literal
+    /// prefix under a parent's `Q/**`, which hold even for globs the splitter can't read.
+    #[test]
+    fn path_shortcuts_cover_what_splitting_cant() {
+        let g = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(path_covered(&g(&["/a/{b/c,d}*"]), "/a/{b/c,d}*"), "the same text");
+        assert!(path_covered(&g(&["/**"]), "/{a/b,c}*"), "everything");
+        assert!(path_covered(&g(&["/repos/acme/**"]), "/repos/acme/{a/b,c}*"), "under a literal prefix");
+        assert!(!path_covered(&g(&["/repos/ac*/**"]), "/repos/acme/{a/b,c}*"), "a wildcard prefix isn't literal");
+        assert!(!path_covered(&g(&["/repos/acme/**"]), "/repos/acmex/*"), "a prefix ends at a segment");
+    }
+
+    #[test]
+    fn segments_split_only_outside_groups_and_classes() {
+        let n = |g: &str| segments(g).map(|s| s.len());
+        assert_eq!(n("/a/{b,c}/d"), Some(3));
+        assert_eq!(n("/a/{b/c}"), None);
+        assert_eq!(n("/a/[/]"), None);
+        assert_eq!(n("/a/[x]/b"), Some(3));
+        assert_eq!(n("/a/[{]/b"), Some(3), "a brace in a class isn't a group");
+        assert_eq!(n("/a/[}]/b"), Some(3));
+        assert_eq!(n("a/b"), None, "not absolute");
+        // A trailing `**` is one or more segments.
+        assert!(segments_cover("/a/**", "/a/b"));
+        assert!(!segments_cover("/a/**", "/a"));
+    }
+
+    #[test]
+    fn byte_sizes_parse_each_suffix() {
+        let cases = [("2k", 2048), ("3m", 3 << 20), ("2g", 2 << 30), ("3b", 3), ("1.5k", 1536), ("7", 7), (" 512M ", 512 << 20)];
+        for (s, want) in cases {
+            assert_eq!(parse_bytes(s), Some(want), "{s}");
+        }
+        assert_eq!((parse_bytes("-1k"), parse_bytes("x"), parse_bytes("")), (None, None, None));
+    }
+
     #[test]
     fn a_narrower_zone_passes() {
         let p = parent();

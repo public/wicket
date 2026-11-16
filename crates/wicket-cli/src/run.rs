@@ -1049,20 +1049,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // Taken over from its node (#164): its time counts from when it started there.
         (None, None, None) => adopt.as_ref().map_or(0, |(at, _)| u64::try_from((wicket_feed::now_ms() - at).max(0) / 1000).unwrap_or(0)),
     };
-    let gs = dir.join("ctl/gateway.sock");
-    // Fail up front, naming the path, rather than in a task whose error nobody sees (#105).
-    wicket_proxy::sockpath::resolve(&gs).with_context(|| format!("the run proxy socket {}", gs.display()))?;
+    // The control host's half of the box's gateway (#257 slice 4b): the tools its node doesn't
+    // answer itself, which the node asks over the run's channel (`Msg::Call`). Nothing listens on a
+    // socket of the run's: the model, egress and gateway proxies are the node's.
     let gateway = Gateway::new(ctx.clone());
-    // The run's own gateway, which its node reaches for the MCP tools it doesn't decide yet: `ctl/`,
-    // not the box's `sock/`, which is the node's. The model and egress proxies are the node's alone
-    // (#257: no egress is forwarded here since slice 3, so nothing listens on `ctl/egress.sock`).
-    // It is bound and listening before it is served, so it is ready here, with no wait for its
-    // socket to appear (#287), and one that can't be bound fails the run, naming it.
-    let waited = std::time::Instant::now();
-    let listen = |s: &std::path::Path| wicket_proxy::sockpath::listen(s).with_context(|| format!("the run proxy socket {}", s.display()));
-    let gl = listen(&gs)?;
-    timings.since("proxies.sockets", waited);
-    let g_task = tokio::spawn(gateway.serve_on(gl));
     timings.since("proxies", proxies_lap);
     let lap = std::time::Instant::now();
 
@@ -1340,6 +1330,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             vault: ctx.vault.clone(),
             swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
+            gateway: gateway.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
         })
@@ -2322,7 +2313,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             println!("    {}", wicket_agent::clip(l, 300));
         }
     }
-    g_task.abort();
 
     // Typed output: the outbox, parsed and size-limited outside the box. (A node that lays out its
     // boxes sent it with the exit.)

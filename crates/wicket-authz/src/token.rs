@@ -140,13 +140,8 @@ impl GrantRequest {
 /// lone third-party block, so an out-of-process approver's reply needs one before this can cross a
 /// process boundary. The feed doesn't: the control host, which holds the approver key, appends
 /// grants itself and publishes the whole token, `wicket_feed::token`.)
+/// It has no serialized form here (#326 removed an unused `to_bytes`): it is appended in-process.
 pub struct SignedGrant(ThirdPartyBlock);
-
-impl SignedGrant {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, AuthzError> {
-        self.0.serialize().map_err(enc)
-    }
-}
 
 /// The approver's side: signs `grant` for the token that made `request`.
 pub fn sign_grant(request: GrantRequest, approver: &SigningKey, grant: &Grant) -> Result<SignedGrant, AuthzError> {

@@ -824,6 +824,31 @@ mod tests {
             .contains("api.example.com"));
     }
 
+    /// #326: an agent's grant must count its uses (bounds refuses one that doesn't, before
+    /// agent_terms would too), has at least one, and at most MAX_AGENT_USES; a human's may be
+    /// unlimited. Lifetimes are above 0 and at most MAX_TTL.
+    #[test]
+    fn a_grants_bounds_by_granter() {
+        let z: wicket_core::ZoneSpec = serde_yaml::from_str("name: z\n").unwrap();
+        let agent = Granter::Agent(AgentAuthority {
+            tenant: TenantId::single(),
+            run: RunId("run_p".into()),
+            zone: Arc::new(CompiledZone::new(z).unwrap()),
+            org: None,
+            until: wicket_store::now() + 3600,
+        });
+        let t =
+            |uses: Option<u32>, secs: u64| Verdict::Approve(Terms { uses, ttl: Duration::from_secs(secs), prefix: None, zone_wide: false });
+        let why = |by: &Granter, v: &Verdict| bounds(by, v).err().map(|e| e.to_string());
+        assert_eq!(why(&agent, &t(None, 60)).as_deref(), Some("an agent's grant needs a number of uses"));
+        assert_eq!(why(&agent, &t(Some(0), 60)).as_deref(), Some("a grant needs at least one use"));
+        assert_eq!(why(&agent, &t(Some(MAX_AGENT_USES), 60)), None);
+        assert!(why(&agent, &t(Some(MAX_AGENT_USES + 1), 60)).unwrap().contains("at most"));
+        assert_eq!(why(&human("ann"), &t(None, 60)), None, "a human's may be unlimited");
+        assert!(why(&human("ann"), &t(Some(1), 0)).is_some(), "a lifetime above 0");
+        assert_eq!(why(&agent, &Verdict::Deny), None);
+    }
+
     fn asked(l: &Ledger, path: &str) -> String {
         let op = Op::egress(&TenantId::single(), &RunId("run_a".into()), "z", "GET", "api.example.com", path);
         l.pending_for(&op, "blocked", None).unwrap().0
