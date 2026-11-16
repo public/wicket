@@ -510,6 +510,13 @@ pub(crate) mod tests {
         for bad in ["['']", "['*opus']", "['claude-*-4']", "['a b']"] {
             assert!(y(bad).is_err(), "{bad}");
         }
+        let with_model = |m: &str| {
+            Manifest::from_yaml(&format!(
+                "task: t\nagent: {{ name: a, model: {m} }}\nzone: {{ name: z, llm: {{ models: ['claude-opus-*'] }} }}\n"
+            ))
+        };
+        assert!(with_model("claude-opus-4-5").is_ok());
+        assert!(with_model("claude-sonnet-4-5").unwrap_err().to_string().contains("not in zone.llm.models"));
         let mut z = y("[claude-opus-4-5]").unwrap().zone;
         z.llm.as_mut().unwrap().models = Some(vec!["cl*ude".into()]);
         assert!(crate::CompiledZone::new(z).is_err(), "a spawned zone is checked too");

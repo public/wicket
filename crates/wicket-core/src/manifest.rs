@@ -862,6 +862,14 @@ impl Manifest {
                 }
                 // Whether the agent's harness takes a model route (`zone.llm`), its default route, and
                 // which ACP profiles exist are its adapter's: `wicket_agent::load` checks them.
+                if let (Some(m), Some(l)) = (&a.model, &self.zone.llm) {
+                    if !l.allows_model(m) {
+                        return Err(ManifestError::Invalid(format!(
+                            "agent.model {m:?} is not in zone.llm.models ({}): every call it made would be refused",
+                            l.models.as_deref().unwrap_or_default().join(", ")
+                        )));
+                    }
+                }
                 if a.image.as_deref().is_some_and(|i| i.trim().is_empty()) {
                     return Err(ManifestError::Invalid("agent.image is empty: name an image, or leave it out for the default".into()));
                 }
