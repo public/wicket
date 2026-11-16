@@ -1036,16 +1036,16 @@ pub fn fold_case_glob(glob: &str) -> String {
                 if !closed {
                     out.push_str(&body);
                 } else {
-                    // The other case of each letter and letter range (`a-z` gains `A-Z`), put right
-                    // after a leading `]` or `-` (literals there), so it never joins another range.
+                    // The other case of each letter, and of the letters inside each range (`a-z`
+                    // gains `A-Z`; a mixed range such as `0-z` or `a-~` gains the other case of the
+                    // letters it holds), put right after a leading `]` or `-` (literals there), so it
+                    // never joins another range.
                     let b: Vec<char> = body.chars().collect();
                     let mut extra = String::new();
                     let mut i = 0;
                     while i < b.len() {
                         if i + 2 < b.len() && b[i + 1] == '-' {
-                            if b[i].is_ascii_alphabetic() && b[i + 2].is_ascii_alphabetic() {
-                                extra.extend([swap(b[i]), '-', swap(b[i + 2])]);
-                            }
+                            fold_range(b[i], b[i + 2], &mut extra);
                             i += 3;
                         } else {
                             if b[i].is_ascii_alphabetic() {
@@ -1054,7 +1054,14 @@ pub fn fold_case_glob(glob: &str) -> String {
                             i += 1;
                         }
                     }
-                    let lead = usize::from(matches!(b.first(), Some(']' | '-')));
+                    // What stays first: a leading `]` or `-` (a literal only there), and the whole
+                    // range if it starts one (`--a`, `]-a`): the folded spelling of every other class
+                    // is what it always was.
+                    let lead = match b.first() {
+                        Some(']' | '-') if b.len() > 2 && b[1] == '-' => 3,
+                        Some(']' | '-') => 1,
+                        _ => 0,
+                    };
                     out.extend(&b[..lead]);
                     out.push_str(&extra);
                     out.extend(&b[lead..]);
@@ -1066,6 +1073,23 @@ pub fn fold_case_glob(glob: &str) -> String {
         }
     }
     out
+}
+
+/// Adds to `extra` the other case of the ASCII letters in the class range `lo-hi`: the lowercase
+/// letters it holds, as capitals, and the capitals it holds, as lowercase. Nothing for a reversed
+/// range (which globset refuses anyway) or one without letters.
+fn fold_range(lo: char, hi: char, extra: &mut String) {
+    for (first, last) in [('a', 'z'), ('A', 'Z')] {
+        let (from, to) = (lo.max(first), hi.min(last));
+        if from <= to {
+            let swap = |c: char| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+            if from == to {
+                extra.push(swap(from));
+            } else {
+                extra.extend([swap(from), '-', swap(to)]);
+            }
+        }
+    }
 }
 
 impl ReachRule {
@@ -1133,6 +1157,82 @@ mod tests {
         assert_eq!(z.wildcard_for("api.example.com"), None, "named exactly");
         assert_eq!(z.wildcard_for("other.org"), None);
     }
+
+    /// A folded glob matches a path exactly when the glob matches it in some ASCII case (the Lean
+    /// spec's `ciEq`, which it states for globs without classes), and a folded negated class matches
+    /// only what it excludes in neither case (the closure of the class is negated, so a forbid rule
+    /// written with one never forbids less than either spelling says): checked here for one-character
+    /// classes, exhaustively over printable ASCII, for every class body from a small alphabet of
+    /// letters of both cases, the punctuation around them in ASCII, and the class's own `-`, `]`,
+    /// `!` and `^`. Mixed ranges (a letter to a non-letter, or across cases) gain exactly the
+    /// other case of the letters inside them.
+    #[test]
+    fn a_folded_class_matches_a_character_in_either_case_and_nothing_else() {
+        let alphabet = ['a', 'c', 'z', 'A', 'C', 'Z', '-', '~', '0', '_', '`', '@', '[', ']', '!', '^'];
+        let swap = |c: char| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+        let mut bodies: Vec<String> = alphabet.iter().map(|c| c.to_string()).collect();
+        for _ in 0..2 {
+            let more: Vec<String> = bodies.iter().flat_map(|b| alphabet.iter().map(move |c| format!("{b}{c}"))).collect();
+            bodies.extend(more);
+        }
+        let (mut checked, mut wrong) = (0, vec![]);
+        for body in &bodies {
+            let glob = format!("/[{body}]");
+            // Only classes globset reads (a reversed range like `z-a` is an error either way).
+            let Ok(plain) = compile_glob(&glob) else { continue };
+            let folded = match compile_glob(&fold_case_glob(&glob)) {
+                Ok(m) => m,
+                Err(e) => {
+                    wrong.push(format!("{glob}: folded to {} which doesn't compile: {e}", fold_case_glob(&glob)));
+                    continue;
+                }
+            };
+            checked += 1;
+            for c in (0x20u8..0x7f).map(char::from).filter(|c| *c != '/') {
+                let path = format!("/{c}");
+                // A class matches in either case; a negated one, only what it doesn't exclude in either.
+                let negated = body.starts_with(['!', '^']);
+                let other = plain.is_match(format!("/{}", swap(c)));
+                let want = if negated { plain.is_match(&path) && other } else { plain.is_match(&path) || other };
+                if folded.is_match(&path) != want {
+                    wrong.push(format!(
+                        "{glob} folded to {}: {path:?} should {}match",
+                        fold_case_glob(&glob),
+                        if want { "" } else { "not " }
+                    ));
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} classes checked");
+        assert!(wrong.is_empty(), "{} wrong, such as:\n{}", wrong.len(), wrong.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+    }
+
+    /// The ranges #326's mutation testing found, by name.
+    #[test]
+    fn mixed_ranges_fold_the_letters_inside_them() {
+        let m = |g: &str| compile_glob(&fold_case_glob(g)).unwrap();
+        // A letter to a non-letter: a-z inside, so A-Z too.
+        let r = m("/[a-~]");
+        assert!(r.is_match("/b") && r.is_match("/B") && r.is_match("/~") && !r.is_match("/@"));
+        // A non-letter to a letter, from below the capitals: 0-Z holds A-Z, so a-z too.
+        let r = m("/x[0-Z]");
+        assert!(r.is_match("/X5") && r.is_match("/xq") && r.is_match("/XQ") && !r.is_match("/x_"));
+        // Across the cases: A-z (A-Z, [\]^_`, a-z).
+        let r = m("/[A-z]");
+        assert!(r.is_match("/q") && r.is_match("/Q") && r.is_match("/_") && !r.is_match("/~"));
+        // Part of the letters: Z-a holds Z and a (and [\]^_`), so z and A.
+        let r = m("/[Z-a]");
+        assert!(r.is_match("/z") && r.is_match("/A") && !r.is_match("/b") && !r.is_match("/Y"));
+        // A trailing dash is a literal, and stays one.
+        let r = m("/[a-]");
+        assert!(r.is_match("/A") && r.is_match("/-") && !r.is_match("/b"));
+        let r = m("/[x-]");
+        assert!(r.is_match("/X") && r.is_match("/-") && !r.is_match("/y"));
+        // A negated mixed range refuses both cases.
+        let r = m("/[!a-~]");
+        assert!(!r.is_match("/b") && !r.is_match("/B") && r.is_match("/@"));
+    }
+
     use super::*;
 
     /// #50: both rights default on, and a zone that doesn't restrict them serializes without the

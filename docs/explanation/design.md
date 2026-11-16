@@ -1235,7 +1235,7 @@ approvals; it isn't asked per action. With the control host unreachable, a box c
 its token covers, spawns a narrower child and uses an existing link on its node; only what needs a
 human queues on the node (#153), and what needs new authority waits.
 
-Decided on the node (protocol 5, `EDGE_DECISIONS`; an older node relays every tool call as before):
+Decided on the node (since protocol 5):
 - egress, grants, splicing, the model proxy and its budget slice, injected credentials (#57, #141,
   #152, #153);
 - `whoami` (the identity's stable claims, handed to the node at start), `request_access` (from the
