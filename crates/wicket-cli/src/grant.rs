@@ -98,10 +98,10 @@ pub fn within_authority(l: &Ledger, a: &AgentAuthority, req: &Request) -> Result
     }
     let method = req.method.to_ascii_uppercase();
     if !wicket_core::op::HTTP_METHODS.contains(&method.as_str()) {
-        bail!("a {} request is decided by a human", req.method);
+        bail!("a {} request is decided by an operator", req.method);
     }
     if req.scope_prefix {
-        bail!("a request for every path under a prefix is decided by a human");
+        bail!("a request for every path under a prefix is decided by an operator");
     }
     let mut op = Op::egress(&a.tenant, &RunId(req.run.clone()), &req.zone, &method, &req.host, &req.path);
     if let Some(why) = op.refused_for_agents() {
@@ -152,7 +152,7 @@ fn agent_terms(a: &AgentAuthority, req: &Request, t: &Terms) -> Result<()> {
     let Some(uses) = t.uses else { bail!("an agent's grant needs a number of uses") };
     // A push's grant is a window, not a number of uses (#26): a human's.
     if wicket_core::git::grant_terms(&req.method, &req.path, Some(uses), t.ttl.as_secs()) != (Some(uses), t.ttl.as_secs()) {
-        bail!("a git push is decided by a human");
+        bail!("a git push is decided by an operator");
     }
     outlasts(a, wicket_store::now().saturating_add(i64::try_from(t.ttl.as_secs()).unwrap_or(i64::MAX)), "grant")
 }
@@ -500,7 +500,7 @@ fn renew(l: &mut Ledger, by: &Granter, id: &str, ttl: Duration, extra: serde_jso
             }
             if let Granter::Agent(a) = by {
                 let Some(req) = g.request_id.as_deref().map(|r| l.request(r)).transpose()? else {
-                    bail!("grant {} answers no request: a human renews it", g.id);
+                    bail!("grant {} answers no request: an operator renews it", g.id);
                 };
                 let chain = within_authority(l, a, &req)?;
                 agent_renews(a, &g, &req, until)?;
@@ -574,7 +574,7 @@ fn agent_renews(a: &AgentAuthority, g: &wicket_store::GrantRow, req: &Request, u
         bail!("an agent renews only a grant with a number of uses");
     }
     if wicket_core::git::grant_terms(&g.method, &g.path, Some(1), 60) != (Some(1), 60) {
-        bail!("a git push is decided by a human");
+        bail!("a git push is decided by an operator");
     }
     outlasts(a, until, "grant")
 }
@@ -735,7 +735,7 @@ impl wicket_proxy::Decisions for AgentDecisions {
             )),
             Err(e) if renewing => Err(format!("{e:#}")),
             Err(e) => match l.request(id).map(|r| r.status) {
-                Ok(s) if s == "pending" => Err(format!("{e:#}; {id} stays pending for a human")),
+                Ok(s) if s == "pending" => Err(format!("{e:#}; {id} stays pending for an operator")),
                 _ => Err(format!("{e:#}")),
             },
         }
@@ -1058,7 +1058,7 @@ mod tests {
         for id in [&beyond, &write] {
             for d in ["approve", "deny"] {
                 let e = hook.decide(&t.signed(id, d, 1, 60)).unwrap_err();
-                assert!(e.contains("outside your own reach") && e.contains("stays pending for a human"), "{e}");
+                assert!(e.contains("outside your own reach") && e.contains("stays pending for an operator"), "{e}");
             }
             assert_eq!(t.status(id), "pending");
         }
@@ -1083,7 +1083,7 @@ mod tests {
         spawn.risk = wicket_core::RiskClass::R0Read;
         let sid = t.ledger.lock().unwrap().pending_for(&spawn, "beyond", None).unwrap().0;
         let e = hook.decide(&t.signed(&sid, "approve", 1, 60)).unwrap_err();
-        assert!(e.contains("decided by a human"), "{e}");
+        assert!(e.contains("decided by an operator"), "{e}");
         let prefix = {
             let op = Op::egress(&TenantId::single(), &RunId("run_c".into()), "z.c", "GET", "api.example.com", "/v1/");
             t.ledger.lock().unwrap().ask(&op, "pages", true, None).unwrap().0
@@ -1142,7 +1142,7 @@ mod tests {
             (0, 60, "at least one use".to_string()),
         ] {
             let e = hook.decide(&t.signed(&id, "approve", uses, ttl)).unwrap_err();
-            assert!(e.contains(&why) && e.contains("stays pending for a human"), "{e} should say {why:?}");
+            assert!(e.contains(&why) && e.contains("stays pending for an operator"), "{e} should say {why:?}");
         }
         assert_eq!(t.status(&id), "pending", "nothing was granted");
         let l = t.ledger.lock().unwrap();

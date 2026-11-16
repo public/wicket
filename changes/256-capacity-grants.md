@@ -12,7 +12,7 @@ type: Added
   principal, with its daily money as its amount. `wicket grant list` shows it, `wicket grant renew`
   and `revoke` work on it, and an operator whose `operators.yaml` authority lacks `capacity` may not
   issue or renew one. It is issued on a `decision` audit record (`decision: issue`).
-- The ledger's schema goes to version 8, an expand step: `grants.principal`, `grants.terms` and the
+- The ledger's schema goes to version 9, an expand step: `grants.principal`, `grants.terms` and the
   `capacity_uses` table.
 ---
 area: Placement

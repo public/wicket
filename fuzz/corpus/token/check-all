@@ -1,0 +1,1 @@
+Acheck all host($h), $h == "a";
