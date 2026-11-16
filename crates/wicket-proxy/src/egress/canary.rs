@@ -46,7 +46,7 @@ pub(crate) fn tripped_response(e: &anyhow::Error) -> Option<Response<BoxBody>> {
         &format!(
             "{}. A credential placeholder is only ever sent as `Authorization: Bearer <placeholder>` to its own host; anywhere else it is treated as an attempt to move it, and recorded. {} Do not retry it.{}",
             t.what,
-            crate::SANDBOX_FACT,
+            crate::BOX_FACT,
             t.note
         ),
         None,

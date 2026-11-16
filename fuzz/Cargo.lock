@@ -3384,6 +3384,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "memchr",
  "psl",
  "quinn",
  "rcgen",

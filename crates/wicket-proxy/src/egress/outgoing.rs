@@ -100,7 +100,7 @@ impl Egress {
                     502,
                     "upstream",
                     "Upstream error",
-                    &format!("refused: {why} (it was asked for an unencoded one). {}", crate::SANDBOX_FACT),
+                    &format!("refused: {why} (it was asked for an unencoded one). {}", crate::BOX_FACT),
                     None,
                 );
             }
