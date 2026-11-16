@@ -645,10 +645,18 @@ impl LlmSpec {
     }
 }
 
+/// Whether an `accept_from` entry names a principal (#250): an id (`spiffe://…`, the only form a
+/// principal's id takes, so with `://`), not a zone. A zone entry matches only the sender's zone and
+/// a principal entry only its id, so a list's two kinds never cross (and wicket-policy's Cedar,
+/// which reads the zone as the message's resource and the id as `context.sender`, says the same, #411).
+pub fn is_principal_entry(entry: &str) -> bool {
+    entry.contains("://")
+}
+
 /// Whether an `accept_from` list lets a sender in: it names the sender's zone, or (#250) the
 /// sender's principal id, when the caller knows it.
 pub fn accepts(accept_from: &[String], zone: &str, principal: Option<&str>) -> bool {
-    accept_from.iter().any(|a| a == zone || principal.is_some_and(|p| a == p))
+    accept_from.iter().any(|a| if is_principal_entry(a) { principal == Some(a.as_str()) } else { a == zone })
 }
 
 /// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
@@ -1139,6 +1147,9 @@ mod tests {
         assert!(!accepts(&list, "audit", Some("spiffe://w.test/t/t0/z/audit/a/other")), "not its zone-mates");
         assert!(!accepts(&list, "audit", None), "a principal entry needs the sender's id");
         assert!(!accepts(&[], "ops", Some("x")));
+        // #411: the kinds never cross: a zone entry isn't an id, a principal entry isn't a zone.
+        assert!(!accepts(&list, "audit", Some("ops")), "a zone entry matches the sender's zone only");
+        assert!(!accepts(&list, "spiffe://w.test/t/t0/z/audit/a/auditor", None), "a principal entry matches the sender's id only");
     }
 
     /// #326: a class's ranges are folded as ranges and its other letters one by one; a `-` at the

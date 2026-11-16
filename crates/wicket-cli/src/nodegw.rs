@@ -317,21 +317,18 @@ fn send_local(node: &Arc<Node>, run: &str, args: &Value) -> (String, bool) {
         ((run.to_string(), my_path, my_zone), (to_run, to_path, to_zone, org))
     };
     let ((_, my_path, my_zone), (to_run, to_path, to_zone, org)) = (mine, theirs);
+    let my_id = node.edge_start(run).and_then(|e| e.who.get("id").and_then(|v| v.as_str()).map(String::from));
     let relation = if to_path == format!("{my_path}/{to_run}") {
         "child"
     } else if my_path.rsplit_once('/').is_some_and(|(p, _)| p == to_path) {
         "parent"
-    } else if wicket_core::manifest::accepts(
-        &to_zone.accept_from,
-        &my_zone,
-        node.edge_start(run).and_then(|e| e.who.get("id").and_then(|v| v.as_str()).map(String::from)).as_deref(),
-    ) {
+    } else if wicket_core::manifest::accepts(&to_zone.accept_from, &my_zone, my_id.as_deref()) {
         "peer"
     } else {
         let why = format!("zone {} does not accept messages from zone {my_zone} (its accept_from does not list it)", to_zone.name);
         return refused_here(node, run, to, &why);
     };
-    if let Some(o) = org.filter(|o| !o.allows_message_from(&my_zone)) {
+    if let Some(o) = org.filter(|o| !o.allows_message_from(&my_zone, my_id.as_deref())) {
         let why = format!("the org policy ({}) doesn't let zone {} hear from zone {my_zone}", o.version, to_zone.name);
         return refused_here(node, run, to, &why);
     }

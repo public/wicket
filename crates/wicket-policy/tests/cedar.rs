@@ -98,6 +98,19 @@ fn what_cant_be_decided_at_the_edge_doesnt_compile() {
     ] {
         assert!(org(&policy).is_err(), "{why} compiled: {policy}");
     }
+    // #411: a message permit is one `accept_from` kind, each in its own form; refused by the
+    // compiler (they validate).
+    let msg = |cond: &str| format!(r#"permit(principal, action == Action::"message", resource) when {{ {cond} }};"#);
+    for (why, policy) in [
+        ("a zone and a sender in one conjunction", msg(r#"resource == Zone::"ops" && context.sender == "spiffe://w/a/x""#)),
+        ("a negated sender", msg(r#"context.sender != "spiffe://w/a/x""#)),
+        ("a sender that isn't an id", msg(r#"context.sender == "ops""#)),
+        ("an id as a zone", msg(r#"resource in [Zone::"spiffe://w/a/x"]"#)),
+    ] {
+        let e = org(&policy).expect_err(&format!("{why} compiled: {policy}"));
+        assert!(!e.contains("validate"), "{why}: {e}");
+    }
+    assert_eq!(org(&msg(r#"["spiffe://w/a/x", "spiffe://w/a/y"].contains(context.sender)"#)).unwrap().msg_from.unwrap().len(), 2);
     // Strict validation: an attribute some of the scope's actions don't have.
     assert!(org(r#"permit(principal, action, resource) when { resource.host == "x" };"#).unwrap_err().contains("validate"));
 }
@@ -149,6 +162,8 @@ const GLOBS: [&str; 6] = ["/repos/acme/**", "/repos/*/x", "/admin/**", "/**", "/
 const LIKES: [&str; 4] = ["/admin*", "*/x", "/a/*/c", "*"];
 const IMAGES: [&str; 3] = ["img:agent", "img:rust", "img:py"];
 const ZONES: [&str; 3] = ["ops", "dev-api", "other"];
+/// Principal ids an `accept_from` may name (#250): one in a listed zone, one outside every zone named.
+const IDS: [&str; 2] = ["spiffe://w.test/t/t0/z/ops/a/auditor", "spiffe://w.test/t/t0/z/audit/a/reviewer"];
 
 fn s(v: &str) -> String {
     wicket_policy::zone::lit(v)
@@ -208,6 +223,12 @@ fn random_org(rng: &mut Rng) -> String {
                 [1 << 28, 1 << 30][rng.below(2)]
             ));
             out.push(format!(r#"permit(principal, action == Action::"message", resource == Zone::{});"#, s(rng.pick(&ZONES))));
+            if rng.chance(50) {
+                out.push(format!(
+                    r#"permit(principal, action == Action::"message", resource) when {{ context.sender == {} }};"#,
+                    s(rng.pick(&IDS))
+                ));
+            }
             out.push(r#"permit(principal, action == Action::"inject", resource == Secret::"gh-app-acme") when { context.host == "api.github.com" && context.header == "Authorization" };"#.into());
         }
     }
@@ -224,7 +245,7 @@ fn random_org(rng: &mut Rng) -> String {
 enum Req {
     Http { method: String, host: String, path: String, risk: RiskClass, inject: Option<(String, String, String)> },
     Spawn { image: String, isolation: i64, mem: i64 },
-    Msg { from: String },
+    Msg { from: String, sender: Option<String> },
 }
 
 fn random_req(rng: &mut Rng, zone_globs: &[String], zone: &ZoneSpec) -> Req {
@@ -243,7 +264,7 @@ fn random_req(rng: &mut Rng, zone_globs: &[String], zone: &ZoneSpec) -> Req {
     }
     match rng.below(10) {
         0 => Req::Spawn { image: rng.pick(&IMAGES).to_string(), isolation: [1, 2][rng.below(2)], mem: [256 << 20, 2 << 30][rng.below(2)] },
-        1 => Req::Msg { from: rng.pick(&ZONES).to_string() },
+        1 => Req::Msg { from: rng.pick(&ZONES).to_string(), sender: [None, Some(IDS[0]), Some(IDS[1])][rng.below(3)].map(String::from) },
         _ => {
             let risks = [
                 RiskClass::R0Read,
@@ -384,12 +405,13 @@ impl Cedar {
                 let (k, org) = one("spawn", Self::uid("Image", image), ctx, e);
                 (if k == NEEDS_GRANT { FORBIDDEN } else { k }, org)
             }
-            Req::Msg { from } => {
+            Req::Msg { from, sender } => {
                 let mut e = ents.clone();
                 if !e.iter().any(|x| x.uid() == Self::uid("Zone", from)) {
                     e.push(Entity::new_no_attrs(Self::uid("Zone", from), HashSet::new()));
                 }
-                let (k, org) = one("message", Self::uid("Zone", from), vec![], e);
+                let ctx = vec![("sender", RestrictedExpression::new_string(sender.clone().unwrap_or_default()))];
+                let (k, org) = one("message", Self::uid("Zone", from), ctx, e);
                 (if k == NEEDS_GRANT { FORBIDDEN } else { k }, org)
             }
         }
@@ -408,7 +430,7 @@ fn token_request(r: &Req) -> Request {
         Req::Spawn { image, isolation, mem } => {
             Action::Spawn { image: image.clone(), isolation: *isolation, mem_bytes: *mem, cpus_milli: 250, pids: 64, timeout_s: 900 }
         }
-        Req::Msg { from } => Action::Msg { from: from.clone() },
+        Req::Msg { from, sender } => Action::Msg { from: from.clone(), sender: sender.clone() },
     };
     Request { time: T0 + 60, tenant: TENANT.into(), box_id: "b0".into(), epoch: 1, action, uses_left: vec![] }
 }
@@ -433,7 +455,7 @@ fn cedar_and_the_compiled_token_agree() {
     let mut zones: Vec<ZoneSpec> = common::example_zones();
     zones.push(
         wicket_core::yaml::from_str(
-            "name: dev-api\nreach:\n  - { host: api.github.com, methods: [GET, PUT, POST], paths: ['/repos/acme/**'] }\n  - { host: '*.githubusercontent.com', methods: [GET] }\n  - { host: example.com, methods: [GET, DELETE], paths: ['/admin/**'], allow_dangerous: true }\nforbid:\n  - { host: api.github.com, paths: ['/admin/**'] }\ninject:\n  - { host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh-app-acme }\nimages: [img:rust]\naccept_from: [ops]\nlimits: { memory: 1g, cpus: 1, timeout: 1h }\n",
+            "name: dev-api\nreach:\n  - { host: api.github.com, methods: [GET, PUT, POST], paths: ['/repos/acme/**'] }\n  - { host: '*.githubusercontent.com', methods: [GET] }\n  - { host: example.com, methods: [GET, DELETE], paths: ['/admin/**'], allow_dangerous: true }\nforbid:\n  - { host: api.github.com, paths: ['/admin/**'] }\ninject:\n  - { host: api.github.com, header: Authorization, format: 'Bearer {secret}', secret: gh-app-acme }\nimages: [img:rust]\naccept_from: [ops, 'spiffe://w.test/t/t0/z/audit/a/reviewer']\nlimits: { memory: 1g, cpus: 1, timeout: 1h }\n",
         )
         .unwrap(),
     );
@@ -487,7 +509,7 @@ fn cedar_and_the_compiled_token_agree() {
                             && inject.as_ref().is_none_or(|(h, hd, s)| layer.allows_inject(&format!("{h}|{hd}|{s}")))
                     }
                     Req::Spawn { image, isolation, mem } => layer.allows_spawn(image, *isolation, *mem, 250, 64, 900),
-                    Req::Msg { from } => layer.allows_message_from(from),
+                    Req::Msg { from, sender } => layer.allows_message_from(from, sender.as_deref()),
                 };
                 assert_eq!(ir_ok, org_ok, "the org IR evaluator: zone {}, {r:?}\norg policy:\n{text}", z.name);
                 kinds[want as usize] += 1;
@@ -548,6 +570,63 @@ fn cedar_and_the_compiled_token_agree() {
     eprintln!("{granted} granted requests checked");
     assert!(kinds.iter().all(|&k| k > 400), "every outcome well exercised: {kinds:?}");
     assert!(granted > 200, "grants exercised: {granted}");
+}
+
+/// #411: an `accept_from`'s zone and principal entries read alike everywhere: the gateway's
+/// `accepts`, Cedar's own `is_authorized` on the zone's generated policy (and on that permit as an
+/// org policy), the token compiled from them, and the org layer's evaluator. Every subset of the
+/// entries, against senders of every zone with every id (none, listed, unlisted, and ones of the
+/// other kind's form).
+#[test]
+fn accept_from_reads_alike_in_cedar_the_token_and_accepts() {
+    let keys = Keys::new(0);
+    let entries = ["ops", "other", IDS[0], IDS[1], "spiffe://w.test/t/t0/z/dev-api/a/me"];
+    let from_zones = ["ops", "other", "audit", "dev-api", IDS[0]];
+    let ids = [None, Some(IDS[0]), Some(IDS[1]), Some("spiffe://w.test/t/t0/z/other/a/x"), Some("ops"), Some("")];
+    let permit_all = compile::parse("permit(principal, action, resource);").unwrap();
+    let (mut checked, mut allowed) = (0usize, 0usize);
+    for mask in 0u32..1 << entries.len() {
+        let list: Vec<String> = entries.iter().enumerate().filter(|(i, _)| mask & 1 << i != 0).map(|(_, e)| e.to_string()).collect();
+        let yaml = format!("name: dev-api\naccept_from: [{}]\n", list.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(", "));
+        let z: ZoneSpec = wicket_core::yaml::from_str(&yaml).unwrap();
+        let base = Ceiling::from_zone(&z, "b0", T0 + 3600, vec![keys.approver.public()]).unwrap();
+        let (zone_text, _) = wicket_policy::zone_layer(&z, &base).unwrap();
+        // The zone's message permit, as an org policy of its own.
+        let org_text = zone_text.find("@id(\"messages\")").map_or("", |i| &zone_text[i..]).to_string();
+        let org_policy = OrgPolicy::parse(&org_text, "[]").unwrap_or_else(|e| panic!("{e}\n{org_text}"));
+        let m = MintCtx { zone: z.name.clone(), tenant: TENANT.into(), principal: "human:alex".into(), depth: 0, groups: BTreeSet::new() };
+        let org_layer = org_policy.layer(&m).unwrap_or_else(|e| panic!("{e}\n{org_text}"));
+        let mut org_list = org_layer.msg_from.clone().expect("a message list");
+        org_list.sort();
+        let mut want_list = list.clone();
+        want_list.sort();
+        assert_eq!(org_list, want_list, "the permit compiles back to its list\n{org_text}");
+        let c = wicket_policy::ceiling(&z, "b0", T0 + 3600, vec![keys.approver.public()], &[], None).unwrap();
+        assert_eq!(canon(&c).accept_from, canon(&base).accept_from, "{zone_text}");
+        let token = wicket_authz::mint(&keys.root, TENANT, "human:alex", &c).unwrap();
+        let loaded = load(&token.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap();
+        let with_org = wicket_policy::ceiling(&z, "b0", T0 + 3600, vec![keys.approver.public()], &[], Some(org_layer.clone())).unwrap();
+        let org_token = wicket_authz::mint(&keys.root, TENANT, "human:alex", &with_org).unwrap();
+        let org_loaded = load(&org_token.to_bytes().unwrap(), &keys.root.public(), &|_| false).unwrap();
+        let zone_cedar = Cedar { org: permit_all.clone(), zone: compile::parse(&zone_text).unwrap(), ents: vec![], globs: BTreeSet::new() };
+        let org_cedar = Cedar { org: org_policy.policy_set().clone(), zone: permit_all.clone(), ents: vec![], globs: BTreeSet::new() };
+        for from in from_zones {
+            for id in ids {
+                let want = wicket_core::manifest::accepts(&list, from, id);
+                let r = Req::Msg { from: from.into(), sender: id.map(String::from) };
+                let what = format!("accept_from {list:?}, from zone {from:?}, id {id:?}");
+                assert_eq!(zone_cedar.decide_with_org(&z.name, &r).0 == ALLOW, want, "Cedar (zone): {what}\n{zone_text}");
+                assert_eq!(org_cedar.decide_with_org(&z.name, &r).1, want, "Cedar (org): {what}\n{org_text}");
+                assert_eq!(kind(&loaded.decide(&token_request(&r))) == ALLOW, want, "the token: {what}");
+                assert_eq!(kind(&org_loaded.decide(&token_request(&r))) == ALLOW, want, "the token with the org layer: {what}");
+                assert_eq!(org_layer.allows_message_from(from, id), want, "the org layer's evaluator: {what}");
+                checked += 1;
+                allowed += want as usize;
+            }
+        }
+    }
+    eprintln!("{checked} message decisions agree ({allowed} allowed)");
+    assert!(allowed > 100 && checked - allowed > 100, "both outcomes exercised: {allowed} of {checked}");
 }
 
 /// Nothing on a node evaluates Cedar: the crates a node runs on don't depend on it (Cargo.lock).

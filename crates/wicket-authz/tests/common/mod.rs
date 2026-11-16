@@ -107,7 +107,7 @@ pub fn level(level: usize, grant_keys: Vec<PublicKey>) -> Ceiling {
             timeout_s: 8 * 3600,
         },
         llm: LlmBudget { max_requests: 3000, max_output_tokens: 4_000_000 },
-        accept_from: vec!["ops".into()],
+        accept_from: vec!["ops".into(), "spiffe://w.test/t/t0/z/ops/a/auditor".into()],
         grant_keys,
         org: None,
     };
@@ -188,7 +188,7 @@ pub fn base_request(leaf: usize) -> Request {
         tenant: TENANT.into(),
         box_id: box_id(leaf),
         epoch: 3,
-        action: Action::Msg { from: "ops".into() },
+        action: Action::Msg { from: "ops".into(), sender: None },
         uses_left: vec![("g-7f3a".into(), 1)],
     }
 }
