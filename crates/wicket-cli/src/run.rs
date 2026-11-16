@@ -851,6 +851,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     timings.since("policy.org", lap);
     // Its limits (#256): the amounts of its quota grants. A root run's zone budget is recorded as
     // its own first, made by who started it; a child's its parent recorded before starting it.
+    let lap = std::time::Instant::now();
     let limits = {
         let start = match (&record, &parent_run) {
             (Some(_), _) => crate::quotas::Start::Reattached,
@@ -859,6 +860,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         };
         crate::quotas::at_start(&ledger.lock().expect("ledger"), &m, &run, start)?
     };
+    timings.since("quotas", lap);
     let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
