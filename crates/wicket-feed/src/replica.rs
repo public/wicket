@@ -660,6 +660,11 @@ impl<P: Policy> Replica<P> {
                 match self.heads.get(&f.epoch) {
                     Some(h) if *h == f.head => {}
                     Some(_) => return Err(Refusal::Fork(format!("statement head differs at epoch {}", f.epoch))),
+                    // Signed before the newest statement held, for an epoch older than the history
+                    // the node holds (it was caught up from a later snapshot meanwhile): it can't
+                    // take effect, and there is nothing to check it against. Another run's honest
+                    // statement, delivered late over its own connection, not a rollback (#300).
+                    None if superseded => return Ok(Plan::Superseded),
                     None => {
                         return Err(Refusal::Rollback(format!(
                             "statement epoch {} is older than the history held (epoch {})",

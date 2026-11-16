@@ -230,3 +230,11 @@ fn without_the_start_by_a_box_starts_past_its_nodes_lease() {
     let o = wicket_sim::placement::Options { start_by: false, ..Default::default() };
     placement_without("start-by", 32_000_006, o, "started on node");
 }
+
+/// Found by the fresh-seed sweep after #395–#399: a run's statement, signed before another run's
+/// and delivered late, named an epoch older than the history its node held (the node had been
+/// caught up from a later snapshot) and was refused as a rollback. It is superseded.
+#[test]
+fn placement_seed_50002077_takes_a_late_statement_as_superseded() {
+    nightly_placement_seed(50_002_077);
+}
