@@ -39,6 +39,7 @@ The documentation has four kinds of page, each with one job ([Diátaxis](https:/
 - [Update wicket and roll back](how-to/update-and-roll-back.md)
 - [Update from CI-signed builds](how-to/update-from-ci.md), and follow main
 - [Run wicket in wicket](how-to/run-wicket-in-wicket.md)
+- [Use wicket's skills](how-to/use-wickets-skills.md) in Claude Code: the plugin, and the skill every box has
 - [Run the gates for a change](how-to/run-the-gates-for-a-change.md)
 - [Run the acceptance tests](how-to/run-the-acceptance-tests.md)
 

@@ -46,6 +46,11 @@ pub const CHANNELS_IN_BOX: bool = false;
 /// Claude Code's config directory, under the box's state dir (`CLAUDE_CONFIG_DIR`).
 pub const STATE_SUBDIR: &str = "claude";
 
+/// Where wicket's guide for an agent in a box ([`crate::BOX_SKILL`]) goes under the box's state dir:
+/// a personal skill in Claude Code's config directory (`$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md`),
+/// so every Claude Code in a box has it, whatever its workspace holds.
+pub const BOX_SKILL_FILE: &str = "claude/skills/wicket-box/SKILL.md";
+
 /// The host's own Claude Code login, relative to `$HOME`: a wrapped session keeps its non-secret
 /// fields (scopes, plan).
 pub const HOST_CREDENTIALS: &str = ".claude/.credentials.json";

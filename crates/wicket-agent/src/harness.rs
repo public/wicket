@@ -291,7 +291,12 @@ fn claude_state(m: &Manifest) -> (Vec<String>, Vec<(String, Vec<u8>)>) {
         return (vec![], vec![]);
     }
     let settings = serde_json::to_vec_pretty(&crate::claude_settings(m)).unwrap_or_default();
-    (vec![claude::STATE_SUBDIR.into()], vec![(format!("{}/settings.json", claude::STATE_SUBDIR), settings)])
+    let files = vec![
+        (format!("{}/settings.json", claude::STATE_SUBDIR), settings),
+        // wicket's guide for an agent in a box, as one of Claude Code's own skills.
+        (claude::BOX_SKILL_FILE.into(), crate::BOX_SKILL.as_bytes().to_vec()),
+    ];
+    (vec![claude::STATE_SUBDIR.into()], files)
 }
 
 /// Claude Code, driven over stream-json; Remote Control is its remote mode, and its Remote Control
@@ -470,7 +475,11 @@ impl Adapter for Acp {
     }
 
     fn state_files(&self, m: &Manifest) -> Vec<(String, Vec<u8>)> {
-        claude_state(m).1
+        if runs_claude_code(m) {
+            return claude_state(m).1;
+        }
+        // Any other ACP agent: wicket's guide as a plain file, which its notice points to.
+        vec![(crate::BOX_GUIDE_FILE.into(), crate::box_guide().as_bytes().to_vec())]
     }
 
     fn plan(&self, m: &Manifest, run: &RunId, session: &AgentSession, _first: &str) -> Result<LaunchPlan, String> {
@@ -542,6 +551,10 @@ mod tests {
         assert_eq!(a.state_dirs(&m), ["claude"]);
         let files = a.state_files(&m);
         assert_eq!(files[0].0, "claude/settings.json");
+        // wicket's guide is one of Claude Code's skills, in its config directory, as the plugin ships it.
+        let skill = files.iter().find(|(r, _)| r == claude::BOX_SKILL_FILE).expect("the wicket-box skill");
+        assert!(claude::BOX_SKILL_FILE.starts_with(&format!("{}/skills/", claude::STATE_SUBDIR)));
+        assert_eq!(skill.1, crate::BOX_SKILL.as_bytes());
         assert_eq!(a.login(&m), Some(Login { secret: "claude-oauth".into(), host: "api.anthropic.com" }));
         assert!(a.is_runtime(&m, "claude -p --input-format stream-json"));
         assert!(a.is_runtime(&m, "/usr/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"));
@@ -552,10 +565,27 @@ mod tests {
     }
 
     #[test]
+    fn the_box_guide_is_the_wicket_box_skill() {
+        let fm = crate::BOX_SKILL.strip_prefix("---\n").expect("the skill starts with its frontmatter");
+        let fm = &fm[..fm.find("\n---\n").expect("the frontmatter ends")];
+        assert!(fm.lines().any(|l| l == "name: wicket-box"));
+        assert!(fm.lines().any(|l| l.starts_with("description: ")));
+        // The guide is the body alone: Markdown, starting with its title.
+        let guide = crate::box_guide();
+        assert!(guide.starts_with("# ") && !guide.contains("\nname: wicket-box\n"));
+        assert!(crate::BOX_SKILL.ends_with(guide));
+    }
+
+    #[test]
     fn a_generic_acp_agent_has_no_claude_and_no_remote_or_wrapped_mode() {
         let m = crate::load("task: hi\nagent: { name: a, harness: acp, acp: { command: [x] } }\nzone: { name: z }\n").unwrap();
         let a = of(&m).unwrap();
-        assert!(a.state_dirs(&m).is_empty() && a.state_files(&m).is_empty() && a.login(&m).is_none());
+        assert!(a.state_dirs(&m).is_empty() && a.login(&m).is_none());
+        // No Claude config, but wicket's guide as a plain file, which the agent's notice names.
+        assert_eq!(a.state_files(&m), vec![(crate::BOX_GUIDE_FILE.to_string(), crate::box_guide().as_bytes().to_vec())]);
+        let p = a.plan(&m, &RunId("run_1".into()), &AgentSession::new(), "hi").unwrap();
+        let guide = format!("{}/{}", crate::STATE_DIR, crate::BOX_GUIDE_FILE);
+        assert!(p.acp.unwrap().system_prompt.contains(&guide));
         assert!(!a.is_runtime(&m, "claude -p"));
         let run = RunId("run_1".into());
         assert!(a.remote_plan(&m, &run, &Value::Null).err().unwrap().contains("no remote mode"));
@@ -571,6 +601,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.state_files(&claude)[0].0, "claude/settings.json");
+        assert!(a.state_files(&claude).iter().any(|(r, _)| r == claude::BOX_SKILL_FILE));
+        let p = a.plan(&claude, &run, &AgentSession::new(), "hi").unwrap();
+        assert!(!p.acp.unwrap().system_prompt.contains(crate::BOX_GUIDE_FILE));
         assert!(a.is_runtime(&claude, "claude -p"));
     }
 }
