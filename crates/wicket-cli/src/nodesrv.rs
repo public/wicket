@@ -59,6 +59,7 @@ mod gateway;
 mod gw;
 mod images;
 mod links;
+mod volumes;
 use conn::*;
 use gateway::*;
 use links::*;
@@ -483,6 +484,34 @@ impl Node {
             let _ = l.out.send(Frame::Msg(status.clone()));
         }
         true
+    }
+
+    /// Deletes what has outlived its retention (#377): runs' caches and unused kept volumes, never
+    /// a workspace, and never a volume a running box has. Audited.
+    fn sweep_volumes(&self) -> usize {
+        let (running, in_use): (std::collections::HashSet<String>, Vec<PathBuf>) = {
+            let boxes = self.boxes.lock().expect("boxes");
+            let live = boxes.iter().filter(|(_, b)| b.exited.is_none());
+            let mut in_use = vec![];
+            for (_, b) in live.clone() {
+                let st = &b.record.start;
+                for (name, _) in &st.volumes {
+                    in_use.push(volumes::dir_for(st, name, self.paths.volumes().join(&st.tenant).join(&st.zone).join(name), &b.dir));
+                }
+            }
+            (boxes.keys().cloned().collect(), in_use)
+        };
+        let swept = volumes::sweep(&self.paths.volumes(), &self.paths.runs(), &|r| running.contains(r), &in_use, (self.clock)());
+        for (dir, why) in &swept {
+            eprintln!("[node] deleted {}: {why}", dir.display());
+            let _ = self.audit.lock().expect("audit").audit(
+                &wicket_core::TenantId::single(),
+                None,
+                "volume.expired",
+                &serde_json::json!({ "dir": dir.display().to_string(), "why": why }),
+            );
+        }
+        swept.len()
     }
 
     /// Sends this node's health on every connection that takes it (#377).
@@ -943,6 +972,10 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
                 if tick5.is_multiple_of(5) {
                     n.recover_feed();
                 }
+                // Volumes past their retention, hourly (and soon after start).
+                if tick5 % 3600 == 30 {
+                    n.sweep_volumes();
+                }
                 if tick5.is_multiple_of(60) && n.feed_stalled.lock().expect("stalled").is_none() {
                     if let Ok(true) = n.reserve.take() {
                         eprintln!("[node] disk reserve: taken back ({} MiB)", n.reserve.size >> 20);
@@ -1294,12 +1327,14 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
         }
         // A long-lived agent's durable volume is its own, kept with its state in the run's
         // directory (and moved when it hibernates); any other is the zone's.
+        // Otherwise it is the zone's, kept across runs, or the run's own cache (#377).
         let d = match bs.long_lived && bs.durable.iter().any(|(n, _)| n == name) {
             true => dir.join("volumes").join(name),
-            false => node.paths.volumes().join(&bs.tenant).join(&bs.zone).join(name),
+            false => volumes::dir_for(&bs, name, node.paths.volumes().join(&bs.tenant).join(&bs.zone).join(name), &dir),
         };
         std::fs::create_dir_all(&d)?;
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+        volumes::used(&bs, name, &d, (node.clock)());
         volume_mounts.push(Mount { host: d, target: target.clone(), read_only: false });
     }
 
@@ -1507,6 +1542,7 @@ fn child_start(
         image_pin: plan.image_pin.clone(),
         timings: parent.timings,
         memory_advice: m.zone.limits.memory_advice().map(str::to_string),
+        volume_life: Some(chan::VolumeLife::of(m)),
     })
 }
 
@@ -2065,6 +2101,13 @@ async fn finish(n: &Arc<Node>, run: &str, box_name: &str, code: i32, mut t: Exit
     }
     let _ = n.docker.remove(box_name).await;
     t.step("node.teardown.rm");
+    // Its caches' retention starts now; its kept volumes were last used now (#377).
+    if let Some(d) = &dir {
+        let start = n.boxes.lock().expect("boxes").get(run).map(|b| b.record.start.clone());
+        if let Some(bs) = start {
+            volumes::box_ended(&bs, &n.paths.volumes(), d, (n.clock)());
+        }
+    }
     if let Some(d) = &dir {
         let _ = std::fs::remove_file(d.join(BoxRecord::FILE));
     }
@@ -2588,7 +2631,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(a.feed(b"yy\nyy\nz"), Some(b"yy\nz".to_vec()));
     }
 
-    fn fake_record(run: &str) -> BoxRecord {
+    pub(super) fn fake_record(run: &str) -> BoxRecord {
         BoxRecord {
             start: BoxStart {
                 run: run.into(),
@@ -2625,6 +2668,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
                 image_pin: None,
                 timings: false,
                 memory_advice: None,
+                volume_life: None,
             },
             image_digest: None,
             name: format!("wicket-{run}"),

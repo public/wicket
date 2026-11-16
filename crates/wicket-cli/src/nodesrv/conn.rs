@@ -342,9 +342,12 @@ pub(super) async fn handle(node: &Arc<Node>, gen: u64, tunnels: &Tunnels, f: Fra
                 node.seen.forget(&run);
                 if let Some(b) = b {
                     b.tasks.iter().for_each(|t| t.abort());
-                    // The control host's own node shares the run's directory with the run: that stays.
+                    // The control host's own node shares the run's directory with the run: that stays,
+                    // but for the run's caches (#377).
                     if !node.paths.shares_host() && b.dir.starts_with(node.paths.runs()) {
                         let _ = std::fs::remove_dir_all(&b.dir);
+                    } else if b.dir.starts_with(node.paths.runs()) {
+                        super::volumes::drop_caches(&b.dir);
                     }
                 }
             }

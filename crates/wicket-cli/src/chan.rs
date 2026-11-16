@@ -224,6 +224,11 @@ pub struct BoxStart {
     /// near its memory limit. A node that doesn't know this field warns without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_advice: Option<String>,
+    /// Which of [`Self::volumes`] the node keeps across runs and for how long (#377); the others
+    /// are the run's own cache. None, from a control host before it: every volume is kept, as
+    /// before.
+    #[serde(default)]
+    pub volume_life: Option<Vec<VolumeLife>>,
 }
 
 /// One credential the node swaps in for a box (#257): toward `host`, a request carrying exactly
@@ -327,6 +332,26 @@ pub struct EdgeSpawn {
 
 fn default_output_cap() -> u64 {
     64 << 20
+}
+
+/// What becomes of a box's volume (#377): kept across runs (deleted once unused for
+/// `retention_secs`, if set), or the run's own cache (deleted when the run's work is collected, or
+/// `retention_secs` after the run ends).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeLife {
+    pub name: String,
+    pub keep: bool,
+    pub retention_secs: Option<u64>,
+}
+
+impl VolumeLife {
+    pub fn of(m: &wicket_core::Manifest) -> Vec<VolumeLife> {
+        m.zone
+            .volumes
+            .iter()
+            .map(|v| VolumeLife { name: v.name.clone(), keep: v.keep, retention_secs: v.retention().ok().flatten().map(|d| d.as_secs()) })
+            .collect()
+    }
 }
 
 /// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).
