@@ -546,6 +546,13 @@ fn socket_slots_are_capped_per_console_session_and_in_all_and_freed_on_drop() {
     assert_eq!(mine.len() + others.len(), MAX_SOCKETS);
     drop(mine);
     assert_eq!(socks.lock().unwrap().open("a"), (MAX_SOCKETS - MAX_SOCKETS_PER_SESSION, 0));
+    let mut again = Slot::take(&socks, "a").expect("freed");
+    // #364: who watches which run, until the socket drops.
+    again.watch("cred-1", "run_w");
+    assert!(socks.lock().unwrap().watching("cred-1", "run_w"));
+    assert!(!socks.lock().unwrap().watching("cred-2", "run_w") && !socks.lock().unwrap().watching("cred-1", "run_x"));
+    drop(again);
+    assert!(!socks.lock().unwrap().watching("cred-1", "run_w"));
     let again = Slot::take(&socks, "a").expect("freed");
     drop((again, others));
     assert_eq!(socks.lock().unwrap().open("a"), (0, 0));

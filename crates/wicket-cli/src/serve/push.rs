@@ -883,6 +883,63 @@ mod tests {
         serde_json::from_slice(&o.payload).unwrap()
     }
 
+    fn rs(id: &str, status: &str, activity: Option<&str>) -> wicket_store::RunState {
+        wicket_store::RunState { id: id.into(), agent: format!("agent-{id}"), status: status.into(), activity: activity.map(String::from) }
+    }
+
+    /// #364: a turn's end (busy to idle) and a run's end are announced; what was so at the first
+    /// look, a hibernation, a supersession and other activity changes are not; a failure says only
+    /// its status's first word.
+    #[test]
+    fn turns_and_runs_ending_are_noticed() {
+        let mut w = RunWatch::default();
+        assert!(w.changes(&[rs("a", "running", Some("idle")), rs("b", "failed (x)", None)]).is_empty(), "first look");
+        assert!(w.changes(&[rs("a", "running", Some("busy")), rs("c", "running", Some("busy"))]).is_empty());
+        let n = w.changes(&[rs("a", "running", Some("idle")), rs("c", "running", Some("waiting"))]);
+        assert_eq!(n, [RunNote { run: "a".into(), agent: "agent-a".into(), event: RunEvent::TurnDone }]);
+        let n = w.changes(&[
+            rs("a", "succeeded", None),
+            rs("c", "failed (ACP: the agent's secret words)", None),
+            rs("d", "running", Some("busy")),
+        ]);
+        assert_eq!(n.iter().map(|n| n.event.clone()).collect::<Vec<_>>(), [RunEvent::Finished, RunEvent::Failed("failed".into())]);
+        assert!(w.changes(&[rs("d", "hibernated", None)]).is_empty(), "asleep, not ended");
+        let mut w = RunWatch::default();
+        w.changes(&[rs("e", "running", None)]);
+        assert_eq!(w.changes(&[rs("e", "timeout", None)])[0].event, RunEvent::Failed("timeout".into()));
+    }
+
+    /// Run pushes: their own topic, coalesced per device, the agent's name only for a device that
+    /// opted in, and none about a run its operator is watching.
+    #[test]
+    fn run_pushes_are_coalesced_minimal_and_skip_a_watched_run() {
+        let note = |run: &str, event| RunNote { run: run.into(), agent: "lead".into(), event };
+        let (plain, detailed) = (sub("p", false), sub("d", true));
+        let subs = [plain.clone(), detailed.clone()];
+        let mut n = Notifier::default();
+        let nobody = |_: &Subscription, _: &str| false;
+        let out = n.tick_runs(&[note("r1", RunEvent::TurnDone)], &subs, &nobody, 100);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|o| o.topic == RUN_TOPIC));
+        assert_eq!(
+            body(&out[0]),
+            json!({ "title": "wicket", "body": "the agent's turn ended", "run": "r1", "count": 1, "tag": RUN_TOPIC })
+        );
+        assert_eq!(body(&out[1])["body"], "lead: the agent's turn ended");
+        // Within MIN_INTERVAL: owed, then sent together.
+        assert!(n.tick_runs(&[note("r2", RunEvent::Finished)], &subs, &nobody, 110).is_empty());
+        let out = n.tick_runs(&[note("r3", RunEvent::Failed("timeout".into()))], &subs, &nobody, 100 + MIN_INTERVAL);
+        assert_eq!(body(&out[0])["body"], "a run ended (timeout) (and 1 more)");
+        assert_eq!(body(&out[0])["count"], 2);
+        // A device whose operator watches the run gets nothing about it; others do.
+        let watching = |s: &Subscription, run: &str| s.id == "d" && run == "r4";
+        let out = n.tick_runs(&[note("r4", RunEvent::TurnDone)], &subs, &watching, 200);
+        assert_eq!(out.iter().map(|o| o.sub.id.as_str()).collect::<Vec<_>>(), ["p"]);
+        // Request pushes keep theirs.
+        let out = Notifier::default().tick(&[w("x")], &subs, 0);
+        assert!(out.is_empty() || out.iter().all(|o| o.topic == TOPIC));
+    }
+
     #[test]
     fn one_push_per_new_request_coalesced_per_device() {
         let mut n = Notifier::default();
