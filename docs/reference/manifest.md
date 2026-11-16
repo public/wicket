@@ -199,6 +199,11 @@ upstream's host when it is stored with no binding of its own.
 | `max_output_tokens` | integer | `400000` | The most output tokens over the agent's life. Each call reserves its `max_tokens` up front. |
 | `max_input_tokens` | integer | none | The most input tokens, cache reads and writes included. None: no input cap. |
 | `allow_server_tools` | boolean | `false` | Forward server-side tools (web search and fetch), URL sources, the MCP connector and containers. They make the provider reach hosts the zone never allowed, so they are refused by default. |
+| `models` | list of strings | none (any model) | The models a box may call: exact names (`claude-opus-4-5`) or prefixes ending in `*` (`claude-sonnet-*`). The model proxy refuses, with a 403, a call naming another model or none. `agent.model` must be in the list. A zone a box starts may only narrow it: with a list here, a child must have one, each entry within one of these (a prefix only within a prefix). |
+
+With `models`, list every model the harness calls on its own too. Claude Code, for one, uses a small
+model (Haiku) for background work such as titles and summaries, and those calls are refused if it
+isn't listed (#366).
 
 ### `volumes`
 

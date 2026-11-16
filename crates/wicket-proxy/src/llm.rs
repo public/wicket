@@ -520,6 +520,16 @@ impl Llm {
         };
         let server_ok = spec.is_some_and(|s| s.allow_server_tools);
         let model = json.get("model").and_then(|m| m.as_str()).map(String::from);
+        // The zone's model list (#366): a call naming another model, or none, never goes upstream.
+        if let Some(allowed) = spec.and_then(|s| s.models.as_ref().map(|ms| (s, ms))) {
+            let (s, ms) = allowed;
+            let list = if ms.is_empty() { "none".to_string() } else { ms.join(", ") };
+            match model.as_deref() {
+                Some(m) if s.allows_model(m) => {}
+                Some(m) => return Err(refuse(403, format!("model {m:?} is not one this zone allows (allowed: {list})"))),
+                None => return Err(refuse(403, format!("a model call that names no model: this zone allows only {list}"))),
+            }
+        }
         let mut notes = Vec::new();
         // Stripped fields and tools are named (#307), by their names and types only, never their values.
         let mut stripped = Vec::new();
@@ -1376,6 +1386,42 @@ mod tests {
         let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &llm);
         c.vault = vault;
         (super::Llm::new(c).unwrap(), dir)
+    }
+
+    /// #366: a zone with a model list sends upstream only calls naming one of its models; any other
+    /// model, or none, is refused here with a 403 naming what is allowed, and audited.
+    #[tokio::test]
+    async fn only_the_zones_models_are_called() {
+        let done = [
+            sse("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":1}}}"#),
+            sse("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let (port, seen) = sse_upstream(vec![done], std::time::Duration::ZERO).await;
+        let dir = std::env::temp_dir().join(format!("wicket-llm-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = crate::vault::Vault::new(dir.clone());
+        vault.set("model", "tok").unwrap();
+        vault.set_hosts("model", &["127.0.0.1".into()]).unwrap();
+        let spec = format!("{{secret: model, upstream: 'http://127.0.0.1:{port}', models: [claude-opus-4-5, 'claude-haiku-*']}}");
+        let mut c = ctx(wicket_store::Ledger::open_in_memory().unwrap(), None, &spec);
+        c.vault = vault;
+        let llm = super::Llm::new(c).unwrap();
+        let body = |m: &str| format!(r#"{{{m}"max_tokens":5,"stream":true,"messages":[]}}"#);
+        assert_eq!(call(llm.clone(), "m-opus", &body(r#""model":"claude-opus-4-5","#), true).await, 200);
+        assert_eq!(call(llm.clone(), "m-haiku", &body(r#""model":"claude-haiku-4-5-20251001","#), true).await, 200);
+        assert_eq!(call(llm.clone(), "m-sonnet", &body(r#""model":"claude-sonnet-4-5","#), true).await, 403);
+        assert_eq!(call(llm.clone(), "m-none", &body(""), true).await, 403);
+        assert_eq!(seen.lock().await.len(), 2, "refused calls never reach the upstream");
+        let ops: Vec<String> = llm.ctx.ledger.lock().unwrap().audit_of_kind("op").unwrap().into_iter().map(|r| r.body).collect();
+        assert!(
+            ops.iter().any(
+                |o| o.contains(r#"model \"claude-sonnet-4-5\" is not one this zone allows (allowed: claude-opus-4-5, claude-haiku-*)"#)
+            ),
+            "{ops:?}"
+        );
+        assert!(ops.iter().any(|o| o.contains("names no model")), "{ops:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Sends one model request; reads the whole response, or (`whole` false) its first frame only,
