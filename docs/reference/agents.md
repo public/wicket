@@ -85,7 +85,7 @@ their state, generation and bundle size.
   zstd, content-addressed, and its digest is checked again on restore. A box still running something else (a
   background build, a dev server) has its other processes stopped after the zone's `limits.exit_grace` (30 s
   by default), named in `wicket agents`, then hibernates, because a rebuild restores files, not processes.
-- **Wake.** `wicket wake <agent> ["…"]`, `wicket session <run or agent> ["…"]`, or a message from another agent
+- **Wake.** `wicket session <run or agent> ["…"]` (a prompt, if given, is its first turn), or a message from another agent
   rebuilds the box. It gets a new identity, CA and placeholders, the state is restored, and Claude Code
   `--resume`s the agent's own session at the same workspace path. The agent's first turn says it was woken,
   and by what. A wake is a compare-and-set claim that bumps the generation, so of two concurrent wakes exactly

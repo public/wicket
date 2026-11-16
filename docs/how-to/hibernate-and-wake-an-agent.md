@@ -25,7 +25,7 @@ zone:
 Run it as usual. After its first turn, `wicket run` prints the agent's id:
 
 ```text
-  agent agt_… (long-lived; session …): wicket hibernate run_… / wicket wake agt_…
+  agent agt_… (long-lived; session …): wicket hibernate run_… / wicket session agt_…
 ```
 
 ## Watch it
@@ -51,15 +51,15 @@ what it stopped in `wicket agents`, since a rebuild restores files, not processe
 
 ## Wake it
 
-Any of these rebuilds its box, restores its state and resumes its session:
+Either of these rebuilds its box, restores its state and resumes its session:
 
 ```sh
 wicket session agt_… "and now the tests"   # a prompt: its first turn once woken
 wicket session agt_…                       # wakes it, then shows its session live
-wicket wake agt_… ["text"]                 # in the foreground, like wicket run
 ```
 
-A message from another agent (`send_message`) wakes it too. The agent's first turn says it was woken,
+A message from another agent (`send_message`) wakes it too. There is no separate wake command
+(#249): what wakes an agent is something for it to read. The agent's first turn says it was woken,
 and by what. On an installed host `wake.log` in `<data dir>/agents/<agent>/` has the log of a wake
 started in the background.
 
@@ -74,7 +74,7 @@ started in the background.
   ([the store](../explanation/store.md)) file by file, so only files that changed since an earlier
   hibernation are written (and sent to the state store). The bundle size `wicket agents` shows is
   what the agent's state restores to; the hibernation's own line and audit record say what it
-  stored. Agents hibernated by an earlier wicket wake as before. One whose files have names that
+  stored. Agents hibernated by an earlier wicket are woken as before. One whose files have names that
   aren't UTF-8 is still hibernated, as a full copy each time, and the log says so.
 
 ## When it won't wake
@@ -83,7 +83,8 @@ started in the background.
 - Only a hibernated agent can be woken. One whose session ended otherwise (stopped, timed out
   mid-turn, over its `/tmp` cap) is `ended`.
 - An agent whose box may still be running on a node this host can't hear from isn't woken until
-  that box's authority has ended; `wicket wake` says from when it can be.
+  that box's authority has ended; the wake's log (`wake.log`, which `wicket session` names) says from
+  when it can be.
 
 `ci/hibernate.sh` runs all of this end to end with the mock model; `ci/hibernate.sh --node` with the
 agent on an enrolled node.

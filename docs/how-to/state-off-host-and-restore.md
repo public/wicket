@@ -128,7 +128,7 @@ Then:
 - What a restore discarded (everything after `--at`, or exported records past the last signed
   checkpoint) is reported as discarded, not as a mismatch; a copy that disagrees with a record the
   restore kept is still a mismatch.
-- `wicket wake <agent>` brings a hibernated agent back from its bundle in the store.
+- `wicket session <agent>` (or a message to it) brings a hibernated agent back from its bundle in the store.
 - Runs that were running when the host was lost have no run directory here: the reconciler ends them
   as `lost`, and stops their boxes on nodes that can be reached.
 

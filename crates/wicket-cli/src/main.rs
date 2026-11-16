@@ -156,9 +156,11 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         wait: u64,
     },
-    /// Wake a hibernated agent: rebuild its box, restore its state and resume its harness session.
-    /// Runs the woken activation in the foreground, like `wicket run`. Text, if given, is the operator's
-    /// message to it.
+    /// Internal: wake a hibernated agent (rebuild its box, restore its state, resume its harness
+    /// session) and run the woken activation in the foreground. What a message to the agent, or
+    /// `wicket session <agent>`, starts (#249): an operator wakes an agent that way. Text, if given,
+    /// is the operator's message to it.
+    #[command(hide = true)]
     Wake {
         agent: String,
         text: Vec<String>,
