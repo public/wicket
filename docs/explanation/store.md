@@ -198,6 +198,16 @@ one audit record that names the grant.
 Done for #258, an update, a program and an image are all accepted through `may_use`. That needs
 #256's grant record, so it lands after it.
 
+**Status (2026-11-16).** #256's grant record has landed, but it holds only one of these answers: the
+human-approved update (an UPDATE grant, `Ledger::use_update_approval`). The others need what
+doesn't exist yet. A **CI principal** with a standing grant (today, release and CI keys are files
+in `<data dir>/release-keys/` and a signature is checked against them, `update::accept`). And a
+**grant recorded on a manifest's pinned digests** when it is run or approved, covering the children
+that inherit them (today, an image or program pin is the manifest's own statement:
+`images_policy::check`, `program::check_pin`, and the node checking an image is its pin). With
+only the update approval to find, `may_use` would add a function and delete none, so it waits for
+those two.
+
 ## Order of the work
 
 1. **The store API and ledger snapshots** (this PR). `wicket_store::cas`: `put`, `get` (verified)
