@@ -84,6 +84,8 @@ jobs:
         run: ci/check-doc-links.sh
       - name: one word per thing in the docs and the CLI's help (#332)
         run: ci/check-terms.sh
+      - name: the Claude Code plugin, its skills and their links
+        run: ci/check-plugin.py
       - name: gitleaks, every commit
         run: |
           f=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
