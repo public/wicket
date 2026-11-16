@@ -186,6 +186,25 @@ multihost() {
   results+=("info lease ${lease:-?} on node ${node_name:-?}: ${billed:-billed ?}")
 }
 
+# The escape box (#326, ci/acceptance/escape.yaml) on the other node: the same attempts, decided by
+# that node's proxies, with the same checks (the canary on this host, which is the node's too when
+# the node is local, and the audit the node shipped).
+escape_flow() {
+  log "a box trying to get out of its reach, on $NODE"
+  local ws; ws=$(workdir escape)
+  sed -i "s/HOST_IP/${host_ip:-127.0.0.1}/g; s/CANARY_PORT/$canary_port/g" "$ws/escape.sh"
+  : >"$work/canary.log"
+  HOME=$HOMEW "$W" run "$(manifest escape)" --workdir "$ws" --image "$IMAGE_TAG" --node "$NODE" >"$work/escape-node.log" 2>&1 || true
+  local r; r=$(run_id_of "$work/escape-node.log")
+  our_runs+=("$r")
+  local out; out=$(data "runs/$r/workspace/out/escape.log" 2>/dev/null || cat "$nodehome/.local/share/wicket-node/runs/$r/workspace/out/escape.log" 2>/dev/null || true)
+  sed 's/^/   /' <<<"$out"
+  check "  on $NODE too: every attempt refused, none ESCAPED" '[ "$(grep -c " blocked " <<<"$out")" -ge 25 ] && ! grep -q " ESCAPED " <<<"$out"'
+  check "  and the canary saw no request" '[ ! -s "$work/canary.log" ]'
+  check "  and the audit its node shipped allowed nothing but GET example.com/ (and resolved no other name)" '[ -z "$(esc_unexpected "$r")" ] || { esc_unexpected "$r"; false; }'
+}
+
+
 # A node on its own (#152, #153), --nodes local: an agent's box on acc-n1 calls the model (its node
 # fetches the credential on first use and keeps it in memory only) and its egress every 5 s. Its
 # control channel is cut for 165 s, longer than the old 150 s offline window: the box keeps working,

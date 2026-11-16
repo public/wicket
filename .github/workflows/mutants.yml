@@ -1,0 +1,46 @@
+name: Mutants (weekly)
+
+# #326: mutation testing of the decision code (ci/mutants.sh: zone subsets, reach and canonical
+# paths, the host and glob matchers, the model budget, token loading and grant bounds). A mutant
+# that survives is a test gap, or an equivalent mutant to list in ci/mutants.accepted with why.
+# Weekly and on demand: about 40 minutes, too long for every pull request.
+
+on:
+  schedule:
+    - cron: "37 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_MUTANTS_VERSION: 27.1.0
+
+jobs:
+  mutants:
+    name: Surviving mutants in the decision code
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: mutants
+      - name: cargo-mutants (from crates.io, its locked dependencies checksum-verified)
+        run: cargo mutants --version 2>/dev/null | grep -q " $CARGO_MUTANTS_VERSION" || cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      - name: Mutants
+        run: ci/mutants.sh --jobs 3
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants
+          path: target/mutants/*/mutants.out
+          retention-days: 30
