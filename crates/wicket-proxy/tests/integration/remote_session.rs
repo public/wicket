@@ -139,7 +139,6 @@ impl World {
             escalate: true,
             attribute: None,
             identity: None,
-            spawner: None,
             swaps: vec![CredentialSwap {
                 name: "account login".into(),
                 host: HOST.into(),

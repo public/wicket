@@ -179,7 +179,7 @@ fn enrol(ledger: &std::sync::Mutex<Ledger>) -> Result<()> {
         "node.enrolled",
         &serde_json::json!({ "name": NAME, "target": row.target, "node_key": node_key, "builtin": true }),
     )?;
-    println!("[wicket] made this host's built-in node {NAME:?} ({})", dir.display());
+    say!("[wicket] made this host's built-in node {NAME:?} ({})", dir.display());
     Ok(())
 }
 

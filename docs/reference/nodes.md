@@ -198,7 +198,7 @@ wicket node revoke n1
     the box's base token (`derived.json` beside it, so a restarted `serve` keeps it), never wider or
     longer-lived than its parent's and revoked with it, its budget carved from the parent's slice. The
     node reports it (`Spawned`, until answered); the control host checks it again, records it and
-    supervises it (`wicket run --adopt`), or refuses it and the node stops it. Spawns elsewhere
+    supervises it (in the parent's supervisor's process), or refuses it and the node stops it. Spawns elsewhere
     (placement), beyond the zone, or under an org policy that decides differently a level down go to the
     control host.
   - **Same node.** Messages between boxes on the node are decided there from both tokens and, cut off,

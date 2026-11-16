@@ -8,14 +8,7 @@ use crate::*;
 /// Runs one of this group's commands.
 pub async fn dispatch(c: Cmd) -> Result<()> {
     match c {
-        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id, parent_run, lease, adopt } => {
-            let adopt = match adopt {
-                Some(a) => {
-                    let (at, session) = a.split_once(':').context("--adopt <started ms>:<session id>")?;
-                    Some((at.parse::<i64>().context("--adopt: started ms")?, session.to_string()))
-                }
-                None => None,
-            };
+        Cmd::Run { manifest, workdir, workspace_dir, task, image, node, ssh_key, run_id } => {
             run::run(run::RunOpts {
                 manifest: &manifest,
                 workdir: workdir.as_deref(),
@@ -25,12 +18,13 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 node: node.as_deref(),
                 ssh_key: ssh_key.as_deref(),
                 run_id,
-                parent_run,
-                lease,
+                parent_run: None,
+                lease: None,
                 wrap: None,
                 wake: None,
                 attach: false,
-                adopt,
+                adopt: None,
+                stop: None,
             })
             .await
         }
@@ -50,6 +44,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
                 wake: None,
                 attach: false,
                 adopt: None,
+                stop: None,
             })
             .await
         }
@@ -68,6 +63,7 @@ pub async fn dispatch(c: Cmd) -> Result<()> {
             wake: None,
             attach: true,
             adopt: None,
+            stop: None,
         })
         .await
         .inspect_err(|e| run::attach_failed(&run, e)),

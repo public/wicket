@@ -203,7 +203,7 @@ pub fn push(
             (m, head, raw)
         }
         Err(e) if bundle::unrepresentable(&e) => {
-            println!("[wicket] agent {}'s state is kept as a version-1 bundle (a full copy each time): {e}", agent.id);
+            say!("[wicket] agent {}'s state is kept as a version-1 bundle (a full copy each time): {e}", agent.id);
             let store = store()?;
             let prev = match agent.head.as_deref().filter(|h| !bundle::is_tree_head(h)) {
                 Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
@@ -455,7 +455,7 @@ pub fn trigger_wake(agent: &str, by: &str) {
     let _ = std::fs::create_dir_all(&dir);
     let log = match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("wake.log")) {
         Ok(f) => f,
-        Err(e) => return eprintln!("[wicket] can't wake {agent}: {e}"),
+        Err(e) => return say_err!("[wicket] can't wake {agent}: {e}"),
     };
     let Ok(exe) = crate::update::self_exe() else { return };
     let mut c = std::process::Command::new(exe);
@@ -474,7 +474,7 @@ pub fn trigger_wake(agent: &str, by: &str) {
     }
     match c.spawn() {
         Ok(_) => {}
-        Err(e) => eprintln!("[wicket] can't wake {agent}: {e}"),
+        Err(e) => say_err!("[wicket] can't wake {agent}: {e}"),
     }
 }
 
@@ -587,7 +587,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         let run = RunId::new();
         let Some(generation) = l.claim_wake(&a.id, &run.0, wicket_store::now() + BUSY_CLAIM_SECS)? else {
             let a = l.agent(&a.id)?.unwrap_or(a);
-            println!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
+            say!("[wicket] agent {} not woken: it is {} (generation {}, run {})", a.id, a.state, a.generation, a.run);
             std::process::exit(2);
         };
         let by = by.unwrap_or_else(|| format!("wicket wake by {}", crate::cli_principal()["id"].as_str().unwrap_or("operator")));
@@ -615,14 +615,14 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         }
     };
     let node = node.filter(|n| n != crate::localnode::NAME);
-    println!("[wicket] waking agent {} ({}): generation {generation}, run {run}", agent.id, agent.name);
+    say!("[wicket] waking agent {} ({}): generation {generation}, run {run}", agent.id, agent.name);
     let res = async {
         let t0 = std::time::Instant::now();
         let state = read_head(agent.head.as_deref().expect("checked"), &agent.id)?;
         if state.session_id != agent.session_id {
             bail!("the bundle's session {} isn't the agent's {}", state.session_id, agent.session_id);
         }
-        println!(
+        say!(
             "[wicket] state: bundle {} ({} trees, {} stored, {} raw), read in {} ms",
             agent.head.as_deref().unwrap_or(""),
             state.trees.len(),
@@ -657,6 +657,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
         wake: Some(Wake { agent: agent.clone(), generation, state, first }),
         attach: false,
         adopt: None,
+        stop: None,
     };
     if let Err(e) = crate::run::run(opts).await {
         let l = Ledger::open(&ledger_path())?;
@@ -725,11 +726,11 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
             match r {
                 Ok(Ok(link)) => link.capacity.map(|cap| Candidate { name: n, cap }),
                 Ok(Err(e)) => {
-                    println!("[wicket] node {n} is not available for the wake: {e:#}");
+                    say!("[wicket] node {n} is not available for the wake: {e:#}");
                     None
                 }
                 Err(_) => {
-                    println!("[wicket] node {n} is not available for the wake: no answer within 10 s");
+                    say!("[wicket] node {n} is not available for the wake: no answer within 10 s");
                     None
                 }
             }
@@ -738,7 +739,7 @@ async fn place(agent: &AgentRow, last: Option<&str>) -> Result<Option<String>> {
     let cands: Vec<Candidate> = futures_util::future::join_all(probes).await.into_iter().flatten().collect();
     match pick(&cands, want, last) {
         Some((n, true)) => {
-            println!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
+            say!("[wicket] placing agent {} on node {n} (best fit of {} available)", agent.id, cands.len());
             Ok(Some(n))
         }
         // No silent overcommit (#377): each node would refuse the box itself.
@@ -768,21 +769,21 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let a = resolve(&l, who)?;
     if a.state == "hibernated" {
-        println!("agent {} is already hibernated ({})", a.id, human(a.bundle_bytes as u64));
+        say!("agent {} is already hibernated ({})", a.id, human(a.bundle_bytes as u64));
         return Ok(());
     }
     let before = a.updated_at;
     if !l.want_agent(&a.id, "hibernate")? {
         bail!("agent {} is {}: only an active agent can be hibernated", a.id, a.state);
     }
-    println!("asked agent {} ({}) to hibernate at its next quiet point", a.id, a.run);
+    say!("asked agent {} ({}) to hibernate at its next quiet point", a.id, a.run);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let Some(now) = l.agent(&a.id)? else { bail!("agent {} is gone", a.id) };
         match now.state.as_str() {
             "hibernated" => {
-                println!(
+                say!(
                     "agent {} hibernated: {} stored (generation {}, bundle {})",
                     a.id,
                     human(now.bundle_bytes as u64),
@@ -796,14 +797,14 @@ pub async fn hibernate(who: &str, wait_secs: u64) -> Result<()> {
                     && now.updated_at >= before
                     && now.note.as_deref().is_some_and(|n| n.starts_with("not hibernated")) =>
             {
-                println!("agent {} goes on running: {}", a.id, now.note.unwrap_or_default());
+                say!("agent {} goes on running: {}", a.id, now.note.unwrap_or_default());
                 return Ok(());
             }
             "ended" | "failed" => bail!("agent {} {}: {}", a.id, now.state, now.note.unwrap_or_default()),
             _ => {}
         }
         if std::time::Instant::now() >= deadline {
-            println!("agent {} is {} (the request stands: it hibernates when its turn ends)", a.id, now.state);
+            say!("agent {} is {} (the request stands: it hibernates when its turn ends)", a.id, now.state);
             return Ok(());
         }
     }
@@ -814,7 +815,7 @@ pub fn list(json: bool) -> Result<()> {
     let l = Ledger::open(&ledger_path())?;
     let rows = l.agents(&TenantId::single().0)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows.iter().map(|a| serde_json::json!({
+        say!("{}", serde_json::to_string_pretty(&rows.iter().map(|a| serde_json::json!({
             "id": a.id, "name": a.name, "zone": a.zone, "state": a.state, "generation": a.generation, "run": a.run,
             "session_id": a.session_id, "bundle_bytes": a.bundle_bytes, "head": a.head, "restorable": a.restorable, "note": a.note,
             "workspace": a.workspace, "updated_at": a.updated_at,
@@ -823,12 +824,12 @@ pub fn list(json: bool) -> Result<()> {
         return Ok(());
     }
     if rows.is_empty() {
-        println!("no agents");
+        say!("no agents");
         return Ok(());
     }
-    println!("{:<30}  {:<16}  {:<11}  {:>3}  {:<30}  {:>9}  note", "agent", "name", "state", "gen", "run", "bundle");
+    say!("{:<30}  {:<16}  {:<11}  {:>3}  {:<30}  {:>9}  note", "agent", "name", "state", "gen", "run", "bundle");
     for a in rows {
-        println!(
+        say!(
             "{:<30}  {:<16}  {:<11}  {:>3}  {:<30}  {:>9}  {}",
             a.id,
             wicket_agent::clip(&a.name, 16),

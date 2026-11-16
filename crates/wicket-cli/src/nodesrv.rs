@@ -2156,7 +2156,6 @@ async fn serve_box(
         escalate: bs.escalate,
         attribute: None,
         identity: None,
-        spawner: None,
         // The box's credential swaps, made here (#257): each fetched from the control host on first
         // use, like an injected secret, under the name its start gives, and bound to its hosts.
         swaps: node_swaps(&bs.swaps),
