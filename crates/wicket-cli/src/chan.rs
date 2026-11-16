@@ -77,7 +77,9 @@ use wicket_proxy::llm::Slice;
 ///   The control host no longer serves the `egress` tunnel target, and `BoxStart::swap_hosts`
 ///   (the hosts a control host before 10 swapped itself) is gone. A box that a node before 11
 ///   would forward a host of goes only to nodes talking [`NO_FORWARDED_EGRESS`] or later.
-pub const PROTOCOL: u32 = 11;
+/// - 12: node health (#377): a node reports its disk, inodes, memory, feed freshness and failures
+///   as [`Msg::Health`], sent only on connections talking [`NODE_HEALTH`] or later.
+pub const PROTOCOL: u32 = 12;
 /// The first protocol version whose nodes decide gateway tools, spawns and same-node links (#164).
 pub const EDGE_DECISIONS: u32 = 5;
 /// The first protocol version whose nodes check a box's image against its pin (#192).
@@ -92,6 +94,8 @@ pub const BUDGET_SLICE: u32 = 9;
 pub const CREDENTIAL_SWAPS: u32 = 10;
 /// The first protocol version whose nodes forward no egress to the control host (#257).
 pub const NO_FORWARDED_EGRESS: u32 = 11;
+/// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
+pub const NODE_HEALTH: u32 = 12;
 /// The run's sockets on the control host a node may open a tunnel to ([`Msg::TunnelOpen`]): its MCP
 /// gateway, for the tools the node relays. Not the model proxy nor the egress proxy: those are the
 /// node's alone (#257).
@@ -234,6 +238,11 @@ pub struct BoxStart {
     /// near its memory limit. A node that doesn't know this field warns without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_advice: Option<String>,
+    /// Which of [`Self::volumes`] the node keeps across runs and for how long (#377); the others
+    /// are the run's own cache. None, from a control host before it: every volume is kept, as
+    /// before.
+    #[serde(default)]
+    pub volume_life: Option<Vec<VolumeLife>>,
 }
 
 /// One credential the node swaps in for a box (#257): toward `host`, a request carrying exactly
@@ -339,6 +348,26 @@ fn default_output_cap() -> u64 {
     64 << 20
 }
 
+/// What becomes of a box's volume (#377): kept across runs (deleted once unused for
+/// `retention_secs`, if set), or the run's own cache (deleted when the run's work is collected, or
+/// `retention_secs` after the run ends).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeLife {
+    pub name: String,
+    pub keep: bool,
+    pub retention_secs: Option<u64>,
+}
+
+impl VolumeLife {
+    pub fn of(m: &wicket_core::Manifest) -> Vec<VolumeLife> {
+        m.zone
+            .volumes
+            .iter()
+            .map(|v| VolumeLife { name: v.name.clone(), keep: v.keep, retention_secs: v.retention().ok().flatten().map(|d| d.as_secs()) })
+            .collect()
+    }
+}
+
 /// A node's size and what its running boxes take, by their limits (for bin-packing boxes onto nodes).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeCapacity {
@@ -347,6 +376,13 @@ pub struct NodeCapacity {
     pub used_vcpus: f32,
     pub used_memory_mib: u64,
     pub boxes: u32,
+    /// The memory limit a new box may have now (#377), as the node's admission reckons it from
+    /// what is actually free; None from a node before it.
+    #[serde(default)]
+    pub room_mib: Option<u64>,
+    /// Whether the node starts no box at all now (its disk below the floor, #377).
+    #[serde(default)]
+    pub full: bool,
 }
 
 /// How far a box's stdio has got, as the node reports it on reconnect.
@@ -700,6 +736,11 @@ pub enum Msg {
     Audit {
         records: Vec<wicket_store::AuditRecord>,
     },
+    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection that
+    /// speaks [`NODE_HEALTH`].
+    Health {
+        health: crate::health::NodeHealth,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -975,7 +1016,14 @@ mod tests {
                     stderr_start: 0,
                     authority_until: 1,
                 }],
-                capacity: Some(NodeCapacity { vcpus: 2.0, memory_mib: 2048, used_vcpus: 1.0, used_memory_mib: 512, boxes: 1 }),
+                capacity: Some(NodeCapacity {
+                    vcpus: 2.0,
+                    memory_mib: 2048,
+                    used_vcpus: 1.0,
+                    used_memory_mib: 512,
+                    boxes: 1,
+                    ..Default::default()
+                }),
             }),
             Frame::Msg(Msg::ImageHave { id: 3, digest: format!("sha256:{}", "a".repeat(64)) }),
             Frame::Msg(Msg::PutImage {
@@ -1146,8 +1194,8 @@ mod tests {
     /// below [`NO_FORWARDED_EGRESS`], and is gated per box (`noderun::refuse_older_node`).
     #[test]
     fn a_node_forwards_no_egress_from_protocol_11() {
-        assert_eq!((PROTOCOL, NO_FORWARDED_EGRESS), (11, 11));
-        assert!(negotiate(PROTOCOL, 10).unwrap() < NO_FORWARDED_EGRESS);
+        assert_eq!(NO_FORWARDED_EGRESS, 11);
+        assert!(negotiate(NO_FORWARDED_EGRESS, 10).unwrap() < NO_FORWARDED_EGRESS);
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values; a control host
@@ -1155,7 +1203,7 @@ mod tests {
     /// talks 9 to a control host at 10, below [`CREDENTIAL_SWAPS`].
     #[test]
     fn a_start_carries_its_swaps_by_name_from_protocol_10() {
-        assert_eq!(CREDENTIAL_SWAPS, 10);
+        assert_eq!((PROTOCOL, CREDENTIAL_SWAPS, NO_FORWARDED_EGRESS, NODE_HEALTH), (12, 10, 11, 12));
         assert!(negotiate(CREDENTIAL_SWAPS, 9).unwrap() < CREDENTIAL_SWAPS);
         let swaps = vec![
             wicket_proxy::CredentialSwap {
