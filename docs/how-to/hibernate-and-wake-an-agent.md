@@ -68,7 +68,14 @@ started in the background.
 - Back up `<data dir>/state.key` with the data directory: without it no hibernated agent can be
   woken. Keep the copy as private as the key (mode 0600, never in the object store).
 - To keep bundles off the host, set `bundles: s3` in the state store
-  ([state off the host](state-off-host-and-restore.md)).
+  ([state off the host](state-off-host-and-restore.md)). A hibernation reaches the state store
+  before the agent counts as hibernated, and a wake on any control host fetches what it lacks.
+- Hibernation is incremental: state goes into the content-addressed store
+  ([the store](../explanation/store.md)) file by file, so only files that changed since an earlier
+  hibernation are written (and sent to the state store). The bundle size `wicket agents` shows is
+  what the agent's state restores to; the hibernation's own line and audit record say what it
+  stored. Agents hibernated by an earlier wicket wake as before. One whose files have names that
+  aren't UTF-8 is still hibernated, as a full copy each time, and the log says so.
 
 ## When it won't wake
 

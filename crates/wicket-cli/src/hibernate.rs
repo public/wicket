@@ -14,6 +14,12 @@
 //!   agent's own session, at the same workspace path (Claude Code keys sessions by directory). Its
 //!   first turn says it was woken, by what, and carries the operator's message if there is one.
 //!   Sources: `wicket wake`, opening its session (`wicket session`), a message from another agent.
+//! - **Incremental** (#365). State goes into the content-addressed store as a bundle tree
+//!   (`wicket_store::bundle`, version 2): the control host's local store (`<data dir>/store`)
+//!   writes only files that changed since an earlier hibernation, and with `bundles: s3` the state
+//!   store is sent only what it lacks, before the ledger's head moves. A wake fetches what the local
+//!   store lacks. Heads pushed before #365 (version 1) are still read; an agent whose files have
+//!   names the tree format can't hold (not UTF-8) is kept as a version-1 bundle, and says so.
 //! - **Fencing.** Waking is a compare-and-set claim in the ledger that bumps the agent's generation;
 //!   the proxies refuse a stale generation and a push commits only under the current one
 //!   (`wicket_store::agents`).
@@ -44,6 +50,33 @@ pub fn store() -> Result<SealedStore<Box<dyn wicket_store::objects::ObjectStore>
         _ => Box::new(DirStore::new(data_dir().join("objects"))),
     };
     Ok(SealedStore::new(inner, &state_key()?))
+}
+
+/// The control host's local content-addressed store (#258, #365), sealed under `state.key` with no
+/// plain reads, and the count of what its backend writes.
+pub fn local_store() -> Result<(wicket_store::cas::Cas, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
+    let (dir, written) = wicket_store::objects::Counting::new(DirStore::new(data_dir().join("store")));
+    Ok((wicket_store::cas::Cas::new(SealedStore::sealed_only(dir, &state_key()?)), written))
+}
+
+/// The shared content-addressed store bundles must reach before a head moves: the state store's, if
+/// `state-store.yaml` puts bundles there (#154), sealed with no plain reads. None: the local store is
+/// the bundles' home.
+pub fn shared_store() -> Result<Option<wicket_store::cas::Cas>> {
+    Ok(match crate::statestore::StateStore::load()? {
+        Some(s) if s.bundles == crate::statestore::Where::S3 => {
+            Some(wicket_store::cas::Cas::new(SealedStore::sealed_only(s.open_s3()?, &state_key()?)))
+        }
+        _ => None,
+    })
+}
+
+/// Reads an agent's head (either version) from the stores it can be in.
+pub fn read_head(head: &str, agent: &str) -> Result<StateManifest> {
+    let (local, _) = local_store()?;
+    let shared = shared_store()?;
+    let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: None };
+    Ok(bundle::read_head(stores, &store()?, head, agent)?)
 }
 
 /// The key agent state is sealed with at rest (`<data dir>/state.key`, 0600, made on first use): it
@@ -152,22 +185,39 @@ pub fn push(
     generation: i64,
     trees: &[(String, PathBuf, &[&str])],
 ) -> Result<Option<StateManifest>> {
-    let store = store()?;
-    let prev = match &agent.head {
-        Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
-        None => None,
-    };
     for (_, p, _) in trees {
         std::fs::create_dir_all(p)?;
     }
     let src: Vec<TreeSrc> = trees.iter().map(|(n, p, x)| TreeSrc { name: n.clone(), path: p.clone(), exclude: x }).collect();
     let seq = agent.head_seq + 1;
-    let scratch = data_dir().join("objects-scratch");
     let to = bundle::PushTo { agent: &agent.id, generation, seq, session_id: &agent.session_id };
-    let (m, key) =
-        bundle::push(&store, &to, &src, prev.as_ref(), &scratch).with_context(|| format!("pushing agent {}'s state", agent.id))?;
+    let (local, written) = local_store()?;
+    let shared = shared_store()?;
+    let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: Some(&written) };
+    // The ledger's bundle size: a version-2 bundle's is what it restores to (its objects are shared
+    // with other bundles), a version-1 bundle's what it stores.
+    let (m, key, bytes) = match bundle::push_tree(stores, &to, &src) {
+        Ok((m, head)) => {
+            let raw = m.raw_bytes();
+            (m, head, raw)
+        }
+        Err(e) if bundle::unrepresentable(&e) => {
+            println!("[wicket] agent {}'s state is kept as a version-1 bundle (a full copy each time): {e}", agent.id);
+            let store = store()?;
+            let prev = match agent.head.as_deref().filter(|h| !bundle::is_tree_head(h)) {
+                Some(k) => Some(bundle::read_manifest(&store, k, &agent.id)?),
+                None => None,
+            };
+            let scratch = data_dir().join("objects-scratch");
+            let (m, key) =
+                bundle::push(&store, &to, &src, prev.as_ref(), &scratch).with_context(|| format!("pushing agent {}'s state", agent.id))?;
+            let stored = m.stored_bytes();
+            (m, key, stored)
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("pushing agent {}'s state", agent.id))),
+    };
     let l = ledger.lock().expect("ledger");
-    if !l.commit_agent_push(&agent.id, generation, agent.head_seq, seq, &key, m.stored_bytes() as i64)? {
+    if !l.commit_agent_push(&agent.id, generation, agent.head_seq, seq, &key, bytes as i64)? {
         return Ok(None);
     }
     Ok(Some(m))
@@ -353,7 +403,9 @@ pub fn write_new(p: &Path, body: &[u8]) -> Result<()> {
 
 /// Restores a tree into `dest`, replacing whatever is there.
 pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
-    let Some(t) = m.tree(name) else { return Ok(()) };
+    if m.tree(name).is_none() {
+        return Ok(());
+    }
     if dest.exists() {
         bundle::make_writable(dest)?;
         std::fs::remove_dir_all(dest)?;
@@ -361,7 +413,10 @@ pub fn restore(m: &StateManifest, name: &str, dest: &Path) -> Result<()> {
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    bundle::pull_tree(&store()?, t, dest).with_context(|| format!("restoring {name}"))?;
+    let (local, _) = local_store()?;
+    let shared = shared_store()?;
+    let stores = bundle::Stores { local: &local, shared: shared.as_ref(), written: None };
+    bundle::restore(stores, &store()?, m, name, dest).with_context(|| format!("restoring {name}"))?;
     Ok(())
 }
 
@@ -561,7 +616,7 @@ pub async fn wake(who: &str, text: Option<String>, by: Option<String>) -> Result
     println!("[wicket] waking agent {} ({}): generation {generation}, run {run}", agent.id, agent.name);
     let res = async {
         let t0 = std::time::Instant::now();
-        let state = bundle::read_manifest(&store()?, agent.head.as_deref().expect("checked"), &agent.id)?;
+        let state = read_head(agent.head.as_deref().expect("checked"), &agent.id)?;
         if state.session_id != agent.session_id {
             bail!("the bundle's session {} isn't the agent's {}", state.session_id, agent.session_id);
         }
