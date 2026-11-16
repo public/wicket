@@ -654,12 +654,12 @@ pub(crate) mod tests {
     fn escalation_rights_only_narrow() {
         let with = |e: &str| {
             let mut z = parent();
-            z.escalation = serde_yaml::from_str(e).unwrap();
+            z.escalation = crate::yaml::from_str(e).unwrap();
             z
         };
         let child = |e: &str| {
             let mut z = zone("  llm: { max_requests: 10, max_output_tokens: 1000 }\n  limits: { memory: 1g, cpus: 1, timeout: 10m }\n");
-            z.escalation = serde_yaml::from_str(e).unwrap();
+            z.escalation = crate::yaml::from_str(e).unwrap();
             z
         };
         let verdict = |p: &ZoneSpec, c: &ZoneSpec| check(&ask(c), &bounds(p)).err().unwrap_or_default();

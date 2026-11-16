@@ -393,7 +393,7 @@ pub fn plan_child(i: &PlanIn, req: &SpawnRequest) -> Result<ChildPlan, String> {
             ));
         }
     }
-    let yaml = serde_yaml::to_string(&cm).map_err(|e| e.to_string())?;
+    let yaml = wicket_core::yaml::to_string(&cm).map_err(|e| e.to_string())?;
     // An approval binds to the request as the agent stated it (defaults derived at call time, such
     // as the time left, would change between the ask and the retry).
     let mut stated = serde_json::json!({

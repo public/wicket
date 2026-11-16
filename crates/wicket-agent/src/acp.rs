@@ -115,7 +115,7 @@ struct InstallationSettings {
 pub fn load_settings(p: &std::path::Path) -> Result<ClaudeAdapterSettings, String> {
     match std::fs::read_to_string(p) {
         Ok(s) if s.trim().is_empty() => Ok(ClaudeAdapterSettings::default()),
-        Ok(s) => serde_yaml::from_str::<InstallationSettings>(&s)
+        Ok(s) => wicket_core::yaml::from_str::<InstallationSettings>(&s)
             .map(|i| i.acp)
             .map_err(|e| format!("the installation settings {}: {e}", p.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaudeAdapterSettings::default()),

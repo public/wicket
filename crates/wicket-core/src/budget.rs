@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn a_zones_quota_is_its_llm_limits() {
         let l: crate::manifest::LlmSpec =
-            serde_yaml::from_str("{ max_requests: 7, max_output_tokens: 70, max_input_tokens: 700 }").unwrap();
+            crate::yaml::from_str("{ max_requests: 7, max_output_tokens: 70, max_input_tokens: 700 }").unwrap();
         assert_eq!(ModelQuota::of_zone(&l), ModelQuota { requests: 7, output_tokens: 70, input_tokens: Some(700) });
     }
 
