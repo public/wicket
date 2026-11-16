@@ -29,6 +29,7 @@ mod localnode;
 mod mock;
 mod node;
 mod nodeauth;
+mod nodeca;
 mod nodecall;
 mod nodecreate;
 mod noderun;

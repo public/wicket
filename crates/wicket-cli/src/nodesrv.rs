@@ -36,6 +36,7 @@
 use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf, RunState, Tunnels, TUNNEL_BIT};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
+use nodeca::LiveCa;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -59,6 +60,7 @@ mod gateway;
 mod gw;
 mod images;
 mod links;
+mod nodeca;
 mod volumes;
 use conn::*;
 use gateway::*;
@@ -271,6 +273,10 @@ struct Node {
     /// Since when (ms) feed frames have failed to persist, if they are failing: the node asks for
     /// them again once it can write (#377).
     feed_stalled: Mutex<Option<i64>>,
+    /// The node CA every box here mints from (#416), swapped in place when it is renewed, and a
+    /// renewal's new key waiting for its certificate.
+    live_ca: Arc<LiveCa>,
+    ca_pending: Mutex<Option<nodeca::Pending>>,
 }
 
 impl Node {
@@ -437,7 +443,10 @@ impl Node {
         };
         let (oom_kills, last_oom) = self.ooms.get();
         let (persist_failures, last_persist_failure) = self.persists.get();
+        let ca = std::fs::read(self.paths.root.join("ca.pem")).ok().and_then(|pem| ca_validity(&pem));
         crate::health::NodeHealth {
+            ca_not_before: ca.map(|c| c.0),
+            ca_not_after: ca.map(|c| c.1),
             at_ms: now,
             disk: crate::health::Disk { reserve_bytes: self.reserve.held(), ..crate::health::disk(&self.paths.root) },
             memory: crate::health::Memory { total_mib, available_mib, committed_mib: self.capacity().used_memory_mib },
@@ -627,19 +636,32 @@ impl Node {
         self.next.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    fn ca(&self) -> Option<Arc<NodeCa>> {
-        let cert = std::fs::read_to_string(self.paths.root.join("ca.pem")).ok()?;
-        let key = std::fs::read_to_string(self.paths.root.join("ca.key")).ok()?;
-        let loaded = if self.paths.shares_host() { NodeCa::load_any(&cert, &key) } else { NodeCa::load(&cert, &key) };
-        match loaded {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                eprintln!(
-                    "[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused"
-                );
-                None
+    /// The node CA, as `ca.pem` and `ca.key` say now (renewed over ssh, `wicket node renew-ca`, they
+    /// change under a running `serve`): loaded into the CA every box shares (#416), which is returned.
+    fn ca(&self) -> Arc<LiveCa> {
+        let loaded = (|| {
+            let cert = std::fs::read_to_string(self.paths.root.join("ca.pem")).ok()?;
+            let key = std::fs::read_to_string(self.paths.root.join("ca.key")).ok()?;
+            let loaded = if self.paths.shares_host() { NodeCa::load_any(&cert, &key) } else { NodeCa::load(&cert, &key) };
+            match loaded {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!(
+                        "[node] the node CA is unusable ({e:#}); hosts are only spliced, where a box's token allows them wholesale, or refused"
+                    );
+                    None
+                }
             }
+        })();
+        // The same CA as before is kept (and its minted leaves with it).
+        let same = match (&loaded, self.live_ca.get()) {
+            (Some(n), Some(c)) => n.not_after == c.not_after && n.permitted == c.permitted && n.cert_der() == c.cert_der(),
+            _ => false,
+        };
+        if !same {
+            self.live_ca.set(loaded.map(Arc::new));
         }
+        self.live_ca.clone()
     }
 
     fn feed_status(&self, refused: Option<&wicket_feed::Refusal>) -> Frame {
@@ -743,25 +765,17 @@ impl ControlLink for Control {
 /// Which of a run's CONNECTs this node can terminate: what its CA covers (#257). The rest are
 /// spliced where the box's token allows the host wholesale, and refused otherwise; none is
 /// forwarded to the control host.
+/// Routes a box's hosts by the node CA as it is at each connection (#416: renewed under it).
 struct NodeRouter {
-    ca: Option<Arc<NodeCa>>,
+    ca: Arc<LiveCa>,
     clock: Clock,
 }
 
 impl Router for NodeRouter {
     fn route(&self, host: &str) -> Route {
         let now = (self.clock)() / 1000;
-        wicket_proxy::decide::route(host, self.ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
-    }
-}
-
-/// A minter for a node without a usable CA: every host is uncovered (spliced or refused), so it is
-/// never asked.
-struct NoCa;
-
-impl Minter for NoCa {
-    fn server_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
-        bail!("this node has no usable CA: {host} can't be terminated here")
+        let ca = self.ca.get();
+        wicket_proxy::decide::route(host, ca.as_ref().map(|c| (&c.permitted[..], c.not_after)), now)
     }
 }
 
@@ -867,6 +881,8 @@ pub async fn serve(dir: Option<PathBuf>, idle_exit: Option<u64>) -> Result<()> {
         admitting: Default::default(),
         reserve,
         feed_stalled: Default::default(),
+        live_ca: Default::default(),
+        ca_pending: Default::default(),
     });
     // Queued audit records are committed (and shipped, if the control host is connected) on a
     // normal exit, SIGTERM or ^C: only a SIGKILL can lose the last unwaited batch.
@@ -1221,6 +1237,13 @@ async fn start_box_steps(node: &Arc<Node>, owner: Option<u64>, bs: BoxStart, t: 
     // only when its run began.
     if let Some(by) = bs.start_by.filter(|by| (node.clock)() / 1000 >= *by) {
         bail!("{}", crate::nodecreate::past_lease(&node.name, by));
+    }
+    // A box whose hosts need the node CA doesn't start on an expired one (#416): every request it
+    // made would be refused. The control host renews it over the channel first, if it can.
+    if let Some(why) = nodeca::expired_for(node.ca().get().as_deref(), &zone, &node.name, (node.clock)() / 1000) {
+        eprintln!("[node] {}: refused: {why}", bs.run);
+        node.audit_note(&bs.run, "box.refused", serde_json::json!({ "why": why }));
+        bail!("{why}");
     }
     // What the image is here (#192). Pinned, the box is exactly that digest: by its pinned
     // reference, or the digest alone; a tag moved to another image since changes nothing, and a
@@ -2168,10 +2191,7 @@ async fn serve_box(
         lifecycle: None,
     };
     let ca = node.ca();
-    let minter: Arc<dyn Minter> = match &ca {
-        Some(c) => c.clone(),
-        None => Arc::new(NoCa),
-    };
+    let minter: Arc<dyn Minter> = ca.clone();
     let decider = Arc::new(NodeDecider {
         replica: node.replica.clone(),
         clock: node.clock.clone(),
@@ -2365,9 +2385,14 @@ const SPEND_FILE: &str = "node-spend.json";
 
 /// When a CA certificate (PEM) expires (Unix s).
 fn ca_not_after(pem: &[u8]) -> Option<i64> {
+    ca_validity(pem).map(|v| v.1)
+}
+
+/// When a CA certificate (PEM) starts and ends (Unix s).
+fn ca_validity(pem: &[u8]) -> Option<(i64, i64)> {
     let (_, p) = x509_parser::pem::parse_x509_pem(pem).ok()?;
     let (_, c) = x509_parser::parse_x509_certificate(&p.contents).ok()?;
-    Some(c.validity().not_after.timestamp())
+    Some((c.validity().not_before.timestamp(), c.validity().not_after.timestamp()))
 }
 
 /// Writes a box's spend file whole or not at all (a temporary file renamed over it): a crash
@@ -2574,6 +2599,8 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
             admitting: Default::default(),
             reserve: crate::health::Reserve { path: i.dir.join("reserve"), size: 1 << 20 },
             feed_stalled: Default::default(),
+            live_ca: Default::default(),
+            ca_pending: Default::default(),
         })
     }
 
@@ -3755,7 +3782,7 @@ exec $EPOCHREALTIME"; printf "%s\n" "$T""#,
         assert_eq!(router.route("wrap.api.test"), Route::Terminate);
         assert!(matches!(router.route("elsewhere.test"), Route::Uncovered(r) if r.contains("name constraints")));
         assert!(
-            matches!(NodeRouter { ca: None, clock: node.clock.clone() }.route("rc.api.test"), Route::Uncovered(r) if r.contains("no CA"))
+            matches!(NodeRouter { ca: Default::default(), clock: node.clock.clone() }.route("rc.api.test"), Route::Uncovered(r) if r.contains("no CA"))
         );
         let op = |m: &str, p: &str| {
             wicket_core::Op::egress(&wicket_core::TenantId("t0".into()), &wicket_core::RunId(RUN.into()), "z", m, "rc.api.test", p)

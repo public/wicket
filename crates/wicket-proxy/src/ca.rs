@@ -165,6 +165,11 @@ impl NodeCa {
         Ok(NodeCa { issuer, der: CertificateDer::from(der), key, not_after, permitted, leaves: Mutex::new(HashMap::new()) })
     }
 
+    /// The certificate as issued (DER).
+    pub fn cert_der(&self) -> &[u8] {
+        &self.der
+    }
+
     /// Whether the CA may mint for `host` at `now` (Unix seconds).
     pub fn may_mint(&self, host: &str, now: i64) -> bool {
         now < self.not_after && self.permitted.iter().any(|s| crate::decide::subtree_permits(s, host))

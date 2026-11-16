@@ -427,6 +427,8 @@ struct Shared {
     ctl: Arc<NodeCtl>,
     cfg: PublisherConfig,
     issuer: Arc<wicket_identity::Issuer>,
+    /// The installation CA, which signs the node's renewed CA (#416), if this host has one.
+    installation_ca: Option<Arc<wicket_proxy::ca::InstallationCa>>,
     /// The box's base token (block 0), and the key that signs its grant blocks. Re-minted when its
     /// authority is renewed (#56).
     token_issuer: Mutex<wicket_feed::Issuer>,
@@ -600,6 +602,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         cfg,
         issuer,
         token_issuer: Mutex::new(token_issuer),
+        installation_ca: crate::nodeca::installation_ca().map(Arc::new),
         approver,
         image: s.start.image.clone(),
         org: s.org.clone(),
@@ -658,6 +661,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         trees.end();
         let start = s.start;
         refuse_older_node(&name, ctl.proto.load(Ordering::SeqCst))?;
+        ca_current(&shared, ctl.proto.load(Ordering::SeqCst)).await;
         // A remote node gets a pinned image it lacks from here, verified there before it imports it
         // (#191); the control host's own node shares its runtime.
         if let (Some(pin), crate::nodecall::Via::Ssh(_)) = (&start.image_pin, &shared.via) {
@@ -685,6 +689,28 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         };
     }
     Ok(NodeBox { image_digest, stdin: interactive.then_some(stdin_ours), stdout: stdout_ours, stderr: stderr_ours, exit: exit_rx, ctl })
+}
+
+/// A node back after its CA expired (#416) has it renewed by the connection (`nodeca.rs`) as soon
+/// as it is up: the box's start waits for that (up to 30 s), since the node refuses a box whose
+/// hosts need the CA while it is expired. Not renewed by then, the start goes ahead and the node
+/// says why it refuses.
+async fn ca_current(sh: &Shared, proto: u32) {
+    if proto < crate::chan::CA_RENEWAL || sh.node == crate::localnode::NAME {
+        return;
+    }
+    let expired =
+        || crate::nodeca::active(&sh.ledger.lock().expect("ledger"), &sh.node).is_some_and(|c| c.not_after <= wicket_store::now());
+    if !expired() {
+        return;
+    }
+    println!("[wicket] node {}'s CA has expired: renewing it before the box starts", sh.node);
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if !expired() {
+            return;
+        }
+    }
 }
 
 /// Makes sure node `node` has image `pin` (#191): if it hasn't, this host's runtime exports it as an
@@ -786,6 +812,8 @@ struct Progress {
     renewing: Option<NodeCertClaims>,
     /// No renewal attempt before this (after a failed one).
     renew_after: i64,
+    /// The node CA's renewal on this connection (#416).
+    ca: crate::nodeca::CaRenewal,
     /// The protocol version this connection talks (#162): version-2 messages go only at 2 or later.
     proto: u32,
     /// Whether a budget slice went on this connection, and the last one sent (#152).
@@ -820,6 +848,7 @@ async fn manage(
         cert: None,
         renewing: None,
         renew_after: 0,
+        ca: Default::default(),
         proto: 0,
         slice_sent: false,
         slice: None,
@@ -943,6 +972,7 @@ async fn session(
     p.ever = true;
     p.cert = Some(authed.cert);
     p.renewing = None;
+    p.ca.reset();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
     let writer = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {
@@ -1070,6 +1100,9 @@ async fn session(
                 }
                 if let Some(f) = renewal(sh, p) {
                     send(f);
+                }
+                if let Some(m) = p.ca.tick(&sh.ledger, &sh.node, p.proto, wicket_store::now()) {
+                    send(Frame::Msg(m));
                 }
             }
         }
@@ -1310,6 +1343,14 @@ async fn on_frame(
             Msg::AuditAsk {} => {
                 let head = sh.ledger.lock().expect("ledger").node_audit_head(&sh.node)?.map(|h| h.0).unwrap_or(0);
                 send(Frame::Msg(Msg::AuditFrom { seq: head }));
+            }
+            Msg::CaCsr { csr, error } => {
+                if let Some(m) = p.ca.on_csr(&sh.ledger, sh.installation_ca.as_deref(), &sh.node, csr, error, wicket_store::now()) {
+                    send(Frame::Msg(m));
+                }
+            }
+            Msg::NodeCaInstalled { serial, error } => {
+                p.ca.on_installed(&sh.ledger, &sh.node, &serial, error, wicket_store::now());
             }
             Msg::NodeCertInstalled { serial, error } => match (p.renewing.take(), error) {
                 (Some(c), None) if c.jti == serial => {

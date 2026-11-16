@@ -45,12 +45,15 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 12 or 13, so only the versions above 12 have a check here; the checks for features of 12 and
+/// 13 or 14, so only the versions above 12 have a check here; the checks for features of 12 and
 /// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
 /// forwarded egress, node health) went once every peer had them.
-pub const PROTOCOL: u32 = 13;
+pub const PROTOCOL: u32 = 14;
 /// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
 pub const ONE_GATEWAY: u32 = 13;
+/// The first protocol version whose node CA is renewed over the channel (#416): [`Msg::CaRenew`],
+/// [`Msg::CaCsr`], [`Msg::NodeCa`] and [`Msg::NodeCaInstalled`].
+pub const CA_RENEWAL: u32 = 14;
 
 /// The gateway tools the control host answers for a box (#257 slice 4b): they need its ledger, the
 /// other boxes' records, the placement backend or the run's own supervisor. A box's node answers
@@ -109,6 +112,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
     assert!(ONE_GATEWAY <= PROTOCOL);
+    assert!(CA_RENEWAL <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -432,6 +436,13 @@ pub enum Msg {
     NodeCert {
         cert: String,
     },
+    /// Renewing the node CA (#416, protocol 14): make a new CA key and answer with its signing
+    /// request ([`Msg::CaCsr`]). The key stays on the node, unused until [`Msg::NodeCa`] certifies it.
+    CaRenew {},
+    /// The node CA certificate for the key of the node's last [`Msg::CaCsr`] (#416).
+    NodeCa {
+        pem: String,
+    },
     Start(Box<BoxStart>),
     /// Replay stdout and stderr from these offsets (after a reconnect).
     Resume {
@@ -623,6 +634,18 @@ pub enum Msg {
     },
     /// Answer to [`Msg::NodeCert`]: installed, or why not.
     NodeCertInstalled {
+        serial: String,
+        error: Option<String>,
+    },
+    /// Answer to [`Msg::CaRenew`] (#416): a PEM certificate signing request for a new node CA key,
+    /// or why there is none (another renewal under way, say).
+    CaCsr {
+        csr: Option<String>,
+        error: Option<String>,
+    },
+    /// Answer to [`Msg::NodeCa`] (#416): the certificate (by its serial, hex) is the node's CA now,
+    /// for every box it runs, or why not.
+    NodeCaInstalled {
         serial: String,
         error: Option<String>,
     },
@@ -970,8 +993,8 @@ mod tests {
     /// and its answer are typed messages (protocol 13).
     #[test]
     fn the_control_hosts_tools_are_typed_calls_from_protocol_13() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
-        assert!(negotiate(PROTOCOL, 12).unwrap() < ONE_GATEWAY);
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (14, 13));
+        assert!(negotiate(12, 13).unwrap() < ONE_GATEWAY);
         assert_eq!(ControlTool::of("await_grant"), Some(ControlTool::AwaitGrant));
         assert_eq!(ControlTool::RequestCapacity.name(), "request_capacity");
         for local in ["whoami", "request_access", "spawn_agent", "anything", ""] {
@@ -1205,27 +1228,29 @@ mod tests {
     }
 
     /// Why this build has no checks for features of protocol 12 or before (node health, #377, the
-    /// last): a peer below 12 can't connect, so every connection talks 12 or 13 (#253, #257 slice
-    /// 4b), and a check for a version at or under 12 would always pass.
+    /// last): a peer below 13 can't connect, so every connection talks 13 or 14 (#257 slice 4b,
+    /// #416), and a check for a version at or under 12 would always pass. 13 (one gateway) keeps its
+    /// check for as long as a node at 13 can connect; so does 14 (CA renewal).
     #[test]
-    fn no_connection_talks_below_protocol_12() {
-        assert_eq!((PROTOCOL, PROTOCOL_SKEW), (13, 1));
+    fn no_connection_talks_below_protocol_13() {
+        assert_eq!((PROTOCOL, PROTOCOL_SKEW, CA_RENEWAL), (14, 1, 14));
         for theirs in 1..=PROTOCOL + 3 {
             match negotiate(PROTOCOL, theirs) {
-                Ok(at) => assert!((12..=13).contains(&at) && (12..=14).contains(&theirs), "{theirs} -> {at}"),
-                Err(_) => assert!(!(12..=14).contains(&theirs), "{theirs} refused"),
+                Ok(at) => assert!((13..=14).contains(&at) && (13..=15).contains(&theirs), "{theirs} -> {at}"),
+                Err(_) => assert!(!(13..=15).contains(&theirs), "{theirs} refused"),
             }
         }
-        // And a node at 13 or 14 talking to a control host at 13 from the other side.
-        assert_eq!(negotiate(14, PROTOCOL), Ok(13));
-        assert!(negotiate(PROTOCOL, 11).is_err() && negotiate(11, PROTOCOL).is_err());
+        // And a node at 14 or 15 talking to a control host at 14 from the other side.
+        assert_eq!(negotiate(15, PROTOCOL), Ok(14));
+        assert!(negotiate(13, PROTOCOL).unwrap() < CA_RENEWAL, "a node at 13 is not asked to renew its CA");
+        assert!(negotiate(PROTOCOL, 12).is_err() && negotiate(12, PROTOCOL).is_err());
     }
 
     /// #257: a box's swaps go in its start as names and placeholders, never values, and a start
     /// without them reads as having none.
     #[test]
     fn a_start_carries_its_swaps_by_name() {
-        assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (14, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),
