@@ -47,7 +47,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled", "cache"], default-features = false }
 sha2 = "0.11"
 hex = "0.4"
 # Without its `std` feature, which brings rand 0.9 (a second rand, #219): ids come from
