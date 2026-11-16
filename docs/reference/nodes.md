@@ -35,8 +35,8 @@ box's token and the grants published to it, splice-through included) exactly as 
 audit records are shipped as `node.audit` like any node's. Its CA is the one difference in kind: a 24-hour
 intermediate with no DNS name constraint (`*`; IP addresses still excluded), since it serves whatever its
 boxes reach, while a remote node's is constrained to `--hosts`. What a node doesn't decide itself (the
-MCP gateway's relayed tools, and hosts its CA can't cover) goes to the run's own proxies
-(`<run dir>/ctl/`) over the node's channel.
+MCP gateway's relayed tools) goes to the run's own gateway (`<run dir>/ctl/gateway.sock`) over the
+node's channel. No egress goes there: since #257's slice 3 the node decides every request itself.
 
 Sharing the filesystem is used only as transport:
 
@@ -215,8 +215,8 @@ wicket node revoke n1
   |---|---|---|
   | fresh (a statement within the TTL, 30 s) | the box's token and its live grants | the control host raises a pending request (`wicket pending`, `wicket approve` as usual); 403 with its id |
   | offline (no live statement) | the same, each until its own expiry | queued on the node (`asks.json`; a node-local id `q-…` in the 403) and raised when the control host is back, saying how old it is; no approvals on the node alone |
-  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 503 with `Retry-After` (a model call is held up to 3 s first) |
-  | closed (no verified state, or the feed key's certificate expired) | nothing | 503 with `Retry-After` |
+  | lagging (a live statement names deltas not yet held) | nothing, until they arrive (milliseconds) | 403, retry |
+  | closed (no verified state, or the feed key's certificate expired) | nothing | 403 |
 
   Approved grants for the box's requests are pushed to the node as feed grants bound to the box, and the node
   counts their uses: the ledger hands them over and never consumes them too. A path-prefix grant is honoured on
@@ -226,15 +226,19 @@ wicket node revoke n1
   remaining lifetime of what was revoked. A tampered, replayed or rolled-back
   feed frame is refused.
 - **TLS.** The node terminates TLS with its own node CA, and the box's CA bundle holds the installation root (for
-  the node CA's leaves) and the run's own CA on the control host. The node never terminates, and instead tunnels
-  the raw CONNECT over the channel to the control host's egress proxy for the run (which decides and terminates
-  it with the run CA), for:
-  hosts outside the node CA's name constraints (e.g. hosts approved later under `unlisted_hosts: escalate`), and
-  every host once the node CA has expired. Grants for those hosts stay in the ledger. An `inject` rule's host
-  and a credential swap's host are terminated on the node, which injects or swaps the credential itself, its
-  secret fetched on first use (#152, #257). The node forwards a swapped host only for a box that a control host
-  at protocol 9 started. While disconnected, they
-  fail with a 503 and `Retry-After` (temporary; clients retry). The LLM proxy and the MCP gateway are reached the same way, through tunnels.
+  the node CA's leaves) and the run's own CA. An `inject` rule's host and a credential swap's host are
+  terminated on the node, which injects or swaps the credential itself, its secret fetched on first use
+  (#152, #257). A host the node CA can't cover (outside its name constraints, e.g. one approved later under
+  `unlisted_hosts: escalate`; or every host once the node CA has expired, or without one) is never terminated
+  and, since protocol 11 (#257's slice 3), never forwarded to the control host either: the node splices it
+  through if the box's token allows the host wholesale, and otherwise refuses the CONNECT with a 403 that says
+  so (`Blocked by wicket box: host not served on this node`, logged as a `forbidden` egress line,
+  `not served on this node (<why>)`). To serve such a host, widen the node's CA (`wicket node renew-ca <node>
+  --hosts …`). Plain `http://` needs no certificate, so the node decides it like any request. Grants are all
+  published to the node, which alone counts their uses; the ledger records them. A box that a node before
+  protocol 11 would forward one of its known hosts for (its zone's reach, inject or swap hosts outside that
+  node's CA, or any host without a live CA) doesn't start there: update the node. The MCP gateway's relayed
+  tools are reached through a tunnel.
 - **Audit and clock.** The node keeps its own hash-chained audit log (`audit.db`, wicket's ledger format) and
   ships it on every connect; the control host stores each record as `node.audit` and `wicket audit --verify`
   recomputes each node's chain. The control host, not the node, decides where a shipped record is filed. It
@@ -255,8 +259,7 @@ wicket node revoke n1
   connection into the target box are execs on that box's node; its hosts file is rewritten there. A box on
   another node than the relaying run's is reached over a connection of the relay's own (scope
   `links:<run>`), so the bytes pass through the control host. Reach, approval and audit are those of any link.
-- **For now.** Plain `http://` to a forwarded host is refused, and gateway tools beyond #164's are still decided on the
-  control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
+- **For now.** Gateway tools beyond #164's are still decided on the control host. `ci/node-e2e.sh --local` runs the whole scenario with localhost as the node (only
   the ssh hop is replaced); `ci/node-e2e.sh <node>` runs it against a real enrolled node.
 
 ## Images on nodes

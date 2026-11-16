@@ -14,6 +14,7 @@ mod cmd;
 mod control;
 mod daemon;
 mod doctor;
+mod effect;
 mod enrol;
 mod exitcause;
 mod grant;

@@ -317,7 +317,9 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     };
     let op = Op::egress(tenant, run, zone, METHOD, HOST, &format!("/capacity/{id}"));
     let reason = format!("capacity lease {id}: {what}, {money}. Asked by the agent: {}", a.reason);
-    let (rid, _) = l.pending_for(&op, &reason, None)?;
+    // The lease as asked is what the approval is for (#369): the reconciler provisions it only as
+    // it was decided on.
+    let rid = l.file_request(&op, Some(&lease_args(&row)), &reason, None)?.id().to_string();
     l.set_lease_request(&id, &rid)?;
     l.audit(
         tenant,
@@ -329,6 +331,16 @@ pub fn ask(l: &mut Ledger, cfg: &PlacementConfig, tenant: &TenantId, run: &RunId
     Ok(CapacityState::Waiting(format!(
         "requested: lease {id} ({what}; {money}), waiting for an operator (request {rid}). Call request_capacity with lease {id} to wait until its node is ready."
     )))
+}
+
+/// The sha256 of what a capacity lease asks for (#369): its provider, spec, money and duration.
+/// The request carries it, its grant is made with it, and the reconciler provisions the lease only
+/// while it is still the same.
+pub fn lease_args(row: &LeaseRow) -> String {
+    wicket_core::effect::args_sha256(&serde_json::json!({
+        "provider": row.provider, "spec": row.spec, "hourly_cap": row.hourly_cap, "reserved": row.reserved,
+        "duration_secs": row.duration_secs,
+    }))
 }
 
 /// Where a lease this run holds is.

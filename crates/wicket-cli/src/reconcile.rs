@@ -15,7 +15,9 @@
 //! - *Machines*: the provider's instances carrying this installation's owner tag, against the approved
 //!   and active leases (`wicket_placement::reconcile`, matching by each lease's idempotency tag). A node
 //!   no live lease asks for is destroyed, or with `warm_pool` kept until minute 50 of its paid hour; a
-//!   duplicate is destroyed; a node that matches a lease the ledger has no node for (a crash between
+//!   duplicate is destroyed; one created less than ten minutes ago that nothing records yet is left
+//!   for its creator to record (`wicket node create` records its node once the provider answers,
+//!   #324); a node that matches a lease the ledger has no node for (a crash between
 //!   create and record) is adopted; an approved lease with no node gets one (acquire, enrol with the
 //!   host key pinned at creation, `wicket node install`). Untagged instances are never listed, so never
 //!   touched; protected ones are reported and left. **Ownership is checked again right before every
@@ -27,7 +29,8 @@
 //!   checks the owner tag and `wicket-protected` first) and its enrolment revoked, with an audit record
 //!   saying why; one a run still holds is kept, audited once per change of holders, and flagged in
 //!   `wicket node list` and the console (asking for a renewal decision is #56; until then it is a
-//!   warning). The machine half above leaves recorded placed nodes to this step.
+//!   warning). A run whose files a fetch didn't bring back (`runs.uncollected`) holds its node the
+//!   same way, so they aren't destroyed with it (#300, #324); so does a capacity lease's run. The machine half above leaves recorded placed nodes to this step.
 //! - *Boxes*: Docker's `wicket=1` containers, here and on every active enrolled node (over its pinned
 //!   ssh), by their `wicket.run` label. A box whose run has ended is stopped; a running run's box is
 //!   left to its run (above). **A box whose run this ledger doesn't know is left alone**: Docker may
@@ -295,6 +298,21 @@ where
             match r.status.as_str() {
                 "pending" => {}
                 "granted" => {
+                    // Provisioned only as it was decided on, and while its approval lasts (#369).
+                    if let Some(why) = self.lease_unbound(&lease, &r)? {
+                        if !self.dry_run {
+                            self.ledger.lease_ended(&lease.id, "denied", &why, None)?;
+                            self.ledger.audit(
+                                &TenantId(lease.tenant.clone()),
+                                Some(&RunId(lease.run.clone())),
+                                "effect.refused",
+                                &serde_json::json!({ "lease": lease.id, "request": rid, "why": why }),
+                            )?;
+                        }
+                        self.leases_ended.insert(lease.id.clone());
+                        self.did("lease_closed", &lease.id, &why, Some(&lease.run));
+                        continue;
+                    }
                     if !self.dry_run {
                         self.ledger.lease_transition(&lease.id, &["pending"], "approved", &format!("request {rid} granted"))?;
                     }
@@ -313,10 +331,42 @@ where
         Ok(())
     }
 
+    /// Why a granted lease may not be provisioned, if it may not (#369): its approval has ended, or
+    /// the lease is no longer what was approved. A request filed before approvals were bound to
+    /// their effect carries no arguments, and is provisioned as before.
+    fn lease_unbound(&self, lease: &wicket_store::LeaseRow, r: &wicket_store::Request) -> Result<Option<String>> {
+        let Some(asked) = r.args_sha256.as_deref() else { return Ok(None) };
+        let Some(g) = self.ledger.grant_for_request(&r.id)? else {
+            return Ok(Some(format!("request {} has no live grant", r.id)));
+        };
+        if g.expires_at <= wicket_store::now() {
+            return Ok(Some(format!("its approval ({}) ended before it was provisioned", g.id)));
+        }
+        let granted = self.ledger.grant_effect(&g.id)?.and_then(|(_, a)| a);
+        let now = crate::capacity::lease_args(lease);
+        if granted.as_deref() != Some(asked) || now != asked {
+            return Ok(Some(format!("the lease is not what its approval ({}) was for: it changed after it was decided", g.id)));
+        }
+        Ok(None)
+    }
+
     async fn lease_ends(&mut self) -> Result<()> {
         for lease in self.live_leases(&["approved", "active"])? {
             let holder = self.run_status(&lease.run)?;
-            let why = if holder.as_deref() != Some("running") {
+            let uncollected = match lease.node_name.as_deref() {
+                Some(n) => self.ledger.uncollected_runs_on_node(n)?.contains(&lease.run),
+                None => false,
+            };
+            let why = if holder.as_deref() != Some("running") && uncollected {
+                // Its node keeps files of its run a fetch didn't bring back (#300, #324): ending
+                // the lease would destroy them with the node.
+                self.note(
+                    "lease_held",
+                    &lease.id,
+                    &format!("its run {} has ended, but its node keeps files a fetch didn't bring back", lease.run),
+                );
+                None
+            } else if holder.as_deref() != Some("running") {
                 Some(format!("its run {} has ended ({})", lease.run, holder.as_deref().unwrap_or("unknown")))
             } else if lease.status == "active" && lease.not_after.is_some_and(|t| t <= self.now) {
                 Some("its lease end has passed".to_string())
@@ -394,6 +444,16 @@ where
             })
             .collect();
         let by_key: HashMap<String, LeaseRow> = leases.into_iter().map(|l| (lease_key(&l.id), l)).collect();
+        // Every lease's idempotency tag, ended ones too: a node with none of them is one nothing records.
+        let recorded: HashSet<String> = self.ledger.leases(&[])?.iter().map(|l| owner.idem_tag(&lease_key(&l.id))).collect();
+        let now = self.now;
+        let young = |id: &NodeId| {
+            observed
+                .iter()
+                .find(|n| &n.id == id)
+                .filter(|n| Owner::idem_tag_of(n).is_none_or(|t| !recorded.contains(t)))
+                .and_then(|n| plan::too_new_to_judge(n, now))
+        };
         // Destroys first, so the envelope sees room before anything is created.
         let mut actions = plan::reconcile(&owner, &desired, &observed, self.now, warm, &PoolRules::default());
         actions.sort_by_key(|a| !matches!(a, plan::Action::Destroy { .. }));
@@ -402,6 +462,16 @@ where
                 plan::Action::Ignore { node, reason } => self.note("ignored", &node.0, &format!("{reason:?}: never touched")),
                 plan::Action::Pool { node, until } => {
                     self.note("kept_warm", &node.0, &format!("no lease; paid until {}, destroyed then", capacity::fmt_time(until)))
+                }
+                plan::Action::Destroy { node, reason: plan::DestroyReason::NoLease } if young(&node).is_some() => {
+                    // Nothing records it, and it is new: its creator (`wicket node create`) may not
+                    // have recorded it yet (#324).
+                    let until = young(&node).unwrap_or(self.now);
+                    self.note(
+                        "young",
+                        &node.0,
+                        &format!("nothing records it, and it was just created: left for its creator until {}", capacity::fmt_time(until)),
+                    )
                 }
                 plan::Action::Destroy { node, reason } => self.destroy(&node, &format!("{reason:?}")).await?,
                 plan::Action::Keep { node, idempotency_key } => {
@@ -620,12 +690,24 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
             }
             done.push(Done { kind, target: row.id.clone(), detail });
         };
-        let holders = ledger.running_runs_on_node(&row.name)?;
-        if !holders.is_empty() {
-            let runs = holders.join(",");
+        let running = ledger.running_runs_on_node(&row.name)?;
+        // A run whose files a fetch didn't bring back holds the node too (#300, #324): releasing
+        // it would destroy them.
+        let uncollected: Vec<String> = ledger.uncollected_runs_on_node(&row.name)?.into_iter().filter(|r| !running.contains(r)).collect();
+        if !running.is_empty() || !uncollected.is_empty() {
+            let runs = running.iter().chain(&uncollected).cloned().collect::<Vec<_>>().join(",");
+            let mut why = vec![];
+            if !running.is_empty() {
+                why.push(format!("run {} still runs on it", running.join(",")));
+            }
+            if !uncollected.is_empty() {
+                why.push(format!("it keeps the files of run {} that a fetch didn't bring back", uncollected.join(",")));
+            }
             let detail = format!(
-                "placed node {} is past its lease (ended {ended}) but run {runs} still runs on it: kept, and billing until it is released (wicket node release {})",
-                row.name, row.id
+                "placed node {} is past its lease (ended {ended}) but {}: kept, and billing until it is released (wicket node release {})",
+                row.name,
+                why.join(", and "),
+                row.id
             );
             let changed = if dry_run { false } else { ledger.set_placed_node_held(&row.id, Some(&runs))? };
             record(ledger, "placed_held", detail, changed);
@@ -1341,6 +1423,29 @@ mod tests {
         assert_eq!((x.status.as_str(), x.node_id.as_deref(), x.not_after), ("active", Some("i-made-before"), Some(NOW + 3000)));
     }
 
+    /// #369: a lease is provisioned only while its approval lasts and as it was approved: one whose
+    /// grant ended first is closed, not provisioned, and that is on the record.
+    #[tokio::test]
+    async fn a_lease_whose_approval_ended_is_not_provisioned() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_a", "alive:1");
+        let lease = approved_lease(&mut l, &c, "run_a");
+        let rid = l.lease(&lease).unwrap().unwrap().request_id.unwrap();
+        let asked = l.request(&rid).unwrap().args_sha256.expect("the ask carries its arguments");
+        assert_eq!(asked, capacity::lease_args(&l.lease(&lease).unwrap().unwrap()));
+        let g = l.grant_for_request(&rid).unwrap().unwrap();
+        assert_eq!(l.grant_effect(&g.id).unwrap().and_then(|(_, a)| a), Some(asked));
+        l.revoke_grant(&g.id).unwrap();
+        let d = w.pass(&mut l, NOW, false).await;
+        assert_eq!(kinds(&d), vec!["lease_closed"], "{d:?}");
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "denied");
+        assert!(l.audit_tail(20).unwrap().iter().any(|r| r.2 == "effect.refused"));
+    }
+
     #[tokio::test]
     async fn request_capacity_on_static_hosts_from_ask_to_lease_end() {
         let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
@@ -1432,6 +1537,30 @@ mod tests {
         assert_eq!(a.approve(&ask("cap-x", 20_000)).await, Approval::Approved);
         assert!(matches!(a.approve(&ask("cap-x", 30_000)).await, Approval::Denied(_)));
         assert!(matches!(a.approve(&ask("cap-y", 1)).await, Approval::Denied(_)));
+    }
+
+    /// #300, #324: a capacity lease whose run ended with files its node kept (a fetch that failed)
+    /// isn't ended, so its node isn't destroyed with them; once they are collected it ends.
+    #[tokio::test]
+    async fn a_lease_whose_run_left_uncollected_files_is_kept() {
+        let dir = std::env::temp_dir().join(format!("wicket-rec-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg("static");
+        let w = World::new(StaticHosts::persistent(c.static_hosts.clone(), dir.join("static.json")));
+        let mut l = Ledger::open_in_memory().unwrap();
+        started(&l, "run_files", "alive:1");
+        let lease = approved_lease(&mut l, &c, "run_files");
+        w.pass(&mut l, NOW, false).await;
+        let node = l.lease(&lease).unwrap().unwrap().node_name.expect("its node");
+        l.run_ended(&RunId("run_files".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_files", Some(&node)).unwrap();
+        let d = w.pass(&mut l, NOW + 60, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "active", "{d:?}");
+        assert!(d.iter().any(|x| x.kind == "lease_held"), "{d:?}");
+        l.set_run_uncollected("run_files", None).unwrap();
+        w.pass(&mut l, NOW + 120, false).await;
+        assert_eq!(l.lease(&lease).unwrap().unwrap().status, "ended");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1676,6 +1805,76 @@ mod tests {
         let d = full_pass(&w, &mut l, end + 60, false).await;
         assert!(!d.iter().any(|x| x.target == "placed-idle"), "{d:?}");
         assert_eq!(audited(&l, "reconcile.placed_released"), 1);
+    }
+
+    /// #324: `wicket node create` records its node once the provider answers. A pass that lists the
+    /// instance before that leaves it alone while it is new, rather than destroying a node its human
+    /// was just given; once the grace is over, a node still unrecorded is an orphan and goes.
+    #[tokio::test]
+    async fn a_node_just_created_and_not_yet_recorded_is_left_for_its_creator() {
+        let (base, st) = vultr_mock::serve().await;
+        let o = Owner::new("example");
+        let mut l = Ledger::open_in_memory().unwrap();
+        // Created just before NOW, not recorded yet.
+        let new = |id: &str, key: &str| {
+            let mut i = vultr_mock::instance(id, &[o.tag(), o.idem_tag(key)]);
+            i["date_created"] = serde_json::json!("2023-11-14T22:13:00+00:00"); // NOW - 20
+            i
+        };
+        st.lock().unwrap().instances.push(new("just-made", "place-create:p0"));
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, NOW + 30, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        assert!(d.iter().any(|x| x.kind == "young" && x.target == "just-made"), "{d:?}");
+        // Recorded meanwhile: it is the placed node's from then on, kept to its lease.
+        let end = NOW + 3000;
+        l.record_placed_node(&wicket_store::PlacedNodeRow {
+            id: "just-made".into(),
+            backend: "vultr".into(),
+            name: "p0".into(),
+            owner: "example".into(),
+            api_key_secret: "vultr-api-key".into(),
+            created_at: NOW,
+            lease_until: end,
+            status: String::new(),
+            held_by: None,
+            ended_at: None,
+            detail: None,
+            hourly: None,
+        })
+        .unwrap();
+        full_pass(&w, &mut l, NOW + 700, false).await;
+        assert!(deletes(&st).is_empty(), "recorded: kept to its lease");
+        // One never recorded is an orphan once the grace is over.
+        st.lock().unwrap().instances.push(new("crashed", "place-create:p1"));
+        full_pass(&w, &mut l, NOW + 60, false).await;
+        assert!(deletes(&st).is_empty());
+        full_pass(&w, &mut l, NOW - 20 + wicket_placement::reconcile::UNRECORDED_GRACE_SECS, false).await;
+        assert_eq!(deletes(&st), vec!["crashed"]);
+    }
+
+    /// #300, #324: a run whose files a fetch didn't bring back holds its placed node past its lease,
+    /// as a running run does: releasing it would destroy them. A human's `place release` decides.
+    #[tokio::test]
+    async fn a_placed_node_keeping_a_runs_uncollected_files_is_not_released() {
+        let (base, st) = vultr_mock::serve().await;
+        let mut l = Ledger::open_in_memory().unwrap();
+        let end = NOW + 2400;
+        placed(&l, &st, "placed-files", "files-node", end);
+        started(&l, "run_done", "alive:1");
+        l.set_run_node("run_done", "files-node").unwrap();
+        l.run_ended(&RunId("run_done".into()), "failed", "fetching its files failed").unwrap();
+        l.set_run_uncollected("run_done", Some("files-node")).unwrap();
+        let w = World::new(vultr(&base));
+        let d = full_pass(&w, &mut l, end + 1, false).await;
+        assert!(deletes(&st).is_empty(), "{d:?}");
+        let x = d.iter().find(|x| x.kind == "placed_held").expect("flagged");
+        assert!(x.detail.contains("run_done") && x.detail.contains("didn't bring back"), "{}", x.detail);
+        assert_eq!(l.placed_node("placed-files").unwrap().unwrap().held_by.as_deref(), Some("run_done"));
+        // Collected (or given up by a human): released at the next pass.
+        l.set_run_uncollected("run_done", None).unwrap();
+        full_pass(&w, &mut l, end + 60, false).await;
+        assert_eq!(deletes(&st), vec!["placed-files"]);
     }
 
     #[tokio::test]

@@ -1,20 +1,27 @@
-//! The simulated scenario (#324): a control host, one node and two box stubs, with faults from a
-//! seed, checked against #321's invariants.
+//! The simulated scenarios (#324), each with faults from a seed, checked against #321's invariants:
+//! `feed` (the first slice: a control host, one node and two box stubs; grants and model budgets),
+//! `placement` (placed nodes' leases, the reconciler, the money envelope and release, several runs
+//! on one node) and `messages` (principals, held messages, wake and receipts).
 //!
-//! - `seeds`: a fixed set of seeds, or `WICKET_SIM_SEEDS=<n>` seeds from `WICKET_SIM_FROM`
-//!   (default 0): CI runs the fixed set on pull requests and more nightly (`ci/sim.sh`).
-//! - `replay`: one seed, `WICKET_SIM_SEED=<seed>`, with its plan and whole trace printed: what a
-//!   failing seed's report says to run.
-//! - `deterministic`: one seed, run twice, gives the same trace.
-//! - `without_the_spend_journal_a_crashed_node_overspends`: the bug this found, still found.
+//! - `seeds`: every scenario for a fixed set of seeds, or `WICKET_SIM_SEEDS=<n>` seeds from
+//!   `WICKET_SIM_FROM` (default 0): CI runs the fixed set on pull requests and more nightly
+//!   (`ci/sim.sh`). `WICKET_SIM_SCENARIO=<name>` runs one scenario only.
+//! - `replay`: one seed, `WICKET_SIM_SEED=<seed>` (and `WICKET_SIM_SCENARIO`), with its plan and
+//!   whole trace printed: what a failing seed's report says to run.
+//! - `deterministic`: seed 7 of each scenario, run twice, gives the same trace.
+//! - `without_…` and `a_relayed_message_…`: what the simulation found, still found with its fix
+//!   turned off (or, for the known relay loss, not yet fixed).
 //! - `published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime`: #342's
 //!   expiry boundary, held by the strict oracle.
+//! - `a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants`: #257's slice 3,
+//!   no forwarded egress: such a host is spliced or refused, never decided.
 
 use std::path::PathBuf;
+use wicket_sim::trace::{replay_command, SCENARIOS};
 use wicket_sim::Options;
 
 /// The seeds every pull request runs.
-const FIXED: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
+const FIXED: [u64; 11] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144];
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wicket-sim")
@@ -22,6 +29,14 @@ fn dir() -> PathBuf {
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// The scenarios a run covers: all of them, or `WICKET_SIM_SCENARIO`'s.
+fn scenarios() -> Vec<&'static str> {
+    match std::env::var("WICKET_SIM_SCENARIO") {
+        Ok(s) => vec![SCENARIOS.iter().copied().find(|x| *x == s).unwrap_or_else(|| panic!("no scenario {s:?}: one of {SCENARIOS:?}"))],
+        Err(_) => SCENARIOS.to_vec(),
+    }
 }
 
 #[test]
@@ -34,27 +49,24 @@ fn seeds() {
         None => FIXED.to_vec(),
     };
     let mut failed = vec![];
-    for seed in seeds {
-        let r = wicket_sim::run(seed, &dir());
-        println!(
-            "seed {seed}: {} faults, {} grant actions, {} decisions, {} model calls, hash {:016x}{}",
-            r.plan.faults.len(),
-            r.stats.grant_actions,
-            r.stats.allowed_reach + r.stats.allowed_grant + r.stats.needs_grant + r.stats.forbidden + r.stats.refused,
-            r.stats.model_ok + r.stats.model_refused,
-            r.hash,
-            if r.ok() { "" } else { " FAILED" }
-        );
-        if !r.ok() {
-            eprintln!("{r}");
-            failed.push(seed);
+    for scenario in scenarios() {
+        for &seed in &seeds {
+            let r = wicket_sim::run_scenario(scenario, seed, &dir().join("seeds"), false);
+            println!("seed {seed}: {scenario}: hash {:016x}{}; {}", r.hash, if r.ok() { "" } else { " FAILED" }, r.stats);
+            for k in &r.known {
+                println!("  KNOWN {k}");
+            }
+            if !r.ok() {
+                eprintln!("{r}");
+                failed.push(replay_command(scenario, seed));
+            }
         }
     }
     assert!(
         failed.is_empty(),
         "{} seed(s) broke an invariant:\n{}",
         failed.len(),
-        failed.iter().map(|s| format!("  {}", wicket_sim::replay_command(*s))).collect::<Vec<_>>().join("\n")
+        failed.iter().map(|c| format!("  {c}")).collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -63,23 +75,29 @@ fn replay() {
     let Some(seed) = env_u64("WICKET_SIM_SEED") else {
         return;
     };
-    let r = wicket_sim::run_with(seed, &dir(), Options { keep_trace: true, ..Options::default() });
-    for line in &r.trace {
-        println!("{line}");
+    let mut ok = true;
+    for scenario in scenarios() {
+        let r = wicket_sim::run_scenario(scenario, seed, &dir().join("replay"), true);
+        for line in &r.trace {
+            println!("{line}");
+        }
+        println!("{r}");
+        ok &= r.ok();
     }
-    println!("{r}");
-    assert!(r.ok(), "seed {seed} broke an invariant");
+    assert!(ok, "seed {seed} broke an invariant");
 }
 
 #[test]
 fn deterministic() {
-    let o = Options { keep_trace: true, ..Options::default() };
-    let a = wicket_sim::run_with(7, &dir().join("a"), o);
-    let b = wicket_sim::run_with(7, &dir().join("b"), o);
-    if a.hash != b.hash {
-        let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
-        panic!("seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
+    for scenario in scenarios() {
+        let a = wicket_sim::run_scenario(scenario, 7, &dir().join("a"), true);
+        let b = wicket_sim::run_scenario(scenario, 7, &dir().join("b"), true);
+        if a.hash != b.hash {
+            let at = a.trace.iter().zip(&b.trace).position(|(x, y)| x != y).unwrap_or(a.trace.len().min(b.trace.len()));
+            panic!("{scenario}: seed 7 ran differently twice, from trace line {at}:\n  {:?}\n  {:?}", a.trace.get(at), b.trace.get(at));
+        }
     }
+    let a = wicket_sim::run_with(7, &dir().join("stats"), Options { keep_trace: true, ..Options::default() });
     assert!(a.stats.allowed_grant > 0 && a.stats.model_ok > 0, "the scenario exercised grants and the budget: {:?}", a.stats);
 }
 
@@ -97,6 +115,48 @@ fn without_the_spend_journal_a_crashed_node_overspends() {
     assert!(r.violations.iter().all(|v| v.contains("billed, budget")), "and breaks nothing else: {r}");
 }
 
+/// What the placement scenario found (#324), each still found with its fix turned off: the seeds
+/// that found them, run without the fix, break the invariant it restored. Each test has its own
+/// directory (`name`): a run clears its directory first.
+fn placement_without(name: &str, seed: u64, options: wicket_sim::placement::Options, expect: &str) {
+    let r = wicket_sim::placement::run(seed, &dir().join(format!("without-{name}")), options);
+    assert!(r.violations.iter().any(|v| v.contains(expect)), "placement seed {seed} no longer finds {expect:?}: {r}");
+}
+
+/// `wicket run --node` started boxes on a placed node past its lease, each run then holding it.
+#[test]
+fn without_the_lease_check_runs_start_on_a_node_past_its_lease() {
+    let o = wicket_sim::placement::Options { refuse_past_lease: false, ..Default::default() };
+    placement_without("lease", 2, o, "past its lease");
+}
+
+/// A run whose fetch failed left its files on its node, and the reconciler released the node with them.
+#[test]
+fn without_the_uncollected_hold_a_node_is_released_with_a_runs_files() {
+    let o = wicket_sim::placement::Options { hold_uncollected: false, ..Default::default() };
+    placement_without("uncollected", 2, o, "work on it uncollected");
+}
+
+/// A reconciler pass listed a node `place create` had just made, before it was recorded, and
+/// destroyed it as having no lease.
+#[test]
+fn without_the_grace_the_reconciler_destroys_a_node_just_placed() {
+    let o = wicket_sim::placement::Options { young_grace: false, ..Default::default() };
+    placement_without("grace", 20, o, "before its lease ends");
+}
+
+/// The known loss the messages scenario found (#324, see `wicket_sim::messages::run`): a relayed
+/// `await_message` answer lost with the node's channel after the control host recorded the message
+/// read. Seed 13 still loses one; when this fails, the loss is fixed: make `strict_relay` the
+/// default and drop this test.
+#[test]
+fn a_relayed_message_whose_answer_is_cut_off_is_still_lost() {
+    let o = wicket_sim::messages::Options { strict_relay: true, ..Default::default() };
+    let r = wicket_sim::messages::run(13, &dir().join("strict"), o);
+    assert!(r.violations.iter().any(|v| v.contains("its receipt says read")), "seed 13 no longer loses a relayed message: {r}");
+    assert!(r.violations.iter().all(|v| v.contains("its receipt says read")), "and breaks nothing else: {r}");
+}
+
 /// #342: a node honoured a grant up to 999 ms past the ledger's `expires_at` (#333's observation,
 /// #337's F1): the token's check is `time <= not_after` in whole seconds, and the grant was
 /// published with `not_after = expires_at`. The oracle is strict (live while `now < expires_at`,
@@ -107,4 +167,18 @@ fn published_with_not_after_at_expires_at_a_node_allows_past_the_grants_lifetime
     let r = wicket_sim::run_with(1, &dir().join("grant-end"), Options { grant_end_fix: false, ..Options::default() });
     assert!(r.violations.iter().any(|v| v.contains("past its lifetime")), "seed 1 no longer allows past a grant's end: {r}");
     assert!(r.violations.iter().all(|v| v.contains("past its lifetime")), "and breaks nothing else: {r}");
+}
+
+/// #257, slice 3: the control host publishes every grant, one on a host the node's CA can't cover
+/// included, and decides nothing; the node splices such a host if the box's token allows it
+/// wholesale and refuses it otherwise. The `seeds` test checks that no such host is allowed but
+/// spliced. A node that decided those hosts from the feed instead (as if it could terminate them)
+/// would honour the published grant: the oracle finds it.
+#[test]
+fn a_node_that_decided_hosts_its_ca_cannot_cover_would_honour_their_grants() {
+    let r = wicket_sim::run_with(1, &dir().join("uncovered"), Options { refuse_uncovered: false, ..Options::default() });
+    assert!(r.violations.iter().any(|v| v.contains("outside the node's CA, and was decided")), "seed 1 no longer shows it: {r}");
+    assert!(r.violations.iter().all(|v| v.contains("outside the node's CA")), "and breaks nothing else: {r}");
+    let ok = wicket_sim::run(1, &dir().join("uncovered-ok"));
+    assert!(ok.ok() && ok.stats.spliced > 0 && ok.stats.uncovered_refused > 0, "both ways exercised: {:?}", ok.stats);
 }

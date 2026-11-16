@@ -57,7 +57,8 @@ function describe(a) {
     return verb + how + ": " + what + (a.prefix ? "\u2026 (every path under it)" : "") +
       (a.scope === "zone" ? " \u00b7 any run in zone " + s(a.zone) : "") +
       " \u00b7 " + riskLabel(a.risk) + " \u00b7 request " + s(a.request) + " \u00b7 run " + s(a.run) +
-      (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "");
+      (a.agent ? " \u00b7 agent " + s(a.agent) : "") + ((a.requested_by || []).length ? " (" + a.requested_by.map(s).join(", ") + ")" : "") +
+      (a.effect_sha256 ? " \u00b7 effect " + s(a.effect_sha256).slice(0, 16) : "");
   }
   if (a.action === "revoke") return "Revoke " + s(a.run) + " (" + s(a.agent) + "): " + s(a.reason);
   if (a.action === "save_manifest" || a.action === "restore_manifest") {
@@ -110,6 +111,7 @@ async function signed(body, after, extra) {
   catch (e) { toast(e.message); closeConfirm(); return; }
   const go = document.getElementById("confirm-go");
   document.getElementById("confirm-what").textContent = describe(begin.action);
+  renderBlast(document.getElementById("confirm-blast"), begin.action.blast);
   document.getElementById("confirm-state").textContent = "";
   const deny = begin.action.decision === "deny" || begin.action.action === "revoke" || begin.action.action === "delete_secret";
   go.textContent = deny ? "Sign: " + ({ revoke: "revoke", delete_secret: "delete" }[begin.action.action] || "deny") : "Sign with passkey";
@@ -125,6 +127,23 @@ async function signed(body, after, extra) {
   };
   document.getElementById("confirm").hidden = false;
   go.focus();
+}
+// #369: what else an approval that widens would allow, shown before the passkey is asked for.
+function renderBlast(box, b) {
+  box.replaceChildren();
+  box.hidden = !b;
+  if (!b) return;
+  const list = (title, xs) => {
+    if (!xs || !xs.length) return;
+    box.append(el("div", "meta", title));
+    const ul = el("ul");
+    for (const x of xs) ul.append(el("li", "", strip(x)));
+    box.append(ul);
+  };
+  list("This approval is wider than the one request:", b.widens);
+  list("It would also allow, for example:", b.examples);
+  box.append(el("div", "meta", "It would have covered " + b.covered + " of this run\u2019s last " + b.recent + " egress requests."));
+  list("The zone already reaches this host by:", b.zone_rules);
 }
 function closeConfirm() {
   document.getElementById("confirm").hidden = true;

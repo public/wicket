@@ -13,7 +13,10 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// The waits are on tokio's clock, as their sleeps are: the same as the OS's in production, and
+// the simulated one in the deterministic simulation (#324).
+use tokio::time::Instant;
 
 /// The most uses one `decide` approval may grant: an agent's grants are always bounded (#50).
 pub const MAX_DECIDE_USES: u32 = 100;
@@ -22,7 +25,7 @@ pub const MAX_DECIDE_USES: u32 = 100;
 const DEFAULT_DECIDE_TTL: u64 = 600;
 
 /// How long `await_grant` waits for a fresh grant to be handed to the box's node (#231): several of
-/// the run's 250 ms ticks, which a grant the control host keeps deciding also waits, once.
+/// the run's 250 ms ticks, which a grant it can't hand over (#257) also waits, once.
 const HAND_OFF: Duration = Duration::from_millis(1500);
 
 pub struct Gateway {
@@ -123,6 +126,14 @@ impl Gateway {
         body(StatusCode::OK, Some(reply))
     }
 
+    /// The deterministic simulation's seam (#324): a `tools/call` without HTTP, as a relayed call
+    /// from a box's node reaches it. The `sim` feature only adds this.
+    #[cfg(feature = "sim")]
+    pub async fn sim_call(&self, name: &str, args: Value) -> (String, bool) {
+        let r = self.call(&json!({ "name": name, "arguments": args })).await;
+        (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
+    }
+
     async fn call(&self, params: &Value) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -188,8 +199,9 @@ impl Gateway {
             match req.status.as_str() {
                 // The box's retry must find the grant where it is decided, or it asks again. A grant
                 // handed to the box's node: answer once the node has it (at most 15 s). One not yet
-                // handed: the run's process hands it over on its next tick (every 250 ms), or keeps
-                // deciding it here; wait a few ticks for that before answering.
+                // handed: the run's process hands it over on its next tick (every 250 ms), or never
+                // can (#257: then the box's retry is asked about again); wait a few ticks for that
+                // before answering.
                 "granted"
                     if {
                         let since = granted_at.get_or_insert_with(Instant::now).elapsed();
@@ -585,8 +597,9 @@ impl Gateway {
         if let Ok(Some(rid)) = l.denied_recently(&op) {
             return (format!("an operator denied exactly this update ({rid}) a few minutes ago; don't ask again"), true);
         }
-        match l.pending_for(&op, &format!("update wicket to the build with sha256 {sha}: {reason}"), None) {
-            Ok((rid, _)) => (
+        // The artifact's hash is the argument the approval is for (#369), as well as its path.
+        match l.file_request(&op, Some(sha), &format!("update wicket to the build with sha256 {sha}: {reason}"), None).map(|f| f.id().to_string()) {
+            Ok(rid) => (
                 format!(
                     "needs an operator: request {rid}. This does not update wicket, and nothing you can call does. If an operator approves it, they run `wicket self update <artifact>` on the control host, which accepts the artifact with sha256 {sha} once. Call await_grant with {rid} to wait for the decision."
                 ),
@@ -638,7 +651,21 @@ impl Gateway {
                 Ok(v) if !v.is_empty() => {
                     let lines: Vec<String> = v
                         .iter()
-                        .map(|r| format!("- {} {} {}{} ({}), from run {}: {}", r.id, r.method, r.host, r.path, r.risk, r.run, r.reason))
+                        .map(|r| {
+                            // The effect it asks for (#369): what a decision on it is made on.
+                            let e = wicket_store::descriptor(r, None);
+                            format!(
+                                "- {} {} {}{} ({}), from run {}, effect {}: {}",
+                                r.id,
+                                r.method,
+                                r.host,
+                                r.path,
+                                r.risk,
+                                r.run,
+                                e.sha256(),
+                                r.reason
+                            )
+                        })
                         .collect();
                     out.push_str(&format!(
                         "\n\nYour descendants' requests you may decide with the decide tool (within your own reach; anything you leave stays pending for an operator):\n{}",
@@ -710,6 +737,27 @@ impl Gateway {
                 "run": self.ctx.run.0, "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
             }),
         };
+        // An approval is of the effect the agent was shown (#369): it names the request's effect as
+        // pending_requests listed it, and signs the effect it grants. If the request changed since
+        // it was listed, or changes before the decision is recorded, nothing is approved.
+        let mut payload = payload;
+        if decision == "approve" {
+            let Some(listed) = named("effect") else {
+                return ("not decided: name the request's effect (sha256) as pending_requests lists it".into(), true);
+            };
+            let req = self.ctx.ledger.lock().ok().and_then(|l| l.request(id).ok());
+            if let Some(req) = req {
+                let asked = wicket_store::descriptor(&req, None).sha256();
+                if listed != asked {
+                    return (
+                        format!("not decided: request {id} changed since it was listed (its effect is now {asked}); look at it again"),
+                        true,
+                    );
+                }
+                let t = wicket_store::DecisionTerms { uses: u32::try_from(uses).ok(), ttl_secs: ttl, prefix: None, zone_wide: false };
+                payload["effect_sha256"] = wicket_store::descriptor(&req, Some(&t)).sha256().into();
+            }
+        }
         let signed = wicket_identity::sign_envelope(&me.key, &me.jws, &payload);
         match hook.decide(&signed) {
             Ok(text) => (text, false),
@@ -1101,6 +1149,7 @@ fn tools() -> Value {
                     "decision": { "type": "string", "enum": ["approve", "deny", "renew"] },
                     "grant_id": { "type": "string", "description": "renew: the grant to renew" },
                     "run": { "type": "string", "description": "renew: the descendant box (its run id) whose authority to renew" },
+                    "effect": { "type": "string", "description": "approve: the request's effect (sha256), as pending_requests lists it; if the request changed since, nothing is approved" },
                     "uses": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
                     "ttl_seconds": { "type": "integer", "minimum": 1, "default": 600, "description": "how long the grant (or renewal) lasts from now: at most 24h, and not past your own authority" }
                 },
@@ -1728,7 +1777,27 @@ mod tests {
         assert!(err && text.contains("may not decide"), "{text}");
         ctx.decisions = Some(rec.clone());
         let gw = Gateway::new(ctx);
-        let (text, err) = call(&gw, json!({ "request_id": "r-1", "decision": "approve", "uses": 3, "ttl_seconds": 120 })).await;
+        // #369: an approval names the effect pending_requests listed, and signs the one it grants.
+        let op = wicket_core::Op::egress(
+            &wicket_core::TenantId::single(),
+            &wicket_core::RunId("run_c".into()),
+            "research",
+            "GET",
+            "a.example",
+            "/x",
+        );
+        let (rid, _) = w.ledger.lock().unwrap().pending_for(&op, "x", None).unwrap();
+        let effect = wicket_store::descriptor(&w.ledger.lock().unwrap().request(&rid).unwrap(), None).sha256();
+        for (bad, why) in [(json!(null), "name the request's effect"), (json!("00".repeat(32)), "changed since it was listed")] {
+            let mut a = json!({ "request_id": rid, "decision": "approve" });
+            if !bad.is_null() {
+                a["effect"] = bad;
+            }
+            let (text, err) = call(&gw, a).await;
+            assert!(err && text.contains(why), "{text}");
+        }
+        let (text, err) =
+            call(&gw, json!({ "request_id": rid, "decision": "approve", "effect": effect, "uses": 3, "ttl_seconds": 120 })).await;
         assert!(!err && text == "recorded", "{text}");
         for bad in [
             json!({ "request_id": "r-1", "decision": "maybe" }),
@@ -1749,8 +1818,9 @@ mod tests {
                 seen[0]["uses"].as_u64(),
                 seen[0]["ttl_secs"].as_u64()
             ),
-            (Some(crate::DECISION_KIND), Some("run_lead"), Some("r-1"), Some(3), Some(120))
+            (Some(crate::DECISION_KIND), Some("run_lead"), Some(rid.as_str()), Some(3), Some(120))
         );
+        assert_eq!(seen[0]["effect_sha256"].as_str().map(str::len), Some(64));
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "decide"));
         // #56: a renewal names exactly one thing, and is signed the same way.
         let (text, err) = call(&gw, json!({ "decision": "renew", "grant_id": "g-1", "ttl_seconds": 300 })).await;
