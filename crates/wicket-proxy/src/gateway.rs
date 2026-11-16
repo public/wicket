@@ -650,7 +650,7 @@ impl Gateway {
                                 r.path,
                                 r.risk,
                                 r.run,
-                                &e.sha256()[..16],
+                                e.sha256(),
                                 r.reason
                             )
                         })
@@ -725,12 +725,23 @@ impl Gateway {
                 "run": self.ctx.run.0, "request": id, "decision": decision, "uses": uses, "ttl_secs": ttl,
             }),
         };
-        // An approval signs the effect it grants (#369), as the ledger's row is now: if the request
-        // changes before the decision is recorded, the decision is refused.
+        // An approval is of the effect the agent was shown (#369): it names the request's effect as
+        // pending_requests listed it, and signs the effect it grants. If the request changed since
+        // it was listed, or changes before the decision is recorded, nothing is approved.
         let mut payload = payload;
         if decision == "approve" {
+            let Some(listed) = named("effect") else {
+                return ("not decided: name the request's effect (sha256) as pending_requests lists it".into(), true);
+            };
             let req = self.ctx.ledger.lock().ok().and_then(|l| l.request(id).ok());
             if let Some(req) = req {
+                let asked = wicket_store::descriptor(&req, None).sha256();
+                if listed != asked {
+                    return (
+                        format!("not decided: request {id} changed since it was listed (its effect is now {asked}); look at it again"),
+                        true,
+                    );
+                }
                 let t = wicket_store::DecisionTerms { uses: u32::try_from(uses).ok(), ttl_secs: ttl, prefix: None, zone_wide: false };
                 payload["effect_sha256"] = wicket_store::descriptor(&req, Some(&t)).sha256().into();
             }
@@ -1126,6 +1137,7 @@ fn tools() -> Value {
                     "decision": { "type": "string", "enum": ["approve", "deny", "renew"] },
                     "grant_id": { "type": "string", "description": "renew: the grant to renew" },
                     "run": { "type": "string", "description": "renew: the descendant box (its run id) whose authority to renew" },
+                    "effect": { "type": "string", "description": "approve: the request's effect (sha256), as pending_requests lists it; if the request changed since, nothing is approved" },
                     "uses": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
                     "ttl_seconds": { "type": "integer", "minimum": 1, "default": 600, "description": "how long the grant (or renewal) lasts from now: at most 24h, and not past your own authority" }
                 },
@@ -1753,7 +1765,27 @@ mod tests {
         assert!(err && text.contains("may not decide"), "{text}");
         ctx.decisions = Some(rec.clone());
         let gw = Gateway::new(ctx);
-        let (text, err) = call(&gw, json!({ "request_id": "r-1", "decision": "approve", "uses": 3, "ttl_seconds": 120 })).await;
+        // #369: an approval names the effect pending_requests listed, and signs the one it grants.
+        let op = wicket_core::Op::egress(
+            &wicket_core::TenantId::single(),
+            &wicket_core::RunId("run_c".into()),
+            "research",
+            "GET",
+            "a.example",
+            "/x",
+        );
+        let (rid, _) = w.ledger.lock().unwrap().pending_for(&op, "x", None).unwrap();
+        let effect = wicket_store::descriptor(&w.ledger.lock().unwrap().request(&rid).unwrap(), None).sha256();
+        for (bad, why) in [(json!(null), "name the request's effect"), (json!("00".repeat(32)), "changed since it was listed")] {
+            let mut a = json!({ "request_id": rid, "decision": "approve" });
+            if !bad.is_null() {
+                a["effect"] = bad;
+            }
+            let (text, err) = call(&gw, a).await;
+            assert!(err && text.contains(why), "{text}");
+        }
+        let (text, err) =
+            call(&gw, json!({ "request_id": rid, "decision": "approve", "effect": effect, "uses": 3, "ttl_seconds": 120 })).await;
         assert!(!err && text == "recorded", "{text}");
         for bad in [
             json!({ "request_id": "r-1", "decision": "maybe" }),
@@ -1774,8 +1806,9 @@ mod tests {
                 seen[0]["uses"].as_u64(),
                 seen[0]["ttl_secs"].as_u64()
             ),
-            (Some(crate::DECISION_KIND), Some("run_lead"), Some("r-1"), Some(3), Some(120))
+            (Some(crate::DECISION_KIND), Some("run_lead"), Some(rid.as_str()), Some(3), Some(120))
         );
+        assert_eq!(seen[0]["effect_sha256"].as_str().map(str::len), Some(64));
         assert!(tools().as_array().unwrap().iter().any(|t| t["name"] == "decide"));
         // #56: a renewal names exactly one thing, and is signed the same way.
         let (text, err) = call(&gw, json!({ "decision": "renew", "grant_id": "g-1", "ttl_seconds": 300 })).await;
