@@ -48,6 +48,9 @@ pub struct Summary {
     pub by_reach: usize,
     /// Reach allows whose zone wicket didn't keep: only the rule's existence was checked.
     pub unverified: usize,
+    /// wicket DNS answers (for HTTP/3): a name resolved to wicket's own synthetic range, not a
+    /// request. Checked to be a host the zone reaches (or a grant names) where the zone was kept.
+    pub dns_answers: usize,
     pub runs_with_spend: usize,
     pub leases: usize,
     pub findings: Vec<Finding>,
@@ -152,6 +155,29 @@ pub fn check(l: &Ledger, data: &Path, grace_secs: i64, now: i64) -> Result<Summa
                     e.0 += 1;
                 }
                 e.1 += ev["output_tokens"].as_i64().unwrap_or(0);
+            }
+            // A wicket DNS answer (method DNS, h3.rs): the name resolved to wicket's synthetic range,
+            // which only wicket's relay answers on. Nothing left the box; the name must still be one
+            // the run may reach.
+            Some("egress") if ev["method"] == "DNS" && ev["outcome"] == "allow" => {
+                s.dns_answers += 1;
+                let host = ev["host"].as_str().unwrap_or("");
+                let start = starts.get(&r.run);
+                let zone = zones.entry(r.run.clone()).or_insert_with(|| {
+                    let spec = zone_of(l, data, &r.run, start.and_then(|b| b["agent_id"].as_str()))?;
+                    wicket_core::CompiledZone::new(spec.clone()).ok().map(|c| (spec, c))
+                });
+                if let Some((spec, _)) = zone {
+                    let reached = spec.reach.iter().any(|q| wicket_core::manifest::host_matches(&q.host, host));
+                    let granted = || l.grants_for_run(&r.run).is_ok_and(|gs| gs.iter().any(|g| g.host.eq_ignore_ascii_case(host)));
+                    if !reached && !granted() {
+                        findings.push(Finding {
+                            invariant: "egress",
+                            run: r.run.clone(),
+                            what: format!("wicket DNS resolved {host} at {}, a host the run's zone doesn't reach and no grant names", r.ts),
+                        });
+                    }
+                }
             }
             Some("egress") if matches!(ev["outcome"].as_str(), Some("allow" | "spliced")) => {
                 s.allows += 1;
@@ -317,8 +343,8 @@ pub fn doctor(lease_grace: i64) -> Result<()> {
     let l = Ledger::open(&crate::ledger_path())?;
     let s = check(&l, &crate::data_dir(), lease_grace, wicket_store::now())?;
     println!(
-        "egress: {} allowed request(s) checked ({} by a grant, {} by reach; {} of those without a kept zone, only their rule's existence checked)",
-        s.allows, s.by_grant, s.by_reach, s.unverified
+        "egress: {} allowed request(s) checked ({} by a grant, {} by reach; {} of those without a kept zone, only their rule's existence checked), and {} wicket DNS answer(s)",
+        s.allows, s.by_grant, s.by_reach, s.unverified, s.dns_answers
     );
     println!("model spend: {} run(s) checked against their quota grants", s.runs_with_spend);
     println!("leases: {} checked (grace {lease_grace}s)", s.leases);
@@ -431,6 +457,35 @@ mod tests {
         assert!(f[1].starts_with("egress: GET example.org/"), "{f:?}");
         assert!(f[2].contains("CONNECT"), "a host spliced wholesale needs a rule without limits: {f:?}");
         assert!(f[3].contains("a reason this check doesn't know"), "{f:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A wicket DNS answer (for HTTP/3) is an answer, not a request: counted, and checked against
+    /// the zone where it was kept, never "an allow for an unknown reason".
+    #[test]
+    fn a_dns_answer_is_checked_as_an_answer() {
+        let d = tmp("dns");
+        let dns = |l: &Ledger, host: &str| {
+            let ev = json!({ "kind": "egress", "method": "DNS", "host": host, "path": "", "risk": "-", "outcome": "allow",
+                             "detail": "resolved to 198.19.0.7 (wicket DNS, for HTTP/3)" });
+            l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "op", &ev).unwrap();
+        };
+        let l = ledger();
+        dns(&l, "example.com");
+        let s = check(&l, &d, 600, wicket_store::now()).unwrap();
+        assert_eq!((s.allows, s.dns_answers, s.findings.len()), (0, 1, 0), "no zone kept: counted only");
+        std::fs::create_dir_all(d.join("runs/run_parent/children")).unwrap();
+        std::fs::write(
+            d.join(format!("runs/run_parent/children/{RUN}.yaml")),
+            "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: example.com, methods: [GET], paths: [\"/\"] }]\n",
+        )
+        .unwrap();
+        let l = ledger();
+        dns(&l, "example.com");
+        dns(&l, "exfil.example.org");
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("resolved exfil.example.org") && f[0].contains("doesn't reach"), "{f:?}");
         let _ = std::fs::remove_dir_all(d);
     }
 
