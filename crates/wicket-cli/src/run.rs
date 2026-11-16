@@ -2360,20 +2360,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
     // A parent's children end with it: each is asked to stop its box and end, then waited for
-    // briefly. (One that hasn't ended by then goes on until its box does, or this process ends.)
+    // briefly. One that hasn't ended by then is recorded as stuck (#409): it goes on until its box
+    // does, or this process ends.
     let kids: Vec<(String, crate::spawn::Supervisor)> = std::mem::take(&mut *children.lock().expect("children"));
-    for (crun, sup) in kids {
-        if !sup.thread.is_finished() {
-            say!("[wicket] stopping child {crun}");
-            sup.stop.notify_one();
-            for _ in 0..60 {
-                if sup.thread.is_finished() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-    }
+    crate::spawn::stop_children(kids, crate::spawn::STOP_GRACE, &ledger, &m.tenant, &run).await;
     let pending: Vec<String> = {
         let l = ledger.lock().expect("ledger");
         l.pending(&m.tenant)?.into_iter().filter(|r| r.run == run.0).map(|r| r.id).collect()

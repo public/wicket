@@ -147,6 +147,54 @@ pub fn supervise(o: ChildOpts) -> std::io::Result<std::thread::JoinHandle<()>> {
     })
 }
 
+/// How long a parent that ends waits for its children's supervisors to end once asked to stop.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stops a parent's children as it ends (#257 slice 4c, #409): each is asked to stop its box and
+/// end, all at once, and then waited for up to `grace`. A child's supervisor runs on a thread of
+/// this process, and a thread can't be killed, so one still running after that is recorded loudly
+/// instead: a line in the parent's log naming it and how long it was waited for, a `run.child_stuck`
+/// audit record on its run, and its run marked stuck in the ledger ([`Ledger::set_run_stuck`]),
+/// which the reconciler and `wicket top` show. Returns the stuck children, with the seconds waited.
+pub async fn stop_children(
+    kids: Vec<(String, Supervisor)>,
+    grace: std::time::Duration,
+    ledger: &Mutex<Ledger>,
+    tenant: &wicket_core::TenantId,
+    parent: &RunId,
+) -> Vec<(String, u64)> {
+    let asked = Instant::now();
+    for (crun, sup) in &kids {
+        if !sup.thread.is_finished() {
+            say!("[wicket] stopping child {crun}");
+            sup.stop.notify_one();
+        }
+    }
+    while asked.elapsed() < grace && kids.iter().any(|(_, s)| !s.thread.is_finished()) {
+        tokio::time::sleep(std::time::Duration::from_millis(100).min(grace)).await;
+    }
+    let waited = asked.elapsed();
+    let mut stuck = vec![];
+    for (crun, _) in kids.iter().filter(|(_, s)| !s.thread.is_finished()) {
+        let secs = waited.as_secs();
+        say!(
+            "[wicket] child {crun} is stuck: its supervisor hasn't ended {:.1} s after it was asked to stop. It goes on until its box ends or this process does; the reconciler and wicket top show it as stuck",
+            waited.as_secs_f64()
+        );
+        if let Ok(l) = ledger.lock() {
+            let _ = l.set_run_stuck(crun, wicket_store::now());
+            let _ = l.audit(
+                tenant,
+                Some(&RunId(crun.clone())),
+                "run.child_stuck",
+                &serde_json::json!({ "parent": parent.0, "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX) }),
+            );
+        }
+        stuck.push((crun.clone(), secs));
+    }
+    stuck
+}
+
 /// Takes over the children this run's node starts for its box (#164).
 pub fn adopter(c: Arc<SpawnCtx>) -> crate::noderun::Adopter {
     Arc::new(move |s| adopt(&c, s))
@@ -1252,6 +1300,50 @@ mod tests {
         // No manifest there: the run fails before it starts anything, and says why in its log.
         let log = std::fs::read_to_string(&log_path).unwrap();
         assert!(log.starts_with("Error: reading ") && log.contains("run_01child.yaml"), "{log}");
+    }
+
+    /// #409: a parent that ends stops its children; one whose supervisor hasn't ended after the
+    /// grace is recorded as stuck (its run marked, an audit record), and one that ended isn't.
+    #[tokio::test]
+    async fn a_child_supervisor_that_does_not_end_is_recorded_as_stuck() {
+        let l = Ledger::open_in_memory().unwrap();
+        let t = wicket_core::TenantId("t".into());
+        for r in ["run_01done", "run_01hung"] {
+            l.run_started(&t, &RunId(r.into()), "z", "a").unwrap();
+        }
+        let ledger = Mutex::new(l);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop_done, stop_hung) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let done = {
+            let stop = stop_done.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(stop.notified())
+            })
+        };
+        // Like #383's deadlock: never looks at its stop.
+        let hung = {
+            let release = release.clone();
+            std::thread::spawn(move || {
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+        };
+        let kids = vec![
+            ("run_01done".to_string(), Supervisor { stop: stop_done, thread: done }),
+            ("run_01hung".to_string(), Supervisor { stop: stop_hung, thread: hung }),
+        ];
+        let stuck = stop_children(kids, std::time::Duration::from_millis(300), &ledger, &t, &RunId("run_01parent".into())).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(stuck.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["run_01hung"]);
+        let l = ledger.lock().unwrap();
+        assert!(l.run_stuck("run_01hung").unwrap().is_some());
+        assert_eq!(l.run_stuck("run_01done").unwrap(), None);
+        let rec: serde_json::Value =
+            serde_json::from_str(&l.audit_latest("run_01hung", "run.child_stuck").unwrap().expect("a record")).unwrap();
+        assert_eq!(rec["parent"], "run_01parent");
+        assert!(rec["waited_ms"].as_u64().unwrap() >= 300, "{rec}");
+        assert!(l.audit_latest("run_01done", "run.child_stuck").unwrap().is_none());
     }
 
     /// #127: a spawned zone's name carries the parent run, so no other run can make it.

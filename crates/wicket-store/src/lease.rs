@@ -293,10 +293,28 @@ impl Ledger {
     // ---- which process owns a run ----
 
     /// Records the process supervising a run (`<machine>:<pid>:<start>`), so a reconciler on the same
-    /// machine can tell when it is gone.
+    /// machine can tell when it is gone. A new supervisor is not stuck: it clears [`Ledger::run_stuck`].
     pub fn set_run_owner(&self, run: &str, owner: &str) -> Result<()> {
-        self.conn.execute("UPDATE runs SET owner = ?2 WHERE id = ?1", params![run, owner])?;
+        self.conn.execute("UPDATE runs SET owner = ?2, stuck_at = NULL WHERE id = ?1", params![run, owner])?;
         Ok(())
+    }
+
+    /// Records that `run`'s supervisor is stuck (#409): a child's, run in its parent's process, that
+    /// hadn't ended when its parent, which had asked it to stop, gave up waiting at `at` (Unix seconds).
+    /// Its owner is still that live process, so nothing takes the run over until the process ends.
+    pub fn set_run_stuck(&self, run: &str, at: i64) -> Result<()> {
+        self.conn.execute("UPDATE runs SET stuck_at = ?2 WHERE id = ?1 AND status = 'running'", params![run, at])?;
+        Ok(())
+    }
+
+    /// When `run`'s supervisor was found stuck ([`Ledger::set_run_stuck`]), if it was and no new
+    /// supervisor has taken the run over since.
+    pub fn run_stuck(&self, run: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT stuck_at FROM runs WHERE id = ?1", params![run], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten())
     }
 
     /// Records that a run was placed on a lease's node (`spawn` with `placement: {lease}`): when the
@@ -553,6 +571,25 @@ mod tests {
         assert_eq!(l.lease(&a).unwrap().unwrap().billed, Some(20_000));
         let (_, r) = ask(&mut l, "run_b", 20_000, 60_000, b);
         r.unwrap();
+    }
+
+    /// #409: a child's stuck supervisor is recorded on its run while it runs, and a new supervisor
+    /// (a re-attach once the stuck one's process ended) clears it.
+    #[test]
+    fn a_stuck_supervisor_is_recorded_until_a_new_one_takes_the_run() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.run_started(&TenantId("t".into()), &RunId("run_c".into()), "z", "a").unwrap();
+        l.set_run_owner("run_c", "m:1:2").unwrap();
+        assert_eq!(l.run_stuck("run_c").unwrap(), None);
+        l.set_run_stuck("run_c", 1000).unwrap();
+        assert_eq!(l.run_stuck("run_c").unwrap(), Some(1000));
+        l.set_run_owner("run_c", "m:3:4").unwrap();
+        assert_eq!(l.run_stuck("run_c").unwrap(), None);
+        // An ended run isn't marked.
+        l.run_ended(&RunId("run_c".into()), "completed", "{}").unwrap();
+        l.set_run_stuck("run_c", 2000).unwrap();
+        assert_eq!(l.run_stuck("run_c").unwrap(), None);
+        assert_eq!(l.run_stuck("run_none").unwrap(), None);
     }
 
     #[test]
