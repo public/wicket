@@ -65,7 +65,7 @@ else
   crates=all suites=all doc_crates=all
 fi
 [ -n "$only_suites" ] && suites=$only_suites
-all_suites="docs policy lean smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update tla"
+all_suites="docs policy lean kani smoke hibernate restore acceptance daemon-uids install-test node-e2e acceptance-nodes update tla"
 fuzz_targets="egress gateway chan feed token manifest store git"
 for t in $fuzz_targets; do all_suites+=" fuzz-$t"; done
 [ "$suites" = all ] && suites=$all_suites
@@ -85,6 +85,7 @@ if [ "$rust" = 1 ]; then
   step "no secrets or machine details" python3 ci/check-public.py
   step "Markdown links" ci/check-doc-links.sh
   step "terms" ci/check-terms.sh
+  step "plugin and skills" python3 -I ci/check-plugin.py
 fi
 
 # ---- Rust ----
@@ -107,6 +108,13 @@ if has policy && [ "$rust" = 1 ]; then
 fi
 if has lean && [ "$rust" = 1 ]; then
   hstep "Lean spec and oracle" ci/lean.sh
+fi
+if has kani && [ "$rust" = 1 ]; then
+  if command -v cargo-kani >/dev/null; then
+    hstep "Kani harnesses and the loom test" ci/kani.sh
+  else
+    log "kani: skipped, Kani is not installed (cargo install --locked kani-verifier && cargo kani setup); CI runs it"
+  fi
 fi
 if has tla; then
   hstep "TLA+ models (TLC)" ci/tla.sh

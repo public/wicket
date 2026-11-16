@@ -1,0 +1,17 @@
+{
+  "name": "wicket",
+  "description": "wicket's own Claude Code plugins",
+  "owner": {
+    "name": "wicket",
+    "url": "https://github.com/public/wicket"
+  },
+  "plugins": [
+    {
+      "name": "wicket",
+      "source": "./plugins/wicket",
+      "description": "Skills for working with wicket: inside a box, as its operator, writing manifests, and coordinating boxes",
+      "category": "development",
+      "tags": ["wicket", "sandbox", "agents"]
+    }
+  ]
+}

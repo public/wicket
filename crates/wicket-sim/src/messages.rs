@@ -541,7 +541,7 @@ async fn control(env: Rc<Env>) -> turmoil::Result {
             manifest: "m",
             image: "img",
             workspace: None,
-            lease_until: wicket_store::now() + 3_600,
+            claim_until: wicket_store::now() + 3_600,
         })
         .expect("c's agent");
         env.ctl.borrow_mut().started = true;

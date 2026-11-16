@@ -21,7 +21,7 @@
 //! [`LEASE_QUOTA_BY`] in the same transaction, revoked when the lease ends. They are the record;
 //! the check stays the installation's limits over the live leases' reservations, here.
 //!
-//! **Placed nodes** ([`PlacedNodeRow`], #294) are the other kind of owned node: made by `wicket place
+//! **Placed nodes** ([`PlacedNodeRow`], #294) are the other kind of owned node: made by `wicket node
 //! create` for the installation rather than asked for by a run. They have no reservation here (the
 //! placer's money envelope covered them); the reconciler releases one at its `lease_until` unless a
 //! run still placed on it (by its enrolled name) holds it, which it records in `held_by`.
@@ -345,7 +345,7 @@ impl Ledger {
     }
 
     /// Forgets every run's uncollected files on node `node`: a human released the node, files
-    /// and all (`wicket place release`). Returns how many runs had some.
+    /// and all (`wicket node release`). Returns how many runs had some.
     pub fn forget_uncollected_on_node(&self, node: &str) -> Result<usize> {
         Ok(self.conn.execute("UPDATE runs SET uncollected = NULL WHERE uncollected = ?1", params![node])?)
     }
@@ -357,18 +357,19 @@ impl Ledger {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    // ---- nodes made by `wicket place create` (#294) ----
+    // ---- nodes made by `wicket node create` (#294) ----
 
-    /// Records a node `wicket place create` made (again: a retried create updates its lease end and
+    /// Records a node `wicket node create` made (again: a retried create updates its lease end and
     /// makes it active).
     pub fn record_placed_node(&self, n: &PlacedNodeRow) -> Result<()> {
         self.conn.execute(
             &format!(
-                "INSERT INTO placed_nodes ({PLACED_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL, NULL, NULL)
+                "INSERT INTO placed_nodes ({PLACED_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', NULL, NULL, NULL, ?8)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name, owner = excluded.owner, api_key_secret = excluded.api_key_secret,
-                   lease_until = excluded.lease_until, status = 'active', held_by = NULL, ended_at = NULL, detail = NULL"
+                   lease_until = excluded.lease_until, status = 'active', held_by = NULL, ended_at = NULL, detail = NULL,
+                   hourly = coalesce(excluded.hourly, hourly)"
             ),
-            params![n.id, n.backend, n.name, n.owner, n.api_key_secret, n.created_at, n.lease_until],
+            params![n.id, n.backend, n.name, n.owner, n.api_key_secret, n.created_at, n.lease_until, n.hourly],
         )?;
         Ok(())
     }
@@ -410,7 +411,7 @@ impl Ledger {
     }
 }
 
-/// A node `wicket place create` made (#294): owned by the installation, not by a run's capacity
+/// A node `wicket node create` made (#294): owned by the installation, not by a run's capacity
 /// lease, and released by the reconciler at `lease_until` unless a run still holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlacedNodeRow {
@@ -432,9 +433,12 @@ pub struct PlacedNodeRow {
     pub held_by: Option<String>,
     pub ended_at: Option<i64>,
     pub detail: Option<String>,
+    /// What it costs per hour, micro-USD, as the provider priced it at creation (None: recorded
+    /// before the ledger kept it).
+    pub hourly: Option<i64>,
 }
 
-const PLACED_COLS: &str = "id, backend, name, owner, api_key_secret, created_at, lease_until, status, held_by, ended_at, detail";
+const PLACED_COLS: &str = "id, backend, name, owner, api_key_secret, created_at, lease_until, status, held_by, ended_at, detail, hourly";
 
 fn row_to_placed(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlacedNodeRow> {
     Ok(PlacedNodeRow {
@@ -449,6 +453,7 @@ fn row_to_placed(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlacedNodeRow> {
         held_by: r.get(8)?,
         ended_at: r.get(9)?,
         detail: r.get(10)?,
+        hourly: r.get(11)?,
     })
 }
 
@@ -580,10 +585,14 @@ mod tests {
             held_by: None,
             ended_at: None,
             detail: None,
+            hourly: Some(14_000),
         };
         l.record_placed_node(&row).unwrap();
         let got = l.placed_node("i-1").unwrap().unwrap();
-        assert_eq!((got.status.as_str(), got.lease_until), ("active", 3100));
+        assert_eq!((got.status.as_str(), got.lease_until, got.hourly), ("active", 3100, Some(14_000)));
+        // A retry that doesn't know the price keeps the one recorded.
+        l.record_placed_node(&PlacedNodeRow { hourly: None, ..row.clone() }).unwrap();
+        assert_eq!(l.placed_node("i-1").unwrap().unwrap().hourly, Some(14_000));
         // A held node's holders are recorded; recording the same holders again is no change.
         assert!(l.set_placed_node_held("i-1", Some("run_a")).unwrap());
         assert!(!l.set_placed_node_held("i-1", Some("run_a")).unwrap());

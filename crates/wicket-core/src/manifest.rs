@@ -329,7 +329,7 @@ pub struct ZoneSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Escalation {
-    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `ask_human`,
+    /// May raise pending requests (a blocked request, `request_access`, `spawn` with `escalate`,
     /// `request_capacity`, `request_update`). Off: anything outside the zone's reach is "never
     /// allowed" instead of pending.
     #[serde(default = "yes")]
@@ -995,14 +995,25 @@ impl ReachRule {
     }
 }
 
-/// `*.example.com` matches one or more labels under example.com, never example.com itself.
+/// `*.example.com` matches one or more labels under example.com, never example.com itself. ASCII
+/// case is ignored, as is a trailing dot on the host. Allocation-free, so the Kani harnesses (#325,
+/// `proofs/host.rs`) check this function itself.
 pub fn host_matches(pattern: &str, host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
-        None => host == pattern,
+    let mut host = host.as_bytes();
+    while let [rest @ .., b'.'] = host {
+        host = rest;
     }
+    match pattern.as_bytes().strip_prefix(b"*.") {
+        Some(suffix) => host.len() > suffix.len() + 1 && label_under(host, suffix),
+        None => host.eq_ignore_ascii_case(pattern.as_bytes()),
+    }
+}
+
+/// Whether `name` ends with `.` and then `suffix`, ignoring ASCII case: `name` is `suffix` with at
+/// least one more label (possibly empty) in front.
+pub(crate) fn label_under(name: &[u8], suffix: &[u8]) -> bool {
+    let Some(at) = name.len().checked_sub(suffix.len() + 1) else { return false };
+    name[at] == b'.' && name[at + 1..].eq_ignore_ascii_case(suffix)
 }
 
 #[cfg(test)]

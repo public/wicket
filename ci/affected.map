@@ -10,8 +10,9 @@
 # when a path is safe to narrow, never a catch-all. `*` stays within a directory, `**` crosses
 # them, and a pattern without a slash matches the file name anywhere.
 #
-# Suites: docs (check-public, Markdown links, terms),
-# policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
+# Suites: docs (check-public, Markdown links, terms, the plugin),
+# policy (SymCC policy diffs), lean (the Lean spec's proofs and its oracle test, #322), kani (Kani
+# harnesses and the loom test, ci/kani.sh, #325), smoke, hibernate, restore, acceptance (local flows), daemon-uids,
 # install-test, tla (TLC on verification/tla/, #321), and, run by local gates and nightly, not on PRs: node-e2e, acceptance-nodes
 # (acceptance --nodes local), update. And one per fuzz target (#323, ci/fuzz.sh): fuzz-egress,
 # fuzz-gateway, fuzz-chan, fuzz-feed, fuzz-token, fuzz-manifest, fuzz-store, fuzz-git.
@@ -48,6 +49,9 @@ ci/check-public.py                 | -   | docs
 ci/check-doc-links.sh              | -   | docs
 ci/check-terms.sh                  | -   | docs
 ci/check-terms.allow               | -   | docs
+ci/check-plugin.py                 | -   | docs
+.claude-plugin/**                  | -   | docs
+plugins/**                         | -   | docs
 ci/gen-cli-reference.sh            | wicket-cli | docs
 changes/**                         | -   | docs
 ci/changelog.py                    | -   | docs
@@ -62,6 +66,8 @@ web/**                             | wicket-cli | -
 ci/session-view.sh                 | wicket-cli | -
 ci/install-node.sh                 | wicket-cli | -
 images/claude-code/wicket-entry    | wicket-fwd | -
+# The wicket-box skill: the Claude adapter installs it in every box (crates/wicket-agent/src/lib.rs).
+plugins/wicket/skills/wicket-box/SKILL.md | wicket-agent | -
 deploy/install.sh                  | wicket-cli | install-test daemon-uids
 deploy/systemd/**                  | wicket-cli | install-test update
 deploy/systemd-user/**             | wicket-cli | -
@@ -96,7 +102,7 @@ crates/wicket-cli/src/nodeauth.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodecall.rs  | -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/nodesecrets.rs | - | node-e2e acceptance-nodes tla
 crates/wicket-cli/src/enrol.rs     | -   | node-e2e acceptance-nodes
-crates/wicket-cli/src/place.rs     | -   | node-e2e acceptance-nodes
+crates/wicket-cli/src/nodecreate.rs| -   | node-e2e acceptance-nodes
 crates/wicket-cli/src/reconcile.rs | -   | node-e2e acceptance-nodes acceptance
 crates/wicket-cli/src/localnode.rs | -   | node-e2e acceptance-nodes acceptance smoke
 crates/wicket-placement/**         | -   | acceptance-nodes
@@ -121,6 +127,14 @@ crates/wicket-cli/src/cmd/policy.rs  | - | restore acceptance policy
 crates/wicket-cli/src/cmd/zone.rs    | - | acceptance
 # Not listed on purpose, so they select every suite: the node protocol (chan.rs), the ledger's
 # schema (wicket-store), token formats (wicket-authz, wicket-feed), wicket-core, run.rs.
+
+# ---- Kani proof harnesses and the loom test (#325) ----
+# The functions they check are wicket-core's (manifest, subset, canon, op, version, budget,
+# authority), which select every suite, kani included. The harnesses, the loom test and the script
+# select only it (and, as crate files, their crate).
+crates/*/src/proofs/**             | -   | kani
+crates/wicket-core/tests/loom_budget.rs | - | kani
+ci/kani.sh                         | -   | kani
 
 # ---- the end-to-end scripts themselves ----
 ci/smoke.sh                        | -   | smoke

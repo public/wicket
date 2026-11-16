@@ -12,7 +12,7 @@
 //! - Two nodes for one lease (two processes raced a create): the oldest is kept, the rest destroyed.
 //!
 //! What it can't tell from leases alone: whether a node no lease asks for is an orphan or one its
-//! creator hasn't recorded yet (#324: `wicket place create` records its node as soon as the
+//! creator hasn't recorded yet (#324: `wicket node create` records its node as soon as the
 //! provider answers, and a pass that listed the instance in between destroyed a node its human had
 //! just been given). A caller that knows no record of a node's idempotency key leaves it alone while
 //! [`too_new_to_judge`] says so: an orphan a crash left is destroyed once the grace is over, still

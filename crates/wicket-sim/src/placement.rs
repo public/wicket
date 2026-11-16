@@ -10,7 +10,7 @@
 //!   audit), and the node's feed ([`wicket_feed::Publisher`] per run, [`wicket_feed::Replica`] on
 //!   the node), so several runs publish to one node as #300 has them.
 //! - Stand-ins, each following a file in `wicket-cli` (which lives in the CLI binary):
-//!   - `place create` follows `place.rs` (`PlaceCmd::Create`): acquire, then record the placed node
+//!   - `node create` follows `nodecreate.rs` (`create`): acquire, then record the placed node
 //!     at once, then enrol it. A create the control host's crash interrupted is run again with the
 //!     same idempotency key, as its human would.
 //!   - `wicket run --node` and its supervisor follow `run.rs` and `noderun.rs`: the run is recorded
@@ -708,7 +708,7 @@ async fn control(env: Rc<Env>) -> turmoil::Result {
     Ok(())
 }
 
-/// `wicket place create`, as the plan has the human run it (and run it again after a crash).
+/// `wicket node create`, as the plan has the human run it (and run it again after a crash).
 async fn creates(env: Rc<Env>) {
     loop {
         tokio::time::sleep(secs(5)).await;
@@ -722,7 +722,7 @@ async fn creates(env: Rc<Env>) {
     }
 }
 
-/// `place.rs`'s `PlaceCmd::Create`: acquire, record at once, enrol.
+/// `nodecreate.rs`'s `create`: acquire, record at once, enrol.
 async fn place_create(env: &Rc<Env>, i: usize) {
     let c = env.plan.creates[i].clone();
     let placer = Placer::new(env.cloud(), PlanApprover(c.approve), Owner::new(OWNER), env.envelope()).with_clock(clock());
@@ -735,7 +735,7 @@ async fn place_create(env: &Rc<Env>, i: usize) {
         lifetime_secs: c.lifetime_s,
         idempotency_key: format!("place-create:{}", c.name),
         name: c.name.clone(),
-        purpose: format!("wicket place create {}", c.name),
+        purpose: format!("wicket node create {}", c.name),
         boot: None,
     };
     let n = match placer.acquire(&req).await {
@@ -762,6 +762,7 @@ async fn place_create(env: &Rc<Env>, i: usize) {
             held_by: None,
             ended_at: None,
             detail: None,
+            hourly: Some(n.billing.hourly_rate().0 as i64),
         })
         .expect("recorded");
     let _ = ledger.audit(
