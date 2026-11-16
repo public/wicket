@@ -233,10 +233,9 @@ fn strength(i: Isolation) -> u8 {
 
 /// Whether every host `child` names is matched by `parent`.
 fn host_covers(parent: &str, child: &str) -> bool {
-    let (p, c) = (parent.to_ascii_lowercase(), child.to_ascii_lowercase());
-    match (p.strip_prefix("*."), c.strip_prefix("*.")) {
-        (_, None) => host_matches(&p, &c),
-        (Some(ps), Some(cs)) => cs == ps || cs.ends_with(&format!(".{ps}")),
+    match (parent.as_bytes().strip_prefix(b"*."), child.as_bytes().strip_prefix(b"*.")) {
+        (_, None) => host_matches(parent, child),
+        (Some(ps), Some(cs)) => cs.eq_ignore_ascii_case(ps) || crate::manifest::label_under(cs, ps),
         (None, Some(_)) => false,
     }
 }
@@ -353,9 +352,50 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Manifest;
+
+    /// Every string of at most `n` bytes over `alphabet`.
+    pub(crate) fn strings(alphabet: &[u8], n: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..n {
+            last = last.iter().flat_map(|s| alphabet.iter().map(move |&c| format!("{s}{}", char::from(c)))).collect();
+            all.extend(last.iter().cloned());
+        }
+        all
+    }
+
+    /// #325 made `host_matches` and `host_covers` allocation-free for Kani: they agree with the
+    /// previous (lowercase-and-`format!`) spellings on every pattern and host of up to 4 bytes over
+    /// letters of both cases, `.` and `*`.
+    #[test]
+    fn allocation_free_host_matching_agrees_with_the_old_spelling() {
+        fn matches_was(pattern: &str, host: &str) -> bool {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            let pattern = pattern.to_ascii_lowercase();
+            match pattern.strip_prefix("*.") {
+                Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
+                None => host == pattern,
+            }
+        }
+        fn covers_was(parent: &str, child: &str) -> bool {
+            let (p, c) = (parent.to_ascii_lowercase(), child.to_ascii_lowercase());
+            match (p.strip_prefix("*."), c.strip_prefix("*.")) {
+                (_, None) => matches_was(&p, &c),
+                (Some(ps), Some(cs)) => cs == ps || cs.ends_with(&format!(".{ps}")),
+                (None, Some(_)) => false,
+            }
+        }
+        let all = strings(b"aB.*", 4);
+        for a in &all {
+            for b in &all {
+                assert_eq!(host_matches(a, b), matches_was(a, b), "host_matches({a:?}, {b:?})");
+                assert_eq!(host_covers(a, b), covers_was(a, b), "host_covers({a:?}, {b:?})");
+            }
+        }
+    }
 
     fn zone(body: &str) -> ZoneSpec {
         let llm = if body.contains("  llm:") { "" } else { "  llm: {}\n" };
@@ -648,3 +688,7 @@ mod tests {
         assert_eq!(parse_bytes("lots"), None);
     }
 }
+
+#[cfg(kani)]
+#[path = "proofs/host.rs"]
+mod host_proofs;

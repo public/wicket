@@ -5,6 +5,8 @@
 //! HTTP reach rules; a small GitHub dangerous-pattern list; and a decision that is either allowed by
 //! a reach rule, forbidden outright, or needs a grant from the ledger.
 
+pub mod authority;
+pub mod budget;
 pub mod canon;
 pub mod git;
 pub mod image;
@@ -15,6 +17,7 @@ pub mod splice;
 pub mod subset;
 pub mod text;
 pub mod timing;
+pub mod version;
 
 pub use canon::{canonical_host, canonical_path, prefix_covers, prefix_dir, CanonError};
 pub use manifest::{
@@ -89,3 +92,6 @@ pub fn new_link_id() -> String {
     let u = ulid::Ulid::new().to_string().to_lowercase();
     format!("l-{}", &u[u.len() - 10..])
 }
+
+#[cfg(kani)]
+mod proofs;

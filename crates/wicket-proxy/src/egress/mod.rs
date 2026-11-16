@@ -723,7 +723,7 @@ mod tests {
         };
         assert_eq!(send("/v1/messages/batches", None).await.0, 403);
         assert_eq!(send("/v1/messages", Some("gzip")).await.0, 415);
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
+        assert_eq!(llm.count.requests.load(std::sync::atomic::Ordering::SeqCst), 2, "counted as model requests");
         llm.spent_before(u64::MAX / 4, 0, 0);
         let (st, body) = send("/v1/messages", None).await;
         assert_eq!(st, 429, "{body}");
@@ -810,14 +810,14 @@ mod tests {
         assert_eq!(enc, "identity");
         assert!(!sent.contains("some_future_field") && sent.contains("\"max_tokens\":300"), "{sent}");
         for _ in 0..300 {
-            if llm.inflight_output_tokens.load(SeqCst) == 0 {
+            if llm.count.inflight_output_tokens.load(SeqCst) == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(llm.inflight_output_tokens.load(SeqCst), 0, "settled");
-        assert_eq!(llm.output_tokens.load(SeqCst), 42, "charged its real output, not the 300 reserved");
-        assert_eq!((llm.input_tokens.load(SeqCst), llm.cache_read_tokens.load(SeqCst)), (12, 5));
+        assert_eq!(llm.count.inflight_output_tokens.load(SeqCst), 0, "settled");
+        assert_eq!(llm.count.output_tokens.load(SeqCst), 42, "charged its real output, not the 300 reserved");
+        assert_eq!((llm.count.input_tokens.load(SeqCst), llm.count.cache_read_tokens.load(SeqCst)), (12, 5));
         let _ = std::fs::remove_dir_all(dir);
     }
 

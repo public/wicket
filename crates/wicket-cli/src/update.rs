@@ -845,7 +845,7 @@ pub async fn update(o: UpdateOpts) -> Result<()> {
     let here = describe()?;
     // More than the skew apart (#207): every remote node switches with the control host, or none
     // may be enrolled. See [`jump_blockers`].
-    let jump = here.protocol.abs_diff(m.describe.protocol) > crate::chan::PROTOCOL_SKEW;
+    let jump = wicket_core::version::is_jump(here.protocol, m.describe.protocol, crate::chan::PROTOCOL_SKEW);
     if jump {
         if o.only_nodes {
             bail!(
@@ -1026,7 +1026,7 @@ async fn control_switch(
 ) -> Result<()> {
     let target = v.manifest(to)?;
     let schema = Ledger::schema_of(&crate::ledger_path())?;
-    if target.describe.schema < schema.floor {
+    if !wicket_core::version::schema_opens(target.describe.schema, schema.floor) {
         bail!(
             "{to} has schema {}, but the ledger has been through a contract step to schema {} (floor {}): it can't go back past it. Roll forward, or restore the snapshot taken before that update (see docs/explanation/updates.md)",
             target.describe.schema,
@@ -1673,7 +1673,7 @@ pub async fn rollback(nodes: Option<String>, only_nodes: bool) -> Result<()> {
         // Back across a protocol jump (#207): the same rule as the jump itself.
         let (pc, pp) =
             (v.manifest(&cur).map(|m| m.describe.protocol).unwrap_or(0), v.manifest(&prev).map(|m| m.describe.protocol).unwrap_or(0));
-        if pc.abs_diff(pp) > crate::chan::PROTOCOL_SKEW {
+        if wicket_core::version::is_jump(pc, pp, crate::chan::PROTOCOL_SKEW) {
             let blockers = jump_blockers(&ledger.lock().expect("ledger"), &nodes)?;
             if !blockers.is_empty() {
                 bail!(

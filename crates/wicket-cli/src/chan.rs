@@ -105,11 +105,22 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
     if theirs == 0 {
         return Err(format!("it runs a wicket from before protocol versions (this one speaks protocol {ours})"));
     }
-    if ours.abs_diff(theirs) > PROTOCOL_SKEW {
-        return Err(format!("it speaks protocol {theirs}, this one {ours} (at most {PROTOCOL_SKEW} apart)"));
-    }
-    Ok(ours.min(theirs))
+    // The rule itself is wicket_core::version's, which Kani checks (#325).
+    wicket_core::version::talk_at(ours, theirs, PROTOCOL_SKEW)
+        .ok_or_else(|| format!("it speaks protocol {theirs}, this one {ours} (at most {PROTOCOL_SKEW} apart)"))
 }
+
+// Every feature's first version is one this build speaks, and a peer at the oldest version it
+// talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
+const _: () = {
+    let floors = [EDGE_DECISIONS, IMAGE_PINS, IMAGE_DELIVERY, IMAGE_PULL, BUDGET_SLICE, CREDENTIAL_SWAPS];
+    let mut i = 0;
+    while i < floors.len() {
+        assert!(floors[i] <= PROTOCOL);
+        i += 1;
+    }
+    assert!(PROTOCOL > PROTOCOL_SKEW);
+};
 
 /// The largest frame body: a feed snapshot (`wicket_feed::MAX_FRAME_BYTES`) plus framing.
 pub const MAX_FRAME: usize = wicket_feed::MAX_FRAME_BYTES + 4096;
