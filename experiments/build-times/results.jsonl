@@ -52,3 +52,4 @@
 {"label":"after-j1c","step":"cli-test","secs":6.62,"peak_mib":2183,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1c","step":"cli-test","secs":6.81,"peak_mib":2170,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
 {"label":"after-j1c","step":"cli-test","secs":6.58,"peak_mib":2169,"commit":"ba951b7","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
+{"label":"after-j1c","step":"cli-clippy-clean","secs":185.95,"peak_mib":1847,"commit":"5c8afb0","jobs":"1","rustc_wrapper":"","incremental":"","rustflags":"","load":"0.00"}
