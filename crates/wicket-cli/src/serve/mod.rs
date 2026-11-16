@@ -20,7 +20,10 @@
 //!    method, host, path, whether it is a prefix ask, decision, uses, lifetime and the agent's
 //!    verified identity), start a run (the allowlisted manifest, its content digest, the task
 //!    override, the run id and the principal it will carry), open a run's session (#327; prompts
-//!    are sent in the session, #198), revoke an identity (run and reason), and the two that widen what a device receives from Web
+//!    are sent in the session, #198), revoke an identity (run and reason), store or replace a secret
+//!    (its name, hosts and a salted sha256 of the value; the value itself only in `finish`'s body),
+//!    change a secret's hosts, delete a secret (the zones and runs using it) ([`secrets`]), and the
+//!    two that widen what a device receives from Web
 //!    Push ([`push`]): register a device (its id, label, push service and digests of its endpoint and
 //!    keys) and turn its details on (removing a device or turning details off only narrow, and need
 //!    only the session). The server builds the JSON from its own reading of the
@@ -54,10 +57,12 @@
 
 mod acme;
 mod authority;
+mod capacity;
 mod limits;
 mod manifests;
 mod net;
 mod push;
+mod secrets;
 pub mod session;
 mod tls;
 mod web;
@@ -171,6 +176,20 @@ enum Action {
     PushDetails {
         operator: String,
         device: String,
+    },
+    /// Store or replace a secret's value, change its hosts, or delete it ([`secrets`]): the signed
+    /// JSON carries a salted digest of a value, never the value, which comes only with `finish`.
+    Secret(Box<secrets::Change>),
+    /// Issue a standing capacity grant to a principal (#256).
+    CapacityGrant {
+        principal: String,
+        terms: wicket_store::CapacityTerms,
+        ttl_secs: u64,
+    },
+    /// Renew a live capacity grant: a new end `ttl_secs` from now.
+    CapacityRenew {
+        grant: String,
+        ttl_secs: u64,
     },
 }
 
@@ -618,7 +637,21 @@ where
         Ok(Err(_)) => return Err(err(StatusCode::BAD_REQUEST, "bad request body")),
         Ok(Ok(b)) => b.to_bytes(),
     };
-    serde_json::from_slice(&b).map_err(|_| err(StatusCode::BAD_REQUEST, "bad JSON body"))
+    // The bytes may carry a secret's value: parsed, then wiped (as the parsed body is, by `scrub`).
+    let mut raw: Vec<u8> = b.into();
+    let v = serde_json::from_slice(&raw).map_err(|_| err(StatusCode::BAD_REQUEST, "bad JSON body"));
+    zeroize::Zeroize::zeroize(&mut raw);
+    v
+}
+
+/// Wipes every string in a request body before it is freed.
+fn scrub(v: &mut Value) {
+    match v {
+        Value::String(s) => zeroize::Zeroize::zeroize(s),
+        Value::Array(a) => a.iter_mut().for_each(scrub),
+        Value::Object(m) => m.values_mut().for_each(scrub),
+        _ => {}
+    }
 }
 
 /// Every POST: the custom header (no cross-site form or simple request can send it) and the
@@ -752,11 +785,14 @@ where
     if let Some(r) = post_checks(state, req.headers()) {
         return to_response(r);
     }
-    let body = match json_body(req, &state.limits).await {
+    let mut body = match json_body(req, &state.limits).await {
         Ok(b) => b,
         Err(r) => return to_response(r),
     };
-    match post(state, &path, &ctx, &body) {
+    let reply = post(state, &path, &ctx, &body);
+    // A body may carry a secret's value (`set_secret`'s finish): wiped before it is freed.
+    scrub(&mut body);
+    match reply {
         Some(r) => to_response(r),
         None => resp(StatusCode::NOT_FOUND, "text/plain", "not found"),
     }
@@ -889,6 +925,18 @@ fn post(state: &State, path: &str, ctx: &Ctx, body: &Value) -> Option<Reply> {
             Some((_, SessionKind::Operator { .. })) => match manifests::check(state, body) {
                 Ok(v) => ok(v),
                 Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            },
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
+        // Every change to a secret is signed: asked for with a session alone, it is refused and audited.
+        p if p.starts_with("/api/secrets/") => match &sess {
+            Some((_, SessionKind::Operator { cred })) => secrets::unsigned(state, cred, p, body),
+            _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
+        },
+        "/api/capacity/revoke" => match &sess {
+            Some((_, SessionKind::Operator { cred })) => match creds(state).unwrap_or_default().into_iter().find(|c| &c.id == cred) {
+                Some(oc) => capacity::revoke(state, &oc, body),
+                None => err(StatusCode::UNAUTHORIZED, "the passkey you signed in with is no longer enrolled"),
             },
             _ => err(StatusCode::UNAUTHORIZED, "sign in with your passkey"),
         },
@@ -1302,8 +1350,13 @@ fn build_action(state: &State, oc: &OperatorCredential, body: &Value) -> Result<
             });
             Ok((Action::PushDetails { operator: oc.id.clone(), device: d.id }, v))
         }
+        Some(k @ ("set_secret" | "secret_hosts" | "delete_secret")) => {
+            secrets::prepare(state, k, body).map(|(c, v)| (Action::Secret(Box::new(c)), v))
+        }
+        Some("capacity_grant") => capacity::build_grant(state, body),
+        Some("capacity_renew") => capacity::build_renew(state, &l, body),
         _ => Err(bad(
-            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe or push_details",
+            "action must be decide, open_session, revoke, start_run, save_manifest, restore_manifest, push_subscribe, push_details, set_secret, secret_hosts, delete_secret, capacity_grant or capacity_renew",
         )),
     }
 }
@@ -1368,7 +1421,19 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     }
     let a = match verify_assertion(state, ch, body) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => {
+            // A change to a secret that wasn't signed is refused, and the refusal audited (by name).
+            if let (Action::Secret(c), Ok(l)) = (&*action, state.ledger()) {
+                let _ = l.audit(
+                    &state.tenant,
+                    None,
+                    "secret.refused",
+                    &json!({ "name": c.name(), "credential": body.get("id").and_then(Value::as_str).map(|c| c.chars().take(200).collect::<String>()),
+                             "reason": format!("signature refused: {}", r.body["error"].as_str().unwrap_or("")) }),
+                );
+            }
+            return r;
+        }
     };
     let mut signed = json!({
         "credential": a.oc.id, "rp_id": state.rp.rp_id, "origin": state.rp.origin,
@@ -1380,6 +1445,23 @@ fn action_finish(state: &State, sess: &Option<(String, SessionKind)>, body: &Val
     if let Action::OpenSession { run } = &*action {
         return match session::open(state, run, &a.oc, &console_session, signed) {
             Ok(v) => ok(v),
+            Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
+        };
+    }
+    if let Action::Secret(c) = &*action {
+        // The value, for set_secret: only from finish's body, held zeroizing until stored. The body
+        // it came in is scrubbed by `dispatch` once this returns.
+        let value = body.get("value").and_then(Value::as_str).map(|v| zeroize::Zeroizing::new(v.to_string()));
+        return match secrets::apply(state, c, value) {
+            Ok((msg, kind, mut rec)) => {
+                rec["by"] = format!("passkey:{}", a.oc.name).into();
+                rec["via"] = "console".into();
+                rec["signed"] = signed;
+                match state.ledger().and_then(|l| Ok(l.audit(&state.tenant, None, kind, &rec)?)) {
+                    Ok(_) => ok(json!({ "ok": format!("{msg} (signed with {})", a.oc.name) })),
+                    Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+                }
+            }
             Err(e) => err(StatusCode::CONFLICT, format!("{e:#}")),
         };
     }
@@ -1448,6 +1530,7 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             ))
         }
         Action::OpenSession { .. } => unreachable!("action_finish opens sessions"),
+        Action::Secret(_) => unreachable!("action_finish applies secret actions"),
         Action::SaveManifest(save) => {
             manifests::apply(state, save)?;
             let signed_action: Value =
@@ -1521,6 +1604,10 @@ fn apply(state: &State, action: &Action, oc: &OperatorCredential, signed: Value)
             )?;
             Ok(format!("notifications on this device show the request (signed with {})", oc.name))
         }
+        Action::CapacityGrant { principal, terms, ttl_secs } => {
+            capacity::apply_grant(state, &mut l, oc, principal, terms, *ttl_secs, signed)
+        }
+        Action::CapacityRenew { grant, ttl_secs } => capacity::apply_renew(state, &mut l, oc, grant, *ttl_secs, signed),
     }
 }
 
@@ -1689,13 +1776,16 @@ fn dashboard(state: &State) -> Result<Value> {
         "decided": l.decided(t, 15)?,
         "runs": runs,
         "manifests": list_manifests(state),
+        // The vault by name: never a value.
+        "secrets": secrets::view(state),
         "passkeys": l.operator_credentials(t)?,
         "placed": placed_view(&l, wicket_store::now())?,
+        "capacity": capacity::view(&l, &t.0)?,
         "audit": audit,
     }))
 }
 
-/// Nodes `wicket place create` made that are still owned (#294), each with whether its lease has
+/// Nodes `wicket node create` made that are still owned (#294), each with whether its lease has
 /// ended and the runs still holding it past then (the reconciler keeps those and warns).
 pub(crate) fn placed_view(l: &wicket_store::Ledger, now: i64) -> Result<Vec<Value>> {
     Ok(l.placed_nodes(&["active"])?
@@ -1875,6 +1965,7 @@ mod tests {
     mod https;
     mod manifests;
     mod notify;
+    mod secrets;
     mod session;
 
     fn assert_refused(r: &Reply, status: StatusCode, msg: &str) {
@@ -2375,5 +2466,51 @@ mod tests {
         // With the header, the same request reaches the action (and fails on its merits: no such run).
         let out = send(true).await;
         assert!(out.starts_with("HTTP/1.1 404") && out.contains("no identity was issued for run_x"), "{out}");
+    }
+
+    /// #256: the Capacity card issues and renews a standing capacity grant with signed actions,
+    /// lists it with what it uses and leaves, and revokes it with the session only.
+    #[test]
+    fn a_capacity_grant_is_issued_and_renewed_signed_and_revoked_from_the_card() {
+        let mut t = setup("capacity");
+        let ask = json!({ "action": "capacity_grant", "principal": "unix/alex", "plans": "vc2-1c-2gb", "regions": ["lhr"],
+                          "max_hourly_usd": "0.05", "max_daily_usd": "1", "nodes": 2, "ttl_secs": 3600 });
+        // Refused before the passkey is asked for: bad terms, a lifetime over a day, an unknown principal.
+        for bad in [json!({ "nodes": 0 }), json!({ "ttl_secs": 90_000 }), json!({ "principal": "alex" }), json!({ "plans": "" })] {
+            let mut b = ask.clone();
+            b.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+            assert_eq!(t.begin(b).status, StatusCode::BAD_REQUEST);
+        }
+        // What the passkey signs names everything the grant covers.
+        let b = t.begin(ask.clone());
+        let a = &b.body["action"];
+        assert!(a["principal"].as_str().unwrap().ends_with("/op/unix/alex"), "{a}");
+        assert_eq!(
+            (a["terms"]["nodes"].as_u64(), a["terms"]["hourly_micros"].as_i64(), a["ttl_secs"].as_u64()),
+            (Some(2), Some(50_000), Some(3600))
+        );
+        let r = t.act(ask);
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        let l = t.ledger();
+        let g = l.capacity_grants(&TenantId::single().0, None, false).unwrap().pop().unwrap();
+        assert_eq!((g.terms.daily, g.decided_by.as_str()), (1_000_000, "passkey:laptop"));
+        let rec: Value = serde_json::from_str(&l.audit_of_kind("decision").unwrap().last().unwrap().body).unwrap();
+        assert_eq!((rec["decision"].as_str(), rec["grant"].as_str()), (Some("issue"), Some(g.id.as_str())));
+        assert!(rec["signed"]["action_json"].as_str().unwrap().contains("capacity_grant"), "{rec}");
+        // The card lists it, with what is used and left.
+        let view = dashboard(&t.state).unwrap();
+        let c = &view["capacity"][0];
+        assert_eq!((c["id"].as_str(), c["left"]["nodes"].as_u64(), c["used"]["nodes"].as_u64()), (Some(g.id.as_str()), Some(2), Some(0)));
+
+        // Renewed: a signed decision.
+        let r = t.act(json!({ "action": "capacity_renew", "id": g.id, "ttl_secs": 7200 }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert!(l.capacity_grant(&g.id).unwrap().unwrap().expires_at > g.expires_at);
+        // Revoked with the session only; then it's gone from the card and can't be renewed.
+        let r = t.post("/api/capacity/revoke", json!({ "id": g.id }));
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        assert!(dashboard(&t.state).unwrap()["capacity"].as_array().unwrap().is_empty());
+        assert_eq!(t.begin(json!({ "action": "capacity_renew", "id": g.id })).status, StatusCode::CONFLICT);
+        assert_eq!(post(&t.state, "/api/capacity/revoke", &anon(), &json!({ "id": g.id })).unwrap().status, StatusCode::UNAUTHORIZED);
     }
 }

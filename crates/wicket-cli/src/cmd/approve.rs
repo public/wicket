@@ -187,6 +187,11 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
             let unit = if res == wicket_store::MONEY_HOURLY { "/h" } else { "" };
             format!("quota {res} = ${}.{:06}{unit} (lease {})", n / 1_000_000, n % 1_000_000, wicket_agent::clip(lease, 64))
         }
+        // A standing capacity grant (#256): its daily money; its whole terms are on the console's
+        // Capacity card and in its `decision` record.
+        (Some("capacity"), Some(n)) if g.path == wicket_store::CAPACITY_GRANT_PATH => {
+            format!("capacity grant, at most ${}.{:06} a day", n / 1_000_000, n % 1_000_000)
+        }
         (Some(res), Some(n)) => format!("quota {res} = {n}"),
         _ => format!(
             "{} {}{}",
@@ -197,6 +202,9 @@ fn show_grant(r: &wicket_store::GrantListing, now: i64) -> String {
     };
     let to = match &g.run {
         Some(run) => format!("run {run}"),
+        None if g.path == wicket_store::CAPACITY_GRANT_PATH && g.amount.is_some() => {
+            "a principal (the console's Capacity card)".to_string()
+        }
         None => format!("any run in zone {}", wicket_agent::clip(&g.zone, 64)),
     };
     let uses = match (g.amount, g.uses_left) {

@@ -40,6 +40,10 @@ pub enum Granter {
     /// An agent run (#50): it may decide only its descendants' requests, and approve only what its
     /// own authority covers ([`within_authority`]).
     Agent(AgentAuthority),
+    /// A standing capacity grant an operator issued (#256): it approves only a CAPACITY request of
+    /// its own principal's for the node `ask` describes, and only within its terms and what its uses
+    /// take now ([`wicket_store::Ledger::use_capacity_grant`]). It never denies or renews.
+    Capacity { grant: String, ask: wicket_store::CapacityAsk },
 }
 
 impl Granter {
@@ -48,6 +52,7 @@ impl Granter {
         match self {
             Granter::Human(o) => o.label.clone(),
             Granter::Agent(a) => format!("agent:{}", a.run),
+            Granter::Capacity { grant, .. } => format!("capacity-grant:{grant}"),
         }
     }
 }
@@ -205,7 +210,7 @@ pub enum Decided {
 /// A decision outside the decider's own authority (an operator's, #11, or an agent's, #50) is
 /// refused, and the refusal is on the audit record (`decision.refused`) with who tried and why.
 pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_json::Value) -> Result<Decided> {
-    let mut extra = extra;
+    let mut extra = if extra.is_null() { serde_json::json!({}) } else { extra };
     if let Err(why) = bounds(by, v) {
         return Err(refused(l, by, id, v, why));
     }
@@ -218,6 +223,17 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
             let why = wicket_store::StoreError::EffectChanged(id.into(), shown.clone(), now);
             return Err(refused(l, by, id, v, why.into()));
         }
+    }
+    if let Granter::Capacity { grant, ask } = by {
+        let used = match capacity_use(l, grant, ask, id, v) {
+            Ok(x) => x,
+            Err(why) => return Err(refused(l, by, id, v, why)),
+        };
+        merge(&mut extra, used);
+        let Verdict::Approve(t) = v else { unreachable!("checked by capacity_use") };
+        return approve(l, by, id, t, shown.as_deref(), extra).inspect_err(|e| {
+            let _ = l.capacity_use_failed(id, &format!("the approval failed: {e:#}"));
+        });
     }
     if let Granter::Human(o) = by {
         if let Err(why) = asked(l, id, v).and_then(|a| o.may_decide(&a).map_err(anyhow::Error::msg)) {
@@ -257,6 +273,138 @@ pub fn decide(l: &mut Ledger, by: &Granter, id: &str, v: &Verdict, extra: serde_
     }
 }
 
+/// The CAPACITY request a node ask is filed as: `CAPACITY wicket.internal /capacity/node/<name>`.
+pub fn node_request_path(node: &str) -> String {
+    format!("/capacity/node/{node}")
+}
+
+/// Uses capacity grant `grant` for request `id`, which must be a pending CAPACITY request of the
+/// grant's principal for `ask`'s node, approved (never denied or renewed) for one use. Returns what
+/// the decision's record adds: the grant, its terms, the ask and what its uses took before.
+fn capacity_use(l: &mut Ledger, grant: &str, ask: &wicket_store::CapacityAsk, id: &str, v: &Verdict) -> Result<serde_json::Value> {
+    let Verdict::Approve(t) = v else { bail!("a capacity grant only approves") };
+    if t.uses != Some(1) || t.prefix.is_some() || t.zone_wide {
+        bail!("a capacity grant approves one node: one use, exactly the asked path, the asking principal only");
+    }
+    let req = l.request(id)?;
+    if req.status != "pending" {
+        bail!("request {id} is no longer pending (it is {})", req.status);
+    }
+    if req.method != capacity::METHOD || req.host != capacity::HOST || req.path != node_request_path(&ask.node) {
+        bail!("request {id} is not a request for node {}", ask.node);
+    }
+    let g = l.capacity_grant(grant)?.ok_or_else(|| anyhow::anyhow!("no capacity grant {grant}"))?;
+    if g.tenant != req.tenant {
+        bail!("capacity grant {grant} is not in the request's tenant");
+    }
+    match l.use_capacity_grant(grant, &req.run, ask, id)? {
+        Ok((use_id, before)) => Ok(serde_json::json!({
+            "granter": "capacity_grant", "capacity_grant": grant, "capacity_use": use_id, "principal": g.principal,
+            "granted_by": g.decided_by, "terms": g.terms, "ask": ask, "used_before": before,
+        })),
+        Err(why) => bail!("outside capacity grant {grant}: {why}"),
+    }
+}
+
+/// Decides CAPACITY request `id` of `principal`, for `ask`, against the principal's live capacity
+/// grants (#256): approved by the first that covers it (one use, for `ttl`), audited against that
+/// grant. Ok(Err) says, grant by grant, why none did: the request stays pending for an operator.
+pub fn decide_by_capacity_grants(
+    l: &mut Ledger,
+    tenant: &TenantId,
+    principal: &str,
+    id: &str,
+    ask: &wicket_store::CapacityAsk,
+) -> Result<std::result::Result<(String, Decided), Vec<String>>> {
+    let mut why = vec![];
+    for g in l.capacity_grants(&tenant.0, Some(principal), false)? {
+        // Checked quietly first, so a grant that doesn't cover the ask leaves no refusal behind; the
+        // decision checks again, atomically.
+        if let Err(w) = wicket_store::capacity_covers(&g.terms, &l.capacity_used(&g.id)?, ask) {
+            why.push(format!("{}: {w}", g.id));
+            continue;
+        }
+        let by = Granter::Capacity { grant: g.id.clone(), ask: ask.clone() };
+        let t = Terms { uses: Some(1), ttl: CAPACITY_APPROVAL_TTL, prefix: None, zone_wide: false };
+        match decide(l, &by, id, &Verdict::Approve(t), serde_json::Value::Null) {
+            Ok(d) => return Ok(Ok((g.id, d))),
+            Err(e) => why.push(format!("{}: {e:#}", g.id)),
+        }
+    }
+    if why.is_empty() {
+        why.push(format!("{principal} has no live capacity grant"));
+    }
+    Ok(Err(why))
+}
+
+/// How long the approval a capacity grant makes for one node lasts: the create that asked uses it
+/// at once.
+pub const CAPACITY_APPROVAL_TTL: Duration = Duration::from_secs(3600);
+
+/// Issues a standing capacity grant to `principal` (#256) as the operator `by`, for `ttl` (at
+/// most a day): one grant record, on the audit record as a decision, or not at all. An operator
+/// whose authority doesn't cover capacity is refused, and the refusal is audited.
+pub fn issue_capacity_grant(
+    l: &mut Ledger,
+    by: &Granter,
+    tenant: &TenantId,
+    principal: &str,
+    terms: &wicket_store::CapacityTerms,
+    ttl: Duration,
+    extra: serde_json::Value,
+) -> Result<String> {
+    let target = format!("capacity grant to {principal}");
+    let v = Verdict::Approve(Terms { uses: None, ttl, prefix: None, zone_wide: false });
+    let Granter::Human(o) = by else { return Err(refused(l, by, &target, &v, anyhow::anyhow!("only an operator issues capacity grants"))) };
+    let checked = check_ttl(ttl)
+        .and_then(|_| terms.check().map_err(anyhow::Error::msg))
+        .and_then(|_| check_principal(principal))
+        .and_then(|_| o.may_decide(&capacity_asked()).map_err(anyhow::Error::msg));
+    if let Err(why) = checked {
+        return Err(refused(l, by, &target, &v, why));
+    }
+    let gid = l.issue_capacity_grant(&tenant.0, principal, terms, ttl.as_secs() as i64, &o.label)?;
+    let g = l.capacity_grant(&gid)?.expect("just issued");
+    let mut record = serde_json::json!({
+        "decision": "issue", "grant": gid, "kind": "capacity", "by": o.label, "granter": "human", "granter_identity": o.id,
+        "principal": principal, "terms": terms, "ttl_secs": ttl.as_secs(), "until": g.expires_at,
+        "method": wicket_store::QUOTA_METHOD, "host": wicket_store::QUOTA_HOST, "path": wicket_store::CAPACITY_GRANT_PATH,
+    });
+    merge(&mut record, extra);
+    if let Err(e) = l.audit(tenant, None, "decision", &record) {
+        let _ = l.revoke_grant(&gid);
+        return Err(anyhow::Error::from(e).context("the capacity grant could not be recorded in the audit log, so it was revoked"));
+    }
+    Ok(gid)
+}
+
+/// Revokes capacity grant `id` as `by` (an operator), audited. Nothing more is approved under it;
+/// nodes already made under it keep their own leases.
+pub fn revoke_capacity_grant(l: &Ledger, by: &str, tenant: &TenantId, id: &str, extra: serde_json::Value) -> Result<()> {
+    let g = l.capacity_grant(id)?.filter(|g| g.tenant == tenant.0).ok_or_else(|| anyhow::anyhow!("no capacity grant {id}"))?;
+    if g.revoked {
+        bail!("capacity grant {id} is already revoked");
+    }
+    l.revoke_grant(id)?;
+    let mut record = serde_json::json!({ "decision": "revoke", "grant": id, "kind": "capacity", "principal": g.principal, "by": by });
+    merge(&mut record, extra);
+    l.audit(tenant, None, "decision", &record)?;
+    Ok(())
+}
+
+/// What issuing or renewing a capacity grant is, as an operator's authority sees it.
+fn capacity_asked() -> crate::operators::Asked {
+    crate::operators::Asked { kind: "capacity".into(), host: capacity::HOST.into(), risk: None }
+}
+
+/// A principal a capacity grant may name: an operator's or an agent's identity.
+fn check_principal(p: &str) -> Result<()> {
+    if !p.starts_with("spiffe://") || p.len() > 512 || p.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("a capacity grant names a principal by its identity (spiffe://…), not {p:?}");
+    }
+    Ok(())
+}
+
 /// The bounds every grant is made within, whoever decides and however the decision arrived (#342):
 /// a lifetime above 0 and at most [`MAX_TTL`], at least one use if counted, and for an agent a
 /// number of uses at most [`MAX_AGENT_USES`].
@@ -285,6 +433,7 @@ fn asked(l: &Ledger, id: &str, v: &Verdict) -> Result<crate::operators::Asked> {
         return Ok(Asked::of_request(&l.request(id)?));
     }
     Ok(match target(l, id)? {
+        Target::Grant(g) if g.path == wicket_store::CAPACITY_GRANT_PATH && g.quota().is_some() => capacity_asked(),
         Target::Grant(g) => match g.request_id.as_deref().map(|r| l.request(r)).transpose()? {
             Some(req) => Asked::of_request(&req),
             None => Asked::of_op(&g.method, &g.host, g.max_risk),
@@ -299,6 +448,7 @@ fn refused(l: &Ledger, by: &Granter, id: &str, v: &Verdict, why: anyhow::Error) 
     let (granter, identity) = match by {
         Granter::Human(o) => ("human", Some(o.id.clone())),
         Granter::Agent(a) => ("agent", l.identity(&a.run.0).ok().flatten().map(|i| i.spiffe_id)),
+        Granter::Capacity { grant, .. } => ("capacity_grant", l.capacity_grant(grant).ok().flatten().map(|g| g.decided_by)),
     };
     let decision = match v {
         Verdict::Approve(_) => "approve",
@@ -1245,5 +1395,168 @@ mod tests {
         let child_jws = t.ledger.lock().unwrap().identity("run_c").unwrap().unwrap().jws;
         assert!(hook.decide(&wicket_identity::sign_envelope(&t.key, &child_jws, &p)).is_err());
         assert_eq!(t.status(&id), "pending");
+    }
+
+    // ---- standing capacity grants (#256, PR 3) ----
+
+    const ALEX: &str = "spiffe://wicket.test/t/default/op/unix/alex";
+
+    fn cap_terms() -> wicket_store::CapacityTerms {
+        wicket_store::CapacityTerms {
+            plans: vec!["vc2-1c-2gb".into()],
+            regions: vec!["lhr".into()],
+            hourly: 30_000,
+            daily: 50_000,
+            nodes: 2,
+        }
+    }
+
+    fn node_ask(node: &str, worst: i64) -> wicket_store::CapacityAsk {
+        wicket_store::CapacityAsk { node: node.into(), plan: "vc2-1c-2gb".into(), region: "lhr".into(), hourly: 14_000, worst }
+    }
+
+    /// A CAPACITY request for a node, filed by `principal` as `wicket node create` files it.
+    fn node_asked(l: &Ledger, principal: &str, node: &str) -> String {
+        let op = Op::egress(
+            &TenantId::single(),
+            &RunId(principal.into()),
+            "operator",
+            capacity::METHOD,
+            capacity::HOST,
+            &node_request_path(node),
+        );
+        l.pending_for(&op, "a node", None).unwrap().0
+    }
+
+    fn issue(l: &mut Ledger) -> String {
+        issue_capacity_grant(
+            l,
+            &human("op"),
+            &TenantId::single(),
+            ALEX,
+            &cap_terms(),
+            Duration::from_secs(8 * 3600),
+            serde_json::json!({ "via": "test" }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_node_within_a_capacity_grant_is_approved_and_audited_against_it() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        let g = issue(&mut l);
+        let issued = decisions(&l);
+        assert_eq!(
+            (issued[0]["decision"].as_str(), issued[0]["grant"].as_str(), issued[0]["principal"].as_str()),
+            (Some("issue"), Some(g.as_str()), Some(ALEX))
+        );
+        assert_eq!(issued[0]["terms"]["nodes"], 2);
+
+        let r1 = node_asked(&l, ALEX, "n1");
+        let (by, d) = decide_by_capacity_grants(&mut l, &t, ALEX, &r1, &node_ask("n1", 20_000)).unwrap().unwrap();
+        assert_eq!(by, g);
+        let Decided::Approved { uses, .. } = d else { panic!("{d:?}") };
+        assert_eq!(uses, Some(1));
+        assert_eq!(l.request(&r1).unwrap().status, "granted");
+        let all = decisions(&l);
+        let rec = all.last().unwrap();
+        assert_eq!(
+            (rec["request"].as_str(), rec["by"].as_str(), rec["granter"].as_str()),
+            (Some(r1.as_str()), Some(format!("capacity-grant:{g}").as_str()), Some("capacity_grant"))
+        );
+        assert_eq!(
+            (rec["capacity_grant"].as_str(), rec["granted_by"].as_str(), rec["principal"].as_str()),
+            (Some(g.as_str()), Some("op"), Some(ALEX))
+        );
+        assert_eq!(rec["ask"]["node"], "n1");
+        assert_eq!(rec["used_before"]["nodes"], 0);
+
+        // Beyond it (the daily money), the request stays pending for an operator, and says why.
+        let r2 = node_asked(&l, ALEX, "n2");
+        let why = decide_by_capacity_grants(&mut l, &t, ALEX, &r2, &node_ask("n2", 40_000)).unwrap().unwrap_err();
+        assert!(why[0].contains(&g) && why[0].contains("a day"), "{why:?}");
+        assert_eq!(l.request(&r2).unwrap().status, "pending");
+        // An operator still decides it, through the same function.
+        assert!(matches!(
+            decide(&mut l, &human("op"), &r2, &Verdict::Approve(terms(600)), serde_json::json!({})).unwrap(),
+            Decided::Approved { .. }
+        ));
+
+        // Someone else's request isn't covered by alex's grant; nor is a request for another node.
+        let eve = "spiffe://wicket.test/t/default/op/unix/eve";
+        let r3 = node_asked(&l, eve, "n3");
+        assert!(
+            decide_by_capacity_grants(&mut l, &t, eve, &r3, &node_ask("n3", 1)).unwrap().unwrap_err()[0].contains("no live capacity grant")
+        );
+        let by = Granter::Capacity { grant: g.clone(), ask: node_ask("n3", 1) };
+        let e = decide(&mut l, &by, &r3, &Verdict::Approve(terms(600)), serde_json::Value::Null).unwrap_err();
+        assert!(format!("{e:#}").contains("not unix/eve") || format!("{e:#}").contains("eve"), "{e:#}");
+        let r4 = node_asked(&l, ALEX, "n4");
+        let e = decide(
+            &mut l,
+            &Granter::Capacity { grant: g.clone(), ask: node_ask("other", 1) },
+            &r4,
+            &Verdict::Approve(terms(600)),
+            serde_json::Value::Null,
+        );
+        assert!(format!("{:#}", e.unwrap_err()).contains("not a request for node other"));
+        assert_eq!(l.request(&r3).unwrap().status, "pending");
+    }
+
+    #[test]
+    fn a_capacity_grant_only_approves_one_node_and_never_renews_or_denies() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let g = issue(&mut l);
+        let r = node_asked(&l, ALEX, "n1");
+        let by = Granter::Capacity { grant: g.clone(), ask: node_ask("n1", 1) };
+        for v in [
+            Verdict::Deny,
+            Verdict::Renew(Duration::from_secs(600)),
+            Verdict::Approve(Terms { uses: Some(5), ..terms(600) }),
+            Verdict::Approve(Terms { zone_wide: true, ..terms(600) }),
+        ] {
+            assert!(decide(&mut l, &by, &r, &v, serde_json::Value::Null).is_err(), "{v:?}");
+        }
+        // Not even its own grant: renewing is an operator's decision.
+        assert!(decide(&mut l, &by, &g, &Verdict::Renew(Duration::from_secs(9 * 3600)), serde_json::Value::Null).is_err());
+        assert_eq!(l.request(&r).unwrap().status, "pending");
+        assert!(l.audit_tail(50).unwrap().iter().any(|x| x.2 == "decision.refused"));
+    }
+
+    #[test]
+    fn a_capacity_grant_is_issued_renewed_and_revoked_by_operators_within_their_authority() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let t = TenantId::single();
+        // Bad terms and principals are refused, and the refusal is audited.
+        let bad = wicket_store::CapacityTerms { nodes: 0, ..cap_terms() };
+        assert!(issue_capacity_grant(&mut l, &human("op"), &t, ALEX, &bad, Duration::from_secs(60), serde_json::json!({})).is_err());
+        assert!(
+            issue_capacity_grant(&mut l, &human("op"), &t, "alex", &cap_terms(), Duration::from_secs(60), serde_json::json!({})).is_err()
+        );
+        assert!(issue_capacity_grant(&mut l, &human("op"), &t, ALEX, &cap_terms(), Duration::from_secs(25 * 3600), serde_json::json!({}))
+            .is_err());
+        // An operator whose authority doesn't cover capacity may not issue or renew one.
+        let policy = crate::operators::Policy::parse("operators:\n  unix/bob: { kinds: [http] }\n").unwrap();
+        let bob = Granter::Human(crate::operators::Operator::new("default", "unix", "bob", "bob@cli".into(), &policy));
+        let e = issue_capacity_grant(&mut l, &bob, &t, ALEX, &cap_terms(), Duration::from_secs(60), serde_json::json!({})).unwrap_err();
+        assert!(format!("{e:#}").contains("may not decide capacity"), "{e:#}");
+        assert_eq!(l.audit_tail(50).unwrap().iter().filter(|x| x.2 == "decision.refused").count(), 4);
+        assert!(l.capacity_grants(&t.0, None, true).unwrap().is_empty());
+
+        let g = issue(&mut l);
+        let before = l.capacity_grant(&g).unwrap().unwrap().expires_at;
+        assert!(decide(&mut l, &bob, &g, &Verdict::Renew(Duration::from_secs(20 * 3600)), serde_json::json!({})).is_err());
+        let Decided::Renewed { until, .. } =
+            decide(&mut l, &human("op"), &g, &Verdict::Renew(Duration::from_secs(20 * 3600)), serde_json::json!({})).unwrap()
+        else {
+            panic!("renewed")
+        };
+        assert!(until > before && l.capacity_grant(&g).unwrap().unwrap().expires_at == until);
+        revoke_capacity_grant(&l, "op", &t, &g, serde_json::json!({})).unwrap();
+        assert!(revoke_capacity_grant(&l, "op", &t, &g, serde_json::json!({})).is_err(), "once");
+        assert_eq!(decisions(&l).last().unwrap()["decision"], "revoke");
+        let r = node_asked(&l, ALEX, "n1");
+        assert!(decide_by_capacity_grants(&mut l, &t, ALEX, &r, &node_ask("n1", 1)).unwrap().is_err(), "nothing under a revoked grant");
     }
 }

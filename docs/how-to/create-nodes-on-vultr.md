@@ -1,7 +1,7 @@
-# Place nodes on Vultr
+# Create nodes on Vultr
 
-Have wicket create nodes on Vultr inside a money envelope, by hand (`wicket place`) or for agents
-that ask (`request_capacity` and leases). [Nodes](../reference/nodes.md#provisioning-nodes-wicket-place)
+Have wicket create nodes on Vultr inside a money envelope, by hand (`wicket node create`) or for agents
+that ask (`request_capacity` and leases). [Nodes](../reference/nodes.md#creating-nodes-wicket-node-create)
 has the rules; this page is the recipe. On an installed control host, run these commands with
 `sudo`.
 
@@ -24,22 +24,30 @@ sudo -u wicket ssh-keygen -q -t ed25519 -N '' -C wicket-placement -f /var/lib/wi
 sudo cat /var/lib/wicket/ssh/placement.pub   # add this public half to the Vultr account, note its id
 ```
 
-`wicket place create` refuses a key it can't read before it creates anything, and asks for the spend
-on the terminal you run it from (`sudo` passes it through wicketd).
+`wicket node create` refuses a key it can't read before it creates anything. Its spend is a request
+from you: a capacity grant of yours approves it at once, and otherwise an operator decides it (see
+below).
 
 ## 2. Create a node by hand
 
 ```sh
-wicket place plans --region lhr                     # plans and their hourly price
-wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
+wicket node plans --region lhr                     # plans and their hourly price
+wicket node create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetime 1h \
     --max-hourly 0.05 --max-total 0.50 --ssh-key-id <id> --ssh-key /var/lib/wicket/ssh/placement \
     --hosts 'api.example.com'
 ```
 
 - `--max-hourly` and `--max-total` are the envelope: every owned node's hourly rate together, and
   every owned node's cost through its lease plus the new node's worst case. Anything beyond it is
-  refused; anything inside it still waits for `yes` on the terminal, with the plan, rate and worst
-  case shown.
+  refused before anything is asked.
+- Inside the envelope, the node is a request, `CAPACITY wicket.internal /capacity/node/n2`, with the
+  plan, region, rate and worst case. If one of your live capacity grants covers it, it is approved
+  at once and audited against that grant. Otherwise it waits for an operator: on the console, which
+  sends a notification, or `wicket approve <id>`. That wait lasts up to `--wait` (default `15m`);
+  if nobody decides by then, the request is denied and nothing is created.
+- To skip the wait, have an operator give you a capacity grant on the console's Capacity card: the
+  plans, regions, hourly and daily money, how many nodes at once, and for how long (at most 24h,
+  renewable). See [capacity grants](../reference/console.md#capacity-grants).
 - Vultr bills per started hour, so a node's lease ends at minute 50 of its last hour.
 - wicket generates the node's ssh host key, installs it through cloud-init as its only host key,
   pins it before the node boots, waits for `node-setup.sh` to finish, enrols the node and removes the
@@ -51,7 +59,7 @@ wicket place create --name n2 --region lhr --vcpus 1 --memory-mib 2048 --lifetim
   checks the owner tag first), records a `placement.node_unreachable` audit record with the reason,
   and says so. Its cost leaves the envelope with it, so you can run `create` again, perhaps in
   another `--region`. A node that answers but doesn't finish setup within 15 minutes is still left
-  running, with the `wicket place release` command to run.
+  running, with the `wicket node release` command to run.
 - A retried `create` with the same `--idempotency-key` (default: derived from `--name`) finds the
   first instance instead of making a second.
 
@@ -65,12 +73,13 @@ wicket run task.yaml --node n2
 ```
 
 ```sh
-wicket place list                  # owned nodes, lease end and next paid hour
-wicket place release <instance-id> # destroy now and revoke the enrolment
+wicket node list                   # every node; a leased one with its lease end, provider and cost
+wicket node list --provider        # and what Vultr says: state, next paid hour, untracked instances
+wicket node release n2             # destroy now (by name or instance id) and revoke the enrolment
 ```
 
 Only instances tagged `wicket-owner-<installation>` (`--owner`, default the trust domain) are listed
-or destroyed; tag an instance `wicket-protected` to keep wicket's hands off it.
+by the provider or destroyed; tag an instance `wicket-protected` to keep wicket's hands off it.
 
 ## 3. Leases for agents
 

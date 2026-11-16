@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
+mod capgrant;
+pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
 mod effect;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
@@ -81,11 +83,15 @@ pub enum StoreError {
 /// Version 7 (expand) adds `agents.claim_until`, the wake claim's end, which `agents.lease_until`
 /// held before (#349: a claim, not a lease). It is copied over once, and both are written until a
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
-/// Version 8 (expand) binds approvals to their effect (#369): `requests.args_sha256` and
+/// Version 8 (expand) adds `placed_nodes.hourly`: what a node from `wicket node create` costs per
+/// hour, for `wicket node list` (#358).
+/// Version 9 (expand) adds standing capacity grants (#256): `grants.principal`, `grants.terms` and
+/// the `capacity_uses` table.
+/// Version 10 (expand) binds approvals to their effect (#369): `requests.args_sha256` and
 /// `grants.args_sha256` (the decided-on arguments' hash), `grants.effect_sha256` (the approved
 /// descriptor's), and the indexes a run's recent egress (`audit_run`) and its pending requests
 /// (`requests_run`) are read by.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 10;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -273,7 +279,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, args_sha256 TEXT, effect_sha256 TEXT
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, principal TEXT, terms TEXT, args_sha256 TEXT, effect_sha256 TEXT
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -341,7 +347,8 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE INDEX IF NOT EXISTS leases_status ON leases (tenant, status);
 CREATE TABLE IF NOT EXISTS placed_nodes (
   id TEXT PRIMARY KEY, backend TEXT NOT NULL, name TEXT NOT NULL, owner TEXT NOT NULL, api_key_secret TEXT NOT NULL,
-  created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT
+  created_at INTEGER NOT NULL, lease_until INTEGER NOT NULL, status TEXT NOT NULL, held_by TEXT, ended_at INTEGER, detail TEXT,
+  hourly INTEGER
 );
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, tenant TEXT NOT NULL, run TEXT,
@@ -420,6 +427,7 @@ impl Ledger {
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
+        conn.execute_batch(capgrant::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -460,6 +468,11 @@ impl Ledger {
         if conn.execute("ALTER TABLE agents ADD COLUMN claim_until INTEGER", []).is_ok() {
             conn.execute("UPDATE agents SET claim_until = lease_until", [])?;
         }
+        // Ledgers created before placed nodes recorded their hourly price (#358).
+        let _ = conn.execute("ALTER TABLE placed_nodes ADD COLUMN hourly INTEGER", []);
+        // Ledgers created before capacity grants (#256): the principal a grant is to, and its terms.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN principal TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN terms TEXT", []);
         // Ledgers created before approvals were bound to their effect (#369).
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN args_sha256 TEXT", []);
         let _ = conn.execute("ALTER TABLE grants ADD COLUMN args_sha256 TEXT", []);
@@ -500,6 +513,7 @@ impl Ledger {
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
+        conn.execute_batch(capgrant::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 

@@ -21,12 +21,12 @@
 //!   touched; protected ones are reported and left. **Ownership is checked again right before every
 //!   destroy** (`Placer::release` reads the instance and refuses one without the owner tag or with
 //!   `wicket-protected`), so a tag changed between list and destroy saves the machine.
-//! - *Placed nodes* (`wicket_store::PlacedNodeRow`, #294): nodes `wicket place create` made, which
+//! - *Placed nodes* (`wicket_store::PlacedNodeRow`, #294): nodes `wicket node create` made, which
 //!   no capacity lease asks for, are held to their own lease ([`placed_pass`]). At its end (minute 50
 //!   of its last paid hour) a node no running run is placed on is released (`Placer::release`, which
 //!   checks the owner tag and `wicket-protected` first) and its enrolment revoked, with an audit record
 //!   saying why; one a run still holds is kept, audited once per change of holders, and flagged in
-//!   `wicket place list` and the console (asking for a renewal decision is #56; until then it is a
+//!   `wicket node list` and the console (asking for a renewal decision is #56; until then it is a
 //!   warning). The machine half above leaves recorded placed nodes to this step.
 //! - *Boxes*: Docker's `wicket=1` containers, here and on every active enrolled node (over its pinned
 //!   ssh), by their `wicket.run` label. A box whose run has ended is stopped; a running run's box is
@@ -414,7 +414,7 @@ where
             let m = self.machines.as_ref().expect("machines");
             (m.placer.owner().clone(), m.warm_pool, m.placer.list().await.context("listing the provider's owned nodes")?)
         };
-        // Nodes `wicket place create` made are held to their own lease ([`placed_pass`]), not destroyed
+        // Nodes `wicket node create` made are held to their own lease ([`placed_pass`]), not destroyed
         // for having no capacity lease.
         let placed: HashSet<String> = self.ledger.placed_nodes(&[])?.into_iter().map(|p| p.id).collect();
         let observed: Vec<NodeHandle> = observed.into_iter().filter(|n| !placed.contains(&n.id.0)).collect();
@@ -626,7 +626,7 @@ where
 
 // ---- placed nodes (#294) ----
 
-/// The placed nodes' half of a pass: every active node `wicket place create` recorded under
+/// The placed nodes' half of a pass: every active node `wicket node create` recorded under
 /// `placer`'s owner and backend whose lease has ended is released if no running run is placed on it,
 /// and otherwise kept and flagged. `retire` runs after a release (revoking its enrolment).
 pub async fn placed_pass<Q: Provider, A: SpendApprover>(
@@ -658,7 +658,7 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
         if !holders.is_empty() {
             let runs = holders.join(",");
             let detail = format!(
-                "placed node {} is past its lease (ended {ended}) but run {runs} still runs on it: kept, and billing until it is released (wicket place release {})",
+                "placed node {} is past its lease (ended {ended}) but run {runs} still runs on it: kept, and billing until it is released (wicket node release {})",
                 row.name, row.id
             );
             let changed = if dry_run { false } else { ledger.set_placed_node_held(&row.id, Some(&runs))? };
@@ -708,7 +708,7 @@ pub async fn placed_pass<Q: Provider, A: SpendApprover>(
 }
 
 /// [`placed_pass`] for every owner and API key placed nodes were recorded under (Vultr: the only
-/// backend `wicket place create` has).
+/// backend `wicket node create` has).
 async fn placed_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Vec<Done>> {
     let mut groups: Vec<(String, String)> = ledger
         .placed_nodes(&["active"])?
@@ -720,8 +720,8 @@ async fn placed_nodes(ledger: &mut Ledger, now: i64, dry_run: bool) -> Result<Ve
     groups.dedup();
     let mut done = vec![];
     for (owner, secret) in groups {
-        match crate::place::release_placer(&owner, &secret) {
-            Ok(p) => done.extend(placed_pass(ledger, &p, crate::place::retire_enrolment, now, dry_run).await?),
+        match crate::nodecreate::release_placer(&owner, &secret) {
+            Ok(p) => done.extend(placed_pass(ledger, &p, crate::nodecreate::retire_enrolment, now, dry_run).await?),
             Err(e) => done.push(Done {
                 kind: "error",
                 target: format!("placed nodes of {owner}"),
@@ -950,7 +950,7 @@ pub mod setup {
             if self.hosts.is_empty() {
                 anyhow::bail!("placement.yaml has no node_hosts for the node's CA");
             }
-            let (_, target) = crate::place::bring_up(
+            let (_, target) = crate::nodecreate::bring_up(
                 p,
                 &node.id,
                 &name,
@@ -1659,7 +1659,7 @@ mod tests {
         assert!(d.iter().any(|x| x.kind == "refused"), "{d:?}");
     }
 
-    // ---- nodes from `wicket place create` (#294), against the Vultr mock and a fake clock ----
+    // ---- nodes from `wicket node create` (#294), against the Vultr mock and a fake clock ----
 
     static RETIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     fn retire(_l: &mut Ledger, n: &NodeHandle) -> Result<bool> {
@@ -1667,7 +1667,7 @@ mod tests {
         Ok(true)
     }
 
-    /// Records `id` as `wicket place create` does, named `name`, its lease ending at `end`.
+    /// Records `id` as `wicket node create` does, named `name`, its lease ending at `end`.
     fn placed(l: &Ledger, st: &vultr_mock::Shared, id: &str, name: &str, end: i64) {
         let o = Owner::new("example");
         let mut i = vultr_mock::instance(id, &[o.tag(), o.idem_tag(&format!("place-create:{name}")), Owner::lease_tag(end)]);
@@ -1685,6 +1685,7 @@ mod tests {
             held_by: None,
             ended_at: None,
             detail: None,
+            hourly: None,
         })
         .unwrap();
     }
@@ -1748,7 +1749,7 @@ mod tests {
         assert!(deletes(&st).is_empty(), "{d:?}");
         let x = d.iter().find(|x| x.kind == "placed_held").expect("flagged");
         assert!(
-            x.detail.contains("past its lease") && x.detail.contains("run_busy") && x.detail.contains("wicket place release placed-busy")
+            x.detail.contains("past its lease") && x.detail.contains("run_busy") && x.detail.contains("wicket node release placed-busy")
         );
         let row = l.placed_node("placed-busy").unwrap().unwrap();
         assert_eq!((row.status.as_str(), row.held_by.as_deref()), ("active", Some("run_busy")));
@@ -1793,6 +1794,7 @@ mod tests {
             held_by: None,
             ended_at: None,
             detail: None,
+            hourly: None,
         })
         .unwrap();
         let d = placed_pass(&mut l, &w.placer, retire, end + 60, false).await.unwrap();

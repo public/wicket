@@ -85,6 +85,7 @@ if [ "$rust" = 1 ]; then
   step "no secrets or machine details" python3 ci/check-public.py
   step "Markdown links" ci/check-doc-links.sh
   step "terms" ci/check-terms.sh
+  step "plugin and skills" python3 -I ci/check-plugin.py
 fi
 
 # ---- Rust ----

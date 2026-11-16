@@ -31,7 +31,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 |---|---|
 | `run`, `wrap`, `session`, `hibernate`, `wake` | run |
 | `agents`, `pending`, `links`, `audit` (and `audit export`), `doctor` | read |
-| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list`, `state check`, `self status` | read |
+| `secret list`, `identity issuer\|show\|list`, `operator list\|sessions`, `lease list`, `node list` (without `--provider`), `state check`, `self status` | read |
 | `unlink`, `grant revoke`, `identity revoke`, `lease release` | revoke |
 | `approve`, `deny`, `grant renew` | privileged |
 | `secret set\|link\|hosts\|rm` | privileged |
@@ -39,7 +39,7 @@ Everyone else approves, denies and starts runs in the console, with a passkey.
 | `operator enrol-link\|reset\|revoke-session` | privileged |
 | `identity init` | privileged |
 | `reconcile` | privileged |
-| `node token\|enrol\|revoke\|renew-ca\|install`, `place …` | privileged |
+| `node token\|enrol\|revoke\|renew-ca\|install\|create\|release\|plans`, `node list --provider` | privileged |
 | `state check --probe`, `state kit`, `state restore`, `keys …` | privileged |
 | `self update\|rollback\|prune\|trust-key` | root only |
 | `program digest`, `zone`, `node serve`, `self keygen\|sign`, `dev …` | local |

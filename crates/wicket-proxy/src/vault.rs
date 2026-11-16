@@ -246,14 +246,7 @@ impl Vault {
     /// Binds `name` to exactly these hosts (patterns: `api.example.com`, `*.example.com`).
     pub fn set_hosts(&self, name: &str, hosts: &[String]) -> Result<()> {
         let p = self.path(name)?;
-        let mut v = Vec::new();
-        for h in hosts {
-            let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
-            check_host_pattern(&h)?;
-            if !v.contains(&h) {
-                v.push(h);
-            }
-        }
+        let v = normalize_hosts(hosts)?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
         let f = p.with_extension("hosts");
@@ -318,6 +311,32 @@ impl Vault {
         Ok(())
     }
 
+    /// What the vault knows about `name` besides its value (never read here): whether it is a stored
+    /// value or a reference (and what it refers to), its hosts, and when it was last set (the value's
+    /// or reference's file time). None if it isn't in this vault's directory.
+    pub fn info(&self, name: &str) -> Option<SecretInfo> {
+        let p = self.path(name).ok()?;
+        let r = p.with_extension("ref");
+        let (reference, meta) = match std::fs::symlink_metadata(&r) {
+            Ok(m) => {
+                let spec: serde_json::Value = std::fs::read(&r).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                let s = |k: &str| spec.get(k).and_then(|v| v.as_str()).map(String::from);
+                (Some(Reference { file: s("file").unwrap_or_default(), pointer: s("pointer") }), m)
+            }
+            Err(_) => (None, std::fs::symlink_metadata(&p).ok()?),
+        };
+        let set_at = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
+        Some(SecretInfo { name: name.to_string(), reference, hosts: self.hosts(name), set_at })
+    }
+
+    /// The names of the secrets in this vault's directory, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.list().into_iter().map(|n| n.strip_suffix(" (reference)").map(String::from).unwrap_or(n)).collect();
+        v.retain(|n| self.path(n).is_ok());
+        v.dedup();
+        v
+    }
+
     pub fn list(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(&self.dir)
             .map(|rd| {
@@ -334,6 +353,38 @@ impl Vault {
         v.sort();
         v
     }
+}
+
+/// A secret as [`Vault::info`] describes it: never its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretInfo {
+    pub name: String,
+    /// Set for a reference (`wicket secret link`): what it refers to.
+    pub reference: Option<Reference>,
+    pub hosts: Vec<String>,
+    /// When its value or reference was last written (Unix seconds).
+    pub set_at: Option<i64>,
+}
+
+/// What a reference names: a file on the host and, for a JSON field in it, a pointer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reference {
+    pub file: String,
+    pub pointer: Option<String>,
+}
+
+/// Host patterns as a binding keeps them: trimmed, lowercased, without a trailing dot, each checked
+/// (as [`Vault::set_hosts`] does), duplicates dropped.
+pub fn normalize_hosts(hosts: &[String]) -> Result<Vec<String>> {
+    let mut v = Vec::new();
+    for h in hosts {
+        let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
+        check_host_pattern(&h)?;
+        if !v.contains(&h) {
+            v.push(h);
+        }
+    }
+    Ok(v)
 }
 
 /// How often [`Vault::get_for_patiently`] tries again.
@@ -581,6 +632,31 @@ mod tests {
         for bad in ["*", "*.com", "a/b", "", "-a.com", "a..com", "*.*.com"] {
             assert!(v.set_hosts("gh", &[bad.into()]).is_err(), "{bad:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn info_says_what_a_secret_is_and_never_its_value() {
+        let dir = std::env::temp_dir().join(format!("wicket-vault-info-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = Vault::new(dir.join("vault"));
+        assert!(v.info("gh").is_none() && v.names().is_empty());
+        v.set("gh", "tok-very-secret").unwrap();
+        v.set_hosts("gh", &["api.github.com".into()]).unwrap();
+        let key = dir.join("key");
+        std::fs::write(&key, "k").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        v.link("api", key.to_str().unwrap(), None, None, None).unwrap();
+        assert_eq!(v.names(), ["api", "gh"]);
+        let gh = v.info("gh").unwrap();
+        assert!(gh.reference.is_none() && gh.hosts == ["api.github.com"] && gh.set_at.is_some());
+        assert!(!format!("{gh:?}").contains("tok-"), "no value in it");
+        let api = v.info("api").unwrap();
+        assert_eq!(api.reference, Some(Reference { file: key.to_str().unwrap().into(), pointer: None }));
+        assert!(api.hosts.is_empty());
+        assert_eq!(normalize_hosts(&["A.example.".into(), "a.example".into()]).unwrap(), ["a.example"]);
+        assert!(normalize_hosts(&["*".into()]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

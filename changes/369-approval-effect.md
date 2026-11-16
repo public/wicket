@@ -25,7 +25,7 @@ type: Added
   own: the same target with other arguments, or an egress request under a pending prefix ask, is
   answered with the pending request. A granted spawn or link waits while another request for it is
   pending.
-- Ledger schema 8 (expand) adds `requests.args_sha256`, `grants.args_sha256`,
+- Ledger schema 10 (expand) adds `requests.args_sha256`, `grants.args_sha256`,
   `grants.effect_sha256`, and indexes on `audit (run, seq)` and `requests (run, status)`.
 - `verification/tla/ApprovalEffect.tla` models these rules for TLC: hold until decided across
   siblings, exactly once on replay, no action after a grant expires, and identity kept across a

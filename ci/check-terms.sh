@@ -6,17 +6,18 @@
 # Flagged, case-insensitively, as whole words:
 #   - "sandbox node": a node (a machine that runs boxes);
 #   - "escalation request": a request ("escalation" is the act of asking, not a separate thing);
+#   - "wicket place": the command is `wicket node create`, `release`, `plans` and `list` (#358);
 #   - "mandate", "crew": deferred designs (#259), outside docs/explanation/research/ and
 #     design.md's "22. Deferred" section;
 #   - "sandbox" where "box" is meant, in the user docs (README.md, docs/README.md, docs/how-to/,
-#     docs/reference/, docs/tutorials/, docs/explanation/concepts.md) and the explanation docs about
+#     docs/reference/, docs/tutorials/, docs/explanation/concepts.md), the plugin's skills (plugins/) and the explanation docs about
 #     boxes (docs/explanation/prior-art.md, why-gvisor.md and design.md's "7. Boxes" section, #349):
 #     "sandbox" names only gVisor's layer. Passing: "gVisor('s) sandbox"; the "process sandbox" tier
 #     (seccomp, namespaces, Landlock); another project's "X's own sandbox(es)"; and hyphenated names
 #     (crates, repos, file names: wicket-sandbox, agent-sandbox, 07-oss-sandboxes-runtimes.md).
 #
-# Checked: README.md and every tracked *.md under docs/ except docs/explanation/research/, code
-# blocks included.
+# Checked: README.md and every tracked *.md under docs/ (except docs/explanation/research/) and
+# plugins/, code blocks included.
 # ci/check-terms.allow lists the lines that may use a word anyway: `<path> | <text>`, where the line
 # contains <text> (or `<path> | *` for the whole file). Keep it short, and say why above each entry.
 #
@@ -30,7 +31,7 @@ import sys
 
 ALLOW_FILE = "ci/check-terms.allow"
 
-USER_DOCS = ("README.md", "docs/README.md", "docs/how-to/", "docs/reference/", "docs/tutorials/", "docs/explanation/concepts.md")
+USER_DOCS = ("README.md", "docs/README.md", "docs/how-to/", "docs/reference/", "docs/tutorials/", "docs/explanation/concepts.md", "plugins/")
 BOX_DOCS = USER_DOCS + ("docs/explanation/prior-art.md", "docs/explanation/why-gvisor.md")
 SANDBOX_OK = re.compile(
     r"gvisor(?:'s)? sandbox|process sandbox(?:es)?|\w+'s own sandbox(?:es)?|[\w.]+-sandbox(?:es)?\b|\bsandbox(?:es)?-[\w.]+",
@@ -41,6 +42,7 @@ RULES = [
     # (pattern, what to say instead, applies to path)
     (re.compile(r"\bsandbox[- ]nodes?\b", re.I), 'say "node"', lambda p: True),
     (re.compile(r"\bescalation[- ]requests?\b", re.I), 'say "request" ("escalation" is the act of asking)', lambda p: True),
+    (re.compile(r"\bwicket place\b", re.I), 'say "wicket node create" (or release, plans, list): nodes have one noun (#358)', lambda p: True),
     (re.compile(r"\b(?:mandates?|crews?)\b", re.I), "a deferred design (#259): only in research and design.md's Deferred section", lambda p: True),
     (re.compile(r"\bsandbox(?:es)?\b", re.I), 'say "box" ("sandbox" is only gVisor\'s layer)', lambda p: p.startswith(BOX_DOCS)),
 ]
@@ -48,7 +50,7 @@ SANDBOX_RULE = RULES[-1][0]
 
 
 def checked(path):
-    return path.endswith(".md") and (path == "README.md" or path.startswith("docs/")) and not path.startswith("docs/explanation/research/")
+    return path.endswith(".md") and (path == "README.md" or path.startswith(("docs/", "plugins/"))) and not path.startswith("docs/explanation/research/")
 
 
 def load_allow():
