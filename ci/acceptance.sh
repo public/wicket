@@ -553,7 +553,7 @@ for line in sys.stdin:
         continue
     if b.get("kind") == "egress" and b.get("outcome") in ("allow", "spliced"):
         print(b.get("method"), b.get("host"), b.get("path"))
-' "$esc_run"
+' "${1:-$esc_run}"
 }
 check "a box trying to get out: every attempt refused, none ESCAPED" '[ "$(esc_out | grep -c " blocked ")" -ge 25 ] && ! esc_out | grep -q " ESCAPED "'
 check "  and the canary on the host's addresses saw no request" '[ ! -s "$work/canary.log" ]'
@@ -562,6 +562,7 @@ check "  and its audit allowed nothing but GET example.com/" '! esc_allowed | gr
 # ---- 4. multi-host (optional) ----
 if [ -n "$nodes" ]; then
   multihost
+  escape_flow
 fi
 if [ "$nodes" = local ]; then
   offline_flow
