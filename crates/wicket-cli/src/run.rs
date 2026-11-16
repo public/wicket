@@ -1084,9 +1084,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // path it has on the host) is mounted as it is, with this run's outbox over its out/. Another
     // node gets a copy and sends it back at the end.
     let outbox = (box_root.join("workspace/out").display().to_string(), format!("{}/out", wicket_agent::WORKSPACE), false);
+    // Its git hooks and config, read-only (#366): the operator's git runs them on this host.
     let binds: Vec<(String, String, bool)> = match (&workspace_dir, shares_host) {
-        (Some(w), true) if wrap_cwd.is_some() => vec![(w.display().to_string(), w.display().to_string(), false), outbox],
-        (Some(w), true) => vec![(w.display().to_string(), wicket_agent::WORKSPACE.into(), false), outbox],
+        (Some(w), true) => {
+            let target = if wrap_cwd.is_some() { w.display().to_string() } else { wicket_agent::WORKSPACE.into() };
+            let git = crate::gitguard::binds(w, &target)?;
+            [(w.display().to_string(), target, false), outbox].into_iter().chain(git).collect()
+        }
         _ => vec![],
     };
     // The harness's own files (its adapter settings: allowlisted keys only, plus what wicket owns,
@@ -2397,7 +2401,11 @@ async fn fetch_trees(stopper: &Stopper, f: Fetch<'_>) -> Result<()> {
     }
     match (in_place, same_dir) {
         (_, true) => {}
-        (Some(w), false) => crate::hibernate::sync_dir(&ws_staged, w, &["out"])?,
+        (Some(w), false) => {
+            // The host's git hooks and config stay the host's (#366).
+            crate::gitguard::keep_host_git(w, &ws_staged)?;
+            crate::hibernate::sync_dir(&ws_staged, w, &["out"])?
+        }
         (None, false) => crate::hibernate::sync_dir(&ws_staged, &ws_dest, &[])?,
     }
     for (tree, dest) in &wanted {

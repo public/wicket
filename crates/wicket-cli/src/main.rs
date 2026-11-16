@@ -16,6 +16,7 @@ mod doctor;
 mod effect;
 mod enrol;
 mod exitcause;
+mod gitguard;
 mod grant;
 mod hibernate;
 mod image;

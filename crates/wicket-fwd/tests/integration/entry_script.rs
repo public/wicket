@@ -142,10 +142,7 @@ fn starts_the_program_once_the_forwarder_listens_and_records_each_step() {
     let env = std::fs::read_to_string(root.join("prog.env")).unwrap();
     let lines: Vec<&str> = env.lines().collect();
     assert_eq!(lines[..6], ["/tmp/ca-bundle.pem"; 6], "{env}");
-    assert_eq!(
-        lines[6],
-        "-Dhttp.proxyHost=wicket.internal -Dhttp.proxyPort=3128 -Dhttps.proxyHost=wicket.internal -Dhttps.proxyPort=3128"
-    );
+    assert_eq!(lines[6], "-Dhttp.proxyHost=wicket.internal -Dhttp.proxyPort=3128 -Dhttps.proxyHost=wicket.internal -Dhttps.proxyPort=3128");
     let pipes = std::fs::read_to_string(root.join("fwd.pipes")).unwrap();
     let fds = std::fs::read_to_string(root.join("prog.fds")).unwrap();
     assert_eq!(pipes.lines().filter(|p| p.starts_with("pipe:")).count(), 2, "{pipes}");
