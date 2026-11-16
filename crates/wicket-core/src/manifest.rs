@@ -557,6 +557,11 @@ pub struct LlmSpec {
     /// Allow server-side tools (web search/fetch). They bypass the egress proxy, so default false.
     #[serde(default)]
     pub allow_server_tools: bool,
+    /// The models a box may call (#366): each an exact name (`claude-opus-4-5`) or a prefix ending
+    /// in `*` (`claude-sonnet-*`). The model proxy refuses a call naming any other, or none. Left
+    /// out: any model the credential reaches. A zone a box starts may only narrow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
 }
 
 /// A harness's default model route: what its adapter fills into a zone's `llm` where the manifest
@@ -586,6 +591,39 @@ impl LlmSpec {
             .into_iter()
             .find(|(_, v)| v.trim().is_empty())
             .map(|(k, _)| k)
+    }
+}
+
+impl LlmSpec {
+    /// Whether the zone lets a box call `model` ([`LlmSpec::models`]).
+    pub fn allows_model(&self, model: &str) -> bool {
+        self.models.as_ref().is_none_or(|ms| ms.iter().any(|m| model_covers(m, model)))
+    }
+
+    /// Whether every entry of `models` is a model name or a prefix ending in its only `*`.
+    pub fn check_models(&self) -> Result<(), ManifestError> {
+        for m in self.models.iter().flatten() {
+            let name = m.strip_suffix('*').unwrap_or(m);
+            let ok = !m.is_empty()
+                && m.len() <= 128
+                && !name.contains('*')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@/".contains(c));
+            if !ok {
+                return Err(ManifestError::Invalid(format!(
+                    "zone.llm.models: {m:?} is neither a model name nor a prefix ending in '*' (letters, digits, '-', '_', '.', ':', '@', '/')"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether model pattern `pattern` (a name, or a prefix ending in `*`) covers `other`: a model
+/// name, or a pattern of its own, for which it covers every name `other` covers.
+pub fn model_covers(pattern: &str, other: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => other.starts_with(prefix),
+        None => pattern == other,
     }
 }
 
@@ -790,6 +828,7 @@ impl Manifest {
         self.zone.limits.authority()?;
         self.zone.limits.exit_grace()?;
         self.zone.check_wildcards()?;
+        self.zone.llm.as_ref().map_or(Ok(()), LlmSpec::check_models)?;
         // Every image named, by tag or pinned by digest (#192): a pin is strict, never a tag.
         let named = self.zone.images.iter().map(|i| ("zone.images", i.as_str()));
         let own = self.agent.as_ref().and_then(|a| a.image.as_deref()).map(|i| ("agent.image", i));

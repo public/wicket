@@ -45,6 +45,7 @@ pub fn check(ask: &Ask<'_>, parent: &Bounds<'_>) -> Result<(), Vec<String>> {
             if cl.allow_server_tools && !pl.allow_server_tools {
                 v.push("server-side model tools: this zone doesn't allow them".into());
             }
+            v.extend(model_violations(cl, pl));
             if let Some((reqs, toks)) = parent.llm_remaining {
                 if cl.max_requests > reqs {
                     v.push(format!("{} model requests: only {reqs} are left in this zone's budget", cl.max_requests));
@@ -172,6 +173,20 @@ pub fn reach_within(outer: &ZoneSpec, inner: &ZoneSpec) -> Result<(), Vec<String
         Ok(())
     } else {
         Err(v)
+    }
+}
+
+/// The models a child's route allows that its parent's doesn't (#366): with a parent list, a child
+/// must have one, each entry covered by one of the parent's (a prefix only by a prefix).
+fn model_violations(c: &crate::manifest::LlmSpec, p: &crate::manifest::LlmSpec) -> Vec<String> {
+    let Some(pm) = &p.models else { return vec![] };
+    match &c.models {
+        None => vec![format!("any model: this zone allows only {}", pm.join(", "))],
+        Some(cm) => cm
+            .iter()
+            .filter(|m| !pm.iter().any(|q| crate::manifest::model_covers(q, m)))
+            .map(|m| format!("model {m}: this zone allows only {}", pm.join(", ")))
+            .collect(),
     }
 }
 
@@ -455,6 +470,54 @@ pub(crate) mod tests {
             "max_children 5",
         ] {
             assert!(errs.contains(needle), "missing {needle:?} in:\n{errs}");
+        }
+    }
+
+    /// #366: a zone's model list only narrows. A child of a listing parent must list, each entry
+    /// within one of the parent's (a prefix only within a prefix); under an unlisted parent,
+    /// anything goes.
+    #[test]
+    fn models_only_narrow() {
+        let llm = |models: &str| {
+            zone(&format!(
+                "  llm: {{ max_requests: 10, max_output_tokens: 1000{models} }}\n  limits: {{ memory: 1g, cpus: 1, timeout: 10m }}\n"
+            ))
+        };
+        let p = llm(", models: [claude-opus-4-5, 'claude-sonnet-*']");
+        let models = |c: &ZoneSpec| {
+            check(&ask(c), &bounds(&p)).err().unwrap_or_default().into_iter().filter(|e| e.contains("model")).collect::<Vec<_>>()
+        };
+        for ok in ["[claude-opus-4-5]", "['claude-sonnet-4-*', claude-sonnet-4-5]", "[]", "[claude-opus-4-5, 'claude-sonnet-*']"] {
+            assert_eq!(models(&llm(&format!(", models: {ok}"))), Vec::<String>::new(), "{ok}");
+        }
+        assert_eq!(models(&llm("")), ["any model: this zone allows only claude-opus-4-5, claude-sonnet-*"]);
+        let wider = models(&llm(", models: ['claude-opus-*', claude-haiku-4-5, 'claude-sonnet-*', 'claude-*']"));
+        assert_eq!(wider.len(), 3, "{wider:?}");
+        for m in ["model claude-opus-*:", "model claude-haiku-4-5:", "model claude-*:"] {
+            assert!(wider.iter().any(|e| e.starts_with(m)), "{m} in {wider:?}");
+        }
+        let open = llm("");
+        assert!(check(&ask(&p), &bounds(&open)).is_ok(), "an unlisted parent allows any list");
+    }
+
+    /// Model lists hold names or prefixes ending in `*` (#366), in a manifest and a spawned zone alike.
+    #[test]
+    fn model_lists_are_checked() {
+        let y = |m: &str| Manifest::from_yaml(&format!("task: t\nagent: {{ name: a }}\nzone: {{ name: z, llm: {{ models: {m} }} }}\n"));
+        for ok in ["[claude-opus-4-5]", "['claude-*']", "[]", "['us.anthropic.claude-sonnet-4-5-v1:0']"] {
+            assert!(y(ok).is_ok(), "{ok}");
+        }
+        for bad in ["['']", "['*opus']", "['claude-*-4']", "['a b']"] {
+            assert!(y(bad).is_err(), "{bad}");
+        }
+        let mut z = y("[claude-opus-4-5]").unwrap().zone;
+        z.llm.as_mut().unwrap().models = Some(vec!["cl*ude".into()]);
+        assert!(crate::CompiledZone::new(z).is_err(), "a spawned zone is checked too");
+        let l = y("[claude-opus-4-5, 'claude-sonnet-*']").unwrap().zone.llm.unwrap();
+        for (m, allowed) in
+            [("claude-opus-4-5", true), ("claude-opus-4-5-x", false), ("claude-sonnet-4-5", true), ("claude-haiku-4-5", false)]
+        {
+            assert_eq!(l.allows_model(m), allowed, "{m}");
         }
     }
 

@@ -293,6 +293,7 @@ impl CompiledZone {
     /// forbid rule can't silently allow.
     pub fn new(spec: ZoneSpec) -> Result<Self, ManifestError> {
         spec.check_wildcards()?;
+        spec.llm.as_ref().map_or(Ok(()), crate::manifest::LlmSpec::check_models)?;
         let globs = |paths: &[String]| paths.iter().map(|p| compile_glob(p)).collect::<Result<Vec<_>, _>>();
         // Forbid globs ignore ASCII case (see `ForbidRule::paths`). A glob that doesn't compile is
         // reported as written.
