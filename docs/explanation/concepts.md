@@ -191,7 +191,11 @@ it goes through one decide function:
 
 wicket's own approvals are grants too, and stay with operators: a child zone beyond its parent's
 (`SPAWN`), a link beyond the default policy (`LINK`), a lease (`CAPACITY`), and an agent's build
-(`UPDATE`). A lease is a grant of capacity: see [placement and leases](#placement-and-leases). A zone
+(`UPDATE`). A lease is a grant of capacity: see [placement and leases](#placement-and-leases). An
+operator may also give a principal a standing **capacity grant** from the console: plans, regions,
+hourly and daily money and nodes at once, for at most 24 h, renewable and revocable. A `wicket node
+create` it covers is approved at once, through the same decide function, and audited against it
+([capacity grants](../reference/console.md#capacity-grants)). A zone
 with `escalation: { request: false }` may not ask at all, and anything outside its reach is "never
 allowed".
 

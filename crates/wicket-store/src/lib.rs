@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicket_core::{new_grant_id, new_request_id, Op, RunId, TenantId};
 
 mod agents;
+mod capgrant;
+pub use capgrant::{covers as capacity_covers, CapacityAsk, CapacityGrant, CapacityTerms, CapacityUsed, CAPACITY_GRANT_PATH};
 mod delegations;
 pub use delegations::{Delegation, NewDelegation, MAX_BRIEF_RECORD};
 pub mod bundle;
@@ -79,7 +81,9 @@ pub enum StoreError {
 /// contract step drops `lease_until`, so a build from before it still sees every claim.
 /// Version 8 (expand) adds `placed_nodes.hourly`: what a node from `wicket node create` costs per
 /// hour, for `wicket node list` (#358).
-pub const SCHEMA_VERSION: u32 = 8;
+/// Version 9 (expand) adds standing capacity grants (#256): `grants.principal`, `grants.terms` and
+/// the `capacity_uses` table.
+pub const SCHEMA_VERSION: u32 = 9;
 /// The oldest schema whose binaries may open a ledger this build has opened.
 pub const SCHEMA_FLOOR: u32 = 1;
 
@@ -263,7 +267,7 @@ CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, zone TEXT NOT NULL, method TEXT NOT NULL, host TEXT NOT NULL,
   path TEXT NOT NULL, prefix INTEGER NOT NULL, uses_left INTEGER, expires_at INTEGER NOT NULL,
   request_id TEXT, decided_by TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER
+  node TEXT, max_risk INTEGER, run TEXT, node_epoch INTEGER, amount INTEGER, principal TEXT, terms TEXT
 );
 CREATE TABLE IF NOT EXISTS operator_credentials (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, x BLOB NOT NULL, y BLOB NOT NULL,
@@ -396,6 +400,7 @@ impl Ledger {
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
+        conn.execute_batch(capgrant::SCHEMA)?;
         // Ledgers created before passkey revocation existed.
         let _ = conn.execute("ALTER TABLE operator_credentials ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0", []);
         // Ledgers created before requests recorded who asked.
@@ -438,6 +443,9 @@ impl Ledger {
         }
         // Ledgers created before placed nodes recorded their hourly price (#358).
         let _ = conn.execute("ALTER TABLE placed_nodes ADD COLUMN hourly INTEGER", []);
+        // Ledgers created before capacity grants (#256): the principal a grant is to, and its terms.
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN principal TEXT", []);
+        let _ = conn.execute("ALTER TABLE grants ADD COLUMN terms TEXT", []);
         Ok(Ledger { conn, path: Some(path.to_path_buf()), writer: None })
     }
 
@@ -471,6 +479,7 @@ impl Ledger {
         conn.execute_batch(agents::SCHEMA)?;
         conn.execute_batch(receipts::SCHEMA)?;
         conn.execute_batch(delegations::SCHEMA)?;
+        conn.execute_batch(capgrant::SCHEMA)?;
         Ok(Ledger { conn, path: None, writer: None })
     }
 
