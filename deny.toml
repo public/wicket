@@ -12,7 +12,15 @@ all-features = true
 # The RustSec database: any vulnerability, unsoundness or yanked version fails the check. An
 # advisory wicket has looked at and accepts goes in `ignore` with its id and why.
 yanked = "deny"
-ignore = []
+ignore = [
+    # unsafe-libyaml (serde_yaml's parser) is unmaintained. The exposure: YAML an agent influences is
+    # parsed host-side, by the control host, as its spawned children's manifests (written from the
+    # zone it asks for, re-read at start and when a child its node started is adopted) and as
+    # manifests generally (`wicket_agent::load`). The fuzz target `manifest` (fuzz/fuzz_targets/
+    # manifest.rs, ci/fuzz.sh) drives that same path (parse, compile, subset admission) nightly.
+    # Replacing serde_yaml is its own change (#326's notes): until then, accepted.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; agent-influenced YAML (spawned zones, manifests) is parsed host-side and fuzzed by the `manifest` target; replacing serde_yaml is a change of its own" },
+]
 
 [licenses]
 # Permissive licences only, as wicket itself is MIT (and the session view's npm
