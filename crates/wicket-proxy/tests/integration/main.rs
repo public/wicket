@@ -4,6 +4,7 @@
 mod zone_decider;
 
 mod canary;
+mod conformance;
 mod git_push;
 mod h3;
 mod remote_session;

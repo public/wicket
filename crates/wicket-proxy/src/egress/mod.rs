@@ -324,7 +324,22 @@ impl Egress {
         if let Some(why) = self.ctx.superseded() {
             return self.refuse(&host, &method, "/", &why);
         }
-        // Authority pinning: a Host header that disagrees with the tunnel target is an attack.
+        // Authority pinning: a Host header that disagrees with the tunnel target is an attack, and
+        // so is a second one (RFC 9112 §3.2: a server answers 400), which a server behind could read
+        // instead of the first.
+        if req.headers().get_all(http::header::HOST).iter().count() > 1 {
+            return self.refuse(&host, &method, "/", "more than one Host header");
+        }
+        // An absolute-form URL names its own authority (RFC 9112 §3.2.2: it wins over Host): inside
+        // a tunnel it must be the tunnel's target, on its port, or the request names another host
+        // than the one decided (#361).
+        if let Some(a) = req.uri().authority().filter(|_| via != Via::H3) {
+            let named = a.host().trim_end_matches('.').to_ascii_lowercase();
+            let default = if scheme == "https" { 443 } else { 80 };
+            if named != host || a.port_u16().is_some_and(|p| p != default) || req.uri().scheme_str().is_some_and(|s| s != scheme) {
+                return self.refuse(&host, &method, "/", &format!("the request's URL names {a}, not the tunnel target {host}"));
+            }
+        }
         if let Some(h) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()) {
             let h = h.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
             if !h.is_empty() && h != host {
