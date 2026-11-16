@@ -97,6 +97,20 @@ impl<R: Read> Read for HashRead<R> {
     }
 }
 
+/// Reads through, counting.
+struct Counted<'a, R: ?Sized> {
+    inner: &'a mut R,
+    n: u64,
+}
+
+impl<R: Read + ?Sized> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n += k as u64;
+        Ok(k)
+    }
+}
+
 /// A hasher as an [`io::Write`] sink, for `io::copy` (RustCrypto's hashers stopped implementing it
 /// in digest 0.11).
 pub(crate) struct HashWrite<'a>(pub(crate) &'a mut Sha256);
@@ -210,6 +224,39 @@ impl Cas {
 
     pub fn has(&self, d: &Digest) -> io::Result<bool> {
         self.inner.has(&d.key())
+    }
+
+    /// Copies tree `d` and everything it reaches into `to`, by negotiation: an object `to` already
+    /// has is skipped, and so is a whole subtree whose tree `to` has, since a tree is only ever sent
+    /// after everything under it (the order kept here). Objects move as stored (compressed), and
+    /// each one read from `self` is verified against its digest first. Returns the bytes `to` was
+    /// sent (as stored) and the objects written.
+    pub fn send_tree(&self, to: &Cas, d: &Digest) -> io::Result<(u64, u64)> {
+        let mut sent = (0, 0);
+        self.send(to, d, Kind::Dir, &mut sent)?;
+        Ok(sent)
+    }
+
+    fn send(&self, to: &Cas, d: &Digest, kind: Kind, sent: &mut (u64, u64)) -> io::Result<()> {
+        if to.has(d)? {
+            return Ok(());
+        }
+        if kind == Kind::Dir {
+            let t = self.get_tree(d)?.ok_or_else(|| invalid(format!("tree {d} is missing")))?;
+            for e in t.entries() {
+                self.send(to, &e.digest, e.kind, sent)?;
+            }
+        }
+        // Verified as plain bytes first (a corrupt local object must not spread), then copied as stored.
+        let mut r = self.get(d)?.ok_or_else(|| invalid(format!("object {d} is missing")))?;
+        io::copy(&mut r, &mut io::sink())?;
+        let mut raw = self.inner.get(&d.key())?.ok_or_else(|| invalid(format!("object {d} is missing")))?;
+        let mut counted = Counted { inner: &mut raw, n: 0 };
+        if to.inner.put_if_absent(&d.key(), &mut counted)? {
+            sent.0 += counted.n;
+            sent.1 += 1;
+        }
+        Ok(())
     }
 
     /// Opens object `d` for reading, verified as it is read (see the module's notes), or None.
