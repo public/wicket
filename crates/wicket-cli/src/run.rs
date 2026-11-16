@@ -2466,7 +2466,7 @@ fn print_event(ev: &Event) {
         }
         Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
         Event::Box { what, detail } => println!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
-        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome } => {
+        Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome, .. } => {
             println!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
                 wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
