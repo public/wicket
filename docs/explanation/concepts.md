@@ -88,8 +88,9 @@ wicket is a meta-harness: it runs no agent loop of its own. It builds the enviro
   the box reaches over bind-mounted unix sockets:
   - the **LLM proxy** swaps the placeholder for the Claude subscription token and enforces the model
     budget;
-  - the **egress proxy** terminates TLS with a per-run CA, decides each HTTP request (HTTP/1.1, and
-    HTTP/3 through wicket's DNS and QUIC relay), and injects credentials into one declared header;
+  - the **egress proxy** terminates TLS with its node's CA (the installation root signs it), decides
+    each HTTP request (HTTP/1.1, and HTTP/3 through wicket's DNS and QUIC relay), and injects
+    credentials into one declared header;
   - the **MCP gateway** is the agent's only MCP server, with wicket's own tools (`await_grant`,
     `request_access`, `spawn`, `send_message`, `expose`, `connect`, `request_capacity`, …).
 - Inside the box, wicket is at `wicket.internal` (198.18.0.1). The box's resolver is wicket too, so a

@@ -45,12 +45,10 @@ use wicket_proxy::llm::Slice;
 
 /// The control/node protocol version this build speaks. What each version added is in
 /// docs/reference/protocol.md ("Versions and skew"). With [`PROTOCOL_SKEW`] 1, a connection talks
-/// 12 or 13, so only the versions from 12 on have a check here; the checks for features of earlier
-/// versions (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
-/// forwarded egress) went once no peer could talk below them.
+/// 12 or 13, so only the versions above 12 have a check here; the checks for features of 12 and
+/// earlier (edge decisions, image pins, delivery and pulls, budget slices, credential swaps,
+/// forwarded egress, node health) went once every peer had them.
 pub const PROTOCOL: u32 = 13;
-/// The first protocol version whose nodes report their health as [`Msg::Health`] (#377).
-pub const NODE_HEALTH: u32 = 12;
 /// The first protocol version whose nodes send the control host's tools as [`Msg::Call`] (#257).
 pub const ONE_GATEWAY: u32 = 13;
 
@@ -110,7 +108,7 @@ pub fn negotiate(ours: u32, theirs: u32) -> Result<u32, String> {
 // Every feature's first version is one this build speaks, and a peer at the oldest version it
 // talks to still has versions (#325: what `version::talk_at`'s harnesses assume of the constants).
 const _: () = {
-    assert!(NODE_HEALTH <= PROTOCOL && ONE_GATEWAY <= PROTOCOL);
+    assert!(ONE_GATEWAY <= PROTOCOL);
     assert!(PROTOCOL > PROTOCOL_SKEW);
 };
 
@@ -155,8 +153,9 @@ pub struct BoxStart {
     pub timeout_secs: u64,
     /// The zone's `escalation.request` (false by default for a program, #255).
     pub escalate: bool,
-    /// The box's CA bundle: the installation root (node-minted leaves) and the run's own CA (hosts the
-    /// control host terminates).
+    /// More of the box's CA bundle, after the installation root (which signs its node CA's leaves).
+    /// Empty: the control host terminates no TLS, so it has no CA of the run's to add (#257 slice 5).
+    /// Still sent, for nodes at 13 that read it.
     pub ca_pem: String,
     /// The workspace, as a tar archive (base64).
     pub workspace_tar: String,
@@ -743,8 +742,7 @@ pub enum Msg {
     Audit {
         records: Vec<wicket_store::AuditRecord>,
     },
-    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection that
-    /// speaks [`NODE_HEALTH`].
+    /// The node's health (#377), every [`crate::health::REPORT_EVERY`] on each connection.
     Health {
         health: crate::health::NodeHealth,
     },
@@ -1206,9 +1204,9 @@ mod tests {
         assert!(serde_json::from_value::<Msg>(old).is_err(), "no alias for the old name");
     }
 
-    /// Why this build has no checks for features before protocol 12: a peer below it can't connect,
-    /// so every connection talks 12 or 13 (#253, #257 slice 4b). A check for a version under 12
-    /// would be dead.
+    /// Why this build has no checks for features of protocol 12 or before (node health, #377, the
+    /// last): a peer below 12 can't connect, so every connection talks 12 or 13 (#253, #257 slice
+    /// 4b), and a check for a version at or under 12 would always pass.
     #[test]
     fn no_connection_talks_below_protocol_12() {
         assert_eq!((PROTOCOL, PROTOCOL_SKEW), (13, 1));
@@ -1227,7 +1225,7 @@ mod tests {
     /// without them reads as having none.
     #[test]
     fn a_start_carries_its_swaps_by_name() {
-        assert_eq!((PROTOCOL, NODE_HEALTH, ONE_GATEWAY), (13, 12, 13));
+        assert_eq!((PROTOCOL, ONE_GATEWAY), (13, 13));
         let swaps = vec![
             wicket_proxy::CredentialSwap {
                 name: "account login".into(),
