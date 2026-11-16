@@ -1190,7 +1190,10 @@ async fn on_frame(
                 // node keeps them anyway (they are the run's directory here); a remote node's
                 // workspace, with nothing of it collected, stays until an operator forces it.
                 if !sh.ctl.keep {
-                    match forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0) {
+                    // Decided first: a guard in the match's scrutinee would be held into its arms,
+                    // which lock the ledger again (a deadlock).
+                    let refused = forget_refused(&sh.ledger.lock().expect("ledger"), &sh.node, &sh.run.0);
+                    match refused {
                         None => send(Frame::Msg(Msg::Forget { run })),
                         Some(why) => {
                             println!("[wicket] {why}");
