@@ -136,3 +136,82 @@ runs there; 2 in 4 on this branch, counting the full run).
 - Tried in neither round: `split-debuginfo` and nextest locally (CI already runs nextest), and
   measuring the release build (`measure.sh release`). Not checked in this round: CI's agent-image
   reuse across steps and parallel e2e jobs (item 3).
+
+## Third round: wicket-cli's clean build, duplicates and Cedar
+
+Measured in a wicket box (5 CPUs, 8 GiB, nothing else building) by `measure.sh`'s `cli-*` steps
+(`results.jsonl`, labels `base-j1c` on origin/main 8275c33 and `after-j1c` on `perf/builds`), with
+incremental builds and no sccache, at `-j1`. The box warned about memory at `-j2` (a clean build's
+link peaks at 2.4 GiB, and the box's own file cache adds to it), so these comparisons are at `-j1`.
+The `base-j2` rows are three clean builds of the base at `-j2`, for scale: 194.8, 194.3 and
+192.5 s. Incremental steps were run three times each (medians below); clean builds once each,
+since one run takes six minutes and the box warned about memory every time. Clean builds at `-j1` are
+nearly serial, so their wall time is close to the sum of the units in `cargo --timings`
+(timings-*-j1c-cli-clean.html). That sum is the more reliable measure: 353.1 s vs. 327.6 s.
+
+| step (wicket-cli, debug) | before | after |
+|---|---|---|
+| clean `cargo build -p wicket-cli` | 355.3 s (441 units) | **329.4 s** (425 units) |
+| clean `cargo clippy -p wicket-cli --all-targets` | 190.6 s | 186.0 s |
+| build after a one-line change in wicket-core | 10.30 s | 10.26 s |
+| build after a one-line change in wicket-cli | 5.57 s | 5.56 s |
+| clippy after a one-line change in wicket-cli | 7.33 s | 7.37 s |
+| `cargo test -p wicket-cli --no-run`, first after the builds | 41.1 s | 40.0 s |
+| the same after a one-line change in wicket-cli | 6.76 s | 6.62 s |
+| peak memory (largest process: the link) | 2.4 GiB | 2.4 GiB |
+
+**What the clean build spends** (base, `-j2`): cedar-policy-core 75 s and cedar-policy 26 s (both
+at opt-level 2, on the critical path: cedar → wicket-policy → wicket-cli), the `wicket` binary
+24 s, biscuit-auth 22 s, regex-automata 9 s twice (host and target, with different features),
+zstd-sys and libsqlite3-sys's C builds 8 s and 5 s, lalrpop 5 s. Everything else is under 5 s.
+Incremental builds after a one-line change are already short (5–10 s) and are dominated by the
+`wicket` binary's own compile and link: nothing below changed them.
+
+### What helped
+
+- **Cedar at opt-level 1** (it was 2, from #237). Measured on the two crates alone, twice each
+  (`cargo clean -p` and then a rebuild, `--timings`), with `tests/cedar.rs` run once at each level:
+
+  | opt-level | cedar-policy-core | cedar-policy | `tests/cedar.rs` run |
+  |---|---|---|---|
+  | 0 | 14.4 s | 3.1 s | 100 s |
+  | 1 | 44.6 s | 12.9 s | 64 s |
+  | 2 | 56.7 s | 25.4 s | 55 s |
+
+  Level 1 saves 25 s of every clean build (and every CI run that builds the dependencies) and costs
+  9 s whenever the differential test runs. Level 0 would save 65 s of a clean build but cost 45 s on every run of
+  the test: worse for CI, whose cache keeps the dependencies built. A `[profile.test]` override
+  can't keep the tests optimized and the build not: in `cargo test`, dependencies build with the
+  dev profile. This is most of the clean build's 26 s.
+- **Duplicates.** `cargo tree -d --workspace` names: 27 → 21; wicket-cli's: 26 → 18; Cargo.lock
+  460 → 448 packages.
+  - rcgen 0.13 → 0.14 (instant-acme's version) and x509-parser 0.16 → 0.18: rcgen, pem,
+    yasna and thiserror 1 (with thiserror-impl) are no longer compiled twice, and neither are the old
+    asn1-rs, der-parser and oid-registry. `ca.rs` now signs through rcgen's `Issuer`. A
+    re-loaded run CA now presents its certificate as issued in the chain, where it used to
+    present a re-signed copy.
+  - ulid without its `std` feature: ids come from `wicket_core::new_ulid` (the same layout, from
+    getrandom 0.4), so rand 0.9, rand_core 0.9 and getrandom 0.3 are built only for wicket-sim
+    (turmoil).
+  - rusqlite 0.32 → 0.43, without default features but with `cache`: hashlink 0.12, one
+    hashbrown. No source change; the bundled SQLite goes from 3.46.0 to 3.54.1.
+
+### Tried, and left as it is
+
+- **biscuit-auth at a lower opt-level:** 13.0 s at 2, 14.6 s at 1, 4.6 s at 0, but wicket-authz's
+  tests take 4.8 s, 5.9 s and 16 s, and every crate's tests mint tokens with it. Kept at 2.
+- **Cedar without its default features** (ip, decimal and datetime extensions): an org policy may
+  use them, so it would be a behaviour change.
+- **The remaining duplicates aren't ours to remove:** base64 0.22 (instant-acme's latest, reqwest
+  0.12, the biscuit fork) beside 0.23 (hyper-util, pem 4), syn 2 and 3, nom 7 (x509-parser's asn1
+  stack) and 8 (the biscuit fork), itertools and digest 0.10 (lalrpop, Cedar's build),
+  getrandom 0.2 (ring), num-bigint 0.4 (der-parser), unicode-width (Cedar's miette), and
+  regex-automata and the like built twice, for build scripts and for the target, with different features.
+- **A faster linker:** the second round found mold no faster than the LLD that Rust 1.99 links with
+  by default, and this round's incremental steps (5–10 s) leave little to a linker.
+- **Splitting wicket-cli:** its own compile is 24 s of a clean build and 5.6 s after a one-line
+  change. Splitting it into crates would let a clean build at `-j2` or more overlap some of that,
+  and nothing at `-j1`. It's a large change for a few seconds, so not this round.
+- **CI:** it already caches with Swatinem/rust-cache (pinned by commit) and runs nextest. Not
+  measured this round: a CI run before and after, and `cargo test --workspace` (the box-only
+  failures above still make it red here).
