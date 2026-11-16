@@ -518,7 +518,11 @@ pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> 
                 e.0.push(k.clone());
             }
         }
-        let status = moving.get(r.id.as_str()).map_or(r.status, |s| s.to_string());
+        // A child whose supervisor didn't end when its parent stopped it (#409) isn't running.
+        let status = match l.run_stuck(&r.id)? {
+            Some(_) => "stuck".to_string(),
+            None => moving.get(r.id.as_str()).map_or(r.status, |s| s.to_string()),
+        };
         f.runs.push(RunLine {
             run: r.id,
             node,
@@ -579,13 +583,15 @@ pub fn control_frame(l: &wicket_store::Ledger, runs_dir: &Path, now_ms: i64) -> 
 /// The control host's view, `width` columns wide.
 pub fn render_control(f: &ControlFrame, width: usize) -> Vec<String> {
     let now = f.now_ms;
-    let running = f.runs.iter().filter(|r| r.status != "hibernated").count();
+    let running = f.runs.iter().filter(|r| r.status != "hibernated" && r.status != "stuck").count();
+    let stuck = f.runs.iter().filter(|r| r.status == "stuck").count();
     let mut out = vec![
         format!("wicket top — control host — {}", clock(now)),
         format!(
-            "{} running run{}   {} pending request{}   {} active lease{}",
+            "{} running run{}{}   {} pending request{}   {} active lease{}",
             running,
             plural(running),
+            if stuck > 0 { format!("   {stuck} stuck") } else { String::new() },
             f.pending,
             plural(f.pending),
             f.leases.len(),
@@ -1185,7 +1191,13 @@ mod tests {
         let b = dir.join("run_01jcbbbbbbbbbbbbbbbbbbbbbb");
         std::fs::create_dir_all(b.join("ctl")).unwrap();
         LinkRecord { node: "hyperv1".into(), connected: false, since_ms: NOW - 7000, updated_ms: NOW, ..Default::default() }.save(&b);
-        let f = control_frame(&l, &dir, NOW).unwrap();
+        // A child whose supervisor didn't end when its parent stopped it (#409).
+        l.run_started(&t, &wicket_core::RunId("run_01jcdddddddddddddddddddddd".into()), "dev", "child").unwrap();
+        l.set_run_stuck("run_01jcdddddddddddddddddddddd", NOW / 1000).unwrap();
+        let mut f = control_frame(&l, &dir, NOW).unwrap();
+        assert_eq!(f.runs.iter().find(|r| r.agent == "child").map(|r| r.status.as_str()), Some("stuck"));
+        assert!(render_control(&f, 100)[1].starts_with("2 running runs   1 stuck"), "{:?}", render_control(&f, 100)[1]);
+        f.runs.retain(|r| r.agent != "child");
         let runs: Vec<(&str, Option<&str>, &str, Option<bool>)> =
             f.runs.iter().map(|r| (r.run.as_str(), r.node.as_deref(), r.status.as_str(), r.connected)).collect();
         assert_eq!(runs.len(), 2, "ended runs are left out: {runs:?}");

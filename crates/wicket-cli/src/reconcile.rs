@@ -8,7 +8,9 @@
 //!   its box untouched. If the node says the box is gone, the run is ended as `lost`; if the node
 //!   can't be reached, the run is left for the next pass. A run with no node recorded (its process
 //!   died before it reached one) is ended as `lost`. A run supervised on another machine is left alone: only that machine can
-//!   tell.
+//!   tell. A run whose owner is alive but whose supervisor is stuck (a child's, in its parent's
+//!   process, that didn't end when its parent stopped it, #409) is reported as `run_stuck` each pass
+//!   and taken over once that process ends.
 //! - *Leases* (`wicket_store::LeaseRow`): a pending lease whose request a human granted becomes
 //!   `approved`, one denied or withdrawn ends. An approved or active lease ends when its holder run has
 //!   ended or (active) when `not_after` has passed; runs placed on it are stopped first.
@@ -222,6 +224,15 @@ where
         for (run, owner) in self.ledger.running_runs()? {
             let Some(o) = owner else { continue };
             if (self.owner_alive)(&o) != Some(false) {
+                // A child's supervisor, in its parent's live process, that didn't end when its parent
+                // stopped it (#409): reported each pass, and left for when that process ends.
+                if let Some(at) = self.ledger.run_stuck(&run)? {
+                    let detail = format!(
+                        "stuck: its supervisor, in process {o}, hasn't ended since its parent asked it to stop ({}s ago); it is taken over once that process ends",
+                        (self.now - at).max(0)
+                    );
+                    self.note("run_stuck", &run, &detail);
+                }
                 continue;
             }
             let Some(node) = self.ledger.run_node(&run)? else {
