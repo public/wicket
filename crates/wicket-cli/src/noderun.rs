@@ -28,7 +28,7 @@
 //! Test hooks: `WICKET_FEED_TTL_MS` and `WICKET_FEED_REFRESH_MS` override the feed's timings (within the certificate's caps, which follow them); `WICKET_FEED_COMPACT_BYTES` the
 //! delta log size past which an idle feed starts a new generation.
 
-use crate::chan::{self, accept_at, BoxStart, Frame, Msg, OutBuf};
+use crate::chan::{self, accept_at, BoxStart, ControlTool, Frame, Msg, OutBuf};
 use crate::nodeauth::HsError;
 use crate::nodecall::{Calls, Via};
 use anyhow::{bail, Context, Result};
@@ -73,7 +73,7 @@ pub fn open_feed(name: &str, cfg: PublisherConfig) -> Result<Publisher<BoxAuthor
         }
         let p = open_feed_inner(name, &cfg, true, true).context("starting the feed's new generation after a restore")?;
         std::fs::remove_file(dir.join(REGENESIS))?;
-        println!("[wicket] node {name}'s feed starts a new generation (restored)");
+        say!("[wicket] node {name}'s feed starts a new generation (restored)");
         return Ok(p);
     }
     open_feed_inner(name, &cfg, false, false)
@@ -113,7 +113,7 @@ fn open_feed_inner(name: &str, cfg: &PublisherConfig, new_generation: bool, rest
     let cert_jws = match old {
         Some((c, j)) if !new_generation && c.kid == kid && c.not_after > now + margin && c.max_ttl_ms >= cfg.ttl_ms => {
             if offline && c.not_after < now + 7 * 86_400_000 {
-                eprintln!(
+                say_err!(
                     "[wicket] node {name}'s feed certificate ends in under a week: renew it with `WICKET_ROOTS=<dir> wicket keys certify`"
                 );
             }
@@ -335,7 +335,7 @@ impl NodeCtl {
             Ok(f) => {
                 self.send(Frame::Feed(f.to_line().trim_end().as_bytes().to_vec()));
             }
-            Err(e) => eprintln!("[wicket] could not publish the revocation of {} to {}: {e}", self.run, self.node),
+            Err(e) => say_err!("[wicket] could not publish the revocation of {} to {}: {e}", self.run, self.node),
         }
         self.kill();
     }
@@ -407,6 +407,9 @@ pub struct Start {
     /// The control host's half of the box's gateway (#257 slice 4b): it answers the node's
     /// [`Msg::Call`]s.
     pub gateway: Arc<wicket_proxy::gateway::Gateway>,
+    /// What answers the box's `spawn` calls (#257 slice 4c): its children's supervisors run in this
+    /// process. None: it may start none.
+    pub spawn: Option<Arc<crate::spawn::SpawnCtx>>,
     /// Takes over children the node starts for the box (#164): None, it may start none.
     pub adopt: Option<Adopter>,
     /// Where the box start's time goes (#287): this host's steps, the node's (`node.start.*`), and
@@ -447,6 +450,8 @@ struct Shared {
     spent_base: Mutex<Option<Option<wicket_proxy::llm::Spent>>>,
     /// Answers the node's [`Msg::Call`]s for the box's gateway (#257).
     gateway: Arc<wicket_proxy::gateway::Gateway>,
+    /// Answers the box's `spawn` calls (#257 slice 4c).
+    spawn: Option<Arc<crate::spawn::SpawnCtx>>,
     /// The run's credential swaps, which its node makes (#257): what this host releases to it for
     /// them ([`fetch_secret`]).
     swaps: Vec<wicket_proxy::CredentialSwap>,
@@ -609,6 +614,7 @@ pub async fn start(s: Start) -> Result<NodeBox> {
         vault: s.vault.clone(),
         spent_base: Mutex::new(s.spent_counted.then_some(None)),
         gateway: s.gateway.clone(),
+        spawn: s.spawn.clone(),
         swaps: s.swaps.clone(),
         adopt: s.adopt.clone(),
         attach: s.attach,
@@ -707,15 +713,15 @@ pub async fn deliver_image(
     let name = crate::oci::import_name(image, pin);
     let mut pulled = None;
     if let Some(src) = pull {
-        println!("[wicket] node {node} pulling image {pin} from {}", src.host);
+        say!("[wicket] node {node} pulling image {pin} from {}", src.host);
         let t0 = std::time::Instant::now();
         match calls.pull_image(run, pin, name.as_deref(), src).await {
             Ok(()) => {
-                println!("[wicket] node {node} pulled, verified and imported image {pin} in {:.1} s", t0.elapsed().as_secs_f64());
+                say!("[wicket] node {node} pulled, verified and imported image {pin} in {:.1} s", t0.elapsed().as_secs_f64());
                 return Ok(());
             }
             Err(e) => {
-                println!("[wicket] node {node} could not pull image {pin} from {}: {e:#}", src.host);
+                say!("[wicket] node {node} could not pull image {pin} from {}: {e:#}", src.host);
                 pulled = Some(e);
             }
         }
@@ -727,10 +733,10 @@ pub async fn deliver_image(
                 e.context(format!("pulling it from {}, and this host hasn't it to send", pull.map(|p| p.host.as_str()).unwrap_or("")))
             );
         }
-        println!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
+        say!("[wicket] node {node} hasn't image {pin}, and this host hasn't it to send");
         return Ok(());
     }
-    println!("[wicket] sending image {image} ({pin}) to node {node}");
+    say!("[wicket] sending image {image} ({pin}) to node {node}");
     let t0 = std::time::Instant::now();
     let mut save = here.export_image(pin)?;
     let out = save.stdout.take().context("the export's output")?;
@@ -749,7 +755,7 @@ pub async fn deliver_image(
     if !st.success() {
         bail!("exporting the image failed: {}", errs.await.unwrap_or_default().trim());
     }
-    println!(
+    say!(
         "[wicket] node {node} verified and imported image {pin} ({:.1} MiB in {:.1} s)",
         sent as f64 / f64::from(1u32 << 20),
         t0.elapsed().as_secs_f64()
@@ -848,13 +854,13 @@ async fn manage(
                     Some(t) => {
                         let _ = t.send(Err(e));
                     }
-                    None => println!("[wicket] giving up on node {}: {e:#}", sh.node),
+                    None => say!("[wicket] giving up on node {}: {e:#}", sh.node),
                 }
                 return;
             }
-            Err(e) => println!("[wicket] node {} unreachable ({e:#}); retrying in {}", sh.node, humantime::format_duration(backoff)),
+            Err(e) => say!("[wicket] node {} unreachable ({e:#}); retrying in {}", sh.node, humantime::format_duration(backoff)),
             Ok(()) => {
-                println!("[wicket] node {} channel closed; reconnecting in {}", sh.node, humantime::format_duration(backoff));
+                say!("[wicket] node {} channel closed; reconnecting in {}", sh.node, humantime::format_duration(backoff));
                 backoff = std::time::Duration::from_millis(500);
             }
         }
@@ -993,7 +999,7 @@ async fn session(
         }
         p.next[0] = p.next[0].max(r.stdout_start);
         p.next[1] = p.next[1].max(r.stderr_start);
-        println!("[wicket] node {} reconnected; resuming the box's output", sh.node);
+        say!("[wicket] node {} reconnected; resuming the box's output", sh.node);
         send(Frame::Msg(Msg::Resume { run: r.run.clone(), stdout_from: p.next[0], stderr_from: p.next[1] }));
         p.stdin.ack(r.stdin_received);
         let (at, bytes) = p.stdin.since(r.stdin_received);
@@ -1104,7 +1110,7 @@ async fn on_frame(
             let (fresh, gap) = accept_at(&mut p.next[i - 1], offset, &bytes);
             sh.ctl.next[i - 1].store(p.next[i - 1], Ordering::SeqCst);
             if gap {
-                println!(
+                say!(
                     "[wicket] some of the box's {} was lost while node {} was unreachable (it keeps {} MiB per stream)",
                     if i == 1 { "stdout" } else { "stderr" },
                     sh.node,
@@ -1127,7 +1133,7 @@ async fn on_frame(
                     let _ = sh.ledger.lock().expect("ledger").node_feed_at(&sh.node, e as i64);
                 }
                 if let Some(r) = refused {
-                    println!("[wicket] node {} refused a feed frame: {r}", sh.node);
+                    say!("[wicket] node {} refused a feed frame: {r}", sh.node);
                 }
                 if let Some(h) = catch_up {
                     for f in sh.ctl.publisher.lock()?.catch_up(&h, wicket_feed::now_ms())? {
@@ -1156,7 +1162,7 @@ async fn on_frame(
                 // The node says the box has stopped: nothing fences a wake of its agent any more.
                 confirm_stopped(&sh.dir);
                 if let Some(why) = &reason {
-                    println!("[wicket] the box ended (exit status {code}): {why}");
+                    say!("[wicket] the box ended (exit status {code}): {why}");
                     let _ = sh.ledger.lock().expect("ledger").audit(
                         &sh.tenant,
                         Some(&sh.run),
@@ -1189,7 +1195,7 @@ async fn on_frame(
                     match refused {
                         None => send(Frame::Msg(Msg::Forget { run })),
                         Some(why) => {
-                            println!("[wicket] {why}");
+                            say!("[wicket] {why}");
                             let _ = sh.ledger.lock().expect("ledger").audit(
                                 &sh.tenant,
                                 Some(&sh.run),
@@ -1242,7 +1248,7 @@ async fn on_frame(
                         None => Some("this run may not start boxes".into()),
                     };
                     if let Some(e) = &error {
-                        println!("[wicket] refused child {child} its node started: {e}");
+                        say!("[wicket] refused child {child} its node started: {e}");
                     }
                     let _ = out.send(Frame::Msg(Msg::Adopted { child, error }));
                 });
@@ -1266,7 +1272,7 @@ async fn on_frame(
                     sh.timings.mark_unix_ms("agent.first_model_request", ms);
                     if wicket_core::timing::enabled() {
                         let at = sh.timings.spans().into_iter().find(|s| s.name == "agent.first_model_request").map_or(0.0, |s| s.at_ms);
-                        println!("[wicket] timings: the agent's first model request reached node {} at {at:.1} ms", sh.node);
+                        say!("[wicket] timings: the agent's first model request reached node {} at {at:.1} ms", sh.node);
                     }
                 }
                 // The node calls the model itself and is the counter of record (#152).
@@ -1284,12 +1290,21 @@ async fn on_frame(
             // A tool of the box's gateway its node doesn't answer itself (#257 slice 4b): answered
             // by the run's own gateway here, on a task of its own (a wait may last minutes).
             Msg::Call { id, run, tool, args } => {
-                let (gw, out) = (sh.gateway.clone(), out.clone());
+                let (gw, spawn, out) = (sh.gateway.clone(), sh.spawn.clone(), out.clone());
                 let mine = run == sh.run.0;
                 tokio::spawn(async move {
-                    let (text, is_error) = match mine {
-                        true => gw.call_tool(&tool.name(), args).await,
-                        false => (format!("no gateway for run {run} here"), true),
+                    let (text, is_error) = match (mine, tool, gw.superseded()) {
+                        (false, ..) => (format!("no gateway for run {run} here"), true),
+                        (true, ControlTool::Spawn, Some(why)) => (why, true),
+                        // A spawn its node doesn't start: its child's supervisor starts here, in
+                        // this process (#257 slice 4c).
+                        (true, ControlTool::Spawn, None) => match spawn {
+                            Some(c) => tokio::task::spawn_blocking(move || crate::spawn::tool(&c, &args))
+                                .await
+                                .unwrap_or_else(|e| (format!("not started: {e}"), true)),
+                            None => ("this agent may not start other boxes (max_children is 0)".into(), true),
+                        },
+                        (true, ..) => gw.call_tool(&tool.name(), args).await,
                     };
                     let _ = out.send(Frame::Msg(Msg::Called { id, text, is_error }));
                 });
@@ -1301,7 +1316,7 @@ async fn on_frame(
             Msg::Audit { records } => {
                 let n = records.len();
                 if let Err(e) = sh.ledger.lock().expect("ledger").append_node_audit(&sh.node, &sh.tenant, &records) {
-                    println!("[wicket] node {}'s audit records were refused ({e}); they stay on the node", sh.node);
+                    say!("[wicket] node {}'s audit records were refused ({e}); they stay on the node", sh.node);
                 } else {
                     tracing::debug!(node = %sh.node, n, "node audit records appended");
                 }
@@ -1313,15 +1328,11 @@ async fn on_frame(
             }
             Msg::NodeCertInstalled { serial, error } => match (p.renewing.take(), error) {
                 (Some(c), None) if c.jti == serial => {
-                    println!("[wicket] node {}'s identity certificate renewed until {}", sh.node, c.exp);
+                    say!("[wicket] node {}'s identity certificate renewed until {}", sh.node, c.exp);
                     p.cert = Some(c);
                 }
                 (_, e) => {
-                    println!(
-                        "[wicket] node {} did not take its renewed certificate ({}); retrying in a minute",
-                        sh.node,
-                        e.unwrap_or(serial)
-                    );
+                    say!("[wicket] node {} did not take its renewed certificate ({}); retrying in a minute", sh.node, e.unwrap_or(serial));
                     p.renew_after = wicket_store::now() + 60;
                 }
             },
@@ -1349,7 +1360,7 @@ fn renewal(sh: &Shared, p: &mut Progress) -> Option<Frame> {
             Some(Frame::Msg(Msg::NodeCert { cert: jws }))
         }
         Err(e) => {
-            println!("[wicket] could not renew node {}'s certificate: {e:#}", sh.node);
+            say!("[wicket] could not renew node {}'s certificate: {e:#}", sh.node);
             p.renew_after = now + 60;
             None
         }
@@ -1467,7 +1478,7 @@ pub fn confirm_stopped(run_dir: &Path) {
     if !a.stopped {
         a.stopped = true;
         if let Err(e) = write_authority(run_dir, &a) {
-            eprintln!("[wicket] recording that {}'s box stopped: {e:#}", run_dir.display());
+            say_err!("[wicket] recording that {}'s box stopped: {e:#}", run_dir.display());
         }
     }
 }
@@ -1595,7 +1606,7 @@ fn slice_due(sh: &Shared, p: &mut Progress) -> Option<Frame> {
         return None;
     }
     if !p.slice_sent {
-        println!("[wicket] sending node {} a budget slice for {}: {slice:?}", sh.node, sh.run);
+        say!("[wicket] sending node {} a budget slice for {}: {slice:?}", sh.node, sh.run);
     }
     p.slice_sent = true;
     p.slice = Some(slice);
@@ -1665,7 +1676,7 @@ fn secrets_changed(sh: &Shared, p: &mut Progress) -> Vec<Frame> {
         if now.as_deref() != p.fetched.get(&name).map(String::as_str) {
             p.fetched.remove(&name);
             save_holdings(sh, p);
-            println!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
+            say!("[wicket] secret {name} changed on this host: node {} drops its copy for {}", sh.node, sh.run);
             out.push(Frame::Msg(Msg::SecretRevoke { run: sh.run.0.clone(), name }));
         }
     }
@@ -1766,10 +1777,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
                 Ok(i) => Some((i, until)),
                 Err(e) => {
                     p.remint_failed = until;
-                    println!(
-                        "[wicket] could not re-mint {}'s token for its renewed authority: {e:#}; the box stops at its old end",
-                        sh.run
-                    );
+                    say!("[wicket] could not re-mint {}'s token for its renewed authority: {e:#}; the box stops at its old end", sh.run);
                     None
                 }
             }
@@ -1812,13 +1820,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         // token allows it wholesale) or refused before any request to it is decided.
         if p.live.len() >= wicket_feed::token::MAX_GRANTS {
             if p.waiting.insert(g.id.clone()) {
-                println!(
-                    "[wicket] node {} holds {} live grants for {}: grant {} waits until one ends",
-                    sh.node,
-                    p.live.len(),
-                    sh.run,
-                    g.id
-                );
+                say!("[wicket] node {} holds {} live grants for {}: grant {} waits until one ends", sh.node, p.live.len(), sh.run, g.id);
             }
             continue;
         }
@@ -1829,9 +1831,12 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         let worst = Op::egress_with_query(&sh.tenant, &sh.run, &sh.zone.name, &g.method, &g.host, &g.path, "any=query");
         if worst.risk.rank() > g.max_risk.unwrap_or(0) {
             if p.published.insert(g.id.clone()) {
-                println!(
+                say!(
                     "[wicket] grant {} is bounded below what {} {}{} can be, which a node can't honour: it isn't published",
-                    g.id, g.method, g.host, g.path
+                    g.id,
+                    g.method,
+                    g.host,
+                    g.path
                 );
             }
             continue;
@@ -1842,7 +1847,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         if let Err(e) = loads(&trial) {
             // Never handed over, and nothing else decides it.
             if p.published.insert(g.id.clone()) {
-                println!("[wicket] grant {} can't go in {}'s token ({e}): it isn't published", g.id, sh.run);
+                say!("[wicket] grant {} can't go in {}'s token ({e}): it isn't published", g.id, sh.run);
             }
             continue;
         }
@@ -1850,7 +1855,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             continue;
         }
         if g.prefix {
-            println!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
+            say!("[wicket] grant {} is for a path prefix; node {} honours it for {} exactly", g.id, sh.node, g.path);
         }
         p.live.push(live);
         handed.push(g.id.clone());
@@ -1866,7 +1871,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             reminted
         }
         Err(e) => {
-            println!("[wicket] could not rebuild the token of {} for node {}: {e}", sh.run, sh.node);
+            say!("[wicket] could not rebuild the token of {} for node {}: {e}", sh.run, sh.node);
             None
         }
     };
@@ -1883,7 +1888,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
         token_out = r.is_ok();
         if r.is_err() && !revokes.is_empty() {
             // The rebuilt token was refused: the revocations must still go out.
-            println!(
+            say!(
                 "[wicket] could not publish {}'s rebuilt token ({}); publishing its grant revocations alone",
                 sh.run,
                 r.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
@@ -1900,7 +1905,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
     }
     match committed {
         Ok((f, epoch)) => {
-            println!(
+            say!(
                 "[wicket] published {}'s token with {n} live grant(s) to node {}, epoch {epoch} (at {} ms)",
                 sh.run,
                 sh.node,
@@ -1909,7 +1914,7 @@ fn sync_grants(sh: &Shared, p: &mut Progress) -> Vec<wicket_feed::Frame> {
             vec![f]
         }
         Err(e) => {
-            println!("[wicket] could not publish grants to node {}: {e}", sh.node);
+            say!("[wicket] could not publish grants to node {}: {e}", sh.node);
             vec![]
         }
     }
@@ -1940,9 +1945,9 @@ fn renewed(sh: &Shared, issuer: wicket_feed::Issuer, until: i64) {
         a.store(until, Ordering::SeqCst);
     }
     if let Err(e) = record_authority(&sh.dir, &sh.node, until_ms + 1000) {
-        println!("[wicket] could not record {}'s renewed authority: {e:#}", sh.run);
+        say!("[wicket] could not record {}'s renewed authority: {e:#}", sh.run);
     }
-    println!("[wicket] {}'s authority on node {} renewed until {until}", sh.run, sh.node);
+    say!("[wicket] {}'s authority on node {} renewed until {until}", sh.run, sh.node);
     let _ = sh.ledger.lock().expect("ledger").audit(
         &sh.tenant,
         Some(&sh.run),
@@ -2150,13 +2155,13 @@ pub async fn forget_command(run: &str, force: bool, by: &str) -> anyhow::Result<
     }
     let link = crate::nodecall::Link::connect(&node, &format!("forget:{}", std::process::id()), &ledger).await?;
     if !link.runs.iter().any(|r| r.run == run) {
-        println!("node {node} has no files for run {run}");
+        say!("node {node} has no files for run {run}");
         return Ok(());
     }
     link.calls.forget(run);
     // A round trip after it: the node has handled the forget once this is answered.
     let _ = link.calls.has_image("sha256:0000000000000000000000000000000000000000000000000000000000000000").await;
-    println!("node {node} deletes run {run}'s files{}", if refused.is_some() { " (forced: its work was never collected)" } else { "" });
+    say!("node {node} deletes run {run}'s files{}", if refused.is_some() { " (forced: its work was never collected)" } else { "" });
     Ok(())
 }
 

@@ -727,7 +727,6 @@ mod tests {
                 escalate: true,
                 attribute: None,
                 identity: Some(Arc::new(IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))),
-                spawner: None,
                 swaps: vec![],
                 boxes: Some(Arc::new(boxes)),
                 capacity: None,

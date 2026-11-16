@@ -56,8 +56,6 @@ pub struct RunCtx {
     /// This agent instance's wicket-issued identity (design §3.2), rotated while it runs. None for
     /// programs.
     pub identity: Option<Arc<IdentityCell>>,
-    /// Starts a child agent in its own box; None when the agent may not spawn.
-    pub spawner: Option<Spawner>,
     /// Placeholders the box holds in place of real credentials, swapped at the egress proxy.
     pub swaps: Vec<CredentialSwap>,
     /// The boxes links reach (`expose`, `connect`, `link`); None where this box can't link.
@@ -221,9 +219,6 @@ pub struct SpawnRequest {
     /// Default: where the parent runs.
     pub placement: Option<serde_json::Value>,
 }
-
-/// Ok: what to tell the agent (started, or waiting for approval). Err: why not.
-pub type Spawner = Arc<dyn Fn(SpawnRequest) -> std::result::Result<String, String> + Send + Sync>;
 
 /// Maximum size of a message body, in bytes of JSON.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -758,7 +753,6 @@ mod fence_tests {
             escalate: true,
             attribute: None,
             identity: None,
-            spawner: None,
             swaps: vec![],
             boxes: None,
             capacity: None,

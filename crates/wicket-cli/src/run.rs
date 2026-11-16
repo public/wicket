@@ -161,6 +161,9 @@ pub struct RunOpts<'a> {
     /// node's clock) and its agent's session. A new run in every other way: its identity, ledger
     /// rows and record are made here; its box isn't started again.
     pub adopt: Option<(i64, String)>,
+    /// A child's supervisor, run in its parent's process (#257 slice 4c): its parent asks it to stop
+    /// its box and end, as an operator's ^C does.
+    pub stop: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// What a run's supervisor keeps in `<run dir>/ctl/run.json` so another can take over (#151).
@@ -317,6 +320,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         wake,
         attach,
         adopt,
+        stop,
     } = o;
     // Where the box start's time goes (#287), from here: in the run's record, and printed with
     // WICKET_TIMINGS=1.
@@ -357,7 +361,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             bail!("could not redirect wicket's output for a wrapped agent");
         }
         agent_stdout = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) });
-        eprintln!("[wicket] wrapping an agent; wicket's log: {}", logs.join(format!("{}.log", std::process::id())).display());
+        say_err!("[wicket] wrapping an agent; wicket's log: {}", logs.join(format!("{}.log", std::process::id())).display());
     }
     if wrap.is_some() && node.is_some() {
         bail!("wrapping an agent runs it on this host's own node; --node isn't supported with it");
@@ -373,7 +377,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let wake_ws: Option<std::path::PathBuf> = wake.as_ref().and_then(|w| w.agent.workspace.as_ref().map(std::path::PathBuf::from));
     if let (Some(w), Some(ws)) = (&wake, &wake_ws) {
         if !ws.exists() {
-            println!("[wicket] the agent's workspace {} is gone; restoring it from the bundle", ws.display());
+            say!("[wicket] the agent's workspace {} is gone; restoring it from the bundle", ws.display());
             crate::hibernate::restore(&w.state, "workspace", ws)?;
         }
     }
@@ -448,12 +452,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             match (&p.digest, &digest, &src) {
                 (Some(want), Some(got), Some(s)) if want != got => match crate::program::check_pin(s, got, want)? {
                     crate::program::Pinned::Legacy => {
-                        println!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name)
+                        say!("[wicket] program {} is pinned by its old digest {want}; `wicket zone pin` rewrites it to {got}", p.name)
                     }
                     _ => bail!("program {} source digest is {got}, but the approved digest is {want}: re-approve the change", p.name),
                 },
                 (Some(_), None, _) => bail!("program {} pins a digest but has no source", p.name),
-                (None, Some(got), _) => println!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
+                (None, Some(got), _) => say!("[wicket] program {} is not pinned (development run); its digest is {got}", p.name),
                 _ => {}
             }
             src.map(|s| (s, digest.unwrap_or_default()))
@@ -485,7 +489,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // its host's requests go without it, and the host is spliced if reach allows it wholesale.
     let unset_injections = m.zone.drop_unset_optional_injections(|s| vault.get(s).is_ok());
     for i in &unset_injections {
-        println!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
+        say!("[wicket] optional secret {:?} is not set: requests to {} go without it", i.secret, i.host);
     }
     for i in &m.zone.inject {
         if let Err(e) = vault.get(&i.secret) {
@@ -541,7 +545,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         for v in m.zone.volumes.iter().filter(|v| v.persist == wicket_core::Persist::Durable) {
             crate::hibernate::restore(&w.state, &format!("volume.{}", v.name), &crate::hibernate::durable_volume(&w.agent.id, &v.name))?;
         }
-        println!("[wicket] restored and verified the agent's state in {} ms", t0.elapsed().as_millis());
+        say!("[wicket] restored and verified the agent's state in {} ms", t0.elapsed().as_millis());
     }
     // What wicket mounts and writes into must be real directories, whatever a restored bundle held:
     // wicket's own, and the harness's config directories.
@@ -573,7 +577,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     // Commits the audit records still queued however the run ends (#62).
     let _flush = crate::audit_export::FlushOnDrop(ledger.clone());
     // Until the run loop handles signals itself: a SIGTERM or ^C commits what is queued first.
-    let early_signals = crate::audit_export::flush_on_signal(ledger.clone(), || {});
+    // (Not a child's: it runs in its parent's process, which handles them.)
+    let early_signals = parent_run.is_none().then(|| crate::audit_export::flush_on_signal(ledger.clone(), || {}));
     // Feeds the installation's audit sinks while this run lasts, if it has any (#91).
     crate::audit_export::spawn_background();
     // The agent's session, and this activation's fencing token: new for a first run, the claimed
@@ -862,7 +867,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         crate::quotas::at_start(&ledger.lock().expect("ledger"), &m, &run, start)?
     };
     timings.since("quotas", lap);
-    let children: Arc<Mutex<Vec<(String, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
+    let children: Arc<Mutex<Vec<(String, crate::spawn::Supervisor)>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_slot: Arc<std::sync::OnceLock<Arc<Llm>>> = Arc::new(std::sync::OnceLock::new());
     let spawn_ctx: Option<Arc<crate::spawn::SpawnCtx>> = match &m.agent {
         Some(a) if a.max_children > 0 => Some(Arc::new(crate::spawn::SpawnCtx {
@@ -870,7 +875,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             // A re-attached run (#151) starts from the slots its children already hold.
             slots: Arc::new(Mutex::new(crate::spawn::reserved_slots(&dir, limits.max_children))),
             max_children: limits.max_children,
-            exe: None,
+            supervise: crate::spawn::supervise,
             run: run.clone(),
             dir: dir.clone(),
             image: image.to_string(),
@@ -886,9 +891,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         _ => None,
     };
     let own_digest = spawn_ctx.as_ref().map(|c| c.own_digest.clone());
-    let spawner: Option<wicket_proxy::Spawner> = spawn_ctx.clone().map(crate::spawn::spawner);
     // Children its node starts for the box, deciding its spawns there (#164).
-    let adopter: Option<crate::noderun::Adopter> = spawn_ctx.map(crate::spawn::adopter);
+    let adopter: Option<crate::noderun::Adopter> = spawn_ctx.clone().map(crate::spawn::adopter);
 
     // Who inside the box made a request: read from the agent's event stream (outside the box).
     let tracker = Arc::new(Mutex::new(wicket_agent::attribution::Tracker::default()));
@@ -962,7 +966,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let capacity = match (&m.agent, crate::capacity::PlacementConfig::load()) {
         (Some(_), Ok(Some(cfg))) => Some(crate::capacity::hook(m.tenant.clone(), run.clone(), m.zone.name.clone(), ledger.clone(), cfg)),
         (Some(_), Err(e)) => {
-            eprintln!("[wicket] request_capacity is off: {e:#}");
+            say_err!("[wicket] request_capacity is off: {e:#}");
             None
         }
         _ => None,
@@ -1002,7 +1006,6 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         escalate,
         attribute,
         identity: identity.clone(),
-        spawner,
         swaps,
         boxes: Some(Arc::new(crate::links::NodeBoxes::new(ledger.clone(), &run.0, &node_name, node_calls.clone(), dir.clone()))
             as Arc<dyn wicket_proxy::link::BoxOps>),
@@ -1122,7 +1125,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     };
 
     timings.since("plan", lap);
-    println!(
+    say!(
         "wicket run {}  tenant {}  zone {}  {} {} ({})",
         run,
         m.tenant,
@@ -1131,17 +1134,17 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         workload,
         workload_runs
     );
-    println!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
+    say!("  isolation {:?}, no network; egress and model calls via wicket only", m.zone.isolation);
     if let Some(i) = &identity {
         let c = i.current().claims.clone();
-        println!("  identity {}  (valid {}s, re-issued every {}s)", c.sub, identity_ttl, identity_ttl / 2);
-        println!("  acting for {}", c.chain().join(" → "));
+        say!("  identity {}  (valid {}s, re-issued every {}s)", c.sub, identity_ttl, identity_ttl / 2);
+        say!("  acting for {}", c.chain().join(" → "));
     }
     if node.is_some() {
-        println!("  node {node_name} via wicket node serve (egress decided there from the signed feed; secrets stay here)");
+        say!("  node {node_name} via wicket node serve (egress decided there from the signed feed; secrets stay here)");
     }
-    println!("  decide requests from another terminal: wicket pending / wicket approve <id>");
-    println!("  run dir {}", dir.display());
+    say!("  decide requests from another terminal: wicket pending / wicket approve <id>");
+    say!("  run dir {}", dir.display());
     let started = std::time::Instant::now();
     let lap = std::time::Instant::now();
     // What another supervisor needs to take this run over (#151).
@@ -1331,6 +1334,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             swaps: ctx.swaps.clone(),
             spent_counted: attach_agent.is_some(),
             gateway: gateway.clone(),
+            spawn: spawn_ctx.clone(),
             adopt: adopter.clone(),
             timings: timings.clone(),
         })
@@ -1355,7 +1359,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     "run.image",
                     &serde_json::json!({ "image": image_name, "digest": d, "pinned": image_pin }),
                 )?;
-                println!("  image {image_name} started as {d}");
+                say!("  image {image_name} started as {d}");
             }
             if let Some(slot) = &own_digest {
                 let _ = slot.set(d.clone());
@@ -1402,7 +1406,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         // Where the start's time went (#287): kept in the run's record, and shown if asked for.
         if record.is_none() {
             if let Err(e) = save_timings(&dir, &timings) {
-                eprintln!("[wicket] could not keep the box start's timings in the run's record: {e:#}");
+                say_err!("[wicket] could not keep the box start's timings in the run's record: {e:#}");
             }
         }
         if wicket_core::timing::enabled() {
@@ -1414,9 +1418,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         let l = ledger.lock().expect("ledger");
         l.set_agent_state(&f.agent, f.generation, "active", None)?;
         if wake.is_some() {
-            println!("  agent {} woken: generation {}, session {} resumed", f.agent, f.generation, session.id);
+            say!("  agent {} woken: generation {}, session {} resumed", f.agent, f.generation, session.id);
         } else {
-            println!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket session {}", f.agent, session.id, run, f.agent);
+            say!("  agent {} (long-lived; session {}): wicket hibernate {} / wicket session {}", f.agent, session.id, run, f.agent);
         }
     }
     // Its quota grants are its limits (#256): kept live while it runs, at most a day ahead each
@@ -1444,7 +1448,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some(tokio::spawn(async move {
                 let issuer = match crate::issuer() {
                     Ok(i) => i,
-                    Err(e) => return eprintln!("[wicket] identity refresh disabled: {e}"),
+                    Err(e) => return say_err!("[wicket] identity refresh disabled: {e}"),
                 };
                 let mut next = wicket_store::now() + identity_ttl / 2;
                 loop {
@@ -1452,7 +1456,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let rv = ledger.lock().ok().and_then(|l| l.revoked_in_chain(&run2.0).ok().flatten());
                     if let Some((r, _, by, reason)) = rv {
                         let whose = if r == run2.0 { "this agent's".to_string() } else { format!("ancestor {r}'s") };
-                        println!("[wicket] {whose} identity was revoked by {by} ({reason}); stopping the box");
+                        say!("[wicket] {whose} identity was revoked by {by} ({reason}); stopping the box");
                         revoked.store(true, std::sync::atomic::Ordering::SeqCst);
                         stopper.revoke().await;
                         return;
@@ -1557,7 +1561,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
     let mut wrapped_exit: Option<std::process::ExitStatus> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // From here the loop handles SIGTERM and ^C, and the run ends through `_flush`.
-    early_signals.abort();
+    if let Some(s) = early_signals {
+        s.abort();
+    }
     // What the control host keeps of the box's output is bounded like its node's (#160): the zone's
     // limits.output of each stream, the newest kept, and of a program's output shown, the first.
     let output_cap = m.zone.limits.output_bytes().unwrap_or(64 << 20);
@@ -1637,7 +1643,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 break;
             }
             _ = term.recv() => {
-                println!("[wicket] terminated; stopping the box");
+                say!("[wicket] terminated; stopping the box");
                 stopper.kill().await?;
                 status = "interrupted".into();
                 if !stopping {
@@ -1653,10 +1659,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if remote {
                         // A remote session's server prints text, not events; its session's address is
                         // what the owner needs (recorded once, and shown on the console's card).
-                        println!("[remote] {}", wicket_agent::clip(&l, 300));
+                        say!("[remote] {}", wicket_agent::clip(&l, 300));
                         if remote_url.is_none() {
                             if let Some(u) = harness.and_then(|h| h.remote_session_url(&l)) {
-                                println!("[wicket] Remote Control session: {u}");
+                                say!("[wicket] Remote Control session: {u}");
                                 if let Ok(lg) = ledger.lock() {
                                     let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &serde_json::json!({ "url": u }));
                                 }
@@ -1666,9 +1672,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     } else if is_program {
                         shown += l.len() as u64 + 1;
                         if shown <= output_cap {
-                            println!("[program] {}", wicket_agent::clip(&l, 300));
+                            say!("[program] {}", wicket_agent::clip(&l, 300));
                         } else if shown - (l.len() as u64 + 1) <= output_cap {
-                            println!("[wicket] the program's output passed limits.output; the rest is only in its transcript, the newest kept");
+                            say!("[wicket] the program's output passed limits.output; the rest is only in its transcript, the newest kept");
                         }
                         program_tail.push(l.clone());
                         if program_tail.len() > 40 {
@@ -1685,7 +1691,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     let _ = lg.audit(&m.tenant, Some(&run), kind, &body);
                                 }
                             } else if acp_audits == ACP_AUDIT_CAP + 1 {
-                                println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+                                say!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
                             }
                         };
                         if let Some(log) = acp_log.as_mut() {
@@ -1702,7 +1708,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         for e in &st.events {
                             use wicket_agent::acp::SessionEvent as E;
                             if let Some(r) = wicket_agent::acp::render(e) {
-                                println!("{r}");
+                                say!("{r}");
                             }
                             match e {
                                 E::Started { session: sid, .. } => {
@@ -1749,18 +1755,18 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                     let mut body = serde_json::json!({ "url": u });
                                     match prior_remote_url.as_deref() {
                                         Some(old) if same_remote_session(old, &u) => {
-                                            println!("[wicket] Remote Control session resumed: {u}");
+                                            say!("[wicket] Remote Control session resumed: {u}");
                                             body["resumed"] = true.into();
                                         }
                                         // A new session, as at the start, and the old one is no longer
                                         // this box's: said as loudly as the start's address.
                                         Some(old) => {
-                                            println!("[wicket] the woken box couldn't reattach to its Remote Control session {old}; it started a new one");
-                                            println!("[wicket] Remote Control session (NEW): {u}");
+                                            say!("[wicket] the woken box couldn't reattach to its Remote Control session {old}; it started a new one");
+                                            say!("[wicket] Remote Control session (NEW): {u}");
                                             body["resumed"] = false.into();
                                             body["previous"] = old.into();
                                         }
-                                        None => println!("[wicket] Remote Control session: {u}"),
+                                        None => say!("[wicket] Remote Control session: {u}"),
                                     }
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session", &body);
@@ -1769,9 +1775,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 }
                                 Some(Err(why)) => {
                                     if let Some(old) = &prior_remote_url {
-                                        println!("[wicket] the woken box's Remote Control session {old} wasn't resumed");
+                                        say!("[wicket] the woken box's Remote Control session {old} wasn't resumed");
                                     }
-                                    println!("[wicket] the Remote Control session didn't start (the agent carries on, driven by wicket only): {why}");
+                                    say!("[wicket] the Remote Control session didn't start (the agent carries on, driven by wicket only): {why}");
                                     if let Ok(lg) = ledger.lock() {
                                         let _ = lg.audit(&m.tenant, Some(&run), "run.remote_session_failed", &serde_json::json!({ "error": why }));
                                     }
@@ -1783,7 +1789,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
                             if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
                                 if wake.is_some() && !saw_assistant {
-                                    println!("[wicket] the woken agent's first reply, {} ms after its box started", started.elapsed().as_millis());
+                                    say!("[wicket] the woken agent's first reply, {} ms after its box started", started.elapsed().as_millis());
                                 }
                                 saw_assistant = true;
                             }
@@ -1799,9 +1805,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             match sub {
                                 Some(who) => {
                                     let who = wicket_agent::clip(&who, 60);
-                                    println!("{}", r.lines().map(|x| format!("  ↳ [{who}] {x}")).collect::<Vec<_>>().join("\n"));
+                                    say!("{}", r.lines().map(|x| format!("  ↳ [{who}] {x}")).collect::<Vec<_>>().join("\n"));
                                 }
-                                None => println!("{r}"),
+                                None => say!("{r}"),
                             }
                         }
                     }
@@ -1815,13 +1821,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             Some(w) = want_rx.recv() => {
                 let when = if turn_running { ": at the end of this turn" } else { "" };
                 match w {
-                    wicket_proxy::Want::Finish if stdin.is_none() => println!("[wicket] the agent asked to finish; its session ends when its process exits"),
+                    wicket_proxy::Want::Finish if stdin.is_none() => say!("[wicket] the agent asked to finish; its session ends when its process exits"),
                     wicket_proxy::Want::Finish => {
-                        println!("[wicket] the agent asked to finish{when}");
+                        say!("[wicket] the agent asked to finish{when}");
                         finish_asked = true;
                     }
                     wicket_proxy::Want::Hibernate => {
-                        println!("[wicket] the agent asked to hibernate{when}");
+                        say!("[wicket] the agent asked to hibernate{when}");
                         hib_asked = true;
                     }
                 }
@@ -1848,7 +1854,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     }
                     let ok = ledger.lock().ok().and_then(|l| l.renew_agent_claim(&f.agent, f.generation, wicket_store::now() + crate::hibernate::CLAIM_SECS).ok());
                     if ok == Some(false) {
-                        println!("[wicket] agent {} was woken elsewhere (this is generation {}); stopping this box", f.agent, f.generation);
+                        say!("[wicket] agent {} was woken elsewhere (this is generation {}); stopping this box", f.agent, f.generation);
                         superseded = true;
                         hibernating = false;
                         stopper.kill().await?;
@@ -1872,7 +1878,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 };
                 {
                     if over {
-                        println!("[wicket] the box's /tmp is over its {} MiB cap; stopping the box", wicket_sandbox::TMP_CAP_MB);
+                        say!("[wicket] the box's /tmp is over its {} MiB cap; stopping the box", wicket_sandbox::TMP_CAP_MB);
                         hibernating = false;
                         stopper.kill().await?;
                         status = "failed (/tmp over its cap)".into();
@@ -1893,7 +1899,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 let msgs = ledger.lock().ok().and_then(|mut l| l.take_operator_messages_with_ids(&run.0).ok()).unwrap_or_default();
                 for (op, text, by) in msgs {
                     use tokio::io::AsyncWriteExt;
-                    println!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
+                    say!("[operator] {by}: {}", wicket_agent::clip(&text, 300));
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {
                             log.queued(transcript_f.offset(), &by, Some(op));
@@ -1922,7 +1928,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     };
                     let sent = !out.is_empty();
                     if sent {
-                        println!("[operator] {by}: cancel the running turn");
+                        say!("[operator] {by}: cancel the running turn");
                         if let Some(c) = &acp {
                             let _ = write_json(&acp_state, c);
                         }
@@ -1957,7 +1963,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if let Some((want, by)) = modes.last() {
                     let outcome = match (crate::control::parse_mode(want), control.as_mut()) {
                         (Some(mode), Some(c)) => {
-                            println!("[operator] {by}: permission mode {mode}");
+                            say!("[operator] {by}: permission mode {mode}");
                             let out = c.set_mode(mode);
                             write_lines(&mut stdin, &out).await;
                             "asked"
@@ -1975,7 +1981,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     if ledger.lock().ok().and_then(|l| l.take_agent_want(&f.agent, f.generation).ok().flatten()).as_deref() == Some("hibernate") {
                         hib_asked = true;
                         if turn_running {
-                            println!("[wicket] hibernate asked: at the end of this turn");
+                            say!("[wicket] hibernate asked: at the end of this turn");
                         }
                     }
                 }
@@ -1988,7 +1994,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if !turn_running && !finish_asked && waiting > notified_msgs {
                     use tokio::io::AsyncWriteExt;
                     let t = format!("[wicket] {waiting} message(s) from other agents (or your parent's next brief) are waiting: read them with wicket's await_message tool.");
-                    println!("{t}");
+                    say!("{t}");
                     if let Some(si) = stdin.as_mut() {
                         if let Some(log) = acp_log.as_mut() {
                             log.queued(transcript_f.offset(), "wicket", None);
@@ -2005,10 +2011,10 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 if !turn_running && !hibernating && hib_asked && lingering.is_none() {
                     hib_asked = false;
                     match &fence {
-                        None => println!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
+                        None => say!("[wicket] not hibernated: only a long-lived agent wicket started itself can hibernate"),
                         Some(f) => match stopper.check_quiet(&box_user, &|c: &str| harness.is_some_and(|h| h.is_runtime(&m, c)), &agent_cmd).await {
                             Ok(()) => {
-                                println!("[wicket] quiet point: hibernating agent {}", f.agent);
+                                say!("[wicket] quiet point: hibernating agent {}", f.agent);
                                 set_state("hibernating", None);
                                 hibernating = true;
                                 stdin = None; // EOF: the agent exits, then its state is pushed
@@ -2017,7 +2023,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 // They get the harness's grace to end, then are stopped (#293). It
                                 // goes on running meanwhile, as it was: nothing is paused.
                                 let note = format!("hibernating in {}, stopping what still runs then: {why}", humantime::format_duration(exit_grace));
-                                println!("[wicket] not quiet yet: {note}");
+                                say!("[wicket] not quiet yet: {note}");
                                 set_state("active", Some(&note));
                                 lingering = Some(Linger::Hibernate);
                                 linger.as_mut().reset(tokio::time::Instant::now() + exit_grace);
@@ -2025,14 +2031,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                             Err(why) => {
                                 // It goes on running, as it was: nothing is paused.
                                 let note = format!("not hibernated: {why}");
-                                println!("[wicket] {note}; the agent goes on running");
+                                say!("[wicket] {note}; the agent goes on running");
                                 set_state("active", Some(&note));
                             }
                         },
                     }
                 }
                 if !turn_running && !hibernating && finish_asked && stdin.is_some() {
-                    println!("[wicket] closing the session, as the agent asked");
+                    say!("[wicket] closing the session, as the agent asked");
                     stdin = None; // EOF: the agent finishes and exits
                     // ...within its grace, or what is left of it is stopped (#293). (A hibernate
                     // waiting for a quiet box gives way: the agent asked to finish since.)
@@ -2048,7 +2054,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     // the run ends as the agent asked, with what wicket stopped named (#293).
                     let left = stopper.processes(&box_user).await.map(|p| crate::hibernate::left_running(&p));
                     let note = finish_note(exit_grace, &left);
-                    println!("[wicket] {note}");
+                    say!("[wicket] {note}");
                     if let Ok(lg) = ledger.lock() {
                         let _ = lg.audit(&m.tenant, Some(&run), "run.leftovers_stopped", &serde_json::json!({ "why": "finish", "processes": left.as_ref().ok(), "note": note }));
                     }
@@ -2063,7 +2069,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
                 Some(Linger::Hibernate) if turn_running => {
                     // A turn began meanwhile (a message): hibernate at its end, with a grace of its own.
-                    println!("[wicket] a turn began before the box was quiet: hibernating at its end");
+                    say!("[wicket] a turn began before the box was quiet: hibernating at its end");
                     hib_asked = true;
                 }
                 Some(Linger::Hibernate) if hibernating || stdin.is_none() || fence.is_none() => {}
@@ -2084,12 +2090,12 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 Ok(()) => {
                                     match &note {
                                         Some(n) => {
-                                            println!("[wicket] {n}");
+                                            say!("[wicket] {n}");
                                             if let Ok(lg) = ledger.lock() {
                                                 let _ = lg.audit(&m.tenant, Some(&run), "run.leftovers_stopped", &serde_json::json!({ "why": "hibernate", "processes": left.iter().map(|(_, c)| c).collect::<Vec<_>>(), "note": n }));
                                             }
                                         }
-                                        None => println!("[wicket] quiet point: hibernating agent {agent}"),
+                                        None => say!("[wicket] quiet point: hibernating agent {agent}"),
                                     }
                                     set_state("hibernating", Some(note.as_deref().unwrap_or("hibernated at a quiet point")));
                                     end_note = note;
@@ -2098,14 +2104,14 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                                 }
                                 Err(e) => {
                                     let note = format!("not hibernated: stopping what else ran in the box failed: {e}");
-                                    println!("[wicket] {note}; the agent goes on running");
+                                    say!("[wicket] {note}; the agent goes on running");
                                     set_state("active", Some(&note));
                                 }
                             }
                         }
                         Err(e) => {
                             let note = format!("not hibernated: {e}");
-                            println!("[wicket] {note}; the agent goes on running");
+                            say!("[wicket] {note}; the agent goes on running");
                             set_state("active", Some(&note));
                         }
                     }
@@ -2115,7 +2121,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
             _ = &mut deadline, if !timed_out => {
                 timed_out = true;
                 hibernating = false;
-                println!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
+                say!("[wicket] timeout after {}; stopping the box", humantime::format_duration(timeout));
                 stopper.kill().await?;
                 status = "timeout".into();
                 if !stopping {
@@ -2124,11 +2130,20 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 }
             }
             _ = &mut give_up, if stopping => {
-                println!("[wicket] node unreachable; not waiting for the box any longer (the node stops it at the run's timeout)");
+                say!("[wicket] node unreachable; not waiting for the box any longer (the node stops it at the run's timeout)");
                 break;
             }
+            _ = async { stop.as_ref().expect("guarded").notified().await }, if stop.is_some() => {
+                say!("[wicket] stopped by its parent; stopping the box");
+                stopper.kill().await?;
+                status = "interrupted".into();
+                if !stopping {
+                    stopping = true;
+                    give_up.as_mut().reset(tokio::time::Instant::now() + stop_grace);
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
-                println!("[wicket] interrupted; stopping the box");
+                say!("[wicket] interrupted; stopping the box");
                 stopper.kill().await?;
                 status = "interrupted".into();
                 if !stopping {
@@ -2207,8 +2222,8 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                 // The run holds its node until they are collected: the reconciler doesn't release
                 // it with them (#324).
                 let _ = ledger.lock().expect("ledger").set_run_uncollected(&run.0, Some(&node_name));
-                println!("[wicket] {msg}");
-                eprintln!("[wicket] {msg}");
+                say!("[wicket] {msg}");
+                say_err!("[wicket] {msg}");
                 let _ = ledger.lock().expect("ledger").audit(
                     &m.tenant,
                     Some(&run),
@@ -2259,7 +2274,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                         }
                     }
                     let ms = t0.elapsed().as_millis();
-                    println!(
+                    say!(
                         "[wicket] agent {} hibernated in {ms} ms: {} trees, {} raw, {} stored (seq {}); wake it with: wicket session {}",
                         f.agent,
                         st.trees.len(),
@@ -2279,23 +2294,23 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
                     let waiting = l.waiting_operator_messages(&run.0).unwrap_or(0) + l.waiting_messages(&run.0).unwrap_or(0);
                     drop(l);
                     if waiting > 0 {
-                        println!("[wicket] {waiting} message(s) arrived while it hibernated: waking it again");
+                        say!("[wicket] {waiting} message(s) arrived while it hibernated: waking it again");
                         crate::hibernate::trigger_wake(&f.agent, "a message that arrived while it hibernated");
                     }
                 }
                 Ok(None) => {
-                    println!("[wicket] agent {} was woken elsewhere while this one hibernated; its push was refused", f.agent);
+                    say!("[wicket] agent {} was woken elsewhere while this one hibernated; its push was refused", f.agent);
                     status = "superseded".into();
                 }
                 Err(e) => {
-                    println!("[wicket] hibernating agent {} failed: {e:#} (its state stays on this node, in {})", f.agent, dir.display());
+                    say!("[wicket] hibernating agent {} failed: {e:#} (its state stays on this node, in {})", f.agent, dir.display());
                     set_state("failed", Some(&format!("hibernate failed: {e:#}")));
                     status = format!("failed (hibernate: {e})");
                 }
             }
         } else if wake.is_some() && !saw_assistant {
             let why = stderr_text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output").to_string();
-            println!("[wicket] the woken session never started ({}); agent {} stays hibernated", wicket_agent::clip(&why, 200), f.agent);
+            say!("[wicket] the woken session never started ({}); agent {} stays hibernated", wicket_agent::clip(&why, 200), f.agent);
             let _ = ledger.lock().expect("ledger").release_failed_wake(
                 &f.agent,
                 f.generation,
@@ -2308,9 +2323,9 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         }
     }
     if !exit.success() && !stderr_text.trim().is_empty() {
-        println!("[wicket] agent stderr (last lines):");
+        say!("[wicket] agent stderr (last lines):");
         for l in stderr_text.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-            println!("    {}", wicket_agent::clip(l, 300));
+            say!("    {}", wicket_agent::clip(l, 300));
         }
     }
 
@@ -2335,28 +2350,28 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         };
         match ctx.send_message(&wicket_proxy::Recipient::Parent, "run_finished", body) {
             Ok(s) => {
-                println!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to);
+                say!("[wicket] sent {} (run_finished) to parent {p} ({})", s.id, s.to);
                 ctx.end_delegation(Some(&s.id));
             }
             Err(e) => {
-                println!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub);
+                say!("[wicket] could not report to parent {p}: {e} ({})", i.claims.sub);
                 ctx.end_delegation(None);
             }
         }
     }
-    // A parent's children end with it: interrupt them (each stops its own box), then wait briefly.
-    let kids: Vec<(String, std::process::Child)> = std::mem::take(&mut *children.lock().expect("children"));
-    for (crun, mut proc) in kids {
-        if proc.try_wait().ok().flatten().is_none() {
-            println!("[wicket] stopping child {crun}");
-            let _ = std::process::Command::new("kill").args(["-INT", &proc.id().to_string()]).status();
+    // A parent's children end with it: each is asked to stop its box and end, then waited for
+    // briefly. (One that hasn't ended by then goes on until its box does, or this process ends.)
+    let kids: Vec<(String, crate::spawn::Supervisor)> = std::mem::take(&mut *children.lock().expect("children"));
+    for (crun, sup) in kids {
+        if !sup.thread.is_finished() {
+            say!("[wicket] stopping child {crun}");
+            sup.stop.notify_one();
             for _ in 0..60 {
-                if proc.try_wait().ok().flatten().is_some() {
+                if sup.thread.is_finished() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            let _ = proc.kill();
         }
     }
     let pending: Vec<String> = {
@@ -2390,7 +2405,7 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         )?;
         l.audit(&m.tenant, Some(&run), "run.end", &summary)?;
     }
-    println!(
+    say!(
         "\n[wicket] run {run}: {status} in {}s; {} model requests, {} in ({} of them cached) / {} out tokens",
         summary["seconds"],
         summary["model_requests"],
@@ -2399,13 +2414,13 @@ pub async fn run(o: RunOpts<'_>) -> Result<()> {
         summary["output_tokens"]
     );
     match &result {
-        Some(r) => println!("[wicket] result.json: {}", wicket_agent::clip(&r.to_string(), 1200)),
-        None => println!("[wicket] no valid result.json in the outbox"),
+        Some(r) => say!("[wicket] result.json: {}", wicket_agent::clip(&r.to_string(), 1200)),
+        None => say!("[wicket] no valid result.json in the outbox"),
     }
     if !pending.is_empty() {
-        println!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
+        say!("[wicket] withdrawn (still pending when the run ended): {}", pending.join(", "));
     }
-    println!("[wicket] transcript {}", transcript.display());
+    say!("[wicket] transcript {}", transcript.display());
     // The box's first output and first model request, if they came, join its start's timings, with
     // its own start and its end (#287).
     timings.since("teardown", teardown);
@@ -2479,7 +2494,7 @@ async fn fetch_trees(stopper: &Stopper, f: Fetch<'_>) -> Result<()> {
         crate::hibernate::sync_dir(&staging.join(tree), dest, &[])?;
     }
     let _ = std::fs::remove_dir_all(&staging);
-    println!("[wicket] fetched the box's files from its node in {} ms", t0.elapsed().as_millis());
+    say!("[wicket] fetched the box's files from its node in {} ms", t0.elapsed().as_millis());
     Ok(())
 }
 
@@ -2534,18 +2549,18 @@ fn note_collected(ledger: &Arc<Mutex<Ledger>>, run: &str, ev: &Event) {
 fn print_event(ev: &Event) {
     match ev {
         Event::Egress { outcome, detail, .. } => {
-            println!("{}", egress_line(ev).unwrap_or_default());
+            say!("{}", egress_line(ev).unwrap_or_default());
             // The hint only for what is shaped like a request id (#121).
             if outcome == "pending" {
                 if let Some(id) = detail.split([' ', ':']).next().filter(|id| is_request_id(id)) {
-                    println!("         → an operator decides: wicket approve {id}   or   wicket deny {id}");
+                    say!("         → an operator decides: wicket approve {id}   or   wicket deny {id}");
                 }
             }
         }
-        Event::Tool { name, detail } => println!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
-        Event::Box { what, detail } => println!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
+        Event::Tool { name, detail } => say!("[wicket-tool] {name}: {}", wicket_agent::clip(detail, 160)),
+        Event::Box { what, detail } => say!("[box] {}: {}", wicket_agent::clip(what, 40), wicket_agent::clip(detail, 400)),
         Event::Llm { model, status, input_tokens, cached_tokens, output_tokens, requests, outcome, .. } => {
-            println!(
+            say!(
                 "[llm]    #{requests} {} → {status}  in {input_tokens} (+{cached_tokens} cached) / out {output_tokens}  ({})",
                 wicket_agent::clip(model.as_deref().unwrap_or("?"), 80),
                 wicket_agent::clip(outcome, 240)
@@ -2641,7 +2656,7 @@ fn control_said(
     audits: &mut u32,
 ) {
     for s in &out.say {
-        println!("{s}");
+        say!("{s}");
     }
     for (kind, body) in &out.audit {
         *audits += 1;
@@ -2650,7 +2665,7 @@ fn control_said(
                 let _ = l.audit(tenant, Some(run), kind, body);
             }
         } else if *audits == ACP_AUDIT_CAP + 1 {
-            println!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
+            say!("[wicket] the agent passed {ACP_AUDIT_CAP} prompts and refused calls: the rest are in its transcript only");
         }
     }
 }
@@ -2658,8 +2673,8 @@ fn control_said(
 /// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
 fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
     match ctx.report_turn(result, is_error) {
-        Some(Ok(s)) => println!("[wicket] sent {} (report) to its parent {}", s.id, s.to),
-        Some(Err(e)) => println!("[wicket] could not send its report to its parent: {e}"),
+        Some(Ok(s)) => say!("[wicket] sent {} (report) to its parent {}", s.id, s.to),
+        Some(Err(e)) => say!("[wicket] could not send its report to its parent: {e}"),
         None => {}
     }
 }

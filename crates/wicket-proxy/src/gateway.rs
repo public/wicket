@@ -43,6 +43,12 @@ impl Gateway {
         (r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"].as_bool().unwrap_or(true))
     }
 
+    /// Why this activation may do nothing more (#70), if it is superseded: for the tools the run
+    /// answers outside this gateway (`spawn`, #257 slice 4c).
+    pub fn superseded(&self) -> Option<String> {
+        self.ctx.superseded()
+    }
+
     async fn call(&self, params: &Value) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -53,7 +59,6 @@ impl Gateway {
             "await_message" => self.await_message(&args).await,
             "principals" => self.principals(),
             "receipts" => self.receipts(&args).await,
-            "spawn" => self.spawn(&args),
             "continue_child" => crate::delegate::continue_child(&self.ctx, &args),
             "delegations" => crate::delegate::delegations(&self.ctx),
             "decide" => self.decide(&args),
@@ -327,21 +332,6 @@ impl Gateway {
         let _ = l.refuse_message(&m.id, &self.ctx.tenant.0, &m.from_run, from.as_deref(), me, why);
         let _ =
             l.audit(&self.ctx.tenant, Some(&self.ctx.run), "message.refused", &json!({ "id": m.id, "from": from, "to": me, "why": why }));
-    }
-
-    /// `spawn`: the request, parsed by [`spawn_request`].
-    fn spawn(&self, args: &Value) -> (String, bool) {
-        let Some(spawn) = &self.ctx.spawner else {
-            return ("this agent may not start other boxes (max_children is 0)".into(), true);
-        };
-        let req = match spawn_request(args) {
-            Ok(r) => r,
-            Err(e) => return (e, true),
-        };
-        match spawn(req) {
-            Ok(msg) => (msg, false),
-            Err(e) => (format!("not started: {e}"), true),
-        }
     }
 
     /// `request_capacity` (#7): ask for a node, or (with `lease`) wait for one asked for earlier. The
@@ -1049,7 +1039,6 @@ mod tests {
                 escalate: true,
                 attribute: None,
                 identity: Some(Arc::new(crate::IdentityCell::new(RunIdentity { jws, claims, key, issuer: self.issuer.verifying_key() }))),
-                spawner: None,
                 swaps: vec![],
                 boxes: None,
                 capacity: None,
