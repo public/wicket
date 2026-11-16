@@ -331,3 +331,142 @@ pub fn doctor(lease_grace: i64) -> Result<()> {
     }
     anyhow::bail!("{} invariant violation(s)", s.findings.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wicket_core::{Op, RunId, TenantId};
+
+    const RUN: &str = "run_inv";
+
+    fn ledger() -> Ledger {
+        let l = Ledger::open_in_memory().unwrap();
+        l.run_started(&TenantId::single(), &RunId(RUN.into()), "z", "a").unwrap();
+        l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "run.start", &json!({ "zone": "z", "reach": 1 })).unwrap();
+        l
+    }
+
+    fn egress(l: &Ledger, method: &str, host: &str, path: &str, outcome: &str, detail: &str) {
+        let ev = json!({ "kind": "egress", "method": method, "host": host, "path": path, "risk": "R1ReadScoped", "outcome": outcome, "detail": detail });
+        l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "op", &ev).unwrap();
+    }
+
+    fn findings(l: &Ledger, data: &Path) -> Vec<String> {
+        check(l, data, 600, wicket_store::now()).unwrap().findings.into_iter().map(|f| format!("{}: {}", f.invariant, f.what)).collect()
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wicket-inv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A request a grant answered: granted for GET api.example.com/x.
+    fn granted(l: &mut Ledger) -> String {
+        let op = Op::egress(&TenantId::single(), &RunId(RUN.into()), "z", "GET", "api.example.com", "/x");
+        let (req, _) = l.pending_for(&op, "blocked", None).unwrap();
+        let a = wicket_store::Approval {
+            uses: Some(5),
+            ttl: std::time::Duration::from_secs(600),
+            path_prefix: None,
+            decided_by: "test".into(),
+        };
+        l.approve(&req, &a).unwrap()
+    }
+
+    #[test]
+    fn a_grant_allow_must_match_a_live_grant_for_the_request() {
+        let mut l = ledger();
+        let d = tmp("grant");
+        let g = granted(&mut l);
+        egress(&l, "GET", "api.example.com", "/x", "allow", &format!("grant {g} (counted on the node)"));
+        assert_eq!(findings(&l, &d), Vec::<String>::new());
+        egress(&l, "GET", "api.example.com", "/other", "allow", &format!("grant {g} (counted on the node)"));
+        egress(&l, "GET", "api.example.com", "/x", "allow", "grant g-never (counted on the node)");
+        egress(&l, "GET", "api.example.com", "/x", "allow", "GrantHold { grant: \"g-held\", until: 1 }");
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f[0].contains("/other") && f[0].contains("which is for GET api.example.com/x"), "{f:?}");
+        assert!(f[1].contains("g-never, which was never issued"), "{f:?}");
+        assert!(f[2].contains("g-held, which was never issued"), "{f:?}");
+        // Used well after its revocation: broken; within the feed's window: not.
+        let l = ledger();
+        let mut l = l;
+        let g = granted(&mut l);
+        l.audit(&TenantId::single(), None, "grant.revoked", &json!({ "grant": g, "by": "test" })).unwrap();
+        egress(&l, "GET", "api.example.com", "/x", "allow", &format!("grant {g}"));
+        assert_eq!(findings(&l, &d), Vec::<String>::new(), "within the window a node may still decide on it");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_reach_allow_is_checked_against_the_zone_when_wicket_kept_it() {
+        let l = ledger();
+        let d = tmp("reach");
+        // No zone kept: only that the rule exists.
+        egress(&l, "GET", "example.com", "/", "allow", "reach rule 0 (node)");
+        egress(&l, "GET", "example.com", "/", "allow", "reach rule 3 (node)");
+        let s = check(&l, &d, 600, wicket_store::now()).unwrap();
+        assert_eq!((s.allows, s.by_reach, s.unverified), (2, 2, 2));
+        assert_eq!(s.findings.len(), 1, "{:?}", s.findings);
+        assert!(s.findings[0].what.contains("reach rule 3, but its zone has 1"));
+        // A spawned child's zone, kept in its parent's run directory: decided again here.
+        std::fs::create_dir_all(d.join("runs/run_parent/children")).unwrap();
+        std::fs::write(
+            d.join(format!("runs/run_parent/children/{RUN}.yaml")),
+            "task: t\nagent: { name: a }\nzone:\n  name: z\n  llm: {}\n  reach: [{ host: example.com, methods: [GET], paths: [\"/\"] }]\n",
+        )
+        .unwrap();
+        let l = ledger();
+        egress(&l, "GET", "example.com", "/", "allow", "reach rule 0 (node)");
+        egress(&l, "POST", "example.com", "/", "allow", "reach rule 0 (node)");
+        egress(&l, "GET", "example.org", "/", "allow", "the box's token (node)");
+        egress(&l, "CONNECT", "example.com", "/", "spliced", "reach rule 0 allows the host wholesale: not inspected");
+        egress(&l, "GET", "example.org", "/", "allow", "because I said so");
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 4, "{f:?}");
+        assert!(f[0].starts_with("egress: POST example.com/") && f[0].contains("the run's zone doesn't allow it"), "{f:?}");
+        assert!(f[1].starts_with("egress: GET example.org/"), "{f:?}");
+        assert!(f[2].contains("CONNECT"), "a host spliced wholesale needs a rule without limits: {f:?}");
+        assert!(f[3].contains("a reason this check doesn't know"), "{f:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_nodes_shipped_records_are_checked_too() {
+        let l = ledger();
+        let d = tmp("node");
+        let inner = json!({ "kind": "egress", "method": "GET", "host": "x.example", "path": "/", "risk": "R1ReadScoped", "outcome": "allow", "detail": "grant g-nope (counted on the node)" });
+        let outer = json!({ "node": "n1", "seq": 1, "ts": wicket_store::now(), "tenant": "default", "run": RUN, "kind": "op", "body": inner.to_string() });
+        l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "node.audit", &outer).unwrap();
+        let f = findings(&l, &d);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("g-nope, which was never issued"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn model_calls_that_went_through_stay_within_the_quota() {
+        let l = ledger();
+        let d = tmp("spend");
+        let quotas = [
+            wicket_store::Quota { resource: "model.requests", amount: 2 },
+            wicket_store::Quota { resource: "model.output_tokens", amount: 100 },
+        ];
+        l.record_quota_grants(&TenantId::single(), "z", &RunId(RUN.into()), "test", &quotas, 3600).unwrap();
+        let llm = |status: u16, out: u64| {
+            let ev = json!({ "kind": "llm", "status": status, "output_tokens": out, "input_tokens": 1, "cached_tokens": 0, "requests": 1, "outcome": "ok" });
+            l.audit(&TenantId::single(), Some(&RunId(RUN.into())), "op", &ev).unwrap();
+        };
+        llm(200, 40);
+        llm(200, 40);
+        llm(429, 0);
+        assert_eq!(findings(&l, &d), Vec::<String>::new(), "a refused call isn't a call that went through");
+        llm(200, 30);
+        let f = findings(&l, &d);
+        assert_eq!(f, ["budget: 3 model calls went through, budget 2", "budget: 110 output tokens, budget 100"]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
