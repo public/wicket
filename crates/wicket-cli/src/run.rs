@@ -2604,7 +2604,6 @@ const CANCEL_FRESH_SECS: i64 = 30;
 /// How many of an ACP agent's permission prompts and refused calls a run audits (#66).
 const ACP_AUDIT_CAP: u32 = 1000;
 
-/// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
 /// Writes lines to the agent's stdin; a stdin that can't be written is dropped.
 async fn write_lines<W: tokio::io::AsyncWrite + Unpin>(stdin: &mut Option<W>, lines: &[String]) {
     use tokio::io::AsyncWriteExt;
@@ -2639,6 +2638,7 @@ fn control_said(
     }
 }
 
+/// The end of a top-level turn (#252): a delegated child's report goes to its parent as a message.
 fn report_turn(ctx: &RunCtx, result: Option<&str>, is_error: bool) {
     match ctx.report_turn(result, is_error) {
         Some(Ok(s)) => println!("[wicket] sent {} (report) to its parent {}", s.id, s.to),
